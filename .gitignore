@@ -1,0 +1,26 @@
+# Go
+/kahyad/kahyad
+/kahyad/cmd/kahya/kahya
+*.test
+/bin/
+/dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Runtime / local state (brain.db lives outside the repo, but never commit any db)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Secrets — secrets live in macOS Keychain, never in the repo
+.env
+*.pem
+*.key
+
+# macOS
+.DS_Store
