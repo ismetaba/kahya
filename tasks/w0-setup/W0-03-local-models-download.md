@@ -1,6 +1,6 @@
 # W0-03 — Local models download
 
-**Status:** todo
+**Status:** blocked-user
 **Phase:** W0 — Day-1 setup
 **Depends on:** none
 **Flags:** long-running
