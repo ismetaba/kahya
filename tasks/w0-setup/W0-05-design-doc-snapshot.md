@@ -1,6 +1,6 @@
 # W0-05 — Design doc snapshot
 
-**Status:** todo
+**Status:** blocked-user
 **Phase:** W0 — Day-1 setup
 **Depends on:** none
 **Flags:** user-assist
