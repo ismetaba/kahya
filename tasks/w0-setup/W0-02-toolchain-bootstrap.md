@@ -1,6 +1,6 @@
 # W0-02 — Toolchain bootstrap
 
-**Status:** todo
+**Status:** done
 **Phase:** W0 — Day-1 setup
 **Depends on:** none
 **Flags:** none

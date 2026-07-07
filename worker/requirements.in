@@ -1,0 +1,3 @@
+# Intent file: direct dependencies only. Frozen transitive set lives in requirements.lock.
+# Version pinned per HANDOFF §4/§9 ("claude-agent-sdk — sürüm sabitlenir + lock dosyası").
+claude-agent-sdk==0.2.111
