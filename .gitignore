@@ -9,6 +9,7 @@
 __pycache__/
 *.pyc
 .venv/
+worker/.venv/
 *.egg-info/
 
 # Runtime / local state (brain.db lives outside the repo, but never commit any db)
