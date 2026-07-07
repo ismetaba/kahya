@@ -1,6 +1,6 @@
 # W0-01 — Memory repo seed
 
-**Status:** blocked-user
+**Status:** done
 **Phase:** W0 — Day-1 setup
 **Depends on:** none
 **Flags:** user-assist
