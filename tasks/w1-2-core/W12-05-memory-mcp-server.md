@@ -1,6 +1,6 @@
 # W12-05 — memory MCP server (kahyad-owned)
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-04
 **Flags:** none

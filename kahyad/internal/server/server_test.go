@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -1028,5 +1030,200 @@ func TestLogEndpointEmptyTraceIDIs400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// ---- W12-05: /v1/memory/search's for_injection extension ----
+
+// fakeEventLogger is a minimal EventLogger stand-in (W12-05) so server
+// tests can assert on ledgered events (policy_decision, hafiza_injected)
+// without a real brain.db.
+type fakeEventLogger struct {
+	events []loggedEvent
+}
+
+type loggedEvent struct {
+	traceID string
+	kind    string
+	payload map[string]any
+}
+
+func (f *fakeEventLogger) LogEvent(_ context.Context, traceID, kind string, payload map[string]any) error {
+	f.events = append(f.events, loggedEvent{traceID: traceID, kind: kind, payload: payload})
+	return nil
+}
+
+func (f *fakeEventLogger) eventsOfKind(kind string) []loggedEvent {
+	var out []loggedEvent
+	for _, e := range f.events {
+		if e.kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestMemorySearchForInjectionExcludesAgentDerived is the W12-05 quarantine
+// test (HANDOFF §5 memory #1, permanent regression coverage feeding
+// W78-03): a chunk from an agent_derived episode is present in the
+// results with for_injection:false, and absent with for_injection:true.
+func TestMemorySearchForInjectionExcludesAgentDerived(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 1, EpisodeID: 1, Path: "trusted.md", Seq: 0, Text: "guvenilir not", Score: 0.9, SourceTier: "user_asserted"},
+		{ChunkID: 2, EpisodeID: 2, Path: "inbox/agent.md", Seq: 0, Text: "ajan notu", Score: 0.5, SourceTier: "agent_derived"},
+	}}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	client := unixHTTPClient(socketPath)
+
+	// for_injection:false - both hits present.
+	resp := postMemorySearch(t, client, `{"query":"not","for_injection":false}`)
+	var bodyFalse struct {
+		Results []struct {
+			Path       string `json:"path"`
+			SourceTier string `json:"source_tier"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bodyFalse); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(bodyFalse.Results) != 2 {
+		t.Fatalf("for_injection:false results = %d, want 2 (agent_derived must be included)", len(bodyFalse.Results))
+	}
+
+	// for_injection:true - agent_derived excluded.
+	resp2 := postMemorySearch(t, client, `{"query":"not","for_injection":true,"task_id":"t1"}`)
+	var bodyTrue struct {
+		Results []struct {
+			Path       string `json:"path"`
+			SourceTier string `json:"source_tier"`
+		} `json:"results"`
+		HafizaBlock string `json:"hafiza_block"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&bodyTrue); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp2.Body.Close()
+	if len(bodyTrue.Results) != 1 || bodyTrue.Results[0].Path != "trusted.md" {
+		t.Fatalf("for_injection:true results = %+v, want only trusted.md", bodyTrue.Results)
+	}
+	for _, r := range bodyTrue.Results {
+		if r.SourceTier == "agent_derived" {
+			t.Errorf("agent_derived chunk leaked into for_injection:true results: %+v", r)
+		}
+	}
+	if !strings.HasPrefix(bodyTrue.HafizaBlock, "<hafiza>") {
+		t.Errorf("hafiza_block = %q, want it to start with <hafiza>", bodyTrue.HafizaBlock)
+	}
+	if strings.Contains(bodyTrue.HafizaBlock, "ajan notu") {
+		t.Errorf("hafiza_block contains agent_derived text: %q", bodyTrue.HafizaBlock)
+	}
+}
+
+// TestMemorySearchForInjectionLedgersHafizaInjected guards HANDOFF §5
+// safety #4 (forensic poisoning traceability): a for_injection:true call
+// ledgers a hafiza_injected event whose payload.block is byte-identical
+// to the HTTP response's hafiza_block, and whose block_sha256 matches
+// sha256(block).
+func TestMemorySearchForInjectionLedgersHafizaInjected(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 5, EpisodeID: 1, Path: "properties/kadikoy.md", Seq: 2, Text: "Kadıköy'de iki daire gezdik", Score: 0.9, SourceTier: "user_asserted"},
+	}}
+	led := &fakeEventLogger{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	srv.SetEventLogger(led)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `{"query":"kadikoy","for_injection":true,"task_id":"task-42","trace_id":"tid-hafiza"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		HafizaBlock string `json:"hafiza_block"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantBlock := "<hafiza>\n- [properties/kadikoy.md#2] Kadıköy'de iki daire gezdik\n</hafiza>"
+	if body.HafizaBlock != wantBlock {
+		t.Fatalf("hafiza_block = %q, want %q", body.HafizaBlock, wantBlock)
+	}
+
+	events := led.eventsOfKind("hafiza_injected")
+	if len(events) != 1 {
+		t.Fatalf("hafiza_injected events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.traceID != "tid-hafiza" {
+		t.Errorf("ledger trace_id = %q, want tid-hafiza", ev.traceID)
+	}
+	if ev.payload["task_id"] != "task-42" {
+		t.Errorf("ledger task_id = %v, want task-42", ev.payload["task_id"])
+	}
+	gotBlock, _ := ev.payload["block"].(string)
+	if gotBlock != body.HafizaBlock {
+		t.Fatalf("ledger payload.block = %q, want byte-identical to response hafiza_block %q", gotBlock, body.HafizaBlock)
+	}
+	sum := sha256.Sum256([]byte(body.HafizaBlock))
+	wantSHA := hex.EncodeToString(sum[:])
+	if ev.payload["block_sha256"] != wantSHA {
+		t.Errorf("ledger block_sha256 = %v, want %s", ev.payload["block_sha256"], wantSHA)
+	}
+}
+
+// TestMemorySearchForInjectionEmptyHitsIsEmptyBlock guards the renderer's
+// "empty results -> empty string" behavior end to end through the HTTP
+// handler (no hafiza_injected ledger row when there is nothing to inject).
+func TestMemorySearchForInjectionEmptyHitsIsEmptyBlock(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 1, EpisodeID: 1, Path: "only-agent.md", Seq: 0, Text: "ajan notu", Score: 0.5, SourceTier: "agent_derived"},
+	}}
+	led := &fakeEventLogger{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	srv.SetEventLogger(led)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `{"query":"ajan","for_injection":true,"task_id":"t1"}`)
+	defer resp.Body.Close()
+	var body struct {
+		Results     []any  `json:"results"`
+		HafizaBlock string `json:"hafiza_block"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Results) != 0 {
+		t.Errorf("results = %+v, want empty (only hit was agent_derived)", body.Results)
+	}
+	if body.HafizaBlock != "" {
+		t.Errorf("hafiza_block = %q, want empty string", body.HafizaBlock)
+	}
+	events := led.eventsOfKind("hafiza_injected")
+	if len(events) != 1 {
+		t.Fatalf("hafiza_injected events = %d, want 1 (still ledgered, even though block is empty)", len(events))
+	}
+	if events[0].payload["block"] != "" {
+		t.Errorf("ledger payload.block = %v, want empty string", events[0].payload["block"])
 	}
 }

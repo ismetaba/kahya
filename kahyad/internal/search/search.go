@@ -80,9 +80,13 @@ func DefaultConfig() Config {
 
 // Hit is one ranked chunk returned by Search.
 type Hit struct {
-	ChunkID    int64
-	EpisodeID  int64
-	Path       string
+	ChunkID   int64
+	EpisodeID int64
+	Path      string
+	// Seq is the chunk's 0-based sequence number within its episode
+	// (chunks.seq). W12-05's <hafiza> renderer cites hits as
+	// "[<path>#<seq>]", so Search must surface it alongside Path/Text.
+	Seq        int64
 	Text       string
 	Score      float64
 	SourceTier string
@@ -510,7 +514,7 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 		args[i] = id
 	}
 	query := fmt.Sprintf(`
-		SELECT c.id, c.episode_id, c.text, e.source_path, e.source_tier
+		SELECT c.id, c.episode_id, c.seq, c.text, e.source_path, e.source_tier
 		FROM chunks c
 		JOIN episodes e ON e.id = c.episode_id
 		WHERE c.id IN (%s)`, strings.Join(placeholders, ","))
@@ -525,7 +529,7 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 	for rows.Next() {
 		var h Hit
 		var path sql.NullString
-		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Text, &path, &h.SourceTier); err != nil {
+		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Seq, &h.Text, &path, &h.SourceTier); err != nil {
 			return nil, err
 		}
 		h.Path = path.String

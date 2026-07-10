@@ -268,6 +268,77 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 	return res, nil
 }
 
+// ReindexFile incrementally reindexes exactly ONE file (relPath, forward-
+// slash separated, relative to memoryDir) instead of walking the whole
+// corpus. It is used by the memory MCP write/forget tools (W12-05): a
+// memory_write/memory_forget call already knows precisely which file just
+// changed on disk, so re-walking the entire corpus (as the boot hook and
+// POST /v1/reindex do via Reindex) would be correct but wasteful.
+//
+// If the file no longer exists on disk (memory_forget's whole-file trash
+// path: the file was git-mv'd into .trash/, which walkFiles would never
+// descend into anyway since it skips dotdirs), any existing active
+// 'memory_file' episode at relPath is marked deleted (removeEpisode) - the
+// same outcome Reindex's removal-detection pass would eventually produce,
+// just applied immediately to the one file the caller cares about. If no
+// episode ever existed for relPath, this is a no-op (episodeID 0, nil
+// error) rather than an error - memory_forget(heading) on a path that
+// was never indexed is not this method's problem to diagnose.
+//
+// Shares idx.mu with Reindex (a blocking Lock, not TryLock): a
+// memory_write/memory_forget call should simply wait its turn behind an
+// in-progress corpus walk rather than fail outright the way a duplicate
+// POST /v1/reindex does - the two are different callers with different
+// expectations (a user-triggered full reindex race is a mistake worth
+// rejecting with 409; a single-file write is routine and should just
+// proceed once the walk finishes).
+func (idx *Indexer) ReindexFile(ctx context.Context, traceID, relPath string) (int64, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	log := idx.log.With(traceID)
+	relPath = filepath.ToSlash(relPath)
+	absPath := filepath.Join(idx.memoryDir, filepath.FromSlash(relPath))
+
+	if _, statErr := os.Stat(absPath); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return 0, fmt.Errorf("indexer: stat %s: %w", relPath, statErr)
+		}
+		existing, err := idx.q.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
+			Source:     sourceMemoryFile,
+			SourcePath: sql.NullString{String: relPath, Valid: true},
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("indexer: lookup episode for %s: %w", relPath, err)
+		}
+		if existing.Status == statusDeleted {
+			return existing.ID, nil
+		}
+		if err := idx.removeEpisode(ctx, existing.ID); err != nil {
+			return 0, fmt.Errorf("indexer: remove episode for %s: %w", relPath, err)
+		}
+		log.Info("reindex_file_removed", "path", relPath, "episode_id", existing.ID)
+		return existing.ID, nil
+	}
+
+	if _, _, err := idx.processFile(ctx, fileEntry{absPath: absPath, relPath: relPath}, false); err != nil {
+		return 0, fmt.Errorf("indexer: process %s: %w", relPath, err)
+	}
+
+	ep, err := idx.q.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
+		Source:     sourceMemoryFile,
+		SourcePath: sql.NullString{String: relPath, Valid: true},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("indexer: lookup episode for %s after write: %w", relPath, err)
+	}
+	log.Info("reindex_file_done", "path", relPath, "episode_id", ep.ID)
+	return ep.ID, nil
+}
+
 // walkFiles returns every *.md file under memoryDir, skipping .git/**,
 // .trash/**, any dotfile/dotdir (task spec step 1 - the general dotfile
 // rule already covers .git and .trash without naming them specially,

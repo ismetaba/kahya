@@ -98,9 +98,19 @@ func run() int {
 
 	// /v1/reindex (W12-04 step 5). idx is shared between this route and the
 	// boot-time incremental reindex kicked off just below, so its internal
-	// mutex correctly serializes the two against each other.
+	// mutex correctly serializes the two against each other. It is ALSO
+	// shared with /v1/mcp's memory_write/memory_forget tools (W12-05,
+	// SetMCPMemory below): a single Indexer instance means its mutex
+	// correctly serializes a full corpus reindex against a single-file
+	// ReindexFile call regardless of which route triggered which.
 	idx := indexer.New(st.DB(), cfg.MemoryDir, log)
 	srv.SetReindexer(idx)
+
+	// POST /v1/mcp (W12-05): the append-only events ledger (policy_decision,
+	// hafiza_injected, and - passed through to mcp/memory.Server - its own
+	// memory_write/memory_forget rows) and the memory tools themselves.
+	srv.SetEventLogger(st)
+	srv.SetMCPMemory(cfg.MemoryDir, idx)
 
 	// ctx is created here (BEFORE the boot reindex goroutine below is
 	// spawned, not after) so that goroutine can share the SAME

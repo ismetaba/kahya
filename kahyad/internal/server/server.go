@@ -7,6 +7,8 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
+	"kahya/mcp/memory"
 )
 
 // ErrAlreadyRunning is returned by Prepare/Run when a live kahyad instance
@@ -71,6 +74,13 @@ type Server struct {
 	db      DBHealth
 	search  Searcher
 	reindex Reindexer
+
+	// eventLogger, mcpMemoryDir, mcpIndexer wire POST /v1/mcp and
+	// /v1/memory/search's for_injection ledgering (W12-05) - see
+	// mcp.go's SetEventLogger/SetMCPMemory doc comments.
+	eventLogger  EventLogger
+	mcpMemoryDir string
+	mcpIndexer   memory.Indexer
 
 	ln   net.Listener
 	http *http.Server
@@ -139,6 +149,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/v1/reindex", s.handleReindex)
 	mux.HandleFunc("/v1/log", s.handleLog)
+	mux.Handle("/v1/mcp", s.buildMCPHandler())
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -352,6 +363,14 @@ type memorySearchRequest struct {
 	Query   string `json:"query"`
 	K       int    `json:"k"`
 	TraceID string `json:"trace_id"`
+	// ForInjection and TaskID are W12-05 step 1's extension: when
+	// ForInjection is true, the response additionally renders a <hafiza>
+	// injection block (excluding 'agent_derived' quarantined episodes,
+	// HANDOFF §5 memory #1) and ledgers it (kind='hafiza_injected',
+	// HANDOFF §5 safety #4). TaskID is carried into that ledger payload
+	// only - it does not affect ranking/search itself.
+	ForInjection bool   `json:"for_injection"`
+	TaskID       string `json:"task_id"`
 }
 
 type memorySearchResultItem struct {
@@ -365,6 +384,12 @@ type memorySearchResultItem struct {
 
 type memorySearchResponse struct {
 	Results []memorySearchResultItem `json:"results"`
+	// HafizaBlock is only populated when the request set for_injection:true
+	// (W12-05 step 1d). Its bytes are exactly what was ledgered as the
+	// hafiza_injected event's payload.block (safety #4 forensic
+	// traceability: the injected block and the ledgered block must be
+	// byte-identical, sha256-verifiable).
+	HafizaBlock string `json:"hafiza_block,omitempty"`
 }
 
 type errorResponse struct {
@@ -407,8 +432,25 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := memorySearchResponse{Results: make([]memorySearchResultItem, 0, len(hits))}
-	for _, h := range hits {
+	// W12-05 step 1a: for_injection=true excludes 'agent_derived' episodes
+	// (HANDOFF §5 memory #1 quarantine - the other four source tiers stay
+	// injectable in W1-2; per-fact confidence gating arrives with W5-04).
+	// This filters BOTH the returned results AND what the renderer/ledger
+	// below ever sees - "absent with for_injection:true" means absent from
+	// the response entirely, not merely excluded from hafiza_block.
+	filtered := hits
+	if req.ForInjection {
+		filtered = make([]search.Hit, 0, len(hits))
+		for _, h := range hits {
+			if h.SourceTier == quarantinedSourceTier {
+				continue
+			}
+			filtered = append(filtered, h)
+		}
+	}
+
+	resp := memorySearchResponse{Results: make([]memorySearchResultItem, 0, len(filtered))}
+	for _, h := range filtered {
 		resp.Results = append(resp.Results, memorySearchResultItem{
 			ChunkID:    h.ChunkID,
 			EpisodeID:  h.EpisodeID,
@@ -418,10 +460,46 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 			SourceTier: h.SourceTier,
 		})
 	}
+
+	if req.ForInjection {
+		memHits := make([]memory.Hit, len(filtered))
+		for i, h := range filtered {
+			memHits[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
+		}
+		block, kept := memory.RenderKept(memHits, memory.DefaultTopK)
+		resp.HafizaBlock = block
+
+		// W12-05 step 1c/HANDOFF §5 safety #4: ledger the EXACT injected
+		// bytes (forensic poisoning traceability) - chunk_ids is only the
+		// chunks that actually survived RenderKept's top-k/budget trim,
+		// never the broader filtered candidate pool.
+		if s.eventLogger != nil {
+			chunkIDs := make([]int64, len(kept))
+			for i, h := range kept {
+				chunkIDs[i] = h.ChunkID
+			}
+			sum := sha256.Sum256([]byte(block))
+			payload := map[string]any{
+				"task_id":      req.TaskID,
+				"chunk_ids":    chunkIDs,
+				"block_sha256": hex.EncodeToString(sum[:]),
+				"block":        block,
+			}
+			if err := s.eventLogger.LogEvent(r.Context(), traceID, "hafiza_injected", payload); err != nil {
+				s.log.With(traceID).Warn("hafiza_injected_ledger_error", "err", err.Error())
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }
+
+// quarantinedSourceTier is the one source_tier for_injection=true excludes
+// (HANDOFF §5 memory #1, verbatim: "Ajan-turevi karantinada, kullanici
+// onaylayana dek profil kartindan/enjeksiyondan haric").
+const quarantinedSourceTier = "agent_derived"
 
 // reindexRequest is POST /v1/reindex's request body (W12-04 step 5).
 // {"full": false} is the default (an empty/omitted body also defaults

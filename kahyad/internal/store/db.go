@@ -10,9 +10,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/mattn/go-sqlite3" // registers the "sqlite3" driver
@@ -214,6 +216,33 @@ func (s *Store) Health(ctx context.Context) (ok bool, schemaVersion int64, err e
 		return false, s.schemaVersion, err
 	}
 	return true, s.schemaVersion, nil
+}
+
+// LogEvent appends one row to the append-only events ledger (HANDOFF §5
+// safety #4). payload is JSON-marshaled here so every caller (W12-05's MCP
+// gate/write/forget/injection ledgering, and any future caller) shares one
+// marshaling/timestamp convention instead of hand-building the JSON string
+// itself - mirroring how kahyad/internal/indexer.Indexer.Reindex already
+// marshals its own ledger payload inline. ts and created_at both use the
+// current UTC time in RFC3339Nano, matching every other ledger writer in
+// this codebase.
+func (s *Store) LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("store: marshal event payload (kind=%s): %w", kind, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = s.Queries.InsertEvent(ctx, sqlcgen.InsertEventParams{
+		TraceID:   traceID,
+		Ts:        now,
+		Kind:      kind,
+		Payload:   string(b),
+		CreatedAt: now,
+	})
+	if err != nil {
+		return fmt.Errorf("store: insert event (kind=%s): %w", kind, err)
+	}
+	return nil
 }
 
 // Close checkpoints the WAL into the main database file (TRUNCATE mode, so

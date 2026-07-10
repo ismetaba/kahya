@@ -21,6 +21,7 @@ build:
 	mkdir -p bin
 	go build -tags $(GOTAGS) -ldflags "-X kahya/kahyad/internal/buildinfo.Version=$(KAHYA_VERSION)" -o bin/kahyad ./kahyad
 	go build -tags $(GOTAGS) -o bin/kahya ./kahyad/cmd/kahya
+	go build -tags $(GOTAGS) -o bin/kahya-mcp ./kahyad/cmd/kahya-mcp
 venv:
 	test -d $(VENV) || python3 -m venv $(VENV)
 	$(PY) -m pip install --quiet -r worker/requirements.lock
