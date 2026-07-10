@@ -16,13 +16,13 @@ from typing import Any
 
 
 class UDSHTTPError(Exception):
-    """Raised for ANY failure translating a UDS HTTP call: a
-    connect/read timeout, a refused/broken connection, a non-200 HTTP
-    status, or a response body that is not valid JSON. Every caller in
-    this package treats every one of these identically - see each
-    caller's own doc comment for whether that means "fail closed" (
-    ``hooks.make_can_use_tool``) or "continue without enrichment" (
-    ``hooks.make_user_prompt_submit_hook``)."""
+    """Raised for ANY failure translating a UDS HTTP call: a payload that
+    is not JSON-serializable, a connect/read timeout, a refused/broken
+    connection, a non-200 HTTP status, or a response body that is not
+    valid JSON. Every caller in this package treats every one of these
+    identically - see each caller's own doc comment for whether that means
+    "fail closed" (``hooks.make_can_use_tool``) or "continue without
+    enrichment" (``hooks.make_user_prompt_submit_hook``)."""
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -55,9 +55,20 @@ def post_json(socket_path: str, path: str, payload: dict[str, Any], timeout: flo
     """POSTs ``payload`` (JSON-encoded) to ``path`` over the ``AF_UNIX``
     socket at ``socket_path``, with the given timeout budget, and returns
     the parsed JSON response body. Raises `UDSHTTPError` on any failure:
-    connect/read timeout, connection refused/reset, an HTTP status other
-    than 200, or a body that does not parse as JSON."""
-    body = json.dumps(payload).encode("utf-8")
+    ``payload`` not JSON-serializable, connect/read timeout, connection
+    refused/reset, an HTTP status other than 200, or a response body that
+    does not parse as JSON."""
+    try:
+        # MINOR 6 fix: json.dumps must be inside the same error handling as
+        # the request itself - a non-JSON-serializable tool_input (e.g. a
+        # `set`) previously raised an uncaught TypeError here, escaping
+        # every caller's `except UDSHTTPError` fail-closed handling
+        # (hooks.make_can_use_tool) instead of becoming one more reason to
+        # deny.
+        body = json.dumps(payload).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        raise UDSHTTPError(f"payload is not JSON-serializable: {e}") from e
+
     conn = _UnixHTTPConnection(socket_path, timeout)
     try:
         try:

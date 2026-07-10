@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -192,6 +193,18 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 
 	cmd := exec.Command(cfg.Cmd[0], cfg.Cmd[1:]...)
 	cmd.Env = BuildEnv(cfg, env)
+	// BLOCKER 1 fix: also set cmd.Dir to the worker directory (belt-and-
+	// braces alongside BuildEnv's PYTHONPATH addition below - see
+	// pythonWorkerDir's doc comment) so `python -m kahya_worker` can
+	// actually import the package regardless of kahyad's own cwd (repo
+	// root under `make run-daemon`, "/" under launchd). A no-op ("")
+	// leaves cmd.Dir at its zero value (the child inherits kahyad's own
+	// cwd), which is exactly today's behavior for cfg.Cmd values that
+	// don't look like the real venv layout (e.g. this package's own
+	// testdata/*.py fake scripts).
+	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
+		cmd.Dir = wd
+	}
 	// New process group, id == this process's own pid (Pgid left at its
 	// zero value): killGroup below can then target -pid to reach every
 	// process in the group, including any grandchildren the worker itself
@@ -435,6 +448,36 @@ func filterSecretEnv(in []string) []string {
 	return out
 }
 
+// pythonWorkerDir derives the directory that must be on PYTHONPATH (and,
+// per Run's own use of this function, is also used as cmd.Dir) for
+// `python -m kahya_worker` to actually import the kahya_worker package
+// (BLOCKER 1 fix): the parent of argv[0]'s own ".venv" directory. In
+// production cfg.Cmd[0] is "<repo>/worker/.venv/bin/python"
+// (config.defaultWorkerCmd derives that same "<repo>/worker" path
+// independently from the running kahyad executable's own location; this
+// function re-derives it from argv[0] instead purely so package spawn does
+// not need to import package config) - two filepath.Dir calls strip
+// "bin/python", and the result is "<repo>/worker" only if that directory
+// really is named ".venv" (a sanity check, not merely stripping two path
+// components blindly).
+//
+// Returns "" - a deliberate no-op - when cfg.Cmd is empty or argv[0] does
+// not sit inside a ".../.venv/bin/..." layout at all (e.g. this package's
+// own tests, whose cfg.Cmd[0] is a bare "python3" or a testdata/*.py fake
+// script): BuildEnv/Run leave PYTHONPATH/cmd.Dir untouched in that case,
+// so no existing test's assumptions about cfg.Cmd shift underneath it.
+func pythonWorkerDir(cmd []string) string {
+	if len(cmd) == 0 {
+		return ""
+	}
+	binDir := filepath.Dir(cmd[0])  // .../worker/.venv/bin
+	venvDir := filepath.Dir(binDir) // .../worker/.venv
+	if filepath.Base(venvDir) != ".venv" {
+		return ""
+	}
+	return filepath.Dir(venvDir) // .../worker
+}
+
 // BuildEnv assembles the worker process's environment (HANDOFF §4 IPC ⚑
 // step 2, docs/ipc.md): the parent's own environment (PATH, HOME, etc. -
 // W1-2's worker is a plain subprocess, not a network-isolated container),
@@ -442,7 +485,12 @@ func filterSecretEnv(in []string) []string {
 // secret-bearing var (BLOCKER 1 fix - see secretEnvDenylist's doc comment),
 // plus the eight KAHYA_*/ANTHROPIC_* variables the IPC contract fixes (six
 // from W12-07/W12-08, plus KAHYA_MCP_BRIDGE/KAHYA_CREDENTIAL_MODE added in
-// W12-09 for the real Python worker).
+// W12-09 for the real Python worker), plus - when cfg.Cmd points at the
+// real venv layout (pythonWorkerDir) - a PYTHONPATH entry that PREPENDS
+// that directory ahead of any inherited PYTHONPATH value, so
+// `python -m kahya_worker` can import the package regardless of kahyad's
+// own cwd (this is the other BLOCKER 1 fix, alongside Run's cmd.Dir - see
+// pythonWorkerDir's own doc comment for why both are set).
 func BuildEnv(cfg Config, env Envelope) []string {
 	base := filterSecretEnv(os.Environ())
 	extra := []string{
@@ -454,6 +502,13 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"ANTHROPIC_API_KEY=" + cfg.APIKey,
 		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
 		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
+	}
+	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
+		pythonPath := wd
+		if existing := os.Getenv("PYTHONPATH"); existing != "" {
+			pythonPath = wd + string(os.PathListSeparator) + existing
+		}
+		extra = append(extra, "PYTHONPATH="+pythonPath)
 	}
 	return append(base, extra...)
 }

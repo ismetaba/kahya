@@ -311,20 +311,19 @@ class TestStdoutProtocolAndSession(unittest.TestCase):
 
 
 class TestBuildOptions(unittest.TestCase):
-    def test_allowed_tools_and_mcp_server_shape(self) -> None:
+    def test_allowed_tools_left_empty_and_mcp_server_shape(self) -> None:
+        """BLOCKER 2 fix: allowed_tools must NOT whole-tool-allow the 3
+        memory tools (or anything else) - doing so auto-approves them
+        before can_use_tool is ever consulted. See
+        test_can_use_tool_is_not_shadowed_for_real_built_options below for
+        the regression that proves this against the SDK's own shadowing
+        rule, not just against our own expectation of the value."""
         from kahya_worker.envelope import parse_envelope
 
         env = parse_envelope(json.dumps(VALID_ENVELOPE).encode("utf-8"))
         options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
 
-        self.assertEqual(
-            options.allowed_tools,
-            [
-                "mcp__kahya_memory__memory_search",
-                "mcp__kahya_memory__memory_write",
-                "mcp__kahya_memory__memory_forget",
-            ],
-        )
+        self.assertEqual(options.allowed_tools, [])
         self.assertEqual(options.model, "claude-sonnet-5")
         self.assertEqual(options.permission_mode, "default")
         self.assertIsNotNone(options.can_use_tool)
@@ -332,6 +331,100 @@ class TestBuildOptions(unittest.TestCase):
         self.assertEqual(mcp_cfg["type"], "stdio")
         self.assertEqual(mcp_cfg["command"], "/repo/bin/kahya-mcp")
         self.assertEqual(mcp_cfg["env"]["KAHYA_SOCKET"], "/tmp/k.sock")
+
+    def test_can_use_tool_is_not_shadowed_for_real_built_options(self) -> None:
+        """BLOCKER 2 regression: for the REAL ClaudeAgentOptions this
+        worker builds, the pinned SDK's own
+        `claude_agent_sdk.types._get_can_use_tool_shadowed_warning` helper
+        (the exact function the SDK itself uses to decide whether
+        can_use_tool would silently never fire) must report NO shadowing -
+        i.e. can_use_tool truly is consulted for every tool call, not
+        bypassed by a whole-tool allowed_tools entry or by
+        permission_mode="bypassPermissions"."""
+        from claude_agent_sdk.types import _get_can_use_tool_shadowed_warning
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(VALID_ENVELOPE).encode("utf-8"))
+        options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+
+        warning = _get_can_use_tool_shadowed_warning(options.permission_mode, options.allowed_tools)
+        self.assertFalse(warning, f"can_use_tool is shadowed and would never fire: {warning!r}")
+
+
+class TestSessionIDCapture(unittest.TestCase):
+    """MINOR 4 fix: the init SystemMessage carries session_id inside
+    `.data`, not as a top-level attribute - _run_session must fall back to
+    `message.data["session_id"]` so the very first message of the stream
+    can already surface the session id."""
+
+    def test_system_message_init_session_id_captured_from_data(self) -> None:
+        from claude_agent_sdk import SystemMessage
+
+        messages = [
+            SystemMessage(subtype="init", data={"session_id": "sess_x"}),
+            ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=1, session_id="sess_x",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=messages)
+            )
+
+        self.assertEqual(code, 0)
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(lines[0], {"type": "session", "session_id": "sess_x"})
+
+
+class TestRealKeyCaseInsensitivity(unittest.TestCase):
+    """BLOCKER 3 fix: the real-key scan must catch SK-ANT-.../Sk-Ant-...
+    variants, not just the exact lowercase "sk-ant-" needle, in EITHER
+    credential mode."""
+
+    def test_uppercase_titlecase_mixedcase_variants_refuse_to_start(self) -> None:
+        variants = [
+            "SK-ANT-UPPERCASEKEY00000000000000",
+            "Sk-Ant-Titlecasekey00000000000000",
+            "sK-aNt-MiXeDcAsEkEy00000000000000",
+        ]
+        for credential_mode in ("keychain", "passthrough"):
+            for variant in variants:
+                with self.subTest(credential_mode=credential_mode, variant=variant):
+                    with tempfile.TemporaryDirectory() as log_dir:
+                        env = base_env(
+                            log_dir,
+                            KAHYA_CREDENTIAL_MODE=credential_mode,
+                            SOME_OTHER_TOOL_VAR=variant,
+                        )
+                        code, out = run_main_with(dict(VALID_ENVELOPE), env)
+                        lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+                    self.assertTrue(any(l.get("event") == "real_key_in_env" for l in lines))
+
+
+class TestTraceIDLeakRedaction(unittest.TestCase):
+    """MINOR 7 fix: a leaked real key sitting in KAHYA_TRACE_ID itself must
+    never be adopted as the JSONL logger's own trace_id - every emitted
+    line (including the leak report) must carry a safe placeholder
+    instead."""
+
+    def test_leaked_key_in_trace_id_itself_is_not_logged_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = base_env(log_dir, KAHYA_TRACE_ID="sk-ant-shouldneverbeloggedverbatim")
+            code, out = run_main_with(dict(VALID_ENVELOPE), env)
+            lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertTrue(len(lines) >= 1)
+        for line in lines:
+            self.assertNotEqual(line.get("trace_id"), "sk-ant-shouldneverbeloggedverbatim")
+            self.assertNotIn("sk-ant-", line.get("trace_id", ""))
+        leak_line = next(l for l in lines if l.get("event") == "real_key_in_env")
+        self.assertEqual(leak_line.get("var"), "KAHYA_TRACE_ID")
 
 
 if __name__ == "__main__":

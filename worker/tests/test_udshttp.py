@@ -46,6 +46,16 @@ class TestPostJSON(unittest.TestCase):
             resp = post_json(sock, "/v1/memory/search", {"query": "Kadıköy'de iki daire gezdik."}, timeout=2.0)
         self.assertEqual(resp, {"echo": True})
 
+    def test_non_serializable_payload_raises_udshttperror(self) -> None:
+        """MINOR 6 fix: json.dumps(payload) must be inside post_json's own
+        error handling - a non-JSON-serializable payload (e.g. containing
+        a `set`) must raise UDSHTTPError, never let the underlying
+        TypeError/ValueError escape uncaught. No socket listener is needed:
+        serialization is attempted before any connection is opened."""
+        missing_sock = os.path.join(self._tmp.name, "no-such.sock")
+        with self.assertRaises(UDSHTTPError):
+            post_json(missing_sock, "/policy/check", {"values": {1, 2, 3}}, timeout=2.0)
+
     def test_non_200_status_raises(self) -> None:
         body = json.dumps({"error": "boom"}).encode("utf-8")
         with UnixHTTPFixture(self._tmp.name, respond_json(500, body)) as sock:

@@ -45,10 +45,22 @@ from .system_prompt import SYSTEM_PROMPT
 MSG_ENVELOPE_INVALID = "Görev zarfı geçersiz."
 MSG_MODEL_CALL_FAILED_FMT = "Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace {trace_id}"
 
-# EXACTLY these three MCP tools - no SDK built-in file/exec tools
-# (Read/Glob/Grep/Bash/...) in W1-2 (task spec step 2). Keep this list AND
-# system_prompt.SYSTEM_PROMPT byte-identical across every task/change -
-# together they are the §4 ⚑ prompt-cache discipline's frozen prefix.
+# Safe placeholder trace_id used ONLY when the real-key leak check
+# (_check_real_key_leak) fires - see MINOR 7 fix in main() below. Never the
+# tainted KAHYA_TRACE_ID value itself.
+_SAFE_TRACE_ID_PLACEHOLDER = "redacted"
+
+# The exact 3 MCP tool names this worker's "kahya_memory" MCP server
+# exposes (kahyad's own /policy/check policy table keys off these same
+# SDK-prefixed names - see hooks.make_can_use_tool). Kept as documentation/
+# cross-check reference only as of the BLOCKER 2 fix in _build_options
+# below: this list is DELIBERATELY NOT passed to
+# ClaudeAgentOptions.allowed_tools anymore. See _build_options's own
+# comment for why - the short version is that the pinned SDK
+# (claude-agent-sdk==0.2.111) whole-tool-allows any bare tool name listed
+# in allowed_tools, auto-approving it before can_use_tool is ever
+# consulted, which would make the mandated fail-closed policy gate
+# (HANDOFF §5 ⚑) dead code for exactly these 3 tools.
 ALLOWED_TOOLS = [
     "mcp__kahya_memory__memory_search",
     "mcp__kahya_memory__memory_write",
@@ -97,11 +109,13 @@ def _print_protocol_line(obj: dict[str, Any]) -> None:
 
 def _check_real_key_leak() -> str | None:
     """Returns the name of the FIRST environment variable whose value
-    looks like a real Anthropic API key (contains "sk-ant-"), or None if
-    none do. Checked regardless of credential_mode (see module doc
-    comment) - "API anahtarı worker'a verilmez" holds in both modes."""
+    looks like a real Anthropic API key (contains "sk-ant-", checked
+    CASE-INSENSITIVELY so SK-ANT-.../Sk-Ant-... variants are caught too -
+    BLOCKER 3 fix), or None if none do. Checked regardless of
+    credential_mode (see module doc comment) - "API anahtarı worker'a
+    verilmez" holds in both modes."""
     for name, value in os.environ.items():
-        if _REAL_KEY_NEEDLE in value:
+        if _REAL_KEY_NEEDLE in value.lower():
             return name
     return None
 
@@ -134,20 +148,19 @@ def _fail_envelope_invalid(detail: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     raw = sys.stdin.buffer.read()
 
-    try:
-        envelope = parse_envelope(raw)
-    except EnvelopeError as e:
-        # KAHYA_LOG_DIR/KAHYA_TRACE_ID are plain env vars spawn always
-        # sets regardless of the envelope's own (possibly invalid)
-        # content (docs/ipc.md §3), so logging can be configured even
-        # when the envelope itself failed to parse.
-        wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), os.environ.get("KAHYA_TRACE_ID", ""))
-        return _fail_envelope_invalid(str(e))
-
-    wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), os.environ.get("KAHYA_TRACE_ID", envelope.trace_id))
-
+    # MINOR 7 fix: scan for a leaked real key BEFORE anything below ever
+    # configures the JSONL logger with a trace_id sourced from the
+    # environment (KAHYA_TRACE_ID, adopted a few lines down and in the
+    # EnvelopeError branch below) - otherwise a leaked sk-ant-* value
+    # sitting in KAHYA_TRACE_ID itself would be written into EVERY
+    # subsequent worker.jsonl line, INCLUDING the very leak report meant to
+    # flag it. Runs even before envelope parsing, so both the success path
+    # and the EnvelopeError path below are covered by the same guard.
     leaked_var = _check_real_key_leak()
     if leaked_var is not None:
+        # Configure with a SAFE placeholder trace_id, never the (possibly
+        # tainted) KAHYA_TRACE_ID env value.
+        wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), _SAFE_TRACE_ID_PLACEHOLDER)
         # Belt-and-braces security invariant violation - should never
         # happen in production. No dedicated Turkish stdout message is
         # defined for this case (unlike step 1/step 5's messages); exit 2
@@ -157,6 +170,19 @@ def main(argv: list[str] | None = None) -> int:
         # for a should-never-happen internal invariant failure.
         wlog.log("error", "real_key_in_env", var=leaked_var)
         return 2
+
+    try:
+        envelope = parse_envelope(raw)
+    except EnvelopeError as e:
+        # KAHYA_LOG_DIR/KAHYA_TRACE_ID are plain env vars spawn always
+        # sets regardless of the envelope's own (possibly invalid)
+        # content (docs/ipc.md §3), so logging can be configured even
+        # when the envelope itself failed to parse. The real-key leak
+        # check above already ran, so adopting KAHYA_TRACE_ID here is safe.
+        wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), os.environ.get("KAHYA_TRACE_ID", ""))
+        return _fail_envelope_invalid(str(e))
+
+    wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), os.environ.get("KAHYA_TRACE_ID", envelope.trace_id))
 
     credential_mode = os.environ.get("KAHYA_CREDENTIAL_MODE") or _CREDENTIAL_MODE_KEYCHAIN
     env_err = _check_credential_env(credential_mode)
@@ -189,7 +215,29 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
                 },
             },
         },
-        allowed_tools=list(ALLOWED_TOOLS),
+        # --- BLOCKER 2 FIX (deviation from this task's own step 2 note,
+        # recorded in tasks/w1-2-core/W12-09-python-worker-harness.md) ---
+        # The task file's step 2 literally says allowed_tools = exactly
+        # ALLOWED_TOOLS (the 3 memory tools). Verified against the pinned
+        # SDK (claude_agent_sdk==0.2.111)'s own
+        # types._whole_tool_allowed/_get_can_use_tool_shadowed_warning: a
+        # bare tool-name entry in allowed_tools (no "(...)" specifier)
+        # whole-tool-allows it, auto-approving every call BEFORE
+        # can_use_tool is ever consulted - so passing ALLOWED_TOOLS here
+        # would make can_use_tool (and the fail-closed /policy/check gate +
+        # event=tool_gate logging it drives - HANDOFF §5 ⚑) dead code for
+        # exactly the 3 tools this worker actually calls. Deliberately left
+        # EMPTY (the SDK default) instead: with permission_mode="default"
+        # below, every tool call - the 3 memory tools AND any SDK built-in
+        # file/exec tool the model might attempt - is routed through
+        # can_use_tool, which denies anything that is not memory_search per
+        # kahyad's interim /policy/check table. Built-in tools are
+        # therefore still effectively unavailable, just enforced by the
+        # policy gate rather than by omission from allowed_tools. See
+        # worker/tests/test_main.py::TestBuildOptions for the regression
+        # that proves types._get_can_use_tool_shadowed_warning returns
+        # falsy for these exact options (i.e. can_use_tool truly fires).
+        allowed_tools=[],
         # Default permission_mode so can_use_tool actually fires (task
         # spec step 2) - never "bypassPermissions"/"acceptEdits", which
         # would shadow it.
@@ -222,7 +270,20 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
 
             session_emitted = False
             async for message in client.receive_response():
+                # MINOR 4 fix: the init SystemMessage (subtype="init") has
+                # no top-level session_id attribute - the pinned SDK's
+                # message_parser puts it inside message.data instead (see
+                # claude_agent_sdk._internal.message_parser's generic
+                # SystemMessage branch: `SystemMessage(subtype=subtype,
+                # data=data)`). Fall back to message.data["session_id"] so
+                # the FIRST message of the stream (the init message) can
+                # already surface the session id, not just a later one that
+                # happens to carry it as a real attribute.
                 session_id = getattr(message, "session_id", None)
+                if session_id is None:
+                    data = getattr(message, "data", None)
+                    if isinstance(data, dict):
+                        session_id = data.get("session_id")
                 if not session_emitted and session_id:
                     _print_protocol_line({"type": "session", "session_id": session_id})
                     session_emitted = True

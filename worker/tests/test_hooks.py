@@ -103,6 +103,34 @@ class TestCanUseTool(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(l.get("event") == "tool_gate" and l.get("decision") == "allow" for l in lines))
         self.assertTrue(all(l.get("trace_id") == "trace-policy-test" for l in lines))
 
+    async def test_allow_with_error_field_is_self_contradictory_denies_fail_closed(self) -> None:
+        """MINOR 5 fix: a 200 body of {"decision":"allow","error":"..."}
+        is self-contradictory - kahyad reporting an "error" alongside
+        "allow" means something went wrong forming the response, not that
+        it deliberately allowed the call. Must be treated exactly like any
+        other malformed response: fail-closed DENY, never a trusting
+        ALLOW."""
+        body = json.dumps({"decision": "allow", "error": "internal inconsistency"}).encode("utf-8")
+        with UnixHTTPFixture(self._tmp.name, respond_json(200, body)) as sock:
+            can_use_tool = make_can_use_tool(sock, "t_1", "trace-1", None)
+            result = await can_use_tool("mcp__kahya_memory__memory_search", {"query": "x"}, {})
+
+        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
+
+    async def test_non_serializable_tool_input_denies_fail_closed_without_raising(self) -> None:
+        """MINOR 6 fix: a non-JSON-serializable tool_input (e.g. a `set`)
+        must not let a TypeError escape can_use_tool - it must surface as
+        one more fail-closed deny, exactly like any other post_json
+        failure."""
+        can_use_tool = make_can_use_tool("/nonexistent.sock", "t_1", "trace-1", None)
+        # A `set` is never JSON-serializable - json.dumps would otherwise
+        # raise a TypeError straight out of udshttp.post_json.
+        result = await can_use_tool("mcp__kahya_memory__memory_write", {"values": {1, 2, 3}}, {})
+
+        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
+
     async def test_deny_with_server_reason(self) -> None:
         reason = "W3 politika altyapısı gelene dek yalnız hafıza araması (memory_search) açık."
         body = json.dumps({"decision": "deny", "reason": reason, "rule": "interim-static-v1"}).encode("utf-8")

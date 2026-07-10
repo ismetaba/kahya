@@ -3,7 +3,9 @@ package spawn
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -455,6 +457,63 @@ func TestBuildEnvIncludesMCPBridgeAndCredentialMode(t *testing.T) {
 	}
 }
 
+// TestBuildEnvSetsPythonPathForRealVenvLayout is BLOCKER 1's BuildEnv-level
+// unit test: when cfg.Cmd[0] sits inside a real ".venv/bin/..." layout
+// (the shape config.defaultWorkerCmd produces), BuildEnv must add a
+// PYTHONPATH entry pointing at the venv's parent directory (the one
+// containing the kahya_worker package - the directory `python -m
+// kahya_worker` needs on its import path), PREPENDED ahead of any
+// inherited PYTHONPATH value rather than replacing it outright.
+func TestBuildEnvSetsPythonPathForRealVenvLayout(t *testing.T) {
+	t.Setenv("PYTHONPATH", "/inherited/from/parent")
+
+	cfg := Config{
+		Cmd:              []string{"/repo/worker/.venv/bin/python", "-m", "kahya_worker"},
+		Socket:           "/s.sock",
+		LogDir:           "/logs",
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-abc",
+	}
+	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
+
+	got := BuildEnv(cfg, env)
+	resolved := map[string]string{}
+	for _, kv := range got {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		resolved[parts[0]] = parts[1]
+	}
+
+	want := "/repo/worker" + string(os.PathListSeparator) + "/inherited/from/parent"
+	if got := resolved["PYTHONPATH"]; got != want {
+		t.Errorf("PYTHONPATH = %q, want %q (worker dir prepended ahead of the inherited value)", got, want)
+	}
+}
+
+// TestBuildEnvLeavesPythonPathAloneForNonVenvCmd covers the negative case:
+// cfg.Cmd values that don't look like the real venv layout (this
+// package's own fake testdata scripts, exercised by every other Run test
+// in this file) must not get a synthesized PYTHONPATH at all.
+func TestBuildEnvLeavesPythonPathAloneForNonVenvCmd(t *testing.T) {
+	cfg := Config{
+		Cmd:              []string{"python3", "testdata/echo_worker.py"},
+		Socket:           "/s.sock",
+		LogDir:           "/logs",
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-abc",
+	}
+	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
+
+	got := BuildEnv(cfg, env)
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "PYTHONPATH=") {
+			t.Errorf("BuildEnv set %q for a non-venv cfg.Cmd, want no PYTHONPATH override", kv)
+		}
+	}
+}
+
 // TestBuildEnvFiltersSecretBearingParentEnvVars is BLOCKER 1's regression
 // test: KAHYA_ANTHROPIC_KEY_OVERRIDE (kahyad/internal/anthproxy's dev/CI
 // substitute for a real Keychain read) and any pre-existing
@@ -495,6 +554,89 @@ func TestBuildEnvFiltersSecretBearingParentEnvVars(t *testing.T) {
 	}
 	if got := resolved["ANTHROPIC_API_KEY"]; got != cfg.APIKey {
 		t.Errorf("ANTHROPIC_API_KEY = %q, want exactly the per-task token %q (not any parent-process override)", got, cfg.APIKey)
+	}
+}
+
+// TestRunSpawnsRealDefaultWorkerCommandBlocker1 is BLOCKER 1's regression
+// test: it runs the ACTUAL default worker command
+// ("<repo>/worker/.venv/bin/python -m kahya_worker") via Run against a
+// minimal INVALID envelope (a blank prompt - the worker's own
+// kahya_worker.envelope.parse_envelope rejects this) so no cloud call is
+// ever attempted, and asserts the worker process actually LOADS (no
+// ModuleNotFoundError) and returns the documented invalid-envelope
+// outcome: stdout protocol error line
+// {"type":"error","message":"Görev zarfı geçersiz."} + exit 2.
+//
+// Before BLOCKER 1's fix, kahyad never set cmd.Dir/PYTHONPATH, so
+// `python -m kahya_worker` failed with ModuleNotFoundError from this
+// package's own working directory (kahyad/internal/spawn, not
+// "<repo>/worker" - go test's cwd is always the package source dir). That
+// failure mode is silent at the Outcome level: the worker crashes before
+// ever writing a stdout protocol line, so Run reports StatusError with an
+// EMPTY ErrMsg (StatusError's own doc comment: "the process exited...
+// without ever sending a terminal result/error line") - indistinguishable
+// from StatusError by status alone. This test asserts the exact ErrMsg
+// too, so it only passes when the worker truly loaded and validated the
+// envelope, not merely when it crashed some other way.
+//
+// Skips cleanly if worker/.venv/bin/python does not exist (e.g. CI that
+// never ran `make venv`), so this test never blocks a checkout that
+// hasn't built the Python venv.
+func TestRunSpawnsRealDefaultWorkerCommandBlocker1(t *testing.T) {
+	// This test file's package directory is kahyad/internal/spawn; go
+	// test's working directory is always the package's own source
+	// directory, so the repo root is three levels up.
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	pythonPath := filepath.Join(repoRoot, "worker", ".venv", "bin", "python")
+	if _, statErr := os.Stat(pythonPath); statErr != nil {
+		t.Skipf("worker/.venv/bin/python not present (%v) - run `make venv` to exercise this test", statErr)
+	}
+
+	cfg := Config{
+		Cmd:              []string{pythonPath, "-m", "kahya_worker"},
+		Socket:           filepath.Join(t.TempDir(), "kahyad.sock"),
+		LogDir:           t.TempDir(),
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-testtoken0000000000",
+	}
+
+	// Minimal INVALID envelope: a blank prompt is enough for the worker's
+	// own parse_envelope to reject it before any SDK session - and so any
+	// cloud call - is ever attempted.
+	env := Envelope{
+		SchemaVersion: SchemaVersion,
+		TaskID:        NewTaskID(),
+		TraceID:       "abcdef0123456789abcdef0123456789",
+		Kind:          "chat",
+		Prompt:        "",
+		Model:         "claude-sonnet-5",
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	outcome, err := Run(ctx, cfg, env, Callbacks{})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Status != StatusError {
+		t.Fatalf("outcome.Status = %q, want %q", outcome.Status, StatusError)
+	}
+	const wantErrMsg = "Görev zarfı geçersiz."
+	if outcome.ErrMsg != wantErrMsg {
+		t.Fatalf(
+			"outcome.ErrMsg = %q, want %q - an empty ErrMsg here means the worker "+
+				"process exited without ever emitting a stdout protocol line (e.g. "+
+				"ModuleNotFoundError: `python -m kahya_worker` failed to import the "+
+				"kahya_worker package - the exact BLOCKER 1 regression this test "+
+				"guards against), not that it validated the envelope and reported "+
+				"the documented invalid-envelope message",
+			outcome.ErrMsg, wantErrMsg,
+		)
 	}
 }
 

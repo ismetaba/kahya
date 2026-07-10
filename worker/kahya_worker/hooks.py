@@ -115,7 +115,8 @@ def make_can_use_tool(
     (SDK-prefixed for MCP tools, e.g.
     ``"mcp__kahya_memory__memory_search"`` - kahyad canonicalizes this
     worker never rewrites it). ANY failure - exception, timeout, non-200,
-    or an unparsable/garbage response body - is a DENY with
+    an unparsable/garbage response body, or a self-contradictory body
+    (``{"decision":"allow","error":...}`` - MINOR 5 fix) - is a DENY with
     ``POLICY_FAIL_CLOSED_MESSAGE``. Every decision (allow, explicit deny,
     or fail-closed deny) is logged as ``event=tool_gate`` with the tool
     name, decision, and ``duration_ms``.
@@ -153,6 +154,19 @@ def make_can_use_tool(
         decision = resp.get("decision")
 
         if decision == "allow":
+            # MINOR 5 fix: a 200 body of {"decision":"allow","error":"..."}
+            # is self-contradictory - an "error" field alongside "allow"
+            # means kahyad itself hit a problem forming its response, not
+            # that it deliberately allowed the call. Treat this the same as
+            # any other malformed/garbage response: fail-closed DENY,
+            # never a trusting ALLOW.
+            if "error" in resp:
+                wlog.log(
+                    "info", "tool_gate", tool=tool_name, decision="deny",
+                    duration_ms=duration_ms, reason=POLICY_FAIL_CLOSED_MESSAGE,
+                    garbage_response=True, server_error=str(resp.get("error")),
+                )
+                return PermissionResultDeny(message=POLICY_FAIL_CLOSED_MESSAGE)
             wlog.log("info", "tool_gate", tool=tool_name, decision="allow", duration_ms=duration_ms)
             return PermissionResultAllow()
 
