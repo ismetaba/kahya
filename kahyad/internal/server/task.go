@@ -1,0 +1,403 @@
+// task.go implements POST /v1/task (HANDOFF §4 IPC ⚑; SSE contract frozen
+// by W12-06's kahya CLI client) and POST /policy/check (HANDOFF §4 IPC ⚑:
+// HTTP-over-UDS, 5s timeout, fail-closed). Both are this task's (W12-07)
+// deliverable. /policy/check reuses the EXACT SAME interim policy table
+// mcp.go's /v1/mcp gate already consults (kahyad/internal/policy) - one
+// table, two mount points, never a second copy (see that package's doc
+// comment).
+//
+// The full contract - envelope, worker env, worker stdout protocol,
+// /policy/check schema, and this file's SSE event shapes - is frozen in
+// docs/ipc.md; that file is the deliverable "IPC sözleşmesi", not this
+// code.
+package server
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/spawn"
+	"kahya/kahyad/internal/store/sqlcgen"
+)
+
+// Turkish user-facing strings this file can emit (HANDOFF §3 language
+// policy - byte-exact per the W12-07 task spec, never paraphrased).
+const (
+	// MsgTaskTimeout is the SSE "error" event message when task_timeout_min
+	// elapses before the worker finishes (%d = cfg.task_timeout_min).
+	MsgTaskTimeout = "Görev zaman aşımına uğradı (%d dk)."
+	// MsgTaskUnexpectedExit is the SSE "error" event message when the
+	// worker process ends (any exit code) without ever sending a terminal
+	// "result"/"error" stdout line, OR when kahyad itself could not even
+	// manage the process (spawn.Run's own error return) - both cases point
+	// the user at the same diagnostic command (%s = trace_id).
+	MsgTaskUnexpectedExit = "Görev beklenmedik şekilde sonlandı. Ayrıntı: kahya log --trace %s"
+)
+
+// TaskStore is the tasks-table persistence source POST /v1/task needs
+// (W12-07 step 4). *store.Store's own sqlc-generated Queries
+// (store.Store.Queries) satisfies this directly - InsertTask/
+// UpdateTaskState/UpdateTaskSession already have exactly this shape, no
+// adapter needed.
+type TaskStore interface {
+	InsertTask(ctx context.Context, arg sqlcgen.InsertTaskParams) (sqlcgen.Task, error)
+	UpdateTaskState(ctx context.Context, arg sqlcgen.UpdateTaskStateParams) error
+	UpdateTaskSession(ctx context.Context, arg sqlcgen.UpdateTaskSessionParams) error
+}
+
+// SetTaskStore wires POST /v1/task's tasks-table persistence. Call before
+// Prepare(); /v1/task answers 503 until this is set (the same
+// "unwired dependency" posture as SetSearcher/SetReindexer/SetMCPMemory
+// elsewhere in this package).
+func (s *Server) SetTaskStore(ts TaskStore) {
+	s.taskStore = ts
+}
+
+// taskRequest is POST /v1/task's request body - the exact shape
+// kahyad/cmd/kahya/client.go already POSTs (W12-06 contract): {"prompt",
+// "trace_id"}. trace_id follows the same optional-override pattern as
+// memorySearchRequest.TraceID: when absent, handleTask falls back to
+// withTraceLogging's own resolved trace id instead of minting an
+// uncorrelated one.
+type taskRequest struct {
+	Prompt  string `json:"prompt"`
+	TraceID string `json:"trace_id"`
+}
+
+// rfc3339Now is time.Now().UTC() formatted as plain RFC3339 (no
+// fractional seconds) - the envelope's created_at field and this file's
+// tasks-table timestamps both use this one convention, matching the
+// envelope.Validate parse layout exactly (time.RFC3339) with no ambiguity
+// about fractional-second handling.
+func rfc3339Now() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// handleTask implements POST /v1/task (W12-07 step 4): validates the
+// prompt, mints a task_id/envelope, inserts the tasks row (state=
+// "running"), ledgers task_spawned, then switches into an SSE response and
+// spawns the worker (kahyad/internal/spawn), relaying delta/session events
+// live and closing out with exactly one terminal "result" (status="ok") or
+// "error" (Turkish message) SSE event - matching kahyad/cmd/kahya/
+// client.go's StreamTask parser exactly (W12-06 contract).
+func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+	if s.taskStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "task engine not available")
+		return
+	}
+
+	var req taskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt must not be empty")
+		return
+	}
+
+	traceID := req.TraceID
+	if traceID == "" {
+		traceID = traceIDFromContext(r)
+	}
+	log := s.log.With(traceID)
+
+	taskID := spawn.NewTaskID()
+	now := rfc3339Now()
+	envelope := spawn.Envelope{
+		SchemaVersion:   spawn.SchemaVersion,
+		TaskID:          taskID,
+		TraceID:         traceID,
+		SessionID:       nil,
+		Kind:            "chat",
+		Prompt:          req.Prompt,
+		Model:           s.cfg.DefaultModel,
+		MemoryInjection: true,
+		CreatedAt:       now,
+	}
+	if err := envelope.Validate(); err != nil {
+		// Only reachable via a misconfigured cfg.default_model - prompt/
+		// task_id/trace_id/created_at above are always well-formed by
+		// construction.
+		log.Error("task_envelope_invalid", "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "invalid task envelope")
+		return
+	}
+	envelopeJSON, err := envelope.Marshal()
+	if err != nil {
+		log.Error("task_envelope_marshal_failed", "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "marshal envelope")
+		return
+	}
+
+	// dbCtx (the request's own context) is used for the writes that happen
+	// BEFORE the worker is spawned, while the client is still known to be
+	// connected. It must NOT be used for anything after spawn.Run returns:
+	// r.Context() is cancelled the moment the underlying connection closes
+	// for ANY reason - not only a clean client exit, but also (verified
+	// live during this task's manual verification) the CLI's OWN 30s
+	// idle-read timeout giving up and closing its side while the server's
+	// task_timeout_min is still counting down. Since taskCtx below is
+	// derived FROM dbCtx, that same disconnect also cancels taskCtx early -
+	// which is desirable for spawn.Run (no orphan worker survives a
+	// disappeared client) - but it must never take down the bookkeeping
+	// that RECORDS the outcome: persistCtx (a plain background context)
+	// is used for every write from OnSession onward specifically so a
+	// disconnected/timed-out client can never prevent kahyad from
+	// recording that the task ended (state + ledger).
+	dbCtx := r.Context()
+	persistCtx := context.Background()
+
+	if _, err := s.taskStore.InsertTask(dbCtx, sqlcgen.InsertTaskParams{
+		ID:        taskID,
+		TraceID:   traceID,
+		SessionID: sql.NullString{},
+		State:     "running",
+		TaintTier: "untrusted",
+		Model:     sql.NullString{String: envelope.Model, Valid: true},
+		Envelope:  sql.NullString{String: string(envelopeJSON), Valid: true},
+		UpdatedAt: now,
+		CreatedAt: now,
+	}); err != nil {
+		log.Error("task_insert_failed", "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "task insert failed")
+		return
+	}
+
+	if s.eventLogger != nil {
+		if err := s.eventLogger.LogEvent(dbCtx, traceID, "task_spawned", map[string]any{
+			"task_id": taskID, "model": envelope.Model,
+		}); err != nil {
+			log.Warn("task_spawned_ledger_error", "err", err.Error())
+		}
+	}
+	log.Info("task_spawned", "task_id", taskID, "model", envelope.Model)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Error("task_streaming_unsupported")
+		writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	writeSSE := func(event string, payload any) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		flusher.Flush()
+	}
+
+	timeoutMin := s.cfg.TaskTimeoutMin
+	taskCtx, cancel := context.WithTimeout(dbCtx, time.Duration(timeoutMin)*time.Minute)
+	defer cancel()
+
+	spawnCfg := spawn.Config{
+		Cmd:    s.cfg.WorkerCmd,
+		Socket: s.cfg.Socket,
+		LogDir: s.cfg.LogDir,
+		// TODO(W12-08): once the forward-proxy lands, AnthropicBaseURL
+		// points at kahyad's own localhost listener instead of the real
+		// upstream, and APIKey (already minted per-task below) becomes the
+		// credential that listener authenticates each inbound request
+		// against.
+		AnthropicBaseURL: s.cfg.AnthropicUpstreamURL,
+		APIKey:           spawn.NewAPIKey(),
+	}
+
+	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
+		OnStart: func(pid int) {
+			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
+		},
+		OnDelta: func(text string) {
+			writeSSE("delta", map[string]string{"text": text})
+		},
+		OnSession: func(sessionID string) {
+			if sessionID == "" {
+				return
+			}
+			if err := s.taskStore.UpdateTaskSession(persistCtx, sqlcgen.UpdateTaskSessionParams{
+				SessionID: sql.NullString{String: sessionID, Valid: true},
+				UpdatedAt: rfc3339Now(),
+				ID:        taskID,
+			}); err != nil {
+				log.Warn("task_session_update_failed", "task_id", taskID, "err", err.Error())
+			}
+		},
+		OnStderr: func(line string) {
+			log.Warn("worker_stderr", "task_id", taskID, "line", line)
+		},
+	})
+
+	if runErr != nil {
+		log.Error("task_spawn_error", "task_id", taskID, "err", runErr.Error())
+	}
+	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
+
+	if err := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+		State: m.finalState, UpdatedAt: rfc3339Now(), ID: taskID,
+	}); err != nil {
+		log.Error("task_state_update_failed", "task_id", taskID, "err", err.Error())
+	}
+	if s.eventLogger != nil {
+		if err := s.eventLogger.LogEvent(persistCtx, traceID, m.ledgerKind, map[string]any{
+			"task_id": taskID, "status": outcome.Status,
+		}); err != nil {
+			log.Warn("task_ledger_error", "kind", m.ledgerKind, "err", err.Error())
+		}
+	}
+	log.Info(m.ledgerKind, "task_id", taskID)
+
+	writeSSE(m.sseEvent, m.ssePayload)
+}
+
+// taskOutcomeMapping is spawn.Run's terminal outcome translated into the
+// tasks-table state, ledger event kind, and SSE event kahyad answers with
+// - factored out of handleTask into a pure function (mapTaskOutcome) so
+// every branch (including the timeout one, which would otherwise need a
+// real elapsed task_timeout_min - minutes-granularity, far too slow for a
+// test) can be unit-tested directly against a synthetic spawn.Outcome.
+type taskOutcomeMapping struct {
+	finalState string
+	ledgerKind string
+	sseEvent   string
+	ssePayload any
+}
+
+// mapTaskOutcome implements W12-07 step 4's terminal-state rules: runErr!=
+// nil (kahyad itself could not manage the process) and
+// outcome.Status==StatusError-with-no-message (worker exited, any code,
+// without ever sending a terminal result/error line) both surface the same
+// generic MsgTaskUnexpectedExit; StatusTimeout surfaces MsgTaskTimeout;
+// StatusError-with-a-message passes the worker's own Turkish message
+// through verbatim; anything else is the StatusOK success path.
+func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string, timeoutMin int) taskOutcomeMapping {
+	switch {
+	case runErr != nil:
+		return taskOutcomeMapping{
+			finalState: "error", ledgerKind: "task_error",
+			sseEvent:   "error",
+			ssePayload: map[string]string{"message": fmt.Sprintf(MsgTaskUnexpectedExit, traceID)},
+		}
+	case outcome.Status == spawn.StatusTimeout:
+		return taskOutcomeMapping{
+			finalState: "error", ledgerKind: "task_timeout",
+			sseEvent:   "error",
+			ssePayload: map[string]string{"message": fmt.Sprintf(MsgTaskTimeout, timeoutMin)},
+		}
+	case outcome.Status == spawn.StatusError:
+		msg := outcome.ErrMsg
+		if msg == "" {
+			msg = fmt.Sprintf(MsgTaskUnexpectedExit, traceID)
+		}
+		return taskOutcomeMapping{
+			finalState: "error", ledgerKind: "task_error",
+			sseEvent:   "error",
+			ssePayload: map[string]string{"message": msg},
+		}
+	default:
+		return taskOutcomeMapping{
+			finalState: "done", ledgerKind: "task_done",
+			sseEvent: "result",
+			ssePayload: map[string]any{
+				"status": "ok", "task_id": taskID, "session_id": outcome.SessionID,
+			},
+		}
+	}
+}
+
+// policyCheckRequest is POST /policy/check's request body (HANDOFF §4 IPC
+// ⚑, frozen in docs/ipc.md).
+type policyCheckRequest struct {
+	TraceID   string          `json:"trace_id"`
+	TaskID    string          `json:"task_id"`
+	SessionID *string         `json:"session_id"`
+	ToolName  string          `json:"tool_name"`
+	ToolInput json.RawMessage `json:"tool_input"`
+}
+
+// policyCheckResponse is POST /policy/check's response body. Reason is
+// omitted (not just empty) on an allow decision - the task spec's example
+// only shows it present on deny, and omitempty keeps an allow response
+// minimal.
+type policyCheckResponse struct {
+	Decision string `json:"decision"`
+	Reason   string `json:"reason,omitempty"`
+	Rule     string `json:"rule"`
+}
+
+// malformedBodyDeny is the fixed response body a malformed POST
+// /policy/check request gets: HTTP 400, but the body still says "deny" -
+// per the task spec, "so a sloppy client can't parse an allow out of an
+// error" - fail-closed applies to the transport layer too.
+var malformedBodyDeny = policyCheckResponse{
+	Decision: "deny",
+	Reason:   "Geçersiz istek gövdesi (fail-closed).",
+	Rule:     policy.RuleInterimStaticV1,
+}
+
+// handlePolicyCheck implements POST /policy/check (HANDOFF §4 IPC ⚑:
+// HTTP-over-UDS, 5s caller-side timeout, fail-closed on any error/timeout).
+// It reuses kahyad/internal/policy's interim static table - the EXACT SAME
+// one mcp.go's /v1/mcp gate already consults (one table, two mount
+// points). No I/O beyond a single ledger insert per decision, well inside
+// the caller's 5s budget.
+func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
+	var req policyCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Malformed body: no trace_id can be trusted from it, so there is
+		// nothing reliable to ledger - just answer the fixed fail-closed
+		// deny body.
+		writeJSON(w, http.StatusBadRequest, malformedBodyDeny)
+		return
+	}
+
+	decision := policy.Check(req.ToolName)
+
+	traceID := req.TraceID
+	if traceID == "" {
+		traceID = traceIDFromContext(r)
+	}
+	if s.eventLogger != nil {
+		payload := map[string]any{
+			"trace_id":   traceID,
+			"task_id":    req.TaskID,
+			"session_id": req.SessionID,
+			"tool_name":  req.ToolName,
+			"tool_input": req.ToolInput,
+			"decision":   allowDenyString(decision.Allow),
+			"rule":       decision.Rule,
+		}
+		if decision.Reason != "" {
+			payload["reason"] = decision.Reason
+		}
+		if err := s.eventLogger.LogEvent(r.Context(), traceID, "policy_decision", payload); err != nil {
+			s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
+		}
+	}
+
+	writeJSON(w, http.StatusOK, policyCheckResponse{
+		Decision: allowDenyString(decision.Allow),
+		Reason:   decision.Reason,
+		Rule:     decision.Rule,
+	})
+}
+
+// writeJSON writes v as a JSON body with the given status code.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}

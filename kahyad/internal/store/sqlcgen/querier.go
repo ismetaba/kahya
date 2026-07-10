@@ -37,6 +37,12 @@ type Querier interface {
 	// new/changed content: same id, fresh hash/tier, status forced back to
 	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
 	UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error
+	// Persists a worker-reported session_id onto the task row (W12-07 step 3:
+	// kahyad "persists session_id onto the task row" as the worker's
+	// {"type":"session",...} stdout line arrives). Session RESUME itself
+	// (using a stored session_id to continue a LATER task) is W4-02; this
+	// query only records the value as it arrives.
+	UpdateTaskSession(ctx context.Context, arg UpdateTaskSessionParams) error
 	UpdateTaskState(ctx context.Context, arg UpdateTaskStateParams) error
 }
 

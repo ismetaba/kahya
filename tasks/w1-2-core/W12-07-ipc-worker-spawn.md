@@ -1,6 +1,6 @@
 # W12-07 — per-task worker spawn + /policy/check
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-01, W12-02 (tasks/events tables), W12-06 (SSE contract)
 **Flags:** none

@@ -36,6 +36,16 @@ type Config struct {
 	TaskTimeoutMin       int    `yaml:"task_timeout_min"`
 	ActiveEmbedModelVer  string `yaml:"active_embed_model_ver"`
 
+	// WorkerCmd is the per-task Python worker command (HANDOFF §4 IPC ⚑,
+	// W12-07): argv[0] is the executable, the rest its args. Default
+	// points at the repo-local venv (defaultWorkerCmd); W12-07's own tests
+	// and the manual verification flow override it via config.yaml to
+	// point at a fake worker script instead. The real worker
+	// (`kahya_worker`, W12-09) does not exist until that task lands - this
+	// config key exists now purely so kahyad/internal/spawn has somewhere
+	// to read the command from.
+	WorkerCmd []string `yaml:"worker_cmd"`
+
 	// LogLevel is the process-wide minimum log level: debug|info|warn|error
 	// (default "info"). main.go passes the resolved value to
 	// kahyad/internal/logx.SetLevel before logx.New. Env override
@@ -53,17 +63,18 @@ type Config struct {
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir              *string `yaml:"data_dir"`
-	Socket               *string `yaml:"socket"`
-	LogDir               *string `yaml:"log_dir"`
-	DBPath               *string `yaml:"db_path"`
-	MemoryDir            *string `yaml:"memory_dir"`
-	AnthropicUpstreamURL *string `yaml:"anthropic_upstream_url"`
-	EmbedPort            *int    `yaml:"embed_port"`
-	DefaultModel         *string `yaml:"default_model"`
-	TaskTimeoutMin       *int    `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer  *string `yaml:"active_embed_model_ver"`
-	LogLevel             *string `yaml:"log_level"`
+	DataDir              *string   `yaml:"data_dir"`
+	Socket               *string   `yaml:"socket"`
+	LogDir               *string   `yaml:"log_dir"`
+	DBPath               *string   `yaml:"db_path"`
+	MemoryDir            *string   `yaml:"memory_dir"`
+	AnthropicUpstreamURL *string   `yaml:"anthropic_upstream_url"`
+	EmbedPort            *int      `yaml:"embed_port"`
+	DefaultModel         *string   `yaml:"default_model"`
+	TaskTimeoutMin       *int      `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer  *string   `yaml:"active_embed_model_ver"`
+	LogLevel             *string   `yaml:"log_level"`
+	WorkerCmd            *[]string `yaml:"worker_cmd"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -133,6 +144,31 @@ func defaults(home string) Config {
 		ActiveEmbedModelVer:  "qwen3-embedding-0.6b:512:v1",
 		LogLevel:             "info",
 		Env:                  EnvProd,
+		WorkerCmd:            defaultWorkerCmd(),
+	}
+}
+
+// defaultWorkerCmd resolves the W12-07 step-fixed default
+// ["<repo>/worker/.venv/bin/python","-m","kahya_worker"]. "<repo>" is
+// derived from the running executable's own path rather than hardcoded:
+// install-agent places the built binary at "<repo>/bin/kahyad" (see the
+// launchd plist's __KAHYA_REPO_ROOT__/bin/kahyad substitution), so two
+// directories up from os.Executable() is the repo root in every
+// production deployment. If the executable's path cannot be resolved
+// (should not happen outside of unusual sandboxes), "." is used as a
+// last-resort repo root - Load() never fails just because this default
+// couldn't be perfectly resolved, since every real caller either runs the
+// installed binary (where the derivation is exact) or overrides
+// worker_cmd explicitly via config.yaml (as every W12-07 test and the
+// manual fake-worker verification flow do).
+func defaultWorkerCmd() []string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return []string{
+		filepath.Join(repoRoot, "worker", ".venv", "bin", "python"),
+		"-m", "kahya_worker",
 	}
 }
 
@@ -187,6 +223,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.LogLevel != nil {
 		cfg.LogLevel = *fc.LogLevel
+	}
+	if fc.WorkerCmd != nil {
+		cfg.WorkerCmd = *fc.WorkerCmd
 	}
 }
 

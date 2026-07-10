@@ -112,6 +112,12 @@ func run() int {
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(cfg.MemoryDir, idx)
 
+	// POST /v1/task (W12-07): st.Queries already has exactly the
+	// InsertTask/UpdateTaskState/UpdateTaskSession method shape
+	// server.TaskStore needs, so it satisfies the interface directly with
+	// no adapter.
+	srv.SetTaskStore(st.Queries)
+
 	// ctx is created here (BEFORE the boot reindex goroutine below is
 	// spawned, not after) so that goroutine can share the SAME
 	// signal-cancelled context srv.Run uses, instead of running on an

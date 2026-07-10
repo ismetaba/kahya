@@ -405,6 +405,28 @@ func (q *Queries) UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeCon
 	return err
 }
 
+const updateTaskSession = `-- name: UpdateTaskSession :exec
+UPDATE tasks
+SET session_id = ?, updated_at = ?
+WHERE id = ?
+`
+
+type UpdateTaskSessionParams struct {
+	SessionID sql.NullString `json:"session_id"`
+	UpdatedAt string         `json:"updated_at"`
+	ID        string         `json:"id"`
+}
+
+// Persists a worker-reported session_id onto the task row (W12-07 step 3:
+// kahyad "persists session_id onto the task row" as the worker's
+// {"type":"session",...} stdout line arrives). Session RESUME itself
+// (using a stored session_id to continue a LATER task) is W4-02; this
+// query only records the value as it arrives.
+func (q *Queries) UpdateTaskSession(ctx context.Context, arg UpdateTaskSessionParams) error {
+	_, err := q.db.ExecContext(ctx, updateTaskSession, arg.SessionID, arg.UpdatedAt, arg.ID)
+	return err
+}
+
 const updateTaskState = `-- name: UpdateTaskState :exec
 UPDATE tasks
 SET state = ?, updated_at = ?

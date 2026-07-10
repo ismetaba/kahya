@@ -82,6 +82,10 @@ type Server struct {
 	mcpMemoryDir string
 	mcpIndexer   memory.Indexer
 
+	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
+	// 4). See SetTaskStore's doc comment.
+	taskStore TaskStore
+
 	ln   net.Listener
 	http *http.Server
 	// lock is the exclusive startup flock on <socket>.lock, held for the
@@ -150,6 +154,8 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/reindex", s.handleReindex)
 	mux.HandleFunc("/v1/log", s.handleLog)
 	mux.Handle("/v1/mcp", s.buildMCPHandler())
+	mux.HandleFunc("/v1/task", s.handleTask)
+	mux.HandleFunc("/policy/check", s.handlePolicyCheck)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -720,6 +726,18 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards to the wrapped ResponseWriter's http.Flusher when it has
+// one, so a handler behind this middleware (POST /v1/task's SSE stream,
+// W12-07) can still flush each event to the client as it is written -
+// without this, wrapping the ResponseWriter here would silently hide
+// Flusher from every handler's own `w.(http.Flusher)` type assertion, even
+// though the real underlying ResponseWriter supports it.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // traceIDContextKey is the unexported context key withTraceLogging stashes

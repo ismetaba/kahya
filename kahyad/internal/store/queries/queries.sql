@@ -23,6 +23,16 @@ UPDATE tasks
 SET state = ?, updated_at = ?
 WHERE id = ?;
 
+-- name: UpdateTaskSession :exec
+-- Persists a worker-reported session_id onto the task row (W12-07 step 3:
+-- kahyad "persists session_id onto the task row" as the worker's
+-- {"type":"session",...} stdout line arrives). Session RESUME itself
+-- (using a stored session_id to continue a LATER task) is W4-02; this
+-- query only records the value as it arrives.
+UPDATE tasks
+SET session_id = ?, updated_at = ?
+WHERE id = ?;
+
 -- name: GetTaskBySession :one
 -- Sessions are not currently guaranteed to map to exactly one task row
 -- (resume/retry may append more), so this returns the most recently

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
 	}
+	if len(cfg.WorkerCmd) != 3 || cfg.WorkerCmd[1] != "-m" || cfg.WorkerCmd[2] != "kahya_worker" {
+		t.Errorf("WorkerCmd = %v, want [<...>/worker/.venv/bin/python -m kahya_worker]", cfg.WorkerCmd)
+	}
+	if want := filepath.Join("worker", ".venv", "bin", "python"); !strings.HasSuffix(cfg.WorkerCmd[0], want) {
+		t.Errorf("WorkerCmd[0] = %q, want suffix %q", cfg.WorkerCmd[0], want)
+	}
 }
 
 func TestLoadFileOverridesDefaults(t *testing.T) {
@@ -102,6 +109,35 @@ func TestLoadFileOverridesDefaults(t *testing.T) {
 	// task_timeout_min wasn't set in the file, default should survive.
 	if cfg.TaskTimeoutMin != 30 {
 		t.Errorf("TaskTimeoutMin = %d, want 30 (untouched default)", cfg.TaskTimeoutMin)
+	}
+}
+
+func TestLoadFileOverridesWorkerCmd(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "worker_cmd:\n  - \"/tmp/fake-worker.sh\"\n  - \"--flag\"\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"/tmp/fake-worker.sh", "--flag"}
+	if len(cfg.WorkerCmd) != len(want) {
+		t.Fatalf("WorkerCmd = %v, want %v", cfg.WorkerCmd, want)
+	}
+	for i := range want {
+		if cfg.WorkerCmd[i] != want[i] {
+			t.Errorf("WorkerCmd[%d] = %q, want %q", i, cfg.WorkerCmd[i], want[i])
+		}
 	}
 }
 
