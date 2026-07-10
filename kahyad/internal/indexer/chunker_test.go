@@ -162,6 +162,117 @@ func TestChunkNeverSplitsInsideFencedCodeBlock(t *testing.T) {
 	}
 }
 
+// TestChunkNestedFenceNotClosedByShorterInnerRun is the BLOCKER 3
+// regression test: a fence OPENED with a 4-backtick run must only be
+// CLOSED by a line whose run of the SAME character is >= 4, per
+// CommonMark. A naive "any 3+ backtick run closes any fence" check would
+// let the inner 3-backtick fence close the outer one early, leaking
+// "outer end" + the closing "````" as unprotected plain paragraph text.
+func TestChunkNestedFenceNotClosedByShorterInnerRun(t *testing.T) {
+	fence := "````\nouter start\n```\ninner nested fence, must NOT close the outer one\n```\nouter end\n````"
+	body := "# Baslik\n\nGiris metni.\n\n" + fence + "\n\nSon metin.\n"
+
+	chunks := Chunk(body)
+	found := false
+	for _, c := range chunks {
+		if strings.Contains(c, fence) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("4-backtick fence with a nested 3-backtick fence did not survive as ONE protected piece; chunks=%v", chunks)
+	}
+}
+
+// TestChunkTildeFencedLongBlockSurvivesAsOneChunk is MINOR 4's regression
+// test: ~~~ (3+ tildes) must be recognized as a fence delimiter with the
+// same open/close matching rules as backticks, so a >1600-rune
+// tilde-fenced block is never window-split.
+func TestChunkTildeFencedLongBlockSurvivesAsOneChunk(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("~~~\n")
+	for b.Len() < 1700 {
+		b.WriteString("kod satiri burada duraksamadan devam ediyor\n")
+	}
+	b.WriteString("~~~")
+	fence := b.String()
+	if n := len([]rune(fence)); n <= MaxChunkRunes {
+		t.Fatalf("test setup: fence has %d runes, want > %d", n, MaxChunkRunes)
+	}
+
+	body := "# Baslik\n\n" + fence + "\n\nSon metin.\n"
+	chunks := Chunk(body)
+
+	found := false
+	for _, c := range chunks {
+		if strings.Contains(c, fence) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("tilde-fenced block > MaxChunkRunes did not survive intact as one chunk; chunks=%v", chunks)
+	}
+}
+
+// TestChunkIndentedHeadingStartsNewPieceEvenWithoutBlankLine is MINOR 5's
+// regression test: up to 3 leading spaces before '#' is still an ATX
+// heading (consistent with fence detection also tolerating leading
+// whitespace) and starts a new section - shown here by a heading directly
+// on the line after paragraph text with NO blank line between them: a
+// recognized heading still flushes the preceding text as its own piece,
+// which mergePieces then joins back with a blank-line separator, so the
+// heading appears in a chunk preceded by "\n\n" rather than a single "\n"
+// (the heading's own leading space is trimmed away by flushParagraph's
+// strings.TrimSpace when it starts a fresh piece - unrelated to the
+// section-boundary behavior this test actually checks).
+func TestChunkIndentedHeadingStartsNewPieceEvenWithoutBlankLine(t *testing.T) {
+	body := "Giris metni onceki satirda.\n # Baslik\nBaslik sonrasi ilk satir.\n"
+	chunks := Chunk(body)
+	joined := strings.Join(chunks, "\x00")
+	if !strings.Contains(joined, "onceki satirda.\n\n# Baslik") {
+		t.Errorf("' # Baslik' (1 leading space) did not start a new section boundary; chunks=%v", chunks)
+	}
+}
+
+// TestChunkFourSpaceIndentNotHeadingStaysInSameParagraph is MINOR 5's
+// negative case: 4+ leading spaces before '#' is CommonMark indented
+// code, never a heading, so it must NOT split the surrounding paragraph
+// into a separate piece.
+func TestChunkFourSpaceIndentNotHeadingStaysInSameParagraph(t *testing.T) {
+	body := "Giris metni onceki satirda.\n    # not-a-heading\nDevam eden satir.\n"
+	chunks := Chunk(body)
+	if len(chunks) != 1 {
+		t.Fatalf("len(chunks) = %d, want 1 (no section boundary at all); chunks=%v", len(chunks), chunks)
+	}
+	if !strings.Contains(chunks[0], "onceki satirda.\n    # not-a-heading\nDevam eden satir.") {
+		t.Errorf("4-space-indented '#' line wrongly treated as a heading boundary; chunks=%v", chunks)
+	}
+}
+
+// TestChunkBareHeadingRecognizedWithAndWithoutCRLF is MINOR 6's regression
+// test: a bare heading line (nothing after the '#' run) must be
+// recognized the same way whether the file uses LF ("###") or CRLF
+// ("###\r" once split on "\n") line endings.
+func TestChunkBareHeadingRecognizedWithAndWithoutCRLF(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		headingLine string
+	}{
+		{"LF", "###"},
+		{"CRLF", "###\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "Onceki satir.\n" + tc.headingLine + "\nSonraki satir.\n"
+			chunks := Chunk(body)
+			joined := strings.Join(chunks, "\x00")
+			want := "Onceki satir.\n\n" + tc.headingLine
+			if !strings.Contains(joined, want) {
+				t.Errorf("bare heading %q did not start a new section boundary; chunks=%v", tc.headingLine, chunks)
+			}
+		})
+	}
+}
+
 // TestChunkLongSingleParagraphProducesOverlappingBoundedChunks is the task
 // spec step 7 test: a >5000-rune file (here: one giant heading-less,
 // blank-line-less paragraph, so it must go through window-splitting)

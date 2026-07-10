@@ -3,10 +3,12 @@ package indexer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
@@ -411,6 +413,162 @@ func TestReindexSkipsGitTrashAndDotfiles(t *testing.T) {
 			if strings.Contains(h.Path, ".git") || strings.Contains(h.Path, ".trash") || strings.HasPrefix(filepath.Base(h.Path), ".") {
 				t.Errorf("search leaked a skipped path into results: %+v", h)
 			}
+		}
+	}
+}
+
+// TestReindexSkipsSymlinksBothFilesAndDirectories is the BLOCKER 1
+// regression test: os.ReadFile silently follows symlinks, so without an
+// explicit skip during the walk, memory_dir/x.md -> /anywhere/secret
+// would get indexed as trusted (source_tier user_asserted) memory content
+// from completely outside the memory corpus - and a symlinked directory
+// must not even be descended into.
+func TestReindexSkipsSymlinksBothFilesAndDirectories(t *testing.T) {
+	memDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	const fileMarker = "essiz-sembolik-dosya-markeri-xyzzy"
+	outsideFile := filepath.Join(outsideDir, "secret.md")
+	if err := os.WriteFile(outsideFile, []byte("# Gizli\n\n"+fileMarker+"\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	const dirMarker = "essiz-sembolik-dizin-markeri-plugh"
+	outsideSubdir := filepath.Join(outsideDir, "subdir")
+	if err := os.MkdirAll(outsideSubdir, 0o700); err != nil {
+		t.Fatalf("MkdirAll outsideSubdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideSubdir, "inner.md"), []byte("# Ic\n\n"+dirMarker+"\n"), 0o600); err != nil {
+		t.Fatalf("write outside subdir file: %v", err)
+	}
+
+	writeFixture(t, memDir, "real-note.md", "# Gercek\n\nBu dosya indekslenmeli.\n")
+
+	if err := os.Symlink(outsideFile, filepath.Join(memDir, "x.md")); err != nil {
+		t.Fatalf("Symlink file: %v", err)
+	}
+	if err := os.Symlink(outsideSubdir, filepath.Join(memDir, "linked-dir")); err != nil {
+		t.Fatalf("Symlink dir: %v", err)
+	}
+
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+
+	res, err := idx.Reindex(context.Background(), "", false)
+	if err != nil {
+		t.Fatalf("Reindex: %v", err)
+	}
+	if res.FilesIndexed != 1 {
+		t.Errorf("FilesIndexed = %d, want 1 (only real-note.md)", res.FilesIndexed)
+	}
+	if res.FilesErrored != 2 {
+		t.Errorf("FilesErrored = %d, want 2 (one for the symlinked file, one for the symlinked dir)", res.FilesErrored)
+	}
+
+	var chunkCount int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM chunks WHERE text LIKE ?`, "%"+fileMarker+"%").Scan(&chunkCount); err != nil {
+		t.Fatalf("count chunks with file marker: %v", err)
+	}
+	if chunkCount != 0 {
+		t.Errorf("symlinked file's content was indexed (%d chunks contain %q), want 0", chunkCount, fileMarker)
+	}
+
+	if err := st.DB().QueryRow(`SELECT count(*) FROM chunks WHERE text LIKE ?`, "%"+dirMarker+"%").Scan(&chunkCount); err != nil {
+		t.Fatalf("count chunks with dir marker: %v", err)
+	}
+	if chunkCount != 0 {
+		t.Errorf("symlinked directory's content was indexed (%d chunks contain %q), want 0 (symlinked dir must not be descended into)", chunkCount, dirMarker)
+	}
+}
+
+// TestReindexCancelMidRunStopsPromptlyWithConsistentState is the BLOCKER 2
+// regression test: cancelling ctx while Reindex is partway through a
+// many-file corpus must make it return promptly with a clean partial
+// result - never treating files past the stop point as errored, never
+// running the removal-detection pass over an incomplete "seen" set (which
+// would otherwise wrongly mark not-yet-visited active episodes deleted),
+// and never leaving the FTS5 index inconsistent.
+func TestReindexCancelMidRunStopsPromptlyWithConsistentState(t *testing.T) {
+	memDir := t.TempDir()
+	const numFiles = 200
+	for i := 0; i < numFiles; i++ {
+		writeFixture(t, memDir, fmt.Sprintf("note-%04d.md", i),
+			fmt.Sprintf("# Not %d\n\nBu notun essiz-icerigi-%04d burada yer aliyor.\n", i, i))
+	}
+
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel as soon as SOME (but well short of all) files have committed,
+	// so this genuinely exercises a MID-run cancellation instead of racing
+	// to cancel before the first file or after the last one. Bounded by a
+	// deadline so the goroutine (and thus the test) can never hang even if
+	// Reindex misbehaves.
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var n int
+			if err := st.DB().QueryRow(`SELECT count(*) FROM episodes WHERE source='memory_file'`).Scan(&n); err == nil && n >= 5 {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel() // fallback: never observed >=5 committed episodes in time
+	}()
+
+	resCh := make(chan Result, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		res, err := idx.Reindex(ctx, "", false)
+		resCh <- res
+		errCh <- err
+	}()
+
+	var res Result
+	select {
+	case res = <-resCh:
+		if err := <-errCh; err != nil {
+			t.Fatalf("Reindex: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Reindex did not return within 5s of cancellation, want a prompt bounded stop")
+	}
+	<-pollDone
+
+	if res.FilesIndexed == 0 {
+		t.Errorf("FilesIndexed = 0, want > 0 (the cancel goroutine only fires after some files already committed)")
+	}
+	if res.FilesIndexed >= numFiles {
+		t.Errorf("FilesIndexed = %d, want < %d (cancellation should have stopped the run early)", res.FilesIndexed, numFiles)
+	}
+
+	// No error rows caused by cancellation after the stop point: every
+	// successfully indexed file has exactly one committed episode row, and
+	// nothing else (no partial/uncommitted state, no wrongly-removed
+	// episodes from an incomplete removal-detection pass).
+	var episodeCount int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM episodes WHERE source='memory_file'`).Scan(&episodeCount); err != nil {
+		t.Fatalf("count episodes: %v", err)
+	}
+	if episodeCount != res.FilesIndexed {
+		t.Errorf("episode count = %d, want it to match FilesIndexed = %d", episodeCount, res.FilesIndexed)
+	}
+	var deletedCount int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM episodes WHERE source='memory_file' AND status='deleted'`).Scan(&deletedCount); err != nil {
+		t.Fatalf("count deleted episodes: %v", err)
+	}
+	if deletedCount != 0 {
+		t.Errorf("deleted episode count = %d, want 0 (removal-detection must be skipped entirely on a cancelled run)", deletedCount)
+	}
+
+	for _, tbl := range []string{"chunks_fts_tri", "chunks_fts_uni"} {
+		if _, err := st.DB().Exec(`INSERT INTO ` + tbl + `(` + tbl + `) VALUES('integrity-check')`); err != nil {
+			t.Errorf("FTS integrity-check on %s failed: %v", tbl, err)
 		}
 	}
 }

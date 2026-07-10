@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -101,31 +102,60 @@ func run() int {
 	idx := indexer.New(st.DB(), cfg.MemoryDir, log)
 	srv.SetReindexer(idx)
 
+	// ctx is created here (BEFORE the boot reindex goroutine below is
+	// spawned, not after) so that goroutine can share the SAME
+	// signal-cancelled context srv.Run uses, instead of running on an
+	// unrelated context.Background() that shutdown could never reach
+	// (BLOCKER 2).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Incremental reindex on every boot, after migrations (W12-04 step:
 	// "Startup hook in main.go"). Async: the memory corpus can be large
 	// enough that blocking Serve on it would delay every other request
 	// (including /health) for no reason - a boot-time reindex and a
 	// concurrent POST /v1/reindex both funnel through idx's own mutex
 	// regardless of goroutine scheduling.
+	//
+	// BLOCKER 2: reindexDone is joined (Wait()) below, AFTER srv.Run
+	// returns but BEFORE run() itself returns - i.e. strictly before the
+	// deferred st.Close() above ever executes. Previously nothing joined
+	// this goroutine and it ran on context.Background(), so a shutdown
+	// signal could let st.Close() close brain.db while this goroutine was
+	// still mid-reindex, producing spurious "database is closed" file
+	// errors; now shutdown cancels ctx (idx.Reindex checks ctx.Err()
+	// between files and stops early) and then actually waits for it to
+	// finish before the DB is allowed to close.
+	var reindexDone sync.WaitGroup
+	reindexDone.Add(1)
 	go func() {
-		// idx.Reindex logs event=reindex_done itself (scoped to
-		// bootTraceID, since it is passed in non-empty here) - see
+		defer reindexDone.Done()
+		// idx.Reindex logs event=reindex_done (or event=reindex_cancelled
+		// if ctx was cancelled mid-run) itself, scoped to bootTraceID since
+		// it is passed in non-empty here - see
 		// kahyad/internal/indexer.Indexer.Reindex's doc comment - so there
 		// is nothing left to log a second time on success.
-		if _, err := idx.Reindex(context.Background(), bootTraceID, false); err != nil {
+		if _, err := idx.Reindex(ctx, bootTraceID, false); err != nil {
 			log.With(bootTraceID).Error("reindex_failed", "err", err.Error())
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	runErr := srv.Run(ctx)
 
-	if err := srv.Run(ctx); err != nil {
-		if errors.Is(err, server.ErrAlreadyRunning) {
+	// Cancel ctx explicitly (a no-op if a shutdown signal already fired
+	// it) and WAIT for the boot reindex goroutine to observe the
+	// cancellation and finish its in-flight per-file transaction, before
+	// this function returns - so this always completes strictly before the
+	// deferred st.Close() call above (BLOCKER 2).
+	stop()
+	reindexDone.Wait()
+
+	if runErr != nil {
+		if errors.Is(runErr, server.ErrAlreadyRunning) {
 			// server.Run already logged event=already_running.
 			return 1
 		}
-		log.Error("fatal", "err", err.Error())
+		log.Error("fatal", "err", runErr.Error())
 		return 1
 	}
 

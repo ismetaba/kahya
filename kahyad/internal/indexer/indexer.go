@@ -115,10 +115,22 @@ const (
 // transactions let searches interleave between files instead.
 //
 // Reindex always writes exactly one events row (kind='reindex') and one
-// event=reindex_done JSONL line before returning successfully, whether
+// event=reindex_done (or, if ctx was cancelled mid-run, event=
+// reindex_cancelled) JSONL line before returning successfully, whether
 // called from the boot hook (main.go) or POST /v1/reindex - both share
 // this one code path, so both count toward the "reindex JSONL log lines
 // share one trace_id" acceptance check for the SAME run.
+//
+// BLOCKER 2: ctx is checked between files (and between removal-scan
+// entries), so a cancelled ctx (main.go cancels the boot-time call's ctx
+// on shutdown, before waiting for this call to return) makes Reindex stop
+// early instead of grinding through the rest of a large corpus. Stopping
+// never returns an error and never corrupts state: each already-processed
+// file's DB write already committed in its own transaction, and the
+// removal-detection pass (which infers "deleted from disk" from files it
+// did NOT see this run) is skipped entirely once cancellation is
+// detected, since an early stop means it saw only a partial subset of the
+// corpus - treating everything past that point as deleted would be wrong.
 func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Result, error) {
 	if !idx.mu.TryLock() {
 		return Result{}, ErrReindexInProgress
@@ -133,14 +145,33 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 	log := idx.log.With(traceID)
 	resolvedTraceID := log.TraceID()
 
-	entries, err := idx.walkFiles()
+	entries, symlinksSkipped, err := idx.walkFiles(log)
 	if err != nil {
 		return Result{}, fmt.Errorf("indexer: walk %s: %w", idx.memoryDir, err)
 	}
 
 	var res Result
+	// BLOCKER 1: every symlink walkFiles skipped (never followed, never
+	// indexed) still counts as an errored entry, same as any other file
+	// this run could not safely index.
+	res.FilesErrored = symlinksSkipped
+
+	// BLOCKER 2: cancelled tracks whether this run stopped early because
+	// ctx was cancelled (main.go cancels this ctx on shutdown). Once set,
+	// the file loop below stops calling processFile immediately, and the
+	// removal-detection pass is skipped ENTIRELY - seen only reflects the
+	// subset of entries actually visited, so treating every unvisited
+	// active episode as "deleted from disk" would wrongly wipe out chunks
+	// for files this run simply never got to. A future Reindex call
+	// (boot-time or POST /v1/reindex) safely finishes the job.
+	cancelled := false
+
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			cancelled = true
+			break
+		}
 		// Mark this path "seen" even on error below: an errored file is
 		// still present on disk, so it must never be mistaken for a
 		// deleted one in the pass below (that would wrongly wipe its
@@ -162,24 +193,36 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 		}
 	}
 
-	actives, err := idx.q.ListActiveMemoryFileEpisodes(ctx)
-	if err != nil {
-		return Result{}, fmt.Errorf("indexer: list active episodes: %w", err)
-	}
-	for _, a := range actives {
-		if !a.SourcePath.Valid || seen[a.SourcePath.String] {
-			continue
+	if !cancelled {
+		actives, err := idx.q.ListActiveMemoryFileEpisodes(ctx)
+		if err != nil {
+			return Result{}, fmt.Errorf("indexer: list active episodes: %w", err)
 		}
-		if err := idx.removeEpisode(ctx, a.ID); err != nil {
-			res.FilesErrored++
-			log.Warn("reindex_remove_error", "path", a.SourcePath.String, "err", err.Error())
-			continue
+		for _, a := range actives {
+			if ctx.Err() != nil {
+				cancelled = true
+				break
+			}
+			if !a.SourcePath.Valid || seen[a.SourcePath.String] {
+				continue
+			}
+			if err := idx.removeEpisode(ctx, a.ID); err != nil {
+				res.FilesErrored++
+				log.Warn("reindex_remove_error", "path", a.SourcePath.String, "err", err.Error())
+				continue
+			}
+			res.FilesRemoved++
 		}
-		res.FilesRemoved++
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()
 
+	// The trailing ledger write and final log line are bookkeeping, not
+	// further corpus work - they deliberately use a fresh background
+	// context rather than the (possibly already cancelled) ctx, so a
+	// cancelled shutdown never prevents recording what this run actually
+	// did. brain.db is still open at this point regardless: main.go always
+	// waits for Reindex to return before closing it (BLOCKER 2).
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	payload, err := json.Marshal(res)
 	if err != nil {
@@ -188,7 +231,7 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 		// this path.
 		payload = []byte("{}")
 	}
-	if _, err := idx.q.InsertEvent(ctx, sqlcgen.InsertEventParams{
+	if _, err := idx.q.InsertEvent(context.Background(), sqlcgen.InsertEventParams{
 		TraceID:   resolvedTraceID,
 		Ts:        nowStr,
 		Kind:      "reindex",
@@ -199,6 +242,18 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 		// (markdown->SQLite sync already committed per-file); log and move
 		// on rather than discarding a successful reindex's result.
 		log.Warn("reindex_ledger_error", "err", err.Error())
+	}
+
+	if cancelled {
+		log.Warn("reindex_cancelled",
+			"files_indexed", res.FilesIndexed,
+			"files_unchanged", res.FilesUnchanged,
+			"files_removed", res.FilesRemoved,
+			"files_errored", res.FilesErrored,
+			"chunks", res.Chunks,
+			"duration_ms", res.DurationMs,
+		)
+		return res, nil
 	}
 
 	log.Info("reindex_done",
@@ -214,17 +269,26 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 }
 
 // walkFiles returns every *.md file under memoryDir, skipping .git/**,
-// .trash/**, and any dotfile/dotdir (task spec step 1) - the general
-// dotfile rule already covers .git and .trash without naming them
-// specially, since both directory names themselves start with '.'.
+// .trash/**, any dotfile/dotdir (task spec step 1 - the general dotfile
+// rule already covers .git and .trash without naming them specially,
+// since both directory names themselves start with '.'), and - BLOCKER 1 -
+// any symlink, file or directory alike. A symlink inside memory_dir could
+// point anywhere on disk (e.g. memory_dir/x.md -> /anywhere/secret); if
+// walkFiles let it through, processFile's os.ReadFile would happily follow
+// it and index arbitrary off-tree content as trusted (source_tier
+// user_asserted by default) memory. So every symlink entry is skipped
+// outright - never resolved, never read, never descended into - and
+// counted/logged via symlinksSkipped so the caller folds it into
+// files_errored rather than silently pretending it never existed.
 // Entries are sorted by relPath for deterministic processing order (tests
 // rely on this; production correctness does not, since Reindex processes
 // every file regardless of order).
-func (idx *Indexer) walkFiles() ([]fileEntry, error) {
+func (idx *Indexer) walkFiles(log *logx.Logger) ([]fileEntry, int, error) {
 	root := idx.memoryDir
 	var out []fileEntry
+	var skipped int
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -236,6 +300,22 @@ func (idx *Indexer) walkFiles() ([]fileEntry, error) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// d.Type() reports the entry's own mode bits WITHOUT following the
+		// link (fs.DirEntry never stats through a symlink to decide this),
+		// so this is true for a symlink regardless of whether it points at
+		// a file or a directory - and since d.IsDir() is therefore also
+		// false for it, filepath.WalkDir already never descends into a
+		// symlinked directory's contents on its own. Skipping here just
+		// makes that explicit and adds the required log/count.
+		if d.Type()&fs.ModeSymlink != 0 {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				rel = path
+			}
+			skipped++
+			log.Warn("symlink_skipped", "path", filepath.ToSlash(rel))
 			return nil
 		}
 		if d.IsDir() {
@@ -252,12 +332,12 @@ func (idx *Indexer) walkFiles() ([]fileEntry, error) {
 		out = append(out, fileEntry{absPath: path, relPath: filepath.ToSlash(rel)})
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if walkErr != nil {
+		return nil, skipped, walkErr
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].relPath < out[j].relPath })
-	return out, nil
+	return out, skipped, nil
 }
 
 // processFile indexes ONE file: reads it, strips front matter (deciding its

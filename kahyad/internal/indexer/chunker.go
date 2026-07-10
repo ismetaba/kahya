@@ -202,6 +202,12 @@ func splitIntoPieces(body string) []piece {
 	var cur []string
 	var fence []string
 	inFence := false
+	// fenceChar/fenceRunLen record the delimiter that OPENED the current
+	// fence (BLOCKER 3), so the close check below can require the same
+	// character and an at-least-as-long run, instead of letting any 3+ run
+	// close a fence opened with a longer (or differently-charactered) one.
+	var fenceChar byte
+	var fenceRunLen int
 
 	flushParagraph := func() {
 		if len(cur) == 0 {
@@ -217,18 +223,22 @@ func splitIntoPieces(body string) []piece {
 	for _, l := range lines {
 		if inFence {
 			fence = append(fence, l)
-			if isFenceDelimiter(l) {
+			if isFenceClose(l, fenceChar, fenceRunLen) {
 				pieces = append(pieces, piece{text: strings.Join(fence, "\n"), protected: true})
 				fence = nil
 				inFence = false
 			}
 			continue
 		}
-		switch {
-		case isFenceDelimiter(l):
+		if ch, n, ok := isFenceDelimiter(l); ok {
 			flushParagraph()
 			inFence = true
+			fenceChar = ch
+			fenceRunLen = n
 			fence = []string{l}
+			continue
+		}
+		switch {
 		case isBlankLine(l):
 			flushParagraph()
 		case isHeadingLine(l):
@@ -248,37 +258,91 @@ func splitIntoPieces(body string) []piece {
 	return pieces
 }
 
-// isFenceDelimiter reports whether l opens or closes a fenced code block:
-// a line whose only non-whitespace content is a run of 3+ backticks
-// (commonmark allows up to 3 leading spaces of indent, and the fence
-// language tag, e.g. "```go", only appears on the OPENING line - this
-// still matches it since we only require the "```" prefix after trimming
-// leading space).
-func isFenceDelimiter(l string) bool {
+// isFenceDelimiter reports whether l is SHAPED like a fence delimiter
+// line: after trimming leading whitespace, a run of 3+ of the SAME fence
+// character - a backtick ` or a tilde ~ (MINOR 4: commonmark treats both
+// as valid fence characters with identical open/close matching rules).
+// Returns that character and the run's length; ok is false if l has no
+// such run at all (including an empty/blank line). This reports a line's
+// SHAPE only - it matches both a valid OPENER (optionally followed by an
+// info string, e.g. "```go") and a candidate CLOSER; see isFenceClose for
+// the additional CommonMark rule that actually decides whether a given
+// line closes a SPECIFIC already-open fence.
+func isFenceDelimiter(l string) (ch byte, runLen int, ok bool) {
 	trimmed := strings.TrimLeft(l, " \t")
-	return strings.HasPrefix(trimmed, "```")
+	if len(trimmed) == 0 {
+		return 0, 0, false
+	}
+	c := trimmed[0]
+	if c != '`' && c != '~' {
+		return 0, 0, false
+	}
+	n := 0
+	for n < len(trimmed) && trimmed[n] == c {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, false
+	}
+	return c, n, true
+}
+
+// isFenceClose reports whether l actually CLOSES a fence that was opened
+// with character openChar and run length openRunLen (BLOCKER 3, per
+// CommonMark's fenced-code-block spec): l must be fence-delimiter-shaped
+// with the SAME character, a run length >= openRunLen, and nothing but
+// trailing whitespace after that run - an info string (even one made of
+// the SAME character run, e.g. an inner "```go" nested inside a 4-
+// backtick-opened fence) makes a line look like an opener but never a
+// valid closer. Without the run-length/character match, the first inner
+// 3-backtick line of a 4+-backtick-opened fence would close it early and
+// leak the rest of the nested block as unprotected plain text.
+func isFenceClose(l string, openChar byte, openRunLen int) bool {
+	ch, n, ok := isFenceDelimiter(l)
+	if !ok || ch != openChar || n < openRunLen {
+		return false
+	}
+	trimmed := strings.TrimLeft(l, " \t")
+	return strings.TrimRight(trimmed[n:], " \t") == ""
 }
 
 func isBlankLine(l string) bool {
 	return strings.TrimSpace(l) == ""
 }
 
-// isHeadingLine reports whether l starts a new H1/H2/H3 section: 1-3
-// leading '#' characters followed by whitespace or end-of-line. A 4th (or
-// more) leading '#' disqualifies the line entirely (H4+ is not a §4
-// section boundary), matching commonmark ATX heading syntax otherwise.
+// isHeadingLine reports whether l starts a new H1/H2/H3 section:
+// MINOR 5 - up to 3 leading spaces (commonmark ATX heading indent,
+// consistent with isFenceDelimiter also tolerating leading whitespace; 4+
+// leading spaces is indented code, never a heading), then 1-3 '#'
+// characters followed by whitespace or end-of-line. A 4th (or more)
+// leading '#' disqualifies the line entirely (H4+ is not a §4 section
+// boundary), matching commonmark ATX heading syntax otherwise.
 func isHeadingLine(l string) bool {
+	indent := 0
+	for indent < len(l) && indent < 4 && l[indent] == ' ' {
+		indent++
+	}
+	if indent >= 4 {
+		return false
+	}
+	rest := l[indent:]
+
 	n := 0
-	for n < len(l) && l[n] == '#' {
+	for n < len(rest) && rest[n] == '#' {
 		n++
 	}
 	if n == 0 || n > 3 {
 		return false
 	}
-	if n == len(l) {
-		return true // a bare "###" line, nothing after it
+
+	// MINOR 6: strip one trailing \r before the bare-heading check so a
+	// CRLF file's "###\r" line is recognized as a heading exactly like a
+	// bare "###" would be.
+	tail := strings.TrimSuffix(rest[n:], "\r")
+	if tail == "" {
+		return true // a bare "###" (or CRLF "###\r") line, nothing after it
 	}
-	return l[n] == ' ' || l[n] == '\t'
+	return tail[0] == ' ' || tail[0] == '\t'
 }
 
 // mergePieces greedily packs pieces into chunks of at most maxRunes runes,
