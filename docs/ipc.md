@@ -108,6 +108,16 @@ one deferred item is a live check with a real Keychain credential/session
 (no CI test exercises a real key or session) — see the W12-08 task file
 and its closing commit for the explicit deferral note.
 
+**Post-review addition (BLOCKER 2 fix)** — `Governor.CheckBeforeForward`
+is now an atomic check-and-reserve, not a plain check-then-act: it
+reserves a conservative (fail-closed = over-, never under-estimated)
+token/USD estimate for the about-to-be-forwarded request before it is
+sent, and `RecordUsage` releases that reservation once the real usage is
+known. When the request's own `max_tokens`/body size can't be parsed, the
+estimate falls back to the new `est_request_tokens` config key (committed
+default `50000`) — see `kahyad/internal/anthproxy/governor.go`'s
+`estimateRequestLocked` for the full estimation strategy.
+
 ## 4 · Worker stdout protocol (JSONL)
 
 One JSON object per line. Every line has a `"type"` field; kahyad ignores

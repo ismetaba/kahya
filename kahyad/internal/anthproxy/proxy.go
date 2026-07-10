@@ -281,18 +281,32 @@ type credentialCtxKey struct{}
 type injectedCredential struct{ name, value string }
 
 type reqData struct {
-	Model      string
-	SystemHash string
-	Start      time.Time
+	Model       string
+	SystemHash  string
+	Start       time.Time
+	Reservation ReservationID
 }
 
 const proxyRequestMaxBytes = 16 << 20 // 16 MiB: generous for a /v1/messages body
 
 // ServeHTTP implements the full per-request pipeline (task spec steps
-// 1/3/4): local-auth check -> egress gate -> governor pre-check -> (in
-// keychain mode) credential resolution -> delegate to the reverse proxy,
-// which streams the response back through wrapResponseBody's usage
-// capture.
+// 1/3/4, reordered by BLOCKER 2): local-auth check -> egress gate -> read
+// body -> governor check-and-RESERVE (needs the body/model to size its
+// conservative estimate - see Governor.CheckBeforeForward) -> (in keychain
+// mode) credential resolution -> delegate to the reverse proxy, which
+// streams the response back through wrapResponseBody's usage capture.
+//
+// BLOCKER 2: once CheckBeforeForward grants a reservation, this handler
+// unconditionally defers releasing it - every return path below the check
+// (keychain failure, or the reverse-proxy's own ErrorHandler firing before
+// ModifyResponse ever runs on a failed upstream RoundTrip) would otherwise
+// leak that reservation forever, permanently over-counting against every
+// later request's ceiling/budget check. The success path's own
+// RecordUsage call (wrapResponseBody's onDone, invoked synchronously
+// during p.rp.ServeHTTP below - ReverseProxy blocks until the response
+// body is fully copied) already releases the SAME reservation before this
+// defer ever runs; ReleaseReservation is idempotent, so this is always
+// safe, never a double-subtraction.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -310,19 +324,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	check := p.cfg.Governor.CheckBeforeForward(p.cfg.TaskID)
-	if !check.Allowed {
-		p.onBudgetBlocked(ctx, check.Message)
-		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", check.Message)
-		return
-	}
-
 	bodyBytes, err := readAndRestoreBody(r)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Istek govdesi okunamadi.")
 		return
 	}
 	model, systemHash := probeRequest(bodyBytes)
+
+	check := p.cfg.Governor.CheckBeforeForward(p.cfg.TaskID, model, bodyBytes)
+	if !check.Allowed {
+		p.onBudgetBlocked(ctx, check.Message)
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", check.Message)
+		return
+	}
+	defer p.cfg.Governor.ReleaseReservation(check.Reservation)
 
 	if p.cfg.CredentialMode == CredentialModeKeychain {
 		headerName, headerValue, credErr := p.cfg.Credential.UpstreamAuth(ctx)
@@ -335,7 +350,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(context.WithValue(r.Context(), reqDataCtxKey{}, &reqData{
-		Model: model, SystemHash: systemHash, Start: p.cfg.Now(),
+		Model: model, SystemHash: systemHash, Start: p.cfg.Now(), Reservation: check.Reservation,
 	}))
 
 	p.rp.ServeHTTP(w, r)
@@ -552,7 +567,7 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 		// must never prevent kahyad from recording that the call
 		// happened, mirroring kahyad/internal/server/task.go's
 		// persistCtx convention.
-		p.cfg.Governor.RecordUsage(context.Background(), p.cfg.EventLedger, p.cfg.TraceID, p.cfg.TaskID,
+		p.cfg.Governor.RecordUsage(context.Background(), data.Reservation, p.cfg.EventLedger, p.cfg.TraceID, p.cfg.TaskID,
 			data.Model, u, usd, statusStr, durationMs, data.SystemHash)
 	}
 	resp.Body = wrapped

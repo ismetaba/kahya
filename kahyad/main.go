@@ -143,6 +143,7 @@ func run() int {
 		TaskTokenCeiling:       cfg.TaskTokenCeiling,
 		DowngradeAtRatio:       cfg.DowngradeAtRatio,
 		CacheHitAlarmThreshold: cfg.CacheHitAlarmThreshold,
+		EstRequestTokens:       cfg.EstRequestTokens,
 	}
 	governor := anthproxy.Boot(bootEvents, limits, nil, notifier)
 	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode)

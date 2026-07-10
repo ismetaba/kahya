@@ -69,6 +69,11 @@ func TestLoadDefaults(t *testing.T) {
 	if want := filepath.Join("worker", ".venv", "bin", "python"); !strings.HasSuffix(cfg.WorkerCmd[0], want) {
 		t.Errorf("WorkerCmd[0] = %q, want suffix %q", cfg.WorkerCmd[0], want)
 	}
+	// BLOCKER 2's fail-closed reservation-estimate fallback (see the
+	// field's own doc comment) - committed default 50000.
+	if cfg.EstRequestTokens != 50_000 {
+		t.Errorf("EstRequestTokens = %d, want 50000", cfg.EstRequestTokens)
+	}
 }
 
 func TestLoadFileOverridesDefaults(t *testing.T) {

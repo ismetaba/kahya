@@ -12,6 +12,7 @@ package anthproxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -27,15 +28,33 @@ type Limits struct {
 	TaskTokenCeiling       int64
 	DowngradeAtRatio       float64
 	CacheHitAlarmThreshold float64
+	// EstRequestTokens is the fail-closed fallback per-request token
+	// estimate (config key est_request_tokens, committed default 50000)
+	// CheckBeforeForward's reservation step (BLOCKER 2 fix) uses when the
+	// about-to-be-forwarded request's own max_tokens/body size cannot be
+	// parsed - see estimateRequestLocked's doc comment for the full
+	// estimation strategy. <=0 falls back to defaultEstRequestTokens, so a
+	// zero-value Limits (e.g. a test literal that predates this field)
+	// never silently disables the reservation.
+	EstRequestTokens int64
 }
+
+// defaultEstRequestTokens is the built-in floor for Limits.EstRequestTokens
+// (see its doc comment) - used whenever that field is <=0.
+const defaultEstRequestTokens = 50_000
 
 // Turkish user-facing block messages (byte-exact from the task file — do
 // not paraphrase, do not ASCII-fold the diacritics).
 const (
-	MsgTaskCeiling         = "Görev token tavanına ulaştı (500K) — duraklatıldı."
-	MsgDailyBudgetBlock    = "Günlük bütçe doldu ($10)."
-	MsgMonthlyBudgetBlock  = "Aylık bütçe doldu ($150)."
-	MsgKeychainUnavailable = "Keychain erişilemiyor — bulut şeridi kapalı."
+	MsgTaskCeiling        = "Görev token tavanına ulaştı (500K) — duraklatıldı."
+	MsgDailyBudgetBlock   = "Günlük bütçe doldu ($10)."
+	MsgMonthlyBudgetBlock = "Aylık bütçe doldu ($150)."
+	// MsgKeychainUnavailable is byte-exact with the fixed error JSON in the
+	// task spec (tasks/w1-2-core/W12-08-anthropic-forward-proxy.md:
+	// `{"type":"error","message":"Keychain erişilemiyor — bulut şeridi
+	// kapalı"}`) - NO trailing period (MINOR 3 fix; the previous value here
+	// had one, which was never byte-exact with the spec literal).
+	MsgKeychainUnavailable = "Keychain erişilemiyor — bulut şeridi kapalı"
 )
 
 // Ledger event kinds this package (and proxy.go) write — HANDOFF §5 safety
@@ -108,15 +127,53 @@ type dailyAgg struct {
 	systemHashChanges int
 }
 
+// ReservationID identifies one CheckBeforeForward reservation (BLOCKER 2
+// fix). The zero value means "no reservation" (CheckBeforeForward returns
+// it when !Allowed, and ReleaseReservation/RecordUsage treat it as a
+// no-op) - valid ids start at 1 (see reserveLocked).
+type ReservationID uint64
+
+// reservation is one in-flight request's conservative estimate, held only
+// long enough for RecordUsage (or, on any failure path that never reaches
+// it, the proxy's own deferred ReleaseReservation call) to release it.
+// day/month are captured at reservation time (not re-derived from a later
+// now() call) so releaseLocked always subtracts from the SAME daily/
+// monthly bucket the estimate was added to, even if a request happens to
+// straddle a UTC day/month boundary between CheckBeforeForward and its
+// eventual release.
+type reservation struct {
+	taskID     string
+	tokens     int64
+	usd        float64
+	day, month string
+}
+
 // Governor is kahyad's shared, in-process cost governor.
 type Governor struct {
 	mu     sync.Mutex
 	limits Limits
 	now    func() time.Time
 
-	perTask map[string]int64     // task_id -> input+output+cache_creation sum
+	perTask map[string]int64     // task_id -> completed input+output+cache_creation sum
 	daily   map[string]*dailyAgg // "2006-01-02" (UTC) -> aggregate
-	monthly map[string]float64   // "2006-01" (UTC) -> usd sum
+	monthly map[string]float64   // "2006-01" (UTC) -> completed usd sum
+
+	// Reservation state (BLOCKER 2 fix): CheckBeforeForward's
+	// check-then-act was a TOCTOU - concurrent requests could each observe
+	// "under limit" and only debit completed totals AFTER forwarding,
+	// jointly blowing past a hard cap by an unbounded multiple. These maps
+	// hold the in-flight, not-yet-completed estimate for every request
+	// currently between CheckBeforeForward and RecordUsage/
+	// ReleaseReservation, all mutated only under mu, so the very next
+	// concurrent CheckBeforeForward call sees them immediately. They are
+	// intentionally NOT rebuilt by Boot (unlike perTask/daily/monthly) -
+	// a reservation only ever exists for the lifetime of one in-flight
+	// HTTP request, so there is nothing to reconcile across a restart.
+	nextReservationID  uint64
+	reservations       map[ReservationID]reservation
+	perTaskReservedTok map[string]int64   // task_id -> reserved token sum
+	dailyReservedUSD   map[string]float64 // "2006-01-02" (UTC) -> reserved usd sum
+	monthlyReservedUSD map[string]float64 // "2006-01" (UTC) -> reserved usd sum
 
 	notifier notify.Notifier
 }
@@ -131,12 +188,16 @@ func NewGovernor(limits Limits, now func() time.Time, notifier notify.Notifier) 
 		now = time.Now
 	}
 	return &Governor{
-		limits:   limits,
-		now:      now,
-		perTask:  map[string]int64{},
-		daily:    map[string]*dailyAgg{},
-		monthly:  map[string]float64{},
-		notifier: notifier,
+		limits:             limits,
+		now:                now,
+		perTask:            map[string]int64{},
+		daily:              map[string]*dailyAgg{},
+		monthly:            map[string]float64{},
+		reservations:       map[ReservationID]reservation{},
+		perTaskReservedTok: map[string]int64{},
+		dailyReservedUSD:   map[string]float64{},
+		monthlyReservedUSD: map[string]float64{},
+		notifier:           notifier,
 	}
 }
 
@@ -215,37 +276,218 @@ type CheckResult struct {
 	Allowed bool
 	// Message is the Turkish block message, set only when !Allowed.
 	Message string
+	// Reservation is the handle CheckBeforeForward granted when
+	// Allowed - the caller (proxy.go) must pass it to RecordUsage once the
+	// call completes, AND (unconditionally, via defer, covering every
+	// failure path in between - a reserved-but-never-recorded request must
+	// never leak a permanent reservation) to ReleaseReservation. Both are
+	// safe to call on the same id - releaseLocked is idempotent, a second
+	// release of an already-released id is a no-op. Zero
+	// (ReservationID's zero value) when !Allowed: there is nothing to
+	// release.
+	Reservation ReservationID
 }
 
-// CheckBeforeForward implements step 3's fail-closed BLOCKING ordering:
-// the request is checked against the per-task ceiling and the daily/
-// monthly budgets using ONLY totals accumulated from calls that already
-// completed. This call's own token/USD cost is not known until its
-// response is parsed (see RecordUsage) — there is no way to predict it in
-// advance — so "blocked before forwarding" means "blocked because PRIOR
-// usage already reached a limit", never a prediction about this
-// particular request.
-func (g *Governor) CheckBeforeForward(taskID string) CheckResult {
+// estRequestBytesPerToken is a deliberately LOW (hence token-count-
+// inflating) bytes-per-token ratio used to translate a request body's raw
+// byte length into an input-token estimate: a real English/Turkish token
+// averages closer to ~4 bytes, so dividing by 3 instead overestimates
+// rather than under - see estimateRequestLocked's doc comment for why
+// CheckBeforeForward's whole estimation posture is "over, never under".
+const estRequestBytesPerToken = 3
+
+// CheckBeforeForward implements step 3's fail-closed BLOCKING ordering,
+// converted (BLOCKER 2 fix) from a plain check-then-act into an atomic
+// check-and-RESERVE: the request is checked against the per-task ceiling
+// and the daily/monthly budgets using completed totals from calls that
+// already finished PLUS every other request's still-outstanding
+// reservation PLUS a conservative (over-, never under-) estimate of this
+// request's own eventual cost - all computed and compared under g.mu, so
+// two requests racing this method never both observe "under limit" for
+// the same slice of headroom. If allowed, that estimate is itself added to
+// the reservation pools before this method returns, closing the exact
+// window a burst of concurrent requests could otherwise use to jointly
+// blow past a hard cap: the very next concurrent call sees this one's
+// reservation immediately, not just its eventual completed total.
+//
+// body/model are best-effort inputs to estimateRequestLocked - a malformed
+// or absent body/model degrades to a fixed configured estimate, never to
+// "no estimate" (see that function's doc comment); this call must never
+// skip reserving just because it could not parse the request precisely.
+//
+// The returned Reservation MUST eventually be released exactly once via
+// RecordUsage or ReleaseReservation (both idempotent, so calling both is
+// safe) - see CheckResult.Reservation's doc comment.
+func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckResult {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.limits.TaskTokenCeiling > 0 && g.perTask[taskID] >= g.limits.TaskTokenCeiling {
-		return CheckResult{Message: MsgTaskCeiling}
+	estTokens, estUSD := g.estimateRequestLocked(model, body)
+
+	if g.limits.TaskTokenCeiling > 0 {
+		projected := g.perTask[taskID] + g.perTaskReservedTok[taskID] + estTokens
+		if projected > g.limits.TaskTokenCeiling {
+			return CheckResult{Message: MsgTaskCeiling}
+		}
 	}
 
 	today := g.now().UTC().Format(dayLayout)
 	if g.limits.DailyBudgetUSD > 0 {
-		if agg := g.daily[today]; agg != nil && agg.usd >= g.limits.DailyBudgetUSD {
+		var completedUSD float64
+		if agg := g.daily[today]; agg != nil {
+			completedUSD = agg.usd
+		}
+		if completedUSD+g.dailyReservedUSD[today]+estUSD > g.limits.DailyBudgetUSD {
 			return CheckResult{Message: MsgDailyBudgetBlock}
 		}
 	}
 
 	month := g.now().UTC().Format(monthLayout)
-	if g.limits.MonthlyBudgetUSD > 0 && g.monthly[month] >= g.limits.MonthlyBudgetUSD {
-		return CheckResult{Message: MsgMonthlyBudgetBlock}
+	if g.limits.MonthlyBudgetUSD > 0 {
+		if g.monthly[month]+g.monthlyReservedUSD[month]+estUSD > g.limits.MonthlyBudgetUSD {
+			return CheckResult{Message: MsgMonthlyBudgetBlock}
+		}
 	}
 
-	return CheckResult{Allowed: true}
+	id := g.reserveLocked(taskID, estTokens, estUSD, today, month)
+	return CheckResult{Allowed: true, Reservation: id}
+}
+
+// estimateRequestLocked computes CheckBeforeForward's CONSERVATIVE
+// upper-bound token/USD estimate for one about-to-be-forwarded request -
+// never an exact prediction (the real number is only known after
+// RecordUsage parses the response), always an over-estimate, so that
+// reserving it against the ceiling/budgets can only make
+// CheckBeforeForward MORE likely to block, never less - the fail-closed
+// posture HANDOFF §5 requires of a hard cap.
+//
+// Estimation strategy, in priority order:
+//  1. If body parses as JSON, its max_tokens field (when positive) is
+//     taken as the output-token bound VERBATIM - Anthropic hard-caps the
+//     response at exactly this many tokens, so it is already a true upper
+//     bound, not a guess. The input-side contribution is estimated from
+//     the body's own byte length (estRequestBytesPerToken) - this
+//     necessarily also covers any system/tools/cache_control blocks the
+//     body contains, and since there is no pre-flight signal for whether
+//     a given call will actually create a cache write, EVERY input-side
+//     token here is priced at the pricier 1h cache-WRITE rate rather than
+//     the plain input rate ("include cache" in the task spec) so the USD
+//     estimate stays an over-estimate even for a cache-writing call.
+//  2. If body is empty/unparseable, or JSON but with no positive
+//     max_tokens, this falls back to Limits.EstRequestTokens (config key
+//     est_request_tokens, <=0 uses defaultEstRequestTokens) for the WHOLE
+//     token count, priced entirely at the pricier OUTPUT rate - the most
+//     conservative single number available when nothing about the actual
+//     request shape is known.
+//
+// A model this function cannot price (empty/unrecognized/no pricing row
+// for "now") still returns a non-zero TOKEN estimate (so the per-task
+// ceiling reservation is never skipped just because pricing is unknown),
+// but a zero USD estimate (there is no rate to apply) - a request whose
+// model cannot be priced is deliberately policed by the token-ceiling
+// check only, not the USD budget checks.
+func (g *Governor) estimateRequestLocked(model string, body []byte) (tokens int64, usd float64) {
+	row, priceErr := PriceFor(model, g.now())
+	fallbackTokens := g.limits.EstRequestTokens
+	if fallbackTokens <= 0 {
+		fallbackTokens = defaultEstRequestTokens
+	}
+
+	if probe, ok := parseEstimateProbe(body); ok {
+		outTokens := probe.MaxTokens
+		if outTokens <= 0 {
+			outTokens = fallbackTokens
+		}
+		inTokens := int64(len(body)) / estRequestBytesPerToken
+		if inTokens <= 0 {
+			inTokens = 1
+		}
+		tokens = inTokens + outTokens
+		if priceErr == nil {
+			usd = float64(inTokens)*row.USDPerMTokCacheWrite1h/1_000_000 +
+				float64(outTokens)*row.USDPerMTokOut/1_000_000
+		}
+		return tokens, usd
+	}
+
+	tokens = fallbackTokens
+	if priceErr == nil {
+		usd = float64(tokens) * row.USDPerMTokOut / 1_000_000
+	}
+	return tokens, usd
+}
+
+// estimateProbe is the subset of a /v1/messages request body
+// estimateRequestLocked reads to size its estimate - kept minimal and
+// separate from probeRequest's (model/system) shape since the two are read
+// for unrelated purposes at unrelated call sites.
+type estimateProbe struct {
+	MaxTokens int64 `json:"max_tokens"`
+}
+
+// parseEstimateProbe reports ok=false for an empty or non-JSON body -
+// exactly the signal estimateRequestLocked uses to fall back to the
+// configured default instead of a body-derived estimate.
+func parseEstimateProbe(body []byte) (estimateProbe, bool) {
+	if len(body) == 0 {
+		return estimateProbe{}, false
+	}
+	var p estimateProbe
+	if err := json.Unmarshal(body, &p); err != nil {
+		return estimateProbe{}, false
+	}
+	return p, true
+}
+
+// reserveLocked grants a new reservation, folding tokens/usd into every
+// reservation pool CheckBeforeForward itself consults (per-task tokens,
+// daily USD, monthly USD) so the very next call sees it. Must be called
+// with g.mu held.
+func (g *Governor) reserveLocked(taskID string, tokens int64, usd float64, day, month string) ReservationID {
+	g.nextReservationID++
+	id := ReservationID(g.nextReservationID)
+	g.reservations[id] = reservation{taskID: taskID, tokens: tokens, usd: usd, day: day, month: month}
+	g.perTaskReservedTok[taskID] += tokens
+	g.dailyReservedUSD[day] += usd
+	g.monthlyReservedUSD[month] += usd
+	return id
+}
+
+// releaseLocked removes reservation id's contribution from every pool it
+// was added to in reserveLocked. Idempotent: an unknown id (zero value, or
+// one already released by a prior call - RecordUsage and the proxy's
+// deferred ReleaseReservation may both race to release the same id) is a
+// silent no-op, never a panic/error - a release is inherently "at most
+// once matters, more than once is harmless". Must be called with g.mu
+// held.
+func (g *Governor) releaseLocked(id ReservationID) {
+	if id == 0 {
+		return
+	}
+	r, ok := g.reservations[id]
+	if !ok {
+		return
+	}
+	delete(g.reservations, id)
+	g.perTaskReservedTok[r.taskID] -= r.tokens
+	g.dailyReservedUSD[r.day] -= r.usd
+	g.monthlyReservedUSD[r.month] -= r.usd
+}
+
+// ReleaseReservation releases a reservation CheckBeforeForward granted
+// WITHOUT recording any completed usage (BLOCKER 2 fix) - proxy.go defers
+// this unconditionally right after a successful CheckBeforeForward, so any
+// path that ends the request without ever reaching RecordUsage (egress-
+// gate/keychain failure after the reservation was already granted, or the
+// upstream RoundTrip itself erroring before the reverse proxy's
+// ModifyResponse hook ever runs) still releases the reservation instead of
+// leaking it forever - a leaked reservation would otherwise permanently
+// count against future requests' ceiling/budget checks. Safe to call after
+// RecordUsage already released the same id (see releaseLocked).
+func (g *Governor) ReleaseReservation(id ReservationID) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.releaseLocked(id)
 }
 
 // DowngradeModel implements the FIXED Opus->Sonnet->yerel chain (HANDOFF
@@ -288,12 +530,21 @@ func (g *Governor) downgradedLocked() bool {
 // RecordUsage applies one completed call's usage/cost to the governor's
 // in-memory state (steps 2/3/4) AFTER the upstream response has been
 // fully parsed — CheckBeforeForward already ran before this request was
-// forwarded, using only prior totals; this is where the request's OWN
-// contribution lands. It ledgers kind=model_call unconditionally, then
-// runs the once-per-day downgrade/alarm/cache-buster bookkeeping against
-// the freshly-updated totals, ledgering/alarming each side effect at most
-// once per UTC day. systemHash is the sha256 hex of the request's
-// system[0] block (empty string if the request had none).
+// forwarded, using only prior totals (plus, since BLOCKER 2, every other
+// still-outstanding reservation and this request's own estimate). This is
+// where the request's OWN ACTUAL contribution lands: reservation
+// (BLOCKER 2 fix) is CheckBeforeForward's returned handle for this exact
+// request - RecordUsage releases it (subtracting the estimate back out of
+// the reserved pools) BEFORE folding the real usage into the completed
+// totals, under the same lock, so no concurrent CheckBeforeForward can
+// ever observe a moment where both the estimate AND the actual are
+// simultaneously counted. reservation may be the zero value (no
+// reservation to release - e.g. a test seeding history directly) which
+// releaseLocked treats as a no-op. It ledgers kind=model_call
+// unconditionally, then runs the once-per-day downgrade/alarm/cache-buster
+// bookkeeping against the freshly-updated totals, ledgering/alarming each
+// side effect at most once per UTC day. systemHash is the sha256 hex of
+// the request's system[0] block (empty string if the request had none).
 //
 // eventLedger/traceID are passed per-call (rather than stored on Governor)
 // because a single shared Governor instance is used across every
@@ -302,8 +553,9 @@ func (g *Governor) downgradedLocked() bool {
 // context.Background(), matching kahyad/internal/server/task.go's
 // persistCtx convention — a disconnected/timed-out client must never
 // prevent kahyad from recording that a call happened).
-func (g *Governor) RecordUsage(ctx context.Context, eventLedger EventLedger, traceID, taskID, model string, u Usage, usd float64, status string, durationMs int64, systemHash string) {
+func (g *Governor) RecordUsage(ctx context.Context, reservation ReservationID, eventLedger EventLedger, traceID, taskID, model string, u Usage, usd float64, status string, durationMs int64, systemHash string) {
 	g.mu.Lock()
+	g.releaseLocked(reservation)
 	now := g.now()
 	r := ModelCallRecord{
 		TaskID: taskID, Model: model,

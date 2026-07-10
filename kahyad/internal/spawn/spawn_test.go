@@ -421,6 +421,49 @@ func TestBuildEnvIncludesAllSixVariables(t *testing.T) {
 	}
 }
 
+// TestBuildEnvFiltersSecretBearingParentEnvVars is BLOCKER 1's regression
+// test: KAHYA_ANTHROPIC_KEY_OVERRIDE (kahyad/internal/anthproxy's dev/CI
+// substitute for a real Keychain read) and any pre-existing
+// ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in kahyad's OWN process
+// environment must never reach the worker - BuildEnv must filter every one
+// of them out of os.Environ() before appending its own six controlled
+// overrides, so the worker's ANTHROPIC_API_KEY is always exactly the
+// per-task kahya-task-<hex32> token, never a real-looking key inherited
+// from the parent process.
+func TestBuildEnvFiltersSecretBearingParentEnvVars(t *testing.T) {
+	t.Setenv("KAHYA_ANTHROPIC_KEY_OVERRIDE", "sk-ant-LEAKTEST")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-parent-process-should-not-leak")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-auth-token-should-not-leak")
+
+	cfg := Config{
+		Socket:           "/s.sock",
+		LogDir:           "/logs",
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-abcdef0123456789abcdef0123456789",
+	}
+	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
+
+	got := BuildEnv(cfg, env)
+
+	resolved := map[string]string{}
+	for _, kv := range got {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		resolved[parts[0]] = parts[1]
+		if strings.Contains(kv, "sk-ant") {
+			t.Errorf("worker env leaked a real-looking Anthropic key: %q", kv)
+		}
+	}
+	if _, ok := resolved["KAHYA_ANTHROPIC_KEY_OVERRIDE"]; ok {
+		t.Error("BuildEnv must never pass KAHYA_ANTHROPIC_KEY_OVERRIDE through to the worker")
+	}
+	if got := resolved["ANTHROPIC_API_KEY"]; got != cfg.APIKey {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want exactly the per-task token %q (not any parent-process override)", got, cfg.APIKey)
+	}
+}
+
 // TestOutcomeIsJSONSerializableShape is a light sanity check that
 // stdoutLine's json tags actually match docs/ipc.md's frozen field names -
 // a typo here would silently make Run ignore every line a real worker

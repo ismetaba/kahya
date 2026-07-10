@@ -383,12 +383,56 @@ func killGroup(cmd *exec.Cmd) {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
+// secretEnvDenylist names kahyad-internal, secret-bearing environment
+// variables that must NEVER reach the worker process, even though BuildEnv
+// otherwise inherits kahyad's entire os.Environ() (HANDOFF §4 IPC ⚑: "API
+// anahtarı worker'a verilmez" / docs/ipc.md §3 - the worker must only ever
+// see the per-task kahya-task-<hex32> token BuildEnv sets explicitly
+// below). Two distinct leak paths this closes (BLOCKER 1 fix):
+//
+//   - KAHYA_ANTHROPIC_KEY_OVERRIDE: kahyad/internal/anthproxy's dev/CI
+//     substitute for a real Keychain read. If a developer or CI job has it
+//     set in kahyad's OWN process environment, filterSecretEnv is the only
+//     thing standing between that real-key-shaped value and a second,
+//     uncontrolled copy of it landing straight in the worker's OS
+//     environment via plain os.Environ() inheritance - the worker has no
+//     business ever seeing this var, controlled or not.
+//   - ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN: if kahyad's own parent
+//     process (a developer's shell, a CI runner) happens to already export
+//     a real Anthropic credential under either name, inheriting it
+//     unfiltered would hand the worker a real key. Stripping both here
+//     means the ANTHROPIC_API_KEY the worker actually receives is always
+//     exactly the one BuildEnv appends below (the per-task token) - never
+//     shadowed-then-unshadowed by an inherited value of the same name.
+var secretEnvDenylist = map[string]bool{
+	"KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
+	"ANTHROPIC_API_KEY":            true,
+	"ANTHROPIC_AUTH_TOKEN":         true,
+}
+
+// filterSecretEnv returns a copy of in with every entry whose NAME (the
+// part before "=") appears in secretEnvDenylist removed, preserving the
+// relative order of everything else. It never mutates in.
+func filterSecretEnv(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, kv := range in {
+		name, _, _ := strings.Cut(kv, "=")
+		if secretEnvDenylist[name] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // BuildEnv assembles the worker process's environment (HANDOFF §4 IPC ⚑
 // step 2, docs/ipc.md): the parent's own environment (PATH, HOME, etc. -
-// W1-2's worker is a plain subprocess, not a network-isolated container)
+// W1-2's worker is a plain subprocess, not a network-isolated container),
+// FILTERED through filterSecretEnv to strip any kahyad-internal
+// secret-bearing var (BLOCKER 1 fix - see secretEnvDenylist's doc comment),
 // plus the six KAHYA_*/ANTHROPIC_* variables the IPC contract fixes.
 func BuildEnv(cfg Config, env Envelope) []string {
-	base := os.Environ()
+	base := filterSecretEnv(os.Environ())
 	extra := []string{
 		"KAHYA_TASK_ID=" + env.TaskID,
 		"KAHYA_TRACE_ID=" + env.TraceID,

@@ -80,6 +80,15 @@ type Config struct {
 	// CacheHitAlarmThreshold is the daily cache-hit-ratio floor below
 	// which (once >=20 calls that day) an alarm fires.
 	CacheHitAlarmThreshold float64 `yaml:"cache_hit_alarm_threshold"`
+	// EstRequestTokens is the fail-closed fallback per-request token
+	// estimate kahyad/internal/anthproxy.Governor.CheckBeforeForward
+	// reserves against TaskTokenCeiling/DailyBudgetUSD/MonthlyBudgetUSD
+	// BEFORE forwarding, whenever the request's own max_tokens/body size
+	// cannot be parsed (BLOCKER 2 fix: closes a check-then-act TOCTOU that
+	// let a burst of concurrent requests jointly exceed a hard cap) - see
+	// docs/ipc.md's W12-08 note and anthproxy.estimateRequestLocked's doc
+	// comment for the full estimation strategy.
+	EstRequestTokens int64 `yaml:"est_request_tokens"`
 	// CredentialMode selects how kahyad/internal/anthproxy authenticates
 	// to cfg.AnthropicUpstreamURL: "keychain" (original HANDOFF design -
 	// kahyad reads kahya.anthropic from the macOS Keychain and injects
@@ -119,6 +128,7 @@ type fileConfig struct {
 	DowngradeAtRatio       *float64  `yaml:"downgrade_at_ratio"`
 	CacheHitAlarmThreshold *float64  `yaml:"cache_hit_alarm_threshold"`
 	CredentialMode         *string   `yaml:"credential_mode"`
+	EstRequestTokens       *int64    `yaml:"est_request_tokens"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -200,6 +210,12 @@ func defaults(home string) Config {
 		DowngradeAtRatio:       0.8,
 		CacheHitAlarmThreshold: 0.5,
 		CredentialMode:         CredentialModePassthrough,
+		// BLOCKER 2's fail-closed reservation fallback (see the field's own
+		// doc comment) - a conservative, committed default: big enough to
+		// not fire on every ordinary call, small enough that a handful of
+		// concurrently-reserved requests still can't blow far past the 500K
+		// per-task ceiling before RecordUsage reconciles them.
+		EstRequestTokens: 50_000,
 	}
 }
 
@@ -299,6 +315,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.CredentialMode != nil {
 		cfg.CredentialMode = *fc.CredentialMode
+	}
+	if fc.EstRequestTokens != nil {
+		cfg.EstRequestTokens = *fc.EstRequestTokens
 	}
 }
 

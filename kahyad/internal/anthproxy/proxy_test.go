@@ -305,7 +305,7 @@ func TestProxyBlocksAtTaskCeilingBeforeForwarding(t *testing.T) {
 	}, nil, nil)
 	// Pre-seed the ceiling via a prior recorded call - the NEXT request
 	// must be blocked before it is ever forwarded.
-	governor.RecordUsage(t.Context(), ledger, "trace1", "t_test", "claude-sonnet-5",
+	governor.RecordUsage(t.Context(), 0, ledger, "trace1", "t_test", "claude-sonnet-5",
 		Usage{InputTokens: 500_000}, 1.0, "ok", 10, "")
 	ledger.calls = nil // reset so the test only counts calls from THIS request
 
@@ -342,7 +342,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 		DailyBudgetUSD: 0.01, MonthlyBudgetUSD: 10000, TaskTokenCeiling: 500_000,
 		DowngradeAtRatio: 0.8, CacheHitAlarmThreshold: 0.5,
 	}, nil, nil)
-	governor.RecordUsage(context.Background(), ledger, "trace1", "t_test", "claude-sonnet-5",
+	governor.RecordUsage(context.Background(), 0, ledger, "trace1", "t_test", "claude-sonnet-5",
 		Usage{InputTokens: 1000}, 0.02, "ok", 10, "")
 	ledger.calls = nil
 
