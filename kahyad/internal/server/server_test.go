@@ -1,0 +1,219 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/logx"
+)
+
+// shortSocketDir returns a short-path temp dir suitable for unix sockets.
+// macOS unix socket paths are capped around ~104 bytes; t.TempDir() nests
+// deep enough (e.g. /private/var/folders/.../TestName/001/002) to blow
+// past that, so tests bind sockets under a short os.MkdirTemp dir instead
+// and clean it up themselves.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "k")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+func testLogger(t *testing.T) *logx.Logger {
+	t.Helper()
+	l, err := logx.New(t.TempDir(), "test0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return l
+}
+
+func testConfig(socketPath string) config.Config {
+	return config.Config{Socket: socketPath}
+}
+
+// unixHTTPClient returns an http.Client that dials socketPath for every
+// request, matching how the real kahya CLI talks to kahyad.
+func unixHTTPClient(socketPath string) *http.Client {
+	return &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test-123")
+
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+
+	client := unixHTTPClient(socketPath)
+	resp, err := client.Get("http://kahyad/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status field = %v, want ok", body["status"])
+	}
+	if body["version"] != "v-test-123" {
+		t.Errorf("version field = %v, want v-test-123", body["version"])
+	}
+	if _, ok := body["pid"]; !ok {
+		t.Error("pid field missing")
+	}
+	if _, ok := body["uptime_s"]; !ok {
+		t.Error("uptime_s field missing")
+	}
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("stat socket: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("socket perm = %o, want 600", perm)
+	}
+
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Errorf("socket file still exists after Shutdown: err=%v", err)
+	}
+}
+
+func TestStaleSocketTakeover(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+
+	// Simulate a daemon that crashed without cleaning up: bind a real unix
+	// listener, then close it WITHOUT unlinking, leaving an orphaned socket
+	// file that nothing is listening on.
+	staleLn, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("create stale listener: %v", err)
+	}
+	if ul, ok := staleLn.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	if err := staleLn.Close(); err != nil {
+		t.Fatalf("close stale listener: %v", err)
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		t.Fatalf("expected stale socket file to remain on disk: %v", err)
+	}
+
+	srv := New(testConfig(socketPath), testLogger(t), "v-test")
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() over stale socket should succeed, got: %v", err)
+	}
+	go srv.Serve()
+
+	client := unixHTTPClient(socketPath)
+	resp, err := client.Get("http://kahyad/health")
+	if err != nil {
+		t.Fatalf("GET /health after takeover: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+}
+
+func TestSecondInstanceRefused(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+
+	first := New(testConfig(socketPath), testLogger(t), "v-first")
+	if err := first.Prepare(); err != nil {
+		t.Fatalf("first Prepare() error = %v", err)
+	}
+	go first.Serve()
+	defer first.Shutdown()
+
+	// Give the first instance's listener a moment to be dial-able (bind
+	// already happened synchronously in Prepare, but be defensive).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := unixHTTPClient(socketPath).Get("http://kahyad/health"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first instance never became healthy")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	second := New(testConfig(socketPath), testLogger(t), "v-second")
+	err := second.Prepare()
+	if err == nil {
+		t.Fatal("second Prepare() error = nil, want ErrAlreadyRunning")
+	}
+	if err != ErrAlreadyRunning {
+		t.Fatalf("second Prepare() error = %v, want ErrAlreadyRunning", err)
+	}
+}
+
+func TestRunGracefulShutdownOnContextCancel(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-run")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := unixHTTPClient(socketPath).Get("http://kahyad/health"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server never became healthy")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run() returned error after cancel: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run() did not return after context cancellation")
+	}
+
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Errorf("socket file still exists after Run() shutdown: err=%v", err)
+	}
+}

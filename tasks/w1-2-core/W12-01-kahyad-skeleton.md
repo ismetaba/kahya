@@ -1,6 +1,6 @@
 # W12-01 — kahyad skeleton
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W0-02
 **Flags:** none

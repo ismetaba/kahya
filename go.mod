@@ -2,7 +2,10 @@ module kahya
 
 go 1.26.4
 
-require github.com/pressly/goose/v3 v3.27.2
+require (
+	github.com/pressly/goose/v3 v3.27.2
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/mfridman/interpolate v0.0.2 // indirect

@@ -1,13 +1,67 @@
-// kahyad is the Kâhya control-plane daemon. This is a build/codesign stub;
-// W12-01 replaces it with the real daemon (config, UDS listener, JSONL logging).
+// kahyad is the Kâhya control-plane daemon (HANDOFF §4): intent router,
+// task/saga state machine, policy engine, cost governor, ledger, scheduler,
+// and the SQLite memory index. This file is the daemon entrypoint:
+// load config → init logger → start the UDS HTTP server → block on
+// SIGTERM/SIGINT → graceful shutdown (W12-01 step 1/4).
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"kahya/kahyad/internal/buildinfo"
+	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/server"
+	"kahya/kahyad/internal/traceid"
 )
 
 func main() {
-	fmt.Printf("kahyad %s (stub; replaced by W12-01)\n", buildinfo.Version)
+	os.Exit(run())
+}
+
+// run contains main's logic and returns the process exit code, so defers
+// (closing the log file) actually execute before the process exits.
+func run() int {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kahyad: config error: %v\n", err)
+		return 1
+	}
+
+	bootTraceID := traceid.New()
+	log, err := logx.New(cfg.LogDir, bootTraceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kahyad: logger init error: %v\n", err)
+		return 1
+	}
+	defer log.Close()
+
+	log.Info("boot",
+		"version", buildinfo.Version,
+		"env", cfg.Env,
+		"socket", cfg.Socket,
+		"pid", os.Getpid(),
+	)
+
+	srv := server.New(cfg, log, buildinfo.Version)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := srv.Run(ctx); err != nil {
+		if errors.Is(err, server.ErrAlreadyRunning) {
+			// server.Run already logged event=already_running.
+			return 1
+		}
+		log.Error("fatal", "err", err.Error())
+		return 1
+	}
+
+	log.Info("shutdown_complete")
+	return 0
 }
