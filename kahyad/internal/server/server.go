@@ -5,6 +5,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -136,6 +138,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/v1/reindex", s.handleReindex)
+	mux.HandleFunc("/v1/log", s.handleLog)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -486,6 +489,103 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// logLineResponse is GET /v1/log's response body (W12-06 deliverable: this
+// endpoint is read-only log plumbing owned by kahyad; the kahya CLI, W12-06's
+// client, is the only consumer of it so far). Lines is every matching JSONL
+// line, each decoded to a generic object and re-encoded, ordered by ts
+// ascending across every source file.
+type logLineResponse struct {
+	Lines []map[string]any `json:"lines"`
+}
+
+// handleLog answers GET /v1/log?trace_id=<id>: it scans every
+// <log_dir>/*.jsonl file for lines whose trace_id matches the query
+// parameter, ordered by ts ascending. This is read-only log plumbing, not
+// task/policy logic, so it never fails closed on a security decision - only
+// on malformed input (empty trace_id) or I/O errors reading the log
+// directory itself.
+func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
+	traceID := strings.TrimSpace(r.URL.Query().Get("trace_id"))
+	if traceID == "" {
+		writeJSONError(w, http.StatusBadRequest, "trace_id must not be empty")
+		return
+	}
+
+	lines, err := readLogLines(s.cfg.LogDir, traceID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(logLineResponse{Lines: lines})
+}
+
+// timedLine pairs a decoded JSONL line with its parsed ts, purely so
+// readLogLines can sort by time without re-parsing ts as a string compare
+// (RFC3339Nano strips trailing zero fractional digits, so it is not always
+// lexicographically sortable).
+type timedLine struct {
+	ts   time.Time
+	line map[string]any
+}
+
+// readLogLines implements handleLog's scan: every *.jsonl file directly
+// under logDir is opened, scanned line by line, and each line whose
+// "trace_id" field equals traceID is decoded, tagged with "proc" (the
+// file's basename minus ".jsonl" - e.g. "kahyad.jsonl" -> "kahyad",
+// "worker.jsonl" -> "worker", per W12-06 step 4: "proc derived from source
+// file name"), and collected. A missing log dir is not an error (a fresh
+// install may not have logged anything yet under it); a malformed line or an
+// unreadable file is skipped rather than failing the whole request, since
+// one bad line/rotated-away file must not hide every other matching line.
+func readLogLines(logDir, traceID string) ([]map[string]any, error) {
+	paths, err := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("server: glob log dir %s: %w", logDir, err)
+	}
+
+	var timed []timedLine
+	for _, path := range paths {
+		proc := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		f, err := os.Open(path)
+		if err != nil {
+			continue // rotated/removed mid-scan: skip, don't fail the request
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // JSONL lines can carry long payloads
+		for sc.Scan() {
+			raw := strings.TrimSpace(sc.Text())
+			if raw == "" {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(raw), &m); err != nil {
+				continue // malformed line: skip, don't fail the whole request
+			}
+			if tid, _ := m["trace_id"].(string); tid != traceID {
+				continue
+			}
+			m["proc"] = proc
+			var ts time.Time
+			if s, ok := m["ts"].(string); ok {
+				ts, _ = time.Parse(time.RFC3339Nano, s) // zero value sorts first if unparsable
+			}
+			timed = append(timed, timedLine{ts: ts, line: m})
+		}
+		f.Close()
+	}
+
+	sort.SliceStable(timed, func(i, j int) bool { return timed[i].ts.Before(timed[j].ts) })
+
+	out := make([]map[string]any, 0, len(timed))
+	for _, t := range timed {
+		out = append(out, t.line)
+	}
+	return out, nil
 }
 
 // writeJSONError writes a {"error": msg} body with the given status code -

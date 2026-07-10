@@ -814,3 +814,130 @@ func TestReindexEndpointGenericErrorIs500(t *testing.T) {
 		t.Errorf("status = %d, want 500", resp.StatusCode)
 	}
 }
+
+// writeJSONL writes lines (each already a complete JSON object) to path,
+// one per line, for /v1/log test fixtures.
+func writeJSONL(t *testing.T, path string, lines []string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestLogEndpointFiltersOrdersAndTagsProc guards GET /v1/log's kahyad-side
+// contract (W12-06 deliverable): only lines whose trace_id matches the
+// query parameter are returned, ordered by ts ascending across every
+// *.jsonl file in log_dir, each tagged with "proc" (source file's basename
+// minus ".jsonl"). The worker.jsonl fixture line also carries the task
+// spec's byte-exact Turkish payload ("Kadıköy randevusu") to prove it
+// survives the read-decode-reencode round trip untouched.
+func TestLogEndpointFiltersOrdersAndTagsProc(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	logDir := t.TempDir()
+
+	writeJSONL(t, filepath.Join(logDir, "kahyad.jsonl"), []string{
+		`{"ts":"2026-07-10T09:00:02.000Z","level":"INFO","event":"second","trace_id":"target"}`,
+		`{"ts":"2026-07-10T09:00:01.000Z","level":"INFO","event":"first","trace_id":"target"}`,
+		`{"ts":"2026-07-10T09:00:03.000Z","level":"INFO","event":"other-trace","trace_id":"not-target"}`,
+	})
+	writeJSONL(t, filepath.Join(logDir, "worker.jsonl"), []string{
+		`{"ts":"2026-07-10T09:00:01.500Z","level":"INFO","event":"worker-line","trace_id":"target","text":"Kadıköy randevusu"}`,
+	})
+
+	cfg := testConfig(socketPath)
+	cfg.LogDir = logDir
+	srv := New(cfg, testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/v1/log?trace_id=target")
+	if err != nil {
+		t.Fatalf("GET /v1/log: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body struct {
+		Lines []map[string]any `json:"lines"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (only trace_id=target lines): %+v", len(body.Lines), body.Lines)
+	}
+	if body.Lines[0]["event"] != "first" || body.Lines[1]["event"] != "worker-line" || body.Lines[2]["event"] != "second" {
+		t.Fatalf("lines not ordered by ts ascending: %+v", body.Lines)
+	}
+	if body.Lines[0]["proc"] != "kahyad" {
+		t.Errorf(`lines[0]["proc"] = %v, want "kahyad"`, body.Lines[0]["proc"])
+	}
+	if body.Lines[1]["proc"] != "worker" {
+		t.Errorf(`lines[1]["proc"] = %v, want "worker"`, body.Lines[1]["proc"])
+	}
+	if body.Lines[1]["text"] != "Kadıköy randevusu" {
+		t.Errorf(`lines[1]["text"] = %v, want byte-exact "Kadıköy randevusu"`, body.Lines[1]["text"])
+	}
+}
+
+// TestLogEndpointNoMatchesReturnsEmptyLines guards the "bogus trace_id"
+// path the kahya CLI's log --trace relies on to print its not-found string:
+// zero matches is a 200 with an empty "lines" array, not an error.
+func TestLogEndpointNoMatchesReturnsEmptyLines(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	logDir := t.TempDir()
+	writeJSONL(t, filepath.Join(logDir, "kahyad.jsonl"), []string{
+		`{"ts":"2026-07-10T09:00:01.000Z","level":"INFO","event":"e","trace_id":"other"}`,
+	})
+	cfg := testConfig(socketPath)
+	cfg.LogDir = logDir
+	srv := New(cfg, testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/v1/log?trace_id=bogus")
+	if err != nil {
+		t.Fatalf("GET /v1/log: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Lines []map[string]any `json:"lines"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Lines) != 0 {
+		t.Errorf("got %d lines, want 0", len(body.Lines))
+	}
+}
+
+// TestLogEndpointEmptyTraceIDIs400 guards malformed-input rejection: a
+// missing/empty trace_id query parameter is a 400, never a panic or a
+// whole-log dump.
+func TestLogEndpointEmptyTraceIDIs400(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/v1/log")
+	if err != nil {
+		t.Fatalf("GET /v1/log: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}

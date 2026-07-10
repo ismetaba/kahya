@@ -1,6 +1,6 @@
 # W12-06 — kahya CLI
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-01
 **Flags:** none
