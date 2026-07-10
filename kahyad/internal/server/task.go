@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"kahya/kahyad/internal/anthproxy"
+	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
@@ -76,6 +78,25 @@ func (s *Server) SetTaskStore(ts TaskStore) {
 	s.taskStore = ts
 }
 
+// SetAnthproxy wires POST /v1/task's per-task Anthropic forward-proxy +
+// cost governor (W12-08, HANDOFF §4 IPC ⚑): governor is the ONE shared,
+// in-process kahyad/internal/anthproxy.Governor (boot-rebuilt once in
+// main.go via anthproxy.Boot, then reused across every task for the rest
+// of the process's life); notifier is the alarm/notification sink
+// (kahyad/internal/notify); credential is the CredentialSource matching
+// cfg.CredentialMode ("keychain" or "passthrough" — see
+// kahyad/internal/anthproxy's package doc comment for the OWNER AUTH
+// DECISION this selects between); egressGate may be nil (always-allow)
+// until W3-05 fills in the real allowlist. Call before Prepare(); until
+// this is set, handleTask answers 503 the same way it does when taskStore
+// is unset (SetTaskStore's "unwired dependency" posture).
+func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Notifier, credential anthproxy.CredentialSource, egressGate func(*http.Request) error) {
+	s.anthGovernor = governor
+	s.anthNotifier = notifier
+	s.anthCredential = credential
+	s.anthEgressGate = egressGate
+}
+
 // taskRequest is POST /v1/task's request body - the exact shape
 // kahyad/cmd/kahya/client.go already POSTs (W12-06 contract): {"prompt",
 // "trace_id"}. trace_id follows the same optional-override pattern as
@@ -106,6 +127,10 @@ func rfc3339Now() string {
 func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	if s.taskStore == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "task engine not available")
+		return
+	}
+	if s.anthGovernor == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "anthropic forward-proxy not available")
 		return
 	}
 
@@ -207,6 +232,44 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info("task_spawned", "task_id", taskID, "model", envelope.Model)
 
+	// W12-08: open this task's own ephemeral forward-proxy listener BEFORE
+	// the SSE response starts, so a failure here is still a plain JSON
+	// 500 like every other pre-stream validation failure - never a
+	// mid-stream SSE error event. apiKey is minted once and used both as
+	// the proxy's expected local auth token AND the worker's own
+	// ANTHROPIC_API_KEY (docs/ipc.md: "kahya-task-<hex32>" - the real key
+	// never leaves kahyad).
+	apiKey := spawn.NewAPIKey()
+	proxy, err := anthproxy.New(anthproxy.ProxyConfig{
+		TaskID:         taskID,
+		TraceID:        traceID,
+		Token:          apiKey,
+		UpstreamURL:    s.cfg.AnthropicUpstreamURL,
+		CredentialMode: s.cfg.CredentialMode,
+		Credential:     s.anthCredential,
+		Governor:       s.anthGovernor,
+		Notifier:       s.anthNotifier,
+		EventLedger:    s.eventLogger,
+		EgressGate:     s.anthEgressGate,
+		PauseBudget: func(ctx context.Context, pausedTaskID string) error {
+			return s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
+				State: "paused_budget", UpdatedAt: rfc3339Now(), ID: pausedTaskID,
+			})
+		},
+	})
+	if err != nil {
+		log.Error("anthproxy_new_failed", "task_id", taskID, "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "anthropic proxy init failed")
+		return
+	}
+	anthropicBaseURL, err := proxy.Start()
+	if err != nil {
+		log.Error("anthproxy_start_failed", "task_id", taskID, "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, "anthropic proxy start failed")
+		return
+	}
+	defer proxy.Close()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Error("task_streaming_unsupported")
@@ -236,13 +299,12 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		Cmd:    s.cfg.WorkerCmd,
 		Socket: s.cfg.Socket,
 		LogDir: s.cfg.LogDir,
-		// TODO(W12-08): once the forward-proxy lands, AnthropicBaseURL
-		// points at kahyad's own localhost listener instead of the real
-		// upstream, and APIKey (already minted per-task below) becomes the
-		// credential that listener authenticates each inbound request
-		// against.
-		AnthropicBaseURL: s.cfg.AnthropicUpstreamURL,
-		APIKey:           spawn.NewAPIKey(),
+		// W12-08: the worker talks only to THIS task's own ephemeral
+		// forward-proxy listener, never the real upstream directly - see
+		// the anthproxy.New/Start call above. apiKey is the same local
+		// token that listener validates every inbound request against.
+		AnthropicBaseURL: anthropicBaseURL,
+		APIKey:           apiKey,
 	}
 
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{

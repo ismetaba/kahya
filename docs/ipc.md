@@ -76,8 +76,37 @@ container), kahyad sets exactly six variables (`spawn.BuildEnv`):
 | `KAHYA_TRACE_ID` | The envelope's `trace_id`. |
 | `KAHYA_SOCKET` | `cfg.socket` — kahyad's own control socket, so the worker's `can_use_tool` hook (W12-09) can reach `POST /policy/check` over HTTP-over-UDS. |
 | `KAHYA_LOG_DIR` | `cfg.log_dir` — the worker writes its own JSONL logs here (every process logs JSONL with `trace_id` on every line, HANDOFF §4 ⚑). |
-| `ANTHROPIC_BASE_URL` | **TODO(W12-08):** until the forward-proxy lands, this is set directly from `cfg.anthropic_upstream_url` (`https://api.anthropic.com` by default) — i.e. the worker currently talks to the real Anthropic API directly if it were to use this var. From W12-08 on, this instead points at kahyad's own localhost forward-proxy listener, and the cost governor / cache-hit metric / egress gate are enforced at that proxy. |
-| `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). W12-08's per-task forward-proxy listener will reject any inbound request whose key does not match this exact token, so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. Until W12-08 lands, nothing actually checks this value. |
+| `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and the `egressGate` hook (nil/always-allow until W3-05) are enforced at that proxy, never in this package. |
+| `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
+
+### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
+
+HANDOFF §4 assumes kahyad reads a real Anthropic API key from the macOS
+Keychain and injects it into every proxied request. The owner decided NOT
+to provision a separate Anthropic API key for this project: the worker
+(`claude-agent-sdk`) instead authenticates through its own, already
+logged-in Claude Code SDK session. `kahyad/internal/anthproxy` implements
+BOTH modes behind one `CredentialSource` interface, selected by the new
+`credential_mode` config key:
+
+- `keychain` — the original HANDOFF design, fully implemented and tested
+  as a valid fallback: strip every inbound auth header, inject the real
+  key read from `kahyad/internal/secrets.Keychain` (never logged).
+- `passthrough` (**default**, the owner-decision mode) — after validating
+  the inbound per-task local token (`ANTHROPIC_API_KEY` above — this still
+  fully upholds "API anahtarı worker'a verilmez": no real Anthropic
+  credential ever reaches the worker either way), strip only the header
+  that carried that local token and forward any OTHER auth header the
+  worker's own HTTP client attached completely unchanged (its Claude Code
+  SDK session credential — the proxy never inspects, replaces, or logs
+  it).
+
+Everything else this task specifies (cost governor, cache-hit metric,
+egress-gate hook, usage/pricing) is auth-agnostic and built exactly per
+the frozen contract above; only credential injection differs by mode. The
+one deferred item is a live check with a real Keychain credential/session
+(no CI test exercises a real key or session) — see the W12-08 task file
+and its closing commit for the explicit deferral note.
 
 ## 4 · Worker stdout protocol (JSONL)
 
@@ -259,9 +288,11 @@ W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
   `UserPromptSubmit` hook, `can_use_tool` client side) — W12-09. Every
   test in this repo against this contract uses a fake worker script under
   `kahyad/internal/spawn/testdata/`.
-- **Forward-proxy + real `ANTHROPIC_BASE_URL`** — W12-08. Until then,
-  `ANTHROPIC_BASE_URL` is the real upstream URL and `ANTHROPIC_API_KEY` is
-  a token nothing yet validates.
+- **Forward-proxy + real `ANTHROPIC_BASE_URL`** — landed in W12-08 (see
+  the note above); the model-call `egressGate` hook itself is still a
+  nil/always-allow stub until W3-05 fills in the real allowlist, and the
+  "→yerel" downgrade rung stays unavailable (ledgered as
+  `budget_downgrade_unavailable`) until W3-08's local lane lands.
 - **Real policy** (`policy.yaml`, autonomy ladder, one-time approval
   tokens, W1 5-minute undo) — W3-01/W3-02. This document's §6 table is
   explicitly interim and will be replaced; the endpoint's request/response

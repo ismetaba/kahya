@@ -13,6 +13,17 @@ FROM events
 WHERE trace_id = ?
 ORDER BY id ASC;
 
+-- name: ListEventsByKind :many
+-- W12-08 (anthproxy cost governor): boot-time rebuild reads every
+-- historical event of one kind (e.g. 'model_call') and replays it into
+-- the in-memory governor totals - kahyad/internal/anthproxy stays
+-- store-agnostic (it never imports this package); main.go converts each
+-- row into an anthproxy.BootEvent.
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = ?
+ORDER BY id ASC;
+
 -- name: InsertTask :one
 INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

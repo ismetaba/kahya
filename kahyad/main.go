@@ -17,11 +17,14 @@ import (
 	"syscall"
 	"time"
 
+	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/secrets"
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/traceid"
@@ -118,6 +121,38 @@ func run() int {
 	// no adapter.
 	srv.SetTaskStore(st.Queries)
 
+	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
+	// (W12-08). notifier logs+ledgers alarms (Telegram delivery is
+	// W3-07); governor is rebuilt once here from every historical
+	// model_call ledger event, then shared across every task for the
+	// rest of the process's life (kahyad/internal/anthproxy.Governor is
+	// safe for concurrent use). credential is selected by
+	// cfg.credential_mode - see kahyad/internal/anthproxy's package doc
+	// comment for the OWNER AUTH DECISION this selects between
+	// (passthrough is the owner-decision default; keychain remains fully
+	// implemented as a valid fallback).
+	notifier := notify.New(log, st)
+	bootEvents, err := loadAnthproxyBootEvents(context.Background(), st)
+	if err != nil {
+		log.Error("anthproxy_boot_events_failed", "err", err.Error())
+		return 1
+	}
+	limits := anthproxy.Limits{
+		DailyBudgetUSD:         cfg.DailyBudgetUSD,
+		MonthlyBudgetUSD:       cfg.MonthlyBudgetUSD,
+		TaskTokenCeiling:       cfg.TaskTokenCeiling,
+		DowngradeAtRatio:       cfg.DowngradeAtRatio,
+		CacheHitAlarmThreshold: cfg.CacheHitAlarmThreshold,
+	}
+	governor := anthproxy.Boot(bootEvents, limits, nil, notifier)
+	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode)
+
+	credential := buildCredentialSource(cfg, log)
+	// EgressGate is nil for now (returns nil/always-allow) - the model-call
+	// egress gate lands in W3-05; the hook shape is fixed here so that
+	// task lands with no wiring changes to this file.
+	srv.SetAnthproxy(governor, notifier, credential, nil)
+
 	// ctx is created here (BEFORE the boot reindex goroutine below is
 	// spawned, not after) so that goroutine can share the SAME
 	// signal-cancelled context srv.Run uses, instead of running on an
@@ -194,6 +229,51 @@ func parseLogLevel(level string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// loadAnthproxyBootEvents reads every historical kind='model_call' ledger
+// event and decodes it into an anthproxy.BootEvent (W12-08 step 3: "SELECT
+// sums for today/this month/per task ... then maintained in memory") -
+// this is the one place a sqlcgen.Event row is converted into
+// anthproxy.BootEvent, keeping kahyad/internal/anthproxy itself
+// store-agnostic (it never imports sqlcgen). A row whose payload fails to
+// decode, or whose ts fails to parse, is skipped rather than failing boot
+// entirely - one malformed historical row must never block the daemon
+// from starting.
+func loadAnthproxyBootEvents(ctx context.Context, st *store.Store) ([]anthproxy.BootEvent, error) {
+	rows, err := st.Queries.ListEventsByKind(ctx, anthproxy.EventModelCall)
+	if err != nil {
+		return nil, fmt.Errorf("list model_call events: %w", err)
+	}
+	events := make([]anthproxy.BootEvent, 0, len(rows))
+	for _, row := range rows {
+		ts, err := time.Parse(time.RFC3339Nano, row.Ts)
+		if err != nil {
+			continue
+		}
+		var rec anthproxy.ModelCallRecord
+		if err := json.Unmarshal([]byte(row.Payload), &rec); err != nil {
+			continue
+		}
+		events = append(events, anthproxy.BootEvent{Ts: ts, Record: rec})
+	}
+	return events, nil
+}
+
+// buildCredentialSource selects the anthproxy.CredentialSource matching
+// cfg.CredentialMode (config.Load already fails closed on any other
+// value). In keychain mode, KAHYA_ANTHROPIC_KEY_OVERRIDE substitutes the
+// real Keychain read only when cfg.Env=="dev" (W12-10's hermetic gate);
+// any other value in prod is ignored with a loud
+// event=key_override_ignored warn line, never silently trusted.
+func buildCredentialSource(cfg config.Config, log *logx.Logger) anthproxy.CredentialSource {
+	if cfg.CredentialMode == config.CredentialModePassthrough {
+		return anthproxy.NewPassthroughCredentialSource()
+	}
+	warnOverrideIgnored := func() {
+		log.Warn("key_override_ignored", "reason", "KAHYA_ANTHROPIC_KEY_OVERRIDE set outside KAHYA_ENV=dev")
+	}
+	return anthproxy.NewKeychainCredentialSource(secrets.New(), cfg.Env, warnOverrideIgnored)
 }
 
 // bootFailLine emits a hand-rolled JSONL error line for failures that occur

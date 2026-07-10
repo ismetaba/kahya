@@ -1,6 +1,6 @@
 # W12-08 — Anthropic forward-proxy + cost governor
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-01, W0-04
 **Flags:** none
@@ -47,12 +47,12 @@ Prior output: W0-04 created Keychain item `kahya.anthropic` with ACL for the cod
 6. Tests: fake upstream `httptest.Server` asserting (a) inbound task token is stripped and replaced with the upstream key; (b) a request with a missing/wrong token gets `401` + `proxy_auth_reject` ledger row and the upstream records zero hits; (c) SSE streams through unbuffered (delta timing preserved via flusher); usage parsing fixtures for stream + non-stream; governor unit tests — ceiling blocks the 500K-crossing request, $-budgets block, 80% flips downgrade (Opus→Sonnet; Sonnet unchanged + `budget_downgrade_unavailable` until W3-08), boot-time rebuild from a fixture events table matches in-memory totals; per-task listener closes on task end (connection refused after); `KAHYA_ANTHROPIC_KEY_OVERRIDE` honored only when `cfg.Env=="dev"`, ignored + warn-logged in prod.
 
 ## Acceptance criteria
-- [ ] `make test` green including all step-6 tests; no test requires a real API key (Keychain test skips cleanly if `kahya.anthropic` absent).
-- [ ] Live check (key present): run a task via `bin/kahya` with `worker_cmd` = a fake worker that curls `$ANTHROPIC_BASE_URL/v1/messages` with header `x-api-key: $ANTHROPIC_API_KEY` and a 1-token Haiku request — response 200, and `sqlite3 brain.db "SELECT json_extract(payload,'$.model'), json_extract(payload,'$.usd') FROM events WHERE kind='model_call' ORDER BY id DESC LIMIT 1;"` shows the call priced.
-- [ ] `grep -c 'sk-ant' "$KAHYA_LOG_DIR"/*.jsonl` → 0, and the env seen by the fake worker contains only a `kahya-task-<hex32>` value in `ANTHROPIC_API_KEY` (real key never leaves kahyad); the same curl repeated with `x-api-key: wrong` from outside the worker gets `401` and a `proxy_auth_reject` ledger row.
-- [ ] Governor test proves fail-closed ordering: the request that would cross 500K is blocked BEFORE forwarding (fake upstream records zero hits for it).
-- [ ] With `daily_budget_usd` test-overridden to $0.01 and one priced fixture event inserted: next proxied request returns the Turkish budget-block message and ledger gains `task_paused_budget`.
-- [ ] Boot with a locked/absent Keychain: `/health` still `ok`, proxied request → 503 with `Keychain erişilemiyor…`, single `keychain_unavailable` notification event.
+- [x] `make test` green including all step-6 tests; no test requires a real API key (Keychain test skips cleanly if `kahya.anthropic` absent).
+- [!] Live check (key present): run a task via `bin/kahya` with `worker_cmd` = a fake worker that curls `$ANTHROPIC_BASE_URL/v1/messages` with header `x-api-key: $ANTHROPIC_API_KEY` and a 1-token Haiku request — response 200, and `sqlite3 brain.db "SELECT json_extract(payload,'$.model'), json_extract(payload,'$.usd') FROM events WHERE kind='model_call' ORDER BY id DESC LIMIT 1;"` shows the call priced. **DEFERRED per owner auth decision** (no real Anthropic API key is provisioned — the default `credential_mode=passthrough` relies on the worker's own Claude Code SDK session, which doesn't exist until W12-09's real worker lands): every automated test in this repo covers this exact flow against a hermetic mock upstream instead (`TestProxyKeychainModeStripsTokenAndInjectsKey`, `TestProxyPassthroughForwardsWorkerAuthUnchanged`, `TestProxySSEStreamsUnbufferedAndRecordsUsage`); re-run this exact manual check once a real session/key is available.
+- [x] `grep -c 'sk-ant' "$KAHYA_LOG_DIR"/*.jsonl` → 0, and the env seen by the fake worker contains only a `kahya-task-<hex32>` value in `ANTHROPIC_API_KEY` (real key never leaves kahyad); the same curl repeated with `x-api-key: wrong` from outside the worker gets `401` and a `proxy_auth_reject` ledger row.
+- [x] Governor test proves fail-closed ordering: the request that would cross 500K is blocked BEFORE forwarding (fake upstream records zero hits for it).
+- [x] With `daily_budget_usd` test-overridden to $0.01 and one priced fixture event inserted: next proxied request returns the Turkish budget-block message and ledger gains `task_paused_budget`.
+- [x] Boot with a locked/absent Keychain: `/health` still `ok`, proxied request → 503 with `Keychain erişilemiyor…`, single `keychain_unavailable` notification event.
 
 ## Out of scope
 - Telegram delivery of alarms — W3-07 (hooks only here). General egress proxy/allowlist for tools — W3-05 (this proxy gates model calls only).

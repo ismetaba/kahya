@@ -23,6 +23,18 @@ const (
 	EnvDev  = "dev"
 )
 
+// CredentialMode values accepted for Config.CredentialMode (W12-08).
+// kahyad/internal/anthproxy defines its own copy of these two literals
+// (rather than importing this package) so that package stays free of a
+// config.Config dependency; keep the two in sync by hand if either ever
+// changes - config_test.go and anthproxy's own tests each pin the literal
+// string value independently, so a drift would fail both suites' tests, not
+// silently pass.
+const (
+	CredentialModeKeychain    = "keychain"
+	CredentialModePassthrough = "passthrough"
+)
+
 // Config is kahyad's fully-resolved runtime configuration.
 type Config struct {
 	DataDir              string `yaml:"data_dir"`
@@ -53,6 +65,32 @@ type Config struct {
 	// an invalid KAHYA_ENV (MINOR 5).
 	LogLevel string `yaml:"log_level"`
 
+	// --- W12-08 cost governor (HANDOFF S4 flag, verbatim defaults) ---
+
+	// DailyBudgetUSD / MonthlyBudgetUSD are kahyad/internal/anthproxy's
+	// budget-block thresholds ("gunluk butce $10 / aylik $150").
+	DailyBudgetUSD   float64 `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD float64 `yaml:"monthly_budget_usd"`
+	// TaskTokenCeiling is the per-task token ceiling (input+output+
+	// cache_creation) - "gorev-basina 500K token tavani".
+	TaskTokenCeiling int64 `yaml:"task_token_ceiling"`
+	// DowngradeAtRatio is the fraction of DailyBudgetUSD at which the
+	// Opus->Sonnet downgrade rung flips (default 0.8, i.e. $8 of $10).
+	DowngradeAtRatio float64 `yaml:"downgrade_at_ratio"`
+	// CacheHitAlarmThreshold is the daily cache-hit-ratio floor below
+	// which (once >=20 calls that day) an alarm fires.
+	CacheHitAlarmThreshold float64 `yaml:"cache_hit_alarm_threshold"`
+	// CredentialMode selects how kahyad/internal/anthproxy authenticates
+	// to cfg.AnthropicUpstreamURL: "keychain" (original HANDOFF design -
+	// kahyad reads kahya.anthropic from the macOS Keychain and injects
+	// it) or "passthrough" (OWNER AUTH DECISION default - see
+	// kahyad/internal/anthproxy's package doc comment for the full
+	// rationale: the worker authenticates via its own Claude Code SDK
+	// session, so kahyad injects no credential and simply forwards the
+	// worker's own upstream auth header unchanged after validating the
+	// per-task local token).
+	CredentialMode string `yaml:"credential_mode"`
+
 	// Env is KAHYA_ENV ("prod" default | "dev"). It is env-only: there is
 	// no config.yaml key for it, since it exists precisely so tests and the
 	// W7-8 KAHYA_ENV=dev profile can redirect every path independent of any
@@ -63,18 +101,24 @@ type Config struct {
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir              *string   `yaml:"data_dir"`
-	Socket               *string   `yaml:"socket"`
-	LogDir               *string   `yaml:"log_dir"`
-	DBPath               *string   `yaml:"db_path"`
-	MemoryDir            *string   `yaml:"memory_dir"`
-	AnthropicUpstreamURL *string   `yaml:"anthropic_upstream_url"`
-	EmbedPort            *int      `yaml:"embed_port"`
-	DefaultModel         *string   `yaml:"default_model"`
-	TaskTimeoutMin       *int      `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer  *string   `yaml:"active_embed_model_ver"`
-	LogLevel             *string   `yaml:"log_level"`
-	WorkerCmd            *[]string `yaml:"worker_cmd"`
+	DataDir                *string   `yaml:"data_dir"`
+	Socket                 *string   `yaml:"socket"`
+	LogDir                 *string   `yaml:"log_dir"`
+	DBPath                 *string   `yaml:"db_path"`
+	MemoryDir              *string   `yaml:"memory_dir"`
+	AnthropicUpstreamURL   *string   `yaml:"anthropic_upstream_url"`
+	EmbedPort              *int      `yaml:"embed_port"`
+	DefaultModel           *string   `yaml:"default_model"`
+	TaskTimeoutMin         *int      `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer    *string   `yaml:"active_embed_model_ver"`
+	LogLevel               *string   `yaml:"log_level"`
+	WorkerCmd              *[]string `yaml:"worker_cmd"`
+	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
+	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
+	DowngradeAtRatio       *float64  `yaml:"downgrade_at_ratio"`
+	CacheHitAlarmThreshold *float64  `yaml:"cache_hit_alarm_threshold"`
+	CredentialMode         *string   `yaml:"credential_mode"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -106,6 +150,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateLogLevel(cfg.LogLevel); err != nil {
+		return Config{}, err
+	}
+	if err := validateCredentialMode(cfg.CredentialMode); err != nil {
 		return Config{}, err
 	}
 
@@ -145,6 +192,14 @@ func defaults(home string) Config {
 		LogLevel:             "info",
 		Env:                  EnvProd,
 		WorkerCmd:            defaultWorkerCmd(),
+
+		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
+		DailyBudgetUSD:         10,
+		MonthlyBudgetUSD:       150,
+		TaskTokenCeiling:       500000,
+		DowngradeAtRatio:       0.8,
+		CacheHitAlarmThreshold: 0.5,
+		CredentialMode:         CredentialModePassthrough,
 	}
 }
 
@@ -227,6 +282,24 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.WorkerCmd != nil {
 		cfg.WorkerCmd = *fc.WorkerCmd
 	}
+	if fc.DailyBudgetUSD != nil {
+		cfg.DailyBudgetUSD = *fc.DailyBudgetUSD
+	}
+	if fc.MonthlyBudgetUSD != nil {
+		cfg.MonthlyBudgetUSD = *fc.MonthlyBudgetUSD
+	}
+	if fc.TaskTokenCeiling != nil {
+		cfg.TaskTokenCeiling = *fc.TaskTokenCeiling
+	}
+	if fc.DowngradeAtRatio != nil {
+		cfg.DowngradeAtRatio = *fc.DowngradeAtRatio
+	}
+	if fc.CacheHitAlarmThreshold != nil {
+		cfg.CacheHitAlarmThreshold = *fc.CacheHitAlarmThreshold
+	}
+	if fc.CredentialMode != nil {
+		cfg.CredentialMode = *fc.CredentialMode
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -272,6 +345,17 @@ var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, 
 func validateLogLevel(level string) error {
 	if !validLogLevels[level] {
 		return fmt.Errorf("config: log_level=%q invalid, must be one of debug|info|warn|error", level)
+	}
+	return nil
+}
+
+// validateCredentialMode fails Load closed (same posture as
+// validateEnv/validateLogLevel) on any credential_mode value other than the
+// two W12-08 defines - an unrecognized value must never silently fall back
+// to either mode's behavior.
+func validateCredentialMode(mode string) error {
+	if mode != CredentialModeKeychain && mode != CredentialModePassthrough {
+		return fmt.Errorf("config: credential_mode=%q invalid, must be %q or %q", mode, CredentialModeKeychain, CredentialModePassthrough)
 	}
 	return nil
 }

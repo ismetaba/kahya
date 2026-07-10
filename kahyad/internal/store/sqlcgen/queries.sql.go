@@ -331,6 +331,48 @@ func (q *Queries) ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([
 	return items, nil
 }
 
+const listEventsByKind = `-- name: ListEventsByKind :many
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = ?
+ORDER BY id ASC
+`
+
+// W12-08 (anthproxy cost governor): boot-time rebuild reads every
+// historical event of one kind (e.g. 'model_call') and replays it into
+// the in-memory governor totals - kahyad/internal/anthproxy stays
+// store-agnostic (it never imports this package); main.go converts each
+// row into an anthproxy.BootEvent.
+func (q *Queries) ListEventsByKind(ctx context.Context, kind string) ([]Event, error) {
+	rows, err := q.db.QueryContext(ctx, listEventsByKind, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.Ts,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsByTrace = `-- name: ListEventsByTrace :many
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events

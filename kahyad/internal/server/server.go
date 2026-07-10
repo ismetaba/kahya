@@ -22,9 +22,11 @@ import (
 	"syscall"
 	"time"
 
+	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
 	"kahya/mcp/memory"
@@ -85,6 +87,14 @@ type Server struct {
 	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
 	// 4). See SetTaskStore's doc comment.
 	taskStore TaskStore
+
+	// anthGovernor/anthNotifier/anthCredential/anthEgressGate wire POST
+	// /v1/task's per-task Anthropic forward-proxy + cost governor
+	// (W12-08). See SetAnthproxy's doc comment (task.go).
+	anthGovernor   *anthproxy.Governor
+	anthNotifier   notify.Notifier
+	anthCredential anthproxy.CredentialSource
+	anthEgressGate func(*http.Request) error
 
 	ln   net.Listener
 	http *http.Server

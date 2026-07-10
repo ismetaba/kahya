@@ -31,6 +31,12 @@ type Querier interface {
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
 	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
+	// W12-08 (anthproxy cost governor): boot-time rebuild reads every
+	// historical event of one kind (e.g. 'model_call') and replays it into
+	// the in-memory governor totals - kahyad/internal/anthproxy stays
+	// store-agnostic (it never imports this package); main.go converts each
+	// row into an anthproxy.BootEvent.
+	ListEventsByKind(ctx context.Context, kind string) ([]Event, error)
 	ListEventsByTrace(ctx context.Context, traceID string) ([]Event, error)
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
 	// Upserts (update half) an existing memory_file episode in place on

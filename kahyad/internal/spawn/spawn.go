@@ -66,13 +66,14 @@ type Config struct {
 	// per the §4 IPC logging invariant (out of scope here - just plumbed
 	// through the environment).
 	LogDir string
-	// AnthropicBaseURL is ANTHROPIC_BASE_URL. TODO(W12-08): until the
-	// forward-proxy lands, callers set this directly from
-	// cfg.anthropic_upstream_url; from W12-08 on it instead points at
-	// kahyad's own localhost forward-proxy listener, and APIKey becomes
-	// the credential that listener authenticates each inbound request
-	// against - this field does not change shape when that lands, only
-	// its value's origin does.
+	// AnthropicBaseURL is ANTHROPIC_BASE_URL. Since W12-08, the caller
+	// (kahyad/internal/server's handleTask) sets this to the per-task
+	// kahyad/internal/anthproxy.Proxy's own ephemeral localhost listener
+	// address (http://127.0.0.1:<port>), started before Run is called and
+	// closed once it returns; APIKey is the credential that listener
+	// authenticates every inbound request against (W12-08's cost
+	// governor, cache-hit metric, and egress-gate hook all live at that
+	// proxy point, never in this package).
 	AnthropicBaseURL string
 	// APIKey is ANTHROPIC_API_KEY: a per-task random token
 	// (NewAPIKey, "kahya-task-<hex32>"), NOT a real Anthropic key - the

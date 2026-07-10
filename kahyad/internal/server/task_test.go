@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
@@ -127,6 +128,17 @@ func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTe
 	srv := New(cfg, log, "v-task-test", healthyDB)
 	srv.SetEventLogger(st)
 	srv.SetTaskStore(st.Queries)
+	// W12-08: handleTask now requires an anthproxy Governor to be wired
+	// (same "unwired dependency -> 503" posture as taskStore). Generous
+	// limits so none of these pre-existing W12-07 fixtures ever trip a
+	// budget/ceiling block; passthrough mode needs no Keychain/real key.
+	srv.SetAnthproxy(anthproxy.NewGovernor(anthproxy.Limits{
+		DailyBudgetUSD:         1000,
+		MonthlyBudgetUSD:       10000,
+		TaskTokenCeiling:       500000,
+		DowngradeAtRatio:       0.8,
+		CacheHitAlarmThreshold: 0.5,
+	}, nil, nil), nil, anthproxy.NewPassthroughCredentialSource(), nil)
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
