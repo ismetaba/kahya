@@ -242,3 +242,57 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 		t.Errorf("Health() schemaVersion = %d, want %d", version, s.SchemaVersion())
 	}
 }
+
+// TestEventsReplaceCannotBypassAppendOnly guards the recursive_triggers
+// pragma: with it OFF, INSERT OR REPLACE's implicit row-delete on a PK
+// conflict skips the events DELETE trigger and silently overwrites a
+// ledger row (§5 safety #4 violation). With _recursive_triggers=on in the
+// DSN, the implicit delete fires events_no_delete and the REPLACE fails.
+func TestEventsReplaceCannotBypassAppendOnly(t *testing.T) {
+	s, err := Open(testCfg(t))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	ev, err := s.Queries.InsertEvent(ctx, sqlcgen.InsertEventParams{
+		TraceID:   "t-replace-bypass",
+		Ts:        "2026-07-10T00:00:00Z",
+		Kind:      "test_event",
+		Payload:   `{"a":1}`,
+		CreatedAt: "2026-07-10T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	// Sanity: the pragma must actually be on for this connection pool.
+	var rt int
+	if err := s.DB().QueryRowContext(ctx, `PRAGMA recursive_triggers`).Scan(&rt); err != nil {
+		t.Fatalf("PRAGMA recursive_triggers: %v", err)
+	}
+	if rt != 1 {
+		t.Fatalf("recursive_triggers = %d, want 1 (DSN must set _recursive_triggers=on)", rt)
+	}
+
+	_, err = s.DB().ExecContext(ctx,
+		`INSERT OR REPLACE INTO events (id, trace_id, ts, kind, payload, created_at)
+		 VALUES (?, 'TAMPERED', '2099-01-01T00:00:00Z', 'k', '{"a":999}', '2099-01-01T00:00:00Z')`,
+		ev.ID)
+	if err == nil {
+		t.Fatal("INSERT OR REPLACE on events succeeded, want failure (ledger is append-only)")
+	}
+	if !strings.Contains(err.Error(), "ledger is append-only") {
+		t.Errorf("INSERT OR REPLACE error = %q, want it to contain %q", err.Error(), "ledger is append-only")
+	}
+
+	// The original row must be intact.
+	var traceID string
+	if err := s.DB().QueryRowContext(ctx, `SELECT trace_id FROM events WHERE id = ?`, ev.ID).Scan(&traceID); err != nil {
+		t.Fatalf("re-read event: %v", err)
+	}
+	if traceID != "t-replace-bypass" {
+		t.Errorf("event trace_id = %q after failed REPLACE, want original %q", traceID, "t-replace-bypass")
+	}
+}

@@ -298,7 +298,7 @@ func TestTakeoverRaceSingleWinner(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			<-start
-			ln, lock, err := prepareListener(sock)
+			ln, lock, err := prepareListener(sock, nil)
 			results <- result{ln, lock, err}
 		}()
 	}
@@ -349,7 +349,7 @@ func TestSocketDirPermsTightenedWhenPreexisting(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	sock := filepath.Join(sockDir, "s.sock")
-	ln, lock, err := prepareListener(sock)
+	ln, lock, err := prepareListener(sock, nil)
 	if err != nil {
 		t.Fatalf("prepareListener: %v", err)
 	}

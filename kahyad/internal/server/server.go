@@ -66,6 +66,13 @@ func New(cfg config.Config, log *logx.Logger, version string, db DBHealth) *Serv
 	return &Server{cfg: cfg, log: log, version: version, db: db}
 }
 
+// AdoptStartupLock hands the Server a startup flock already acquired via
+// AcquireStartupLock (the production path acquires it before the DB opens).
+// The Server owns it from here: Shutdown releases it.
+func (s *Server) AdoptStartupLock(f *os.File) {
+	s.lock = f
+}
+
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and
 // binds the listener, but does not yet start serving:
 //   - socket file missing → bind fresh.
@@ -75,7 +82,7 @@ func New(cfg config.Config, log *logx.Logger, version string, db DBHealth) *Serv
 //
 // The bound socket is chmod'd 0600.
 func (s *Server) Prepare() error {
-	ln, lock, err := prepareListener(s.cfg.Socket)
+	ln, lock, err := prepareListener(s.cfg.Socket, s.lock)
 	if err != nil {
 		if errors.Is(err, ErrAlreadyRunning) {
 			s.log.Error("already_running", "socket", s.cfg.Socket)
@@ -143,11 +150,16 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// acquireStartupLock takes the exclusive cross-process flock that serializes
-// socket takeover. It also creates the socket directory and tightens it to
-// 0700 even when it pre-existed with looser permissions (MkdirAll alone is a
-// no-op on an existing directory's mode).
-func acquireStartupLock(socketPath string) (*os.File, error) {
+// AcquireStartupLock takes the exclusive cross-process flock that serializes
+// the entire daemon startup — socket takeover AND everything before it.
+// main.go MUST call this before store.Open: goose migrations against a
+// fresh brain.db are not safe to race, and kahyad being brain.db's only
+// writer implies at most one kahyad exists from the first DB byte on.
+// Pass the returned lock to the Server via AdoptStartupLock. It also
+// creates the socket directory and tightens it to 0700 even when it
+// pre-existed with looser permissions (MkdirAll alone is a no-op on an
+// existing directory's mode).
+func AcquireStartupLock(socketPath string) (*os.File, error) {
 	dir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("server: create socket dir: %w", err)
@@ -177,11 +189,15 @@ func acquireStartupLock(socketPath string) (*os.File, error) {
 // startup lock. The flock makes the stat→probe→remove→listen sequence
 // atomic across processes — without it, two racing startups can both
 // conclude the socket is dead, both bind, and later unlink each other's
-// live socket.
-func prepareListener(socketPath string) (net.Listener, *os.File, error) {
-	lock, err := acquireStartupLock(socketPath)
-	if err != nil {
-		return nil, nil, err
+// live socket. If lock is nil it is acquired here (test convenience);
+// the production path acquires it earlier, before the DB opens.
+func prepareListener(socketPath string, lock *os.File) (net.Listener, *os.File, error) {
+	if lock == nil {
+		var err error
+		lock, err = AcquireStartupLock(socketPath)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	if _, err := os.Stat(socketPath); err == nil {

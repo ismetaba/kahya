@@ -52,6 +52,20 @@ func run() int {
 		"pid", os.Getpid(),
 	)
 
+	// Serialize the WHOLE startup — including migrations — across
+	// processes: kahyad is brain.db's only writer, so at most one kahyad
+	// may exist from the first DB byte on. Without this, two racing boots
+	// (double launch, launchd respawn overlap) race goose.Up on a fresh DB.
+	lock, err := server.AcquireStartupLock(cfg.Socket)
+	if err != nil {
+		if errors.Is(err, server.ErrAlreadyRunning) {
+			log.Error("already_running", "socket", cfg.Socket)
+			return 1
+		}
+		log.Error("startup_lock_failed", "err", err.Error())
+		return 1
+	}
+
 	// Migrate before anything else can serve a request: a half-migrated
 	// brain.db must never be reachable (HANDOFF §4 ⚑ fail-closed).
 	st, err := store.Open(cfg)
@@ -63,6 +77,7 @@ func run() int {
 	log.Info("migrations_applied", "schema_version", st.SchemaVersion())
 
 	srv := server.New(cfg, log, buildinfo.Version, st)
+	srv.AdoptStartupLock(lock)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -24,8 +24,10 @@ import (
 // connection via DSN query parameters (HANDOFF §4 stack; W12-02 step 2):
 // WAL journal, a 5s busy timeout so concurrent readers/writers back off
 // instead of failing immediately, foreign key enforcement on, and NORMAL
-// synchronous (safe under WAL).
-const dsnPragmas = "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=NORMAL"
+// synchronous (safe under WAL). recursive_triggers must be ON or the
+// implicit row-delete performed by INSERT OR REPLACE skips the events
+// append-only DELETE trigger, silently overwriting ledger rows (§5 #4).
+const dsnPragmas = "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=NORMAL&_recursive_triggers=on"
 
 // walAutocheckpointPages matches the step-2 checkpoint policy: run an
 // automatic passive checkpoint every 1000 WAL pages so the WAL file never
