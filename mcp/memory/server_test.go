@@ -3,11 +3,13 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -83,6 +85,20 @@ func runGitT(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// installFailingPreCommitHook makes every future `git commit` in repoRoot
+// fail, WITHOUT affecting `git add`/`git mv` (hooks only run on commit) -
+// used to deterministically force the "file/mv already landed, then the
+// commit step failed" orphan scenario the mutate-sequence restore logic
+// (restoreMemoryFile / the reverse git mv in HandleForget) must clean up
+// after.
+func installFailingPreCommitHook(t *testing.T, repoRoot string) {
+	t.Helper()
+	hookPath := filepath.Join(repoRoot, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write failing pre-commit hook: %v", err)
+	}
 }
 
 func newTestServer(memoryDir string, search Searcher, idx Indexer, ledger Ledger) *Server {
@@ -289,6 +305,165 @@ func TestHandleWriteRejectsTraversal(t *testing.T) {
 	}
 }
 
+// ---- Blocker 1 regression: commit must be scoped to ONLY the path(s) the
+// operation itself touched, never sweeping in whatever else a caller
+// already `git add`-ed in the memory repo. ----
+
+func TestHandleWriteCommitsOnlyItsOwnFileNotPreStagedContent(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+
+	// A user (or some other process) has already `git add`-ed an unrelated
+	// file in the memory repo, but not committed it yet.
+	userFile := filepath.Join(memDir, "user-draft.md")
+	if err := os.WriteFile(userFile, []byte("kullanicinin henuz commitlemedigi taslak"), 0o600); err != nil {
+		t.Fatalf("seed user file: %v", err)
+	}
+	runGitT(t, repoRoot, "add", "--", "memory/user-draft.md")
+
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{episodeID: 1}, &fakeLedger{})
+	out, err := s.HandleWrite(context.Background(), "tid", MemoryWriteArgs{Content: "ajan notu", File: "inbox/agent.md"})
+	if err != nil {
+		t.Fatalf("HandleWrite: %v", err)
+	}
+
+	changed := runGitT(t, repoRoot, "show", "--name-only", "--format=", out.CommitSHA)
+	files := strings.Fields(changed)
+	if len(files) != 1 || files[0] != "memory/inbox/agent.md" {
+		t.Fatalf("commit %s changed files = %v, want exactly [memory/inbox/agent.md]", out.CommitSHA, files)
+	}
+	author := runGitT(t, repoRoot, "log", "-1", "--format=%an", out.CommitSHA)
+	if author != "kahyad" {
+		t.Errorf("commit author = %q, want kahyad", author)
+	}
+
+	// The pre-staged user file must remain staged and uncommitted - NOT
+	// swept into kahyad's commit.
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if !strings.Contains(status, "user-draft.md") {
+		t.Errorf("git status --porcelain = %q, want user-draft.md still listed (staged, uncommitted)", status)
+	}
+	headFiles := runGitT(t, repoRoot, "ls-tree", "-r", "--name-only", "HEAD")
+	if strings.Contains(headFiles, "user-draft.md") {
+		t.Errorf("HEAD tree = %q, must NOT contain user-draft.md", headFiles)
+	}
+}
+
+// ---- Blocker 2 regression: the whole write mutate sequence must
+// serialize (no .git/index.lock races) and never leave an orphan
+// (uncommitted/unreindexed/unledgered) file on disk. ----
+
+func TestHandleWriteConcurrentCallsSerializeWithNoOrphans(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	idx := &fakeIndexer{episodeID: 1}
+	led := &fakeLedger{}
+	s := newTestServer(memDir, &fakeSearcher{}, idx, led)
+
+	const n = 12
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	shas := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			out, err := s.HandleWrite(context.Background(), fmt.Sprintf("tid-%d", i), MemoryWriteArgs{
+				Content: fmt.Sprintf("not %d", i),
+				File:    fmt.Sprintf("inbox/concurrent-%d.md", i),
+			})
+			errs[i], shas[i] = err, out.CommitSHA
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: HandleWrite error: %v", i, err)
+		}
+	}
+	seenSHA := make(map[string]bool, n)
+	for i, sha := range shas {
+		if sha == "" {
+			t.Errorf("goroutine %d: empty commit sha", i)
+			continue
+		}
+		if seenSHA[sha] {
+			t.Errorf("commit sha %s produced by more than one goroutine, want each write its own commit", sha)
+		}
+		seenSHA[sha] = true
+	}
+	if len(idx.calls) != n {
+		t.Errorf("ReindexFile calls = %d, want %d (one per write)", len(idx.calls), n)
+	}
+	if len(led.events) != n {
+		t.Errorf("ledger events = %d, want %d (one per write)", len(led.events), n)
+	}
+	for i := 0; i < n; i++ {
+		want := filepath.Join(memDir, "inbox", fmt.Sprintf("concurrent-%d.md", i))
+		if _, err := os.Stat(want); err != nil {
+			t.Errorf("file for goroutine %d missing on disk: %v", i, err)
+		}
+	}
+
+	// No untracked/orphan files: every byte written above must have been
+	// committed too, so the working tree matches the index exactly.
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if status != "" {
+		t.Errorf("git status --porcelain = %q, want clean (no untracked/orphan files)", status)
+	}
+}
+
+func TestHandleWriteGitCommitFailureLeavesNoOrphanNewFile(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	installFailingPreCommitHook(t, repoRoot)
+
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
+	target := "inbox/orphan-check.md"
+	if _, err := s.HandleWrite(context.Background(), "tid", MemoryWriteArgs{Content: "x", File: target}); err == nil {
+		t.Fatal("HandleWrite with a failing pre-commit hook = nil error, want error")
+	}
+
+	if _, err := os.Stat(filepath.Join(memDir, filepath.FromSlash(target))); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file present after failed HandleWrite (err=%v), want it removed (no orphan)", err)
+	}
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if status != "" {
+		t.Errorf("git status --porcelain after failed write = %q, want clean (add was unstaged too)", status)
+	}
+}
+
+func TestHandleWriteGitCommitFailureRestoresPriorContentOnAppend(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
+
+	if _, err := s.HandleWrite(context.Background(), "t1", MemoryWriteArgs{Content: "ilk", File: "inbox/x.md"}); err != nil {
+		t.Fatalf("seed HandleWrite: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(memDir, "inbox", "x.md"))
+	if err != nil {
+		t.Fatalf("read seeded file: %v", err)
+	}
+
+	// Break the SECOND write's commit step only (the seed commit above
+	// already landed fine).
+	installFailingPreCommitHook(t, repoRoot)
+
+	if _, err := s.HandleWrite(context.Background(), "t2", MemoryWriteArgs{Content: "ikinci", File: "inbox/x.md"}); err == nil {
+		t.Fatal("HandleWrite with a failing pre-commit hook = nil error, want error")
+	}
+
+	after, err := os.ReadFile(filepath.Join(memDir, "inbox", "x.md"))
+	if err != nil {
+		t.Fatalf("read file after failed write: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("file content after failed write = %q, want restored to prior %q", after, before)
+	}
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if status != "" {
+		t.Errorf("git status --porcelain after failed write = %q, want clean", status)
+	}
+}
+
 // ---- memory_forget ----
 
 func TestHandleForgetHeadingRemovesOnlyThatSection(t *testing.T) {
@@ -413,6 +588,136 @@ func TestHandleForgetRejectsTraversal(t *testing.T) {
 	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
 	if _, err := s.HandleForget(context.Background(), "t", MemoryForgetArgs{File: "../../etc/passwd"}); err == nil {
 		t.Fatal("HandleForget(traversal) = nil error, want error")
+	}
+}
+
+// ---- Blocker 1 regression (memory_forget side): whole-file trash mode
+// must commit BOTH the old and new .trash path and nothing else, never
+// sweeping in whatever a caller already staged. ----
+
+func TestHandleForgetFileModeCommitsOldAndNewPathOnly(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	if err := os.WriteFile(filepath.Join(memDir, "notes.md"), []byte("iceri"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	runGitT(t, repoRoot, "add", "-A")
+	runGitT(t, repoRoot, "-c", "user.email=seed@example.com", "-c", "user.name=Seed", "commit", "-q", "-m", "seed")
+
+	// A user (or some other process) has already `git add`-ed an unrelated
+	// file in the memory repo, but not committed it yet.
+	if err := os.WriteFile(filepath.Join(memDir, "user-draft.md"), []byte("taslak"), 0o600); err != nil {
+		t.Fatalf("seed user file: %v", err)
+	}
+	runGitT(t, repoRoot, "add", "--", "memory/user-draft.md")
+
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{episodeID: 9}, &fakeLedger{})
+	out, err := s.HandleForget(context.Background(), "tid", MemoryForgetArgs{File: "notes.md"})
+	if err != nil {
+		t.Fatalf("HandleForget: %v", err)
+	}
+
+	// Use --name-status (not --name-only): git auto-detects this as a pure
+	// rename and --name-only would then print just the destination path on
+	// its own, collapsing the very thing this test needs to check (both
+	// sides of the rename are the ONLY two paths this commit touches).
+	// --name-status always lists every path column for a rename ("R100
+	// old\tnew" as one line), so parse the path columns out of each line
+	// rather than assuming a fixed line count.
+	changed := runGitT(t, repoRoot, "show", "--name-status", "--format=", out.CommitSHA)
+	touched := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(changed), "\n") {
+		fields := strings.Split(line, "\t")
+		for _, p := range fields[1:] {
+			touched[p] = true
+		}
+	}
+	foundOld := touched["memory/notes.md"]
+	foundNew := false
+	for p := range touched {
+		if strings.HasPrefix(p, "memory/.trash/") && strings.HasSuffix(p, "-notes.md") {
+			foundNew = true
+		}
+	}
+	if len(touched) != 2 || !foundOld || !foundNew {
+		t.Errorf("commit %s touched paths = %v, want exactly memory/notes.md and memory/.trash/*-notes.md", out.CommitSHA, touched)
+	}
+
+	author := runGitT(t, repoRoot, "log", "-1", "--format=%an", out.CommitSHA)
+	if author != "kahyad" {
+		t.Errorf("commit author = %q, want kahyad", author)
+	}
+
+	// The pre-staged user file must remain staged and uncommitted - NOT
+	// swept into kahyad's commit.
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if !strings.Contains(status, "user-draft.md") {
+		t.Errorf("git status --porcelain = %q, want user-draft.md still listed (staged, uncommitted)", status)
+	}
+}
+
+// ---- Blocker 2 regression (memory_forget side): a failed git commit
+// after the on-disk mutation already happened must never leave an orphan
+// (uncommitted) change behind. ----
+
+func TestHandleForgetHeadingGitCommitFailureRestoresPriorContent(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	original := "# Notlar\n\n## Birinci\nBirinci icerik.\n\n## Ikinci\nIkinci icerik.\n"
+	if err := os.WriteFile(filepath.Join(memDir, "notes.md"), []byte(original), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	runGitT(t, repoRoot, "add", "-A")
+	runGitT(t, repoRoot, "-c", "user.email=seed@example.com", "-c", "user.name=Seed", "commit", "-q", "-m", "seed")
+
+	installFailingPreCommitHook(t, repoRoot)
+
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
+	if _, err := s.HandleForget(context.Background(), "t", MemoryForgetArgs{File: "notes.md", Heading: "Ikinci"}); err == nil {
+		t.Fatal("HandleForget with a failing pre-commit hook = nil error, want error")
+	}
+
+	after, err := os.ReadFile(filepath.Join(memDir, "notes.md"))
+	if err != nil {
+		t.Fatalf("read file after failed forget: %v", err)
+	}
+	if string(after) != original {
+		t.Errorf("file content after failed forget = %q, want restored to original %q", after, original)
+	}
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if status != "" {
+		t.Errorf("git status --porcelain after failed forget = %q, want clean", status)
+	}
+}
+
+func TestHandleForgetFileModeGitCommitFailureRestoresOriginalLocation(t *testing.T) {
+	repoRoot, memDir := newFixtureRepo(t)
+	if err := os.WriteFile(filepath.Join(memDir, "notes.md"), []byte("iceri"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	runGitT(t, repoRoot, "add", "-A")
+	runGitT(t, repoRoot, "-c", "user.email=seed@example.com", "-c", "user.name=Seed", "commit", "-q", "-m", "seed")
+
+	installFailingPreCommitHook(t, repoRoot)
+
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
+	if _, err := s.HandleForget(context.Background(), "t", MemoryForgetArgs{File: "notes.md"}); err == nil {
+		t.Fatal("HandleForget with a failing pre-commit hook = nil error, want error")
+	}
+
+	// The original file must be back in place (the git mv into .trash was
+	// reversed), and .trash must be left empty - no orphaned rename.
+	after, err := os.ReadFile(filepath.Join(memDir, "notes.md"))
+	if err != nil {
+		t.Fatalf("original file missing after failed forget: %v", err)
+	}
+	if string(after) != "iceri" {
+		t.Errorf("original file content = %q, want %q", after, "iceri")
+	}
+	if entries, err := os.ReadDir(filepath.Join(memDir, ".trash")); err == nil && len(entries) != 0 {
+		t.Errorf(".trash entries after failed forget = %v, want none", entries)
+	}
+	status := runGitT(t, repoRoot, "status", "--porcelain")
+	if status != "" {
+		t.Errorf("git status --porcelain after failed forget = %q, want clean", status)
 	}
 }
 

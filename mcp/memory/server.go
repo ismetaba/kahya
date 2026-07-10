@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -76,6 +77,18 @@ type Server struct {
 	Index     Indexer
 	Ledger    Ledger
 	Log       Logger
+
+	// mu serializes the ENTIRE mutate sequence of HandleWrite/HandleForget
+	// (path validation through file write, git add/mv, git commit,
+	// ReindexFile, ledger). brain.db is single-writer and the memory
+	// repo's git index is single anyway, so two concurrent memory_write/
+	// memory_forget calls racing .git/index.lock is never valid: a loser
+	// used to be able to return an error AFTER writeMemoryFile already put
+	// real bytes on disk, leaving an untracked file with no commit, no
+	// reindex, and no ledger row - a filesystem write invisible to the
+	// audit ledger. Holding mu across the whole sequence makes every call
+	// fully serialize instead of interleave.
+	mu sync.Mutex
 }
 
 // New constructs a Server. log may be nil (defaults to a no-op Logger).
@@ -172,9 +185,20 @@ func (s *Server) HandleSearch(ctx context.Context, traceID string, args MemorySe
 // the target path under MemoryDir, write markdown with a fresh
 // kahya_source_tier: agent_derived front-matter block (appending with a
 // "\n\n---\n\n" separator if the file already existed), commit it in the
-// memory git repo as author "kahyad <kahyad@local>", incrementally
-// reindex just that file, and ledger a memory_write event.
+// memory git repo as author "kahyad <kahyad@local>" - scoped to ONLY this
+// file (whatever else a caller may already have `git add`-ed in the memory
+// repo is left staged, untouched, never swept into this commit) -
+// incrementally reindex just that file, and ledger a memory_write event.
+// The whole sequence runs under Server.mu, and a failure after the file
+// write (git add/commit) triggers a best-effort restore of the prior
+// on-disk state before returning the error, so a losing/failing call never
+// leaves bytes on disk that are not also committed+reindexed+ledgered.
 func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWriteArgs) (MemoryWriteOutput, error) {
+	// Serialize the whole mutate sequence below - see the Server.mu doc
+	// comment for why (concurrent git index races + orphaned writes).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	relPath := filepath.ToSlash(strings.TrimSpace(args.File))
 	if relPath == "" {
 		relPath = defaultInboxFile(time.Now())
@@ -185,16 +209,19 @@ func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWri
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 
-	if err := writeMemoryFile(abs, args.Content); err != nil {
+	prevContent, hadPrev, err := writeMemoryFile(abs, args.Content)
+	if err != nil {
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 
 	repoRoot, err := gitRepoRoot(s.MemoryDir)
 	if err != nil {
+		restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 	commitSHA, err := gitCommitPath(repoRoot, abs, "memory_write: "+relPath)
 	if err != nil {
+		restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 
@@ -221,10 +248,20 @@ func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWri
 // HandleForget implements memory_forget (W12-05 step 5): with heading,
 // removes just that markdown section in place; without, git-mv's the
 // whole file into .trash/<unix-ts>-<basename>. Either way it commits in
-// the memory git repo, incrementally reindexes (making the old location
+// the memory git repo - scoped to ONLY the path(s) this operation touched
+// (the edited file alone in heading-mode; both the old and new .trash path
+// in whole-file mode) - incrementally reindexes (making the old location
 // unsearchable), and ledgers a memory_forget event. Refuses anything
-// resolveMemoryPath would refuse (outside MemoryDir).
+// resolveMemoryPath would refuse (outside MemoryDir). The whole sequence
+// runs under Server.mu, and a failure after the on-disk mutation (git add/
+// mv/commit) triggers a best-effort restore of the prior repo state before
+// returning the error - see Server.mu and HandleWrite's doc comments.
 func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryForgetArgs) (MemoryForgetOutput, error) {
+	// Serialize the whole mutate sequence below - see the Server.mu doc
+	// comment for why (concurrent git index races + orphaned writes).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	relPath := filepath.ToSlash(strings.TrimSpace(args.File))
 	if relPath == "" {
 		return MemoryForgetOutput{}, errors.New("memory_forget: file must not be empty")
@@ -258,6 +295,11 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 		}
 		commitSHA, err = gitCommitPath(repoRoot, abs, fmt.Sprintf("memory_forget: %s (%s)", relPath, heading))
 		if err != nil {
+			// gitCommitPath already best-effort unstaged its `git add`;
+			// restore the WORKING TREE bytes we just edited (raw is the
+			// pre-edit content read above) so no partial edit is left on
+			// disk uncommitted.
+			restoreMemoryFile(abs, raw, true, s.Log)
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: %w", err)
 		}
 	} else {
@@ -275,11 +317,20 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 		if err != nil {
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: %w", err)
 		}
-		if err := gitMovePath(repoRoot, abs, trashAbs); err != nil {
+		relSrc, relDst, err := gitMovePath(repoRoot, abs, trashAbs)
+		if err != nil {
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: %w", err)
 		}
-		commitSHA, err = gitCommit(repoRoot, "memory_forget: "+relPath)
+		commitSHA, err = gitCommit(repoRoot, "memory_forget: "+relPath, relSrc, relDst)
 		if err != nil {
+			// gitMovePath already succeeded (both index and working tree
+			// moved abs -> trashAbs) before this commit failed; reverse
+			// the move so no uncommitted rename is left behind. A second
+			// `git mv` back to the original path restores index AND
+			// working tree together in one atomic step.
+			if out, mvErr := runGit(repoRoot, "mv", "--", relDst, relSrc); mvErr != nil {
+				s.Log.Error("memory_forget_restore_error", "src", relSrc, "dst", relDst, "err", mvErr.Error(), "out", out)
+			}
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: %w", err)
 		}
 	}
@@ -434,11 +485,16 @@ func resolveMemoryPath(memoryDir, rel string) (string, error) {
 // (HANDOFF §5 memory #1 quarantine: "there is no argument to claim a
 // higher tier", including by pointing `file` at an existing
 // higher-tier document to smuggle agent text in under its trust level).
-func writeMemoryFile(abs, content string) error {
+//
+// Returns the file's PRIOR bytes and whether it existed before this call
+// (hadPrev), so a caller that must undo the write after a LATER step fails
+// (git add/commit) can restore exactly the prior on-disk state - via
+// restoreMemoryFile - without a second read.
+func writeMemoryFile(abs, content string) (prevContent []byte, hadPrev bool, err error) {
 	existingRaw, readErr := os.ReadFile(abs)
 	isNew := errors.Is(readErr, os.ErrNotExist)
 	if readErr != nil && !isNew {
-		return fmt.Errorf("read %s: %w", abs, readErr)
+		return nil, false, fmt.Errorf("read %s: %w", abs, readErr)
 	}
 
 	body := content
@@ -448,12 +504,35 @@ func writeMemoryFile(abs, content string) error {
 	newContent := "---\nkahya_source_tier: agent_derived\n---\n" + body
 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(abs), err)
+		return nil, false, fmt.Errorf("mkdir %s: %w", filepath.Dir(abs), err)
 	}
 	if err := os.WriteFile(abs, []byte(newContent), 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", abs, err)
+		return nil, false, fmt.Errorf("write %s: %w", abs, err)
 	}
-	return nil
+	return existingRaw, !isNew, nil
+}
+
+// restoreMemoryFile is HandleWrite/HandleForget's best-effort undo for the
+// "file write succeeded, a later git add/commit failed" case (Blocker: a
+// losing git call must never leave bytes on disk that are neither
+// committed, reindexed, nor ledgered). It removes abs if it did not exist
+// before the mutation (hadPrev false), or restores its prior bytes
+// otherwise. Any restore error is only logged - this is best-effort
+// cleanup on a path that is already returning the ORIGINAL git error, and a
+// failed cleanup must never mask or replace that error.
+func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger) {
+	var restoreErr error
+	if hadPrev {
+		restoreErr = os.WriteFile(abs, prevContent, 0o600)
+	} else {
+		restoreErr = os.Remove(abs)
+		if errors.Is(restoreErr, os.ErrNotExist) {
+			restoreErr = nil
+		}
+	}
+	if restoreErr != nil {
+		log.Error("memory_restore_error", "path", abs, "err", restoreErr.Error())
+	}
 }
 
 // stripLeadingFrontMatter removes a leading "---\n...\n---\n" block from
@@ -568,9 +647,16 @@ func gitRepoRoot(memoryDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitCommitPath stages absPath (relative to repoRoot) and commits it as
-// author "kahyad <kahyad@local>" (W12-05 step 4, exact author string),
-// returning the new commit's SHA.
+// gitCommitPath stages absPath (relative to repoRoot) and commits ONLY that
+// path as author "kahyad <kahyad@local>" (W12-05 step 4, exact author
+// string), returning the new commit's SHA. The commit is scoped to
+// relFromRoot via a trailing `-- <pathspec>` (see gitCommit) so it never
+// sweeps in whatever else a caller may already have staged in the memory
+// repo. If the commit itself fails after `git add` already staged
+// relFromRoot, this best-effort unstages it again (`git reset --
+// relFromRoot`) so the git INDEX is left as it found it; the caller is
+// still responsible for restoring the WORKING TREE bytes it wrote (see
+// restoreMemoryFile) since `git reset` never touches the working tree.
 func gitCommitPath(repoRoot, absPath, message string) (string, error) {
 	relFromRoot, err := filepath.Rel(repoRoot, absPath)
 	if err != nil {
@@ -579,41 +665,60 @@ func gitCommitPath(repoRoot, absPath, message string) (string, error) {
 	if out, err := runGit(repoRoot, "add", "--", relFromRoot); err != nil {
 		return "", fmt.Errorf("git add %s: %w (%s)", relFromRoot, err, out)
 	}
-	return gitCommit(repoRoot, message)
+	sha, err := gitCommit(repoRoot, message, relFromRoot)
+	if err != nil {
+		_, _ = runGit(repoRoot, "reset", "--", relFromRoot) // best-effort unstage; err below is authoritative
+		return "", err
+	}
+	return sha, nil
 }
 
 // gitMovePath git-mv's absSrc to absDst (both must resolve to paths under
 // repoRoot), creating absDst's parent directory first (e.g. a fresh
 // .trash/ dir) - used by memory_forget's whole-file trash path. git mv
-// stages the rename itself; no separate git add is needed.
-func gitMovePath(repoRoot, absSrc, absDst string) error {
-	relSrc, err := filepath.Rel(repoRoot, absSrc)
+// stages the rename itself; no separate git add is needed. Returns both
+// paths relative to repoRoot so the caller can pass them both to gitCommit
+// (scoping the commit to exactly this rename, W12-05's "-- <pathspec>"
+// discipline) and, on a later commit failure, reverse the move with
+// `git mv relDst relSrc`.
+func gitMovePath(repoRoot, absSrc, absDst string) (relSrc, relDst string, err error) {
+	relSrc, err = filepath.Rel(repoRoot, absSrc)
 	if err != nil {
-		return fmt.Errorf("path %s relative to repo root %s: %w", absSrc, repoRoot, err)
+		return "", "", fmt.Errorf("path %s relative to repo root %s: %w", absSrc, repoRoot, err)
 	}
-	relDst, err := filepath.Rel(repoRoot, absDst)
+	relDst, err = filepath.Rel(repoRoot, absDst)
 	if err != nil {
-		return fmt.Errorf("path %s relative to repo root %s: %w", absDst, repoRoot, err)
+		return "", "", fmt.Errorf("path %s relative to repo root %s: %w", absDst, repoRoot, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(absDst), 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(absDst), err)
+		return "", "", fmt.Errorf("mkdir %s: %w", filepath.Dir(absDst), err)
 	}
 	if out, err := runGit(repoRoot, "mv", "--", relSrc, relDst); err != nil {
-		return fmt.Errorf("git mv %s %s: %w (%s)", relSrc, relDst, err, out)
+		return "", "", fmt.Errorf("git mv %s %s: %w (%s)", relSrc, relDst, err, out)
 	}
-	return nil
+	return relSrc, relDst, nil
 }
 
-// gitCommit commits whatever is currently staged in repoRoot as author
-// "kahyad <kahyad@local>" (W12-05 step 4's exact author string), returning
-// the new commit's SHA. GIT_AUTHOR_*/GIT_COMMITTER_* env vars are set
-// alongside the --author flag so this succeeds even in a bare fixture
-// repository with no user.name/user.email configured (as every W12-05 test
-// fixture is) - --author alone only fixes the AUTHOR identity; git still
-// refuses to commit at all if it cannot determine a COMMITTER identity
-// from either config or environment.
-func gitCommit(repoRoot, message string) (string, error) {
-	cmd := exec.Command("git", "-C", repoRoot, "commit", "--author=kahyad <kahyad@local>", "-m", message)
+// gitCommit commits repoRoot's currently-staged changes as author "kahyad
+// <kahyad@local>" (W12-05 step 4's exact author string), returning the new
+// commit's SHA. paths is REQUIRED and is passed as a trailing `--
+// <pathspec>...` argument, so the commit records ONLY the working-tree
+// state of those paths - never whatever else a caller may already have
+// staged in the memory repo (e.g. a user's own in-progress `git add`) - a
+// partial/scoped commit exactly like `git commit -- <path>...`.
+// GIT_AUTHOR_*/GIT_COMMITTER_* env vars are set alongside the --author flag
+// so this succeeds even in a bare fixture repository with no
+// user.name/user.email configured (as every W12-05 test fixture is) -
+// --author alone only fixes the AUTHOR identity; git still refuses to
+// commit at all if it cannot determine a COMMITTER identity from either
+// config or environment.
+func gitCommit(repoRoot, message string, paths ...string) (string, error) {
+	if len(paths) == 0 {
+		return "", errors.New("gitCommit: at least one path is required (commits must be scoped, never repo-wide)")
+	}
+	args := []string{"-C", repoRoot, "commit", "--author=kahyad <kahyad@local>", "-m", message, "--"}
+	args = append(args, paths...)
+	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=kahyad", "GIT_AUTHOR_EMAIL=kahyad@local",
 		"GIT_COMMITTER_NAME=kahyad", "GIT_COMMITTER_EMAIL=kahyad@local",
