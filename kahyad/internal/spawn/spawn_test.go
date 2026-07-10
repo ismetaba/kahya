@@ -421,6 +421,40 @@ func TestBuildEnvIncludesAllSixVariables(t *testing.T) {
 	}
 }
 
+// TestBuildEnvIncludesMCPBridgeAndCredentialMode is W12-09's addition:
+// BuildEnv must also set KAHYA_MCP_BRIDGE (the absolute path to the
+// kahya-mcp stdio bridge, bin/kahya-mcp) and KAHYA_CREDENTIAL_MODE (so the
+// worker knows whether it's running under "keychain" or "passthrough"
+// credential mode - see kahya_worker.__main__'s startup env assertions),
+// matching docs/ipc.md's updated env table exactly.
+func TestBuildEnvIncludesMCPBridgeAndCredentialMode(t *testing.T) {
+	cfg := Config{
+		Socket:           "/s.sock",
+		LogDir:           "/logs",
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-abc",
+		MCPBridgePath:    "/repo/bin/kahya-mcp",
+		CredentialMode:   "passthrough",
+	}
+	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
+
+	got := BuildEnv(cfg, env)
+	resolved := map[string]string{}
+	for _, kv := range got {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		resolved[parts[0]] = parts[1]
+	}
+	if got := resolved["KAHYA_MCP_BRIDGE"]; got != "/repo/bin/kahya-mcp" {
+		t.Errorf("KAHYA_MCP_BRIDGE = %q, want %q", got, "/repo/bin/kahya-mcp")
+	}
+	if got := resolved["KAHYA_CREDENTIAL_MODE"]; got != "passthrough" {
+		t.Errorf("KAHYA_CREDENTIAL_MODE = %q, want %q", got, "passthrough")
+	}
+}
+
 // TestBuildEnvFiltersSecretBearingParentEnvVars is BLOCKER 1's regression
 // test: KAHYA_ANTHROPIC_KEY_OVERRIDE (kahyad/internal/anthproxy's dev/CI
 // substitute for a real Keychain read) and any pre-existing

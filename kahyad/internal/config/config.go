@@ -58,6 +58,16 @@ type Config struct {
 	// to read the command from.
 	WorkerCmd []string `yaml:"worker_cmd"`
 
+	// MCPBridgePath is the absolute path to the kahya-mcp stdio<->UDS
+	// bridge binary (W12-05: kahyad/cmd/kahya-mcp, built to
+	// bin/kahya-mcp). W12-09's worker execs this as its "kahya_memory" MCP
+	// server's stdio command - it learns the path via the KAHYA_MCP_BRIDGE
+	// env var spawn.BuildEnv sets from this field (docs/ipc.md §3).
+	// Default points at "<repo>/bin/kahya-mcp", derived the same way
+	// defaultWorkerCmd derives the worker's own venv path - two
+	// directories up from the running kahyad executable.
+	MCPBridgePath string `yaml:"mcp_bridge_path"`
+
 	// LogLevel is the process-wide minimum log level: debug|info|warn|error
 	// (default "info"). main.go passes the resolved value to
 	// kahyad/internal/logx.SetLevel before logx.New. Env override
@@ -122,6 +132,7 @@ type fileConfig struct {
 	ActiveEmbedModelVer    *string   `yaml:"active_embed_model_ver"`
 	LogLevel               *string   `yaml:"log_level"`
 	WorkerCmd              *[]string `yaml:"worker_cmd"`
+	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
 	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
 	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
 	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
@@ -202,6 +213,7 @@ func defaults(home string) Config {
 		LogLevel:             "info",
 		Env:                  EnvProd,
 		WorkerCmd:            defaultWorkerCmd(),
+		MCPBridgePath:        defaultMCPBridgePath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -241,6 +253,19 @@ func defaultWorkerCmd() []string {
 		filepath.Join(repoRoot, "worker", ".venv", "bin", "python"),
 		"-m", "kahya_worker",
 	}
+}
+
+// defaultMCPBridgePath resolves the default "<repo>/bin/kahya-mcp" path,
+// using the exact same repo-root derivation as defaultWorkerCmd (see its
+// doc comment) - both the worker's venv python and the kahya-mcp bridge
+// binary live at fixed, predictable locations relative to the installed
+// kahyad binary.
+func defaultMCPBridgePath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "bin", "kahya-mcp")
 }
 
 func loadFile(path string) (fileConfig, bool, error) {
@@ -297,6 +322,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.WorkerCmd != nil {
 		cfg.WorkerCmd = *fc.WorkerCmd
+	}
+	if fc.MCPBridgePath != nil {
+		cfg.MCPBridgePath = expandHome(*fc.MCPBridgePath, home)
 	}
 	if fc.DailyBudgetUSD != nil {
 		cfg.DailyBudgetUSD = *fc.DailyBudgetUSD

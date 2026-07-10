@@ -305,6 +305,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		// token that listener validates every inbound request against.
 		AnthropicBaseURL: anthropicBaseURL,
 		APIKey:           apiKey,
+		// W12-09: the worker execs this path as its "kahya_memory" MCP
+		// server's stdio command, and reads CredentialMode to decide which
+		// startup env assertions apply (see kahya_worker.__main__).
+		MCPBridgePath:  s.cfg.MCPBridgePath,
+		CredentialMode: s.cfg.CredentialMode,
 	}
 
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{

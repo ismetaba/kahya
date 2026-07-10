@@ -79,6 +79,16 @@ type Config struct {
 	// (NewAPIKey, "kahya-task-<hex32>"), NOT a real Anthropic key - the
 	// real key never leaves kahyad (HANDOFF §4 IPC ⚑).
 	APIKey string
+	// MCPBridgePath is KAHYA_MCP_BRIDGE (W12-09): the absolute path to the
+	// kahya-mcp stdio<->UDS bridge binary (bin/kahya-mcp, W12-05) the
+	// worker execs as its "kahya_memory" MCP server's stdio command.
+	MCPBridgePath string
+	// CredentialMode is KAHYA_CREDENTIAL_MODE (W12-09): "keychain" or
+	// "passthrough" (config.CredentialModeKeychain/Passthrough) - lets the
+	// worker apply the right startup env assertions for whichever mode
+	// kahyad/internal/anthproxy is running in (see docs/ipc.md's W12-08
+	// note and kahya_worker.__main__'s own OWNER AUTH DECISION comment).
+	CredentialMode string
 }
 
 // Outcome is Run's terminal result. See StatusOK/StatusError/StatusTimeout
@@ -430,7 +440,9 @@ func filterSecretEnv(in []string) []string {
 // W1-2's worker is a plain subprocess, not a network-isolated container),
 // FILTERED through filterSecretEnv to strip any kahyad-internal
 // secret-bearing var (BLOCKER 1 fix - see secretEnvDenylist's doc comment),
-// plus the six KAHYA_*/ANTHROPIC_* variables the IPC contract fixes.
+// plus the eight KAHYA_*/ANTHROPIC_* variables the IPC contract fixes (six
+// from W12-07/W12-08, plus KAHYA_MCP_BRIDGE/KAHYA_CREDENTIAL_MODE added in
+// W12-09 for the real Python worker).
 func BuildEnv(cfg Config, env Envelope) []string {
 	base := filterSecretEnv(os.Environ())
 	extra := []string{
@@ -440,6 +452,8 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"KAHYA_LOG_DIR=" + cfg.LogDir,
 		"ANTHROPIC_BASE_URL=" + cfg.AnthropicBaseURL,
 		"ANTHROPIC_API_KEY=" + cfg.APIKey,
+		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
+		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
 	}
 	return append(base, extra...)
 }

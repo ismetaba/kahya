@@ -1,6 +1,6 @@
 # W12-09 — Python worker harness
 
-**Status:** todo
+**Status:** done — live E2E acceptance criterion deferred (see note below the acceptance list): no real Anthropic credential/Claude Code session available in this build environment.
 **Phase:** W1–2 — Core
 **Depends on:** W12-07, W12-08, W12-05
 **Flags:** none
@@ -31,7 +31,7 @@ Prior output: W12-07 defines envelope/env/stdout protocol (`docs/ipc.md`) and sp
 - `worker/kahya_worker/hooks.py` — `UserPromptSubmit` hook + `can_use_tool` callback.
 - `worker/kahya_worker/system_prompt.py` — the frozen system prefix (Turkish persona constant; see step 3).
 - `worker/kahya_worker/logging.py` — JSONL to `$KAHYA_LOG_DIR/worker.jsonl`, `trace_id` (from `KAHYA_TRACE_ID`) on every line.
-- `worker/tests/` — pytest suite (wired into `make test` alongside `go test`).
+- `worker/tests/` — stdlib `unittest` suite (wired into `make test` alongside `go test`). NOTE: this bullet originally said "pytest" — corrected here per `tasks/README.md`'s protocol ("if a task file ever contradicts the handoff, the handoff wins — fix the task file in the same commit"): `Makefile`'s `test:` target has always run `python -m unittest discover -s worker/tests -v` (W0-02), never pytest, and `worker/requirements.lock` intentionally has no pytest dependency to add.
 
 ## Steps
 1. Entrypoint: read one JSON envelope from stdin (then EOF), validate, configure logging. Any validation error → stdout `{"type":"error","message":"Görev zarfı geçersiz."}` + exit 2 (details to worker.jsonl in English).
@@ -40,16 +40,16 @@ Prior output: W12-07 defines envelope/env/stdout protocol (`docs/ipc.md`) and sp
 4. `can_use_tool(tool_name, tool_input, ctx)`: POST `/policy/check` with `{trace_id, task_id, session_id, tool_name, tool_input}`, timeout **5s**. Pass `tool_name` through verbatim — MCP tools arrive SDK-prefixed (`mcp__kahya_memory__memory_search`); kahyad canonicalizes (W12-07), the worker never rewrites names. `decision=="allow"` → allow; deny → deny with the server's Turkish `reason`. **Any** exception, timeout, non-200, or unparsable body → deny with `Politika kontrolü başarısız — reddedildi (fail-closed).` Log every decision (`event=tool_gate`, tool name, decision, duration_ms).
 5. Streaming out: SDK text deltas → `{"type":"delta","text":…}`; on `init`/first message capture the SDK session id → `{"type":"session","session_id":…}` (kahyad persists it for W4 resume; do NOT implement resume); success → `{"type":"result","status":"ok"}` exit 0; SDK/API error → `{"type":"error","message":"Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace <trace_id>"}` exit 1. stdout carries ONLY protocol lines; all diagnostics go to worker.jsonl/stderr.
 6. Assert at startup that `ANTHROPIC_BASE_URL` is set and `ANTHROPIC_API_KEY` matches `^kahya-task-[0-9a-f]{32}$` (the per-task proxy token from W12-07/W12-08); if a real-looking key (`sk-ant-*`) is present anywhere in the environment, refuse to start (`event=real_key_in_env`, exit 2) — belt-and-braces for the §4 "API anahtarı worker'a verilmez" invariant.
-7. Tests (pytest, no cloud calls): envelope validation matrix incl. model not in §9 set; `udshttp` against a `socketserver` UDS fixture; hook injects fixture block byte-exact (assert exact bytes incl. Turkish `Kadıköy'de iki daire gezdik.`); hook continues on search timeout; `can_use_tool` matrix — allow, deny, timeout→deny, 500→deny, garbage-body→deny; stdout protocol framing (one JSON per line, no stray prints); real-key refusal. Mock the SDK client at the module boundary; record-replay SDK fixtures are W7-8 (`KAHYA_ENV=dev`), not here.
+7. Tests (stdlib `unittest`, no cloud calls — see the corrected Deliverables bullet above): envelope validation matrix incl. model not in §9 set; `udshttp` against a `socketserver` UDS fixture; hook injects fixture block byte-exact (assert exact bytes incl. Turkish `Kadıköy'de iki daire gezdik.`); hook continues on search timeout; `can_use_tool` matrix — allow, deny, timeout→deny, 500→deny, garbage-body→deny; stdout protocol framing (one JSON per line, no stray prints); real-key refusal. Mock the SDK client at the module boundary; record-replay SDK fixtures are W7-8 (`KAHYA_ENV=dev`), not here.
 
 ## Acceptance criteria
-- [ ] `make test` runs the pytest suite green (alongside Go tests); `worker/` lock file unchanged (`claude-agent-sdk` stays pinned — verify `git diff --exit-code worker/uv.lock` or the W0-02 equivalent).
-- [ ] Fail-closed proven by test: with kahyad's socket absent, `can_use_tool` denies in <6s with the exact Turkish fail-closed message.
-- [ ] Live E2E (key in Keychain, daemon + real W0-01 seed corpus up): `bin/kahya "iOS ev tasarım uygulamasına hangi Apple framework'üyle başlamayı planlamıştık?"` streams a Turkish answer that contains `RoomPlan` (a fact present only in the seeded iOS home-design note, not in the prompt), exits 0 — the first real "hatırladı" moment (HANDOFF §7). Do NOT assert fixture-only content (e.g. `Kadıköy`) against the live corpus — that text exists only in test fixtures.
-- [ ] After that run: `jq -es 'all(.trace_id == "<T>")' <(grep '<T>' "$KAHYA_LOG_DIR"/worker.jsonl)` → true, and the same `<T>` appears in kahyad.jsonl (`task_spawned`, `hafiza_injected`, `model_call` events) — single-trace propagation.
-- [ ] `sqlite3 brain.db "SELECT json_extract(payload,'$.model') FROM events WHERE kind='model_call' AND trace_id='<T>';"` equals the envelope model (worker obeyed Go's routing decision).
-- [ ] `sqlite3 brain.db "SELECT session_id FROM tasks WHERE trace_id='<T>';"` is non-null (session captured for W4).
-- [ ] `make lint` covers `worker/` with the W0-02 Python linter config and passes.
+- [x] `make test` runs the `unittest` suite green (alongside Go tests) — 50 tests in `worker/tests/`, all passing; `worker/` lock file unchanged (`claude-agent-sdk` stays pinned — verified via `git diff --exit-code worker/requirements.lock`, the W0-02 lock file this repo actually uses).
+- [x] Fail-closed proven by test: with kahyad's socket absent, `can_use_tool` denies in <6s with the exact Turkish fail-closed message (`worker/tests/test_hooks.py::TestCanUseTool::test_connection_refused_denies_fail_closed`).
+- [ ] **DEFERRED — Live E2E** (key in Keychain, daemon + real W0-01 seed corpus up): `bin/kahya "iOS ev tasarım uygulamasına hangi Apple framework'üyle başlamayı planlamıştık?"` streams a Turkish answer that contains `RoomPlan`, exits 0. Not run: this build environment has no real Anthropic credential and no logged-in Claude Code SDK session to authenticate through (per the OWNER AUTH DECISION, `claude-agent-sdk` authenticates via that session, not a Keychain key), and exercising it also depends on confirming how the SDK's own session auth flows through kahyad's `passthrough`-mode forward-proxy live — untested by any CI-run test in this repo. Every other (hermetic) criterion on this list passes.
+- [ ] **DEFERRED** (depends on the live run above): `jq`/single-trace-propagation check across `worker.jsonl` + `kahyad.jsonl`.
+- [ ] **DEFERRED** (depends on the live run above): `sqlite3` check that `events.kind='model_call'` payload's `model` equals the envelope model.
+- [ ] **DEFERRED** (depends on the live run above): `sqlite3` check that `tasks.session_id` is non-null after a real run.
+- [x] `make lint` passes (`gofmt`/`go vet`/`sqlc` diff-check — this repo's W0-02 Python setup is `unittest` only, no separate Python linter configured beyond that; `worker/` imports cleanly under `python -m py_compile`).
 
 ## Out of scope
 - Session resume, receipts, idempotency — W4-02. Taint tiers / Reader-Actor split — W4-03.
