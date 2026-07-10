@@ -21,6 +21,12 @@ var wantTables = []string{
 	"evidence", "merge_ledger", "tasks", "events", "outbox",
 }
 
+// ftsVecTables are the three W12-03 virtual tables (FTS5 dual index +
+// sqlite-vec) that must both fully tear down on goose.DownTo(0) and be
+// fully recreated - dimension CHECK included - by the next goose.Up
+// (MINOR 8 regression coverage; see TestGooseDownUpRoundTrip).
+var ftsVecTables = []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec"}
+
 func testCfg(t *testing.T) config.Config {
 	t.Helper()
 	return config.Config{DBPath: filepath.Join(t.TempDir(), "brain.db")}
@@ -192,6 +198,13 @@ func TestGooseDownUpRoundTrip(t *testing.T) {
 			t.Errorf("table %q still present after migrating all the way down", name)
 		}
 	}
+	// MINOR 8: the W12-03 FTS5/vec virtual tables must also be torn down
+	// by the down migrations, not just the §5 base tables checked above.
+	for _, name := range ftsVecTables {
+		if got[name] {
+			t.Errorf("virtual table %q still present after migrating all the way down", name)
+		}
+	}
 
 	if err := goose.Up(s.DB(), "."); err != nil {
 		t.Fatalf("goose.Up after down: %v", err)
@@ -201,6 +214,22 @@ func TestGooseDownUpRoundTrip(t *testing.T) {
 		if !got[want] {
 			t.Errorf("table %q missing after down/up round-trip; tables = %v", want, got)
 		}
+	}
+	for _, want := range ftsVecTables {
+		if !got[want] {
+			t.Errorf("virtual table %q missing after down/up round-trip; tables = %v", want, got)
+		}
+	}
+
+	// MINOR 8: chunk_vec's 512-float dimension CHECK must survive the
+	// down/up round trip too - a re-created chunk_vec that silently
+	// dropped its dimension enforcement would accept a malformed
+	// embedding without error.
+	blob511 := make([]byte, 511*4)
+	if _, err := s.DB().Exec(
+		`INSERT INTO chunk_vec(chunk_id, embedding, model_ver) VALUES (?, ?, ?)`,
+		1, blob511, "qwen3-embedding-0.6b:512:v1"); err == nil {
+		t.Error("insert of a 511-float embedding succeeded after down/up round-trip, want a dimension-mismatch error")
 	}
 }
 

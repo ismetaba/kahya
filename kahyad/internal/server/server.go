@@ -317,11 +317,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // memorySearchRequest is POST /v1/memory/search's request body (W12-03
-// step 4). trace_id is optional: when absent, the search layer mints one
-// (kahyad/internal/logx.Logger.With's own fallback), independent of the
+// step 4). trace_id is optional: a caller resuming a multi-step trace
+// supplies its own trace_id here on purpose, independent of the
 // X-Kahya-Trace-Id header withTraceLogging uses for the outer
-// event=http_request line - a caller resuming a multi-step trace supplies
-// its own trace_id here on purpose.
+// event=http_request line. When the body omits it, handleMemorySearch
+// falls back to withTraceLogging's own resolved trace id (via
+// traceIDFromContext) rather than minting a fresh one, so the
+// event=memory_search JSONL line correlates with the event=http_request
+// line for the SAME request (MINOR 6).
 type memorySearchRequest struct {
 	Query   string `json:"query"`
 	K       int    `json:"k"`
@@ -365,7 +368,17 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hits, err := s.search.Search(r.Context(), req.TraceID, req.Query, req.K)
+	traceID := req.TraceID
+	if traceID == "" {
+		// MINOR 6: fall back to withTraceLogging's resolved trace id (the
+		// inbound X-Kahya-Trace-Id header, or one it freshly minted) rather
+		// than letting search.Searcher.Search mint its own - otherwise the
+		// event=memory_search line can never be correlated with this
+		// request's event=http_request line.
+		traceID = traceIDFromContext(r)
+	}
+
+	hits, err := s.search.Search(r.Context(), traceID, req.Query, req.K)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -409,8 +422,28 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// traceIDContextKey is the unexported context key withTraceLogging stashes
+// its resolved trace id under (MINOR 6), so a downstream handler can
+// correlate its own JSONL lines with the outer event=http_request line
+// instead of minting an unrelated trace id when a request has none of its
+// own. An unexported type, rather than a bare string/int, follows
+// context.WithValue's documented collision-avoidance idiom.
+type traceIDContextKey struct{}
+
+// traceIDFromContext returns the trace_id withTraceLogging resolved for r
+// (the inbound X-Kahya-Trace-Id header, or a freshly minted one), or "" if
+// r never passed through withTraceLogging - should not happen in
+// production, since every route is mounted through it in Prepare.
+func traceIDFromContext(r *http.Request) string {
+	id, _ := r.Context().Value(traceIDContextKey{}).(string)
+	return id
+}
+
 // withTraceLogging assigns/propagates a trace_id and logs event=http_request
-// for every handled request (HANDOFF §4 IPC step 3).
+// for every handled request (HANDOFF §4 IPC step 3). The resolved trace id
+// is also stashed on the request context (traceIDFromContext) so handlers
+// can correlate their own logging with this request without minting a
+// second, uncorrelated trace id of their own (MINOR 6).
 func (s *Server) withTraceLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -418,6 +451,7 @@ func (s *Server) withTraceLogging(next http.Handler) http.Handler {
 		if id == "" {
 			id = traceid.New()
 		}
+		r = r.WithContext(context.WithValue(r.Context(), traceIDContextKey{}, id))
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		s.log.With(id).Info("http_request",

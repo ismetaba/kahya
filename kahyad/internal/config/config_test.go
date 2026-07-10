@@ -10,7 +10,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL"} {
 		t.Setenv(k, "")
 	}
 }
@@ -58,6 +58,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Env != EnvProd {
 		t.Errorf("Env = %q, want %q", cfg.Env, EnvProd)
+	}
+	if cfg.LogLevel != "info" {
+		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
 	}
 }
 
@@ -190,5 +193,42 @@ func TestLoadRejectsInvalidEnv(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("Load() error = nil, want rejection of invalid KAHYA_ENV")
+	}
+}
+
+// TestLoadAcceptsValidLogLevels guards MINOR 5: every one of the four
+// documented KAHYA_LOG_LEVEL values must load cleanly and round-trip onto
+// Config.LogLevel unchanged.
+func TestLoadAcceptsValidLogLevels(t *testing.T) {
+	for _, lvl := range []string{"debug", "info", "warn", "error"} {
+		t.Run(lvl, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("KAHYA_LOG_LEVEL", lvl)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want KAHYA_LOG_LEVEL=%q accepted", err, lvl)
+			}
+			if cfg.LogLevel != lvl {
+				t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, lvl)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsInvalidLogLevel guards MINOR 5's fail-closed posture: an
+// unrecognized KAHYA_LOG_LEVEL must fail Load, the same as an invalid
+// KAHYA_ENV, never silently fall back to a default.
+func TestLoadRejectsInvalidLogLevel(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_LOG_LEVEL", "verbose")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want rejection of invalid KAHYA_LOG_LEVEL")
 	}
 }

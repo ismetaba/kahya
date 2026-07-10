@@ -3,6 +3,7 @@ package logx
 import (
 	"bufio"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,6 +147,46 @@ func TestNeverEmptyTraceID(t *testing.T) {
 		v, ok := m["trace_id"].(string)
 		if !ok || v == "" {
 			t.Fatalf("line %d trace_id empty or missing despite fallback: %v", i, m)
+		}
+	}
+}
+
+// TestSetLevelControlsDebugEmission guards MINOR 5: Debug() lines are
+// silently discarded at the default Info level, and start emitting (with
+// every one of the four required keys) once SetLevel(slog.LevelDebug)
+// raises the process-wide floor.
+func TestSetLevelControlsDebugEmission(t *testing.T) {
+	t.Cleanup(func() { SetLevel(slog.LevelInfo) }) // restore the default for any other test in this binary
+
+	logDir := t.TempDir()
+	l, err := New(logDir, "boot0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	SetLevel(slog.LevelInfo)
+	l.Debug("debug_at_info_level")
+
+	SetLevel(slog.LevelDebug)
+	l.Debug("debug_at_debug_level", "k", "v")
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	lines := readLines(t, filepath.Join(logDir, "kahyad.jsonl"))
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1 (only the debug-level line, since debug was suppressed at info level): %v", len(lines), lines)
+	}
+	m := lines[0]
+	if m["event"] != "debug_at_debug_level" {
+		t.Errorf("event = %v, want debug_at_debug_level", m["event"])
+	}
+	for _, key := range []string{"ts", "level", "event", "trace_id"} {
+		if v, ok := m[key]; !ok {
+			t.Errorf("line missing key %q: %v", key, m)
+		} else if s, ok := v.(string); !ok || s == "" {
+			t.Errorf("key %q empty or non-string: %v", key, v)
 		}
 	}
 }

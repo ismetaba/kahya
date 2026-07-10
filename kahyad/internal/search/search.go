@@ -30,8 +30,12 @@ const DefaultK = 8
 // (HANDOFF §4 ⚑: BM25 fusion; W12-03 step 3c).
 type Config struct {
 	// TriWeight/UniWeight are the fusion weights: fused =
-	// TriWeight*triScore + UniWeight*uniScore, each a per-chunk
-	// min-max-normalized leg score in [0,1] (a missing leg contributes 0).
+	// TriWeight*triScore + UniWeight*uniScore, each a per-chunk leg score
+	// in [0,1] (a missing leg contributes 0). The unicode61 leg's score is
+	// a plain min-max normalization of its raw bm25 rows. The trigram
+	// leg's score is either a scan-floor hit (fixed at ScanFloorScore) or
+	// a genuine MATCH hit, min-max normalized and then rescaled into
+	// [2*ScanFloorScore, 1.0] - see ScanFloorScore below.
 	TriWeight float64
 	UniWeight float64
 
@@ -39,12 +43,27 @@ type Config struct {
 	// trigram-leg hit found only by the Go substring scan below the
 	// trigram tokenizer's 3-rune floor (W12-03 step 3b). It is injected
 	// after normalization, never averaged into it, so a genuine bm25 MATCH
-	// hit always outranks a scan-floor hit for the SAME token.
+	// hit always outranks a scan-floor hit for the SAME token: the
+	// trigram leg's real MATCH scores are rescaled into
+	// [2*ScanFloorScore, 1.0] (see rescaleMatchScores), never down to the
+	// plain min-max [0,1] range, so even the single worst MATCH hit still
+	// scores strictly above every scan-floor hit.
 	ScanFloorScore float64
 
 	// UniLimit caps how many unicode61 MATCH rows are considered before
 	// fusion (W12-03 step 3a: "take top 50").
 	UniLimit int
+
+	// LadderStartMax bounds the trigram MATCH relaxation ladder (BLOCKER
+	// 4): after the full token is always tried once, further truncated
+	// attempts start at min(len(token)-1, LadderStartMax) runes rather
+	// than always len(token)-1. Without this bound, a single pathological
+	// token (a URL, a hash, a pasted log line) issues one sequential MATCH
+	// query per rune-length down to 3 - thousands of queries against a
+	// single-connection db handle (SetMaxOpenConns(1)), serializing out
+	// every other request for seconds. Real Turkish words are well under
+	// this floor, so natural-language behavior is unchanged.
+	LadderStartMax int
 }
 
 // DefaultConfig returns the committed-default fusion weights (HANDOFF §4:
@@ -55,6 +74,7 @@ func DefaultConfig() Config {
 		UniWeight:      0.4,
 		ScanFloorScore: 0.1,
 		UniLimit:       50,
+		LadderStartMax: 32,
 	}
 }
 
@@ -188,26 +208,40 @@ func (s *Searcher) uniLeg(ctx context.Context, q string) (map[int64]float64, int
 	return minMaxNormalize(raw), len(raw), nil
 }
 
-// chunkText is the (id, byte-exact text) pair loaded for the trigram leg's
-// Go substring-scan fallback.
+// chunkText is the (id, byte-exact text, once-folded text) triple loaded
+// for the trigram leg's Go substring-scan fallback. textFolded is computed
+// once here, at load time, rather than inside scanSubstring on every call
+// (MINOR 7): a query whose tokens all fall through to the scan floor would
+// otherwise re-fold the whole corpus once per token instead of once per
+// Search call.
 type chunkText struct {
-	id   int64
-	text string
+	id         int64
+	text       string
+	textFolded string
 }
 
 // triLeg runs the trigram leg (W12-03 step 3b) over fold(q): for each
-// whitespace token, a MATCH relaxation ladder truncates one trailing rune
-// at a time down to 3 runes (the trigram tokenizer's floor); if that never
-// finds a row (or the token started under 3 runes, where trigram MATCH is
-// impossible), relaxation continues as a Go substring scan one rune
-// shorter still, down to 2 runes, stopping at the first length with >= 1
-// hit. This is the mechanism that makes 'evlerimizden' find a chunk
-// containing only 'ev' (HANDOFF §6 W1-2 gate) without any Turkish
-// suffix table or morphological analyzer (tasks/README.md: no manual
-// stemming - only character truncation).
+// whitespace token of len >= 3 runes, the full token is always tried as a
+// MATCH first (so exact long-token matches - a full URL, a hash - still
+// hit even when truncation is bounded below); if that finds nothing, a
+// relaxation ladder truncates one trailing rune at a time down to 3 runes
+// (the trigram tokenizer's floor), starting no higher than
+// cfg.LadderStartMax runes below the full length (BLOCKER 4: bounds a
+// pathological single-token input to ~cfg.LadderStartMax queries instead
+// of thousands; real Turkish words are well under this floor so natural-
+// language behavior is unchanged). If the MATCH ladder never finds a row
+// (or the token started under 3 runes, where trigram MATCH is impossible),
+// relaxation continues as a single Go substring scan against the token's
+// first 2 runes (BLOCKER 2: a 1-rune token never scans), stopping at the
+// first length with >= 1 hit. This is the mechanism that makes
+// 'evlerimizden' find a chunk containing only 'ev' (HANDOFF §6 W1-2 gate)
+// without any Turkish suffix table or morphological analyzer
+// (tasks/README.md: no manual stemming - only character truncation).
 //
 // Returns the per-chunk score ready for fusion (real MATCH rows min-max
-// normalized into [0,1]; scan-only rows fixed at cfg.ScanFloorScore) plus
+// normalized and then rescaled into [2*cfg.ScanFloorScore, 1.0] - see
+// rescaleMatchScores - so a genuine MATCH hit always outranks a scan-only
+// hit for the same token; scan-only rows fixed at cfg.ScanFloorScore) plus
 // raw hit counts for logging.
 func (s *Searcher) triLeg(ctx context.Context, q string) (scores map[int64]float64, matchHitCount, scanHitCount int, err error) {
 	fq := textnorm.Fold(q)
@@ -237,21 +271,32 @@ func (s *Searcher) triLeg(ctx context.Context, q string) (scores map[int64]float
 		found := false
 
 		if len(runes) >= 3 {
-			for length := len(runes); length >= 3; length-- {
-				stem := string(runes[:length])
-				rows, err := s.triMatch(ctx, stem)
-				if err != nil {
-					return nil, 0, 0, fmt.Errorf("query chunks_fts_tri: %w", err)
+			// Always try the full token once first (BLOCKER 4): even when
+			// the ladder below is bounded, an exact full-length match must
+			// still hit.
+			rows, err := s.triMatch(ctx, string(runes))
+			if err != nil {
+				return nil, 0, 0, fmt.Errorf("query chunks_fts_tri: %w", err)
+			}
+			if len(rows) > 0 {
+				mergeMatchRows(matchRaw, rows)
+				found = true
+			} else {
+				startFrom := len(runes) - 1
+				if startFrom > s.cfg.LadderStartMax {
+					startFrom = s.cfg.LadderStartMax
 				}
-				if len(rows) > 0 {
-					for id, bm := range rows {
-						neg := -bm
-						if cur, ok := matchRaw[id]; !ok || neg > cur {
-							matchRaw[id] = neg
-						}
+				for length := startFrom; length >= 3; length-- {
+					stem := string(runes[:length])
+					rows, err := s.triMatch(ctx, stem)
+					if err != nil {
+						return nil, 0, 0, fmt.Errorf("query chunks_fts_tri: %w", err)
 					}
-					found = true
-					break
+					if len(rows) > 0 {
+						mergeMatchRows(matchRaw, rows)
+						found = true
+						break
+					}
 				}
 			}
 		}
@@ -259,28 +304,31 @@ func (s *Searcher) triLeg(ctx context.Context, q string) (scores map[int64]float
 			continue
 		}
 
-		// Below the trigram floor: continue the SAME one-trailing-rune
-		// truncation as a Go substring scan (language-agnostic relaxation,
-		// not stemming), stopping at the first length with >= 1 hit.
-		for length := min(len(runes), 3) - 1; length >= 2; length-- {
-			stem := string(runes[:length])
+		// Below the trigram floor: fall back to a Go substring scan
+		// against the token's first 2 runes (language-agnostic relaxation,
+		// not stemming). The scan start is fixed at 2 runes whenever the
+		// token itself has >= 2 runes (BLOCKER 2: the old
+		// `min(len(runes), 3) - 1` start collapsed to 1 or 0 for tokens
+		// shorter than 3 runes, and the loop's own `>= 2` floor then
+		// silently skipped the scan for exactly the short tokens it exists
+		// to serve, e.g. a bare "ev" query). A 1-rune token still never
+		// scans.
+		if len(runes) >= 2 {
+			stem := string(runes[:2])
 			cs, err := loadAllChunks()
 			if err != nil {
 				return nil, 0, 0, fmt.Errorf("load chunks for scan: %w", err)
 			}
 			hitIDs := scanSubstring(cs, stem)
-			if len(hitIDs) > 0 {
-				for _, id := range hitIDs {
-					if _, already := matchRaw[id]; !already {
-						scanOnly[id] = true
-					}
+			for _, id := range hitIDs {
+				if _, already := matchRaw[id]; !already {
+					scanOnly[id] = true
 				}
-				break
 			}
 		}
 	}
 
-	normMatch := minMaxNormalize(matchRaw)
+	normMatch := rescaleMatchScores(matchRaw, matchFloorScore(s.cfg))
 	final := make(map[int64]float64, len(normMatch)+len(scanOnly))
 	for id, v := range normMatch {
 		final[id] = v
@@ -320,10 +368,24 @@ func (s *Searcher) triMatch(ctx context.Context, stem string) (map[int64]float64
 	return out, rows.Err()
 }
 
-// loadAllChunkText loads every chunk's id+text for the trigram leg's Go
-// substring-scan fallback (W12-03 step 3b: "Corpus <= ~100k chunks per §4 -
-// brute force is in-budget"). Called at most once per Search call, lazily,
-// only once some token's MATCH ladder has bottomed out with zero rows.
+// mergeMatchRows folds one triMatch call's raw bm25 rows into dst
+// (chunk_id -> best negated bm25 seen across every token/length tried so
+// far), negating so higher=better throughout, keeping the best (max)
+// negated score per chunk_id when a chunk is hit by more than one token.
+func mergeMatchRows(dst, rows map[int64]float64) {
+	for id, bm := range rows {
+		neg := -bm
+		if cur, ok := dst[id]; !ok || neg > cur {
+			dst[id] = neg
+		}
+	}
+}
+
+// loadAllChunkText loads every chunk's id+text (plus its folded text, see
+// chunkText) for the trigram leg's Go substring-scan fallback (W12-03 step
+// 3b: "Corpus <= ~100k chunks per §4 - brute force is in-budget"). Called
+// at most once per Search call, lazily, only once some token's MATCH
+// ladder has bottomed out with zero rows.
 func (s *Searcher) loadAllChunkText(ctx context.Context) ([]chunkText, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, text FROM chunks`)
 	if err != nil {
@@ -337,19 +399,21 @@ func (s *Searcher) loadAllChunkText(ctx context.Context) ([]chunkText, error) {
 		if err := rows.Scan(&c.id, &c.text); err != nil {
 			return nil, err
 		}
+		c.textFolded = textnorm.Fold(c.text)
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
 // scanSubstring returns the ids of every chunk whose FOLDED text contains
-// stem. Folding happens here (not at load time) so loadAllChunkText stays a
-// dumb byte-exact loader; the corpus is bounded (~100k chunks, HANDOFF §4)
-// so re-folding on each scan call is in-budget.
+// stem, using each chunk's textFolded computed once by loadAllChunkText
+// (MINOR 7) rather than re-folding c.text here on every call - a query
+// whose N tokens all fall through to the scan floor previously re-folded
+// the whole corpus N times over.
 func scanSubstring(chunks []chunkText, stem string) []int64 {
 	var ids []int64
 	for _, c := range chunks {
-		if strings.Contains(textnorm.Fold(c.text), stem) {
+		if strings.Contains(c.textFolded, stem) {
 			ids = append(ids, c.id)
 		}
 	}
@@ -402,6 +466,31 @@ func minMaxNormalize(raw map[int64]float64) map[int64]float64 {
 	}
 	for id, v := range raw {
 		out[id] = (v - lo) / (hi - lo)
+	}
+	return out
+}
+
+// matchFloorScore returns the minimum post-normalization score a genuine
+// trigram MATCH hit may receive: 2*cfg.ScanFloorScore (0.2 with defaults).
+// This is strictly above cfg.ScanFloorScore itself, so the worst MATCH hit
+// still always outranks a scan-only hit for the same token (BLOCKER 1).
+func matchFloorScore(cfg Config) float64 {
+	return 2 * cfg.ScanFloorScore
+}
+
+// rescaleMatchScores min-max normalizes raw trigram MATCH scores (see
+// minMaxNormalize) and then rescales the [0,1] result into [floor, 1.0]
+// via `floor + (1-floor)*minmax` (BLOCKER 1). Plain min-max normalization
+// maps the single worst MATCH hit to 0.0 - at or below cfg.ScanFloorScore -
+// which would invert the required invariant that a genuine MATCH hit
+// always outranks a scan-floor hit. A single-hit (or all-equal) input
+// still maps to 1.0: minMaxNormalize's hi==lo branch already yields 1.0,
+// and floor + (1-floor)*1.0 == 1.0 regardless of floor.
+func rescaleMatchScores(raw map[int64]float64, floor float64) map[int64]float64 {
+	minmax := minMaxNormalize(raw)
+	out := make(map[int64]float64, len(minmax))
+	for id, v := range minmax {
+		out[id] = floor + (1-floor)*v
 	}
 	return out
 }

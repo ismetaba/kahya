@@ -30,6 +30,22 @@ type Logger struct {
 	file    *os.File
 }
 
+// level is the process-wide minimum log level shared by every Logger
+// (current and future - they all point at this same LevelVar via New's
+// HandlerOptions). Its zero value is slog.LevelInfo, so Debug() lines are
+// silently discarded until SetLevel(slog.LevelDebug) raises the floor
+// (MINOR 5: logx previously had no level control at all, so Debug() built
+// a well-formed JSONL line and then handed it to a handler whose level
+// nothing here ever configured - it just happened to default to Info).
+var level slog.LevelVar
+
+// SetLevel sets the process-wide minimum log level for every Logger.
+// main.go calls this once at boot, after config.Load and before logx.New,
+// using the resolved config.Config.LogLevel.
+func SetLevel(l slog.Level) {
+	level.Set(l)
+}
+
 // New creates the boot logger: it appends JSONL to <logDir>/kahyad.jsonl
 // (creating logDir with 0700 if needed) and mirrors every line to stderr.
 // bootTraceID is attached to every line logged directly on the returned
@@ -52,6 +68,7 @@ func New(logDir, bootTraceID string) (*Logger, error) {
 
 	mw := io.MultiWriter(f, os.Stderr)
 	opts := &slog.HandlerOptions{
+		Level: &level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			switch a.Key {
 			case slog.TimeKey:

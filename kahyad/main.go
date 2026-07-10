@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -38,6 +39,11 @@ func run() int {
 		bootFailLine(bootTraceID, "config_load_failed", err)
 		return 1
 	}
+
+	// MINOR 5: the resolved log level must be in place before logx.New
+	// constructs the boot logger's handler, since New shares the package-
+	// wide slog.LevelVar every Logger reads from.
+	logx.SetLevel(parseLogLevel(cfg.LogLevel))
 
 	log, err := logx.New(cfg.LogDir, bootTraceID)
 	if err != nil {
@@ -102,6 +108,23 @@ func run() int {
 
 	log.Info("shutdown_complete")
 	return 0
+}
+
+// parseLogLevel maps config.Config.LogLevel's four validated values
+// (config.validateLogLevel already fails Load closed on anything else) onto
+// their slog.Level, defaulting to Info for safety if an unrecognized value
+// ever reached here regardless.
+func parseLogLevel(level string) slog.Level {
+	switch level {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // bootFailLine emits a hand-rolled JSONL error line for failures that occur

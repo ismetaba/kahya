@@ -36,6 +36,13 @@ type Config struct {
 	TaskTimeoutMin       int    `yaml:"task_timeout_min"`
 	ActiveEmbedModelVer  string `yaml:"active_embed_model_ver"`
 
+	// LogLevel is the process-wide minimum log level: debug|info|warn|error
+	// (default "info"). main.go passes the resolved value to
+	// kahyad/internal/logx.SetLevel before logx.New. Env override
+	// KAHYA_LOG_LEVEL; an unrecognized value fails Load closed, the same as
+	// an invalid KAHYA_ENV (MINOR 5).
+	LogLevel string `yaml:"log_level"`
+
 	// Env is KAHYA_ENV ("prod" default | "dev"). It is env-only: there is
 	// no config.yaml key for it, since it exists precisely so tests and the
 	// W7-8 KAHYA_ENV=dev profile can redirect every path independent of any
@@ -56,6 +63,7 @@ type fileConfig struct {
 	DefaultModel         *string `yaml:"default_model"`
 	TaskTimeoutMin       *int    `yaml:"task_timeout_min"`
 	ActiveEmbedModelVer  *string `yaml:"active_embed_model_ver"`
+	LogLevel             *string `yaml:"log_level"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -84,6 +92,9 @@ func Load() (Config, error) {
 	applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
 
 	if err := validateEnv(cfg.Env); err != nil {
+		return Config{}, err
+	}
+	if err := validateLogLevel(cfg.LogLevel); err != nil {
 		return Config{}, err
 	}
 
@@ -120,6 +131,7 @@ func defaults(home string) Config {
 		DefaultModel:         "claude-sonnet-5",
 		TaskTimeoutMin:       30,
 		ActiveEmbedModelVer:  "qwen3-embedding-0.6b:512:v1",
+		LogLevel:             "info",
 		Env:                  EnvProd,
 	}
 }
@@ -173,6 +185,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.ActiveEmbedModelVer != nil {
 		cfg.ActiveEmbedModelVer = *fc.ActiveEmbedModelVer
 	}
+	if fc.LogLevel != nil {
+		cfg.LogLevel = *fc.LogLevel
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -197,11 +212,27 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_ENV"); v != "" {
 		cfg.Env = v
 	}
+	if v := os.Getenv("KAHYA_LOG_LEVEL"); v != "" {
+		cfg.LogLevel = v
+	}
 }
 
 func validateEnv(env string) error {
 	if env != EnvProd && env != EnvDev {
 		return fmt.Errorf("config: KAHYA_ENV=%q invalid, must be %q or %q", env, EnvProd, EnvDev)
+	}
+	return nil
+}
+
+// validLogLevels are the only values Load accepts for LogLevel/
+// KAHYA_LOG_LEVEL. logx maps these onto slog levels (see main.go); an
+// invalid value fails Load closed, the same posture as validateEnv (MINOR
+// 5 - fail-closed on unrecognized config, never silently default).
+var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+
+func validateLogLevel(level string) error {
+	if !validLogLevels[level] {
+		return fmt.Errorf("config: log_level=%q invalid, must be one of debug|info|warn|error", level)
 	}
 	return nil
 }

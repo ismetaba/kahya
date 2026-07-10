@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
@@ -21,7 +22,7 @@ import (
 // test fixtures must never be "translated" or ASCII-folded).
 const (
 	chunkAText = "İstanbul'da yeni bir ev bakıyoruz; Kadıköy'de iki daire gezdik."
-	chunkBText = "gold-token servisinde NATS saga deseni ve trace_id correlation notlari."
+	chunkBText = "gold-token servisinde NATS saga deseni ve trace_id correlation notları."
 )
 
 func newTestStore(t *testing.T) *store.Store {
@@ -191,6 +192,156 @@ func TestSearchSagaDeseniFindsBHigherThanA(t *testing.T) {
 	}
 	if bScore <= aScore {
 		t.Errorf("chunk B score %v, chunk A score %v, want B strictly higher", bScore, aScore)
+	}
+}
+
+// TestTriLegMatchScoresOutrankScanFloor is BLOCKER 1's regression test: the
+// trigram leg's genuine bm25 MATCH scores (after min-max normalization and
+// BLOCKER 1's floor rescale) must always outrank a scan-floor hit for a
+// DIFFERENT chunk, and must never sink to (or below) cfg.ScanFloorScore
+// itself, even for the single worst-scoring MATCH hit. Plain min-max
+// normalization would map that worst hit to 0.0, at or below
+// cfg.ScanFloorScore, inverting the required invariant.
+func TestTriLegMatchScoresOutrankScanFloor(t *testing.T) {
+	st := newTestStore(t)
+	searcher := newTestSearcher(t, st)
+	cfg := DefaultConfig()
+
+	// Three chunks all genuinely MATCH the token "kahya" via the trigram
+	// leg, with different term frequency/document length so their raw
+	// bm25 scores differ (distinct MATCH scores for the same token).
+	id1 := seedChunk(t, st, "note-tri-1.md", "kahya")
+	id2 := seedChunk(t, st, "note-tri-2.md", "kahya kahya bugun cok yorgun ama kahya isini bitirdi")
+	id3 := seedChunk(t, st, "note-tri-3.md", "kahya hakkinda uzun bir not kahya sistemleri artik daha stabil calisiyor kahya her gun loglarini kontrol ediyor")
+
+	// A fourth chunk that matches NEITHER "kahya" nor any 3+ rune
+	// truncation of the nonsense second query token below, but does
+	// contain that token's folded first-2-rune prefix "zz" as a mid-word
+	// substring - so it is found ONLY via the Go substring scan floor,
+	// mixed into the SAME triLeg call as the three real MATCH hits above.
+	idScan := seedChunk(t, st, "note-tri-scan.md", "Masada bir puzzle kutusu duruyor.")
+
+	scores, matchHits, scanHits, err := searcher.triLeg(context.Background(), "kahya zzqxxjklmnoprst")
+	if err != nil {
+		t.Fatalf("triLeg: %v", err)
+	}
+	if matchHits != 3 {
+		t.Fatalf("matchHitCount = %d, want 3 (chunks %d,%d,%d); scores=%v", matchHits, id1, id2, id3, scores)
+	}
+	if scanHits != 1 {
+		t.Fatalf("scanHitCount = %d, want 1 (chunk %d); scores=%v", scanHits, idScan, scores)
+	}
+
+	matchFloor := matchFloorScore(cfg)
+	matchScores := map[int64]float64{}
+	for _, id := range []int64{id1, id2, id3} {
+		v, ok := scores[id]
+		if !ok {
+			t.Fatalf("scores missing MATCH chunk %d: %v", id, scores)
+		}
+		matchScores[id] = v
+		if v < matchFloor {
+			t.Errorf("chunk %d MATCH score = %v, want >= matchFloor %v (BLOCKER 1)", id, v, matchFloor)
+		}
+		if v <= cfg.ScanFloorScore {
+			t.Errorf("chunk %d MATCH score = %v, want strictly > ScanFloorScore %v (BLOCKER 1)", id, v, cfg.ScanFloorScore)
+		}
+	}
+	if matchScores[id1] == matchScores[id2] && matchScores[id2] == matchScores[id3] {
+		t.Errorf("all three MATCH scores identical (%v); want distinct bm25 scores to exercise the rescale", matchScores[id1])
+	}
+
+	scanScore, ok := scores[idScan]
+	if !ok {
+		t.Fatalf("scores missing scan-only chunk %d: %v", idScan, scores)
+	}
+	if scanScore != cfg.ScanFloorScore {
+		t.Errorf("scan-only chunk score = %v, want exactly cfg.ScanFloorScore %v", scanScore, cfg.ScanFloorScore)
+	}
+	for id, v := range matchScores {
+		if v <= scanScore {
+			t.Errorf("MATCH chunk %d score = %v, want strictly > scan-only score %v", id, v, scanScore)
+		}
+	}
+}
+
+// TestSearchShortTokenEvFindsChunkA is BLOCKER 2's regression test (a): a
+// bare 2-rune query "ev" must reach the Go substring scan fallback and find
+// chunk A's standalone "ev" token, via the full Search() pipeline (not just
+// triLeg directly). The old `min(len(runes), 3) - 1` scan-start arithmetic
+// collapsed to 1 for a 2-rune token, and the loop's own `>= 2` floor then
+// skipped the scan entirely.
+func TestSearchShortTokenEvFindsChunkA(t *testing.T) {
+	st := newTestStore(t)
+	chunkAID, _ := seedFixtureChunks(t, st)
+	searcher := newTestSearcher(t, st)
+
+	hits, err := searcher.Search(context.Background(), "", "ev", 3)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.ChunkID == chunkAID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf(`Search("ev") hits = %+v, want chunk A (%d) via the scan floor (BLOCKER 2)`, hits, chunkAID)
+	}
+}
+
+// TestSearchShortTokenEvFindsMidWordSubstring is BLOCKER 2's regression
+// test (b): a chunk containing "ev" ONLY as a mid-word substring (inside
+// "devam", not at a token boundary, so unicode61's whole-token MATCH cannot
+// find it either) must still be found by the 2-rune query "ev" via the Go
+// substring scan - the same relaxation mechanism that makes "evlerimizden"
+// find a chunk containing only "ev", with query/corpus roles reversed.
+// (NOTE: the task's literal fixture word "kahve" does NOT in fact contain
+// "ev" as a substring - k-a-h-v-e contains "ve", not "ev" - so it cannot
+// exercise this path; "devam" ("continue"), which genuinely contains "ev",
+// is used here instead to preserve the intended mid-word-substring case.)
+func TestSearchShortTokenEvFindsMidWordSubstring(t *testing.T) {
+	st := newTestStore(t)
+	searcher := newTestSearcher(t, st)
+	chunkID := seedChunk(t, st, "note-devam.md", "Toplantiya devam ediyoruz.")
+
+	hits, err := searcher.Search(context.Background(), "", "ev", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.ChunkID == chunkID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf(`Search("ev") hits = %+v, want chunk %d ("kahve", mid-word "ev" substring) via the scan floor (BLOCKER 2)`, hits, chunkID)
+	}
+}
+
+// TestSearchLongTokenLadderBounded is BLOCKER 4's regression test: a single
+// pathological 10000-rune token must not walk an unbounded MATCH ladder -
+// Search must return with no error well within a couple seconds against a
+// small corpus, not the ~3.55s an unbounded ladder measured pre-fix.
+func TestSearchLongTokenLadderBounded(t *testing.T) {
+	st := newTestStore(t)
+	seedFixtureChunks(t, st)
+	searcher := newTestSearcher(t, st)
+
+	longToken := strings.Repeat("x", 10000)
+	start := time.Now()
+	_, err := searcher.Search(context.Background(), "", longToken, 3)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	// Generous bound (measured well under 500ms locally) to avoid flakes
+	// on a loaded CI machine while still catching the unbounded-ladder
+	// regression.
+	if elapsed > 2*time.Second {
+		t.Errorf("Search with a 10000-rune token took %v, want < 2s (BLOCKER 4: unbounded MATCH ladder)", elapsed)
 	}
 }
 

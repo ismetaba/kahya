@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,23 @@ func (f *fakeSearcher) Search(_ context.Context, traceID, q string, k int) ([]se
 		return nil, f.err
 	}
 	return f.hits, nil
+}
+
+// loggingFakeSearcher is like fakeSearcher but also emits an
+// event=memory_search JSONL line via log, scoped to the traceID it was
+// called with - mirroring the real search.Searcher.Search's own logging
+// pattern - without needing a real brain.db. It lets
+// TestMemorySearchCorrelatesTraceIDWithHTTPRequestLine (MINOR 6) assert
+// that the memory_search and http_request lines share one trace_id.
+type loggingFakeSearcher struct {
+	log     *logx.Logger
+	lastTID string
+}
+
+func (f *loggingFakeSearcher) Search(_ context.Context, traceID, q string, _ int) ([]search.Hit, error) {
+	f.lastTID = traceID
+	f.log.With(traceID).Info("memory_search", "query_len", len(q))
+	return nil, nil
 }
 
 // unixHTTPClient returns an http.Client that dials socketPath for every
@@ -516,6 +534,74 @@ func TestMemorySearchEndpointNoSearcherIs503(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestMemorySearchCorrelatesTraceIDWithHTTPRequestLine is MINOR 6's
+// regression test: when the POST body omits trace_id, handleMemorySearch
+// must fall back to withTraceLogging's own resolved trace id (the request's
+// context, set from X-Kahya-Trace-Id or freshly minted) rather than letting
+// the Searcher mint an unrelated one - otherwise the event=memory_search
+// JSONL line can never be correlated with this request's event=http_request
+// line.
+func TestMemorySearchCorrelatesTraceIDWithHTTPRequestLine(t *testing.T) {
+	logDir := t.TempDir()
+	log, err := logx.New(logDir, "boot0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	defer log.Close()
+
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &loggingFakeSearcher{log: log}
+	srv := New(testConfig(socketPath), log, "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	// No trace_id in the body: this is the case the middleware's own
+	// resolved id must cover.
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `{"query":"hello"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	data, err := os.ReadFile(filepath.Join(logDir, "kahyad.jsonl"))
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+
+	var httpTID, memTID string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		switch rec["event"] {
+		case "http_request":
+			httpTID, _ = rec["trace_id"].(string)
+		case "memory_search":
+			memTID, _ = rec["trace_id"].(string)
+		}
+	}
+	if httpTID == "" {
+		t.Fatal("no event=http_request log line found")
+	}
+	if memTID == "" {
+		t.Fatal("no event=memory_search log line found")
+	}
+	if httpTID != memTID {
+		t.Errorf("http_request trace_id = %q, memory_search trace_id = %q, want equal (MINOR 6)", httpTID, memTID)
+	}
+	if fs.lastTID != httpTID {
+		t.Errorf("Searcher.Search was called with traceID = %q, want the middleware's context trace id %q", fs.lastTID, httpTID)
 	}
 }
 
