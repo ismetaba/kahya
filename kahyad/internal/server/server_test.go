@@ -217,3 +217,102 @@ func TestRunGracefulShutdownOnContextCancel(t *testing.T) {
 		t.Errorf("socket file still exists after Run() shutdown: err=%v", err)
 	}
 }
+
+// TestTakeoverRaceSingleWinner reproduces the TOCTOU hazard the startup
+// flock exists to prevent: N concurrent startups against one stale socket
+// file must yield exactly one bound listener; every loser must see
+// ErrAlreadyRunning, and the winner's listener must be reachable at the
+// canonical path (not orphaned by a later remove+rebind).
+func TestTakeoverRaceSingleWinner(t *testing.T) {
+	dir := shortSocketDir(t)
+	sock := filepath.Join(dir, "s.sock")
+
+	// Seed a stale socket file (no listener behind it).
+	staleLn, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("seed listen: %v", err)
+	}
+	// Close without unlinking: simulates a SIGKILLed daemon's leftover.
+	staleLn.(*net.UnixListener).SetUnlinkOnClose(false)
+	staleLn.Close()
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("stale socket file missing after seed: %v", err)
+	}
+
+	const n = 8
+	type result struct {
+		ln   net.Listener
+		lock *os.File
+		err  error
+	}
+	results := make(chan result, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			ln, lock, err := prepareListener(sock)
+			results <- result{ln, lock, err}
+		}()
+	}
+	close(start)
+
+	var winners []result
+	for i := 0; i < n; i++ {
+		r := <-results
+		if r.err == nil {
+			winners = append(winners, r)
+		} else if r.err != ErrAlreadyRunning {
+			t.Errorf("loser returned unexpected error: %v", r.err)
+		}
+	}
+	if len(winners) != 1 {
+		t.Fatalf("want exactly 1 winner, got %d", len(winners))
+	}
+	w := winners[0]
+	defer w.ln.Close()
+	defer w.lock.Close()
+
+	// The winner's listener must be the one reachable at the path: accept a
+	// connection dialed against the canonical socket path.
+	done := make(chan error, 1)
+	go func() {
+		conn, err := w.ln.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		done <- err
+	}()
+	conn, err := net.DialTimeout("unix", sock, time.Second)
+	if err != nil {
+		t.Fatalf("dial winner: %v", err)
+	}
+	conn.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("winner accept: %v", err)
+	}
+}
+
+// TestSocketDirPermsTightenedWhenPreexisting guards against the MkdirAll
+// no-op: a pre-existing 0755 socket dir must be chmod'd to 0700 at startup.
+func TestSocketDirPermsTightenedWhenPreexisting(t *testing.T) {
+	dir := shortSocketDir(t)
+	sockDir := filepath.Join(dir, "d")
+	if err := os.Mkdir(sockDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sock := filepath.Join(sockDir, "s.sock")
+	ln, lock, err := prepareListener(sock)
+	if err != nil {
+		t.Fatalf("prepareListener: %v", err)
+	}
+	defer ln.Close()
+	defer lock.Close()
+
+	fi, err := os.Stat(sockDir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Fatalf("socket dir perms = %o, want 0700", got)
+	}
+}

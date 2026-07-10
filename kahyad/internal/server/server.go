@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"kahya/kahyad/internal/config"
@@ -39,6 +40,11 @@ type Server struct {
 
 	ln   net.Listener
 	http *http.Server
+	// lock is the exclusive startup flock on <socket>.lock, held for the
+	// whole daemon lifetime. It serializes socket takeover across processes
+	// and proves the socket at cfg.Socket is ours to unlink on Shutdown.
+	// The kernel releases it on any process death, including SIGKILL.
+	lock *os.File
 
 	started time.Time
 }
@@ -58,7 +64,7 @@ func New(cfg config.Config, log *logx.Logger, version string) *Server {
 //
 // The bound socket is chmod'd 0600.
 func (s *Server) Prepare() error {
-	ln, err := prepareListener(s.cfg.Socket)
+	ln, lock, err := prepareListener(s.cfg.Socket)
 	if err != nil {
 		if errors.Is(err, ErrAlreadyRunning) {
 			s.log.Error("already_running", "socket", s.cfg.Socket)
@@ -66,6 +72,7 @@ func (s *Server) Prepare() error {
 		return err
 	}
 	s.ln = ln
+	s.lock = lock
 	s.started = time.Now()
 
 	mux := http.NewServeMux()
@@ -96,7 +103,13 @@ func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(ctx)
+	// Safe: we have held the startup flock since Prepare, so no other
+	// daemon can have bound this path in the meantime.
 	_ = os.Remove(s.cfg.Socket)
+	if s.lock != nil {
+		_ = s.lock.Close() // releases the flock; the .lock file stays (never unlink a lock file)
+		s.lock = nil
+	}
 	return err
 }
 
@@ -119,35 +132,79 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+// acquireStartupLock takes the exclusive cross-process flock that serializes
+// socket takeover. It also creates the socket directory and tightens it to
+// 0700 even when it pre-existed with looser permissions (MkdirAll alone is a
+// no-op on an existing directory's mode).
+func acquireStartupLock(socketPath string) (*os.File, error) {
+	dir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("server: create socket dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("server: chmod socket dir %s: %w", dir, err)
+	}
+
+	f, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("server: open lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			// Another instance holds the lock: it is either serving already
+			// or mid-startup and about to. Either way, we must not start.
+			return nil, ErrAlreadyRunning
+		}
+		return nil, fmt.Errorf("server: flock %s.lock: %w", socketPath, err)
+	}
+	return f, nil
+}
+
 // prepareListener implements the socket takeover decision described on
-// Prepare, returning a bound, chmod 0600 unix listener.
-func prepareListener(socketPath string) (net.Listener, error) {
+// Prepare, returning a bound, chmod 0600 unix listener plus the held
+// startup lock. The flock makes the stat→probe→remove→listen sequence
+// atomic across processes — without it, two racing startups can both
+// conclude the socket is dead, both bind, and later unlink each other's
+// live socket.
+func prepareListener(socketPath string) (net.Listener, *os.File, error) {
+	lock, err := acquireStartupLock(socketPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if _, err := os.Stat(socketPath); err == nil {
 		alive := probeHealth(socketPath)
 		if alive {
-			return nil, ErrAlreadyRunning
+			lock.Close()
+			return nil, nil, ErrAlreadyRunning
 		}
 		// Dead socket file: unlink before binding a fresh one.
 		if err := os.Remove(socketPath); err != nil {
-			return nil, fmt.Errorf("server: remove stale socket %s: %w", socketPath, err)
+			lock.Close()
+			return nil, nil, fmt.Errorf("server: remove stale socket %s: %w", socketPath, err)
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("server: stat socket %s: %w", socketPath, err)
+		lock.Close()
+		return nil, nil, fmt.Errorf("server: stat socket %s: %w", socketPath, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return nil, fmt.Errorf("server: create socket dir: %w", err)
-	}
-
+	// Tighten the umask so the socket is never observable with wider
+	// permissions than 0600, even before the explicit chmod below. The
+	// enclosing directory is already 0700, so this is defense in depth.
+	oldMask := syscall.Umask(0o177)
 	ln, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldMask)
 	if err != nil {
-		return nil, fmt.Errorf("server: listen on %s: %w", socketPath, err)
+		lock.Close()
+		return nil, nil, fmt.Errorf("server: listen on %s: %w", socketPath, err)
 	}
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		ln.Close()
-		return nil, fmt.Errorf("server: chmod socket %s: %w", socketPath, err)
+		lock.Close()
+		return nil, nil, fmt.Errorf("server: chmod socket %s: %w", socketPath, err)
 	}
-	return ln, nil
+	return ln, lock, nil
 }
 
 // probeHealth dials socketPath and asks /health; it returns true only if a

@@ -39,6 +39,11 @@ func New(logDir, bootTraceID string) (*Logger, error) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, fmt.Errorf("logx: create log dir %s: %w", logDir, err)
 	}
+	// MkdirAll is a no-op on an existing directory's mode; enforce 0700
+	// even when the log dir pre-existed with looser permissions.
+	if err := os.Chmod(logDir, 0o700); err != nil {
+		return nil, fmt.Errorf("logx: chmod log dir %s: %w", logDir, err)
+	}
 	path := filepath.Join(logDir, fileName)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {

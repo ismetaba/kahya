@@ -7,11 +7,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
@@ -27,16 +29,17 @@ func main() {
 // run contains main's logic and returns the process exit code, so defers
 // (closing the log file) actually execute before the process exits.
 func run() int {
+	bootTraceID := traceid.New()
+
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kahyad: config error: %v\n", err)
+		bootFailLine(bootTraceID, "config_load_failed", err)
 		return 1
 	}
 
-	bootTraceID := traceid.New()
 	log, err := logx.New(cfg.LogDir, bootTraceID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kahyad: logger init error: %v\n", err)
+		bootFailLine(bootTraceID, "logger_init_failed", err)
 		return 1
 	}
 	defer log.Close()
@@ -64,4 +67,19 @@ func run() int {
 
 	log.Info("shutdown_complete")
 	return 0
+}
+
+// bootFailLine emits a hand-rolled JSONL error line for failures that occur
+// before the real logger exists (config load, logger init). Even these
+// bootstrap paths must honor the "every line is JSONL with a trace_id"
+// invariant (HANDOFF §4 ⚑).
+func bootFailLine(traceID, event string, err error) {
+	line, _ := json.Marshal(map[string]string{
+		"ts":       time.Now().UTC().Format(time.RFC3339Nano),
+		"level":    "ERROR",
+		"event":    event,
+		"trace_id": traceID,
+		"error":    err.Error(),
+	})
+	fmt.Fprintln(os.Stderr, string(line))
 }

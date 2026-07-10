@@ -149,3 +149,26 @@ func TestNeverEmptyTraceID(t *testing.T) {
 		}
 	}
 }
+
+// TestLogDirPermsTightenedWhenPreexisting guards against the MkdirAll no-op:
+// a pre-existing 0755 log dir must be chmod'd to 0700 by New.
+func TestLogDirPermsTightenedWhenPreexisting(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.Mkdir(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	l, err := New(logDir, "test0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	fi, err := os.Stat(logDir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Fatalf("log dir perms = %o, want 0700", got)
+	}
+}
