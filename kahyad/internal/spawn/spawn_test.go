@@ -155,6 +155,109 @@ func TestRunKillsProcessGroupOnTimeout(t *testing.T) {
 	}
 }
 
+// TestRunReturnsRecordedResultInsteadOfTimeout is BLOCKER 1's regression
+// test: a worker that already sent a terminal "result" line before ctx's
+// deadline arrives, but is merely slow to exit afterward, must have that
+// ALREADY-recorded outcome win over StatusTimeout - and the process group
+// must still be killed (no orphan process survives), exactly as for a
+// worker that never sent a terminal line at all.
+func TestRunReturnsRecordedResultInsteadOfTimeout(t *testing.T) {
+	env := testEnvelope(t)
+	cfg := testConfig("testdata/result_then_sleep_worker.py")
+
+	var pid int
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	outcome, err := Run(ctx, cfg, env, Callbacks{
+		OnStart: func(p int) { pid = p },
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Status != StatusOK {
+		t.Fatalf("outcome.Status = %q, want %q (an already-recorded result must win over timeout)", outcome.Status, StatusOK)
+	}
+	if pid == 0 {
+		t.Fatal("OnStart never called with a non-zero pid")
+	}
+	// Run must not wait out the worker's own 5s sleep just because it
+	// hadn't exited yet - the ctx timeout (400ms) plus a bounded kill/drain
+	// is all that should elapse.
+	if elapsed > 5*time.Second {
+		t.Errorf("Run() took %v to return, want well under the worker's own 5s sleep", elapsed)
+	}
+
+	// No orphan process (this script's own pid/group) may remain after
+	// ctx's timeout killed it, even though it already reported success.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		out, _ := exec.Command("pgrep", "-g", strconv.Itoa(pid)).CombinedOutput()
+		if len(strings.TrimSpace(string(out))) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("orphan process(es) still in group %d after timeout kill: %s", pid, out)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestRunReturnsBoundedWhenDetachedGrandchildHoldsPipeOpen is BLOCKER 2's
+// regression test: a grandchild that escapes this package's own process
+// group (setsid/start_new_session) and holds the stdout/stderr pipe
+// write-end open (by not having its stdout/stderr redirected away from
+// the ones it inherits) must never make Run hang forever - Run's
+// guarantee is a bounded return and killing everything still IN the
+// group, not reaching a detached grandchild (see Run's doc comment).
+func TestRunReturnsBoundedWhenDetachedGrandchildHoldsPipeOpen(t *testing.T) {
+	env := testEnvelope(t)
+	cfg := testConfig("testdata/detached_grandchild_worker.py")
+
+	var pid int
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	outcome, err := Run(ctx, cfg, env, Callbacks{
+		OnStart: func(p int) { pid = p },
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Status != StatusTimeout {
+		t.Fatalf("outcome.Status = %q, want %q", outcome.Status, StatusTimeout)
+	}
+	if pid == 0 {
+		t.Fatal("OnStart never called with a non-zero pid")
+	}
+	// Run must return boundedly (drainGrace-bounded, see spawn.go) even
+	// though the detached grandchild (running "sleep 3" outside the killed
+	// process group) is still holding the stdout/stderr pipe open.
+	if elapsed > 8*time.Second {
+		t.Errorf("Run() took %v to return, want well under 8s - a detached grandchild holding the stdout/stderr pipe open must not hang Run", elapsed)
+	}
+
+	// The DIRECT child (this script's own pid, also its process group id)
+	// is reaped even though its detached grandchild (outside that group)
+	// survives a little longer - pgrep -g matches by process GROUP, so it
+	// correctly excludes the escaped grandchild.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		out, _ := exec.Command("pgrep", "-g", strconv.Itoa(pid)).CombinedOutput()
+		if len(strings.TrimSpace(string(out))) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("direct child's process group %d still has members after Run returned: %s", pid, out)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestRunExitNonZeroWithoutResultLineIsTaskError is spec test (c): a
 // worker that emits a delta then exits 3 mid-stream, never sending a
 // terminal result/error line, must surface as StatusError with an empty

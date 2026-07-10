@@ -470,6 +470,71 @@ func TestPolicyCheckMalformedBodyDeniesWith400(t *testing.T) {
 	}
 }
 
+// TestPolicyCheckOversizedBodyDeniesWithinBudget is BLOCKER 3's regression
+// test: a 64MB /policy/check body must be rejected fail-closed (deny) well
+// under the documented 5s caller-side budget - decoding 64MB alone would
+// already blow past that budget without a body size cap in front of
+// json.Decode - and the ledger must still record the deny under the
+// trace_id from the request header (independent of the oversized body,
+// which never gets far enough to be parsed).
+func TestPolicyCheckOversizedBodyDeniesWithinBudget(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+
+	traceID := "trace-oversized-00000000000000001"
+	padding := strings.Repeat("A", 64<<20) // 64MB, comfortably over policyCheckMaxBody (1 MiB).
+	body := `{"trace_id":"` + traceID + `","task_id":"t1","tool_name":"Read","tool_input":{"padding":"` + padding + `"}}`
+
+	req, err := http.NewRequest(http.MethodPost, "http://kahyad/policy/check", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Kahya-Trace-Id", traceID)
+
+	start := time.Now()
+	resp, err := f.client.Do(req)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("POST /policy/check: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if elapsed > time.Second {
+		t.Errorf("policy/check with a 64MB body took %v, want well under 1s (well inside the 5s fail-closed budget)", elapsed)
+	}
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 400 or 413", resp.StatusCode)
+	}
+	var pr policyCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if pr.Decision != "deny" {
+		t.Errorf("decision = %q, want deny", pr.Decision)
+	}
+
+	// The ledger still records the fail-closed deny, under the header's
+	// trace_id, even though the oversized body itself was never parsed.
+	assertLedgerHasKind(t, f.store, traceID, "policy_decision")
+}
+
+// TestTaskOversizedBodyRejected covers /v1/task's own body size cap
+// (BLOCKER 3): an oversized body must be rejected before a worker is ever
+// spawned, not left to exhaust memory decoding it.
+func TestTaskOversizedBodyRejected(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+
+	body := `{"prompt":"` + strings.Repeat("A", 9<<20) + `","trace_id":"trace-oversized-task"}`
+	resp, err := f.client.Post("http://kahyad/v1/task", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/task: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 400 or 413", resp.StatusCode)
+	}
+}
+
 func TestPolicyCheckAnswersWellUnder5Seconds(t *testing.T) {
 	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
 	body, _ := json.Marshal(map[string]any{"trace_id": "trace-speed", "task_id": "t1", "tool_name": "memory_search"})

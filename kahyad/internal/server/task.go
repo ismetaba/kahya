@@ -16,6 +16,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,6 +25,22 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
+)
+
+// Request body size caps (BLOCKER 3 hardening: an unbounded body reaching
+// json.Decode can blow either endpoint's fail-closed latency budget - a
+// 64MB /policy/check body alone takes several seconds just to read, well
+// past the documented 5s caller-side timeout - so both bodies are capped
+// via http.MaxBytesReader BEFORE decoding, not after).
+const (
+	// policyCheckMaxBody caps POST /policy/check's request body: a real
+	// tool_input is tiny, so 1 MiB is already generous - reading it can
+	// never meaningfully eat into the 5s fail-closed budget.
+	policyCheckMaxBody = 1 << 20 // 1 MiB
+	// taskBodyMaxBytes caps POST /v1/task's request body (prompt +
+	// optional trace_id): generous even for a very long prompt, but
+	// bounded so an oversized body can't tie up the daemon decoding it.
+	taskBodyMaxBytes = 8 << 20 // 8 MiB
 )
 
 // Turkish user-facing strings this file can emit (HANDOFF §3 language
@@ -92,9 +109,20 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BLOCKER 3: cap the body BEFORE decoding - this happens before the SSE
+	// response even starts (headers are written further below), so an
+	// oversized body is rejected with a plain JSON error same as any other
+	// pre-SSE validation failure, never left to decode arbitrarily large
+	// input first.
+	r.Body = http.MaxBytesReader(w, r.Body, taskBodyMaxBytes)
 	var req taskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		status := http.StatusBadRequest
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSONError(w, status, "invalid request body")
 		return
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
@@ -355,12 +383,29 @@ var malformedBodyDeny = policyCheckResponse{
 // points). No I/O beyond a single ledger insert per decision, well inside
 // the caller's 5s budget.
 func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
+	// BLOCKER 3: cap the body BEFORE decoding - the endpoint's whole 5s
+	// fail-closed budget (HANDOFF §4 IPC ⚑) must never be at risk from an
+	// oversized body alone (a 64MB body can take several seconds to read
+	// on its own); a real tool_input is tiny, so 1 MiB is already
+	// generous.
+	r.Body = http.MaxBytesReader(w, r.Body, policyCheckMaxBody)
+
 	var req policyCheckRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Malformed body: no trace_id can be trusted from it, so there is
-		// nothing reliable to ledger - just answer the fixed fail-closed
-		// deny body.
-		writeJSON(w, http.StatusBadRequest, malformedBodyDeny)
+		// Malformed body, or one that exceeded policyCheckMaxBody: no
+		// tool_name/tool_input can be trusted from it, but the trace_id
+		// withTraceLogging already resolved from the X-Kahya-Trace-Id
+		// header (independent of the body) is still recorded, best-effort,
+		// against the fail-closed "deny" actually returned below - so
+		// evidence that a fail-closed deny happened is never silently
+		// dropped just because the body itself couldn't be parsed.
+		s.ledgerPolicyCheckDecodeFailure(r, err)
+		status := http.StatusBadRequest
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, malformedBodyDeny)
 		return
 	}
 
@@ -393,6 +438,38 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		Reason:   decision.Reason,
 		Rule:     decision.Rule,
 	})
+}
+
+// ledgerPolicyCheckDecodeFailure records a best-effort policy_decision
+// ledger row for a /policy/check request whose body could not be decoded
+// at all - either genuinely malformed JSON, or one that tripped
+// policyCheckMaxBody (BLOCKER 3). Nothing in the body itself (tool_name,
+// tool_input, the body's own trace_id/task_id) can be trusted at this
+// point, but the trace_id withTraceLogging already resolved from the
+// X-Kahya-Trace-Id header is independent of the body and still available -
+// fail-closed applies to the ledger too: record that a deny happened
+// rather than silently drop the only evidence of it. Best-effort only:
+// never blocks the response, and does nothing at all if no trace_id can
+// be recovered (should not happen in production - every route is mounted
+// through withTraceLogging in Prepare, which always resolves one).
+func (s *Server) ledgerPolicyCheckDecodeFailure(r *http.Request, decodeErr error) {
+	if s.eventLogger == nil {
+		return
+	}
+	traceID := traceIDFromContext(r)
+	if traceID == "" {
+		return
+	}
+	payload := map[string]any{
+		"trace_id": traceID,
+		"decision": malformedBodyDeny.Decision,
+		"rule":     malformedBodyDeny.Rule,
+		"reason":   malformedBodyDeny.Reason,
+		"error":    decodeErr.Error(),
+	}
+	if err := s.eventLogger.LogEvent(r.Context(), traceID, "policy_decision", payload); err != nil {
+		s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
+	}
 }
 
 // writeJSON writes v as a JSON body with the given status code.

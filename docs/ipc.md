@@ -119,6 +119,14 @@ Request body (matches `kahyad/cmd/kahya/client.go`'s `StreamTask`, W12-06):
 absent. An empty/whitespace-only `prompt` is rejected locally with `400`
 before a task is minted at all.
 
+**Body size cap:** the request body is capped at 8 MiB
+(`http.MaxBytesReader`, `kahyad/internal/server.taskBodyMaxBytes`) before
+`json.Decode` ever runs — generous for even a very long prompt, but bounded
+so an oversized body can't tie up the daemon decoding it. A body over the
+cap (or otherwise malformed) is rejected with `400` or `413`, same as any
+other pre-SSE validation failure — this happens before the SSE response
+starts, so no task is minted and no worker is spawned.
+
 Response: `Content-Type: text/event-stream`. Exactly the SSE contract
 W12-06 already implements client-side — this task (W12-07) is the server
 side that must match it, not the other way around:
@@ -175,6 +183,12 @@ any error or timeout on the caller's side must be treated as `deny`
 (fail-closed)** — the endpoint itself does no I/O beyond one ledger
 insert, so it always answers in well under that budget.
 
+**Body size cap:** the request body is capped at 1 MiB
+(`http.MaxBytesReader`, `kahyad/internal/server.policyCheckMaxBody`) before
+`json.Decode` ever runs — a real `tool_input` is tiny, so this can never
+meaningfully eat into the 5s budget above (an uncapped multi-megabyte body
+alone can take seconds just to read).
+
 Request:
 
 ```json
@@ -213,12 +227,16 @@ W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
 - **Allow, exactly:** `memory_search`.
 - **Deny** (reason `"W3 politika altyapısı gelene dek yalnız hafıza araması (memory_search) açık."`): `memory_write`, `memory_forget`, and every SDK built-in R-class tool — `Read`, `Glob`, `Grep` — plus `Bash`, `WebFetch`, `WebSearch`, `Write`, `Edit`. `Read`/`Glob`/`Grep` are denied *even though R-class actions are nominally auto-approved* per the §4 autonomy ladder, because no secret-lane classification exists before W3-01's `policy.yaml` globs land — HANDOFF §4's ordering invariant ("hiçbir bayt, gizli-şerit sınıflandırması yerel/deterministik olarak tamamlanmadan bulut modele gitmez") means an allowed file read could put unclassified bytes in front of a cloud model with no classification having happened. `memory_search`'s corpus is the user-reviewed seed, which is a designed exception.
 - **Deny, unknown tool** (reason `"Tanınmayan araç reddedildi (fail-closed)."`): any tool name not in the table at all — a distinct reason from the known-deny case, so a typo'd or future tool name is visibly distinguishable in logs/ledger.
-- **Malformed request body ⇒ HTTP 400**, but the body still says
-  `{"decision":"deny",...}` (`rule` still `"interim-static-v1"`, `reason`
-  `"Geçersiz istek gövdesi (fail-closed)."`) — so a sloppy client cannot
-  parse an "allow" out of a transport-level error. No ledger row is
-  written for a malformed body (there is no `trace_id` that can be
-  trusted from an unparseable request).
+- **Malformed request body, or one over the 1 MiB cap above, ⇒ HTTP 400 or
+  413**, but the body still says `{"decision":"deny",...}` (`rule` still
+  `"interim-static-v1"`, `reason` `"Geçersiz istek gövdesi
+  (fail-closed)."`) — so a sloppy client cannot parse an "allow" out of a
+  transport-level error. A best-effort `policy_decision` ledger row IS
+  still written for this case, under the `trace_id` `withTraceLogging`
+  already resolved from the `X-Kahya-Trace-Id` header (independent of the
+  unparseable/oversized body itself) — fail-closed applies to the ledger
+  too, so evidence that a deny happened is never silently dropped just
+  because the body couldn't be parsed.
 
 **Ledger:** every well-formed decision writes exactly one
 `kind='policy_decision'` event, payload = the full request (`trace_id`,

@@ -10,7 +10,20 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
+
+// drainGrace bounds how long Run tolerates the stdout/stderr drain
+// goroutines not finishing on their own once the direct child's process
+// group has already been killed (BLOCKER 2 fix): the direct child is
+// always in the killed group and its own stdout/stderr write-ends close
+// essentially immediately once SIGKILL lands, but a grandchild that
+// escaped the group via setsid can keep holding those pipes open
+// indefinitely. Run allows two such grace windows (see
+// awaitExitBounded) before giving up on ever observing a clean drain and
+// returning regardless - so Run's worst-case added latency after a
+// timeout is bounded by roughly 2*drainGrace, never unbounded.
+const drainGrace = 2 * time.Second
 
 // Terminal Outcome.Status values (HANDOFF §4 IPC ⚑ / W12-07 step 3-4).
 const (
@@ -25,8 +38,16 @@ const (
 	// message's "kahya log --trace %s" needs).
 	StatusError = "error"
 	// StatusTimeout means ctx was done before the process exited on its
-	// own; Run killed the whole process GROUP and waited for it to be
-	// reaped before returning - no orphan process ever survives Run.
+	// own AND the process never sent a terminal "result"/"error" stdout
+	// line before that happened (see Run's doc comment: an
+	// already-recorded terminal outcome always wins over StatusTimeout,
+	// even when ctx.Done fires first - a slow-to-exit-but-already-done
+	// worker is not a timeout). When StatusTimeout IS returned, Run killed
+	// every process still in the child's own process GROUP and waited
+	// (bounded - see Run's doc comment) for it to be reaped before
+	// returning. A grandchild that detached from the group via setsid is
+	// the one documented exception that can survive this - see Run's doc
+	// comment.
 	StatusTimeout = "timeout"
 )
 
@@ -118,10 +139,30 @@ type stdoutLine struct {
 // comes first; it has no timeout policy of its own - the caller is
 // responsible for giving ctx a deadline that reflects cfg.task_timeout_min
 // (kahyad/internal/server's /v1/task handler does this). On ctx.Done, Run
-// sends SIGKILL to the entire process group and waits for the exit to be
-// fully reaped (and both stdout/stderr readers to observe EOF) before
-// returning Outcome{Status: StatusTimeout} - so no orphan process ever
-// survives a call to Run, timeout or not.
+// sends SIGKILL to the entire process group.
+//
+// Run's guarantee is a BOUNDED RETURN, not "no descendant process ever
+// survives": every process still in the child's own process group is
+// killed and (within drainGrace of the group's own exit) reaped before
+// Run returns. A grandchild that detaches from the group itself
+// (setsid/`start_new_session=True`, e.g. Python's subprocess.Popen) is, by
+// definition, OUTSIDE that group - kill(-pgid) cannot reach it, and if it
+// also still holds the worker's stdout/stderr pipe write-end open (e.g.
+// by not redirecting its own stdout/stderr away from the inherited ones),
+// kahyad's stdout/stderr readers never see a natural EOF from it either.
+// Run tolerates this: after drainGrace, it reclaims its own pipe read-ends
+// to unblock those readers and returns anyway, rather than hang
+// indefinitely on a process it was never going to be able to kill. This
+// is a documented, accepted limitation, not a bug - the sanctioned worker
+// (W12-09) does not setsid; a future `⌥⎋` halt (W6-03) is what handles the
+// sanctioned tree's own halt semantics, not Run.
+//
+// Whenever the worker DID send a terminal {"type":"result"/"error"} stdout
+// line before ctx.Done fired - it just hadn't exited yet - Run reports
+// that already-recorded Outcome, never StatusTimeout: a slow-to-exit
+// worker that had already finished is not a timeout (see StatusTimeout's
+// own doc comment). StatusTimeout is reserved for "ctx.Done fired and no
+// terminal line was ever observed".
 //
 // A non-nil error return means Run could not even manage the process
 // (marshal/pipe/start failure) - as distinct from Outcome.Status ==
@@ -234,25 +275,106 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 	select {
 	case <-ctx.Done():
 		killGroup(cmd)
-		<-waitErrCh // blocks until the killed process is fully reaped
-		return Outcome{Status: StatusTimeout, SessionID: outcome.SessionID}, nil
+		// BLOCKER 2: waitErrCh is gated (above) behind BOTH stdoutDone and
+		// stderrDone, which only close on a natural EOF - and EOF never
+		// arrives if a detached grandchild (outside the just-killed group)
+		// still holds a pipe write-end open. awaitExitBounded gives that
+		// natural path drainGrace to happen on its own before forcing it,
+		// so Run always returns bounded regardless.
+		return awaitExitBounded(stdout, stderr, waitErrCh, &outcome, &sawTerminal), nil
 	case <-waitErrCh:
-		if !sawTerminal {
-			// The process ended - any exit code - without ever sending a
-			// terminal result/error line (W12-07 step 4: "worker exit ≠0
-			// without a result line ⇒ task_error"; extended here to ANY
-			// exit without one, per this package's fail-closed posture -
-			// see StatusError's doc comment).
-			outcome.Status = StatusError
-			outcome.ErrMsg = ""
-		}
-		return outcome, nil
+		// BLOCKER 1: an already-recorded terminal result/error outcome
+		// (sawTerminal) is authoritative - finalizeOutcome only falls back
+		// to StatusError here (the process ended - any exit code - without
+		// ever sending a terminal result/error line; W12-07 step 4:
+		// "worker exit ≠0 without a result line ⇒ task_error", extended to
+		// ANY exit without one, per this package's fail-closed posture -
+		// see StatusError's doc comment) when no terminal line was ever
+		// observed.
+		return finalizeOutcome(outcome, sawTerminal, StatusError), nil
+	}
+}
+
+// finalizeOutcome is the single place both of Run's select branches decide
+// the returned Outcome from what the stdout parser observed (BLOCKER 1
+// fix, factored out so both branches share exactly one decision instead of
+// each re-deriving it slightly differently): a terminal "result"/"error"
+// JSONL line, once seen (sawTerminal), is authoritative regardless of why
+// Run's select fired - in particular, a worker that already reported
+// success but is merely slow to exit afterward must not be relabeled
+// StatusTimeout just because ctx's deadline happened to arrive first.
+// onNoTerminal is the Status used only when no terminal line was ever
+// parsed: StatusTimeout from the ctx.Done() branch, StatusError (the
+// process ended - any exit code - without ever sending one) from the
+// waitErrCh branch.
+func finalizeOutcome(outcome Outcome, sawTerminal bool, onNoTerminal string) Outcome {
+	if sawTerminal {
+		return outcome
+	}
+	return Outcome{Status: onNoTerminal, SessionID: outcome.SessionID}
+}
+
+// awaitExitBounded is the post-kill half of Run's ctx.Done() branch
+// (BLOCKER 2): killGroup has already been called, so the direct child
+// (always a member of its own killed group) is dying or already dead, but
+// waitErrCh only fires once stdoutDone AND stderrDone both close, which
+// depends on the stdout/stderr pipes reaching EOF - and EOF never arrives
+// if a grandchild that escaped the group via setsid still holds a
+// write-end open (killGroup's kill(-pgid) cannot reach it - it is, by
+// definition, outside the group).
+//
+// awaitExitBounded gives that natural drain path drainGrace to finish. If
+// it hasn't, it reclaims the pipe read-ends kahyad itself still owns
+// (stdout/stderr, from cmd.StdoutPipe/StderrPipe) - closing a pipe that a
+// goroutine is currently blocked reading forces that Read to return an
+// error, which is exactly what unblocks the stdout/stderr scanner
+// goroutines (see scanLines) and, through them, waitErrCh's own gate. It
+// then waits once more, bounded, for that unblocked drain-then-Wait to
+// actually complete (so the direct child is always reaped by the time Run
+// returns in the overwhelmingly common case) before giving up entirely.
+//
+// outcome/sawTerminal are passed by pointer and only ever dereferenced
+// AFTER a receive from waitErrCh has actually happened in one of the two
+// selects below - that receive is what establishes the happens-before
+// relationship with the stdout-parsing goroutine's last write to them
+// (mirrored exactly from Run's own pre-fix ordering); dereferencing them
+// any earlier would race with that goroutine. The one path that gives up
+// without ever receiving from waitErrCh (drainGrace elapsing twice in a
+// row - should not happen: closing an *os.File a goroutine is blocked
+// reading interrupts that read on every platform kahyad supports)
+// therefore returns a bare Outcome instead of touching outcome/sawTerminal
+// at all, keeping this function race-free under every possible timing.
+func awaitExitBounded(stdout, stderr io.Closer, waitErrCh <-chan error, outcome *Outcome, sawTerminal *bool) Outcome {
+	select {
+	case <-waitErrCh:
+		return finalizeOutcome(*outcome, *sawTerminal, StatusTimeout)
+	case <-time.After(drainGrace):
+	}
+
+	// A detached grandchild is still holding a pipe open: force the
+	// drain goroutines to give up rather than wait for an EOF that may
+	// never come.
+	_ = stdout.Close()
+	_ = stderr.Close()
+
+	select {
+	case <-waitErrCh:
+		return finalizeOutcome(*outcome, *sawTerminal, StatusTimeout)
+	case <-time.After(drainGrace):
+		// Never block indefinitely, no matter what: Run returns even in
+		// this should-not-happen case, without touching outcome/
+		// sawTerminal (still being written by a goroutine this function
+		// never synchronized with, at this point).
+		return Outcome{Status: StatusTimeout}
 	}
 }
 
 // killGroup sends SIGKILL to cmd's entire process group (the negative pid
 // convention). A nil Process (should not happen after a successful Start)
-// is a no-op.
+// is a no-op. This can only ever reach processes still IN the group - a
+// grandchild that detached via setsid/`start_new_session=True` is outside
+// it by definition and survives (see Run's doc comment; awaitExitBounded
+// is what keeps Run itself from hanging on that, not this function).
 func killGroup(cmd *exec.Cmd) {
 	if cmd.Process == nil {
 		return
