@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
 )
 
@@ -34,6 +36,14 @@ type DBHealth interface {
 	Health(ctx context.Context) (ok bool, schemaVersion int64, err error)
 }
 
+// Searcher is the fused BM25 search source /v1/memory/search reports
+// (W12-03 step 4). It is a narrow interface - *search.Searcher satisfies
+// it without any adapter code - so tests can fake it without a real
+// brain.db.
+type Searcher interface {
+	Search(ctx context.Context, traceID, query string, k int) ([]search.Hit, error)
+}
+
 const (
 	healthCheckDialTimeout = 500 * time.Millisecond
 	healthCheckTimeout     = 1 * time.Second
@@ -47,6 +57,7 @@ type Server struct {
 	log     *logx.Logger
 	version string
 	db      DBHealth
+	search  Searcher
 
 	ln   net.Listener
 	http *http.Server
@@ -73,6 +84,15 @@ func (s *Server) AdoptStartupLock(f *os.File) {
 	s.lock = f
 }
 
+// SetSearcher wires the /v1/memory/search route to searcher (W12-03 step
+// 4). Call this before Prepare/Run. Kept as a setter (rather than a New
+// parameter) so every existing New(...) call site - including every
+// current server_test.go test - keeps working unchanged; /v1/memory/search
+// answers 503 until a searcher is set.
+func (s *Server) SetSearcher(searcher Searcher) {
+	s.search = searcher
+}
+
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and
 // binds the listener, but does not yet start serving:
 //   - socket file missing → bind fresh.
@@ -95,6 +115,7 @@ func (s *Server) Prepare() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/v1/memory/search", s.handleMemorySearch)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -293,6 +314,87 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// memorySearchRequest is POST /v1/memory/search's request body (W12-03
+// step 4). trace_id is optional: when absent, the search layer mints one
+// (kahyad/internal/logx.Logger.With's own fallback), independent of the
+// X-Kahya-Trace-Id header withTraceLogging uses for the outer
+// event=http_request line - a caller resuming a multi-step trace supplies
+// its own trace_id here on purpose.
+type memorySearchRequest struct {
+	Query   string `json:"query"`
+	K       int    `json:"k"`
+	TraceID string `json:"trace_id"`
+}
+
+type memorySearchResultItem struct {
+	ChunkID    int64   `json:"chunk_id"`
+	EpisodeID  int64   `json:"episode_id"`
+	Path       string  `json:"path"`
+	Text       string  `json:"text"`
+	Score      float64 `json:"score"`
+	SourceTier string  `json:"source_tier"`
+}
+
+type memorySearchResponse struct {
+	Results []memorySearchResultItem `json:"results"`
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+// handleMemorySearch is the raw internal ranking API (W12-03 step 4); the
+// <hafiza> injection-eligibility layer on top is W12-05. An empty query
+// (or one that is all whitespace) is a 400, never a panic; k<=0 defaults to
+// 8 inside search.Searcher.Search.
+func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
+	if s.search == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "memory search not available")
+		return
+	}
+
+	var req memorySearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		writeJSONError(w, http.StatusBadRequest, "query must not be empty")
+		return
+	}
+
+	hits, err := s.search.Search(r.Context(), req.TraceID, req.Query, req.K)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	resp := memorySearchResponse{Results: make([]memorySearchResultItem, 0, len(hits))}
+	for _, h := range hits {
+		resp.Results = append(resp.Results, memorySearchResultItem{
+			ChunkID:    h.ChunkID,
+			EpisodeID:  h.EpisodeID,
+			Path:       h.Path,
+			Text:       h.Text,
+			Score:      h.Score,
+			SourceTier: h.SourceTier,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeJSONError writes a {"error": msg} body with the given status code -
+// every error path in this package answers JSON, never a bare text/plain
+// http.Error body, so CLI/worker callers can always json.Decode the
+// response regardless of status.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(errorResponse{Error: msg})
 }
 
 // statusRecorder captures the status code written by a downstream handler

@@ -243,6 +243,128 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 	}
 }
 
+// TestMigrationFromV1UpgradesToV2 is the W12-03 acceptance-criterion
+// regression test: a brain.db that only ever saw migration 0001 (as every
+// pre-W12-03 database did) must migrate cleanly up to schema version 2
+// (chunks_fts_tri/chunks_fts_uni/chunk_vec) the next time kahyad boots.
+func TestMigrationFromV1UpgradesToV2(t *testing.T) {
+	cfg := testCfg(t)
+
+	// Simulate a pre-existing v1-only database by migrating a raw
+	// connection up to version 1 ONLY, bypassing Store.Open (which always
+	// migrates to the latest embedded version).
+	rawDB, err := sql.Open("sqlite3", cfg.DBPath+dsnPragmas)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("goose.SetDialect: %v", err)
+	}
+	if err := goose.UpTo(rawDB, ".", 1); err != nil {
+		t.Fatalf("goose.UpTo(1): %v", err)
+	}
+
+	got := tableNames(t, rawDB)
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec"} {
+		if got[name] {
+			t.Fatalf("table %q unexpectedly present on a v1-only db", name)
+		}
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	// Boot through the real path: Store.Open must migrate the existing v1
+	// db cleanly up to v2 (and pass the sqlite_feature_missing assertion).
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open() on v1-only db error = %v", err)
+	}
+	defer s.Close()
+
+	if s.SchemaVersion() != 2 {
+		t.Errorf("SchemaVersion() after upgrade = %d, want 2", s.SchemaVersion())
+	}
+	var userVersion int64
+	if err := s.DB().QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		t.Fatalf("PRAGMA user_version: %v", err)
+	}
+	if userVersion != 2 {
+		t.Errorf("PRAGMA user_version after upgrade = %d, want 2", userVersion)
+	}
+
+	got = tableNames(t, s.DB())
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec"} {
+		if !got[name] {
+			t.Errorf("table %q missing after v1->v2 upgrade; tables = %v", name, got)
+		}
+	}
+}
+
+// TestAssertSQLiteFeaturesPassesOnOpen guards the W12-03 startup assertion
+// indirectly: every successful Open() above already proves
+// assertSQLiteFeatures did not fail-close a healthy database. This test
+// makes that assertion explicit and checks vec_version()/sqlite_version()
+// are independently queryable post-Open, the same way assertSQLiteFeatures
+// checks them.
+func TestAssertSQLiteFeaturesPassesOnOpen(t *testing.T) {
+	s, err := Open(testCfg(t))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	var sqliteVersion, vecVersion string
+	if err := s.DB().QueryRow(`SELECT sqlite_version()`).Scan(&sqliteVersion); err != nil {
+		t.Fatalf("sqlite_version(): %v", err)
+	}
+	if err := s.DB().QueryRow(`SELECT vec_version()`).Scan(&vecVersion); err != nil {
+		t.Fatalf("vec_version(): %v (sqlite-vec extension not loaded)", err)
+	}
+	if major, minor, err := parseSQLiteVersion(sqliteVersion); err != nil {
+		t.Errorf("parseSQLiteVersion(%q): %v", sqliteVersion, err)
+	} else if major < minSQLiteMajor || (major == minSQLiteMajor && minor < minSQLiteMinor) {
+		t.Errorf("sqlite_version() = %s, want >= %d.%d", sqliteVersion, minSQLiteMajor, minSQLiteMinor)
+	}
+}
+
+// TestParseSQLiteVersion is a pure unit test of the major.minor parser used
+// by assertSQLiteFeatures's >= 3.45 floor check.
+func TestParseSQLiteVersion(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantMajor int
+		wantMinor int
+		wantErr   bool
+	}{
+		{in: "3.45.0", wantMajor: 3, wantMinor: 45},
+		{in: "3.53.2", wantMajor: 3, wantMinor: 53},
+		{in: "4.0.0", wantMajor: 4, wantMinor: 0},
+		{in: "3.44.9", wantMajor: 3, wantMinor: 44},
+		{in: "garbage", wantErr: true},
+		{in: "3", wantErr: true},
+		{in: "", wantErr: true},
+	}
+	for _, c := range cases {
+		major, minor, err := parseSQLiteVersion(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseSQLiteVersion(%q) error = nil, want error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseSQLiteVersion(%q) error = %v, want nil", c.in, err)
+			continue
+		}
+		if major != c.wantMajor || minor != c.wantMinor {
+			t.Errorf("parseSQLiteVersion(%q) = (%d, %d), want (%d, %d)", c.in, major, minor, c.wantMajor, c.wantMinor)
+		}
+	}
+}
+
 // TestEventsReplaceCannotBypassAppendOnly guards the recursive_triggers
 // pragma: with it OFF, INSERT OR REPLACE's implicit row-delete on a PK
 // conflict skips the events DELETE trigger and silently overwrites a

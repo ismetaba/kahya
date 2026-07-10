@@ -1,6 +1,6 @@
 # W12-03 — FTS5 dual index + sqlite-vec table + search API
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-02
 **Flags:** none

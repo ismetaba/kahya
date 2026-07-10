@@ -18,6 +18,7 @@ import (
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/traceid"
@@ -70,7 +71,11 @@ func run() int {
 	// brain.db must never be reachable (HANDOFF §4 ⚑ fail-closed).
 	st, err := store.Open(cfg)
 	if err != nil {
-		log.Error("migrate_failed", "err", err.Error())
+		if errors.Is(err, store.ErrSQLiteFeatureMissing) {
+			log.Error("sqlite_feature_missing", "err", err.Error())
+		} else {
+			log.Error("migrate_failed", "err", err.Error())
+		}
 		return 1
 	}
 	defer st.Close() // checkpoints the WAL (TRUNCATE) on every exit path
@@ -78,6 +83,10 @@ func run() int {
 
 	srv := server.New(cfg, log, buildinfo.Version, st)
 	srv.AdoptStartupLock(lock)
+	// /v1/memory/search (W12-03 step 4). Its own JSONL logging is scoped
+	// per-request (from the request body's trace_id, or a freshly minted
+	// one), not to bootTraceID.
+	srv.SetSearcher(search.New(st.DB(), log, search.DefaultConfig()))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

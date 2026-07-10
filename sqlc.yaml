@@ -1,7 +1,18 @@
 version: "2"
 sql:
   - engine: "sqlite"
-    schema: "kahyad/migrations"
+    # NOTE (W12-03): this is an explicit file list, not the whole
+    # "kahyad/migrations" directory, because sqlc's sqlite grammar cannot
+    # parse the FTS5/vec0 virtual-table DDL in 0002_fts_vec.sql at all
+    # ("extraneous input '=' expecting {')', ','}" on tokenize='trigram'
+    # and on vec0's distance_metric=cosine / FLOAT[512] syntax - confirmed
+    # empirically, not a guess). Nothing needs sqlc for those three virtual
+    # tables anyway: kahyad/internal/search writes/reads them with
+    # hand-written SQL. Add each FUTURE plain-table migration file here by
+    # name; skip any migration file that (like 0002) only contains virtual
+    # table DDL sqlc can't parse.
+    schema:
+      - "kahyad/migrations/0001_init_schema.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

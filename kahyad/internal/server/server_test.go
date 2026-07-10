@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/search"
 )
 
 // shortSocketDir returns a short-path temp dir suitable for unix sockets.
@@ -55,6 +57,24 @@ type fakeDB struct {
 func (f fakeDB) Health(context.Context) (bool, int64, error) { return f.ok, f.version, f.err }
 
 var healthyDB = fakeDB{ok: true, version: 1}
+
+// fakeSearcher is a minimal Searcher stand-in so server tests can exercise
+// /v1/memory/search without a real brain.db.
+type fakeSearcher struct {
+	hits    []search.Hit
+	err     error
+	lastQ   string
+	lastK   int
+	lastTID string
+}
+
+func (f *fakeSearcher) Search(_ context.Context, traceID, q string, k int) ([]search.Hit, error) {
+	f.lastTID, f.lastQ, f.lastK = traceID, q, k
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.hits, nil
+}
 
 // unixHTTPClient returns an http.Client that dials socketPath for every
 // request, matching how the real kahya CLI talks to kahyad.
@@ -362,5 +382,159 @@ func TestSocketDirPermsTightenedWhenPreexisting(t *testing.T) {
 	}
 	if got := fi.Mode().Perm(); got != 0o700 {
 		t.Fatalf("socket dir perms = %o, want 0700", got)
+	}
+}
+
+// postMemorySearch is a small helper for hitting POST /v1/memory/search
+// over the unix socket client with a raw JSON body.
+func postMemorySearch(t *testing.T, client *http.Client, body string) *http.Response {
+	t.Helper()
+	resp, err := client.Post("http://kahyad/v1/memory/search", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /v1/memory/search: %v", err)
+	}
+	return resp
+}
+
+// TestMemorySearchEndpointReturnsResults guards W12-03 step 4's happy path:
+// a valid request reaches the wired Searcher and its hits round-trip as
+// JSON with every documented field.
+func TestMemorySearchEndpointReturnsResults(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 7, EpisodeID: 3, Path: "note-a.md", Text: "ev bakiyoruz", Score: 0.42, SourceTier: "user_asserted"},
+	}}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	client := unixHTTPClient(socketPath)
+	resp := postMemorySearch(t, client, `{"query":"evlerimizden","k":3,"trace_id":"tid-1"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Results []struct {
+			ChunkID    int64   `json:"chunk_id"`
+			EpisodeID  int64   `json:"episode_id"`
+			Path       string  `json:"path"`
+			Text       string  `json:"text"`
+			Score      float64 `json:"score"`
+			SourceTier string  `json:"source_tier"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(body.Results))
+	}
+	got := body.Results[0]
+	if got.ChunkID != 7 || got.EpisodeID != 3 || got.Path != "note-a.md" || got.Text != "ev bakiyoruz" || got.SourceTier != "user_asserted" {
+		t.Errorf("result = %+v, want chunk_id=7 episode_id=3 path=note-a.md text=%q source_tier=user_asserted", got, "ev bakiyoruz")
+	}
+	if got.Score != 0.42 {
+		t.Errorf("result.score = %v, want 0.42", got.Score)
+	}
+
+	if fs.lastQ != "evlerimizden" || fs.lastK != 3 || fs.lastTID != "tid-1" {
+		t.Errorf("Searcher.Search called with (traceID=%q, q=%q, k=%d), want (tid-1, evlerimizden, 3)", fs.lastTID, fs.lastQ, fs.lastK)
+	}
+}
+
+// TestMemorySearchEndpointEmptyQueryIs400 guards step 4: an empty query
+// must be a clean 400, never a panic (and never reach the Searcher at all).
+func TestMemorySearchEndpointEmptyQueryIs400(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	client := unixHTTPClient(socketPath)
+	for _, body := range []string{`{"query":""}`, `{"query":"   "}`, `{}`} {
+		resp := postMemorySearch(t, client, body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, resp.StatusCode)
+		}
+		var errBody map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&errBody); err != nil {
+			t.Errorf("body %s: decode error response: %v", body, err)
+		}
+		resp.Body.Close()
+		if _, ok := errBody["error"]; !ok {
+			t.Errorf("body %s: error response missing \"error\" field: %v", body, errBody)
+		}
+	}
+	if fs.lastQ != "" {
+		t.Errorf("Searcher.Search should never have been called for an empty query, got q=%q", fs.lastQ)
+	}
+}
+
+// TestMemorySearchEndpointMalformedJSONIs400 guards against a panic on a
+// non-JSON body.
+func TestMemorySearchEndpointMalformedJSONIs400(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(&fakeSearcher{})
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `not json`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestMemorySearchEndpointNoSearcherIs503 guards the pre-wiring state: if
+// SetSearcher is never called, the route must fail closed with 503, not
+// panic on a nil s.search.
+func TestMemorySearchEndpointNoSearcherIs503(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `{"query":"hello"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestMemorySearchEndpointSearcherErrorIs400 guards a Searcher error (e.g.
+// search.ErrEmptyQuery bubbling up, or any other internal failure)
+// surfacing as a clean 400 with an error body, never a 500 stack dump.
+func TestMemorySearchEndpointSearcherErrorIs400(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(&fakeSearcher{err: search.ErrEmptyQuery})
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postMemorySearch(t, unixHTTPClient(socketPath), `{"query":"hello"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
