@@ -90,27 +90,36 @@ func execTask(client *Client, traceID, prompt string, stdout, stderr io.Writer) 
 }
 
 // runREPL implements the REPL (W12-06 step 3): a banner, then a
-// read-eval-print loop over bufio.Scanner (no readline dependency); "/çık"
-// or "/cik", or EOF/Ctrl-D, ends it. Each non-empty line runs one task with
-// a fresh trace_id. The REPL itself always exits 0 - a failed task inside
-// the loop is reported (via execTask's own stderr output) but does not end
-// the session or change its exit code.
+// read-eval-print loop over a bufio.Reader (no readline dependency, and -
+// unlike bufio.Scanner's default 64KB token cap, BLOCKER 2 - no line-length
+// limit at all); "/çık" or "/cik", or EOF/Ctrl-D, ends it. Each non-empty
+// line runs one task with a fresh trace_id. The REPL itself always exits 0
+// - a failed task inside the loop is reported (via execTask's own stderr
+// output) but does not end the session or change its exit code.
 func runREPL(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, MsgREPLBanner)
-	sc := bufio.NewScanner(stdin)
+	r := bufio.NewReader(stdin)
 	for {
 		fmt.Fprint(stdout, MsgREPLPrompt)
-		if !sc.Scan() {
-			break // EOF/Ctrl-D
+		raw, err := r.ReadString('\n')
+		if raw == "" && err != nil {
+			break // EOF/Ctrl-D with nothing left to process
 		}
-		line := strings.TrimSpace(sc.Text())
+		// Mirror bufio.ScanLines' framing (strip one trailing "\n", then one
+		// trailing "\r") before the same TrimSpace the old Scanner-based loop
+		// applied, so behavior is unchanged beyond removing the line cap.
+		line := strings.TrimSuffix(raw, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		line = strings.TrimSpace(line)
 		if line == "/çık" || line == "/cik" {
 			break
 		}
-		if line == "" {
-			continue
+		if line != "" {
+			execTask(client, traceid.New(), line, stdout, stderr)
 		}
-		execTask(client, traceid.New(), line, stdout, stderr)
+		if err != nil {
+			break // EOF right after a final, newline-less line
+		}
 	}
 	fmt.Fprintln(stdout, MsgFarewell)
 	return 0

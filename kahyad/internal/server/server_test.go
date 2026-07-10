@@ -885,6 +885,95 @@ func TestLogEndpointFiltersOrdersAndTagsProc(t *testing.T) {
 	}
 }
 
+// TestLogEndpointSkipsOversizedMalformedLineAndKeepsLaterMatches guards
+// BLOCKER 3: readLogLines used to scan each file with a bufio.Scanner capped
+// at 1MB, so one oversized (or merely malformed) line made the scan look
+// like EOF and silently dropped every later line in that file - including
+// real matches. A 2MB non-JSON line sandwiched between two real matches
+// must not hide the second match.
+func TestLogEndpointSkipsOversizedMalformedLineAndKeepsLaterMatches(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	logDir := t.TempDir()
+
+	hugeGarbage := strings.Repeat("x", 2*1024*1024) // 2MB, not valid JSON, over the old 1MB cap
+	writeJSONL(t, filepath.Join(logDir, "kahyad.jsonl"), []string{
+		`{"ts":"2026-07-10T09:00:01.000Z","level":"INFO","event":"first","trace_id":"target"}`,
+		hugeGarbage,
+		`{"ts":"2026-07-10T09:00:02.000Z","level":"INFO","event":"second","trace_id":"target"}`,
+	})
+
+	cfg := testConfig(socketPath)
+	cfg.LogDir = logDir
+	srv := New(cfg, testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/v1/log?trace_id=target")
+	if err != nil {
+		t.Fatalf("GET /v1/log: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Lines []map[string]any `json:"lines"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Lines) != 2 {
+		t.Fatalf("got %d lines, want 2 (both real matches survive the oversized garbage line)", len(body.Lines))
+	}
+	if body.Lines[0]["event"] != "first" || body.Lines[1]["event"] != "second" {
+		t.Errorf("lines = %+v, want [first, second]", body.Lines)
+	}
+}
+
+// TestLogEndpointMissingTsSortsLastPreservingOrder guards MINOR 7: a line
+// with a missing/unparseable "ts" used to parse to time.Time's zero value
+// and sort BEFORE every real timestamp. It must instead sort AFTER every
+// valid-ts line, in its original read order relative to any other
+// missing-ts lines.
+func TestLogEndpointMissingTsSortsLastPreservingOrder(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	logDir := t.TempDir()
+	writeJSONL(t, filepath.Join(logDir, "kahyad.jsonl"), []string{
+		`{"ts":"2026-07-10T09:00:01.000Z","level":"INFO","event":"first","trace_id":"target"}`,
+		`{"ts":"2026-07-10T09:00:02.000Z","level":"INFO","event":"second","trace_id":"target"}`,
+		`{"level":"INFO","event":"no-ts","trace_id":"target"}`,
+	})
+
+	cfg := testConfig(socketPath)
+	cfg.LogDir = logDir
+	srv := New(cfg, testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/v1/log?trace_id=target")
+	if err != nil {
+		t.Fatalf("GET /v1/log: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Lines []map[string]any `json:"lines"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Lines) != 3 {
+		t.Fatalf("got %d lines, want 3", len(body.Lines))
+	}
+	if body.Lines[0]["event"] != "first" || body.Lines[1]["event"] != "second" || body.Lines[2]["event"] != "no-ts" {
+		t.Errorf("lines = %+v, want [first, second, no-ts] (missing ts sorts last, original order preserved)", body.Lines)
+	}
+}
+
 // TestLogEndpointNoMatchesReturnsEmptyLines guards the "bogus trace_id"
 // path the kahya CLI's log --trace relies on to print its not-found string:
 // zero matches is a 200 with an empty "lines" array, not an error.

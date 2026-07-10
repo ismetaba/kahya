@@ -37,16 +37,20 @@ const (
 // env override if set, else kahyad's own resolved default (config.Load
 // applies the identical defaulting/override rules kahyad itself uses, so
 // the CLI and daemon always agree on the socket path without kahya
-// hand-rolling a second copy of that logic).
+// hand-rolling a second copy of that logic). Both the env override and the
+// resolved default are passed through config.ExpandHome so a "~/..."
+// KAHYA_SOCKET value expands identically to how kahyad's own config.Load
+// expands it (BLOCKER 1) - without this, the CLI would dial a literal
+// "~/..." path while kahyad listens on the tilde-expanded one.
 func resolveSocket() (string, error) {
 	if v := os.Getenv("KAHYA_SOCKET"); v != "" {
-		return v, nil
+		return config.ExpandHome(v), nil
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return "", err
 	}
-	return cfg.Socket, nil
+	return config.ExpandHome(cfg.Socket), nil
 }
 
 // unreachableError renders as the exact MsgDaemonUnreachable string (socket
@@ -71,6 +75,20 @@ type idleTimeoutError struct {
 }
 
 func (e *idleTimeoutError) Error() string { return fmt.Sprintf(MsgIdleTimeout, e.traceID) }
+
+// streamIncompleteError renders as the exact MsgStreamIncomplete string
+// (trace_id substituted). It is returned (MINOR 6) instead of
+// unreachableError when a /v1/task SSE stream ends - via a clean close or a
+// low-level read failure, readSSE does not distinguish the two - after at
+// least one byte of the stream had already arrived but before a terminal
+// "result"/"error" event: at that point the daemon was clearly reachable
+// and the task may have progressed or even completed server-side, so
+// "kahyad'a ulaşılamıyor" (daemon unreachable) would be misleading.
+type streamIncompleteError struct {
+	traceID string
+}
+
+func (e *streamIncompleteError) Error() string { return fmt.Sprintf(MsgStreamIncomplete, e.traceID) }
 
 // Client talks HTTP-over-UDS to kahyad.
 type Client struct {
@@ -286,7 +304,7 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta
 
 	var result taskResult
 	gotResult := false
-	err = readSSE(resp.Body, idleReadTimeout, traceID, func(ev sseEvent) (stop bool) {
+	sawAny, err := readSSE(resp.Body, idleReadTimeout, traceID, func(ev sseEvent) (stop bool) {
 		switch ev.event {
 		case "delta":
 			var d struct {
@@ -300,9 +318,21 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta
 				Status    string `json:"status"`
 				TaskID    string `json:"task_id"`
 				SessionID string `json:"session_id"`
+				// Message is an optional explanation the server may attach
+				// to a status="error" result (MINOR 5); when absent,
+				// MsgTaskFailed is used below so an error result is never
+				// silently swallowed with no stderr output.
+				Message string `json:"message"`
 			}
 			if json.Unmarshal(ev.data, &r) == nil {
 				result = taskResult{Status: r.Status, TaskID: r.TaskID, SessionID: r.SessionID}
+				if r.Status == "error" {
+					if r.Message != "" {
+						result.ErrMsg = r.Message
+					} else {
+						result.ErrMsg = MsgTaskFailed
+					}
+				}
 				gotResult = true
 			}
 			return true
@@ -319,9 +349,29 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta
 		return false
 	})
 	if err != nil {
-		return taskResult{}, err
+		// idleTimeoutError already renders its own distinct, correct Turkish
+		// string; let it propagate as-is. Any other error from readSSE is a
+		// low-level read failure (BLOCKER 4) that must never reach the user
+		// as a raw Go error - fold it into the same "reachable but
+		// incomplete" vs. "unreachable" distinction as a clean mid-stream
+		// close (MINOR 6), based on whether any bytes had already arrived.
+		if _, isIdle := err.(*idleTimeoutError); isIdle {
+			return taskResult{}, err
+		}
+		if sawAny {
+			return taskResult{}, &streamIncompleteError{traceID: traceID}
+		}
+		return taskResult{}, &unreachableError{sock: c.sock, err: err}
 	}
 	if !gotResult {
+		// The stream ended cleanly (EOF, no read error) without a
+		// result/error event ever arriving. A connection that produced at
+		// least one byte was reachable and the task may have progressed or
+		// even completed server-side (MINOR 6) - only a stream that never
+		// produced anything at all is genuinely "unreachable".
+		if sawAny {
+			return taskResult{}, &streamIncompleteError{traceID: traceID}
+		}
 		return taskResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("task: stream ended without a result/error event")}
 	}
 	return result, nil
@@ -331,23 +381,41 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta
 // dispatch), calling handle for each complete frame until handle returns
 // true or the stream ends. It enforces idleTimeout between reads - not an
 // overall deadline, since long tasks may legitimately run for a long time -
-// by running the blocking line-scan on its own goroutine and racing each
+// by running the blocking line-read on its own goroutine and racing each
 // line against a timer; if idleTimeout elapses with no line at all, it
-// returns an *idleTimeoutError. The scanning goroutine is intentionally not
+// returns an *idleTimeoutError. The reading goroutine is intentionally not
 // joined on that path: closing resp.Body (the caller's defer) unblocks its
-// Read/Scan shortly after, and kahya is a short-lived CLI process where
-// that is a harmless, process-exit-bounded leak, not a long-running server.
-func readSSE(body io.Reader, idleTimeout time.Duration, traceID string, handle func(sseEvent) (stop bool)) error {
+// Read shortly after, and kahya is a short-lived CLI process where that is
+// a harmless, process-exit-bounded leak, not a long-running server.
+//
+// Lines are read with a bufio.Reader + ReadString('\n') loop rather than
+// bufio.Scanner (BLOCKER 4): Scanner's default 1MB token cap would otherwise
+// turn one oversized SSE data line into the raw, English
+// "bufio.Scanner: token too long", violating the Turkish-only user-facing
+// string policy. ReadString has no such cap, and any other low-level read
+// error it does surface is returned as-is here for the caller to translate
+// into a Turkish message (StreamTask does so, never printing it raw).
+//
+// The bool return reports whether at least one line was ever read off body,
+// so callers can distinguish "never reachable" from "reachable, but the
+// stream ended - cleanly or via a read error - before a terminal event"
+// (MINOR 6).
+func readSSE(body io.Reader, idleTimeout time.Duration, traceID string, handle func(sseEvent) (stop bool)) (sawAny bool, err error) {
 	lines := make(chan string, 16)
-	scanErr := make(chan error, 1)
+	readErrCh := make(chan error, 1)
 	go func() {
-		sc := bufio.NewScanner(body)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		if err := sc.Err(); err != nil {
-			scanErr <- err
+		r := bufio.NewReader(body)
+		for {
+			text, err := r.ReadString('\n')
+			if len(text) > 0 {
+				lines <- strings.TrimSuffix(strings.TrimSuffix(text, "\n"), "\r")
+			}
+			if err != nil {
+				if err != io.EOF {
+					readErrCh <- err
+				}
+				break
+			}
 		}
 		close(lines)
 	}()
@@ -368,16 +436,17 @@ func readSSE(body io.Reader, idleTimeout time.Duration, traceID string, handle f
 		case line, ok := <-lines:
 			if !ok {
 				select {
-				case err := <-scanErr:
-					return err
+				case err := <-readErrCh:
+					return sawAny, err
 				default:
 				}
-				return nil
+				return sawAny, nil
 			}
+			sawAny = true
 			switch {
 			case line == "":
 				if dispatch() {
-					return nil
+					return sawAny, nil
 				}
 			case strings.HasPrefix(line, "event:"):
 				evType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
@@ -388,7 +457,7 @@ func readSSE(body io.Reader, idleTimeout time.Duration, traceID string, handle f
 			default:
 			}
 		case <-time.After(idleTimeout):
-			return &idleTimeoutError{traceID: traceID}
+			return sawAny, &idleTimeoutError{traceID: traceID}
 		}
 	}
 }

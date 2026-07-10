@@ -63,4 +63,19 @@ const (
 	// MsgDaemonUnreachable (the task cannot be confirmed to have completed
 	// from here - it may still be running server-side).
 	MsgIdleTimeout = "kahyad yanıt vermiyor (30 sn) — görev arka planda sürüyor olabilir. Kontrol: kahya log --trace %s"
+
+	// MsgTaskFailed is the fallback line printed when a terminal "result"
+	// SSE event reports status="error" without its own optional "message"
+	// field (MINOR 5) - so an error result is never silently swallowed with
+	// no explanation on stderr.
+	MsgTaskFailed = "Görev başarısız oldu."
+
+	// MsgStreamIncomplete is printed (with the trace_id substituted via %s)
+	// when a /v1/task SSE stream ends - cleanly or via a low-level read
+	// error - after at least one byte had already arrived but before a
+	// terminal "result"/"error" event (MINOR 6). Distinct from
+	// MsgDaemonUnreachable: the daemon was reachable and the task may have
+	// progressed or completed server-side, so the message points at
+	// `kahya log` rather than implying the daemon is down.
+	MsgStreamIncomplete = "Görev yanıtı yarıda kesildi, sonuç alınamadı. Kontrol: kahya log --trace %s"
 )

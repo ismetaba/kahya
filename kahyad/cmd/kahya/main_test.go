@@ -79,6 +79,107 @@ func TestREPLExitsOnCikAsciiVariant(t *testing.T) {
 	}
 }
 
+// TestREPLProcessesLineOverScannerCap guards BLOCKER 2: bufio.Scanner's
+// default 64KB token cap used to make a longer line silently look like EOF,
+// ending the REPL early and dropping every subsequent line. A REPL fed a
+// >64KB line followed by "ikinci komut" and "/çık" must dispatch BOTH
+// commands, then exit cleanly.
+func TestREPLProcessesLineOverScannerCap(t *testing.T) {
+	huge := strings.Repeat("a", 100*1024) // 100KB, over the old 64KB cap
+	var dispatched []string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Prompt string `json:"prompt"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		dispatched = append(dispatched, body.Prompt)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	stdin := strings.NewReader(huge + "\nikinci komut\n/çık\n")
+	var stdout, stderr bytes.Buffer
+	code := run(nil, stdin, &stdout, &stderr)
+
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), MsgFarewell) {
+		t.Errorf("stdout missing farewell: %q", stdout.String())
+	}
+	if len(dispatched) != 2 {
+		t.Fatalf("dispatched %d prompts, want 2: %v", len(dispatched), truncateForLog(dispatched))
+	}
+	if dispatched[0] != huge {
+		t.Errorf("dispatched[0] length = %d, want %d (huge line intact)", len(dispatched[0]), len(huge))
+	}
+	if dispatched[1] != "ikinci komut" {
+		t.Errorf("dispatched[1] = %q, want %q", dispatched[1], "ikinci komut")
+	}
+}
+
+// truncateForLog keeps a failing test's output readable even if one of the
+// dispatched prompts is the 100KB fixture line.
+func truncateForLog(prompts []string) []string {
+	out := make([]string, len(prompts))
+	for i, p := range prompts {
+		if len(p) > 40 {
+			p = p[:40] + "...(truncated)"
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// TestOneShotResultErrorPrintsMessageAndExits1 guards MINOR 5's end-to-end
+// path: a terminal "result" event with status="error" and a "message" field
+// must have that message printed to stderr (Turkish, as-is) on exit 1.
+func TestOneShotResultErrorPrintsMessageAndExits1(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"error\",\"message\":\"Model çağrısı başarısız oldu.\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"merhaba"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Model çağrısı başarısız oldu.") {
+		t.Errorf("stderr = %q, want it to contain the Turkish error message", stderr.String())
+	}
+}
+
+// TestOneShotResultErrorNoMessagePrintsFallbackAndExits1 guards MINOR 5's
+// fallback path: a status="error" result with no "message" field must still
+// print MsgTaskFailed to stderr, never a silent exit 1.
+func TestOneShotResultErrorNoMessagePrintsFallbackAndExits1(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"error\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"merhaba"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), MsgTaskFailed) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr.String(), MsgTaskFailed)
+	}
+}
+
 func TestREPLExitsOnEOF(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(nil, strings.NewReader(""), &stdout, &stderr)

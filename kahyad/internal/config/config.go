@@ -247,6 +247,24 @@ func expandHome(path, home string) string {
 	return path
 }
 
+// ExpandHome resolves a leading "~" or "~/" in path against the current
+// user's home directory, applying the exact same expansion rule Load uses
+// for every configured path (it delegates to the unexported expandHome).
+// This is exported specifically so the kahya CLI's resolveSocket can expand
+// a raw KAHYA_SOCKET env value identically to how Load's applyEnv expands
+// it internally - without this, a "~/..." KAHYA_SOCKET value would make the
+// CLI and kahyad dial two different paths. If the home directory cannot be
+// resolved, path is returned unchanged (best-effort) rather than erroring;
+// callers needing Load's stricter fail-closed posture should call Load
+// itself.
+func ExpandHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return expandHome(path, home)
+}
+
 func validateASCIIPaths(cfg Config) error {
 	paths := map[string]string{
 		"data_dir":   cfg.DataDir,

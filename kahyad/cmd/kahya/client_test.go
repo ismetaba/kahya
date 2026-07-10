@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/config"
 )
 
 // startFakeServer binds handler to a fresh UDS path (in a short os.MkdirTemp
@@ -45,6 +47,33 @@ func TestResolveSocketUsesEnvOverride(t *testing.T) {
 	}
 	if got != "/tmp/whatever-kahya-test.sock" {
 		t.Errorf("resolveSocket() = %q, want the KAHYA_SOCKET override", got)
+	}
+}
+
+// TestResolveSocketExpandsTildeSameAsConfigLoad guards BLOCKER 1: a
+// "~/..." KAHYA_SOCKET value must resolve to the exact same absolute path
+// config.Load().Socket produces, so the CLI and kahyad always dial the same
+// socket instead of silently disagreeing.
+func TestResolveSocketExpandsTildeSameAsConfigLoad(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_SOCKET", "~/x/k.sock")
+
+	got, err := resolveSocket()
+	if err != nil {
+		t.Fatalf("resolveSocket() error = %v", err)
+	}
+	want := filepath.Join(home, "x", "k.sock")
+	if got != want {
+		t.Errorf("resolveSocket() = %q, want %q (tilde-expanded)", got, want)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	if got != cfg.Socket {
+		t.Errorf("resolveSocket() = %q, config.Load().Socket = %q - CLI and daemon disagree", got, cfg.Socket)
 	}
 }
 
@@ -226,6 +255,132 @@ func TestClientLogByteExactTurkish(t *testing.T) {
 	}
 }
 
+// TestStreamTaskResultErrorWithMessage guards MINOR 5: a terminal "result"
+// event with status="error" and its own "message" field surfaces that
+// message on taskResult.ErrMsg verbatim.
+func TestStreamTaskResultErrorWithMessage(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"error\",\"message\":\"Model çağrısı başarısız oldu.\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	res, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	if err != nil {
+		t.Fatalf("StreamTask() error = %v", err)
+	}
+	if res.Status != "error" || res.ErrMsg != "Model çağrısı başarısız oldu." {
+		t.Errorf("result = %+v, want status=error errMsg=%q", res, "Model çağrısı başarısız oldu.")
+	}
+}
+
+// TestStreamTaskResultErrorWithoutMessageUsesFallback guards MINOR 5's
+// fallback: a terminal "result" event with status="error" but no "message"
+// field must still produce a non-empty, Turkish ErrMsg (MsgTaskFailed)
+// rather than leaving it blank.
+func TestStreamTaskResultErrorWithoutMessageUsesFallback(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"error\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	res, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	if err != nil {
+		t.Fatalf("StreamTask() error = %v", err)
+	}
+	if res.Status != "error" || res.ErrMsg != MsgTaskFailed {
+		t.Errorf("result = %+v, want status=error errMsg=%q", res, MsgTaskFailed)
+	}
+}
+
+// TestStreamTaskMidStreamCloseIsStreamIncomplete guards MINOR 6: when the
+// server closes the /v1/task stream after sending at least one delta but no
+// result/error event, StreamTask must surface MsgStreamIncomplete (with the
+// trace id), not the misleading MsgDaemonUnreachable - the daemon plainly
+// was reachable, the task was simply mid-flight.
+func TestStreamTaskMidStreamCloseIsStreamIncomplete(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: delta\ndata: {\"text\":\"merhaba\"}\n\n")
+		// Handler returns without a result/error event: the connection
+		// closes mid-task.
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	_, err := client.StreamTask(context.Background(), "trace-mid", "soru", nil)
+	if err == nil {
+		t.Fatal("StreamTask() error = nil, want stream-incomplete error")
+	}
+	want := fmt.Sprintf(MsgStreamIncomplete, "trace-mid")
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if strings.Contains(err.Error(), "ulaşılamıyor") {
+		t.Errorf("error = %q, must not be the daemon-unreachable string", err.Error())
+	}
+}
+
+// TestStreamTaskZeroByteCloseIsUnreachable guards MINOR 6's other half: a
+// connection that fails/closes before ANY byte of the stream arrives must
+// still surface as MsgDaemonUnreachable, not stream-incomplete.
+func TestStreamTaskZeroByteCloseIsUnreachable(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// No body at all before the handler returns and the connection
+		// closes.
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	_, err := client.StreamTask(context.Background(), "trace-empty", "soru", nil)
+	if err == nil {
+		t.Fatal("StreamTask() error = nil, want unreachable error")
+	}
+	want := fmt.Sprintf(MsgDaemonUnreachable, sock)
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestReadSSEOversizedLineHasNoCap guards BLOCKER 4: a single SSE data line
+// well over the old 1MB bufio.Scanner cap must still be read in full and
+// delivered to onDelta, instead of the stream aborting with the raw English
+// "bufio.Scanner: token too long".
+func TestReadSSEOversizedLineHasNoCap(t *testing.T) {
+	hugeText := strings.Repeat("a", 2*1024*1024) // 2MB, over the old 1MB cap
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		payload, _ := json.Marshal(map[string]string{"text": hugeText})
+		fmt.Fprintf(w, "event: delta\ndata: %s\n\n", payload)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	var got strings.Builder
+	res, err := client.StreamTask(context.Background(), "trace-huge", "soru", func(text string) {
+		got.WriteString(text)
+	})
+	if err != nil {
+		t.Fatalf("StreamTask() error = %v", err)
+	}
+	if got.String() != hugeText {
+		t.Errorf("delta length = %d, want %d (huge line delivered intact)", len(got.String()), len(hugeText))
+	}
+	if res.Status != "ok" {
+		t.Errorf("result = %+v, want status=ok", res)
+	}
+}
+
 // TestReadSSEIdleTimeout guards the 30s-idle-timeout contract at the unit
 // level (using a tiny timeout, not the real 30s, so the test stays fast):
 // a stream that never sends a byte at all must return *idleTimeoutError.
@@ -233,7 +388,7 @@ func TestReadSSEIdleTimeout(t *testing.T) {
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { pw.Close() })
 
-	err := readSSE(pr, 20*time.Millisecond, "trace-idle", func(sseEvent) bool { return false })
+	_, err := readSSE(pr, 20*time.Millisecond, "trace-idle", func(sseEvent) bool { return false })
 	if err == nil {
 		t.Fatal("readSSE() error = nil, want idle timeout error")
 	}

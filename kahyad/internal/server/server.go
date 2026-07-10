@@ -524,17 +524,18 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(logLineResponse{Lines: lines})
 }
 
-// timedLine pairs a decoded JSONL line with its parsed ts, purely so
-// readLogLines can sort by time without re-parsing ts as a string compare
-// (RFC3339Nano strips trailing zero fractional digits, so it is not always
-// lexicographically sortable).
+// timedLine pairs a decoded JSONL line with its parsed ts (and whether that
+// parse succeeded), purely so readLogLines can sort by time without
+// re-parsing ts as a string compare (RFC3339Nano strips trailing zero
+// fractional digits, so it is not always lexicographically sortable).
 type timedLine struct {
 	ts   time.Time
+	tsOK bool
 	line map[string]any
 }
 
 // readLogLines implements handleLog's scan: every *.jsonl file directly
-// under logDir is opened, scanned line by line, and each line whose
+// under logDir is opened, read line by line, and each line whose
 // "trace_id" field equals traceID is decoded, tagged with "proc" (the
 // file's basename minus ".jsonl" - e.g. "kahyad.jsonl" -> "kahyad",
 // "worker.jsonl" -> "worker", per W12-06 step 4: "proc derived from source
@@ -542,6 +543,12 @@ type timedLine struct {
 // install may not have logged anything yet under it); a malformed line or an
 // unreadable file is skipped rather than failing the whole request, since
 // one bad line/rotated-away file must not hide every other matching line.
+//
+// Lines are read with a bufio.Reader + ReadString('\n') loop rather than
+// bufio.Scanner (BLOCKER 3): Scanner's default token buffer caps out at 1MB
+// and would otherwise treat one oversized JSONL line as EOF, silently
+// dropping every subsequent line in that file - including later real
+// matches. ReadString has no such cap.
 func readLogLines(logDir, traceID string) ([]map[string]any, error) {
 	paths, err := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
 	if err != nil {
@@ -555,31 +562,58 @@ func readLogLines(logDir, traceID string) ([]map[string]any, error) {
 		if err != nil {
 			continue // rotated/removed mid-scan: skip, don't fail the request
 		}
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // JSONL lines can carry long payloads
-		for sc.Scan() {
-			raw := strings.TrimSpace(sc.Text())
+		r := bufio.NewReader(f)
+		for {
+			text, readErr := r.ReadString('\n')
+			raw := strings.TrimSpace(text)
 			if raw == "" {
+				if readErr != nil {
+					break
+				}
 				continue
 			}
 			var m map[string]any
 			if err := json.Unmarshal([]byte(raw), &m); err != nil {
-				continue // malformed line: skip, don't fail the whole request
-			}
-			if tid, _ := m["trace_id"].(string); tid != traceID {
+				// Malformed (or, per BLOCKER 3, merely oversized-and-thus-
+				// truncated-looking) line: skip just this line and keep
+				// reading the rest of the file - don't fail the whole scan.
+				if readErr != nil {
+					break
+				}
 				continue
 			}
-			m["proc"] = proc
-			var ts time.Time
-			if s, ok := m["ts"].(string); ok {
-				ts, _ = time.Parse(time.RFC3339Nano, s) // zero value sorts first if unparsable
+			if tid, _ := m["trace_id"].(string); tid == traceID {
+				m["proc"] = proc
+				var ts time.Time
+				var tsOK bool
+				if s, ok := m["ts"].(string); ok {
+					if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
+						ts, tsOK = parsed, true
+					}
+				}
+				timed = append(timed, timedLine{ts: ts, tsOK: tsOK, line: m})
 			}
-			timed = append(timed, timedLine{ts: ts, line: m})
+			if readErr != nil {
+				break
+			}
 		}
 		f.Close()
 	}
 
-	sort.SliceStable(timed, func(i, j int) bool { return timed[i].ts.Before(timed[j].ts) })
+	// MINOR 7: a line with a missing/unparseable ts must sort AFTER every
+	// valid-ts line, tie-broken by original read order - not before all of
+	// them, which is what comparing raw zero-value time.Time would do.
+	// SliceStable preserves relative order whenever less() is false both
+	// ways, which is exactly the "both invalid: keep read order" case below.
+	sort.SliceStable(timed, func(i, j int) bool {
+		if timed[i].tsOK && timed[j].tsOK {
+			return timed[i].ts.Before(timed[j].ts)
+		}
+		if timed[i].tsOK != timed[j].tsOK {
+			return timed[i].tsOK // valid ts sorts before any invalid/missing ts
+		}
+		return false // both invalid: stable sort keeps original read order
+	})
 
 	out := make([]map[string]any, 0, len(timed))
 	for _, t := range timed {
