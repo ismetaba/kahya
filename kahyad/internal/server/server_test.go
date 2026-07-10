@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -43,6 +44,18 @@ func testConfig(socketPath string) config.Config {
 	return config.Config{Socket: socketPath}
 }
 
+// fakeDB is a minimal DBHealth stand-in so server tests don't need a real
+// brain.db (and don't pull the sqlite/cgo driver into this package's tests).
+type fakeDB struct {
+	ok      bool
+	version int64
+	err     error
+}
+
+func (f fakeDB) Health(context.Context) (bool, int64, error) { return f.ok, f.version, f.err }
+
+var healthyDB = fakeDB{ok: true, version: 1}
+
 // unixHTTPClient returns an http.Client that dials socketPath for every
 // request, matching how the real kahya CLI talks to kahyad.
 func unixHTTPClient(socketPath string) *http.Client {
@@ -59,7 +72,7 @@ func unixHTTPClient(socketPath string) *http.Client {
 
 func TestHealthEndpoint(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
-	srv := New(testConfig(socketPath), testLogger(t), "v-test-123")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test-123", healthyDB)
 
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -93,6 +106,12 @@ func TestHealthEndpoint(t *testing.T) {
 	if _, ok := body["uptime_s"]; !ok {
 		t.Error("uptime_s field missing")
 	}
+	if body["db"] != "ok" {
+		t.Errorf("db field = %v, want ok", body["db"])
+	}
+	if body["schema_version"] != float64(1) {
+		t.Errorf("schema_version field = %v, want 1", body["schema_version"])
+	}
 
 	info, err := os.Stat(socketPath)
 	if err != nil {
@@ -107,6 +126,35 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
 		t.Errorf("socket file still exists after Shutdown: err=%v", err)
+	}
+}
+
+// TestHealthEndpointReportsDBError guards the fail-closed reporting rule in
+// handleHealth: a failing DB ping must surface as "db":"error", never as
+// "ok" (HANDOFF §4/§5 fail-closed posture applied to health reporting).
+func TestHealthEndpointReportsDBError(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	unhealthyDB := fakeDB{ok: false, version: 1, err: errors.New("ping failed")}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test-db-down", unhealthyDB)
+
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["db"] != "error" {
+		t.Errorf("db field = %v, want error", body["db"])
 	}
 }
 
@@ -130,7 +178,7 @@ func TestStaleSocketTakeover(t *testing.T) {
 		t.Fatalf("expected stale socket file to remain on disk: %v", err)
 	}
 
-	srv := New(testConfig(socketPath), testLogger(t), "v-test")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare() over stale socket should succeed, got: %v", err)
 	}
@@ -154,7 +202,7 @@ func TestStaleSocketTakeover(t *testing.T) {
 func TestSecondInstanceRefused(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
 
-	first := New(testConfig(socketPath), testLogger(t), "v-first")
+	first := New(testConfig(socketPath), testLogger(t), "v-first", healthyDB)
 	if err := first.Prepare(); err != nil {
 		t.Fatalf("first Prepare() error = %v", err)
 	}
@@ -174,7 +222,7 @@ func TestSecondInstanceRefused(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	second := New(testConfig(socketPath), testLogger(t), "v-second")
+	second := New(testConfig(socketPath), testLogger(t), "v-second", healthyDB)
 	err := second.Prepare()
 	if err == nil {
 		t.Fatal("second Prepare() error = nil, want ErrAlreadyRunning")
@@ -186,7 +234,7 @@ func TestSecondInstanceRefused(t *testing.T) {
 
 func TestRunGracefulShutdownOnContextCancel(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
-	srv := New(testConfig(socketPath), testLogger(t), "v-run")
+	srv := New(testConfig(socketPath), testLogger(t), "v-run", healthyDB)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)

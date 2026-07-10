@@ -19,6 +19,7 @@ import (
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/server"
+	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/traceid"
 )
 
@@ -51,7 +52,17 @@ func run() int {
 		"pid", os.Getpid(),
 	)
 
-	srv := server.New(cfg, log, buildinfo.Version)
+	// Migrate before anything else can serve a request: a half-migrated
+	// brain.db must never be reachable (HANDOFF §4 ⚑ fail-closed).
+	st, err := store.Open(cfg)
+	if err != nil {
+		log.Error("migrate_failed", "err", err.Error())
+		return 1
+	}
+	defer st.Close() // checkpoints the WAL (TRUNCATE) on every exit path
+	log.Info("migrations_applied", "schema_version", st.SchemaVersion())
+
+	srv := server.New(cfg, log, buildinfo.Version, st)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

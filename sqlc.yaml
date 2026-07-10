@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "kahyad/migrations"
+    queries: "kahyad/internal/store/queries"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "kahyad/internal/store/sqlcgen"
+        emit_json_tags: true
+        emit_interface: true
+        emit_empty_slices: true

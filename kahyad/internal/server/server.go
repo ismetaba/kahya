@@ -25,6 +25,15 @@ import (
 // already holds the configured socket and answers /health.
 var ErrAlreadyRunning = errors.New("server: another kahyad instance is already running")
 
+// DBHealth is the health data source /health reports under "db" and
+// "schema_version" (W12-02). It is a narrow interface — rather than the
+// concrete *store.Store — so this package does not have to pull in the
+// sqlite/cgo dependency just to serve HTTP; *store.Store satisfies it
+// without any adapter code.
+type DBHealth interface {
+	Health(ctx context.Context) (ok bool, schemaVersion int64, err error)
+}
+
 const (
 	healthCheckDialTimeout = 500 * time.Millisecond
 	healthCheckTimeout     = 1 * time.Second
@@ -37,6 +46,7 @@ type Server struct {
 	cfg     config.Config
 	log     *logx.Logger
 	version string
+	db      DBHealth
 
 	ln   net.Listener
 	http *http.Server
@@ -49,10 +59,11 @@ type Server struct {
 	started time.Time
 }
 
-// New constructs a Server bound to cfg.Socket. Call Prepare (or Run, which
-// calls Prepare for you) to actually bind the listener.
-func New(cfg config.Config, log *logx.Logger, version string) *Server {
-	return &Server{cfg: cfg, log: log, version: version}
+// New constructs a Server bound to cfg.Socket, reporting db's health at
+// /health. Call Prepare (or Run, which calls Prepare for you) to actually
+// bind the listener.
+func New(cfg config.Config, log *logx.Logger, version string, db DBHealth) *Server {
+	return &Server{cfg: cfg, log: log, version: version, db: db}
 }
 
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and
@@ -231,18 +242,37 @@ func probeHealth(socketPath string) bool {
 }
 
 type healthResponse struct {
-	Status  string `json:"status"`
-	PID     int    `json:"pid"`
-	UptimeS int64  `json:"uptime_s"`
-	Version string `json:"version"`
+	Status        string `json:"status"`
+	PID           int    `json:"pid"`
+	UptimeS       int64  `json:"uptime_s"`
+	Version       string `json:"version"`
+	DB            string `json:"db"`
+	SchemaVersion int64  `json:"schema_version"`
 }
 
+// handleHealth reports process liveness plus brain.db reachability and
+// schema version (W12-02 step "extend /health"). db is "ok" only when a
+// live ping against brain.db succeeds; any ping failure or a nil db (should
+// never happen outside of misconfigured tests) reports "error" — this
+// endpoint never claims the database is fine when it hasn't verified that.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	dbStatus := "error"
+	var schemaVersion int64
+	if s.db != nil {
+		ok, version, err := s.db.Health(r.Context())
+		schemaVersion = version
+		if err == nil && ok {
+			dbStatus = "ok"
+		}
+	}
+
 	resp := healthResponse{
-		Status:  "ok",
-		PID:     os.Getpid(),
-		UptimeS: int64(time.Since(s.started).Seconds()),
-		Version: s.version,
+		Status:        "ok",
+		PID:           os.Getpid(),
+		UptimeS:       int64(time.Since(s.started).Seconds()),
+		Version:       s.version,
+		DB:            dbStatus,
+		SchemaVersion: schemaVersion,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

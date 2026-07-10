@@ -1,6 +1,6 @@
 # W12-02 — schema + goose migrations
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-01
 **Flags:** none
