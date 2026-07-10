@@ -51,3 +51,35 @@ SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, 
 FROM episodes
 WHERE source_path = ?
 LIMIT 1;
+
+-- W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
+-- filter by source, which is fine for callers that only ever use one
+-- source, but the indexer must scope its hash-compare lookup to
+-- source='memory_file' specifically (task spec step 3), so it gets its own
+-- query rather than overloading GetEpisodeByPath's signature.
+
+-- name: GetEpisodeBySourceAndPath :one
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
+FROM episodes
+WHERE source = ? AND source_path = ?
+LIMIT 1;
+
+-- name: UpdateEpisodeContent :exec
+-- Upserts (update half) an existing memory_file episode in place on
+-- new/changed content: same id, fresh hash/tier, status forced back to
+-- 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
+UPDATE episodes
+SET source_hash = ?, source_tier = ?, status = ?
+WHERE id = ?;
+
+-- name: MarkEpisodeDeleted :exec
+UPDATE episodes
+SET status = 'deleted'
+WHERE id = ?;
+
+-- name: ListChunkIDsByEpisode :many
+SELECT id FROM chunks WHERE episode_id = ? ORDER BY seq ASC;
+
+-- name: ListActiveMemoryFileEpisodes :many
+SELECT id, source_path FROM episodes
+WHERE source = 'memory_file' AND status = 'active';

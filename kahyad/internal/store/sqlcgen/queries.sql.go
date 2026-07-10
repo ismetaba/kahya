@@ -44,6 +44,42 @@ func (q *Queries) GetEpisodeByPath(ctx context.Context, sourcePath sql.NullStrin
 	return i, err
 }
 
+const getEpisodeBySourceAndPath = `-- name: GetEpisodeBySourceAndPath :one
+
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
+FROM episodes
+WHERE source = ? AND source_path = ?
+LIMIT 1
+`
+
+type GetEpisodeBySourceAndPathParams struct {
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+}
+
+// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
+// filter by source, which is fine for callers that only ever use one
+// source, but the indexer must scope its hash-compare lookup to
+// source='memory_file' specifically (task spec step 3), so it gets its own
+// query rather than overloading GetEpisodeByPath's signature.
+func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error) {
+	row := q.db.QueryRowContext(ctx, getEpisodeBySourceAndPath, arg.Source, arg.SourcePath)
+	var i Episode
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.SourcePath,
+		&i.SourceHash,
+		&i.SourceTier,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.Meta,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getTaskBySession = `-- name: GetTaskBySession :one
 SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at
 FROM tasks
@@ -235,6 +271,66 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 	return i, err
 }
 
+const listActiveMemoryFileEpisodes = `-- name: ListActiveMemoryFileEpisodes :many
+SELECT id, source_path FROM episodes
+WHERE source = 'memory_file' AND status = 'active'
+`
+
+type ListActiveMemoryFileEpisodesRow struct {
+	ID         int64          `json:"id"`
+	SourcePath sql.NullString `json:"source_path"`
+}
+
+func (q *Queries) ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveMemoryFileEpisodes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveMemoryFileEpisodesRow{}
+	for rows.Next() {
+		var i ListActiveMemoryFileEpisodesRow
+		if err := rows.Scan(&i.ID, &i.SourcePath); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listChunkIDsByEpisode = `-- name: ListChunkIDsByEpisode :many
+SELECT id FROM chunks WHERE episode_id = ? ORDER BY seq ASC
+`
+
+func (q *Queries) ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listChunkIDsByEpisode, episodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsByTrace = `-- name: ListEventsByTrace :many
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
@@ -270,6 +366,43 @@ func (q *Queries) ListEventsByTrace(ctx context.Context, traceID string) ([]Even
 		return nil, err
 	}
 	return items, nil
+}
+
+const markEpisodeDeleted = `-- name: MarkEpisodeDeleted :exec
+UPDATE episodes
+SET status = 'deleted'
+WHERE id = ?
+`
+
+func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, markEpisodeDeleted, id)
+	return err
+}
+
+const updateEpisodeContent = `-- name: UpdateEpisodeContent :exec
+UPDATE episodes
+SET source_hash = ?, source_tier = ?, status = ?
+WHERE id = ?
+`
+
+type UpdateEpisodeContentParams struct {
+	SourceHash sql.NullString `json:"source_hash"`
+	SourceTier string         `json:"source_tier"`
+	Status     string         `json:"status"`
+	ID         int64          `json:"id"`
+}
+
+// Upserts (update half) an existing memory_file episode in place on
+// new/changed content: same id, fresh hash/tier, status forced back to
+// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
+func (q *Queries) UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error {
+	_, err := q.db.ExecContext(ctx, updateEpisodeContent,
+		arg.SourceHash,
+		arg.SourceTier,
+		arg.Status,
+		arg.ID,
+	)
+	return err
 }
 
 const updateTaskState = `-- name: UpdateTaskState :exec

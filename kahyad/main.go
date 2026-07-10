@@ -18,6 +18,7 @@ import (
 
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/server"
@@ -93,6 +94,28 @@ func run() int {
 	// per-request (from the request body's trace_id, or a freshly minted
 	// one), not to bootTraceID.
 	srv.SetSearcher(search.New(st.DB(), log, search.DefaultConfig()))
+
+	// /v1/reindex (W12-04 step 5). idx is shared between this route and the
+	// boot-time incremental reindex kicked off just below, so its internal
+	// mutex correctly serializes the two against each other.
+	idx := indexer.New(st.DB(), cfg.MemoryDir, log)
+	srv.SetReindexer(idx)
+
+	// Incremental reindex on every boot, after migrations (W12-04 step:
+	// "Startup hook in main.go"). Async: the memory corpus can be large
+	// enough that blocking Serve on it would delay every other request
+	// (including /health) for no reason - a boot-time reindex and a
+	// concurrent POST /v1/reindex both funnel through idx's own mutex
+	// regardless of goroutine scheduling.
+	go func() {
+		// idx.Reindex logs event=reindex_done itself (scoped to
+		// bootTraceID, since it is passed in non-empty here) - see
+		// kahyad/internal/indexer.Indexer.Reindex's doc comment - so there
+		// is nothing left to log a second time on success.
+		if _, err := idx.Reindex(context.Background(), bootTraceID, false); err != nil {
+			log.With(bootTraceID).Error("reindex_failed", "err", err.Error())
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

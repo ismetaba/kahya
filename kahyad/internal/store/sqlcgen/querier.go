@@ -12,6 +12,12 @@ import (
 type Querier interface {
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (Episode, error)
+	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
+	// filter by source, which is fine for callers that only ever use one
+	// source, but the indexer must scope its hash-compare lookup to
+	// source='memory_file' specifically (task spec step 3), so it gets its own
+	// query rather than overloading GetEpisodeByPath's signature.
+	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error)
 	// Sessions are not currently guaranteed to map to exactly one task row
 	// (resume/retry may append more), so this returns the most recently
 	// updated task for the session.
@@ -23,7 +29,14 @@ type Querier interface {
 	// regenerates the whole package from the union of every *.sql file here.
 	InsertEvent(ctx context.Context, arg InsertEventParams) (Event, error)
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
+	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
+	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
 	ListEventsByTrace(ctx context.Context, traceID string) ([]Event, error)
+	MarkEpisodeDeleted(ctx context.Context, id int64) error
+	// Upserts (update half) an existing memory_file episode in place on
+	// new/changed content: same id, fresh hash/tier, status forced back to
+	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
+	UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error
 	UpdateTaskState(ctx context.Context, arg UpdateTaskStateParams) error
 }
 

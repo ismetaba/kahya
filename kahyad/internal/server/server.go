@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
@@ -44,6 +46,14 @@ type Searcher interface {
 	Search(ctx context.Context, traceID, query string, k int) ([]search.Hit, error)
 }
 
+// Reindexer is the corpus-indexing source POST /v1/reindex reports
+// (W12-04 step 5). It is a narrow interface - *indexer.Indexer satisfies
+// it without any adapter code - so tests can fake it without a real
+// brain.db or memory-dir corpus.
+type Reindexer interface {
+	Reindex(ctx context.Context, traceID string, full bool) (indexer.Result, error)
+}
+
 const (
 	healthCheckDialTimeout = 500 * time.Millisecond
 	healthCheckTimeout     = 1 * time.Second
@@ -58,6 +68,7 @@ type Server struct {
 	version string
 	db      DBHealth
 	search  Searcher
+	reindex Reindexer
 
 	ln   net.Listener
 	http *http.Server
@@ -93,6 +104,14 @@ func (s *Server) SetSearcher(searcher Searcher) {
 	s.search = searcher
 }
 
+// SetReindexer wires the /v1/reindex route to r (W12-04 step 5). Call this
+// before Prepare/Run. Kept as a setter, matching SetSearcher's rationale:
+// every existing New(...) call site keeps working unchanged; /v1/reindex
+// answers 503 until a Reindexer is set.
+func (s *Server) SetReindexer(r Reindexer) {
+	s.reindex = r
+}
+
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and
 // binds the listener, but does not yet start serving:
 //   - socket file missing → bind fresh.
@@ -116,6 +135,7 @@ func (s *Server) Prepare() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/memory/search", s.handleMemorySearch)
+	mux.HandleFunc("/v1/reindex", s.handleReindex)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -394,6 +414,74 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 			Score:      h.Score,
 			SourceTier: h.SourceTier,
 		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// reindexRequest is POST /v1/reindex's request body (W12-04 step 5).
+// {"full": false} is the default (an empty/omitted body also defaults
+// full to false, see handleReindex). trace_id follows the same optional-
+// override pattern as memorySearchRequest.TraceID (MINOR 6): a caller
+// resuming a multi-step trace supplies its own trace_id here on purpose;
+// when the body omits it, handleReindex falls back to withTraceLogging's
+// own resolved trace id rather than letting Reindex mint an unrelated one.
+type reindexRequest struct {
+	Full    bool   `json:"full"`
+	TraceID string `json:"trace_id"`
+}
+
+// reindexResponse is exactly the five-key schema the task spec fixes:
+// {"files_indexed","files_unchanged","files_removed","chunks",
+// "duration_ms"}. indexer.Result also tracks files_errored (logged and
+// carried in the ledger event payload), but that key is deliberately left
+// out of the HTTP response to match the spec's schema exactly.
+type reindexResponse struct {
+	FilesIndexed   int   `json:"files_indexed"`
+	FilesUnchanged int   `json:"files_unchanged"`
+	FilesRemoved   int   `json:"files_removed"`
+	Chunks         int   `json:"chunks"`
+	DurationMs     int64 `json:"duration_ms"`
+}
+
+// handleReindex triggers a corpus reindex (W12-04 step 5). A second,
+// concurrent call while one is already running answers 409 with the exact
+// Turkish body the task spec fixes (this is the one user-facing string on
+// this route - kahya reindex, W12-06, surfaces it verbatim to the CLI).
+func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
+	if s.reindex == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "reindex not available")
+		return
+	}
+
+	var req reindexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	traceID := req.TraceID
+	if traceID == "" {
+		traceID = traceIDFromContext(r)
+	}
+
+	res, err := s.reindex.Reindex(r.Context(), traceID, req.Full)
+	if err != nil {
+		if errors.Is(err, indexer.ErrReindexInProgress) {
+			writeJSONError(w, http.StatusConflict, "reindex zaten çalışıyor")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	resp := reindexResponse{
+		FilesIndexed:   res.FilesIndexed,
+		FilesUnchanged: res.FilesUnchanged,
+		FilesRemoved:   res.FilesRemoved,
+		Chunks:         res.Chunks,
+		DurationMs:     res.DurationMs,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

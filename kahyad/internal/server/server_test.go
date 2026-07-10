@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 )
@@ -622,5 +623,194 @@ func TestMemorySearchEndpointSearcherErrorIs400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// fakeReindexer is a minimal Reindexer stand-in (W12-04 step 5) so server
+// tests can exercise POST /v1/reindex without a real brain.db or
+// memory-dir corpus.
+type fakeReindexer struct {
+	res      indexer.Result
+	err      error
+	lastFull bool
+	lastTID  string
+}
+
+func (f *fakeReindexer) Reindex(_ context.Context, traceID string, full bool) (indexer.Result, error) {
+	f.lastTID, f.lastFull = traceID, full
+	if f.err != nil {
+		return indexer.Result{}, f.err
+	}
+	return f.res, nil
+}
+
+func postReindex(t *testing.T, client *http.Client, body string) *http.Response {
+	t.Helper()
+	resp, err := client.Post("http://kahyad/v1/reindex", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("POST /v1/reindex: %v", err)
+	}
+	return resp
+}
+
+// TestReindexEndpointReturnsSummary guards W12-04 step 5's happy path: a
+// valid request reaches the wired Reindexer and its Result round-trips as
+// the exact five-key JSON schema the task spec fixes.
+func TestReindexEndpointReturnsSummary(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fr := &fakeReindexer{res: indexer.Result{
+		FilesIndexed: 3, FilesUnchanged: 11, FilesRemoved: 1, FilesErrored: 0, Chunks: 9, DurationMs: 42,
+	}}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(fr)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `{"full":true,"trace_id":"tid-reindex-1"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	want := map[string]float64{
+		"files_indexed":   3,
+		"files_unchanged": 11,
+		"files_removed":   1,
+		"chunks":          9,
+		"duration_ms":     42,
+	}
+	for k, v := range want {
+		if body[k] != v {
+			t.Errorf("body[%q] = %v, want %v", k, body[k], v)
+		}
+	}
+	if _, ok := body["files_errored"]; ok {
+		t.Errorf("body contains files_errored = %v, want it absent (not part of the fixed 5-key schema)", body["files_errored"])
+	}
+	if len(body) != 5 {
+		t.Errorf("body has %d keys (%v), want exactly 5", len(body), body)
+	}
+
+	if !fr.lastFull || fr.lastTID != "tid-reindex-1" {
+		t.Errorf("Reindexer.Reindex called with (traceID=%q, full=%v), want (tid-reindex-1, true)", fr.lastTID, fr.lastFull)
+	}
+}
+
+// TestReindexEndpointEmptyBodyDefaultsFullFalse guards the documented
+// default: an empty POST body (no JSON at all) must behave exactly like
+// {"full": false}, never error.
+func TestReindexEndpointEmptyBodyDefaultsFullFalse(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fr := &fakeReindexer{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(fr)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	for _, body := range []string{``, `{}`} {
+		resp := postReindex(t, unixHTTPClient(socketPath), body)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("body=%q: status = %d, want 200", body, resp.StatusCode)
+		}
+		resp.Body.Close()
+		if fr.lastFull {
+			t.Errorf("body=%q: Reindex called with full=true, want false", body)
+		}
+	}
+}
+
+// TestReindexEndpointMalformedJSONIs400 guards against a panic on a
+// non-JSON body.
+func TestReindexEndpointMalformedJSONIs400(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(&fakeReindexer{})
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `not json`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestReindexEndpointNoReindexerIs503 guards the pre-wiring state: if
+// SetReindexer is never called, the route must fail closed with 503, not
+// panic on a nil s.reindex.
+func TestReindexEndpointNoReindexerIs503(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// TestReindexEndpointConflictIs409WithTurkishBody guards the task spec's
+// exact concurrent-call contract: a Reindexer already running (surfaced as
+// indexer.ErrReindexInProgress) answers 409 with the byte-exact Turkish
+// error body the CLI (W12-06) surfaces verbatim.
+func TestReindexEndpointConflictIs409WithTurkishBody(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(&fakeReindexer{err: indexer.ErrReindexInProgress})
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["error"] != "reindex zaten çalışıyor" {
+		t.Errorf(`body["error"] = %v, want "reindex zaten çalışıyor"`, body["error"])
+	}
+}
+
+// TestReindexEndpointGenericErrorIs500 guards a non-conflict Reindexer
+// error (e.g. a real filesystem walk failure) surfacing as a 500, not a
+// misleading 409.
+func TestReindexEndpointGenericErrorIs500(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(&fakeReindexer{err: errors.New("boom")})
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
 	}
 }

@@ -1,6 +1,6 @@
 # W12-04 — memory corpus indexer
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-03, W0-01
 **Flags:** none
