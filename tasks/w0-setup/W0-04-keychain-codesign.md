@@ -1,6 +1,6 @@
 # W0-04 — Keychain + codesign
 
-**Status:** todo
+**Status:** blocked-user
 **Phase:** W0 — Day-1 setup
 **Depends on:** W0-02
 **Flags:** user-assist
