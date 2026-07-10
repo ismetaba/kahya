@@ -14,7 +14,7 @@ Flags: 🧍 user-assist · ⏳ long-running · ↔ slidable per §6 timing note
 - [x] **W0-02** `toolchain-bootstrap` — Go module + goose + sqlc scaffolding; Python env with pinned `claude-agent-sdk` + lock file; Makefile (`build/test/lint`); minimal CI-ready test harness. Deps: none. Refs: §4 stack, §9.
 - [x] **W0-03** ⏳ `local-models-download` — download `Qwen3-30B-A3B` (MLX 4-bit), `whisper-large-v3-turbo` (MLX), `Qwen3-Embedding-0.6B` (~20GB, resume-capable); verify `say -v '?' | grep -i yelda` and flag for user if missing. Deps: none. Refs: §4 models, §7.
 - [!] **W0-04** 🧍 `keychain-codesign` — self-signed `Kahya Dev` signing identity + Makefile codesign step; add `kahya.anthropic` / `kahya.telegram` / `kahya.anchor` Keychain items with `-T $(which kahyad)`; user supplies actual secret values. Deps: W0-02. Refs: §7 secrets, §9. *Blocked: user must run `bash scripts/setup-signing.sh` (sudo trust prompt), `make install`, add `~/bin` to PATH, and add the 3 Keychain secrets — cert is already imported, script/Makefile ready.*
-- [ ] **W0-05** 🧍 `design-doc-snapshot` — commit the full design artifact as `docs/design.html` (fetch from the artifact URL in HANDOFF §9; if unreachable, ask the user to export it). Deps: none. Refs: §7, §9.
+- [!] **W0-05** 🧍 `design-doc-snapshot` — commit the full design artifact as `docs/design.html` (fetch from the artifact URL in HANDOFF §9; if unreachable, ask the user to export it). Deps: none. Refs: §7, §9. *Blocked: artifact 404s even authenticated (deleted/unshared); user must export the design artifact from the browser and save as `~/code/kahya/docs/design.html`.*
 
 ## Phase W1–2 — Core (`tasks/w1-2-core/`, HANDOFF §4 IPC, §5 schema, §6 W1–2)
 
