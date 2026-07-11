@@ -88,13 +88,33 @@ func IsLegalTransition(from, to string) bool {
 // Transition's own doc comment.
 var ErrIllegalTransition = errors.New("task: illegal status transition")
 
+// ErrLostTransitionRace is returned by Machine.Transition when its
+// compare-and-set UPDATE (SetTaskStatus, BLOCKER 3 fix) affects zero rows:
+// taskID's status was legal-and-read as `from`, but by the time the UPDATE
+// ran, some OTHER concurrent Transition call had already moved it
+// somewhere else - the classic lost-race outcome of "read status, then
+// write based on it" without a WHERE-clause guard. The caller's own
+// attempted transition never happened at all (tasks.status is untouched by
+// it, and no task.transition ledger event was appended for it) - this is
+// deliberately distinct from ErrIllegalTransition (a transition that was
+// never legal in the first place, from any starting status) versus this
+// error (a transition that WAS legal from the status just read, but lost a
+// race to a concurrent one).
+var ErrLostTransitionRace = errors.New("task: lost transition race (status changed concurrently)")
+
 // Store is the narrow tasks-table persistence surface Machine needs.
 // *sqlcgen.Queries (via *store.Store) satisfies this directly, with no
 // adapter - the same pattern kahyad/internal/policy.Store already
 // establishes for the autonomy ladder.
 type Store interface {
 	GetTaskByID(ctx context.Context, id string) (sqlcgen.Task, error)
-	SetTaskStatus(ctx context.Context, arg sqlcgen.SetTaskStatusParams) error
+	// SetTaskStatus is now an atomic compare-and-set (BLOCKER 3 fix):
+	// Status_2 carries the FROM status Transition just read, so the UPDATE
+	// itself only ever affects a row when that from-status still holds -
+	// the returned rows-affected count is what lets Transition detect a
+	// lost race instead of blindly overwriting a concurrent winner (see
+	// Transition's own doc comment).
+	SetTaskStatus(ctx context.Context, arg sqlcgen.SetTaskStatusParams) (int64, error)
 	IncrementTaskAttempts(ctx context.Context, arg sqlcgen.IncrementTaskAttemptsParams) (int64, error)
 	// ListExecutingTasks is resume.go's resume-scan candidate query
 	// (kahyad startup + a periodic tick) - included here (rather than a
@@ -121,6 +141,13 @@ type Ledger interface {
 const (
 	EventTransition        = "task.transition"
 	EventIllegalTransition = "task.illegal_transition"
+	// EventTransitionConflict fires when Transition loses the
+	// compare-and-set race (ErrLostTransitionRace, BLOCKER 3 fix) - kept
+	// distinct from EventIllegalTransition (a (from, to) pair that was
+	// never legal at all) so a ledger reader can tell "this was never
+	// allowed" apart from "this was allowed but a concurrent transition
+	// won first".
+	EventTransitionConflict = "task.transition_conflict"
 )
 
 // Machine is the W4-02 task status state machine: one per kahyad
@@ -173,6 +200,27 @@ func (m *Machine) nowRFC3339() string { return m.now().UTC().Format(time.RFC3339
 // attempt at running this task's worker; the resume scan's own
 // within-cap W1 receipt-less retry path, which never leaves 'executing'
 // in the first place, bumps attempts directly instead - see resume.go).
+//
+// BLOCKER 3 fix: GetTaskByID's read and the SetTaskStatus write below are
+// NOT protected by any lock spanning both - two concurrent Transition
+// calls for the same taskID can both read the SAME stale `from` and both
+// decide their own (from, to) pair is legal. What used to happen next was
+// a blind `UPDATE tasks SET status=? WHERE id=?`: whichever caller's
+// UPDATE ran LAST simply won, silently discarding the other's transition
+// with no error to either caller (a torn, last-write-wins outcome - e.g.
+// one caller legitimately moving executing->done while another legitimately
+// moves the SAME task executing->user_halted would leave the task in
+// WHICHEVER state happened to commit second, with the first caller having
+// no idea it was overwritten). SetTaskStatus is now an atomic
+// compare-and-set (`UPDATE ... WHERE id=? AND status=<from>`): only the
+// FIRST of any two concurrent Transition calls racing from the same stale
+// `from` ever actually affects a row. The loser's rows-affected comes back
+// 0 - it lost the race (some other transition already moved taskID's
+// status away from `from` between this call's own GetTaskByID read and its
+// UPDATE) - and Transition returns ErrLostTransitionRace WITHOUT appending
+// a task.transition ledger event for it (it never happened), so tasks.status
+// ends up as EXACTLY one of the two callers' intended destinations, never a
+// blend of both and never silently the "wrong" one with no signal.
 func (m *Machine) Transition(ctx context.Context, traceID, taskID, to string) error {
 	t, err := m.store.GetTaskByID(ctx, taskID)
 	if err != nil {
@@ -192,8 +240,18 @@ func (m *Machine) Transition(ctx context.Context, traceID, taskID, to string) er
 	}
 
 	now := m.nowRFC3339()
-	if err := m.store.SetTaskStatus(ctx, sqlcgen.SetTaskStatusParams{Status: to, UpdatedAt: now, ID: taskID}); err != nil {
+	affected, err := m.store.SetTaskStatus(ctx, sqlcgen.SetTaskStatusParams{
+		Status: to, UpdatedAt: now, ID: taskID, Status_2: from,
+	})
+	if err != nil {
 		return fmt.Errorf("task: set status %s -> %s (task %s): %w", from, to, taskID, err)
+	}
+	if affected == 0 {
+		m.ledgerRaw(ctx, traceID, EventTransitionConflict, map[string]any{
+			"event": EventTransitionConflict, "task_id": taskID, "from": from, "to": to,
+		})
+		m.logJSONL(traceID, EventTransitionConflict, taskID, from, to)
+		return fmt.Errorf("%w: %s -> %s (task %s)", ErrLostTransitionRace, from, to, taskID)
 	}
 	if to == StatusExecuting {
 		if _, err := m.store.IncrementTaskAttempts(ctx, sqlcgen.IncrementTaskAttemptsParams{UpdatedAt: now, ID: taskID}); err != nil {

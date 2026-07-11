@@ -229,6 +229,16 @@ type Querier interface {
 	// The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
 	// never-attempted triple).
 	NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams) (int64, error)
+	// Task durability BLOCKER 2(b) fix: kahyad/internal/outbox.Dispatcher's
+	// heartbeat goroutine calls this every leaseDuration/3 for as long as
+	// spawn.Run blocks on a claimed row's re-spawned worker, so a
+	// longer-than-one-lease-period task is never re-claimed by a second
+	// dispatcher pass purely because its ORIGINAL lease (computed once at
+	// claim time) elapsed while the worker was still genuinely running.
+	// Scoped to dispatched_at IS NULL defensively - a row this dispatcher has
+	// already marked delivered (or that somehow no longer exists) must never
+	// have its lease resurrected.
+	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
 	// W3-08 (secret-lane routing) queries below: lane/secret_category are
 	// STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
 	// never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
@@ -240,7 +250,16 @@ type Querier interface {
 	// - every status change is preceded by that function's own legal-transition
 	// check and followed by a task.transition (or task.illegal_transition)
 	// ledger event; this query performs no validation of its own.
-	SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) error
+	//
+	// task durability BLOCKER 3 fix: the WHERE clause's own "status = ?" (the
+	// FROM status Machine.Transition just read via GetTaskByID) makes this an
+	// atomic compare-and-set, not a blind write - two concurrent Transition
+	// calls racing from the SAME stale 'from' read can now only ever have ONE
+	// of them actually affect a row (rows-affected 1); the loser affects 0
+	// rows (its 'from' no longer matches - some other transition already won)
+	// and Machine.Transition treats that as a lost race, never silently
+	// overwriting whatever the winner just wrote (no more last-write-wins).
+	SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) (int64, error)
 	SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error
 	// Update-half of an application-level upsert (kahyad/internal/policy
 	// calls this first; a 0-rows-affected result means no row exists yet, so

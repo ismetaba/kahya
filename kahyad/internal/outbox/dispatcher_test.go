@@ -316,3 +316,156 @@ func TestLeaseExpiryAllowsReClaim(t *testing.T) {
 		t.Errorf("attempts = %d, want 2 (one for the initial claim, one for the re-claim)", attempts)
 	}
 }
+
+// countingLiveRegistry wraps a real *task.LiveRegistry and additionally
+// counts how many times Register has ever been called. The BLOCKER 2
+// regression test below uses this count as ground truth for "how many
+// times was a real worker actually spawned" - independent of how many
+// ClaimAndDispatch/processResume invocations raced to get there, and
+// independent of Unregister timing (which the counting-only approach
+// sidesteps entirely).
+type countingLiveRegistry struct {
+	inner *task.LiveRegistry
+	mu    sync.Mutex
+	regs  int
+}
+
+func newCountingLiveRegistry() *countingLiveRegistry {
+	return &countingLiveRegistry{inner: task.NewLiveRegistry()}
+}
+
+func (c *countingLiveRegistry) Register(taskID string, pid int) {
+	c.mu.Lock()
+	c.regs++
+	c.mu.Unlock()
+	c.inner.Register(taskID, pid)
+}
+func (c *countingLiveRegistry) Unregister(taskID string)  { c.inner.Unregister(taskID) }
+func (c *countingLiveRegistry) IsLive(taskID string) bool { return c.inner.IsLive(taskID) }
+func (c *countingLiveRegistry) Registrations() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.regs
+}
+
+// TestLiveWorkerNeverDoubleSpawnedAcrossConcurrentDispatchers is the
+// BLOCKER 2 regression test (task durability core hardening): a claimed
+// row whose worker outlives the row's INITIAL lease must never be
+// re-claimed AND re-spawned by a second, concurrent ClaimAndDispatch
+// pass. Before the fix, processResume never checked LiveRegistry.IsLive
+// before re-spawning, and a claimed row's lease was computed once at
+// claim time and never renewed while spawn.Run blocked for the worker's
+// entire runtime - a task that ran longer than one lease period got
+// re-claimed and a SECOND live worker spawned for the same task/session.
+//
+// This test uses an initial lease (30ms) much shorter than the slow
+// worker's own sleep (300ms), so - absent BOTH the lease-renewal
+// heartbeat (BLOCKER 2(b)) and the IsLive skip-guard (BLOCKER 2(a)) - the
+// row would become re-claimable well before the first worker finishes,
+// and drives a SECOND Dispatcher instance (sharing the SAME LiveRegistry,
+// exactly as main.go wires its one real Dispatcher/LiveRegistry pair)
+// against the row repeatedly for the whole window a real overlapping
+// cron-tick dispatcher could plausibly hit it in. Assertion: exactly one
+// real worker was ever spawned (countingLiveRegistry.Registrations),
+// exactly one outbox.resume_dispatched ledger event exists, and the task
+// ends 'done' - never two live workers for the same task at once.
+func TestLiveWorkerNeverDoubleSpawnedAcrossConcurrentDispatchers(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	enqueueResumeRow(t, st, "t1")
+
+	live := newCountingLiveRegistry()
+	m := task.NewMachine(st.Queries, st)
+	slowCmd := []string{"python3", "testdata/slow_session_worker.py", "0.3"}
+
+	d1 := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: slowCmd}, live)
+	d1.SetLeaseDuration(30 * time.Millisecond)
+	d2 := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: slowCmd}, live)
+	d2.SetLeaseDuration(30 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := d1.ClaimAndDispatch(context.Background()); err != nil {
+			t.Errorf("d1.ClaimAndDispatch() error = %v", err)
+		}
+	}()
+
+	// Give d1 a head start to actually claim the row and register itself
+	// live before d2 starts repeatedly trying the same row.
+	time.Sleep(20 * time.Millisecond)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := d2.ClaimAndDispatch(context.Background()); err != nil {
+			t.Errorf("d2.ClaimAndDispatch() error = %v", err)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	wg.Wait()
+
+	if got := live.Registrations(); got != 1 {
+		t.Fatalf("live worker registrations = %d, want exactly 1 (double-spawn guard failed)", got)
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM events WHERE kind = ?`, EventResumeDispatched); n != 1 {
+		t.Errorf("outbox.resume_dispatched events = %d, want exactly 1", n)
+	}
+	got, err := st.Queries.GetTaskByID(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("GetTaskByID: %v", err)
+	}
+	if got.Status != task.StatusDone {
+		t.Errorf("status = %q, want %q", got.Status, task.StatusDone)
+	}
+}
+
+// TestClaimAndDispatchOverlapGuardSkipsConcurrentInvocation is BLOCKER
+// 2(c)'s own regression test: a SECOND call to ClaimAndDispatch on the
+// SAME Dispatcher instance, made while a FIRST call is still blocked
+// inside a long-running processResume (its own slow spawn.Run), must
+// return immediately (0, nil) without listing or claiming any row -
+// proving the in-flight guard actually short-circuits an overlapping
+// call instead of letting two claim passes run concurrently against the
+// same Dispatcher, which is exactly the shape an overlapping
+// outbox_dispatch cron tick would otherwise produce (robfig/cron/v3
+// starts a new goroutine per scheduled fire with no built-in
+// skip-if-still-running behavior).
+func TestClaimAndDispatchOverlapGuardSkipsConcurrentInvocation(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	enqueueResumeRow(t, st, "t1")
+
+	m := task.NewMachine(st.Queries, st)
+	d := newTestDispatcher(st, m, []string{"python3", "testdata/slow_session_worker.py", "0.3"})
+
+	firstDone := make(chan int, 1)
+	go func() {
+		claimed, err := d.ClaimAndDispatch(context.Background())
+		if err != nil {
+			t.Errorf("first ClaimAndDispatch() error = %v", err)
+		}
+		firstDone <- claimed
+	}()
+
+	// Let the first call actually claim the row and block inside
+	// spawn.Run before the second, overlapping call is attempted.
+	time.Sleep(30 * time.Millisecond)
+
+	claimed, err := d.ClaimAndDispatch(context.Background())
+	if err != nil {
+		t.Fatalf("second (overlapping) ClaimAndDispatch() error = %v", err)
+	}
+	if claimed != 0 {
+		t.Errorf("overlapping ClaimAndDispatch() claimed = %d, want 0 (must be skipped while the first call is still in flight)", claimed)
+	}
+
+	select {
+	case got := <-firstDone:
+		if got != 1 {
+			t.Errorf("first ClaimAndDispatch() claimed = %d, want 1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ClaimAndDispatch() never returned")
+	}
+}

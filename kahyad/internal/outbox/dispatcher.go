@@ -13,6 +13,24 @@
 // Machine, and the outbox payload shape), never the other way around -
 // kahyad/internal/task never imports this package, so there is no import
 // cycle.
+//
+// BLOCKER 2 fix (dispatcher re-claiming a still-running worker):
+// processResume used to never check whether a live worker already existed
+// for a claimed row's task, and a claimed row's lease was computed once
+// at claim time and never renewed while spawn.Run blocked for the
+// worker's entire runtime - a task that ran longer than one lease period
+// got re-claimed (by this same Dispatcher's own next tick, or a
+// concurrent one) and a SECOND live worker spawned for the same
+// task/session. processResume now (a) skips re-spawning entirely when
+// LiveRegistry reports the task already live, and (b) runs a heartbeat
+// goroutine that renews the claimed row's lease every leaseDuration/3 for
+// as long as spawn.Run blocks, so a long-running task's row is never
+// re-claimed purely because its ORIGINAL lease elapsed while it was still
+// genuinely running. ClaimAndDispatch also gained its own in-flight guard
+// (inFlight) so an overlapping cron tick - robfig/cron/v3 starts a new
+// goroutine per scheduled fire with no built-in "skip if still running"
+// by default - can never run a SECOND claim pass concurrently with one
+// this same Dispatcher instance is still processing.
 package outbox
 
 import (
@@ -21,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"kahya/kahyad/internal/spawn"
@@ -42,6 +61,13 @@ const (
 	// re-spawns a worker for (successfully claimed, task not
 	// halted/blocked).
 	EventResumeDispatched = "outbox.resume_dispatched"
+	// EventResumeSkippedLive fires when a claimed row's task ALREADY has a
+	// live, kahyad-owned worker running (LiveRegistry.IsLive) - BLOCKER 2
+	// fix. The row is left exactly as claimed (not marked delivered): the
+	// worker that is actually running will mark it delivered itself once
+	// spawn.Run returns for that original processResume call - see the
+	// package doc comment.
+	EventResumeSkippedLive = "outbox.resume_skipped_live"
 )
 
 // defaultBatchSize/defaultLeaseDuration are Dispatcher's own defaults
@@ -61,6 +87,12 @@ type Store interface {
 	MarkOutboxDelivered(ctx context.Context, arg sqlcgen.MarkOutboxDeliveredParams) error
 	GetTaskByID(ctx context.Context, id string) (sqlcgen.Task, error)
 	UpdateTaskSession(ctx context.Context, arg sqlcgen.UpdateTaskSessionParams) error
+	// RenewOutboxLease extends a claimed row's lease_until - the BLOCKER 2
+	// fix's heartbeat goroutine (renewLeaseWhileRunning) calls this
+	// periodically for as long as spawn.Run blocks on the re-spawned
+	// worker, so a long-running task's row is never re-claimed purely
+	// because its original lease (computed once at claim time) elapsed.
+	RenewOutboxLease(ctx context.Context, arg sqlcgen.RenewOutboxLeaseParams) error
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -77,9 +109,15 @@ type Ledger interface {
 // <id>` reads from) for the whole time it is actually running - not just
 // the first time a task was ever spawned. Optional (nil is a documented
 // no-op, matching this codebase's usual unwired-dependency posture).
+//
+// IsLive is BLOCKER 2's own addition: processResume consults it BEFORE
+// ever re-spawning a worker, so a row re-claimed while its task's
+// original worker is still genuinely running (e.g. after a lease elapsed
+// mid-run) is skipped rather than given a second, concurrent worker.
 type LiveRegistry interface {
 	Register(taskID string, pid int)
 	Unregister(taskID string)
+	IsLive(taskID string) bool
 }
 
 var _ LiveRegistry = (*task.LiveRegistry)(nil)
@@ -95,6 +133,17 @@ type Dispatcher struct {
 	batchSize     int
 	leaseDuration time.Duration
 	now           func() time.Time
+
+	// inFlight is BLOCKER 2(c)'s overlap guard: true for the entire
+	// duration of a ClaimAndDispatch call THIS Dispatcher instance is
+	// already running. robfig/cron/v3 (kahyad/internal/scheduler) starts a
+	// new goroutine per scheduled tick fire with no "skip if still
+	// running" behavior of its own, so without this guard an
+	// outbox_dispatch tick firing while the previous tick's
+	// ClaimAndDispatch is still blocked (e.g. inside a long spawn.Run)
+	// would start a SECOND, fully concurrent claim pass on the same
+	// Dispatcher.
+	inFlight atomic.Bool
 }
 
 // NewDispatcher constructs a Dispatcher. spawnCfg is the SAME
@@ -128,7 +177,19 @@ func (d *Dispatcher) nowRFC3339() string { return d.now().UTC().Format(time.RFC3
 // guarantee - a row another concurrent dispatcher already claimed first
 // affects 0 rows here and is silently skipped), and processes every row
 // this call actually won. It returns how many rows this call claimed.
+//
+// BLOCKER 2(c) fix: if a PREVIOUS call to ClaimAndDispatch on this exact
+// Dispatcher instance is still running (inFlight), this call returns
+// (0, nil) immediately without listing or claiming anything - the
+// overlap guard a periodic caller (kahyad/internal/scheduler's
+// outbox_dispatch tick) needs, since robfig/cron/v3 does not itself skip
+// a tick whose previous firing is still in flight.
 func (d *Dispatcher) ClaimAndDispatch(ctx context.Context) (claimed int, err error) {
+	if !d.inFlight.CompareAndSwap(false, true) {
+		return 0, nil
+	}
+	defer d.inFlight.Store(false)
+
 	// FixedNanoRFC3339, NOT nowRFC3339: available_at/lease_until are
 	// compared with a plain SQL TEXT `<=`/`<` (ListDueOutboxRows/
 	// ClaimOutboxRow) - see FixedNanoRFC3339's own doc comment for why a
@@ -217,6 +278,22 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		return
 	}
 
+	// BLOCKER 2(a) fix: a live, kahyad-owned worker is ALREADY running for
+	// this task - this row is a re-claim of one whose original lease
+	// elapsed (or would have, absent the renewal below) while that worker
+	// was still genuinely running, not a crashed/abandoned claim. Spawning
+	// a SECOND worker for the same task/session here would be exactly the
+	// double-execution this whole package exists to prevent. Leave the row
+	// as claimed (NOT delivered) - the running worker's own processResume
+	// call will mark it delivered itself once spawn.Run returns for THAT
+	// call (see the package doc comment).
+	if d.live != nil && d.live.IsLive(t.ID) {
+		d.ledgerRaw(ctx, t.TraceID, EventResumeSkippedLive, map[string]any{
+			"event": EventResumeSkippedLive, "task_id": t.ID, "outbox_id": row.ID,
+		})
+		return
+	}
+
 	env, err := d.buildResumeEnvelope(t)
 	if err != nil {
 		d.ledgerRaw(ctx, t.TraceID, "outbox.envelope_invalid", map[string]any{
@@ -228,6 +305,15 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	if d.live != nil {
 		defer d.live.Unregister(t.ID)
 	}
+
+	// BLOCKER 2(b) fix: renew this row's lease every leaseDuration/3 for as
+	// long as spawn.Run (below) blocks, so a worker that runs longer than
+	// one lease period is never re-claimed purely because the lease
+	// ClaimOutboxRow set once, at claim time, elapsed while it was still
+	// genuinely running - see renewLeaseWhileRunning's own doc comment.
+	heartbeatDone := make(chan struct{})
+	defer close(heartbeatDone)
+	go d.renewLeaseWhileRunning(row.ID, heartbeatDone)
 
 	outcome, runErr := spawn.Run(ctx, d.spawnCfg, env, spawn.Callbacks{
 		OnStart: func(pid int) {
@@ -263,6 +349,40 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// state: leave the row unacknowledged (task spec step 7) - lease
 	// expiry drives the re-claim, and ClaimOutboxRow already incremented
 	// outbox.attempts for THIS claim regardless of how it turns out.
+}
+
+// renewLeaseWhileRunning extends outboxID's lease every leaseDuration/3
+// (BLOCKER 2(b) fix) until done is closed - processResume closes done via
+// defer immediately once spawn.Run returns, which also stops this
+// goroutine. Runs against context.Background() rather than processResume's
+// own ctx: a renewal already in flight when processResume returns should
+// still complete rather than being aborted mid-write (a renewal landing a
+// moment late is harmless - see RenewOutboxLease's own dispatched_at IS
+// NULL guard and the package doc comment's "worst case: one extra,
+// otherwise-safe reclaim-then-skip cycle"), but this goroutine itself must
+// never outlive done being closed.
+func (d *Dispatcher) renewLeaseWhileRunning(outboxID int64, done <-chan struct{}) {
+	interval := d.leaseDuration / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			leaseUntil := task.FixedNanoRFC3339(d.now().Add(d.leaseDuration))
+			if err := d.store.RenewOutboxLease(context.Background(), sqlcgen.RenewOutboxLeaseParams{
+				LeaseUntil: sql.NullString{String: leaseUntil, Valid: true}, ID: outboxID,
+			}); err != nil {
+				d.ledgerRaw(context.Background(), "", "outbox.lease_renew_failed", map[string]any{
+					"event": "outbox.lease_renew_failed", "outbox_id": outboxID, "err": err.Error(),
+				})
+			}
+		}
+	}
 }
 
 func (d *Dispatcher) markDelivered(ctx context.Context, outboxID int64) {

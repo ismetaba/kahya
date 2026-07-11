@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -373,5 +374,81 @@ func mustTransition(t *testing.T, m *Machine, ctx context.Context, taskID, to st
 	t.Helper()
 	if err := m.Transition(ctx, "trace", taskID, to); err != nil {
 		t.Fatalf("Transition(-> %s) error = %v", to, err)
+	}
+}
+
+// TestConcurrentTransitionsFromSameStatusExactlyOneWins is the BLOCKER 3
+// regression test: Machine.Transition used to read tasks.status via
+// GetTaskByID, validate against that possibly-stale read, then blindly
+// `UPDATE tasks SET status=? WHERE id=?` with no WHERE-clause guard on the
+// from-status and no rows-affected check - two concurrent LEGAL
+// transitions racing from the SAME 'from' status could both "succeed"
+// with no error to either caller, the second silently overwriting the
+// first (last-write-wins, torn result). SetTaskStatus is now an atomic
+// compare-and-set (`UPDATE ... WHERE id=? AND status=<from>`): of two
+// concurrent Transition calls from 'executing' (one to 'done', one to
+// 'user_halted'), exactly one must ever succeed; the loser must get an
+// error (ErrLostTransitionRace in the interleaving this test is built to
+// exercise - its own GetTaskByID read raced the winner's write; a rarer,
+// still-correct interleaving can instead read the ALREADY-written status
+// and get ErrIllegalTransition, which this test also accepts as
+// non-torn); and tasks.status must land on EXACTLY one of the two
+// destinations, never a blend of both and never silently discarded with
+// no signal at all. Run 20 times under -race, since which interleaving
+// actually happens is inherently timing-dependent - across 20 runs this
+// asserts ErrLostTransitionRace (the bug's own failure mode) was actually
+// observed at least once, so the test is not merely exercising the
+// benign path by accident.
+func TestConcurrentTransitionsFromSameStatusExactlyOneWins(t *testing.T) {
+	sawLostRace := false
+	for run := 0; run < 20; run++ {
+		st := testStore(t)
+		const id = "t-race"
+		insertTask(t, st, id)
+		m := NewMachine(st.Queries, st)
+		ctx := context.Background()
+		mustTransition(t, m, ctx, id, StatusExecuting)
+
+		dests := [2]string{StatusDone, StatusUserHalted}
+		errs := make([]error, 2)
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			i := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = m.Transition(ctx, "trace-race", id, dests[i])
+			}()
+		}
+		wg.Wait()
+
+		successCount := 0
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				successCount++
+			case errors.Is(err, ErrLostTransitionRace):
+				sawLostRace = true
+			case errors.Is(err, ErrIllegalTransition):
+				// The rarer benign interleaving: this goroutine's
+				// GetTaskByID read happened AFTER the other's write had
+				// already fully committed, so its own (from, to) pair was
+				// never legal to begin with - still not a torn write.
+			default:
+				t.Fatalf("run %d: Transition()[%d] (-> %s) error = %v, want nil, ErrLostTransitionRace, or ErrIllegalTransition",
+					run, i, dests[i], err)
+			}
+		}
+		if successCount != 1 {
+			t.Fatalf("run %d: successCount = %d, want exactly 1 (never 0, never 2 - no torn/last-write-wins result)", run, successCount)
+		}
+
+		got := taskStatus(t, st, id)
+		if got != StatusDone && got != StatusUserHalted {
+			t.Fatalf("run %d: status = %q, want exactly one of %q/%q", run, got, StatusDone, StatusUserHalted)
+		}
+	}
+	if !sawLostRace {
+		t.Error("ErrLostTransitionRace was never observed across 20 runs - the compare-and-set race window may not be exercised at all")
 	}
 }

@@ -1538,6 +1538,31 @@ func (q *Queries) NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams
 	return column_1, err
 }
 
+const renewOutboxLease = `-- name: RenewOutboxLease :exec
+UPDATE outbox
+SET lease_until = ?
+WHERE id = ? AND dispatched_at IS NULL
+`
+
+type RenewOutboxLeaseParams struct {
+	LeaseUntil sql.NullString `json:"lease_until"`
+	ID         int64          `json:"id"`
+}
+
+// Task durability BLOCKER 2(b) fix: kahyad/internal/outbox.Dispatcher's
+// heartbeat goroutine calls this every leaseDuration/3 for as long as
+// spawn.Run blocks on a claimed row's re-spawned worker, so a
+// longer-than-one-lease-period task is never re-claimed by a second
+// dispatcher pass purely because its ORIGINAL lease (computed once at
+// claim time) elapsed while the worker was still genuinely running.
+// Scoped to dispatched_at IS NULL defensively - a row this dispatcher has
+// already marked delivered (or that somehow no longer exists) must never
+// have its lease resurrected.
+func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error {
+	_, err := q.db.ExecContext(ctx, renewOutboxLease, arg.LeaseUntil, arg.ID)
+	return err
+}
+
 const setTaskLane = `-- name: SetTaskLane :exec
 
 UPDATE tasks
@@ -1568,25 +1593,43 @@ func (q *Queries) SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error 
 	return err
 }
 
-const setTaskStatus = `-- name: SetTaskStatus :exec
+const setTaskStatus = `-- name: SetTaskStatus :execrows
 UPDATE tasks
 SET status = ?, updated_at = ?
-WHERE id = ?
+WHERE id = ? AND status = ?
 `
 
 type SetTaskStatusParams struct {
 	Status    string `json:"status"`
 	UpdatedAt string `json:"updated_at"`
 	ID        string `json:"id"`
+	Status_2  string `json:"status_2"`
 }
 
 // The ONLY writer of tasks.status is kahyad/internal/task.Machine.Transition
 // - every status change is preceded by that function's own legal-transition
 // check and followed by a task.transition (or task.illegal_transition)
 // ledger event; this query performs no validation of its own.
-func (q *Queries) SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) error {
-	_, err := q.db.ExecContext(ctx, setTaskStatus, arg.Status, arg.UpdatedAt, arg.ID)
-	return err
+//
+// task durability BLOCKER 3 fix: the WHERE clause's own "status = ?" (the
+// FROM status Machine.Transition just read via GetTaskByID) makes this an
+// atomic compare-and-set, not a blind write - two concurrent Transition
+// calls racing from the SAME stale 'from' read can now only ever have ONE
+// of them actually affect a row (rows-affected 1); the loser affects 0
+// rows (its 'from' no longer matches - some other transition already won)
+// and Machine.Transition treats that as a lost race, never silently
+// overwriting whatever the winner just wrote (no more last-write-wins).
+func (q *Queries) SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setTaskStatus,
+		arg.Status,
+		arg.UpdatedAt,
+		arg.ID,
+		arg.Status_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const setUndoWindowState = `-- name: SetUndoWindowState :exec

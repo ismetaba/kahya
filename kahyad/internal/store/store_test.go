@@ -344,9 +344,10 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 // autonomy_state/approval_tokens/undo_windows from 0003, egress_budget
 // from 0004 (W3-05), pending_approvals.tool_input from 0005 (W3-06),
 // tasks.lane/tasks.secret_category from 0006 (W3-08), and
-// tasks.status/tool_calls/outbox lease columns from 0007 (W4-02)) the
-// next time kahyad boots. The expected latest version is asserted as 7
-// (0001..0007); bump this literal, deliberately, the next time a new
+// tasks.status/tool_calls/outbox lease columns from 0007 (W4-02), and
+// idx_tool_calls_live_unique from 0008 (task durability BLOCKER 1 fix))
+// the next time kahyad boots. The expected latest version is asserted as
+// 8 (0001..0008); bump this literal, deliberately, the next time a new
 // migration file is added - this is the one place in the test suite that
 // pins "the latest goose version kahyad ships" as a number, so a
 // forgotten migration file never silently passes this gate.
@@ -387,7 +388,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 7 // 0001-0007; bump alongside each new migration file
+	const latestVersion = 8 // 0001-0008; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}
