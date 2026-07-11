@@ -1,0 +1,71 @@
+# tests/w3/fixtures/policy.yaml — W3-10 gate suite's own tiny policy.yaml
+# fixture: real kahyad/internal/policy.Load parses/validates this exactly
+# like the repo-root policy.yaml (same strict loader, same Day-1 mandatory
+# fs_write_deny_globs, same non-empty egress.allowlist requirement) — this
+# is not a hand-rolled stand-in, it is a real, loadable Document.
+#
+# Deviations from the committed root policy.yaml, deliberate and narrow:
+#   - fs_write/fs_delete are class W2 here (the real policy.yaml has them
+#     W1) so Gate 1 can exercise "a W2 action needs a byte-exact Telegram
+#     diff approval" against a real tool already wired end-to-end
+#     (mcp/fs), without inventing a new tool.
+#   - mail_send (W3) is kept, with no real MCP tool implementation behind
+#     it (none exists yet in the landed W3 stack) — Gate 2 only needs the
+#     REAL policy decision + Telegram notify-only + engine-level
+#     surface=local backstop, all of which run before any tool handler
+#     would ever be reached (kahyad/internal/server/mcp.go's
+#     policyGateMiddleware denies before dispatch on anything short of
+#     ResultAllow).
+#   - secret_lane_globs is intentionally EMPTY: Gate 3 must prove the
+#     W3-08 CONTENT classifier (not a path-glob coincidence) drives
+#     redaction/sensitive-marking — see kahyad/internal/telegram/
+#     redact.go's isSecretLane and mcp/fs.Server.ContentClassifier (both
+#     W3-10 fixes, separate commits from this one).
+#   - egress.allowlist's api.anthropic.com-equivalent entry is patched in
+#     per-run by writeFixturePolicyYAML (harness_test.go) with the mock
+#     Anthropic server's own ephemeral host:port — mirrors tests/e2e/
+#     w12_gate_test.go's writeHermeticPolicyYAML technique exactly, for
+#     the identical reason (kahyad/internal/egress.Gate denies loopback/
+#     private hosts by default; the mock's port is only known at run time).
+
+tools:
+  - name: fs_read
+    class: R
+
+  - name: fs_write
+    class: W2
+    reversible: false
+
+  - name: fs_delete
+    class: W2
+    reversible: false
+
+  - name: shell_docker
+    class: W2
+    reversible: false
+
+  - name: shell_host
+    class: W2
+    reversible: false
+
+  - name: mail_send
+    class: W3
+    reversible: false
+
+secret_lane_globs: []
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.telegram.org
+  default_daily_byte_budget: 26214400

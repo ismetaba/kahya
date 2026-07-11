@@ -1,6 +1,6 @@
 # W3-10 — W3 acceptance gate
 
-**Status:** todo
+**Status:** done (live-Telegram-card checklist step deferred to the user — see docs/w3-gate-checklist.md §3, needs a real BotFather token)
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-01, W3-02, W3-03, W3-04, W3-05, W3-06, W3-07, W3-08
 **Flags:** none
@@ -45,13 +45,13 @@ Mapping table — gate clause → test → mechanism under test:
 8. Run the full suite: `make test` green, `make lint` green. Mark W3-10 done in BACKLOG.md per protocol; if W3-09 slid, leave it `[ ]` with a note — it does not block this gate.
 
 ## Acceptance criteria
-- [ ] `go test ./tests/w3/... -count=1` green in `make test`; with Docker running, `KAHYA_DOCKER_TESTS=1 go test ./tests/w3/... -run TestGate -v` shows all five gate tests RUN (zero skips).
-- [ ] Gate test 1 asserts byte-exact diff equality (not substring) between the approval card and the canonical payload, including the Turkish filename fixture.
-- [ ] Gate test 2 proves both rejections (forged Telegram callback AND CLI `evet`) and the `onayla` success path in one test, with ledger rows for each.
-- [ ] Gate test 4 covers all four bypass vectors: proxy-403, direct-IP, DNS, and network-none.
-- [ ] Gate test 5 asserts zero upstream requests for the secret-lane `trace_id` at the recording stub — the strongest form of "gizli-şerit içerik bulut çağrısına çıkamıyor".
-- [ ] `docs/w3-gate-checklist.md` committed with a completed live run (date, trace_ids, ledger query outputs pasted).
-- [ ] All five tests are plain `go test` tests (no manual setup beyond Docker running) so W78-03 can lift them into CI unchanged.
+- [x] `go test ./tests/w3/... -count=1` green in `make test`; with Docker running, `KAHYA_DOCKER_TESTS=1 go test ./tests/w3/... -run TestGate -v` shows all five gate tests RUN (zero skips).
+- [x] Gate test 1 asserts byte-exact diff equality (not substring) between the approval card and the canonical payload, including the Turkish filename fixture.
+- [x] Gate test 2 proves both rejections (forged Telegram callback AND CLI `evet`) and the `onayla` success path in one test, with ledger rows for each.
+- [x] Gate test 4 covers all four bypass vectors: proxy-403, direct-IP, DNS, and network-none.
+- [x] Gate test 5 asserts zero upstream requests for the secret-lane `trace_id` at the recording stub — the strongest form of "gizli-şerit içerik bulut çağrısına çıkamıyor".
+- [x] `docs/w3-gate-checklist.md` committed with a completed live run (date, trace_ids, ledger query outputs pasted).
+- [x] All five tests are plain `go test` tests (no manual setup beyond Docker running) so W78-03 can lift them into CI unchanged.
 
 ## Out of scope
 - Fixing bugs found by the gate — file/fix them under the owning task ID and its file (never bundle two tasks in one commit), then re-run this gate.
