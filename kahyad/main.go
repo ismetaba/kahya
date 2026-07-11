@@ -305,6 +305,13 @@ func run() int {
 
 	fsPolicyClient := server.NewFSPolicyClient(policyEngine, srv.DenyAll)
 	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
+	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
+	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
+	// paths) - this wires the SEPARATE, content-based half so a file whose
+	// PATH is unremarkable but whose CONTENT is finans/sağlık/kimlik still
+	// marks the session sensitive (see mcp/fs.Server.ContentClassifier's
+	// own doc comment).
+	fsTool.ContentClassifier = server.NewFSContentClassifier()
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
 

@@ -14,6 +14,7 @@ import (
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/secretlane"
 	mcpfs "kahya/mcp/fs"
 )
 
@@ -94,6 +95,24 @@ type fsLoggerAdapter struct{ l *logx.Logger }
 // mcp/fs.New with.
 func NewFSLogger(l *logx.Logger) mcpfs.Logger {
 	return fsLoggerAdapter{l: l}
+}
+
+// fsContentClassifier adapts kahyad/internal/secretlane.ClassifyDeterministic
+// to mcp/fs.ContentClassifier (W3-10 gate-test fix — see mcp/fs.Server.
+// ContentClassifier's own doc comment). Deterministic-only, on purpose: no
+// live Qwen/MLX dependency for this ingest point, matching
+// kahyad/internal/server/task.go's own POST /v1/task prompt-classification
+// call, which uses the exact same function.
+type fsContentClassifier struct{}
+
+func (fsContentClassifier) ClassifySecretLane(text string) bool {
+	return secretlane.ClassifyDeterministic(text).SecretLane
+}
+
+// NewFSContentClassifier constructs the mcp/fs.ContentClassifier adapter
+// main.go wires fsTool.ContentClassifier with.
+func NewFSContentClassifier() mcpfs.ContentClassifier {
+	return fsContentClassifier{}
 }
 
 func (a fsLoggerAdapter) With(traceID string) mcpfs.Logger {

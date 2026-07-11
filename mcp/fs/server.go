@@ -202,8 +202,33 @@ type Server struct {
 	// SessionID (there is nothing to attribute the read to without one).
 	SensitiveMarker SensitiveReadMarker
 
+	// ContentClassifier is the OPTIONAL W3-08 content-based secret-lane
+	// seam (nil by default — every pre-W3-10 caller/test is unaffected,
+	// and HandleRead's own path-glob check runs first/unconditionally
+	// regardless of whether this is wired): HANDOFF §4's ordering
+	// invariant scopes policy.yaml's SecretLaneGlobs to file PATHS only
+	// ("policy.yaml globlari yalniz dosya yollari icin") — a file whose
+	// PATH is unremarkable but whose CONTENT is finans/sağlık/kimlik
+	// (e.g. a downloaded bank statement saved under an ordinary name) was
+	// otherwise invisible to fs_read's own secret_lane_read/
+	// SensitiveMarker seam. kahyad wires this to a direct adapter onto
+	// kahyad/internal/secretlane.ClassifyDeterministic (this package
+	// cannot import that package directly — Go's internal-package import
+	// boundary, this package's own doc comment) — the same
+	// no-model-required deterministic pre-pass, never the Qwen fallback,
+	// so wiring this never takes a live-MLX dependency.
+	ContentClassifier ContentClassifier
+
 	registry *undoRegistry
 	now      func() time.Time
+}
+
+// ContentClassifier is HandleRead's optional content-based secret-lane
+// check (Server.ContentClassifier's own doc comment). ClassifySecretLane
+// reports whether text itself (not its path) is finans/sağlık/kimlik
+// content.
+type ContentClassifier interface {
+	ClassifySecretLane(text string) bool
 }
 
 // New constructs a Server. home is the real (or, in tests, fake) user
@@ -404,6 +429,14 @@ func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs
 	secretLane, glenErr := MatchesAnyGlobCI(cp.Match, s.SecretLaneGlobs)
 	if glenErr != nil {
 		s.Log.Warn("fs_read_secret_lane_glob_error", "err", glenErr.Error())
+	}
+	// W3-10 gate-test fix: the path-glob check above is HANDOFF's
+	// file-path-only rule; this is the SEPARATE, content-based half (see
+	// Server.ContentClassifier's own doc comment) — a path-glob miss does
+	// not short-circuit it, since the two checks are independent OR'd
+	// signals, not an either/or.
+	if !secretLane && s.ContentClassifier != nil {
+		secretLane = s.ContentClassifier.ClassifySecretLane(string(data))
 	}
 	if secretLane {
 		// Always attempted (not routed through the best-effort
