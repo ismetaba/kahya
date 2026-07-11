@@ -33,6 +33,7 @@ import (
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/traceid"
+	mcpfs "kahya/mcp/fs"
 )
 
 func main() {
@@ -219,6 +220,30 @@ func run() int {
 	// ever be consulted; see server.Server.SetDenyAll's doc comment).
 	policyEngine := policy.NewEngine(pol, st.Queries, st)
 	srv.SetPolicyEngine(policyEngine)
+
+	// W3-03: fs_read/fs_write/fs_delete, registered onto the SAME shared
+	// /v1/mcp server as the memory tools (server.SetFSTool's doc
+	// comment). fsPolicyClient satisfies mcp/fs.PolicyClient with a
+	// direct in-process call onto policyEngine (this task's own
+	// ambiguity-decision note: mcp/fs cannot import kahyad/internal/
+	// policy directly - Go's internal-package import boundary - so this
+	// adapter lives on the server package's side instead); srv.DenyAll
+	// is threaded through so a policy.yaml load failure at boot still
+	// denies every fs operation even though fs_read/fs_write/fs_delete
+	// bypass policyGateMiddleware's own deny-all short-circuit (they run
+	// their own gate chain - see mcp.go's fsOwnedTools). undoDir is
+	// cfg.DataDir/undo (fallback pre-image copies for a fs_write target
+	// NOT inside any git work tree); policyEngine's undo-window-expiry
+	// hook purges those copies once their 5-minute window lapses.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Error("fs_tool_home_dir_failed", "err", err.Error())
+		return 1
+	}
+	fsPolicyClient := server.NewFSPolicyClient(policyEngine, srv.DenyAll)
+	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log))
+	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
+	srv.SetFSTool(fsTool)
 
 	// POST /v1/task (W12-07): st.Queries already has exactly the
 	// InsertTask/UpdateTaskState/UpdateTaskSession method shape

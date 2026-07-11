@@ -1,6 +1,6 @@
 # W3-03 — fs MCP tool (kahyad-owned) with deny globs + undo recipes
 
-**Status:** todo
+**Status:** done
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-02
 **Flags:** none
@@ -42,15 +42,15 @@ Gotchas:
 7. Tests: deny-glob bypass attempts MUST fail — fixtures: `~/Library/LaunchAgents/../LaunchAgents/evil.plist`, a symlink `~/tmp/lnk → ~/.zshrc`, NFD-encoded `~/Library/Application Support/Kahya/…` variant; write→undo→byte-identical restore; delete→undo→file back at original path; write without a valid token fails when ladder says NEEDS_APPROVAL.
 
 ## Acceptance criteria
-- [ ] `go test ./mcp/fs/...` green in `make test`, including all three bypass fixtures (dotdot, symlink, NFD).
-- [ ] Manual: with kahyad running, an `fs_write` to `~/.zshrc` requested through the worker is denied; JSONL log line with `"event":"fs_deny_glob_hit"` and the request's `trace_id` exists; `~/.zshrc` mtime unchanged.
-- [ ] Manual: `fs_write` to a scratch file at L2 auto-runs; `kahya undo --trace <id>` within 5 minutes restores the byte-exact pre-image (compare `shasum -a 256` before/after); ledger shows `undo_executed`.
-- [ ] `fs_delete` moves the file to `~/.Trash/` (verify with `ls`), never unlinks — test asserts the Trash entry exists.
-- [ ] Token replay test: reusing a consumed token on a second `fs_write` fails (covered in tests, runs in `make test`).
-- [ ] Undo pre-images purged after window expiry: after the 5-minute window lapses in a test (inject a short window via config), `~/Library/Application Support/Kahya/undo/<task_id>/` is empty.
-- [ ] Case-insensitivity test green: `fs_write` to `~/LIBRARY/LaunchAgents/x.plist` is denied like its lowercase form.
-- [ ] `fs_read` of a path matching a `secret_lane_globs` fixture (e.g. `~/Documents/saglik/tahlil-sonuçları.pdf`, byte-exact Turkish path) produces a `secret_lane_read` ledger event with `trace_id` and `secret_lane: true` in the result metadata (test) — W3-05 consumes this seam.
-- [ ] Every fs operation logs one JSONL line with `trace_id` and canonical path (grep a manual run's log).
+- [x] `go test ./mcp/fs/...` green in `make test`, including all three bypass fixtures (dotdot, symlink, NFD).
+- [x] Manual: with kahyad running, an `fs_write` to `~/.zshrc` requested through the worker is denied; JSONL log line with `"event":"fs_deny_glob_hit"` and the request's `trace_id` exists; `~/.zshrc` mtime unchanged.
+- [x] Manual: `fs_write` to a scratch file at L2 auto-runs; `kahya undo --trace <id>` within 5 minutes restores the byte-exact pre-image (compare `shasum -a 256` before/after); ledger shows `undo_executed`.
+- [x] `fs_delete` moves the file to `~/.Trash/` (verify with `ls`), never unlinks — test asserts the Trash entry exists.
+- [x] Token replay test: reusing a consumed token on a second `fs_write` fails (covered in tests, runs in `make test`).
+- [x] Undo pre-images purged after window expiry: after the 5-minute window lapses in a test (inject a short window via config), `~/Library/Application Support/Kahya/undo/<task_id>/` is empty.
+- [x] Case-insensitivity test green: `fs_write` to `~/LIBRARY/LaunchAgents/x.plist` is denied like its lowercase form.
+- [x] `fs_read` of a path matching a `secret_lane_globs` fixture (e.g. `~/Documents/saglik/tahlil-sonuçları.pdf`, byte-exact Turkish path) produces a `secret_lane_read` ledger event with `trace_id` and `secret_lane: true` in the result metadata (test) — W3-05 consumes this seam.
+- [x] Every fs operation logs one JSONL line with `trace_id` and canonical path (grep a manual run's log).
 
 ## Out of scope
 - Shell execution of any kind — W3-04 (and the binary allowlist is NOT a security boundary, §5 #6).

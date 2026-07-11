@@ -184,6 +184,17 @@ type Engine struct {
 	// now is time.Now by default; tests substitute a fixed/advancing clock
 	// so undo-window/token-expiry logic never needs a real sleep.
 	now func() time.Time
+	// undoExpiryHook is W3-03's purge seam (SetUndoExpiryHook): called
+	// once per undo_windows row this Engine itself flips to "expired"
+	// (both SweepExpiredUndoWindows' background sweep and TriggerUndo's
+	// own lazy expiry-on-trigger-attempt branch), AFTER the row is
+	// already durably marked expired and undo_window_expired is already
+	// ledgered. nil by default (every pre-W3-03 caller/test keeps working
+	// unchanged) - a set hook lets the owning tool (mcp/fs.Server.
+	// PurgeExpired) delete its own fallback pre-image copy without this
+	// package needing to know anything about what that tool stores or
+	// where.
+	undoExpiryHook func(traceID, taskID, tool string)
 }
 
 // NewEngine constructs an Engine. pol is W3-01's loaded tool registry (the
@@ -192,6 +203,24 @@ type Engine struct {
 // fakes or a real temp *store.Store (kahyad/internal/store).
 func NewEngine(pol Policy, store Store, ledger Ledger) *Engine {
 	return &Engine{policy: pol, store: store, ledger: ledger, now: time.Now}
+}
+
+// SetUndoExpiryHook registers fn to be called whenever this Engine flips
+// an undo_windows row to "expired" (W3-03 task spec: "Purge fallback
+// pre-image copies when the 5-minute window expires — hook the
+// undo_window_expired event"). Call before the undo sweeper goroutine
+// starts (main.go); nil (the default) means no hook runs.
+func (e *Engine) SetUndoExpiryHook(fn func(traceID, taskID, tool string)) {
+	e.undoExpiryHook = fn
+}
+
+// fireUndoExpiryHook calls the registered hook, if any - a small helper so
+// SweepExpiredUndoWindows and TriggerUndo's own expiry branch share
+// exactly one nil-check instead of duplicating it.
+func (e *Engine) fireUndoExpiryHook(traceID, taskID, tool string) {
+	if e.undoExpiryHook != nil {
+		e.undoExpiryHook(traceID, taskID, tool)
+	}
 }
 
 // SetClock overrides Engine's clock (tests only).
@@ -559,6 +588,7 @@ func (e *Engine) SweepExpiredUndoWindows(ctx context.Context) (int, error) {
 		e.ledgerRaw(ctx, w.TraceID, "undo_window_expired", map[string]any{
 			"event": "undo_window_expired", "task_id": w.TaskID, "tool": w.Tool,
 		})
+		e.fireUndoExpiryHook(w.TraceID, w.TaskID, w.Tool)
 	}
 	return n, nil
 }
@@ -611,6 +641,7 @@ func (e *Engine) TriggerUndo(ctx context.Context, traceID string) (sqlcgen.UndoW
 		e.ledgerRaw(ctx, traceID, "undo_window_expired", map[string]any{
 			"event": "undo_window_expired", "task_id": row.TaskID, "tool": row.Tool,
 		})
+		e.fireUndoExpiryHook(traceID, row.TaskID, row.Tool)
 		return sqlcgen.UndoWindow{}, ErrNoOpenUndoWindow
 	}
 

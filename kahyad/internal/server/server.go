@@ -30,6 +30,7 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
+	mcpfs "kahya/mcp/fs"
 	"kahya/mcp/memory"
 )
 
@@ -109,6 +110,14 @@ type Server struct {
 	// once s.denyAll itself is not already overriding the decision. See
 	// SetPolicyEngine's doc comment (mcp.go).
 	policyEngine *policy.Engine
+
+	// fsServer is the W3-03 fs MCP tool set (fs_read/fs_write/fs_delete),
+	// registered onto the SAME shared /v1/mcp server as mcp/memory's tools
+	// (buildMCPHandler) and consulted by handlePolicyUndo/
+	// handlePolicyFeedback (policy.go) to execute the owning recipe once
+	// kahyad/internal/policy.Engine.TriggerUndo has flipped the window and
+	// demoted the ladder state. nil until SetFSTool is called - see fs.go.
+	fsServer *mcpfs.Server
 
 	// anthGovernor/anthNotifier/anthCredential/anthEgressGate wire POST
 	// /v1/task's per-task Anthropic forward-proxy + cost governor

@@ -120,6 +120,14 @@ func (s *Server) buildMCPHandler() http.Handler {
 
 	memSrv := memory.New(s.mcpMemoryDir, mcpSearchAdapter{s.search}, s.mcpIndexer, s.eventLogger, s.log)
 	mcpServer := memSrv.MCPServer(nil)
+	// W3-03: fs_read/fs_write/fs_delete, registered onto this SAME shared
+	// server (one MCP session/tool surface for the worker) - see
+	// fs.go's SetFSTool doc comment and fsOwnedTools, which
+	// policyGateMiddleware below defers to entirely for these three tool
+	// names.
+	if s.fsServer != nil {
+		s.fsServer.RegisterTools(mcpServer)
+	}
 	mcpServer.AddReceivingMiddleware(s.policyGateMiddleware())
 
 	streamable := mcp.NewStreamableHTTPHandler(
@@ -204,6 +212,23 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			deny := func(reason string) (mcp.Result, error) {
 				s.log.With(traceID).Info("mcp_tool_denied", "tool", canonName, "reason", reason)
 				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: reason}}}, nil
+			}
+
+			// W3-03: fs_read/fs_write/fs_delete run their OWN full gate
+			// chain (deny-glob check BEFORE any policy decision, then
+			// Check, then ConsumeToken - see mcp/fs's package doc comment
+			// and fs.go's fsOwnedTools) instead of this middleware's
+			// generic Check+auto-consume step: a middleware that always
+			// Check()s first, unconditionally, cannot express "a
+			// fs_write_deny_globs hit denies immediately, with no
+			// approval able to override it, before the ladder is ever
+			// consulted". This bypass runs BEFORE the deny-all check
+			// below too - mcp/fs's own PolicyClient adapter
+			// (enginePolicyClient in fs.go) independently re-checks
+			// s.denyAll and fails closed identically, so a policy.yaml
+			// load failure at boot still denies every fs operation.
+			if fsOwnedTools[canonName] {
+				return next(ctx, method, req)
 			}
 
 			// W3-01: deny-all mode overrides the ladder engine entirely - even

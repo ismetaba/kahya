@@ -134,7 +134,8 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: "trace_id required for kind=undo"})
 			return
 		}
-		if _, err := s.policyEngine.TriggerUndo(r.Context(), traceID); err != nil {
+		row, err := s.policyEngine.TriggerUndo(r.Context(), traceID)
+		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, policy.ErrNoOpenUndoWindow) {
 				status = http.StatusNotFound
@@ -142,6 +143,12 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, policyFeedbackResponse{OK: false, Error: err.Error()})
 			return
 		}
+		// W3-03: execute the owning tool's undo recipe (Trash restore /
+		// git-checkpoint restore) now that the window is durably
+		// "triggered" and the ladder state already demoted - see
+		// fs.go's dispatchFSUndo doc comment for why this is a SEPARATE,
+		// best-effort step from TriggerUndo's own bookkeeping.
+		s.dispatchFSUndo(r.Context(), traceID, row.Tool)
 		writeJSON(w, http.StatusOK, policyFeedbackResponse{OK: true})
 	default:
 		writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: "kind must be approve, deny, or undo"})
@@ -243,10 +250,13 @@ type policyUndoResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-// handlePolicyUndo implements POST /policy/undo: triggers the undo window
-// for trace_id while it is still open (HANDOFF S4 ladder L2 row). Recipe
-// EXECUTION itself is delegated to the owning tool (W3-03) - out of scope
-// here, per this task's Out of scope.
+// handlePolicyUndo implements POST /policy/undo (`kahya undo --trace
+// <id>`'s real server-side call, kahyad/cmd/kahya/client.go's
+// PolicyUndo): triggers the undo window for trace_id while it is still
+// open (HANDOFF S4 ladder L2 row), then dispatches to the owning tool's
+// recipe (W3-03: mcp/fs.Server.UndoWrite/UndoDelete) - see
+// dispatchFSUndo's doc comment (fs.go) for why that is a separate,
+// best-effort step from TriggerUndo's own window/demotion bookkeeping.
 func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, policyCheckMaxBody)
 	var req policyUndoRequest
@@ -271,5 +281,6 @@ func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, policyUndoResponse{OK: false, Error: err.Error()})
 		return
 	}
+	s.dispatchFSUndo(r.Context(), req.TraceID, row.Tool)
 	writeJSON(w, http.StatusOK, policyUndoResponse{OK: true, Tool: row.Tool, TaskID: row.TaskID})
 }
