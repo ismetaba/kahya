@@ -238,6 +238,39 @@ func TestCheck_IPLiteralAndPrivateRangeRejectedUnlessAllowlisted(t *testing.T) {
 	}
 }
 
+// TestCheck_NoPortsConfiguredDefaultsToHTTPSOnly is MINOR G's regression
+// test: an allowlist entry with NO `ports:` configured (every real
+// policy.yaml entry today) used to mean "any port" — this proves it now
+// means 443 ONLY, closing the "allowlisted host, arbitrary port" pivot
+// (which, combined with BLOCKER D's DNS-rebinding fix, matters most for a
+// hostname whose resolved address turns out to be reachable on some other
+// service port).
+func TestCheck_NoPortsConfiguredDefaultsToHTTPSOnly(t *testing.T) {
+	cfg := policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "no-ports-test.example.com"}},
+		DefaultDailyByteBudget: 1 << 20,
+	}
+	g := NewGate(cfg, NewSensitiveTracker(), newFakeBudget(), &fakeLedger{}, nil, nil)
+
+	d443, err := g.Check(context.Background(), Target{Host: "no-ports-test.example.com", Port: 443}, 10, SessionInfo{TraceID: "t1"})
+	if err != nil {
+		t.Fatalf("Check(443) error = %v", err)
+	}
+	if !d443.Allow {
+		t.Errorf("Check(port 443, no ports: configured) = deny (%s), want allow (443 is the default)", d443.Reason)
+	}
+
+	for _, port := range []int{22, 80, 8080, 3128, 5432} {
+		d, err := g.Check(context.Background(), Target{Host: "no-ports-test.example.com", Port: port}, 10, SessionInfo{TraceID: "t2"})
+		if err != nil {
+			t.Fatalf("Check(%d) error = %v", port, err)
+		}
+		if d.Allow {
+			t.Errorf("Check(port %d, no ports: configured) = allow, want deny (an entry with no ports must default to 443 ONLY, never any port)", port)
+		}
+	}
+}
+
 func TestCheck_ExplicitlyAllowlistedPrivateIPIsAllowed(t *testing.T) {
 	cfg := policy.EgressConfig{
 		Allowlist: []policy.EgressAllowEntry{

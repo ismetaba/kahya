@@ -238,14 +238,25 @@ func (s *Server) SetClock(now func() time.Time) { s.now = now }
 // ---- MCP wire types (English arg names, Turkish tool descriptions). ----
 
 // FsReadArgs is fs_read's input.
+//
+// BLOCKER A fix: this struct used to also carry a model-supplied
+// SessionID, which HandleRead used as the sensitive-read taint key
+// (SensitiveMarker.MarkSensitiveRead). A free-form tool-call argument the
+// model itself supplies is both SKIPPABLE (simply omit it — the old code
+// treated an empty SessionID as "nothing to attribute the read to" and
+// silently skipped marking anything at all) and LAUNDERABLE (present some
+// OTHER session's id instead, redirecting the mark), defeating HANDOFF §5
+// safety #1's "aynı oturumda hassas okuma varsa allowlist-dışı egress sert
+// bloke" invariant entirely — a model that wants to read a secret-lane
+// file and then exfiltrate it off-allowlist just never sends session_id.
+// SessionID is removed outright: there is no argument left for the model
+// to omit or forge. HandleRead now ALWAYS keys the taint mark on the
+// request's own SERVER-ASSIGNED trace_id (kahyad's /v1/mcp wiring sets
+// X-Kahya-Trace-Id on every request; traceIDFromRequest reads it back out
+// — see this package's own traceHeader doc comment) — an identity the
+// model never supplies and cannot influence.
 type FsReadArgs struct {
 	Path string `json:"path" jsonschema:"okunacak dosyanın mutlak veya ~ ile başlayan yolu"`
-	// SessionID is an optional seam for the secret_lane_read ledger event
-	// (this task's spec: "emit ledger secret_lane_read with trace_id +
-	// session_id") — there is no session_id propagated on the MCP path
-	// yet (W4's session-continuity work), so callers that have one may
-	// pass it through; absent, the ledger event simply carries "".
-	SessionID string `json:"session_id,omitempty" jsonschema:"gizli-şerit okuma etiketi için oturum kimliği (opsiyonel)"`
 }
 
 // FsReadOutput is fs_read's output.
@@ -398,20 +409,29 @@ func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs
 		// Always attempted (not routed through the best-effort
 		// ledgerEvent silencing pattern's docstring caveat) — this is the
 		// durable seam W3-05 wires to POST /session/sensitive-read (this
-		// task's spec, step 2).
+		// task's spec, step 2). session_id now carries the REQUEST's own
+		// trace_id (BLOCKER A fix — see FsReadArgs' doc comment): that is
+		// the taint key HandleRead marks below, so the ledger row and the
+		// actual mark always agree on which identity was tainted.
 		s.logAndLedger(ctx, traceID, "secret_lane_read", map[string]any{
-			"event": "secret_lane_read", "canonical_path": cp.Match, "session_id": args.SessionID,
+			"event": "secret_lane_read", "canonical_path": cp.Match, "session_id": traceID,
 		})
 
-		// W3-05: mark the session sensitive so kahyad/internal/egress.Gate
-		// hard-blocks any LATER allowlist-external egress from it (HANDOFF
-		// §5 safety #1). No session_id means there is nothing to attribute
-		// the read to — SensitiveMarker (and egress.SensitiveTracker.Mark)
-		// both treat an empty session_id as a deliberate no-op, so this
-		// call is simply skipped rather than marking some shared "" bucket
-		// that would incorrectly taint every sessionless read.
-		if s.SensitiveMarker != nil && args.SessionID != "" {
-			if err := s.SensitiveMarker.MarkSensitiveRead(ctx, args.SessionID, traceID); err != nil {
+		// BLOCKER A fix: taint is now keyed on the request's own
+		// SERVER-ASSIGNED trace_id, NEVER a model-supplied argument (see
+		// FsReadArgs' doc comment for why the old SessionID argument was
+		// removed entirely). This mark is UNCONDITIONAL — there is no
+		// model-controlled way to omit or redirect it — except for the
+		// defensive traceID != "" guard, which only ever protects against
+		// a direct in-process Go caller that passed "" (mirrors
+		// SensitiveMarker/egress.SensitiveTracker.Mark's own "empty key is
+		// always a no-op" convention); every REAL request reaching this
+		// code has a non-empty trace_id by construction (kahyad's /v1/mcp
+		// wiring — server.ensureTraceHeader — guarantees the
+		// X-Kahya-Trace-Id header, and therefore traceIDFromRequest, is
+		// never empty).
+		if s.SensitiveMarker != nil && traceID != "" {
+			if err := s.SensitiveMarker.MarkSensitiveRead(ctx, traceID, traceID); err != nil {
 				s.Log.With(traceID).Warn("secret_lane_read_sensitive_mark_failed", "err", err.Error())
 			}
 		}

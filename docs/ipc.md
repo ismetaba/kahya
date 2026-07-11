@@ -343,6 +343,59 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   (W3-05), and the
   "→yerel" downgrade rung stays unavailable (ledgered as
   `budget_downgrade_unavailable`) until W3-08's local lane lands.
+- **W3-05 egress-security review fixes (post-W3-05, this pass)** —
+  tightened the gate/proxy without changing the IPC contract's own wire
+  shapes:
+  - **Taint/session key is always `trace_id`, never a model-supplied
+    argument.** `mcp/fs`'s `fs_read` used to take an optional,
+    caller-supplied `session_id` tool-call argument as its taint key —
+    skippable (omit it) and launderable (present a different id). That
+    argument is REMOVED; `fs_read`'s secret-lane taint mark is now
+    unconditional and keyed on the REQUEST's own server-assigned
+    `X-Kahya-Trace-Id`. The anthproxy egress-gate factory
+    (`kahyad/internal/egress.NewAnthproxyEgressGateHook`, wired by
+    `kahyad/internal/server.SetAnthproxy`) keys `SessionInfo.SessionID` on
+    that SAME `trace_id`, so a secret-lane read anywhere in a task's own
+    lifetime hard-blocks that task's later model-call egress the instant
+    it would leave the allowlist.
+  - **`needs_network:true` container egress is attributed via a
+    per-task Proxy-Authorization credential.** `mcp/shell`'s
+    `EgressTokenRegistrar` seam (`kahyad/internal/server.
+    NewEgressTokenRegistrar`, backed by
+    `kahyad/internal/egress.ProxySessionRegistry`) mints a per-task token
+    embedded as the container's `HTTP_PROXY`/`HTTPS_PROXY` URL userinfo
+    (`http://<token>:@kahya-egress-fwd:3128` — curl/wget/most HTTP clients
+    send that as `Proxy-Authorization: Basic ...` automatically). The
+    shared `kahyad/internal/egress.Proxy` listener (the ONE forward-proxy
+    every `needs_network:true` container reaches, for the whole daemon's
+    lifetime — unlike the per-task anthproxy listener above) looks the
+    token back up to attribute the connection to that task's own
+    `trace_id`. A request with no/unknown token is an ANONYMOUS,
+    UNTAINTED session — still fully allowlist+budget-gated (Gate.Check's
+    ordinary empty-`SessionID` path), just never sensitive-read-tainted;
+    this is the documented floor for a connection the proxy cannot
+    attribute to any known task (fail-closed on TAINT is not possible
+    without an identity to key it on).
+  - **An `egress.allowlist` entry with no `ports:` now means 443
+    (HTTPS) only**, never "any port" — every entry in this repo's own
+    `policy.yaml` already relied on this (all HTTPS endpoints); an
+    operator who genuinely needs a different/additional port must say so
+    explicitly via `ports:`.
+  - **DNS rebinding**: an allowlisted HOSTNAME's resolved address is now
+    validated (every resolved IP must be public) and the ACTUAL dial is
+    pinned to that validated literal (`kahyad/internal/egress/proxy.go`'s
+    `resolveAndPin`) — a hijacked/rebound DNS answer for e.g.
+    `api.anthropic.com` pointing at a private/link-local/loopback address
+    is denied at dial time (`egress_blocked_dns_rebind`), even though the
+    hostname itself is allowlisted.
+  - **`kahya-egress`'s own gateway IP** (on-link, reachable by direct IP
+    from any attached container even with `--internal`'s "no route out")
+    is now blocked via an iptables `DROP` rule kahyad installs inside the
+    colima VM's own `INPUT` chain (`mcp/shell.EgressNetworkEnsurer.Ensure`
+    — re-applied idempotently before every `needs_network:true` run).
+    This is a within-colima-VM mitigation: it does not (and cannot, from
+    inside the VM's own iptables) protect against a hypothetical escape
+    from the colima VM to the macOS host itself.
 - **Approval surface rendering** (Telegram inline buttons, CLI "onayla" +
   byte-exact WYSIWYE diff, Hammerspoon cards) — W3-06/W3-07/W6-01. W3-02
   only exposes the engine API those surfaces call

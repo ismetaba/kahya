@@ -132,6 +132,35 @@ func startTestEgressStandinProxy(t *testing.T, allowedHost string, allowedPort i
 	return port
 }
 
+// liveEgressGatewayIP resolves kahya-egress's OWN gateway IP via a real
+// `docker network inspect` call (through exec — the SAME Executor
+// Runner/EgressNetworkEnsurer themselves use) — BLOCKER E's live
+// verification step needs this network's ACTUAL assigned gateway (Docker
+// auto-assigns kahya-egress's subnet; nothing pins it), not a hardcoded
+// guess. Requires the network to already exist (this test's own
+// r.Run(...) call, further down, has always already triggered
+// EgressNetworkEnsurer.Ensure by the time a container needs this value —
+// but this helper itself runs BEFORE that call, so it independently
+// ensures the network exists first via the exact same `docker network
+// create --internal` idempotent call EgressNetworkEnsurer.ensureNetwork
+// makes).
+func liveEgressGatewayIP(t *testing.T, exec Executor) string {
+	t.Helper()
+	ctx := context.Background()
+	_, _ = exec.Run(ctx, "docker", []string{"network", "create", "--internal", EgressNetworkName}, nil) // idempotent; ignores "already exists"
+	res, err := exec.Run(ctx, "docker", []string{
+		"network", "inspect", EgressNetworkName, "--format", "{{(index .IPAM.Config 0).Gateway}}",
+	}, nil)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("docker network inspect %s (gateway lookup): err=%v exitCode=%d stderr=%s", EgressNetworkName, err, res.ExitCode, res.Stderr)
+	}
+	gw := strings.TrimSpace(string(res.Stdout))
+	if gw == "" {
+		t.Fatalf("docker network inspect %s returned an empty gateway", EgressNetworkName)
+	}
+	return gw
+}
+
 // TestDockerIntegration_EgressAllowlistCannotBeBypassed is this task's
 // live §6 W3 gate: a needs_network:true shell_docker job, routed through
 // the REAL kahya-egress Docker network + kahya-egress-fwd sidecar, cannot
@@ -175,6 +204,17 @@ func TestDockerIntegration_EgressAllowlistCannotBeBypassed(t *testing.T) {
 	})
 	workdir := liveWorkdir(t)
 
+	// BLOCKER E: resolve kahya-egress's OWN gateway IP via the host-side
+	// `docker network inspect` (the same call
+	// EgressNetworkEnsurer.ensureGatewayIsolation itself makes) — computing
+	// it INSIDE the container instead is not viable: the sandbox image
+	// (docker/sandbox/Dockerfile) deliberately ships neither `ip` nor `nc`
+	// (curl/coreutils/git/jq/python3 only), and there is no in-container
+	// signal for "my own gateway" without one of those. r.Exec is the SAME
+	// Executor Runner/EgressNetworkEnsurer themselves use — no second
+	// implementation.
+	gatewayIP := liveEgressGatewayIP(t, r.Exec)
+
 	script := `
 FAIL=0
 
@@ -210,6 +250,22 @@ if [ "$CODE" = "200" ] || [ "$CODE" = "301" ] || [ "$CODE" = "308" ]; then
 else
   echo "STEP4_FAIL_CODE_$CODE"
   FAIL=1
+fi
+
+echo "=== step5 (BLOCKER E): the network's own ON-LINK GATEWAY IP must be unreachable — an --internal network's gateway is still on the same L2 segment as every attached container, so it is reachable by direct IP with NO route needed at all (verified live against this repo's own colima VM: the gateway is the VM's own bridge interface, sshd included) ==="
+# The sandbox image ships neither ip nor nc (docker/sandbox/Dockerfile is
+# deliberately minimal) - curl (always present) doubles as the raw-TCP
+# reachability probe: a "Connected to" line in curl's verbose trace means
+# the TCP handshake succeeded (gateway reachable) REGARDLESS of what
+# happens at the SSH protocol layer above it (curl itself speaking HTTP to
+# an sshd naturally fails, which is fine - only the CONNECT step matters
+# here); a DROPped SYN instead times out with no such line at all.
+OUT5=$(curl -s -v --max-time 5 http://` + gatewayIP + `:22/ 2>&1)
+if echo "$OUT5" | grep -q "Connected to ` + gatewayIP + `"; then
+  echo "STEP5_FAIL_GATEWAY_REACHABLE: $OUT5"
+  FAIL=1
+else
+  echo "STEP5_OK_GATEWAY_UNREACHABLE"
 fi
 
 exit $FAIL

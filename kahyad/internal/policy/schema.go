@@ -53,9 +53,18 @@ type ToolRule struct {
 
 // EgressAllowEntry is one `egress.allowlist[]` entry (HANDOFF §5 safety
 // #1: "Off-box'a byte gonderen her cagri ... hedef allowlist + hacim
-// butcesine tabi"). Ports/Methods are optional narrowing filters; an
-// absent Ports/Methods means "any port"/"any method" is permitted to Host
-// (subject to the byte-budget check egress.Check performs - W3-05).
+// butcesine tabi"). Ports/Methods are optional narrowing filters.
+//
+// MINOR G fix (egress-security review): an ABSENT Ports no longer means
+// "any port" — kahyad/internal/egress.NewGate defaults a portless entry
+// to {443} (HTTPS) ONLY, since every entry this codebase's own
+// policy.yaml declares is in fact HTTPS-only, and "any port" silently let
+// a needs_network:true container or the anthproxy path reach an
+// allowlisted HOST on an arbitrary TCP port (e.g. 22, or an internal
+// admin port) an operator never intended to expose. An operator who
+// genuinely needs a different/additional port must say so explicitly via
+// `ports:`. Methods remains "any method" when absent (subject to the
+// byte-budget check egress.Check performs - W3-05).
 type EgressAllowEntry struct {
 	Host    string   `yaml:"host"`
 	Ports   []int    `yaml:"ports,omitempty"`

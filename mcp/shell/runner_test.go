@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -218,6 +219,131 @@ func TestRun_NeedsNetworkAttachesKahyaEgressNetwork(t *testing.T) {
 	argv, _ := argValue(transcript[0].args, "docker_argv").([]string)
 	if !strings.Contains(strings.Join(argv, " "), "HTTP_PROXY=http://kahya-egress-fwd:3128") {
 		t.Fatalf("expected the proxy env value un-redacted in the transcript: %v", argv)
+	}
+}
+
+// fakeEgressTokenRegistrar is EgressTokenRegistrar's test double: records
+// every Register/Release call so a test can assert Runner.Run mints and
+// wires a per-task token end to end (BLOCKER B/C).
+type fakeEgressTokenRegistrar struct {
+	mu             sync.Mutex
+	registered     []struct{ token, traceID, taskID string }
+	released       []string
+	registeredThen func() // if set, called synchronously inside Register — this test's stand-in for "the container is now running with this token", so it can assert Release has NOT happened yet at that point.
+}
+
+func (f *fakeEgressTokenRegistrar) Register(token, traceID, taskID string) {
+	f.mu.Lock()
+	f.registered = append(f.registered, struct{ token, traceID, taskID string }{token, traceID, taskID})
+	then := f.registeredThen
+	f.mu.Unlock()
+	if then != nil {
+		then()
+	}
+}
+
+func (f *fakeEgressTokenRegistrar) Release(token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = append(f.released, token)
+}
+
+// TestRun_NeedsNetworkWithTokenRegistrar_MintsRegistersAndReleasesToken is
+// the BLOCKER B/C regression test at the Runner level: once an
+// EgressTokenRegistrar is wired, a needs_network:true Run mints a
+// per-task token, registers it (keyed on THIS call's own traceID/taskID)
+// BEFORE the container starts, embeds it in the container's HTTP_PROXY/
+// HTTPS_PROXY as Basic-auth userinfo, and releases it once the container
+// (docker run) has exited — never before.
+func TestRun_NeedsNetworkWithTokenRegistrar_MintsRegistersAndReleasesToken(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{}
+	ledger := &fakeLedger{}
+	log := newFakeLogger()
+	pc := &fakePolicyClient{decision: allowDecision("tok")}
+	r := newTestRunner(home, nil, pc, ledger, log, exec,
+		&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+	r.SetEgressEnsurer(NewEgressNetworkEnsurer(exec, "sha256:pinned-test-digest"), 3128)
+
+	registrar := &fakeEgressTokenRegistrar{}
+	var releasedBeforeRunReturns bool
+	registrar.registeredThen = func() {
+		// At the moment Register fires (BEFORE the container starts),
+		// nothing has been released yet.
+		registrar.mu.Lock()
+		releasedBeforeRunReturns = len(registrar.released) == 0
+		registrar.mu.Unlock()
+	}
+	r.SetEgressTokenRegistrar(registrar)
+
+	_, err := r.Run(context.Background(), "trace-token-1", "task-token-1", RunInput{Script: "echo hi", Workdir: workdir, NeedsNetwork: true})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success", err)
+	}
+
+	if len(registrar.registered) != 1 {
+		t.Fatalf("Register calls = %d, want 1", len(registrar.registered))
+	}
+	reg := registrar.registered[0]
+	if reg.traceID != "trace-token-1" || reg.taskID != "task-token-1" {
+		t.Errorf("Register called with (traceID=%q, taskID=%q), want (%q, %q)", reg.traceID, reg.taskID, "trace-token-1", "task-token-1")
+	}
+	if reg.token == "" {
+		t.Error("Register called with an empty token")
+	}
+	if !releasedBeforeRunReturns {
+		t.Error("token was released BEFORE the container ever started — a token's validity window must cover the container's own run")
+	}
+	if len(registrar.released) != 1 || registrar.released[0] != reg.token {
+		t.Fatalf("Release calls = %v, want exactly one release of %q", registrar.released, reg.token)
+	}
+
+	// The SAME token must be embedded in the container's own HTTP_PROXY/
+	// HTTPS_PROXY, as Basic-auth userinfo.
+	runCalls := exec.callsFor("run")
+	mainRun := runCalls[len(runCalls)-1]
+	joined := strings.Join(mainRun.args, " ")
+	wantProxy := "HTTP_PROXY=http://" + reg.token + ":@" + EgressSidecarName + ":3128"
+	if !strings.Contains(joined, wantProxy) {
+		t.Fatalf("expected %q in argv, got: %v", wantProxy, mainRun.args)
+	}
+
+	// The transcript must redact JUST the userinfo/token, not the whole
+	// value (env_allowlist.go's redactProxyURL).
+	transcript := log.find("shell_docker_run")
+	argv, _ := argValue(transcript[0].args, "docker_argv").([]string)
+	argvJoined := strings.Join(argv, " ")
+	if strings.Contains(argvJoined, reg.token) {
+		t.Fatalf("the per-task egress token must NEVER appear in cleartext in the transcript: %v", argv)
+	}
+	if !strings.Contains(argvJoined, "HTTP_PROXY=http://REDACTED@"+EgressSidecarName+":3128") {
+		t.Fatalf("expected the redacted (but still host:port-visible) proxy URL in the transcript, got: %v", argv)
+	}
+}
+
+// TestRun_NeedsNetworkWithoutTokenRegistrar_UsesCredentialFreeProxyURL
+// proves the fallback: no EgressTokenRegistrar wired means no token is
+// minted at all, and the container's proxy URL is the ORIGINAL
+// credential-free one — exactly this Runner's pre-BLOCKER-B/C-fix
+// behavior.
+func TestRun_NeedsNetworkWithoutTokenRegistrar_UsesCredentialFreeProxyURL(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{}
+	pc := &fakePolicyClient{decision: allowDecision("tok")}
+	r := newTestRunner(home, nil, pc, &fakeLedger{}, newFakeLogger(), exec,
+		&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+	r.SetEgressEnsurer(NewEgressNetworkEnsurer(exec, "sha256:pinned-test-digest"), 3128)
+	// No SetEgressTokenRegistrar call at all.
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: workdir, NeedsNetwork: true})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success", err)
+	}
+	runCalls := exec.callsFor("run")
+	mainRun := runCalls[len(runCalls)-1]
+	joined := strings.Join(mainRun.args, " ")
+	if !strings.Contains(joined, "HTTP_PROXY=http://"+EgressSidecarName+":3128") {
+		t.Fatalf("expected the credential-free proxy URL when no registrar is wired, got: %v", mainRun.args)
 	}
 }
 

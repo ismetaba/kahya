@@ -332,6 +332,16 @@ type Runner struct {
 	// the kahya-egress-fwd sidecar forwards to
 	// host.docker.internal:<EgressHostPort>.
 	EgressHostPort int
+	// EgressTokenRegistrar binds a needs_network:true container's own
+	// per-task egress-proxy credential to this task's trace_id (W3-05
+	// BLOCKER B/C fix — see EgressTokenRegistrar's own doc comment in
+	// egress_network.go). nil means every such container's egress is
+	// attributed to an anonymous, UNTAINTED session — still
+	// allowlist+budget-gated by the forward proxy (Gate.Check's ordinary
+	// "no session to taint-check" posture), just never sensitive-read-
+	// tainted. kahyad's real wiring (main.go) always sets this via
+	// SetEgressTokenRegistrar.
+	EgressTokenRegistrar EgressTokenRegistrar
 
 	// timeoutUnit scales RunInput.TimeoutS into a time.Duration (defaults
 	// to time.Second; tests shrink this to time.Millisecond so a
@@ -346,6 +356,15 @@ type Runner struct {
 func (r *Runner) SetEgressEnsurer(ensurer *EgressNetworkEnsurer, hostEgressPort int) {
 	r.EgressEnsurer = ensurer
 	r.EgressHostPort = hostEgressPort
+}
+
+// SetEgressTokenRegistrar wires this Runner's W3-05 BLOCKER B/C
+// proxy-credential-to-trace_id registration (see EgressTokenRegistrar's
+// own doc comment in egress_network.go). Call before any
+// needs_network:true Run — safe to leave unset (nil), which simply means
+// every such container's egress is attributed anonymously.
+func (r *Runner) SetEgressTokenRegistrar(reg EgressTokenRegistrar) {
+	r.EgressTokenRegistrar = reg
 }
 
 // NewRunner constructs a production Runner: home is the real user home
@@ -422,6 +441,14 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		return RunOutput{}, errors.New(reasonWorkdirDenyGlob)
 	}
 
+	// egressToken is the per-task egress-proxy credential this run's
+	// container gets (BLOCKER B/C fix), minted only when an
+	// EgressTokenRegistrar is actually wired — an unminted (empty) token
+	// falls back to egressProxyEnv's original credential-free URL,
+	// matching this Runner's pre-fix behavior exactly when no registrar is
+	// configured (there is nothing for kahyad's forward-proxy to look the
+	// token up against anyway).
+	var egressToken string
 	if in.NeedsNetwork {
 		if r.EgressEnsurer == nil {
 			logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_egress_network_failed", map[string]any{
@@ -436,6 +463,16 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 				"reason": err.Error(),
 			})
 			return RunOutput{}, err
+		}
+		if r.EgressTokenRegistrar != nil {
+			egressToken = "kahya-egt-" + randHex(16)
+			r.EgressTokenRegistrar.Register(egressToken, traceID, taskID)
+			// Released once THIS Run call's docker run has exited, below
+			// (Run blocks for the whole container lifetime — see
+			// EgressTokenRegistrar's own doc comment for why that makes
+			// deferring here safe: nothing can present this token after
+			// Release runs).
+			defer r.EgressTokenRegistrar.Release(egressToken)
 		}
 	}
 
@@ -485,7 +522,7 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		// kahyad's own egress.Gate, which the sidecar dumbly TCP-forwards
 		// every byte to.
 		spec.Network = EgressNetworkName
-		spec.ProxyEnvPairs = egressProxyEnv()
+		spec.ProxyEnvPairs = egressProxyEnv(egressToken)
 	}
 	args := buildDockerRunArgs(spec)
 

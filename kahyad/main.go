@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -268,6 +267,17 @@ func run() int {
 	egressGate := egress.NewGate(pol.Egress, sessions, egressBudget, st, notifier, log)
 	srv.SetEgressGate(egressGate)
 
+	// BLOCKER B/C: the shared, daemon-lifetime forward-proxy (egress.Proxy,
+	// started below) cannot infer which task a needs_network:true
+	// container's connection belongs to on its own — egressTokens maps the
+	// per-task credential mcp/shell.Runner mints (via
+	// server.NewEgressTokenRegistrar below) to that task's own trace_id,
+	// so the proxy can attribute the connection to the SAME
+	// SensitiveTracker key mcp/fs's fs_read seam and the anthproxy
+	// egress-gate factory both use. See egress.ProxySessionRegistry's own
+	// doc comment.
+	egressTokens := egress.NewProxySessionRegistry()
+
 	fsPolicyClient := server.NewFSPolicyClient(policyEngine, srv.DenyAll)
 	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
@@ -304,6 +314,10 @@ func run() int {
 		log.Error("egress_sidecar_digest_load_failed", "path", cfg.EgressSidecarDigestPath, "err", err.Error())
 	}
 	shellRunner.SetEgressEnsurer(mcpshell.NewEgressNetworkEnsurer(shellRunner.Exec, egressSidecarDigest), cfg.EgressPort)
+	// BLOCKER B/C: bind every needs_network:true container Runner.Run
+	// starts to its own task's trace_id, via the SAME egressTokens
+	// registry the egress.Proxy listener below consults.
+	shellRunner.SetEgressTokenRegistrar(server.NewEgressTokenRegistrar(egressTokens))
 
 	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
 	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
@@ -349,33 +363,16 @@ func run() int {
 	// W3-05: the Anthropic forward-proxy becomes a CLIENT of egressGate -
 	// every /v1/messages call this task's worker makes is gated on
 	// host=<AnthropicUpstreamURL's own host:port>, nbytes=the request's
-	// Content-Length, session={task_id, trace_id} BEFORE anthproxy ever
-	// forwards it (HANDOFF §4: "model-cagrisi egress kapisi bu proxy
-	// noktasinda uygulanir"). A sensitive-read-tainted session cannot
-	// even reach the upstream host if it were ever off-allowlist; the
-	// stronger "no secret-lane byte to cloud" content rule is W3-08's
+	// Content-Length, session keyed on trace_id (BLOCKER B/C fix — see
+	// egress.NewAnthproxyEgressGateHook's own doc comment for why
+	// SessionID must be the task's trace_id, never left empty) BEFORE
+	// anthproxy ever forwards it (HANDOFF §4: "model-cagrisi egress kapisi
+	// bu proxy noktasinda uygulanir"). A sensitive-read-tainted session
+	// cannot even reach the upstream host if it were ever off-allowlist;
+	// the stronger "no secret-lane byte to cloud" content rule is W3-08's
 	// classifier + W3-10's test.
 	anthropicHost, anthropicPort := hostPortFromURL(cfg.AnthropicUpstreamURL)
-	egressGateFactory := func(taskID, traceID string) func(*http.Request) error {
-		return func(r *http.Request) error {
-			nbytes := r.ContentLength
-			if nbytes < 0 {
-				nbytes = 0
-			}
-			decision, err := egressGate.Check(r.Context(), egress.Target{Host: anthropicHost, Port: anthropicPort}, nbytes,
-				egress.SessionInfo{TaskID: taskID, TraceID: traceID})
-			if err != nil {
-				// Fail-closed (tasks/README.md global convention): a gate
-				// error is treated exactly like a deny, never a
-				// permissive fallback.
-				return err
-			}
-			if !decision.Allow {
-				return errors.New(decision.Reason)
-			}
-			return nil
-		}
-	}
+	egressGateFactory := egress.NewAnthproxyEgressGateHook(egressGate, anthropicHost, anthropicPort)
 	srv.SetAnthproxy(governor, notifier, credential, egressGateFactory)
 
 	// W3-05: the egress proxy itself - the ONLY route out of the
@@ -385,6 +382,11 @@ func run() int {
 	// for the whole daemon's lifetime (unlike the per-task anthproxy
 	// listener above, this one is shared by every container job).
 	egressProxy := egress.NewProxy(egressGate, cfg.EgressPort)
+	// BLOCKER B/C: the SAME token->trace_id registry mcp/shell.Runner
+	// registers into (via server.NewEgressTokenRegistrar above) is what
+	// this listener consults to attribute each inbound connection's
+	// Proxy-Authorization credential to a task's trace_id.
+	egressProxy.Tokens = egressTokens
 	if err := egressProxy.Start(); err != nil {
 		log.Error("egress_proxy_start_failed", "port", cfg.EgressPort, "err", err.Error())
 		return 1

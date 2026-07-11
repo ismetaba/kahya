@@ -25,16 +25,28 @@ package egress
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"kahya/kahyad/internal/traceid"
 )
+
+// Resolver resolves host to its IP addresses — BLOCKER D (DNS rebinding):
+// production uses net.DefaultResolver.LookupIPAddr directly (*net.Resolver
+// already has this exact method), tests inject a fake mapping so a
+// rebinding scenario (an allowlisted hostname resolving to a private/
+// link-local/loopback address) is reproducible with no real DNS or
+// /etc/hosts change involved.
+type Resolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
 
 // Proxy is the W3-05 forward proxy.
 type Proxy struct {
@@ -43,12 +55,27 @@ type Proxy struct {
 	Addr string
 	// Dial resolves a CONNECT tunnel's upstream connection (production:
 	// a plain net.Dialer.DialContext). Tests override this to prove a
-	// denied CONNECT dials nothing at all.
+	// denied CONNECT dials nothing at all. BLOCKER D: Dial is now called
+	// with an ALREADY-RESOLVED, ALREADY-VALIDATED IP literal (never the
+	// original hostname) — see resolveAndPin.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// Transport forwards a plain-HTTP request once the gate allows it
 	// (production: http.DefaultTransport). Tests override this the same
 	// way Dial is overridden.
 	Transport http.RoundTripper
+	// Resolver resolves an allowlisted HOSTNAME's IP addresses before
+	// every dial (BLOCKER D). Defaults to net.DefaultResolver.
+	Resolver Resolver
+	// Tokens maps a per-task egress-proxy credential (carried in the
+	// CONNECT/plain-HTTP request's Proxy-Authorization header — see
+	// sessionForRequest) to that task's own SessionInfo (BLOCKER B/C).
+	// nil (the zero value) means every request is attributed to a fresh,
+	// anonymous, untainted session — this proxy's ORIGINAL behavior,
+	// still fully allowlist+budget-gated, just never sensitive-read-
+	// tainted. kahyad's real wiring (main.go) always sets this to the
+	// SAME *ProxySessionRegistry mcp/shell.Runner registers tokens into
+	// (via kahyad/internal/server.NewEgressTokenRegistrar).
+	Tokens *ProxySessionRegistry
 
 	ln  net.Listener
 	srv *http.Server
@@ -62,6 +89,7 @@ func NewProxy(gate *Gate, port int) *Proxy {
 		Addr:      fmt.Sprintf("127.0.0.1:%d", port),
 		Dial:      (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		Transport: http.DefaultTransport,
+		Resolver:  net.DefaultResolver,
 	}
 }
 
@@ -106,6 +134,99 @@ func denyResponse(w http.ResponseWriter, reason string) {
 	http.Error(w, reason, http.StatusForbidden)
 }
 
+// proxyAuthToken extracts the per-task egress-proxy credential from r's
+// Proxy-Authorization header (RFC 7235 §4.4 — the proxy-specific
+// counterpart of Authorization): the "Basic base64(token:)" scheme a
+// needs_network:true container's HTTP_PROXY/HTTPS_PROXY env
+// (mcp/shell/egress_network.go's egressProxyEnv) encodes its per-task
+// token into as the proxy URL's userinfo (e.g.
+// "http://<token>:@kahya-egress-fwd:3128" — curl/wget and most HTTP
+// clients send that userinfo as Proxy-Authorization automatically, on
+// every request through that proxy, CONNECT or plain, with zero extra
+// container-side configuration). Returns "" for anything else (missing
+// header, wrong scheme, malformed base64, no ":" separator) — an empty
+// token is exactly the "UNKNOWN, untainted session" case
+// sessionForRequest already handles via the ordinary empty-SessionID
+// no-taint path.
+func proxyAuthToken(r *http.Request) string {
+	h := r.Header.Get("Proxy-Authorization")
+	const prefix = "Basic "
+	if !strings.HasPrefix(h, prefix) {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(h, prefix))
+	if err != nil {
+		return ""
+	}
+	token, _, ok := strings.Cut(string(decoded), ":")
+	if !ok {
+		return ""
+	}
+	return token
+}
+
+// sessionForRequest resolves r's SessionInfo (BLOCKER B/C): if a
+// per-task egress-proxy token is present AND registered (p.Tokens), the
+// request is attributed to THAT task's own SessionInfo (SessionID keyed
+// on its trace_id — see egress.ProxySessionRegistry's own doc comment for
+// how it got there); otherwise a fresh, anonymous, untainted session is
+// minted — Gate.Check's ordinary "no session to taint-check" path already
+// handles this correctly: fail-closed on TAINT is not possible without an
+// identity to key it on, but the allowlist/budget gate is still fully
+// enforced regardless (this is the documented, intentional floor for a
+// request this proxy cannot attribute to any known task).
+func (p *Proxy) sessionForRequest(r *http.Request) SessionInfo {
+	if p.Tokens != nil {
+		if token := proxyAuthToken(r); token != "" {
+			if session, ok := p.Tokens.Lookup(token); ok {
+				return session
+			}
+		}
+	}
+	return SessionInfo{TraceID: traceid.New()}
+}
+
+// resolveAndPin resolves host (already Gate-approved — this is called
+// AFTER Gate.Check has returned Allow=true for it) to a single public IP
+// literal to dial, closing BLOCKER D (DNS rebinding): isPrivateOrLinkLocal
+// only ever inspected a bare IP LITERAL present in the original request;
+// an ALLOWLISTED HOSTNAME's actual DNS answer was never checked at all,
+// so a hijacked/rebound record for e.g. api.anthropic.com could silently
+// pivot every dial at a private address. host that is already an IP
+// literal is returned unchanged (no resolution possible or needed — its
+// own literal value is what Gate.Check's isPrivateOrLinkLocal path
+// already reasons about). For a HOSTNAME, EVERY resolved address is
+// required to be public — rejecting the whole result if even ONE
+// resolved address is private/link-local/loopback (a DNS response may
+// list several A/AAAA records; trusting only the "safe-looking" one and
+// ignoring the rest would still let an attacker who controls even one
+// authoritative answer redirect a later connection/retry to it) — and the
+// FIRST validated address is returned so the caller's actual TCP
+// connection is PINNED to a Gate-checked literal, never re-resolved by
+// the dialer/transport afterward (the whole point: what was checked is
+// exactly what gets dialed).
+func resolveAndPin(ctx context.Context, resolver Resolver, host string) (string, error) {
+	if IsIPLiteral(host) {
+		return host, nil
+	}
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	addrs, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("resolve %s: no addresses", host)
+	}
+	for _, a := range addrs {
+		if isPrivateOrLinkLocal(a.IP.String()) {
+			return "", fmt.Errorf("resolved address %s for %s is private/link-local", a.IP.String(), host)
+		}
+	}
+	return addrs[0].IP.String(), nil
+}
+
 // handleConnect implements the HTTPS tunneling path: gate on host:port
 // BEFORE dialing, tunnel bytes both directions once allowed, meter the
 // observed total after the tunnel closes.
@@ -120,7 +241,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := SessionInfo{TraceID: traceid.New()}
+	// BLOCKER B/C: attribute this connection to a per-task session via its
+	// Proxy-Authorization credential (needs_network:true containers), not
+	// an always-fresh, always-anonymous one.
+	session := p.sessionForRequest(r)
 	decision, err := p.Gate.Check(r.Context(), Target{Host: host, Port: port}, 0, session)
 	if err != nil {
 		// Fail-closed (tasks/README.md global convention): a gate error
@@ -133,9 +257,22 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only AFTER the gate allows do we ever dial the upstream (this
-	// file's own doc comment).
-	upstream, err := p.Dial(r.Context(), "tcp", net.JoinHostPort(host, portStr))
+	// BLOCKER D: resolve+validate host's OWN DNS answer before ever
+	// dialing, even though Check already allowed the hostname itself —
+	// see resolveAndPin's doc comment.
+	dialHost, resolveErr := resolveAndPin(r.Context(), p.Resolver, host)
+	if resolveErr != nil {
+		d := p.Gate.DenyDNSRebind(r.Context(), host, session)
+		denyResponse(w, d.Reason)
+		return
+	}
+
+	// Only AFTER the gate allows AND the resolved address is validated do
+	// we ever dial the upstream (this file's own doc comment) — dialing
+	// dialHost (the PINNED, already-checked literal), never host itself,
+	// so the dialer/transport can never independently re-resolve to a
+	// different (possibly hostile) address.
+	upstream, err := p.Dial(r.Context(), "tcp", net.JoinHostPort(dialHost, portStr))
 	if err != nil {
 		http.Error(w, "yukari akis baglantisi kurulamadi", http.StatusBadGateway)
 		return
@@ -211,12 +348,20 @@ func (p *Proxy) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MINOR F: nbytes is only ever a pre-admission ESTIMATE (Content-Length
+	// -1 for a chunked body clamps to 0, same as it always has) — the
+	// ACTUAL bytes streamed upstream are counted for real below (reqCounter)
+	// and added to the post-hoc MeterUsage call, so a chunked request body
+	// is no longer invisible to the budget.
 	nbytes := r.ContentLength
 	if nbytes < 0 {
 		nbytes = 0
 	}
 
-	session := SessionInfo{TraceID: traceid.New()}
+	// BLOCKER B/C: attribute this request to a per-task session via its
+	// Proxy-Authorization credential (needs_network:true containers), not
+	// an always-fresh, always-anonymous one.
+	session := p.sessionForRequest(r)
 	decision, err := p.Gate.Check(r.Context(), Target{Host: host, Port: port}, nbytes, session)
 	if err != nil {
 		denyResponse(w, "Egress kapisi hata verdi; guvenlik geregi reddedildi.")
@@ -227,8 +372,35 @@ func (p *Proxy) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BLOCKER D: resolve+validate host's OWN DNS answer before ever
+	// dialing, even though Check already allowed the hostname itself —
+	// see resolveAndPin's doc comment.
+	dialHost, resolveErr := resolveAndPin(r.Context(), p.Resolver, host)
+	if resolveErr != nil {
+		d := p.Gate.DenyDNSRebind(r.Context(), host, session)
+		denyResponse(w, d.Reason)
+		return
+	}
+
+	// MINOR F: wrap the request body (if any) in a counting reader BEFORE
+	// cloning — r.Clone copies the Body field by reference, so outReq.Body
+	// below is this SAME counter, and every byte RoundTrip reads from it
+	// (and therefore streams upstream) is counted for real, regardless of
+	// whether Content-Length was known up front.
+	var reqCounter *countingReadCloser
+	if r.Body != nil {
+		reqCounter = &countingReadCloser{ReadCloser: r.Body}
+		r.Body = reqCounter
+	}
+
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
+	// BLOCKER D: dial the PINNED, already-validated IP literal, never
+	// host itself — outReq.Host preserves the ORIGINAL Host header
+	// (virtual hosting on the upstream still sees the hostname the client
+	// asked for; only the actual TCP connection target is pinned).
+	outReq.Host = r.URL.Host
+	outReq.URL.Host = net.JoinHostPort(dialHost, portStr)
 	resp, err := p.Transport.RoundTrip(outReq)
 	if err != nil {
 		http.Error(w, "yukari akis istegi basarisiz", http.StatusBadGateway)
@@ -243,5 +415,28 @@ func (p *Proxy) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	n, _ := io.Copy(w, resp.Body)
-	p.Gate.MeterUsage(context.Background(), host, n, session)
+
+	var reqBytes int64
+	if reqCounter != nil {
+		reqBytes = reqCounter.n
+	}
+	p.Gate.MeterUsage(context.Background(), host, n+reqBytes, session)
+}
+
+// countingReadCloser wraps an io.ReadCloser, counting every byte Read
+// returns (MINOR F fix): a chunked request body has no Content-Length at
+// all (handlePlainHTTP's own nbytes pre-admission estimate clamps to 0
+// for it), so without this, that body's real size never reaches the
+// budget at all, even after the fact — this counts the ACTUAL bytes
+// streamed upstream (via RoundTrip reading from it), independent of
+// whatever Content-Length (if any) the request declared.
+type countingReadCloser struct {
+	io.ReadCloser
+	n int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.n += int64(n)
+	return n, err
 }

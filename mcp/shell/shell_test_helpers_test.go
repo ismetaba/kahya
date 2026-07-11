@@ -197,6 +197,17 @@ func (f *fakeExecutor) Run(ctx context.Context, name string, args []string, stdi
 		return Result{}, nil
 	}
 	switch args[0] {
+	case "network":
+		// "docker network inspect kahya-egress --format ..." (subnet/
+		// gateway lookup, egress_network.go's networkSubnetGateway) needs
+		// a real-shaped answer so Ensure()'s gateway-isolation step can
+		// parse it; every OTHER "docker network ..." call (plain
+		// existence check, "network create") just needs ExitCode 0, which
+		// this same canned response already provides.
+		if containsArg(args, "--format") {
+			return Result{ExitCode: 0, Stdout: []byte("172.30.0.0/16 172.30.0.1\n")}, nil
+		}
+		return Result{ExitCode: 0}, nil
 	case "info":
 		healthy := true
 		f.mu.Lock()
@@ -227,6 +238,19 @@ func (f *fakeExecutor) Run(ctx context.Context, name string, args []string, stdi
 	default:
 		return Result{}, nil
 	}
+}
+
+// containsArg reports whether needle is present verbatim among args —
+// used to distinguish a plain "docker network inspect X" existence check
+// from the "... --format ..." subnet/gateway lookup, both of which share
+// args[0]=="network".
+func containsArg(args []string, needle string) bool {
+	for _, a := range args {
+		if a == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeExecutor) callCount(argsPrefix string) int {

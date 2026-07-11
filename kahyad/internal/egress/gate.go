@@ -112,6 +112,14 @@ const (
 	// the time this fires), so it is logged separately from the four
 	// decision kinds above.
 	EventMetered = "egress_metered"
+	// EventBlockedDNSRebind is BLOCKER D's dial-time denial: proxy.go's
+	// resolveAndPin resolved an ALLOWLISTED hostname to a private/
+	// link-local/loopback address (DNS rebinding) — the gate already said
+	// Allow=true for the hostname itself (host.go's own doc comment: an
+	// allowlist match never re-checks whether the LITERAL is private), so
+	// this is a SEPARATE, later refusal the dial path performs, never
+	// folded into EventBlockedAllowlist/EventBlockedSensitive above.
+	EventBlockedDNSRebind = "egress_blocked_dns_rebind"
 )
 
 // Turkish, user-facing deny reasons (CLAUDE.md language policy).
@@ -122,11 +130,20 @@ const (
 	// reasonBudgetFmt is ALSO the exact Turkish notify message this
 	// task's spec fixes verbatim: "Egress bütçesi aşıldı: <host>".
 	reasonBudgetFmt = "Egress bütçesi aşıldı: %s"
+	// reasonDNSRebindFmt is BLOCKER D's dial-time deny reason: %s is the
+	// ALLOWLISTED hostname whose DNS resolution turned out private.
+	reasonDNSRebindFmt = "Egress reddedildi: %s adresi çözümlendiğinde özel/link-local bir IP'ye işaret etti (DNS rebinding şüphesi)."
 )
 
 // allowEntry is one canonicalized allowlist entry.
 type allowEntry struct {
-	ports map[int]bool // nil/empty means "any port"
+	// ports is NEVER empty for a live Gate — MINOR G fix: NewGate defaults
+	// an entry with no configured ports to {443} (HTTPS-only), never "any
+	// port" (see NewGate's own construction loop). A zero-value allowEntry
+	// (only reachable via a test constructing one directly, never via
+	// NewGate) still falls back to matchAllowlist's own "empty means any
+	// port" branch for backward compatibility with such a direct literal.
+	ports map[int]bool
 }
 
 // Gate is the W3-05 decision engine: one per kahyad process, shared by
@@ -175,6 +192,21 @@ func NewGate(cfg policy.EgressConfig, sessions *SensitiveTracker, budget Budget,
 			for _, p := range e.Ports {
 				ports[p] = true
 			}
+		} else {
+			// MINOR G fix: an allowlist entry with NO configured ports used
+			// to mean "any port" (matchAllowlist's old empty-map branch) —
+			// every real policy.yaml entry omits ports, so this silently
+			// allowed a container/task to reach an allowlisted HOST on ANY
+			// TCP port (e.g. 22, or an internal admin port), not just the
+			// HTTPS port an operator actually intended. Default to 443
+			// (HTTPS) only, matching what every entry in this codebase's
+			// own policy.yaml is actually used for (api.anthropic.com,
+			// api.telegram.org, api.github.com, github.com — all HTTPS).
+			// An operator who genuinely needs a different/additional port
+			// must say so explicitly via `ports:` — see policy.yaml's own
+			// egress.allowlist doc comment (kahyad/internal/policy/
+			// schema.go's EgressAllowEntry), updated alongside this fix.
+			ports = map[int]bool{443: true}
 		}
 		allow[host] = allowEntry{ports: ports}
 	}
@@ -334,6 +366,24 @@ func (g *Gate) MarkSensitiveRead(ctx context.Context, sessionID, traceID string)
 	}
 	g.record(ctx, SessionInfo{SessionID: sessionID, TraceID: traceID}, EventSensitiveMarked, nil)
 	return nil
+}
+
+// DenyDNSRebind records BLOCKER D's dial-time denial: proxy.go calls this
+// AFTER Check has already returned Allow=true for an allowlisted
+// HOSTNAME, once its own DNS resolution (resolveAndPin) discovers that
+// EVERY/ANY resolved address is private/link-local/loopback — a rebound
+// or hijacked DNS record pivoting an allowlisted name (api.anthropic.com,
+// ...) at an internal address. This is a SEPARATE decision from Check's
+// own allowlist/sensitive/budget ladder (host is already known-allowed by
+// the time this is called), so it gets its own event kind
+// (EventBlockedDNSRebind) rather than being folded into
+// EventBlockedAllowlist — a ledger/JSONL reader can always tell "never
+// allowlisted" apart from "allowlisted, but its DNS answer was hostile".
+func (g *Gate) DenyDNSRebind(ctx context.Context, host string, session SessionInfo) Decision {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	reason := fmt.Sprintf(reasonDNSRebindFmt, host)
+	return g.deny(ctx, host, EventBlockedDNSRebind, reason, session)
 }
 
 func (g *Gate) deny(ctx context.Context, host, event, reason string, session SessionInfo) Decision {

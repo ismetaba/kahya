@@ -188,7 +188,7 @@ func TestHandleReadSecretLaneMarksLedgerAndMetadata(t *testing.T) {
 	led := &fakeLedger{}
 	s := newTestServer(t, home, nil, secretLaneGlobs, pc, led)
 
-	out, err := s.HandleRead(context.Background(), "trace-secret", FsReadArgs{Path: "~/Documents/saglik/tahlil-sonuçları.pdf", SessionID: "sess-1"})
+	out, err := s.HandleRead(context.Background(), "trace-secret", FsReadArgs{Path: "~/Documents/saglik/tahlil-sonuçları.pdf"})
 	if err != nil {
 		t.Fatalf("HandleRead: %v", err)
 	}
@@ -204,15 +204,18 @@ func TestHandleReadSecretLaneMarksLedgerAndMetadata(t *testing.T) {
 	if ev.traceID != "trace-secret" {
 		t.Errorf("trace_id = %q, want %q", ev.traceID, "trace-secret")
 	}
-	if ev.payload["session_id"] != "sess-1" {
-		t.Errorf("session_id = %v, want %q", ev.payload["session_id"], "sess-1")
+	// BLOCKER A fix: session_id is now the REQUEST's own trace_id (there
+	// is no model-supplied session_id argument left at all — see
+	// FsReadArgs' doc comment).
+	if ev.payload["session_id"] != "trace-secret" {
+		t.Errorf("session_id = %v, want %q", ev.payload["session_id"], "trace-secret")
 	}
 }
 
 // TestHandleReadSecretLaneCallsSensitiveMarker is W3-05's own seam test:
-// a secret_lane_globs hit with a non-empty session_id calls
-// SensitiveMarker.MarkSensitiveRead exactly once, with that session_id
-// and the request's trace_id.
+// a secret_lane_globs hit calls SensitiveMarker.MarkSensitiveRead exactly
+// once, keyed on the request's own trace_id (BLOCKER A fix — FsReadArgs
+// has no session_id argument at all anymore; see its doc comment).
 func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
 	home := testHome(t)
 	rel := "Documents/saglik/tahlil-sonuçları.pdf"
@@ -225,7 +228,7 @@ func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
 	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
 
 	if _, err := s.HandleRead(context.Background(), "trace-mark", FsReadArgs{
-		Path: "~/Documents/saglik/tahlil-sonuçları.pdf", SessionID: "sess-mark",
+		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
 	}); err != nil {
 		t.Fatalf("HandleRead: %v", err)
 	}
@@ -234,15 +237,20 @@ func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
 		t.Fatalf("MarkSensitiveRead calls = %d, want 1", marker.callCount())
 	}
 	got := marker.calls[0]
-	if got.sessionID != "sess-mark" || got.traceID != "trace-mark" {
-		t.Errorf("MarkSensitiveRead called with (%q, %q), want (%q, %q)", got.sessionID, got.traceID, "sess-mark", "trace-mark")
+	if got.sessionID != "trace-mark" || got.traceID != "trace-mark" {
+		t.Errorf("MarkSensitiveRead called with (%q, %q), want (%q, %q) — taint keyed on the REQUEST trace_id", got.sessionID, got.traceID, "trace-mark", "trace-mark")
 	}
 }
 
-// TestHandleReadSecretLaneSkipsMarkerWithoutSessionID proves an empty
-// session_id never calls the marker at all (there is nothing to
-// attribute the read to — see Server.SensitiveMarker's doc comment).
-func TestHandleReadSecretLaneSkipsMarkerWithoutSessionID(t *testing.T) {
+// TestHandleReadSecretLaneAlwaysMarksTaintOnRequestTraceID is the BLOCKER
+// A regression test (replaces the old
+// TestHandleReadSecretLaneSkipsMarkerWithoutSessionID, which proved the
+// OPPOSITE of what is now correct behavior): FsReadArgs no longer has a
+// session_id field at all, so there is NO argument the model could omit
+// or forge to suppress or redirect the taint mark. A secret-lane read
+// ALWAYS marks taint, keyed on the request's own SERVER-ASSIGNED
+// trace_id — proving the model cannot suppress or redirect it.
+func TestHandleReadSecretLaneAlwaysMarksTaintOnRequestTraceID(t *testing.T) {
 	home := testHome(t)
 	rel := "Documents/saglik/tahlil-sonuçları.pdf"
 	mustWriteFile(t, filepath.Join(home, filepath.FromSlash(rel)), "gizli tahlil verisi")
@@ -258,8 +266,12 @@ func TestHandleReadSecretLaneSkipsMarkerWithoutSessionID(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleRead: %v", err)
 	}
-	if marker.callCount() != 0 {
-		t.Fatalf("MarkSensitiveRead calls = %d, want 0 (no session_id)", marker.callCount())
+	if marker.callCount() != 1 {
+		t.Fatalf("MarkSensitiveRead calls = %d, want 1 (taint is unconditional now — no model-controlled argument can skip it)", marker.callCount())
+	}
+	got := marker.calls[0]
+	if got.sessionID != "trace-nomark" || got.traceID != "trace-nomark" {
+		t.Errorf("MarkSensitiveRead called with (%q, %q), want (%q, %q)", got.sessionID, got.traceID, "trace-nomark", "trace-nomark")
 	}
 }
 

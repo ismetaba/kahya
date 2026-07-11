@@ -105,6 +105,12 @@ fs_write_deny_globs:
   - "~/.hammerspoon/**"
   - "~/Library/Application Support/Kahya/**"
 
+# egress.allowlist entries below all omit `ports:`, which now defaults to
+# 443 (HTTPS) ONLY (egress-security review, MINOR G fix —
+# kahyad/internal/policy's EgressAllowEntry doc comment) — every one of
+# these hosts is in fact HTTPS-only, so this is not a behavior change for
+# any of them; add an explicit `ports:` list on an entry if it ever
+# genuinely needs a different/additional port.
 egress:
   allowlist:
     - host: api.anthropic.com

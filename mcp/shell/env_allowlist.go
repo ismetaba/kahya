@@ -24,7 +24,10 @@
 // cleartext in a JSONL log file or the append-only brain.db ledger.
 package shell
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // safeEnvAllowlist is shell_docker's ENTIRE set of env_allowlist NAMES that
 // may ever be forwarded into the container — growing it means editing this
@@ -79,28 +82,53 @@ func isForwardableEnvName(name string) bool {
 }
 
 // nonSecretEnvNames are env var NAMES that redactDockerArgv leaves
-// UN-redacted in the transcript: kahyad-INJECTED proxy configuration
-// (egress_network.go's egressProxyEnv), never model-controlled and never
-// secret (a fixed, publicly-documented sidecar address) — an operator
-// reading the JSONL/ledger transcript should be able to see that a
-// needs_network:true run really was pointed at kahya-egress-fwd, not
-// "<redacted>".
+// partially or fully UN-redacted in the transcript: kahyad-INJECTED proxy
+// configuration (egress_network.go's egressProxyEnv), never model-
+// controlled and never secret IN ITS SHAPE (a fixed, publicly-documented
+// sidecar address) — an operator reading the JSONL/ledger transcript
+// should still be able to see that a needs_network:true run really was
+// pointed at kahya-egress-fwd, not "<redacted>". Since BLOCKER B/C, this
+// value's URL MAY also carry a per-task egress-proxy credential as
+// Basic-auth userinfo (egressProxyEnv's token argument) — redactProxyURL
+// below strips exactly that piece, leaving scheme/host/port visible.
 var nonSecretEnvNames = map[string]bool{
 	"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
 	"http_proxy": true, "https_proxy": true, "no_proxy": true,
 }
 
+// redactProxyURL redacts JUST the Basic-auth userinfo portion of a proxy
+// env var's URL value (BLOCKER B/C: egressProxyEnv's per-task token, when
+// present), leaving scheme/host/port visible — v is returned unchanged
+// when it doesn't parse as a URL, or carries no userinfo at all (the
+// common "no EgressTokenRegistrar wired" case), matching nonSecretEnvNames'
+// own "show the sidecar address in cleartext" goal. The replacement
+// literal is "REDACTED" (no angle brackets, unlike this file's other
+// "<redacted>" substitutions) specifically so url.URL.String() never
+// percent-encodes it — "<"/">" are not valid literal userinfo characters
+// and would otherwise round-trip as "%3Credacted%3E" in the transcript,
+// which is correct but needlessly harder to grep/read.
+func redactProxyURL(v string) string {
+	u, err := url.Parse(v)
+	if err != nil || u.User == nil {
+		return v
+	}
+	u.User = url.User("REDACTED")
+	return u.String()
+}
+
 // redactDockerArgv returns a COPY of a built `docker run` argv with every
 // "-e NAME=VALUE" pair's VALUE replaced by "<redacted>" (BLOCKER 2 fix,
-// part b), EXCEPT nonSecretEnvNames (above). This is ONLY for the
-// shell_docker_run transcript this package logs AND ledgers (runner.go's
-// Run) — the REAL invocation still gets args (buildDockerRunArgs' own,
-// unredacted output), so the container itself still receives the real
-// values; only the observability trail is redacted, since env_allowlist
-// values (even a safe-allowlisted one — defense in depth against a future
-// safeEnvAllowlist edit that accidentally widens it to something
-// secret-shaped) must never sit in cleartext in a JSONL log file or the
-// append-only brain.db ledger.
+// part b), EXCEPT nonSecretEnvNames (above), whose value instead goes
+// through redactProxyURL — BLOCKER B/C fix: a nonSecretEnvNames value is
+// no longer left FULLY in cleartext unconditionally, since it may now
+// carry a per-task egress-proxy credential (egressProxyEnv's token) as
+// Basic-auth userinfo, which must never sit in cleartext in a JSONL log
+// file or the append-only brain.db ledger any more than any other
+// credential this package redacts. This is ONLY for the shell_docker_run
+// transcript this package logs AND ledgers (runner.go's Run) — the REAL
+// invocation still gets args (buildDockerRunArgs' own, unredacted
+// output), so the container itself still receives the real values; only
+// the observability trail is redacted.
 func redactDockerArgv(args []string) []string {
 	out := make([]string, len(args))
 	copy(out, args)
@@ -108,14 +136,17 @@ func redactDockerArgv(args []string) []string {
 		if out[i] != "-e" {
 			continue
 		}
-		name := out[i+1]
-		if idx := strings.IndexByte(name, '='); idx >= 0 {
-			name = name[:idx]
+		pair := out[i+1]
+		name, value := pair, ""
+		if idx := strings.IndexByte(pair, '='); idx >= 0 {
+			name, value = pair[:idx], pair[idx+1:]
 		}
-		if !nonSecretEnvNames[name] {
+		if nonSecretEnvNames[name] {
+			out[i+1] = name + "=" + redactProxyURL(value)
+		} else {
 			out[i+1] = name + "=<redacted>"
 		}
-		i++ // skip the pair's value slot we just rewrote (or left as-is)
+		i++ // skip the pair's value slot we just rewrote
 	}
 	return out
 }

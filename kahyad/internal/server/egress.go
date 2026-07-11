@@ -16,6 +16,7 @@ import (
 
 	"kahya/kahyad/internal/egress"
 	mcpfs "kahya/mcp/fs"
+	mcpshell "kahya/mcp/shell"
 )
 
 // SetEgressGate wires the W3-05 gate (kahya/internal/egress.NewGate) into
@@ -50,6 +51,38 @@ func (a egressSensitiveMarker) MarkSensitiveRead(ctx context.Context, sessionID,
 // adapter main.go wires mcp/fs.New with. gate must not be nil.
 func NewEgressSensitiveMarker(gate *egress.Gate) mcpfs.SensitiveReadMarker {
 	return egressSensitiveMarker{gate: gate}
+}
+
+// egressTokenRegistrar adapts *egress.ProxySessionRegistry to
+// mcp/shell.EgressTokenRegistrar (BLOCKER B/C) — a direct in-process call,
+// exactly like egressSensitiveMarker above: mcp/shell cannot import
+// kahyad/internal/egress directly (Go's internal-package import
+// boundary), so this thin adapter is what main.go wires
+// mcp/shell.Runner.SetEgressTokenRegistrar with. SessionID is set to
+// traceID (not left empty) — the SAME key BLOCKER A's mcp/fs fix and
+// egress.NewAnthproxyEgressGateHook both use, so a needs_network:true
+// container's egress lands in the identical taint bucket a secret-lane
+// read under the same trace_id already marked.
+type egressTokenRegistrar struct {
+	reg *egress.ProxySessionRegistry
+}
+
+func (a egressTokenRegistrar) Register(token, traceID, taskID string) {
+	a.reg.Register(token, egress.SessionInfo{SessionID: traceID, TraceID: traceID, TaskID: taskID})
+}
+
+func (a egressTokenRegistrar) Release(token string) {
+	a.reg.Release(token)
+}
+
+// NewEgressTokenRegistrar constructs the mcp/shell.EgressTokenRegistrar
+// adapter main.go wires mcp/shell.Runner.SetEgressTokenRegistrar with.
+// reg must not be nil — it must be the SAME *egress.ProxySessionRegistry
+// instance the egress.Proxy listener's own Tokens field is set to,
+// otherwise a container's registered token would never be visible to the
+// proxy that actually needs to look it up.
+func NewEgressTokenRegistrar(reg *egress.ProxySessionRegistry) mcpshell.EgressTokenRegistrar {
+	return egressTokenRegistrar{reg: reg}
 }
 
 // sensitiveReadRequest is POST /session/sensitive-read's request body.
