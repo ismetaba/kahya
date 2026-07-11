@@ -24,6 +24,7 @@ import (
 
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/notify"
@@ -128,13 +129,20 @@ type Server struct {
 	// this daemon may have left running (this task's spec step 7).
 	shellServer *mcpshell.Server
 
-	// anthGovernor/anthNotifier/anthCredential/anthEgressGate wire POST
-	// /v1/task's per-task Anthropic forward-proxy + cost governor
+	// anthGovernor/anthNotifier/anthCredential/anthEgressGateFactory wire
+	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
 	// (W12-08). See SetAnthproxy's doc comment (task.go).
-	anthGovernor   *anthproxy.Governor
-	anthNotifier   notify.Notifier
-	anthCredential anthproxy.CredentialSource
-	anthEgressGate func(*http.Request) error
+	anthGovernor          *anthproxy.Governor
+	anthNotifier          notify.Notifier
+	anthCredential        anthproxy.CredentialSource
+	anthEgressGateFactory func(taskID, traceID string) func(*http.Request) error
+
+	// egressGate is the W3-05 decision engine (kahya/internal/egress.Gate)
+	// POST /session/sensitive-read consults (egress.go), and the SAME Gate
+	// task.go's per-task anthproxy egress-gate factory and main.go's
+	// egress.Proxy both call — one gate, every in-process caller. See
+	// SetEgressGate's doc comment (egress.go).
+	egressGate *egress.Gate
 
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
@@ -247,6 +255,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/policy/state", s.handlePolicyState)
 	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
 	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
+	mux.HandleFunc("/session/sensitive-read", s.handleSensitiveRead)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

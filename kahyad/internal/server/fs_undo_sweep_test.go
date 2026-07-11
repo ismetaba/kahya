@@ -93,7 +93,7 @@ func TestFsUndoWindowExpiryPurgesFallbackCopyThroughRealSweepPath(t *testing.T) 
 
 	undoDir := filepath.Join(dataDir, "undo")
 	log := testLogger(t)
-	fsTool := mcpfs.New(home, nil, nil, undoDir, NewFSPolicyClient(engine, func() bool { return false }), st, NewFSLogger(log))
+	fsTool := mcpfs.New(home, nil, nil, undoDir, NewFSPolicyClient(engine, func() bool { return false }), st, NewFSLogger(log), nil)
 	engine.SetUndoExpiryHook(fsTool.PurgeExpired)
 
 	target := filepath.Join(home, "toexpire.txt")

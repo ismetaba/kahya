@@ -86,15 +86,23 @@ func (s *Server) SetTaskStore(ts TaskStore) {
 // (kahyad/internal/notify); credential is the CredentialSource matching
 // cfg.CredentialMode ("keychain" or "passthrough" — see
 // kahyad/internal/anthproxy's package doc comment for the OWNER AUTH
-// DECISION this selects between); egressGate may be nil (always-allow)
-// until W3-05 fills in the real allowlist. Call before Prepare(); until
-// this is set, handleTask answers 503 the same way it does when taskStore
-// is unset (SetTaskStore's "unwired dependency" posture).
-func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Notifier, credential anthproxy.CredentialSource, egressGate func(*http.Request) error) {
+// DECISION this selects between); egressGateFactory may be nil
+// (always-allow — pre-W3-05 behavior). Once set (main.go, W3-05), it is
+// called ONCE per task, with that task's own taskID/traceID, to build the
+// anthproxy.ProxyConfig.EgressGate closure THIS task's Proxy uses — the
+// factory indirection exists because anthproxy.ProxyConfig.EgressGate's
+// own fixed signature (func(*http.Request) error, from W12-08) carries no
+// task/trace correlation of its own (the forwarded request is a real
+// Anthropic API call, not a kahya-internal one), so task/trace identity
+// is captured in a closure built fresh per task instead. Call before
+// Prepare(); until this is set, handleTask answers 503 the same way it
+// does when taskStore is unset (SetTaskStore's "unwired dependency"
+// posture).
+func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Notifier, credential anthproxy.CredentialSource, egressGateFactory func(taskID, traceID string) func(*http.Request) error) {
 	s.anthGovernor = governor
 	s.anthNotifier = notifier
 	s.anthCredential = credential
-	s.anthEgressGate = egressGate
+	s.anthEgressGateFactory = egressGateFactory
 }
 
 // taskRequest is POST /v1/task's request body - the exact shape
@@ -240,6 +248,10 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// ANTHROPIC_API_KEY (docs/ipc.md: "kahya-task-<hex32>" - the real key
 	// never leaves kahyad).
 	apiKey := spawn.NewAPIKey()
+	var egressGate func(*http.Request) error
+	if s.anthEgressGateFactory != nil {
+		egressGate = s.anthEgressGateFactory(taskID, traceID)
+	}
 	proxy, err := anthproxy.New(anthproxy.ProxyConfig{
 		TaskID:         taskID,
 		TraceID:        traceID,
@@ -250,7 +262,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		Governor:       s.anthGovernor,
 		Notifier:       s.anthNotifier,
 		EventLedger:    s.eventLogger,
-		EgressGate:     s.anthEgressGate,
+		EgressGate:     egressGate,
 		PauseBudget: func(ctx context.Context, pausedTaskID string) error {
 			return s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
 				State: "paused_budget", UpdatedAt: rfc3339Now(), ID: pausedTaskID,

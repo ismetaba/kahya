@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -87,6 +88,13 @@ type Config struct {
 	// committed repo-root policy.yaml).
 	PolicyPath string `yaml:"policy_path"`
 
+	// EgressPort is the W3-05 egress proxy's listen port
+	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
+	// passes through (HANDOFF S5 safety #1). Default 3128 (the
+	// conventional squid/forward-proxy port); mcp/shell's kahya-egress-fwd
+	// Docker sidecar forwards to host.docker.internal:<EgressPort>.
+	EgressPort int `yaml:"egress_port"`
+
 	// DockerImageTag is the W3-04 shell sandbox image's tag (e.g.
 	// "kahya-sandbox:0.1.0") — the SAME tag `make sandbox-image` builds
 	// and mcp/shell.Runner's DigestChecker inspects before every run.
@@ -99,6 +107,15 @@ type Config struct {
 	// return, which is itself Runner's fail-closed state (every
 	// shell_docker run refused until `make sandbox-image` has run).
 	DockerImageDigestPath string `yaml:"docker_image_digest_path"`
+
+	// EgressSidecarDigestPath is the absolute path to docker/egress/
+	// IMAGE_DIGEST (W3-05's committed pin for the kahya-egress-fwd
+	// sidecar's alpine/socat image), derived the same way
+	// DockerImageDigestPath is. An empty/missing file resolves to
+	// mcp/shell.LoadPinnedDigest's "" return, which is itself
+	// EgressNetworkEnsurer's fail-closed state (every needs_network:true
+	// shell_docker run refused until this is pinned).
+	EgressSidecarDigestPath string `yaml:"egress_sidecar_digest_path"`
 
 	// ShellWorkdirRoots is mcp/shell.Runner.WorkdirRoots (BLOCKER 1 fix's
 	// OPTIONAL, stricter opt-in allowlist): when non-empty, a shell_docker
@@ -173,32 +190,34 @@ type Config struct {
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir                *string   `yaml:"data_dir"`
-	Socket                 *string   `yaml:"socket"`
-	LogDir                 *string   `yaml:"log_dir"`
-	DBPath                 *string   `yaml:"db_path"`
-	MemoryDir              *string   `yaml:"memory_dir"`
-	AnthropicUpstreamURL   *string   `yaml:"anthropic_upstream_url"`
-	EmbedPort              *int      `yaml:"embed_port"`
-	DefaultModel           *string   `yaml:"default_model"`
-	TaskTimeoutMin         *int      `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer    *string   `yaml:"active_embed_model_ver"`
-	LogLevel               *string   `yaml:"log_level"`
-	UndoWindowSeconds      *int      `yaml:"undo_window_seconds"`
-	WorkerCmd              *[]string `yaml:"worker_cmd"`
-	EmbedCmd               *[]string `yaml:"embed_cmd"`
-	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
-	PolicyPath             *string   `yaml:"policy_path"`
-	DockerImageTag         *string   `yaml:"docker_image_tag"`
-	DockerImageDigestPath  *string   `yaml:"docker_image_digest_path"`
-	ShellWorkdirRoots      *[]string `yaml:"shell_workdir_roots"`
-	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
-	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
-	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
-	DowngradeAtRatio       *float64  `yaml:"downgrade_at_ratio"`
-	CacheHitAlarmThreshold *float64  `yaml:"cache_hit_alarm_threshold"`
-	CredentialMode         *string   `yaml:"credential_mode"`
-	EstRequestTokens       *int64    `yaml:"est_request_tokens"`
+	DataDir                 *string   `yaml:"data_dir"`
+	Socket                  *string   `yaml:"socket"`
+	LogDir                  *string   `yaml:"log_dir"`
+	DBPath                  *string   `yaml:"db_path"`
+	MemoryDir               *string   `yaml:"memory_dir"`
+	AnthropicUpstreamURL    *string   `yaml:"anthropic_upstream_url"`
+	EmbedPort               *int      `yaml:"embed_port"`
+	DefaultModel            *string   `yaml:"default_model"`
+	TaskTimeoutMin          *int      `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer     *string   `yaml:"active_embed_model_ver"`
+	LogLevel                *string   `yaml:"log_level"`
+	UndoWindowSeconds       *int      `yaml:"undo_window_seconds"`
+	WorkerCmd               *[]string `yaml:"worker_cmd"`
+	EmbedCmd                *[]string `yaml:"embed_cmd"`
+	MCPBridgePath           *string   `yaml:"mcp_bridge_path"`
+	PolicyPath              *string   `yaml:"policy_path"`
+	EgressPort              *int      `yaml:"egress_port"`
+	DockerImageTag          *string   `yaml:"docker_image_tag"`
+	DockerImageDigestPath   *string   `yaml:"docker_image_digest_path"`
+	EgressSidecarDigestPath *string   `yaml:"egress_sidecar_digest_path"`
+	ShellWorkdirRoots       *[]string `yaml:"shell_workdir_roots"`
+	DailyBudgetUSD          *float64  `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD        *float64  `yaml:"monthly_budget_usd"`
+	TaskTokenCeiling        *int64    `yaml:"task_token_ceiling"`
+	DowngradeAtRatio        *float64  `yaml:"downgrade_at_ratio"`
+	CacheHitAlarmThreshold  *float64  `yaml:"cache_hit_alarm_threshold"`
+	CredentialMode          *string   `yaml:"credential_mode"`
+	EstRequestTokens        *int64    `yaml:"est_request_tokens"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -259,25 +278,27 @@ func Load() (Config, error) {
 func defaults(home string) Config {
 	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
 	return Config{
-		DataDir:               dataDir,
-		Socket:                filepath.Join(dataDir, "kahyad.sock"),
-		LogDir:                filepath.Join(dataDir, "logs"),
-		DBPath:                filepath.Join(dataDir, "brain.db"),
-		MemoryDir:             filepath.Join(home, "Kahya", "memory"),
-		AnthropicUpstreamURL:  "https://api.anthropic.com",
-		EmbedPort:             8092,
-		DefaultModel:          "claude-sonnet-5",
-		TaskTimeoutMin:        30,
-		ActiveEmbedModelVer:   "qwen3-embedding-0.6b:512:v1",
-		LogLevel:              "info",
-		UndoWindowSeconds:     300,
-		Env:                   EnvProd,
-		WorkerCmd:             defaultWorkerCmd(),
-		EmbedCmd:              defaultEmbedCmd(),
-		MCPBridgePath:         defaultMCPBridgePath(),
-		PolicyPath:            defaultPolicyPath(),
-		DockerImageTag:        "kahya-sandbox:0.1.0",
-		DockerImageDigestPath: defaultDockerImageDigestPath(),
+		DataDir:                 dataDir,
+		Socket:                  filepath.Join(dataDir, "kahyad.sock"),
+		LogDir:                  filepath.Join(dataDir, "logs"),
+		DBPath:                  filepath.Join(dataDir, "brain.db"),
+		MemoryDir:               filepath.Join(home, "Kahya", "memory"),
+		AnthropicUpstreamURL:    "https://api.anthropic.com",
+		EmbedPort:               8092,
+		DefaultModel:            "claude-sonnet-5",
+		TaskTimeoutMin:          30,
+		ActiveEmbedModelVer:     "qwen3-embedding-0.6b:512:v1",
+		LogLevel:                "info",
+		UndoWindowSeconds:       300,
+		Env:                     EnvProd,
+		WorkerCmd:               defaultWorkerCmd(),
+		EmbedCmd:                defaultEmbedCmd(),
+		MCPBridgePath:           defaultMCPBridgePath(),
+		PolicyPath:              defaultPolicyPath(),
+		EgressPort:              3128,
+		DockerImageTag:          "kahya-sandbox:0.1.0",
+		DockerImageDigestPath:   defaultDockerImageDigestPath(),
+		EgressSidecarDigestPath: defaultEgressSidecarDigestPath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -374,6 +395,18 @@ func defaultDockerImageDigestPath() string {
 	return filepath.Join(repoRoot, "docker", "sandbox", "IMAGE_DIGEST")
 }
 
+// defaultEgressSidecarDigestPath resolves the default "<repo>/docker/
+// egress/IMAGE_DIGEST" path (W3-05), using the exact same repo-root
+// derivation as defaultDockerImageDigestPath (see defaultWorkerCmd's doc
+// comment).
+func defaultEgressSidecarDigestPath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "docker", "egress", "IMAGE_DIGEST")
+}
+
 func loadFile(path string) (fileConfig, bool, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -441,11 +474,17 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.PolicyPath != nil {
 		cfg.PolicyPath = expandHome(*fc.PolicyPath, home)
 	}
+	if fc.EgressPort != nil {
+		cfg.EgressPort = *fc.EgressPort
+	}
 	if fc.DockerImageTag != nil {
 		cfg.DockerImageTag = *fc.DockerImageTag
 	}
 	if fc.DockerImageDigestPath != nil {
 		cfg.DockerImageDigestPath = expandHome(*fc.DockerImageDigestPath, home)
+	}
+	if fc.EgressSidecarDigestPath != nil {
+		cfg.EgressSidecarDigestPath = expandHome(*fc.EgressSidecarDigestPath, home)
 	}
 	if fc.ShellWorkdirRoots != nil {
 		cfg.ShellWorkdirRoots = expandHomeEach(*fc.ShellWorkdirRoots, home)
@@ -501,11 +540,19 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_POLICY_PATH"); v != "" {
 		cfg.PolicyPath = expandHome(v, home)
 	}
+	if v := os.Getenv("KAHYA_EGRESS_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.EgressPort = p
+		}
+	}
 	if v := os.Getenv("KAHYA_DOCKER_IMAGE_TAG"); v != "" {
 		cfg.DockerImageTag = v
 	}
 	if v := os.Getenv("KAHYA_DOCKER_IMAGE_DIGEST_PATH"); v != "" {
 		cfg.DockerImageDigestPath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_EGRESS_SIDECAR_DIGEST_PATH"); v != "" {
+		cfg.EgressSidecarDigestPath = expandHome(v, home)
 	}
 	if v := os.Getenv("KAHYA_SHELL_WORKDIR_ROOTS"); v != "" {
 		cfg.ShellWorkdirRoots = expandHomeEach(strings.Split(v, ","), home)

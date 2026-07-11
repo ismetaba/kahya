@@ -39,6 +39,12 @@ type Chunk struct {
 	CreatedAt   string `json:"created_at"`
 }
 
+type EgressBudget struct {
+	Host  string `json:"host"`
+	Day   string `json:"day"`
+	Bytes int64  `json:"bytes"`
+}
+
 type Entity struct {
 	ID            int64          `json:"id"`
 	CanonicalName string         `json:"canonical_name"`

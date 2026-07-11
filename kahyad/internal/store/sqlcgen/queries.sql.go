@@ -128,6 +128,27 @@ func (q *Queries) GetAutonomyState(ctx context.Context, arg GetAutonomyStatePara
 	return i, err
 }
 
+const getEgressBudget = `-- name: GetEgressBudget :one
+
+SELECT host, day, bytes FROM egress_budget WHERE host = ? AND day = ?
+`
+
+type GetEgressBudgetParams struct {
+	Host string `json:"host"`
+	Day  string `json:"day"`
+}
+
+// W3-05 (egress proxy) queries below: egress_budget persists each host's
+// daily byte counter across restarts. See
+// migrations/0004_egress_budget.sql for the schema and
+// kahyad/internal/egress/budget.go for the only caller.
+func (q *Queries) GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error) {
+	row := q.db.QueryRowContext(ctx, getEgressBudget, arg.Host, arg.Day)
+	var i EgressBudget
+	err := row.Scan(&i.Host, &i.Day, &i.Bytes)
+	return i, err
+}
+
 const getEpisodeByPath = `-- name: GetEpisodeByPath :one
 SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
 FROM episodes
@@ -301,6 +322,30 @@ func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString
 	return i, err
 }
 
+const incrementEgressBudget = `-- name: IncrementEgressBudget :execrows
+UPDATE egress_budget
+SET bytes = bytes + ?
+WHERE host = ? AND day = ?
+`
+
+type IncrementEgressBudgetParams struct {
+	Bytes int64  `json:"bytes"`
+	Host  string `json:"host"`
+	Day   string `json:"day"`
+}
+
+// Update-half of an application-level upsert (the same "upsert (update
+// half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
+// UpdateEpisodeContent above already use in this file) - the common case
+// once a (host, day) row already exists.
+func (q *Queries) IncrementEgressBudget(ctx context.Context, arg IncrementEgressBudgetParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, incrementEgressBudget, arg.Bytes, arg.Host, arg.Day)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const insertApprovalToken = `-- name: InsertApprovalToken :exec
 INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
@@ -397,6 +442,21 @@ func (q *Queries) InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const insertEgressBudget = `-- name: InsertEgressBudget :exec
+INSERT INTO egress_budget (host, day, bytes) VALUES (?, ?, ?)
+`
+
+type InsertEgressBudgetParams struct {
+	Host  string `json:"host"`
+	Day   string `json:"day"`
+	Bytes int64  `json:"bytes"`
+}
+
+func (q *Queries) InsertEgressBudget(ctx context.Context, arg InsertEgressBudgetParams) error {
+	_, err := q.db.ExecContext(ctx, insertEgressBudget, arg.Host, arg.Day, arg.Bytes)
+	return err
 }
 
 const insertEpisode = `-- name: InsertEpisode :one

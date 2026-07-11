@@ -16,6 +16,8 @@ sql:
       # 0003 (W3-02) is plain tables only (no FTS5/vec0 syntax), so unlike
       # 0002 it parses fine and has real sqlc-generated queries below.
       - "kahyad/migrations/0003_autonomy_policy.sql"
+      # 0004 (W3-05) is a plain table too (egress_budget) - same reasoning.
+      - "kahyad/migrations/0004_egress_budget.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

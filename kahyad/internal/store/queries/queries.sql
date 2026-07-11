@@ -228,3 +228,23 @@ WHERE id = ?;
 UPDATE pending_approvals
 SET consumed_at = ?
 WHERE id = ? AND consumed_at IS NULL;
+
+-- W3-05 (egress proxy) queries below: egress_budget persists each host's
+-- daily byte counter across restarts. See
+-- migrations/0004_egress_budget.sql for the schema and
+-- kahyad/internal/egress/budget.go for the only caller.
+
+-- name: GetEgressBudget :one
+SELECT host, day, bytes FROM egress_budget WHERE host = ? AND day = ?;
+
+-- name: InsertEgressBudget :exec
+INSERT INTO egress_budget (host, day, bytes) VALUES (?, ?, ?);
+
+-- name: IncrementEgressBudget :execrows
+-- Update-half of an application-level upsert (the same "upsert (update
+-- half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
+-- UpdateEpisodeContent above already use in this file) - the common case
+-- once a (host, day) row already exists.
+UPDATE egress_budget
+SET bytes = bytes + ?
+WHERE host = ? AND day = ?;

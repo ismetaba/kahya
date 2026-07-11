@@ -122,6 +122,21 @@ type Ledger interface {
 	LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error
 }
 
+// SensitiveReadMarker is the W3-05 seam this task wires fs_read's
+// secret_lane_read hit to: it sets the session's sensitive_read flag
+// (HANDOFF §5 safety #1: "Ayni oturumda hassas okuma varsa allowlist-disi
+// egress sert bloke"). This is the wire shape of POST /session/
+// sensitive-read (UDS) — kahyad's own wiring satisfies it with a direct
+// in-process call onto kahyad/internal/egress.Gate's SensitiveTracker
+// today (this package's own doc comment: the same "in-process now, a
+// real HTTP client can satisfy the identical interface later" seam
+// PolicyClient already established), and a real HTTP client could
+// satisfy the exact same interface once a caller of this package runs
+// out-of-process.
+type SensitiveReadMarker interface {
+	MarkSensitiveRead(ctx context.Context, sessionID, traceID string) error
+}
+
 // Logger is the JSONL logging surface this package needs. Unlike
 // mcp/memory.Logger (which logs only error/warn side channels under
 // whatever trace_id the shared boot-scoped logger already carries), every
@@ -179,13 +194,23 @@ type Server struct {
 	Ledger Ledger
 	Log    Logger
 
+	// SensitiveMarker is the W3-05 seam (may be nil — a nil marker simply
+	// means no session gets flagged, matching this package's usual
+	// "unwired dependency is a no-op, never a crash" posture; kahyad's
+	// real wiring always sets it). HandleRead calls it whenever a read
+	// matches SecretLaneGlobs AND the caller supplied a non-empty
+	// SessionID (there is nothing to attribute the read to without one).
+	SensitiveMarker SensitiveReadMarker
+
 	registry *undoRegistry
 	now      func() time.Time
 }
 
 // New constructs a Server. home is the real (or, in tests, fake) user
-// home directory; log may be nil (defaults to a no-op Logger).
-func New(home string, denyGlobs, secretLaneGlobs []string, undoDir string, policy PolicyClient, ledger Ledger, log Logger) *Server {
+// home directory; log may be nil (defaults to a no-op Logger);
+// sensitiveMarker may be nil (see the Server.SensitiveMarker field's doc
+// comment).
+func New(home string, denyGlobs, secretLaneGlobs []string, undoDir string, policy PolicyClient, ledger Ledger, log Logger, sensitiveMarker SensitiveReadMarker) *Server {
 	if log == nil {
 		log = noopLogger{}
 	}
@@ -198,6 +223,7 @@ func New(home string, denyGlobs, secretLaneGlobs []string, undoDir string, polic
 		Policy:          policy,
 		Ledger:          ledger,
 		Log:             log,
+		SensitiveMarker: sensitiveMarker,
 		registry:        newUndoRegistry(),
 		now:             time.Now,
 	}
@@ -376,6 +402,19 @@ func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs
 		s.logAndLedger(ctx, traceID, "secret_lane_read", map[string]any{
 			"event": "secret_lane_read", "canonical_path": cp.Match, "session_id": args.SessionID,
 		})
+
+		// W3-05: mark the session sensitive so kahyad/internal/egress.Gate
+		// hard-blocks any LATER allowlist-external egress from it (HANDOFF
+		// §5 safety #1). No session_id means there is nothing to attribute
+		// the read to — SensitiveMarker (and egress.SensitiveTracker.Mark)
+		// both treat an empty session_id as a deliberate no-op, so this
+		// call is simply skipped rather than marking some shared "" bucket
+		// that would incorrectly taint every sessionless read.
+		if s.SensitiveMarker != nil && args.SessionID != "" {
+			if err := s.SensitiveMarker.MarkSensitiveRead(ctx, args.SessionID, traceID); err != nil {
+				s.Log.With(traceID).Warn("secret_lane_read_sensitive_mark_failed", "err", err.Error())
+			}
+		}
 	}
 
 	s.logAndLedger(ctx, traceID, "fs_read", map[string]any{

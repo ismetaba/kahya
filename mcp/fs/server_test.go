@@ -108,8 +108,30 @@ func allowDecision(token string) PolicyDecision {
 
 func newTestServer(t *testing.T, home string, denyGlobs, secretLaneGlobs []string, pc PolicyClient, led Ledger) *Server {
 	t.Helper()
-	s := New(home, denyGlobs, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil)
+	s := New(home, denyGlobs, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, nil)
 	return s
+}
+
+// fakeSensitiveMarker is a spy SensitiveReadMarker (W3-05): records every
+// call so a test can assert fs_read's secret_lane_read seam calls it
+// exactly when expected.
+type fakeSensitiveMarker struct {
+	mu    sync.Mutex
+	calls []struct{ sessionID, traceID string }
+	err   error
+}
+
+func (f *fakeSensitiveMarker) MarkSensitiveRead(_ context.Context, sessionID, traceID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, struct{ sessionID, traceID string }{sessionID, traceID})
+	return f.err
+}
+
+func (f *fakeSensitiveMarker) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -184,6 +206,60 @@ func TestHandleReadSecretLaneMarksLedgerAndMetadata(t *testing.T) {
 	}
 	if ev.payload["session_id"] != "sess-1" {
 		t.Errorf("session_id = %v, want %q", ev.payload["session_id"], "sess-1")
+	}
+}
+
+// TestHandleReadSecretLaneCallsSensitiveMarker is W3-05's own seam test:
+// a secret_lane_globs hit with a non-empty session_id calls
+// SensitiveMarker.MarkSensitiveRead exactly once, with that session_id
+// and the request's trace_id.
+func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
+	home := testHome(t)
+	rel := "Documents/saglik/tahlil-sonuçları.pdf"
+	mustWriteFile(t, filepath.Join(home, filepath.FromSlash(rel)), "gizli tahlil verisi")
+
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	led := &fakeLedger{}
+	marker := &fakeSensitiveMarker{}
+	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
+
+	if _, err := s.HandleRead(context.Background(), "trace-mark", FsReadArgs{
+		Path: "~/Documents/saglik/tahlil-sonuçları.pdf", SessionID: "sess-mark",
+	}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+
+	if marker.callCount() != 1 {
+		t.Fatalf("MarkSensitiveRead calls = %d, want 1", marker.callCount())
+	}
+	got := marker.calls[0]
+	if got.sessionID != "sess-mark" || got.traceID != "trace-mark" {
+		t.Errorf("MarkSensitiveRead called with (%q, %q), want (%q, %q)", got.sessionID, got.traceID, "sess-mark", "trace-mark")
+	}
+}
+
+// TestHandleReadSecretLaneSkipsMarkerWithoutSessionID proves an empty
+// session_id never calls the marker at all (there is nothing to
+// attribute the read to — see Server.SensitiveMarker's doc comment).
+func TestHandleReadSecretLaneSkipsMarkerWithoutSessionID(t *testing.T) {
+	home := testHome(t)
+	rel := "Documents/saglik/tahlil-sonuçları.pdf"
+	mustWriteFile(t, filepath.Join(home, filepath.FromSlash(rel)), "gizli tahlil verisi")
+
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	led := &fakeLedger{}
+	marker := &fakeSensitiveMarker{}
+	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
+
+	if _, err := s.HandleRead(context.Background(), "trace-nomark", FsReadArgs{
+		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
+	}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if marker.callCount() != 0 {
+		t.Fatalf("MarkSensitiveRead calls = %d, want 0 (no session_id)", marker.callCount())
 	}
 }
 

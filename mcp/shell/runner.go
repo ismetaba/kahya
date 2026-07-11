@@ -109,8 +109,15 @@ const (
 const (
 	reasonEmptyScript     = "shell_docker reddedildi: script boş olamaz."
 	reasonWorkdirDenyGlob = "shell_docker reddedildi: iş dizini izin verilmeyen bir desenle eşleşiyor (fs_write_deny_globs); onay bu kuralı geçersiz kılamaz."
-	reasonNetworkRejected = "shell_docker reddedildi: ağ erişimi gerektiren görevler henüz desteklenmiyor (kahya-egress proxy'si W3-05 ile gelecek)."
-	reasonDigestMismatch  = "shell_docker reddedildi: sandbox imajı beklenen özet ile eşleşmiyor (tedarik zinciri sabitleme ihlali) — 'make sandbox-image' çalıştırıp yeniden deneyin."
+	// reasonNetworkSetupUnavailable fires when needs_network:true is
+	// requested but this Runner has no EgressEnsurer wired at all (should
+	// never happen in production — kahyad's wiring always sets one; this
+	// is the fail-closed floor for a misconfigured/test build). Carries
+	// the SAME reasonEgressNetworkFailed (egress_network.go) prefix as
+	// every OTHER egress-network failure, so a grep for that one literal
+	// Turkish string finds every case.
+	reasonNetworkSetupUnavailable = reasonEgressNetworkFailed + ": kahya-egress kurulumu yapılandırılmamış."
+	reasonDigestMismatch          = "shell_docker reddedildi: sandbox imajı beklenen özet ile eşleşmiyor (tedarik zinciri sabitleme ihlali) — 'make sandbox-image' çalıştırıp yeniden deneyin."
 	// reasonDockerDown is the EXACT string this task's spec quotes
 	// verbatim — do not reword.
 	reasonDockerDown = "Docker çalışmıyor — 'make docker-up' ile başlatın"
@@ -125,9 +132,12 @@ type RunInput struct {
 	Workdir string `json:"workdir" jsonschema:"rw bind-mount edilecek TEK dizin (mutlak veya ~ ile başlayan yol) — script yalnız bu dizine kalıcı yazabilir"`
 	// TimeoutS<=0 defaults to defaultTimeoutSeconds.
 	TimeoutS int `json:"timeout_s,omitempty" jsonschema:"saniye cinsinden sert zaman aşımı (varsayılan 300)"`
-	// NeedsNetwork is ALWAYS rejected today (W3-05 has not landed) — see
-	// Runner.Run's own doc comment on this fail-closed seam.
-	NeedsNetwork bool `json:"needs_network,omitempty" jsonschema:"ağ erişimi gerekiyorsa true (W3-05 gelene kadar HER ZAMAN reddedilir)"`
+	// NeedsNetwork attaches the container to the kahya-egress internal
+	// Docker network (W3-05) instead of running with --network none —
+	// see Runner.Run's own doc comment for the full wiring
+	// (EgressEnsurer.Ensure + HTTP_PROXY/HTTPS_PROXY/NO_PROXY pointed at
+	// the kahya-egress-fwd sidecar).
+	NeedsNetwork bool `json:"needs_network,omitempty" jsonschema:"ağ erişimi gerekiyorsa true — konteyner yalnız kahya-egress proxy'si üzerinden çıkabilir"`
 	// EnvAllowlist names host env vars to forward into the container
 	// (looked up via Runner.EnvLookup — never trusted as caller-supplied
 	// values themselves).
@@ -310,11 +320,32 @@ type Runner struct {
 	// VALUES are never trusted as caller-supplied.
 	EnvLookup func(name string) (string, bool)
 
+	// EgressEnsurer sets up (idempotently) the kahya-egress Docker
+	// network + kahya-egress-fwd sidecar (W3-05, egress_network.go) — nil
+	// means needs_network:true is refused fail-closed
+	// (reasonNetworkSetupUnavailable), matching this Runner's
+	// pre-W3-05-wiring posture. kahyad's real wiring (main.go) always
+	// sets this via SetEgressEnsurer.
+	EgressEnsurer *EgressNetworkEnsurer
+	// EgressHostPort is kahyad's own egress proxy listen port
+	// (config.Config.EgressPort) — threaded into EgressEnsurer.Ensure so
+	// the kahya-egress-fwd sidecar forwards to
+	// host.docker.internal:<EgressHostPort>.
+	EgressHostPort int
+
 	// timeoutUnit scales RunInput.TimeoutS into a time.Duration (defaults
 	// to time.Second; tests shrink this to time.Millisecond so a
 	// timeout/kill test runs in milliseconds, never a real 300s wait —
 	// see SetTimeoutUnit).
 	timeoutUnit time.Duration
+}
+
+// SetEgressEnsurer wires this Runner's W3-05 Docker network glue (see the
+// EgressEnsurer field's own doc comment). Call before any needs_network:
+// true Run.
+func (r *Runner) SetEgressEnsurer(ensurer *EgressNetworkEnsurer, hostEgressPort int) {
+	r.EgressEnsurer = ensurer
+	r.EgressHostPort = hostEgressPort
 }
 
 // NewRunner constructs a production Runner: home is the real user home
@@ -392,10 +423,20 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	}
 
 	if in.NeedsNetwork {
-		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_network_rejected", map[string]any{
-			"event": "shell_network_rejected", "tool": "shell_docker", "workdir": cp.Match, "task_id": taskID,
-		})
-		return RunOutput{}, errors.New(reasonNetworkRejected)
+		if r.EgressEnsurer == nil {
+			logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_egress_network_failed", map[string]any{
+				"event": "shell_egress_network_failed", "tool": "shell_docker", "workdir": cp.Match, "task_id": taskID,
+				"reason": "no egress ensurer wired",
+			})
+			return RunOutput{}, errors.New(reasonNetworkSetupUnavailable)
+		}
+		if err := r.EgressEnsurer.Ensure(ctx, r.EgressHostPort); err != nil {
+			logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_egress_network_failed", map[string]any{
+				"event": "shell_egress_network_failed", "tool": "shell_docker", "workdir": cp.Match, "task_id": taskID,
+				"reason": err.Error(),
+			})
+			return RunOutput{}, err
+		}
 	}
 
 	if r.Health != nil && !r.Health.Healthy(ctx) {
@@ -431,10 +472,22 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	}
 
 	containerName := containerNameFor(taskID)
-	args := buildDockerRunArgs(dockerRunSpec{
+	spec := dockerRunSpec{
 		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID,
 		Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
-	})
+	}
+	if in.NeedsNetwork {
+		// W3-05: attach to kahya-egress (an --internal Docker network
+		// with no route out at all) instead of the default --network
+		// none, and point HTTP_PROXY/HTTPS_PROXY at the kahya-egress-fwd
+		// sidecar (this task's spec, verbatim: "HTTP_PROXY=http://
+		// kahya-egress-fwd:3128") — the ONLY route out is through
+		// kahyad's own egress.Gate, which the sidecar dumbly TCP-forwards
+		// every byte to.
+		spec.Network = EgressNetworkName
+		spec.ProxyEnvPairs = egressProxyEnv()
+	}
+	args := buildDockerRunArgs(spec)
 
 	// Logged BEFORE execution so the JSONL transcript this task's own
 	// acceptance criteria grep for ("docker run transcript ... shows
@@ -553,15 +606,26 @@ type dockerRunSpec struct {
 	TaskID        string
 	Workdir       string // host-side canonical path (CanonicalPath.Op)
 	EnvPairs      map[string]string
+	// Network overrides the default "none" — Run sets this to
+	// EgressNetworkName for a needs_network:true invocation (W3-05),
+	// after EgressEnsurer.Ensure has already set the network/sidecar up.
+	Network string
+	// ProxyEnvPairs are kahyad-INJECTED env vars (HTTP_PROXY et al.,
+	// egressProxyEnv — egress_network.go), set only when Network !=
+	// "none" — kept SEPARATE from EnvPairs (model-requested, via
+	// env_allowlist) so redactDockerArgv's transcript redaction can tell
+	// the two apart (env_allowlist.go's nonSecretEnvNames).
+	ProxyEnvPairs map[string]string
 }
 
 // buildDockerRunArgs constructs the FIXED, non-negotiable `docker run`
 // argv (this task's spec step 3 — every flag here is load-bearing, never
 // config-overridable, and this function is a PURE function specifically
 // so a unit test can assert every flag's presence with no docker daemon
-// involved): `--network none` (needs_network:true never reaches this
-// function at all — Runner.Run rejects it long before — see Run's own doc
-// comment on that fail-closed seam), `--read-only` root + `--tmpfs /tmp`,
+// involved): `--network none` by default, or `--network kahya-egress`
+// for a needs_network:true invocation (W3-05 — Run has already run
+// EgressEnsurer.Ensure by the time this is called, so the network/
+// sidecar are guaranteed to exist), `--read-only` root + `--tmpfs /tmp`,
 // `-v <workdir>:/work:rw` as the ONLY bind mount, `--user 1000:1000`,
 // `--pids-limit 256`, `--memory 2g`, `--cap-drop ALL`, `--security-opt
 // no-new-privileges`, `--label kahya.task_id=<id>` (spec step 7: "label
@@ -574,9 +638,13 @@ type dockerRunSpec struct {
 // otherwise mangle, and exactly what Runner.Run's WYSIWYE token hash
 // already bound the approval to.
 func buildDockerRunArgs(spec dockerRunSpec) []string {
+	network := spec.Network
+	if network == "" {
+		network = "none"
+	}
 	args := []string{
 		"run", "--rm", "-i",
-		"--network", "none",
+		"--network", network,
 		"--read-only",
 		"--tmpfs", "/tmp",
 		"-v", spec.Workdir + ":" + containerWorkdir + ":rw",
@@ -589,15 +657,26 @@ func buildDockerRunArgs(spec dockerRunSpec) []string {
 		"--name", spec.ContainerName,
 		"--label", "kahya.task_id=" + spec.TaskID,
 	}
-	names := make([]string, 0, len(spec.EnvPairs))
-	for name := range spec.EnvPairs {
+	args = appendSortedEnvPairs(args, spec.ProxyEnvPairs)
+	args = appendSortedEnvPairs(args, spec.EnvPairs)
+	args = append(args, spec.ImageTag, "/bin/sh")
+	return args
+}
+
+// appendSortedEnvPairs appends "-e NAME=VALUE" for every entry in pairs,
+// in a deterministic (sorted-by-name) order — deterministic argv for
+// tests/logs, and so two separate maps (ProxyEnvPairs, EnvPairs) each
+// contribute their own pairs predictably regardless of Go's randomized
+// map iteration order.
+func appendSortedEnvPairs(args []string, pairs map[string]string) []string {
+	names := make([]string, 0, len(pairs))
+	for name := range pairs {
 		names = append(names, name)
 	}
-	sort.Strings(names) // deterministic argv for tests/logs
+	sort.Strings(names)
 	for _, name := range names {
-		args = append(args, "-e", name+"="+spec.EnvPairs[name])
+		args = append(args, "-e", name+"="+pairs[name])
 	}
-	args = append(args, spec.ImageTag, "/bin/sh")
 	return args
 }
 

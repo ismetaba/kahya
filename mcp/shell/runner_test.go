@@ -132,7 +132,12 @@ func TestRun_WorkdirDenyGlobRejectedBeforeExecutor(t *testing.T) {
 	}
 }
 
-func TestRun_NeedsNetworkAlwaysRejected(t *testing.T) {
+// TestRun_NeedsNetworkRejectedWithoutEgressEnsurer proves needs_network:
+// true still fails CLOSED (never reaches the executor/policy gate) when
+// this Runner has no EgressEnsurer wired at all — the fail-closed floor
+// for a misconfigured/test build (kahyad's real wiring, main.go, always
+// sets one).
+func TestRun_NeedsNetworkRejectedWithoutEgressEnsurer(t *testing.T) {
 	home, workdir := baseFixture(t)
 	exec := &fakeExecutor{}
 	ledger := &fakeLedger{}
@@ -144,14 +149,104 @@ func TestRun_NeedsNetworkAlwaysRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected needs_network rejection")
 	}
+	if !strings.Contains(err.Error(), reasonEgressNetworkFailed) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), reasonEgressNetworkFailed)
+	}
 	if exec.totalCalls() != 0 {
-		t.Fatalf("needs_network:true must never reach the executor (W3-05 not landed), got %d calls", exec.totalCalls())
+		t.Fatalf("needs_network:true with no EgressEnsurer must never reach the executor, got %d calls", exec.totalCalls())
 	}
 	if pc.checkCalls != 0 {
-		t.Fatalf("needs_network:true must never even reach Policy.Check, got %d calls", pc.checkCalls)
+		t.Fatalf("needs_network:true with no EgressEnsurer must never even reach Policy.Check, got %d calls", pc.checkCalls)
 	}
-	if len(ledger.find("shell_network_rejected")) != 1 {
-		t.Fatalf("expected shell_network_rejected ledger event")
+	if len(ledger.find("shell_egress_network_failed")) != 1 {
+		t.Fatalf("expected shell_egress_network_failed ledger event")
+	}
+}
+
+// TestRun_NeedsNetworkAttachesKahyaEgressNetwork proves the HAPPY path:
+// once an EgressEnsurer is wired (and Ensure succeeds — the fakeExecutor's
+// default zero-value Result{} for every unrecognized docker subcommand IS
+// success, ExitCode 0), a needs_network:true run attaches the container
+// to kahya-egress (never --network none) and sets HTTP_PROXY/HTTPS_PROXY/
+// NO_PROXY pointed at the kahya-egress-fwd sidecar (this task's spec,
+// verbatim).
+func TestRun_NeedsNetworkAttachesKahyaEgressNetwork(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{}
+	ledger := &fakeLedger{}
+	log := newFakeLogger()
+	pc := &fakePolicyClient{decision: allowDecision("tok")}
+	r := newTestRunner(home, nil, pc, ledger, log, exec,
+		&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+	r.SetEgressEnsurer(NewEgressNetworkEnsurer(exec, "sha256:pinned-test-digest"), 3128)
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: workdir, NeedsNetwork: true})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success", err)
+	}
+
+	runCalls := exec.callsFor("run")
+	if len(runCalls) == 0 {
+		t.Fatal("expected at least one docker run call")
+	}
+	// The MAIN sandbox container's docker run is always the LAST "run"
+	// call (the sidecar's own "docker run -d --name kahya-egress-fwd..."
+	// call, if any, happens first, inside EgressEnsurer.Ensure).
+	mainRun := runCalls[len(runCalls)-1]
+	joined := " " + strings.Join(mainRun.args, " ") + " "
+	if !strings.Contains(joined, " --network kahya-egress ") {
+		t.Fatalf("expected --network kahya-egress in the main container's argv, got: %v", mainRun.args)
+	}
+	if strings.Contains(joined, " --network none ") {
+		t.Fatalf("did not expect --network none for a needs_network:true run, got: %v", mainRun.args)
+	}
+	for _, want := range []string{
+		"-e HTTP_PROXY=http://kahya-egress-fwd:3128",
+		"-e HTTPS_PROXY=http://kahya-egress-fwd:3128",
+		"-e NO_PROXY=localhost,127.0.0.1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected %q in argv, got: %v", want, mainRun.args)
+		}
+	}
+
+	// The transcript must NOT redact the (non-secret) proxy values.
+	transcript := log.find("shell_docker_run")
+	if len(transcript) != 1 {
+		t.Fatalf("expected one shell_docker_run transcript line, got %d", len(transcript))
+	}
+	argv, _ := argValue(transcript[0].args, "docker_argv").([]string)
+	if !strings.Contains(strings.Join(argv, " "), "HTTP_PROXY=http://kahya-egress-fwd:3128") {
+		t.Fatalf("expected the proxy env value un-redacted in the transcript: %v", argv)
+	}
+}
+
+// TestRun_NeedsNetworkEgressEnsureFailurePropagates proves an
+// EgressEnsurer.Ensure failure (e.g. host.docker.internal unreachable)
+// fails the run CLOSED, before the executor's main container ever runs.
+func TestRun_NeedsNetworkEgressEnsureFailurePropagates(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{}
+	ledger := &fakeLedger{}
+	pc := &fakePolicyClient{decision: allowDecision("tok")}
+	r := newTestRunner(home, nil, pc, ledger, newFakeLogger(), exec,
+		&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+	// An EMPTY pinned digest is EgressNetworkEnsurer's own fail-closed
+	// state (mirrors Runner.PinnedDigest's identical convention).
+	r.SetEgressEnsurer(NewEgressNetworkEnsurer(exec, ""), 3128)
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: workdir, NeedsNetwork: true})
+	if err == nil {
+		t.Fatal("expected an error when the egress sidecar image digest is not pinned")
+	}
+	if !strings.Contains(err.Error(), reasonEgressNetworkFailed) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), reasonEgressNetworkFailed)
+	}
+	if len(exec.callsFor("run")) != 0 {
+		t.Fatalf("expected zero docker run calls when Ensure fails before ever dialing docker, got %d", len(exec.callsFor("run")))
+	}
+	if pc.checkCalls != 0 {
+		t.Fatalf("expected Policy.Check never reached, got %d calls", pc.checkCalls)
 	}
 }
 

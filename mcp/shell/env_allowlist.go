@@ -78,16 +78,29 @@ func isForwardableEnvName(name string) bool {
 	return safeEnvAllowlist[name] && !isSecretShapedEnvName(name)
 }
 
+// nonSecretEnvNames are env var NAMES that redactDockerArgv leaves
+// UN-redacted in the transcript: kahyad-INJECTED proxy configuration
+// (egress_network.go's egressProxyEnv), never model-controlled and never
+// secret (a fixed, publicly-documented sidecar address) — an operator
+// reading the JSONL/ledger transcript should be able to see that a
+// needs_network:true run really was pointed at kahya-egress-fwd, not
+// "<redacted>".
+var nonSecretEnvNames = map[string]bool{
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+	"http_proxy": true, "https_proxy": true, "no_proxy": true,
+}
+
 // redactDockerArgv returns a COPY of a built `docker run` argv with every
 // "-e NAME=VALUE" pair's VALUE replaced by "<redacted>" (BLOCKER 2 fix,
-// part b). This is ONLY for the shell_docker_run transcript this package
-// logs AND ledgers (runner.go's Run) — the REAL invocation still gets args
-// (buildDockerRunArgs' own, unredacted output), so the container itself
-// still receives the real values; only the observability trail is
-// redacted, since env_allowlist values (even a safe-allowlisted one —
-// defense in depth against a future safeEnvAllowlist edit that accidentally
-// widens it to something secret-shaped) must never sit in cleartext in a
-// JSONL log file or the append-only brain.db ledger.
+// part b), EXCEPT nonSecretEnvNames (above). This is ONLY for the
+// shell_docker_run transcript this package logs AND ledgers (runner.go's
+// Run) — the REAL invocation still gets args (buildDockerRunArgs' own,
+// unredacted output), so the container itself still receives the real
+// values; only the observability trail is redacted, since env_allowlist
+// values (even a safe-allowlisted one — defense in depth against a future
+// safeEnvAllowlist edit that accidentally widens it to something
+// secret-shaped) must never sit in cleartext in a JSONL log file or the
+// append-only brain.db ledger.
 func redactDockerArgv(args []string) []string {
 	out := make([]string, len(args))
 	copy(out, args)
@@ -99,8 +112,10 @@ func redactDockerArgv(args []string) []string {
 		if idx := strings.IndexByte(name, '='); idx >= 0 {
 			name = name[:idx]
 		}
-		out[i+1] = name + "=<redacted>"
-		i++ // skip the pair's value slot we just rewrote
+		if !nonSecretEnvNames[name] {
+			out[i+1] = name + "=<redacted>"
+		}
+		i++ // skip the pair's value slot we just rewrote (or left as-is)
 	}
 	return out
 }

@@ -76,7 +76,7 @@ container), kahyad sets exactly eight variables (`spawn.BuildEnv`):
 | `KAHYA_TRACE_ID` | The envelope's `trace_id`. |
 | `KAHYA_SOCKET` | `cfg.socket` — kahyad's own control socket, so the worker's `can_use_tool` hook (W12-09) can reach `POST /policy/check` over HTTP-over-UDS. |
 | `KAHYA_LOG_DIR` | `cfg.log_dir` — the worker writes its own JSONL logs here (every process logs JSONL with `trace_id` on every line, HANDOFF §4 ⚑). |
-| `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and the `egressGate` hook (nil/always-allow until W3-05) are enforced at that proxy, never in this package. |
+| `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and (since W3-05) the `egressGate` hook — now a real `kahyad/internal/egress.Gate.Check` call, gating `host=<AnthropicUpstreamURL's own host:port>` — are enforced at that proxy, never in this package. |
 | `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
@@ -338,8 +338,9 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   this repo exercises that; see W12-09's task file and closing commit for
   the explicit deferral note.
 - **Forward-proxy + real `ANTHROPIC_BASE_URL`** — landed in W12-08 (see
-  the note above); the model-call `egressGate` hook itself is still a
-  nil/always-allow stub until W3-05 fills in the real allowlist, and the
+  the note above); the model-call `egressGate` hook is now the real
+  `kahyad/internal/egress.Gate.Check` allowlist/budget/sensitive-read gate
+  (W3-05), and the
   "→yerel" downgrade rung stays unavailable (ledgered as
   `budget_downgrade_unavailable`) until W3-08's local lane lands.
 - **Approval surface rendering** (Telegram inline buttons, CLI "onayla" +

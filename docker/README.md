@@ -28,3 +28,13 @@ make sandbox-image   # builds kahya-sandbox:<version>, pins docker/sandbox/IMAGE
 ```
 
 `shell_docker` refuses to run until this has completed once (fail-closed).
+
+## Egress network (W3-05)
+
+`needs_network: true` shell_docker jobs attach to an internal Docker
+network (`kahya-egress`, no route out at all) plus a `kahya-egress-fwd`
+sidecar that dumbly TCP-forwards to kahyad's own egress proxy
+(`127.0.0.1:<egress.port>`) — the ONLY way such a job ever reaches the
+network. `mcp/shell.EgressNetworkEnsurer` sets this up automatically
+(idempotent, self-healing); nothing to run by hand. See
+`docker/egress/README.md` for the sidecar's own image pin.

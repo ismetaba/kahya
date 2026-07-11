@@ -35,6 +35,11 @@ type Querier interface {
 	// for the schema and kahyad/internal/policy/engine.go + tokens.go for the
 	// only two callers.
 	GetAutonomyState(ctx context.Context, arg GetAutonomyStateParams) (AutonomyState, error)
+	// W3-05 (egress proxy) queries below: egress_budget persists each host's
+	// daily byte counter across restarts. See
+	// migrations/0004_egress_budget.sql for the schema and
+	// kahyad/internal/egress/budget.go for the only caller.
+	GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error)
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (Episode, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 	// filter by source, which is fine for callers that only ever use one
@@ -57,6 +62,11 @@ type Querier interface {
 	// (resume/retry may append more), so this returns the most recently
 	// updated task for the session.
 	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (Task, error)
+	// Update-half of an application-level upsert (the same "upsert (update
+	// half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
+	// UpdateEpisodeContent above already use in this file) - the common case
+	// once a (host, day) row already exists.
+	IncrementEgressBudget(ctx context.Context, arg IncrementEgressBudgetParams) (int64, error)
 	// consumed_at starts NULL (a literal, not a param - see
 	// ConsumeApprovalToken below for the only statement that ever sets it).
 	// class/scope persist the token's REAL bound identity (post-security-
@@ -66,6 +76,7 @@ type Querier interface {
 	InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error
 	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)
+	InsertEgressBudget(ctx context.Context, arg InsertEgressBudgetParams) error
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (Episode, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
 	// Later tasks add more queries to this file as they need them; sqlc

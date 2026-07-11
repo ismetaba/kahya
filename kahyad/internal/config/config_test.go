@@ -86,6 +86,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.EstRequestTokens != 50_000 {
 		t.Errorf("EstRequestTokens = %d, want 50000", cfg.EstRequestTokens)
 	}
+	// W3-05 egress proxy default port.
+	if cfg.EgressPort != 3128 {
+		t.Errorf("EgressPort = %d, want 3128", cfg.EgressPort)
+	}
 }
 
 func TestLoadFileOverridesDefaults(t *testing.T) {
@@ -265,6 +269,37 @@ func TestLoadEnvOverridesFileAndDefaults(t *testing.T) {
 	// data_dir, not the file's data_dir.
 	if want := filepath.Join(envDataDir, "logs"); cfg.LogDir != want {
 		t.Errorf("LogDir = %q, want %q (should derive from final data_dir)", cfg.LogDir, want)
+	}
+}
+
+func TestLoadEgressPortFileAndEnvOverride(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("egress_port: 4000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.EgressPort != 4000 {
+		t.Errorf("EgressPort = %d, want 4000 (file override)", cfg.EgressPort)
+	}
+
+	t.Setenv("KAHYA_EGRESS_PORT", "4001")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.EgressPort != 4001 {
+		t.Errorf("EgressPort = %d, want 4001 (env beats file)", cfg.EgressPort)
 	}
 }
 

@@ -12,9 +12,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +25,7 @@ import (
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
@@ -247,8 +251,25 @@ func run() int {
 		log.Error("fs_tool_home_dir_failed", "err", err.Error())
 		return 1
 	}
+
+	// W3-05: the egress gate - the single decision engine every off-box
+	// byte passes through (HANDOFF §5 safety #1 flag). notifier is built
+	// here (rather than down where W12-08 originally built it) precisely
+	// so BOTH the gate and the anthproxy governor below share the exact
+	// same Notifier instance. sessions is the per-process, session-
+	// lifetime "has this session done a secret-lane read" tracker
+	// (durable cross-restart taint is W4-03) - fsTool's
+	// SensitiveMarker below and every future in-process caller (the
+	// Telegram sender W3-07, the ledger anchor push W4-05) all reach the
+	// SAME egressGate, never a second copy.
+	notifier := notify.New(log, st)
+	sessions := egress.NewSensitiveTracker()
+	egressBudget := egress.NewSQLBudget(st.Queries)
+	egressGate := egress.NewGate(pol.Egress, sessions, egressBudget, st, notifier, log)
+	srv.SetEgressGate(egressGate)
+
 	fsPolicyClient := server.NewFSPolicyClient(policyEngine, srv.DenyAll)
-	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log))
+	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
 
@@ -269,6 +290,21 @@ func run() int {
 		log.Error("shell_pinned_digest_load_failed", "path", cfg.DockerImageDigestPath, "err", err.Error())
 	}
 	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, pol.FSWriteDenyGlobs, cfg.ShellWorkdirRoots, fsPolicyClient, st, server.NewFSLogger(log))
+
+	// W3-05: needs_network:true jobs attach to the kahya-egress internal
+	// Docker network instead of being refused outright (W3-04's
+	// fail-closed placeholder) - egressSidecarDigest is docker/egress/
+	// IMAGE_DIGEST's committed content, the SAME "missing pin -> refuse
+	// at RUN time, not at boot" posture pinnedDigest already uses above.
+	// shellRunner.Exec is reused directly (not a second Executor
+	// implementation) for the sidecar's own docker network/run/exec
+	// calls.
+	egressSidecarDigest, err := mcpshell.LoadPinnedDigest(cfg.EgressSidecarDigestPath)
+	if err != nil {
+		log.Error("egress_sidecar_digest_load_failed", "path", cfg.EgressSidecarDigestPath, "err", err.Error())
+	}
+	shellRunner.SetEgressEnsurer(mcpshell.NewEgressNetworkEnsurer(shellRunner.Exec, egressSidecarDigest), cfg.EgressPort)
+
 	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
 	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
 	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {
@@ -284,16 +320,15 @@ func run() int {
 	srv.SetTaskStore(st.Queries)
 
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
-	// (W12-08). notifier logs+ledgers alarms (Telegram delivery is
-	// W3-07); governor is rebuilt once here from every historical
-	// model_call ledger event, then shared across every task for the
-	// rest of the process's life (kahyad/internal/anthproxy.Governor is
-	// safe for concurrent use). credential is selected by
-	// cfg.credential_mode - see kahyad/internal/anthproxy's package doc
-	// comment for the OWNER AUTH DECISION this selects between
-	// (passthrough is the owner-decision default; keychain remains fully
-	// implemented as a valid fallback).
-	notifier := notify.New(log, st)
+	// (W12-08). notifier (built above, alongside the egress gate)
+	// logs+ledgers alarms (Telegram delivery is W3-07); governor is
+	// rebuilt once here from every historical model_call ledger event,
+	// then shared across every task for the rest of the process's life
+	// (kahyad/internal/anthproxy.Governor is safe for concurrent use).
+	// credential is selected by cfg.credential_mode - see
+	// kahyad/internal/anthproxy's package doc comment for the OWNER AUTH
+	// DECISION this selects between (passthrough is the owner-decision
+	// default; keychain remains fully implemented as a valid fallback).
 	bootEvents, err := loadAnthproxyBootEvents(context.Background(), st)
 	if err != nil {
 		log.Error("anthproxy_boot_events_failed", "err", err.Error())
@@ -311,10 +346,51 @@ func run() int {
 	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode)
 
 	credential := buildCredentialSource(cfg, log)
-	// EgressGate is nil for now (returns nil/always-allow) - the model-call
-	// egress gate lands in W3-05; the hook shape is fixed here so that
-	// task lands with no wiring changes to this file.
-	srv.SetAnthproxy(governor, notifier, credential, nil)
+	// W3-05: the Anthropic forward-proxy becomes a CLIENT of egressGate -
+	// every /v1/messages call this task's worker makes is gated on
+	// host=<AnthropicUpstreamURL's own host:port>, nbytes=the request's
+	// Content-Length, session={task_id, trace_id} BEFORE anthproxy ever
+	// forwards it (HANDOFF §4: "model-cagrisi egress kapisi bu proxy
+	// noktasinda uygulanir"). A sensitive-read-tainted session cannot
+	// even reach the upstream host if it were ever off-allowlist; the
+	// stronger "no secret-lane byte to cloud" content rule is W3-08's
+	// classifier + W3-10's test.
+	anthropicHost, anthropicPort := hostPortFromURL(cfg.AnthropicUpstreamURL)
+	egressGateFactory := func(taskID, traceID string) func(*http.Request) error {
+		return func(r *http.Request) error {
+			nbytes := r.ContentLength
+			if nbytes < 0 {
+				nbytes = 0
+			}
+			decision, err := egressGate.Check(r.Context(), egress.Target{Host: anthropicHost, Port: anthropicPort}, nbytes,
+				egress.SessionInfo{TaskID: taskID, TraceID: traceID})
+			if err != nil {
+				// Fail-closed (tasks/README.md global convention): a gate
+				// error is treated exactly like a deny, never a
+				// permissive fallback.
+				return err
+			}
+			if !decision.Allow {
+				return errors.New(decision.Reason)
+			}
+			return nil
+		}
+	}
+	srv.SetAnthproxy(governor, notifier, credential, egressGateFactory)
+
+	// W3-05: the egress proxy itself - the ONLY route out of the
+	// kahya-egress Docker network mcp/shell's needs_network container
+	// jobs attach to (HANDOFF §5 safety #1 flag: "aksi halde container
+	// ici curl allowlist'i atlar"). Listens on 127.0.0.1:<cfg.EgressPort>
+	// for the whole daemon's lifetime (unlike the per-task anthproxy
+	// listener above, this one is shared by every container job).
+	egressProxy := egress.NewProxy(egressGate, cfg.EgressPort)
+	if err := egressProxy.Start(); err != nil {
+		log.Error("egress_proxy_start_failed", "port", cfg.EgressPort, "err", err.Error())
+		return 1
+	}
+	defer egressProxy.Close()
+	log.Info("egress_proxy_started", "addr", egressProxy.Addr)
 
 	// ctx is created here (BEFORE the boot reindex goroutine below is
 	// spawned, not after) so that goroutine can share the SAME
@@ -414,6 +490,33 @@ func embedServiceDir(cmd []string) string {
 		return ""
 	}
 	return filepath.Dir(cmd[1])
+}
+
+// hostPortFromURL resolves rawURL's host and port (defaulting to 80/443
+// per scheme when no explicit port is present) - used to derive the
+// egress.Target the W3-05 gate checks cfg.AnthropicUpstreamURL's OWN
+// host:port against (e.g. "https://api.anthropic.com" ->
+// ("api.anthropic.com", 443)). An unparsable rawURL (should not happen
+// with a validated config.Config) returns ("", 0) - Check's own
+// CanonicalizeHost then rejects the empty host, and the gate's ordinary
+// fail-closed "not in allowlist" denial applies, never a permissive
+// fallback.
+func hostPortFromURL(rawURL string) (host string, port int) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return "", 0
+	}
+	host = u.Hostname()
+	portStr := u.Port()
+	if portStr == "" {
+		if u.Scheme == "http" {
+			portStr = "80"
+		} else {
+			portStr = "443"
+		}
+	}
+	port, _ = strconv.Atoi(portStr)
+	return host, port
 }
 
 // parseLogLevel maps config.Config.LogLevel's four validated values

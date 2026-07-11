@@ -31,10 +31,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -107,8 +109,19 @@ func TestW12Acceptance(t *testing.T) {
 
 	seedMemoryFixture(t, root, memDir)
 	writeConfigYAML(t, homeDir, mock.URL())
+	// W3-05: kahyad/internal/anthproxy's per-task forward-proxy now
+	// routes every call through the SAME egress.Gate as everything else,
+	// which denies loopback/private addresses unless explicitly
+	// allowlisted (proxy-as-pivot prevention). The real, committed
+	// policy.yaml intentionally does NOT allowlist 127.0.0.1 - this
+	// hermetic gate's mock Anthropic server binds an ephemeral loopback
+	// port standing in for the real api.anthropic.com, so it needs its
+	// OWN policy.yaml with that one extra, test-only allowlist entry
+	// (see writeHermeticPolicyYAML's own doc comment for why this is a
+	// textual patch of the real file rather than a hand-rolled one).
+	policyPath := writeHermeticPolicyYAML(t, root, homeDir, mock.URL())
 
-	kahyadEnv := buildKahyadEnv(homeDir, dataDir, memDir, sockPath)
+	kahyadEnv := buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath)
 	cliEnv := buildCLIEnv(homeDir, sockPath)
 
 	var mu sync.Mutex
@@ -357,6 +370,60 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 	}
 }
 
+// hermeticEgressAllowlistAnchor is the exact text writeHermeticPolicyYAML
+// patches (root/policy.yaml's committed egress.allowlist opening two
+// lines) - kept as its own constant so a future edit to policy.yaml's
+// egress section that changes this text breaks this test LOUDLY (a
+// t.Fatalf below, never a silent "the mock server's host just never got
+// allowlisted, so every model call now 403s" failure mode).
+const hermeticEgressAllowlistAnchor = "egress:\n  allowlist:\n"
+
+// writeHermeticPolicyYAML builds a test-local policy.yaml: the REAL,
+// committed root/policy.yaml's bytes (every tool/class/undo/deny-glob/
+// secret-lane entry unchanged - this test must keep exercising the actual
+// shipped policy, not a hand-rolled stand-in that could silently drift
+// from it), textually patched to ALSO allowlist the mock Anthropic
+// server's own loopback host:port (W3-05: kahyad/internal/egress.Gate
+// denies 127.0.0.1 by default - proxy-as-pivot prevention - unless
+// explicitly allowlisted; the mock's ephemeral port is only known at test
+// run time, so it cannot be a permanent entry in the committed file). The
+// result is written under homeDir (never mutating the repo's own
+// policy.yaml) and its path returned for KAHYA_POLICY_PATH.
+func writeHermeticPolicyYAML(t *testing.T, root, homeDir, mockUpstreamURL string) string {
+	t.Helper()
+
+	u, err := url.Parse(mockUpstreamURL)
+	if err != nil {
+		t.Fatalf("parse mock upstream URL %q: %v", mockUpstreamURL, err)
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse mock upstream port from %q: %v", mockUpstreamURL, err)
+	}
+
+	original, err := os.ReadFile(filepath.Join(root, "policy.yaml"))
+	if err != nil {
+		t.Fatalf("read repo policy.yaml: %v", err)
+	}
+
+	patch := fmt.Sprintf("egress:\n  allowlist:\n    - host: %s\n      ports: [%d]\n", host, port)
+	patched := strings.Replace(string(original), hermeticEgressAllowlistAnchor, patch, 1)
+	if patched == string(original) {
+		t.Fatalf("writeHermeticPolicyYAML: anchor %q not found in policy.yaml - has its egress: section been reworded?", hermeticEgressAllowlistAnchor)
+	}
+
+	dir := filepath.Join(homeDir, "hermetic-policy")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir hermetic policy dir: %v", err)
+	}
+	path := filepath.Join(dir, "policy.yaml")
+	if err := os.WriteFile(path, []byte(patched), 0o600); err != nil {
+		t.Fatalf("write hermetic policy.yaml: %v", err)
+	}
+	return path
+}
+
 // buildKahyadEnv assembles the environment kahyad itself runs under: the
 // current process's own environment (PATH, etc. - kahyad's worker spawn is
 // a plain subprocess, not a container, so PATH/HOME resolution must work
@@ -369,12 +436,13 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 // per-task proxy values it appends, and having the same env var name
 // twice in a child's environment is exactly the kind of ambiguity a
 // hermetic test must never depend on being resolved "the right way").
-func buildKahyadEnv(homeDir, dataDir, memDir, sockPath string) []string {
+func buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath string) []string {
 	strip := map[string]bool{
 		"HOME": true, "KAHYA_DATA_DIR": true, "KAHYA_MEMORY_DIR": true,
 		"KAHYA_SOCKET": true, "KAHYA_DB_PATH": true, "KAHYA_ENV": true,
 		"KAHYA_LOG_LEVEL": true, "KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
 		"ANTHROPIC_BASE_URL": true, "ANTHROPIC_API_KEY": true, "ANTHROPIC_AUTH_TOKEN": true,
+		"KAHYA_POLICY_PATH": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {
@@ -392,6 +460,7 @@ func buildKahyadEnv(homeDir, dataDir, memDir, sockPath string) []string {
 		"KAHYA_ENV=dev",
 		"KAHYA_ANTHROPIC_KEY_OVERRIDE=hermetic-dummy",
 		"KAHYA_LOG_LEVEL=info",
+		"KAHYA_POLICY_PATH="+policyPath,
 		// Belt-and-braces so the worker's own stdout/log JSONL lines (which
 		// carry byte-exact Turkish/Turkish-script text) never hit a
 		// non-UTF-8 default text encoding regardless of the invoking

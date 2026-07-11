@@ -75,6 +75,25 @@ mlx-venv:
 test-mlx: mlx-venv build
 	go test -tags $(GOTAGS),mlx ./... -v
 	$(MLX_PY) -m pytest mlx/embed/test_server.py -v
+# lint's single-egress-gate check (W3-05, HANDOFF S5 safety #1): every
+# off-box byte must pass through kahyad/internal/egress.Gate.Check - this
+# grep proves no OTHER code path in kahyad/mcp/worker dials out on its
+# own. kahyad/internal/egress/ itself is exempt (it IS the gate). The
+# short allowlist below is every net.Dial call this codebase had BEFORE
+# W3-05 and still has after it - all of them dial a LOCAL UDS socket or
+# 127.0.0.1 loopback, never an off-box host, so they are not egress at
+# all: kahyad/cmd/kahya/client.go + kahyad/cmd/kahya-mcp/main.go (the UDS
+# control-socket clients), kahyad/internal/server/server.go's probeHealth
+# (dials kahyad's own UDS socket) + its test, kahyad/internal/mlxe2e's
+# test (dials the local MLX embed service's loopback TCP port), and
+# mcp/shell/egress_integration_test.go's stand-in test proxy (this
+# package cannot import kahyad/internal/egress - Go's internal-package
+# boundary - so its Docker-integration test builds a small, independent,
+# SAME-SHAPE stand-in proxy purely to drive the Docker network plumbing;
+# see that file's own doc comment). Adding a NEW net.Dial/
+# http.ProxyFromEnvironment anywhere else must fail this check until
+# either it is routed through egress.Check or deliberately added here
+# (reviewed in a commit) as another confirmed local-only exception.
 lint:
 	test -z "$$(gofmt -l .)"
 	go vet -tags $(GOTAGS) ./...
@@ -84,6 +103,15 @@ lint:
 		go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate && \
 		git diff --exit-code -- kahyad/internal/store/sqlcgen || \
 			(echo "sqlc generate produced a diff — commit the regenerated code" && exit 1); \
+	fi
+	@echo "checking W3-05 single-egress-gate invariant..."
+	@matches=$$(grep -rn 'http\.ProxyFromEnvironment\|net\.Dial' kahyad mcp worker 2>/dev/null \
+		| grep -v '^kahyad/internal/egress/' \
+		| grep -vE '^(kahyad/cmd/kahya/client\.go|kahyad/cmd/kahya-mcp/main\.go|kahyad/internal/server/server\.go|kahyad/internal/server/server_test\.go|kahyad/internal/mlxe2e/cross_lingual_test\.go|mcp/shell/egress_integration_test\.go):'); \
+	if [ -n "$$matches" ]; then \
+		echo "single-egress-gate violation: net.Dial/http.ProxyFromEnvironment found outside kahyad/internal/egress/ and the reviewed local-only allowlist (every OTHER off-box dial must go through egress.Check):"; \
+		echo "$$matches"; \
+		exit 1; \
 	fi
 generate:   # activated by W12-02 when sqlc.yaml lands
 	if [ -f sqlc.yaml ]; then go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate; else echo "sqlc.yaml not yet present (W12-02)"; fi
