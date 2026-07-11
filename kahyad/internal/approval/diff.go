@@ -185,6 +185,11 @@ func (p ApprovalPayload) Render() string {
 		fmt.Fprintf(&b, "alıcı: %s\n", canon.Normalize(p.Recipient).Display)
 		b.WriteString("gövde:\n")
 		b.WriteString(renderScriptLines([]byte(p.Body)))
+	case KindShortcut:
+		fmt.Fprintf(&b, "shortcut: %s\n", canon.Normalize(p.ShortcutName).Display)
+		if p.ShortcutInputPath != "" {
+			fmt.Fprintf(&b, "input_path: %s\n", canon.Normalize(p.ShortcutInputPath).Display)
+		}
 	}
 
 	if len(p.Flags) > 0 {

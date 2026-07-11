@@ -167,6 +167,21 @@ func TestLoadRejectsDuplicateEgressHost(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsOsascriptToolBelowW2Floor is W3-09's own acceptance
+// criterion, verbatim: "a fixture policy.yaml with applescript_run
+// class:W1 must FAIL to load" — the loader-enforced floor that
+// applescript_run/jxa_run/shortcuts_run may never be registered below W2
+// (HANDOFF §5 safety #6 ⚑).
+func TestLoadRejectsOsascriptToolBelowW2Floor(t *testing.T) {
+	_, err := Load(testdataPath(t, "invalid_osascript_below_w2.yaml"))
+	if err == nil {
+		t.Fatal("Load(invalid_osascript_below_w2.yaml) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "applescript_run") {
+		t.Errorf("error = %q, want it to name applescript_run", err.Error())
+	}
+}
+
 func TestLoadRejectsMissingMandatoryDenyGlob(t *testing.T) {
 	_, err := Load(testdataPath(t, "invalid_missing_deny_glob.yaml"))
 	if err == nil {

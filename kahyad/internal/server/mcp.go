@@ -135,6 +135,14 @@ func (s *Server) buildMCPHandler() http.Handler {
 	if s.shellServer != nil {
 		s.shellServer.RegisterTools(mcpServer)
 	}
+	// W3-09: applescript_run/jxa_run/shortcuts_run, registered onto this
+	// SAME shared server - see osascript.go's SetOsascriptTool doc comment
+	// and osascriptOwnedTools, which policyGateMiddleware below defers to
+	// entirely for these three tool names (mirrors fsOwnedTools'/
+	// shellOwnedTools' identical bypass).
+	if s.osascriptServer != nil {
+		s.osascriptServer.RegisterTools(mcpServer)
+	}
 	mcpServer.AddReceivingMiddleware(s.policyGateMiddleware())
 
 	streamable := mcp.NewStreamableHTTPHandler(
@@ -237,7 +245,7 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			// (shell.go's doc comment), independently re-checks s.denyAll
 			// and fails closed identically, so a policy.yaml load failure
 			// at boot still denies every fs/shell operation.
-			if fsOwnedTools[canonName] || shellOwnedTools[canonName] {
+			if fsOwnedTools[canonName] || shellOwnedTools[canonName] || osascriptOwnedTools[canonName] {
 				return next(ctx, method, req)
 			}
 

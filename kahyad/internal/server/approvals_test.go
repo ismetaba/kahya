@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"kahya/kahyad/internal/approval"
 )
 
 // postJSON POSTs body (marshaled to JSON) to path over f's UDS client and
@@ -152,5 +154,73 @@ func TestPolicyFeedback_W3RefusesNonLocalSurface(t *testing.T) {
 	}, &approved)
 	if !approved.OK || approved.Token == "" {
 		t.Fatalf("approve(surface=local) = %+v, want ok with a token", approved)
+	}
+}
+
+// TestRenderPendingApproval_ApplescriptRunShowsScriptAndTargetApp is
+// W3-09's own dispatch case: applescript_run's tool_input envelope
+// {script, target_app} renders as a KindOsascript payload whose Summary
+// names the target app (this task's spec, verbatim: "target app name in
+// the summary") and whose rendered body contains the FULL script bytes.
+func TestRenderPendingApproval_ApplescriptRunShowsScriptAndTargetApp(t *testing.T) {
+	toolInput, err := json.Marshal(osascriptScriptToolInput{
+		Script: `tell application "Finder" to make new folder at desktop`, TargetApp: "Finder",
+	})
+	if err != nil {
+		t.Fatalf("marshal tool_input: %v", err)
+	}
+	p := renderPendingApproval("/Users/kahya", "applescript_run", toolInput)
+
+	if !strings.Contains(p.Summary, "Finder") {
+		t.Errorf("Summary = %q, want it to name the target app", p.Summary)
+	}
+	if !strings.Contains(p.Summary, "applescript_run") {
+		t.Errorf("Summary = %q, want it to name the tool", p.Summary)
+	}
+	rendered := p.Render()
+	if !strings.Contains(rendered, "make new folder at desktop") {
+		t.Errorf("Render() = %q, want it to contain the full script bytes", rendered)
+	}
+}
+
+// TestRenderPendingApproval_JXARunShowsScript mirrors the applescript_run
+// case for jxa_run.
+func TestRenderPendingApproval_JXARunShowsScript(t *testing.T) {
+	toolInput, err := json.Marshal(osascriptScriptToolInput{
+		Script: `Application("Finder").windows().length;`, TargetApp: "Finder",
+	})
+	if err != nil {
+		t.Fatalf("marshal tool_input: %v", err)
+	}
+	p := renderPendingApproval("/Users/kahya", "jxa_run", toolInput)
+	if !strings.Contains(p.Render(), "windows().length") {
+		t.Errorf("Render() = %q, want it to contain the full JXA script bytes", p.Render())
+	}
+}
+
+// TestRenderPendingApproval_ShortcutsRunShowsNameAndPathOnly is this
+// task's own acceptance criterion: shortcuts_run's rendered approval
+// shows the shortcut name and canonical input path, and the underlying
+// payload is a KindShortcut built via approval.BuildShortcut (whose own
+// byte-exact "nothing else" assertion lives in
+// kahyad/internal/approval/payload_test.go).
+func TestRenderPendingApproval_ShortcutsRunShowsNameAndPathOnly(t *testing.T) {
+	toolInput, err := json.Marshal(osascriptShortcutToolInput{
+		Name: "Yedekle", InputPath: "/Users/kahya/girdi.txt",
+	})
+	if err != nil {
+		t.Fatalf("marshal tool_input: %v", err)
+	}
+	p := renderPendingApproval("/Users/kahya", "shortcuts_run", toolInput)
+
+	if p.Kind != approval.KindShortcut {
+		t.Errorf("Kind = %q, want %q", p.Kind, approval.KindShortcut)
+	}
+	if !strings.Contains(p.Summary, "Yedekle") {
+		t.Errorf("Summary = %q, want it to name the shortcut", p.Summary)
+	}
+	rendered := p.Render()
+	if !strings.Contains(rendered, "Yedekle") || !strings.Contains(rendered, "girdi.txt") {
+		t.Errorf("Render() = %q, want it to contain the name and input path", rendered)
 	}
 }

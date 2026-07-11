@@ -30,6 +30,24 @@ type fsWriteToolInput struct {
 	ContentBase64 string `json:"content_base64,omitempty"`
 }
 
+// osascriptScriptToolInput mirrors mcp/osascript's own (unexported)
+// scriptToolInputEnvelope — {script, target_app} — the exact JSON shape
+// applescript_run/jxa_run hash via PolicyClient.Check (mcp/osascript/
+// runner.go's buildScriptToolInput).
+type osascriptScriptToolInput struct {
+	Script    string `json:"script"`
+	TargetApp string `json:"target_app,omitempty"`
+}
+
+// osascriptShortcutToolInput mirrors mcp/osascript's own (unexported)
+// shortcutToolInputEnvelope — {name, input_path} and NOTHING else — the
+// exact JSON shape shortcuts_run hashes (mcp/osascript/shortcuts.go's
+// buildShortcutToolInput).
+type osascriptShortcutToolInput struct {
+	Name      string `json:"name"`
+	InputPath string `json:"input_path,omitempty"`
+}
+
 // readCurrentFile returns the CURRENT on-disk bytes at rawPath (resolved
 // against home via mcp/fs's own canonicalization — the exact same
 // resolution fs_write/fs_delete themselves use), or nil if it does not
@@ -80,6 +98,22 @@ func renderPendingApproval(home, tool string, toolInput []byte) approval.Approva
 			p := approval.BuildFileEdit(env.Path, oldContent, nil)
 			p.Summary = "fs_delete: " + p.Path
 			return p
+		}
+	case "applescript_run", "jxa_run":
+		var env osascriptScriptToolInput
+		if json.Unmarshal(toolInput, &env) == nil {
+			p := approval.BuildOsascript([]byte(env.Script))
+			appName := env.TargetApp
+			if appName == "" {
+				appName = "(bilinmeyen uygulama)"
+			}
+			p.Summary = tool + ": " + appName
+			return p
+		}
+	case "shortcuts_run":
+		var env osascriptShortcutToolInput
+		if json.Unmarshal(toolInput, &env) == nil {
+			return approval.BuildShortcut(env.Name, env.InputPath)
 		}
 	}
 	p := approval.BuildOsascript(toolInput)

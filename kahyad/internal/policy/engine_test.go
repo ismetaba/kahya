@@ -33,6 +33,7 @@ func testEngine(t *testing.T) (*Engine, *store.Store) {
 		{Name: "fs_read", Class: ClassR, ScopeKey: "global"},
 		{Name: "fs_write", Class: ClassW1, ScopeKey: "global"},
 		{Name: "shell_docker", Class: ClassW2, ScopeKey: "global"},
+		{Name: "applescript_run", Class: ClassW2, ScopeKey: "global"},
 		{Name: "mail_send", Class: ClassW3, ScopeKey: "global"},
 	}
 	byName := make(map[string]ToolRule, len(tools))

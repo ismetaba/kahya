@@ -36,6 +36,10 @@ const (
 	KindOsascript   Kind = "osascript"
 	KindEgress      Kind = "egress"
 	KindMessage     Kind = "message"
+	// KindShortcut is W3-09's shortcuts_run payload shape: NAME + a
+	// canonicalized input path, and NOTHING else — see BuildShortcut's own
+	// doc comment for why there is no "script bytes" material here at all.
+	KindShortcut Kind = "shortcut"
 )
 
 // ApprovalPayload is the WYSIWYE approval unit: Summary+CanonicalBytes+
@@ -78,6 +82,10 @@ type ApprovalPayload struct {
 	// ---- message rendering material ----
 	Recipient string // canonicalized display recipient
 	Body      string
+
+	// ---- shortcut (shortcuts_run) rendering material ----
+	ShortcutName      string // the named, existing shortcut being run
+	ShortcutInputPath string // canonicalized --input-path, "" if none
 
 	// Flags aggregates every canon.Flag surfaced while building this
 	// payload's rendering material (path/host/recipient/body canon.Result
@@ -165,6 +173,38 @@ func BuildOsascript(script []byte) ApprovalPayload {
 		CanonicalBytes: canonicalBytes, Hash: hashOf(canonicalBytes),
 		Summary: "osascript",
 		Flags:   scanTextFlags(string(script)),
+	}
+}
+
+// BuildShortcut builds a shortcuts_run ApprovalPayload: the shortcut's own
+// NAME plus its canonicalized --input-path, and NOTHING else (this task's
+// own spec, verbatim: "the approval payload is the shortcut name +
+// canonicalized input path"). Unlike file_edit/shell_script/osascript
+// there is no script/content material to show at all here: HANDOFF §5
+// safety #6's own reasoning is that shortcut BODIES are opaque to us —
+// only an existing, user-created, NAMED shortcut is ever run (creating/
+// editing one is out of scope), so name+input path IS the entire
+// approved surface, and CanonicalBytes/Hash below are built from exactly
+// those two fields (encodeFields' length-prefixed encoding, like every
+// other Build* function here) so a test can assert the serialized bytes
+// carry nothing more.
+func BuildShortcut(name, canonicalInputPath string) ApprovalPayload {
+	canonicalBytes := encodeFields([]byte(KindShortcut), []byte(name), []byte(canonicalInputPath))
+	summary := "shortcuts_run: " + name
+	if canonicalInputPath != "" {
+		summary += " (girdi: " + canonicalInputPath + ")"
+	}
+	return ApprovalPayload{
+		Kind: KindShortcut, ShortcutName: name, ShortcutInputPath: canonicalInputPath,
+		CanonicalBytes: canonicalBytes, Hash: hashOf(canonicalBytes),
+		Summary: summary,
+		// Flags mirrors every other Build* function's own convention
+		// (HANDOFF §5 safety #5: "never dropped invisibly") — Render()'s
+		// Display pass already makes a stray bidi/zero-width/confusable
+		// rune in the name visible inline, but aggregating it here too
+		// keeps the bottom-of-card "Uyarılar:" summary consistent across
+		// every Kind, not just this one silently omitting it.
+		Flags: scanTextFlags(name),
 	}
 }
 

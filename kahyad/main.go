@@ -41,6 +41,7 @@ import (
 	"kahya/kahyad/internal/telegram"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
+	mcposascript "kahya/mcp/osascript"
 	mcpshell "kahya/mcp/shell"
 )
 
@@ -350,6 +351,20 @@ func run() int {
 	} else {
 		log.Info("docker_health_checked", "healthy", true)
 	}
+
+	// W3-09: applescript_run/jxa_run/shortcuts_run, registered onto the
+	// SAME shared /v1/mcp server as memory's/fs's/shell's own tools
+	// (server.SetOsascriptTool's doc comment). fsPolicyClient/
+	// server.NewFSLogger(log) are REUSED directly (not re-adapted) -
+	// mcp/osascript.PolicyClient/Logger are type aliases of mcp/fs's own
+	// interfaces (kahyad/internal/server/osascript.go's doc comment), so
+	// the exact values already built for the fs/shell tools above satisfy
+	// mcp/osascript's dependencies with zero new adapter code. home is the
+	// SAME real user home directory fsTool/shellRunner already resolved
+	// above (shortcuts_run's --input-path canonicalization needs it;
+	// applescript_run/jxa_run do not).
+	osascriptRunner := mcposascript.NewRunner(home, fsPolicyClient, st, server.NewFSLogger(log))
+	srv.SetOsascriptTool(mcposascript.New(osascriptRunner))
 
 	// POST /v1/task (W12-07): st.Queries already has exactly the
 	// InsertTask/UpdateTaskState/UpdateTaskSession method shape

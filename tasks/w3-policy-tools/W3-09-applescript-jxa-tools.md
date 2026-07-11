@@ -1,6 +1,6 @@
 # W3-09 — AppleScript/JXA/Shortcuts MCP tools (≥W2, WYSIWYE-gated)
 
-**Status:** todo
+**Status:** blocked-user — code + unit tests + `docs/tcc-automation.md` + loader floor are done and green (`make build && make test && make lint`); the two live "Manual" acceptance criteria below (a real Finder folder created via `applescript_run` under launchd, and the actual TCC Automation grant) need the user to click through a real macOS permission dialog and cannot be faked or automated. See the note under Acceptance criteria.
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-06, W3-04
 **Flags:** slidable, user-assist
@@ -42,14 +42,14 @@ Gotchas:
 6. Tests: scanner fixtures — `do shell script "rm -rf ~"` rejected; `do  shell   script` (extra whitespace) rejected; `tell application "Finder" to get name of every window` passes scan; JXA `doShellScript` rejected; byte-mutation between approval and execution rejected (reuse W3-06 harness); policy floor test — a fixture policy.yaml with `applescript_run: class: W1` fails to load; ledger event emitted with `trace_id`.
 
 ## Acceptance criteria
-- [ ] `go test ./mcp/osascript/...` green in `make test` (execution tests behind `KAHYA_OSASCRIPT_TESTS=1`; scanner + gate-chain tests unconditional with a stub executor).
-- [ ] Scanner test matrix green, including whitespace-variant `do shell script` and JXA `doShellScript` fixtures.
-- [ ] Loader floor test green: registering any of the three tools below W2 fails policy load.
-- [ ] Manual: `applescript_run` with `tell application "Finder" to make new folder at desktop` → WYSIWYE diff of the script bytes shown on the approval surface, approve, folder appears; ledger `osascript_exec` row carries the `trace_id`; run it via kahyad under launchd (not a terminal) to bind the TCC grant correctly.
-- [ ] Manual: a body containing `do shell script "whoami"` is rejected with the Turkish reroute hint; nothing executes (no `osascript` process spawned — assert via test with the stub executor and manually via `log stream` or absence of ledger exec event).
-- [ ] `docs/tcc-automation.md` committed and followed once for at least one app (screenshot or `System Settings > Privacy & Security > Automation` entry noted in the task log).
-- [ ] Timeout test green (stub executor that sleeps): process group killed at the limit, `osascript_timeout` ledger event with `trace_id` exists.
-- [ ] `shortcuts_run` approval payload contains the shortcut name + canonical input path and nothing else (test asserts the serialized payload bytes).
+- [x] `go test ./mcp/osascript/...` green in `make test` (execution tests behind `KAHYA_OSASCRIPT_TESTS=1` — a real-`osascript`, no-target-app, no-TCC-needed smoke test in `mcp/osascript/live_test.go`; scanner + gate-chain + timeout tests unconditional with a stub executor).
+- [x] Scanner test matrix green, including whitespace-variant `do shell script` and JXA `doShellScript` fixtures (`mcp/osascript/scan_test.go`).
+- [x] Loader floor test green: registering any of the three tools below W2 fails policy load (`kahyad/internal/policy/loader.go`'s `osascriptFloorTools` + `TestLoadRejectsOsascriptToolBelowW2Floor`, fixture `kahyad/internal/policy/testdata/invalid_osascript_below_w2.yaml`).
+- [ ] **DEFERRED — needs the user.** Manual: `applescript_run` with `tell application "Finder" to make new folder at desktop` → WYSIWYE diff of the script bytes shown on the approval surface, approve, folder appears; ledger `osascript_exec` row carries the `trace_id`; run it via kahyad under launchd (not a terminal) to bind the TCC grant correctly. Code path is fully implemented and unit-tested with a stub executor (`mcp/osascript/runner_test.go`'s happy-path tests) and with the REAL `osascript` binary via a no-target-app script (`live_test.go`) — only the real Finder+launchd+TCC run itself is deferred, since it requires a human to click "Allow" on a live Automation dialog.
+- [x] A body containing `do shell script "whoami"` is rejected with the Turkish reroute hint; nothing executes — unit-tested with the stub executor (`TestRunApplescriptScanRejectedNeverConsultsPolicy`, `TestCallToolShellShapedScriptRejectedOverWire`: zero `Executor.Run` calls, asserted directly). The "manually via `log stream`" half of this criterion is folded into the same deferred TCC/launchd manual pass below, since it needs a live kahyad instance to observe.
+- [ ] **DEFERRED — needs the user.** `docs/tcc-automation.md` committed (done — see the file) and followed once for at least one app (screenshot or `System Settings > Privacy & Security > Automation` entry noted in the task log) — this is the live TCC grant itself, see Status above.
+- [x] Timeout test green (stub executor that sleeps): process group killed at the limit, `osascript_timeout` ledger event with `trace_id` exists (`TestRunApplescriptTimeoutKillsAndLedgers`, `TestRunShortcutTimeoutKillsAndLedgers`; the REAL process-group kill mechanics are additionally proven against a real `sleep` subprocess in `TestProcessGroupExecutorKillsOnTimeout`).
+- [x] `shortcuts_run` approval payload contains the shortcut name + canonical input path and nothing else (test asserts the serialized payload bytes) — `kahyad/internal/approval/payload_test.go`'s `TestBuildShortcut_PayloadContainsOnlyNameAndInputPath` decodes the length-prefixed `CanonicalBytes` and asserts exactly 3 fields; `mcp/osascript/shortcuts_test.go`'s `TestShortcutsRunApprovalToolInputContainsOnlyNameAndInputPath` asserts the same at the tool_input-envelope layer.
 
 ## Out of scope
 - Sliding decision: if W3 is running late, mark this task `[ ]` and move on — W3-10 does not depend on it (per BACKLOG deps and §6 timing note). It must be done before W7-8.

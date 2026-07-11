@@ -130,10 +130,11 @@ func validate(doc Document) error {
 	return nil
 }
 
-// validateTool implements the three tool-level rules: Name non-empty,
+// validateTool implements the four tool-level rules: Name non-empty,
 // Class in the R|W1|W2|W3 enum, reversible=true requires a non-empty
-// Undo, and class=W3 forbids reversible=true (W3 is irreversible by
-// definition, HANDOFF §4).
+// Undo, class=W3 forbids reversible=true (W3 is irreversible by
+// definition, HANDOFF §4), and the W3-09 osascript/JXA/Shortcuts W2 floor
+// (below).
 func validateTool(t ToolRule) error {
 	if strings.TrimSpace(t.Name) == "" {
 		return fmt.Errorf("policy: tool entry has empty name")
@@ -147,7 +148,24 @@ func validateTool(t ToolRule) error {
 	if t.Class == ClassW3 && t.Reversible {
 		return fmt.Errorf("policy: tool %q is class W3 but reversible: true (W3 is irreversible by definition)", t.Name)
 	}
+	if osascriptFloorTools[t.Name] && (t.Class == ClassR || t.Class == ClassW1) {
+		return fmt.Errorf("policy: tool %q must be class W2 or W3 (HANDOFF §5 safety #6: osascript/JXA/Shortcuts bodies are the same arbitrary-code class as shell — static label >= W2), got %q", t.Name, t.Class)
+	}
 	return nil
+}
+
+// osascriptFloorTools are the three W3-09 tool names (mcp/osascript:
+// applescript_run/jxa_run/shortcuts_run) HANDOFF §5 safety #6 ⚑ names
+// explicitly: "osascript/JXA/Shortcuts gövdeleri shell ile aynı 'keyfi
+// kod' sınıfıdır — statik etiketi en az W2". Enforced HERE, at load time
+// — exactly like MandatoryFSWriteDenyGlobs — so a policy.yaml that tries
+// to register one of these three below W2 fails to LOAD at all, rather
+// than merely being a bad idea an operator could commit by mistake and
+// have it silently take effect.
+var osascriptFloorTools = map[string]bool{
+	"applescript_run": true,
+	"jxa_run":         true,
+	"shortcuts_run":   true,
 }
 
 // validateGlobSyntax compiles every entry in globs with doublestar (the

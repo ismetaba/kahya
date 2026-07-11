@@ -34,6 +34,7 @@ import (
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
 	"kahya/mcp/memory"
+	mcposascript "kahya/mcp/osascript"
 	mcpshell "kahya/mcp/shell"
 )
 
@@ -129,6 +130,13 @@ type Server struct {
 	// shellServer.Shutdown to kill every kahya.task_id-labeled container
 	// this daemon may have left running (this task's spec step 7).
 	shellServer *mcpshell.Server
+
+	// osascriptServer is the W3-09 osascript MCP tool set (applescript_run/
+	// jxa_run/shortcuts_run), registered onto the SAME shared /v1/mcp
+	// server as mcp/memory's/mcp/fs's/mcp/shell's own tools
+	// (buildMCPHandler). nil until SetOsascriptTool is called - see
+	// osascript.go.
+	osascriptServer *mcposascript.Server
 
 	// anthGovernor/anthNotifier/anthCredential/anthEgressGateFactory wire
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor

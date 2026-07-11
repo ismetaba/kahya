@@ -1,0 +1,32 @@
+# Same as valid.yaml, but applescript_run is registered as class W1 —
+# below the mandatory W2 floor the three W3-09 osascript/JXA/Shortcuts
+# tool names (applescript_run/jxa_run/shortcuts_run) must never go under
+# (HANDOFF §5 safety #6 [flag]: "statik etiketi en az W2").
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+  - name: applescript_run
+    class: W1
+    reversible: false
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+  default_daily_byte_budget: 26214400

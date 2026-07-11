@@ -120,3 +120,94 @@ func TestBuildMessage_Fields(t *testing.T) {
 		t.Fatalf("changing recipient or body must each change the hash")
 	}
 }
+
+// decodeLengthPrefixedFields reverses encodeFields' own
+// [len uint64 big-endian][bytes]... layout — used ONLY by this test to
+// prove a payload's CanonicalBytes carries EXACTLY the fields the spec
+// says and no more, rather than merely re-deriving the same bytes
+// encodeFields would produce (which would pass even if BuildShortcut
+// silently started including an extra field, as long as this test's own
+// expectation string also silently grew to match).
+func decodeLengthPrefixedFields(t *testing.T, b []byte) [][]byte {
+	t.Helper()
+	var fields [][]byte
+	for len(b) > 0 {
+		if len(b) < 8 {
+			t.Fatalf("truncated length prefix in %d remaining bytes", len(b))
+		}
+		n := uint64(0)
+		for i := 0; i < 8; i++ {
+			n = n<<8 | uint64(b[i])
+		}
+		b = b[8:]
+		if uint64(len(b)) < n {
+			t.Fatalf("field length %d exceeds %d remaining bytes", n, len(b))
+		}
+		fields = append(fields, b[:n])
+		b = b[n:]
+	}
+	return fields
+}
+
+// TestBuildShortcut_PayloadContainsOnlyNameAndInputPath is W3-09's own
+// acceptance criterion, verbatim: "shortcuts_run approval payload
+// contains ONLY the shortcut name + canonical input path and nothing
+// else (test asserts the serialized payload bytes)" — decoded field by
+// field (not merely re-derived via encodeFields, which would trivially
+// match itself), asserting EXACTLY three fields: kind, name, input path.
+func TestBuildShortcut_PayloadContainsOnlyNameAndInputPath(t *testing.T) {
+	p := BuildShortcut("Yedekle", "/Users/kahya/Desktop/girdi.txt")
+
+	if p.Kind != KindShortcut {
+		t.Fatalf("Kind = %q, want %q", p.Kind, KindShortcut)
+	}
+
+	fields := decodeLengthPrefixedFields(t, p.CanonicalBytes)
+	if len(fields) != 3 {
+		t.Fatalf("decoded %d fields, want exactly 3 (kind, name, input_path); fields=%q", len(fields), fields)
+	}
+	if got := string(fields[0]); got != string(KindShortcut) {
+		t.Errorf("field[0] (kind) = %q, want %q", got, KindShortcut)
+	}
+	if got := string(fields[1]); got != "Yedekle" {
+		t.Errorf("field[1] (name) = %q, want %q", got, "Yedekle")
+	}
+	if got := string(fields[2]); got != "/Users/kahya/Desktop/girdi.txt" {
+		t.Errorf("field[2] (input_path) = %q, want %q", got, "/Users/kahya/Desktop/girdi.txt")
+	}
+}
+
+// TestBuildShortcut_Fields checks the shortcut serialization incorporates
+// name and input path (the hash-changes-on-either-field-changing pattern
+// every other Build* test in this file already uses).
+func TestBuildShortcut_Fields(t *testing.T) {
+	base := BuildShortcut("Yedekle", "/tmp/a.txt")
+	diffName := BuildShortcut("Baska", "/tmp/a.txt")
+	diffPath := BuildShortcut("Yedekle", "/tmp/b.txt")
+	noPath := BuildShortcut("Yedekle", "")
+
+	if base.Hash == diffName.Hash || base.Hash == diffPath.Hash || base.Hash == noPath.Hash {
+		t.Fatalf("changing name or input path must each change the hash")
+	}
+}
+
+// TestBuildShortcut_FlagsSurfaceBidiInName proves a bidi/zero-width rune
+// hidden inside the shortcut NAME is surfaced via Flags (HANDOFF §5
+// safety #5: "never dropped invisibly") — mirrors every other Build*
+// function's own Flags convention (BuildMessage/BuildEgress/
+// BuildFileEdit), which BuildShortcut must not silently omit.
+func TestBuildShortcut_FlagsSurfaceBidiInName(t *testing.T) {
+	p := BuildShortcut("Yedekle‮evil", "/tmp/a.txt")
+	if len(p.Flags) == 0 {
+		t.Fatal("Flags is empty, want the RLO override rune surfaced")
+	}
+	found := false
+	for _, f := range p.Flags {
+		if f.Kind == canon.FlagBidi {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Flags = %+v, want a FlagBidi entry", p.Flags)
+	}
+}
