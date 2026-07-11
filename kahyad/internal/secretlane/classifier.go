@@ -54,26 +54,87 @@ type Verdict struct {
 
 // --- Deterministic pre-pass: IBAN / TCKN / card number / CVV ---
 
-// ibanRe matches a Turkish IBAN: "TR" + 2 check digits + 22 more digits
-// (24 digits total after "TR"), tolerating the conventional
-// space-every-4-digits grouping (or none at all) - task spec fixture:
-// "TR33 0006 1005 1978 6457 8413 26".
-var ibanRe = regexp.MustCompile(`(?i)\bTR\d{2}(?:[ ]?\d{4}){5}[ ]?\d{2}\b`)
+// ibanCandidateRe finds a Turkish IBAN CANDIDATE: a word-bounded "TR"
+// immediately followed by a run of digits and conventional grouping
+// separators (space or dash) long enough to contain the required 24
+// digits. This is deliberately format-agnostic - it matches the
+// four-by-four convention ("TR33 0006 1005 1978 6457 8413 26"), fully
+// unspaced ("TR330006100519786457841326"), dash-separated
+// ("TR33-0006-1005-1978-6457-8413-26"), or irregular/mixed grouping alike,
+// and is NOT anchored to the whole string so it fires just as well
+// embedded mid-sentence ("Hesap numaram: TR33... lütfen bu hesaba
+// gönderin"). A candidate is only FINAL once isValidIBANStructure
+// confirms the right digit COUNT once separators are stripped - "TR"
+// followed by some unrelated digits is not enough on its own.
+var ibanCandidateRe = regexp.MustCompile(`(?i)\bTR[0-9 \-]{24,40}`)
+
+// isValidIBANStructure reports whether s (an ibanCandidateRe match),
+// once every ASCII space/dash grouping separator is stripped out, is
+// exactly "TR" + 24 digits - a Turkish IBAN's fixed length regardless of
+// how it was grouped in the source text. This mirrors the task spec's own
+// format ("TR" + 24 digits) - no mod-97 checksum is required or
+// implemented, matching the pre-existing behavior this replaces.
+func isValidIBANStructure(s string) bool {
+	stripped := stripSeparators(strings.ToUpper(s))
+	if !strings.HasPrefix(stripped, "TR") {
+		return false
+	}
+	digits := stripped[2:]
+	if len(digits) != 24 {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// stripSeparators removes ASCII space and dash grouping separators (the
+// only two this package's IBAN/card normalization tolerates) from s.
+func stripSeparators(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == ' ' || r == '-' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
 
 // tcknCandidateRe finds any word-bounded run of exactly 11 digits - a TCKN
 // (Turkish national ID number) candidate, verified below by its checksum
 // (an arbitrary 11-digit run is NOT enough on its own - e.g. a phone
-// number with a leading 0 stripped could collide).
+// number with a leading 0 stripped could collide). \b is a digit/non-digit
+// transition, not a whole-string anchor, so this already fires on an 11-
+// digit run embedded anywhere in a larger sentence ("TC kimlik numaram
+// 10000000146 şeklinde") - confirmed by
+// TestClassifyDeterministicTCKNEmbeddedInSentence.
 var tcknCandidateRe = regexp.MustCompile(`\b\d{11}\b`)
 
 // cardCandidateRe finds digit runs shaped like a payment card number: 13
-// to 19 digits, optionally grouped by spaces or dashes (every real card
-// network's PAN length range) - verified below by the Luhn checksum.
+// to 19 digits, optionally grouped by spaces OR dashes, in any mix
+// (every real card network's PAN length range) - verified below by the
+// Luhn checksum after stripNonDigits normalizes away whatever separator
+// was used. Confirmed dash-grouped ("4111-1111-1111-1111"), space-grouped
+// ("4111 1111 1111 1111") and unspaced all normalize correctly by
+// TestClassifyDeterministicCardNumberDashSeparated /
+// TestClassifyDeterministicCardNumberUnspaced.
 var cardCandidateRe = regexp.MustCompile(`\b(?:\d[ -]?){12,18}\d\b`)
 
 // cvvRe matches an explicit CVV/CVC label followed by a 3-4 digit code -
 // task spec fixture keyword: "kredi kartı ekstresi" is covered by the
-// finans keyword lexicon below, this pattern is the CVV-specific one.
+// finans keyword lexicon below, this pattern is the CVV-specific one. A
+// bare 3-4 digit run with NO "cvv"/"cvv2" cue never matches this (avoids
+// false-positiving on any random short number) - the "güvenlik kodu" cue
+// variant ("güvenlik kodu 123") is instead covered unconditionally by the
+// finans keyword lexicon below (it already lists "güvenlik kodu"/
+// "guvenlik kodu" as a phrase, independent of whether a number follows),
+// so between the two, every context-cued CVV mention is caught while a
+// bare "123" alone still is not.
 var cvvRe = regexp.MustCompile(`(?i)\bcvv2?\b\s*[:\-=]?\s*\d{3,4}\b`)
 
 // isValidTCKN implements the standard Turkish national ID checksum
@@ -158,7 +219,23 @@ func stripNonDigits(s string) string {
 
 var saglikKeywords = foldAll([]string{
 	"tahlil sonuçları", "tahlil sonuclari", "tahlil sonucu",
-	"sağlık", "saglik", "hastane", "reçete", "recete",
+	// Bare "tahlil" (lab test/analysis) ALSO stands alone so it substring-
+	// matches inside a Turkish suffix compound the phrases above don't
+	// cover, e.g. "tahlillerim" (my test results): "tahlillerim" contains
+	// "tahlil" as a prefix, so no separate suffix table is needed here -
+	// this is exactly the review fixture ("tahlil" in "tahlillerim").
+	"tahlil",
+	"sağlık", "saglik",
+	// "sağlığ"/"saglig" are the Turkish consonant-softening (yumuşama)
+	// stem of "sağlık"/"saglik": a vowel-initial possessive suffix turns
+	// the word-final k into ğ (sağlık + -ım -> sağlığım, "my health"), so
+	// plain "sağlık" is NEVER a substring of "sağlığım" - this stem entry
+	// is what the review fixture ("sağlık" in "sağlığım") actually needs,
+	// not the unsuffixed form above. Both the Turkish-diacritic and
+	// ASCII-folded spellings are listed for the same reason every other
+	// pair in this lexicon is (Fold does not touch ğ).
+	"sağlığ", "saglig",
+	"hastane", "reçete", "recete",
 	"teşhis", "teshis", "diagnoz", "ilaç", "ilac",
 	"ameliyat", "psikiyatr", "psikolog", "doktor raporu",
 	"epikriz", "biyopsi", "tetkik sonucu", "kan tahlili",
@@ -193,8 +270,10 @@ func foldAll(words []string) []string {
 // (task spec: "a hit is final: secret-lane, no model needed") - ok=false
 // means nothing matched, so the caller falls through to Qwen.
 func classifyDeterministic(text string) (Verdict, bool) {
-	if ibanRe.MatchString(text) {
-		return Verdict{SecretLane: true, Category: CategoryFinans, Reason: "iban"}, true
+	for _, m := range ibanCandidateRe.FindAllString(text, -1) {
+		if isValidIBANStructure(m) {
+			return Verdict{SecretLane: true, Category: CategoryFinans, Reason: "iban"}, true
+		}
 	}
 	for _, m := range tcknCandidateRe.FindAllString(text, -1) {
 		if isValidTCKN(m) {

@@ -67,6 +67,59 @@ One RAM-exhaustion drill was **not** performed as a real test (rather than a fak
 
 Not wired in this task (explicitly out of scope, see below): `memory_write`/fs-read/mail-web classifier escalation (W4-03); Telegram redaction consulting the persisted task lane in addition to its existing path-glob check (W3-07's `isSecretLane` already redacts any secret-lane-labeled approval by path; extending it to also consult `tasks.lane` is a small, independent follow-up left for a future pass — the core §5 safety #5 guarantee, "gizli-şerit tek bir bayt Telegram'a gönderilmez", already holds for every path-glob-detected case W3-07 covers, and secret-lane tasks per this task never reach a Telegram-approval-worthy W1/W2 action in the first place since the worker is never spawned for them).
 
+### Post-review scope note
+
+A security review of the deterministic pre-pass (`secretlane.ClassifyDeterministic`,
+the classifier `POST /v1/task` uses on the raw chat prompt - see `task.go`'s
+own classification comment) found that mis-formatted / sentence-embedded
+structured secrets were sailing past it to the cloud: an unspaced or
+dash-grouped IBAN, a dash/space-grouped card number, a TCKN embedded
+mid-sentence, and Turkish-suffixed keyword forms (e.g. "sağlığım", the
+consonant-softened form of "sağlık"; "tahlillerim", "my test results")
+were not matched. All five detectors (IBAN, TCKN, card number, CVV,
+sağlık/finans/kimlik keyword lexicon) in `kahyad/internal/secretlane/
+classifier.go` were fixed/hardened to be format-robust - see that file's
+own doc comments on `ibanCandidateRe`/`isValidIBANStructure`,
+`tcknCandidateRe`, `cardCandidateRe`, `cvvRe`, and the `saglikKeywords`
+"tahlil"/"sağlığ"/"saglig" entries - with regression fixtures added to
+`classifier_test.go` for each mis-formatted case (unspaced/dash-separated/
+mid-sentence IBAN, mid-sentence TCKN, dash/unspaced card number, cued CVV,
+suffixed sağlık/tahlil keywords, and a multi-line payload where only one
+line is secret). This was a genuine bug fix, not a scope change.
+
+Separately, and NOT a bug: the review also surfaced, as a question rather
+than a defect, exactly WHICH classifier `POST /v1/task`'s chat-prompt path
+should use. This is the deliberate, recorded answer:
+
+- **Chat prompt (`POST /v1/task`, user-authored direct input):**
+  `secretlane.ClassifyDeterministic` - the deterministic regex/lexicon
+  pre-pass ONLY, no Qwen dependency. This is what the original task text
+  above ("One deliberate scope decision...") already documented; this note
+  additionally ties it explicitly to HANDOFF §4's own wording: "mail/web
+  gibi içerik-kaynaklı veride gizli-şerit kararı yerel içerik-
+  sınıflandırıcıyla **alım anında** verilir" is specified for
+  content-SOURCED / ingested data, decided at ingest time via the W4-03
+  Reader path - it is not specified for a prompt the user typed directly
+  into the assistant.
+- **Content-sourced/ingested data (mail/web/files, W4-03 Reader path):**
+  the full Qwen-backed `secretlane.Classifier` (deterministic pre-pass +
+  Qwen fallback, fail-closed on any Qwen error/timeout) - already fully
+  implemented and wired to `Server.SetSecretLane`, not yet called by any
+  W4-03 ingestion point because W4-03 has not landed.
+
+Consequence, stated explicitly rather than left implicit: a chat prompt
+the user types themselves that names a secret in natural language only -
+no structured marker (IBAN/TCKN/card/CVV) and no sağlık/finans/kimlik
+lexicon term - is out of the deterministic pre-pass's reach and is the
+user's own choice in phrasing it that way directly to the assistant, not a
+silent gap. Always loading the 30B Qwen model for every ordinary chat
+prompt to close this was considered and rejected again here, for the same
+reason it was rejected the first time: it defeats on-demand
+load/idle-unload and breaks the hermetic `tests/e2e/w12_gate_test.go` gate
+(confirmed by re-running that gate after this pass; `/v1/task` remains
+model-free). No re-architecture was done; `task.go`'s own classification
+comment now carries the same explicit scope statement in code.
+
 ## Out of scope
 - Reader/Actor taint split and mail/web ingestion pipelines — W4-03 (this task exposes the classifier they will call).
 - Embedding service / `Qwen3-Embedding-0.6B` — W12-11.

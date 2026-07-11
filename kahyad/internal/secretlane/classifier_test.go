@@ -110,6 +110,158 @@ func TestClassifyDeterministicASCIIFoldedKeywordVariant(t *testing.T) {
 	}
 }
 
+// --- Post-review regression fixtures: format-robustness of the
+// deterministic pre-pass (mis-formatted / sentence-embedded structured
+// secrets must not sail past to the cloud). See
+// tasks/w3-policy-tools/W3-08-secret-lane-local.md's "Post-review scope
+// note".
+
+func TestClassifyDeterministicIBANUnspaced(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "IBAN'ım TR330006100519786457841326")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for an unspaced IBAN", v)
+	}
+}
+
+func TestClassifyDeterministicIBANDashSeparated(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "Hesap: TR33-0006-1005-1978-6457-8413-26 bu hesaba gönderin")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for a dash-separated IBAN", v)
+	}
+}
+
+func TestClassifyDeterministicIBANEmbeddedInSentence(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "arkadaşıma TR33 0006 1005 1978 6457 8413 26 numaralı hesaptan para gönderdim dün akşam")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for a mid-sentence IBAN", v)
+	}
+}
+
+func TestClassifyDeterministicTCKNEmbeddedInSentence(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "TC kimlik numaram 10000000146 şeklinde, gerekirse iletirim")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryKimlik {
+		t.Errorf("Classify() = %+v, want secret-lane kimlik for a sentence-embedded TCKN", v)
+	}
+}
+
+func TestClassifyDeterministicCardNumberDashSeparated(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "kartım 4111-1111-1111-1111 son kullanma 12/29")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for a dash-separated card number", v)
+	}
+}
+
+func TestClassifyDeterministicCardNumberUnspaced(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "kart no 4111111111111111")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for an unspaced card number", v)
+	}
+}
+
+func TestClassifyDeterministicCVVWithCue(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "kart arkasındaki cvv 123 lazım olacak")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for 'cvv 123'", v)
+	}
+}
+
+func TestClassifyDeterministicGuvenlikKoduCue(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "güvenlik kodu 123 az önce geldi")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for 'güvenlik kodu 123'", v)
+	}
+}
+
+func TestClassifyDeterministicCVVBareDigitsNotSecretLane(t *testing.T) {
+	// Guards the false-positive side: a bare 3-digit number with NO
+	// cvv/güvenlik-kodu cue must NOT itself trip the deterministic
+	// pre-pass (it would fall through to Qwen instead, same as any other
+	// ordinary text).
+	v, ok := classifyDeterministic("oda numaram 123, akşam görüşürüz")
+	if ok {
+		t.Errorf("classifyDeterministic() = %+v, ok=true, want ok=false for a bare uncued 3-digit number", v)
+	}
+}
+
+func TestClassifyDeterministicSaglikSuffixedSagligim(t *testing.T) {
+	// "sağlığım" (my health) is the consonant-softened (yumuşama) form of
+	// "sağlık" - plain "sağlık" is never a substring of it, so this
+	// exercises the dedicated "sağlığ" stem entry.
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "son zamanlarda sağlığım pek iyi değil, doktora gitmem lazım")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategorySaglik {
+		t.Errorf("Classify() = %+v, want secret-lane saglik for 'sağlığım'", v)
+	}
+}
+
+func TestClassifyDeterministicSaglikSuffixedTahlillerim(t *testing.T) {
+	// "tahlillerim" (my test results) contains "tahlil" as a prefix - the
+	// bare "tahlil" lexicon entry (added alongside the existing "tahlil
+	// sonuçları" phrases) is what catches this.
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "tahlillerim yarın çıkacakmış, biraz endişeliyim")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategorySaglik {
+		t.Errorf("Classify() = %+v, want secret-lane saglik for 'tahlillerim'", v)
+	}
+}
+
+func TestClassifyDeterministicMixedPayloadSecretOnOneLine(t *testing.T) {
+	// A single secret-lane line anywhere in an otherwise ordinary
+	// multi-line payload must classify the WHOLE payload secret-lane -
+	// the deterministic pre-pass scans the entire text, not line-by-line
+	// with an early "looks fine so far" exit.
+	c := NewClassifier(nil)
+	payload := "bugün hava çok güzel, parkta yürüyüş yaptım\n" +
+		"akşam yemeği için markete uğrayacağım\n" +
+		"bu arada IBAN'ım TR330006100519786457841326, unutmadan not aldım\n" +
+		"yarın toplantı saat 10'da"
+	v, err := c.Classify(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if !v.SecretLane || v.Category != CategoryFinans {
+		t.Errorf("Classify() = %+v, want secret-lane finans for a multi-line payload with an IBAN on line 3", v)
+	}
+}
+
 // --- Fail-closed: no local classifier / Qwen error / non-JSON ---
 
 func TestClassifyNilQwenFailsClosed(t *testing.T) {

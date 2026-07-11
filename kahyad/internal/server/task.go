@@ -251,6 +251,29 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// (kahyad/internal/secretlane.Escalate) would STICKILY widen this exact
 	// task's lane to secret if any of them find something the chat prompt
 	// itself did not.
+	//
+	// SCOPE DECISION (post-review, explicit and deliberate - not a gap):
+	// HANDOFF §4's ordering invariant reads "policy.yaml globları yalnız
+	// dosya yolları için; mail/web gibi içerik-kaynaklı veride gizli-şerit
+	// kararı yerel içerik-sınıflandırıcıyla alım anında verilir" - i.e. the
+	// FULL local-classifier decision is specified for content-SOURCED /
+	// ingested data (mail/web/files), decided AT INGEST TIME via the W4-03
+	// Reader path. A user's own directly-typed chat prompt is a different
+	// thing: it is user-authored direct input, not ingested content, so it
+	// is handled by the deterministic pre-pass ONLY, here. This is what
+	// keeps kahyad from loading the 30B-parameter Qwen model on every single
+	// ordinary chat message (defeating on-demand load/idle-unload) and
+	// keeps the hermetic W12-10 e2e gate model-free. The consequence, made
+	// explicit rather than left implicit: a prompt the user types themselves
+	// that describes a secret in natural language ONLY - no IBAN/TCKN/card
+	// number/CVV, no sağlık/finans/kimlik lexicon term - is genuinely out of
+	// the deterministic pre-pass's reach and will be routed by whatever the
+	// normal (cloud) lane would do. That is the user's own choice in typing
+	// it directly to the assistant, not a silent classifier miss; it is NOT
+	// in scope for this ingestion point to catch, and this is intentionally
+	// NOT being "fixed" by always-loading Qwen here (see
+	// tasks/w3-policy-tools/W3-08-secret-lane-local.md's "Post-review scope
+	// note").
 	lane := spawn.LaneNormal
 	category := ""
 	verdict := secretlane.ClassifyDeterministic(req.Prompt)
