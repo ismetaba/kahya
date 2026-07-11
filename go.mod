@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/modelcontextprotocol/go-sdk v1.0.0
 	github.com/pressly/goose/v3 v3.27.2

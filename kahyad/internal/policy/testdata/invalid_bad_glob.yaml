@@ -1,0 +1,25 @@
+# Same as valid.yaml, but one secret_lane_globs entry has an unterminated
+# character class - a syntactically invalid doublestar pattern.
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+secret_lane_globs:
+  - "~/Documents/saglik/[unterminated"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+  default_daily_byte_budget: 26214400

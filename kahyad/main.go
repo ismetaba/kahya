@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secrets"
 	"kahya/kahyad/internal/server"
@@ -34,11 +36,50 @@ import (
 )
 
 func main() {
-	os.Exit(run())
+	os.Exit(dispatch(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// run contains main's logic and returns the process exit code, so defers
-// (closing the log file) actually execute before the process exits.
+// dispatch handles kahyad's argv-based subcommands. Currently the only one
+// is "policy validate" (W3-01 acceptance criterion); any other argv
+// (including none at all) runs the daemon itself (run()), matching every
+// prior release's behavior exactly - kahyad has never taken positional
+// arguments before this task.
+func dispatch(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "policy" {
+		return runPolicyCLI(args[1:], stdout, stderr)
+	}
+	return run()
+}
+
+// runPolicyCLI implements `kahyad policy validate [path]` (W3-01): loads
+// and strictly validates a policy.yaml, printing the tool count and
+// exiting 0 on success, or the validation error (Turkish, per CLAUDE.md's
+// user-facing-string language policy) and exiting 1 on any failure. path
+// defaults to policy.DefaultPath() (the repo-root policy.yaml derived
+// from this binary's own install location, kahyad/internal/policy.
+// DefaultPath's doc comment) when omitted - matching the task spec's "a
+// policy.yaml path arg or the default repo-root one".
+func runPolicyCLI(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] != "validate" {
+		fmt.Fprintln(stderr, "usage: kahyad policy validate [path]")
+		return 2
+	}
+	path := policy.DefaultPath()
+	if len(args) > 1 {
+		path = args[1]
+	}
+	pol, err := policy.Load(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "policy.yaml geçersiz: %s\n", err.Error())
+		return 1
+	}
+	fmt.Fprintf(stdout, "policy.yaml geçerli: %d araç tanımlı.\n", len(pol.Tools))
+	return 0
+}
+
+// run contains the daemon's logic and returns the process exit code, so
+// defers (closing the log file) actually execute before the process
+// exits.
 func run() int {
 	bootTraceID := traceid.New()
 
@@ -66,6 +107,25 @@ func run() int {
 		"socket", cfg.Socket,
 		"pid", os.Getpid(),
 	)
+
+	// W3-01: load + strictly validate policy.yaml BEFORE the UDS listener
+	// (bound further below, inside srv.Run's Prepare) can accept a single
+	// /policy/check or /v1/mcp request. Any error here — a missing file, an
+	// unknown YAML key, a bad class, a W3 tool marked reversible, a missing
+	// mandatory fs_write_deny_globs entry, anything — means kahyad boots
+	// into PERMANENT deny-all mode (tasks/README.md global convention:
+	// policy error => DENY, never a permissive fallback) rather than
+	// refusing to start at all: refusing to start would silently take down
+	// every other already-working capability (health checks, log
+	// tailing...) over a policy typo, when fail-closed on the tool-gating
+	// surface alone is the more precise fix. policyLoadErr is consulted
+	// again just below, once srv exists, to flip SetDenyAll.
+	pol, policyLoadErr := policy.Load(cfg.PolicyPath)
+	if policyLoadErr != nil {
+		log.Error("policy_load_failed", "path", cfg.PolicyPath, "err", policyLoadErr.Error())
+	} else {
+		log.Info("policy_loaded", "path", cfg.PolicyPath, "tools", len(pol.Tools))
+	}
 
 	// Serialize the WHOLE startup — including migrations — across
 	// processes: kahyad is brain.db's only writer, so at most one kahyad
@@ -97,6 +157,9 @@ func run() int {
 
 	srv := server.New(cfg, log, buildinfo.Version, st)
 	srv.AdoptStartupLock(lock)
+	if policyLoadErr != nil {
+		srv.SetDenyAll()
+	}
 
 	// Local MLX embedding service (W12-11): kahyad-supervised, lazily
 	// spawned on first embedding need (never at boot - HANDOFF §6 timing

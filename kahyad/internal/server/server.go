@@ -111,6 +111,18 @@ type Server struct {
 	anthCredential anthproxy.CredentialSource
 	anthEgressGate func(*http.Request) error
 
+	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
+	// Prepare) when policy.yaml failed to load/validate at boot. Both
+	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
+	// policyGateMiddleware (mcp.go) consult it BEFORE consulting
+	// kahyad/internal/policy's interim static table (or, once W3-02 lands,
+	// the real ladder engine) - deny-all overrides even memory_search, the
+	// one tool the interim table itself allows. There is deliberately no
+	// path back out of deny-all short of restarting kahyad with a fixed
+	// policy.yaml (HANDOFF §4 fail-closed posture: a policy load failure is
+	// a startup-time, not a runtime-recoverable, condition).
+	denyAll bool
+
 	ln   net.Listener
 	http *http.Server
 	// lock is the exclusive startup flock on <socket>.lock, held for the
@@ -159,6 +171,22 @@ func (s *Server) SetReindexer(r Reindexer) {
 // /health reports "embed":"disabled" until an EmbedHealth is set.
 func (s *Server) SetEmbedHealth(sup EmbedHealth) {
 	s.embedHealth = sup
+}
+
+// SetDenyAll puts the server into permanent deny-all mode (W3-01): every
+// subsequent /policy/check response and /v1/mcp tools/call is denied,
+// regardless of tool name - including memory_search, the one tool the
+// interim static table itself allows. main.go calls this BEFORE Prepare
+// (so no /policy/check can ever be answered any other way) whenever
+// policy.Load(cfg.PolicyPath) fails; it also logs event=policy_load_failed
+// itself, in the same boot sequence, before the socket is even bound.
+func (s *Server) SetDenyAll() {
+	s.denyAll = true
+}
+
+// DenyAll reports whether the server is in W3-01 deny-all mode.
+func (s *Server) DenyAll() bool {
+	return s.denyAll
 }
 
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and

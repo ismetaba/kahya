@@ -1,0 +1,27 @@
+# Same as valid.yaml, but fs_write_deny_globs is missing specifically the
+# "~/Library/Application Support/Kahya/**" mandatory entry (every other
+# mandatory glob is present) - the defter/DB self-tampering guard.
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+  default_daily_byte_budget: 26214400

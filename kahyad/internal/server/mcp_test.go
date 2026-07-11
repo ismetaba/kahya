@@ -15,6 +15,7 @@ import (
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/indexer"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/store"
 	"kahya/mcp/memory"
@@ -146,6 +147,69 @@ func TestMCPToolsListReturnsExactlyThreeTools(t *testing.T) {
 		if !names[want] {
 			t.Errorf("missing tool %q; got %+v", want, parsed.Result.Tools)
 		}
+	}
+}
+
+// newMCPTestFixtureDenyAll is newMCPTestFixture's twin, but with
+// SetDenyAll called before Prepare - simulating a policy.yaml load
+// failure at boot (W3-01).
+func newMCPTestFixtureDenyAll(t *testing.T) mcpTestFixture {
+	t.Helper()
+	repoRoot := t.TempDir()
+	memDir := filepath.Join(repoRoot, "memory")
+	if err := os.MkdirAll(memDir, 0o700); err != nil {
+		t.Fatalf("mkdir memory dir: %v", err)
+	}
+	runGitCmd(t, repoRoot, "init", "-q")
+
+	cfg := config.Config{DBPath: filepath.Join(t.TempDir(), "brain.db"), MemoryDir: memDir}
+	st, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	log := testLogger(t)
+	idx := indexer.New(st.DB(), memDir, log)
+	searcher := search.New(st.DB(), log, search.DefaultConfig())
+
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), log, "v-mcp-denyall-test", healthyDB)
+	srv.SetSearcher(searcher)
+	srv.SetEventLogger(st)
+	srv.SetMCPMemory(memDir, idx)
+	srv.SetDenyAll()
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	go srv.Serve() //nolint:errcheck
+	t.Cleanup(func() { srv.Shutdown() })
+
+	return mcpTestFixture{
+		srv: srv, client: unixHTTPClient(socketPath),
+		memoryDir: memDir, repoRoot: repoRoot, store: st,
+	}
+}
+
+// TestMCPGateDenyAllModeDeniesEvenMemorySearch is W3-01's deny-all
+// acceptance criterion applied to the /v1/mcp mount point: while deny-all
+// mode is active, even memory_search - the ONE tool the interim static
+// table itself allows - is denied, with policy.RuleDenyAllV1 as its rule.
+func TestMCPGateDenyAllModeDeniesEvenMemorySearch(t *testing.T) {
+	f := newMCPTestFixtureDenyAll(t)
+
+	resp := postMCP(t, f.client, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"test"}}}`)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var parsed jsonrpcToolCallResult
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("decode: %v\nbody=%s", err, body)
+	}
+	if !parsed.Result.IsError {
+		t.Fatalf("memory_search under deny-all: result.isError = false, want true; body=%s", body)
+	}
+	if len(parsed.Result.Content) == 0 || parsed.Result.Content[0].Text != policy.ReasonDenyAll {
+		t.Fatalf("deny-all message = %+v, want %q", parsed.Result.Content, policy.ReasonDenyAll)
 	}
 }
 

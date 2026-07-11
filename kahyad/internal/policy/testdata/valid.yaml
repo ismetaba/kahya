@@ -1,0 +1,39 @@
+# Minimal-but-representative valid fixture (W3-01 test step 7): one tool
+# per class, a Turkish-path-matching secret_lane_globs entry, the full
+# mandatory fs_write_deny_globs set, and a valid egress block.
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+  - name: memory_write
+    class: W1
+    reversible: true
+    undo: "git revert of the memory commit"
+  - name: shell_docker
+    class: W2
+    reversible: false
+  - name: mail_send
+    class: W3
+    reversible: false
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+    - host: api.telegram.org
+  default_daily_byte_budget: 26214400

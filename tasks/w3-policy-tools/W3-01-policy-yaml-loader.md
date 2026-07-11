@@ -1,6 +1,6 @@
 # W3-01 — policy.yaml schema + validating loader
 
-**Status:** todo
+**Status:** done
 **Phase:** W3 — Policy + tools
 **Depends on:** W12-01
 **Flags:** none
@@ -51,11 +51,11 @@ Prior output you build on: W12-01 gives the kahyad skeleton, config loading, JSO
 7. Tests: valid fixture loads; each validation rule has a failing fixture; a fixture with `fs_write_deny_globs` missing `~/Library/Application Support/Kahya/**` fails; glob matching works on paths containing Turkish characters (fixture path `~/Documents/saglik/tahlil-sonuçları.pdf` matches `~/Documents/saglik/**` byte-exactly, no ASCII folding).
 
 ## Acceptance criteria
-- [ ] `go test ./kahyad/internal/policy/...` green and included in `make test`.
-- [ ] `policy.yaml` at repo root parses: a `kahyad policy validate` subcommand (add it) exits 0 and prints the tool count; `kahyad policy validate` against a fixture missing a mandatory deny glob exits non-zero.
-- [ ] Start kahyad with a deliberately broken `policy.yaml`: JSONL log contains `"event":"policy_load_failed"` and a subsequent `POST /policy/check` over the UDS returns DENY (deny-all mode) — verify with `curl --unix-socket ~/Library/Application\ Support/Kahya/kahyad.sock`.
-- [ ] Test proves W3-class tool with `reversible: true` is rejected at load.
-- [ ] All four mandatory deny-glob families (§5 #6 quote above: shell rc/profile files; `~/Library/LaunchAgents/**`; `~/.hammerspoon/**`; `~/Library/Application Support/Kahya/**`) present in committed `policy.yaml` — checked by a test, not by eyeball.
+- [x] `go test ./kahyad/internal/policy/...` green and included in `make test`.
+- [x] `policy.yaml` at repo root parses: a `kahyad policy validate` subcommand (add it) exits 0 and prints the tool count; `kahyad policy validate` against a fixture missing a mandatory deny glob exits non-zero.
+- [x] Start kahyad with a deliberately broken `policy.yaml`: JSONL log contains `"event":"policy_load_failed"` and a subsequent `POST /policy/check` over the UDS returns DENY (deny-all mode) — verify with `curl --unix-socket ~/Library/Application\ Support/Kahya/kahyad.sock`.
+- [x] Test proves W3-class tool with `reversible: true` is rejected at load.
+- [x] All four mandatory deny-glob families (§5 #6 quote above: shell rc/profile files; `~/Library/LaunchAgents/**`; `~/.hammerspoon/**`; `~/Library/Application Support/Kahya/**`) present in committed `policy.yaml` — checked by a test, not by eyeball.
 
 ## Out of scope
 - Enforcing any of this (ladder decisions, deny-glob checks, egress blocking) — W3-02/W3-03/W3-05.

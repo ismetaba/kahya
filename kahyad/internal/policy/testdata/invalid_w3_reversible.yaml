@@ -1,0 +1,29 @@
+# Same as valid.yaml, but mail_send (class W3) is marked reversible: true
+# with an undo recipe - still rejected, since W3 is irreversible by
+# definition (HANDOFF §4) regardless of what undo recipe is supplied.
+tools:
+  - name: mail_send
+    class: W3
+    reversible: true
+    undo: "this must never be accepted"
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+  default_daily_byte_budget: 26214400

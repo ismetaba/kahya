@@ -16,6 +16,7 @@ import (
 
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
 )
@@ -458,6 +459,75 @@ func TestPolicyCheckTableDriven(t *testing.T) {
 			// Every decision writes a policy_decision ledger row carrying
 			// the request's own trace_id.
 			assertLedgerHasKind(t, f.store, traceID, "policy_decision")
+		})
+	}
+}
+
+// TestPolicyCheckDenyAllModeDeniesEvenMemorySearch is W3-01's deny-all
+// acceptance criterion applied to /policy/check: SetDenyAll (simulating a
+// policy.yaml load failure at boot) overrides the interim static table
+// entirely - even memory_search, the one tool it itself allows - for
+// every tool name, with policy.RuleDenyAllV1 as the returned rule.
+func TestPolicyCheckDenyAllModeDeniesEvenMemorySearch(t *testing.T) {
+	cfg := config.Config{
+		DBPath:               filepath.Join(t.TempDir(), "brain.db"),
+		MemoryDir:            t.TempDir(),
+		Socket:               filepath.Join(shortSocketDir(t), "k.sock"),
+		LogDir:               t.TempDir(),
+		AnthropicUpstreamURL: "https://upstream.invalid",
+		DefaultModel:         "claude-sonnet-5",
+		TaskTimeoutMin:       5,
+		WorkerCmd:            []string{"python3", "-c", "pass"},
+	}
+	st, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	log := testLogger(t)
+	srv := New(cfg, log, "v-denyall-test", healthyDB)
+	srv.SetEventLogger(st)
+	srv.SetTaskStore(st.Queries)
+	srv.SetAnthproxy(anthproxy.NewGovernor(anthproxy.Limits{
+		DailyBudgetUSD:         1000,
+		MonthlyBudgetUSD:       10000,
+		TaskTokenCeiling:       500000,
+		DowngradeAtRatio:       0.8,
+		CacheHitAlarmThreshold: 0.5,
+	}, nil, nil), nil, anthproxy.NewPassthroughCredentialSource(), nil)
+	srv.SetDenyAll() // simulate a policy.yaml load failure at boot.
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	go srv.Serve() //nolint:errcheck
+	t.Cleanup(func() { srv.Shutdown() })
+
+	client := unixHTTPClient(cfg.Socket)
+
+	for _, tool := range []string{"memory_search", "Read", "some_future_tool"} {
+		t.Run(tool, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]any{
+				"trace_id": "trace-denyall-" + tool, "task_id": "t1", "tool_name": tool, "tool_input": map[string]any{},
+			})
+			resp, err := client.Post("http://kahyad/policy/check", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("POST /policy/check: %v", err)
+			}
+			defer resp.Body.Close()
+			var pr policyCheckResponse
+			if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if pr.Decision != "deny" {
+				t.Errorf("decision = %q, want deny (deny-all mode must override even memory_search)", pr.Decision)
+			}
+			if pr.Rule != policy.RuleDenyAllV1 {
+				t.Errorf("rule = %q, want %q", pr.Rule, policy.RuleDenyAllV1)
+			}
+			if pr.Reason != policy.ReasonDenyAll {
+				t.Errorf("reason = %q, want %q", pr.Reason, policy.ReasonDenyAll)
+			}
 		})
 	}
 }

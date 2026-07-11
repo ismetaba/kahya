@@ -1,0 +1,124 @@
+# policy.yaml — Kâhya's single source of truth for tool registrations,
+# action-class labels, undo recipes, secret-lane globs, fs write-deny
+# globs, and the egress allowlist/volume budgets (W3-01).
+#
+# Loaded and strictly validated by kahyad/internal/policy (unknown keys are
+# a hard error). ANY validation failure puts kahyad into deny-all mode at
+# boot (tasks/README.md global convention: policy error => DENY, never a
+# permissive fallback) — see kahyad/internal/policy/loader.go.
+#
+# Action classes (HANDOFF §4, defined before first use):
+#   R  = salt-okuma (read-only)
+#   W1 = geri-alinabilir yazma (undoable write)
+#   W2 = sert/zor geri alinir yazma (hard-to-undo write)
+#   W3 = geri donussuz (irreversible: para * prod * kimlik * senin adina mesaj)
+#
+# Enforcement (autonomy ladder, undo execution, egress blocking,
+# content-based secret-lane classification) is NOT this file's job — that
+# is W3-02/W3-03/W3-05/W3-08. This file is metadata only.
+
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+  - name: memory_write
+    class: W1
+    reversible: true
+    undo: "git revert of the memory commit"
+
+  - name: memory_forget
+    class: W1
+    reversible: true
+    undo: "git revert"
+
+  - name: fs_read
+    class: R
+    reversible: false
+
+  - name: fs_write
+    class: W1
+    reversible: true
+    undo: "pre-op git checkpoint restore"
+
+  - name: fs_delete
+    class: W1
+    reversible: true
+    undo: "move back from Trash"
+
+  - name: shell_docker
+    class: W2
+    reversible: false
+
+  - name: shell_host
+    class: W2
+    reversible: false
+
+  - name: applescript_run
+    class: W2
+    reversible: false
+
+  - name: jxa_run
+    class: W2
+    reversible: false
+
+  - name: shortcuts_run
+    class: W2
+    reversible: false
+
+  - name: mail_draft
+    class: W1
+    reversible: true
+    undo: "taslak-asla-gönderme — draft is never sent, delete draft"
+
+  - name: mail_send
+    class: W3
+    reversible: false
+
+  - name: telegram_send
+    class: W2
+    reversible: false
+
+# File-path globs only. Content-sourced data (mail bodies, fetched web
+# pages, etc.) is classified at ingest time by W3-08's local content
+# pre-classifier, NEVER by matching a glob against a path — HANDOFF §4's
+# ordering invariant ("policy.yaml globlari yalniz dosya yollari icin")
+# means these globs never see the inside of a file, only its path.
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+# Day-1 invariants (HANDOFF §5 safety #6 [flag]). The loader hard-rejects
+# any policy.yaml whose fs_write_deny_globs is missing ANY one of these,
+# verbatim — they exist so a compromised/over-eager agent can never
+# rewrite your shell startup files, LaunchAgents, Hammerspoon config, or
+# kahyad's own ledger/DB directory.
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+    - host: api.telegram.org
+    - host: api.github.com
+    - host: github.com
+    # W0-01's private memory-git remote host goes here once known (its
+    # push/pull must pass egress.Check — addable without a schema change).
+    # - host: <memory-git-remote-host>
+    # W4-05's external ledger-anchor remote host goes here once known
+    # (its periodic anchor push must pass egress.Check — addable without a
+    # schema change).
+    # - host: <ledger-anchor-remote-host>
+  default_daily_byte_budget: 26214400 # 25 MiB, per host
+  # Per-host overrides go here once needed, e.g.:
+  # daily_byte_budget:
+  #   api.telegram.org: 10485760

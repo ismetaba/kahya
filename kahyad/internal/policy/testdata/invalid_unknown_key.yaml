@@ -1,0 +1,30 @@
+# Same as valid.yaml, plus one stray top-level key the schema doesn't
+# know about - must be rejected by strict (KnownFields) parsing before any
+# validation rule even runs.
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+  default_daily_byte_budget: 26214400
+
+not_a_real_field: true

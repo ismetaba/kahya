@@ -171,7 +171,17 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			}
 
 			rawName := callReq.Params.Name
-			decision := policy.Check(rawName)
+
+			// W3-01: deny-all mode overrides the interim table entirely -
+			// even memory_search - whenever policy.yaml failed to
+			// load/validate at boot (see
+			// kahyad/internal/server.Server.SetDenyAll's doc comment).
+			var decision policy.Decision
+			if s.denyAll {
+				decision = policy.Decision{Allow: false, Reason: policy.ReasonDenyAll, Rule: policy.RuleDenyAllV1}
+			} else {
+				decision = policy.Check(rawName)
+			}
 
 			traceID := ""
 			if callReq.Extra != nil && callReq.Extra.Header != nil {

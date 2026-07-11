@@ -76,6 +76,17 @@ type Config struct {
 	// directories up from the running kahyad executable.
 	MCPBridgePath string `yaml:"mcp_bridge_path"`
 
+	// PolicyPath is the absolute path to policy.yaml (W3-01): kahyad's
+	// main.go loads this at boot, BEFORE the UDS listener accepts any
+	// /policy/check request, via kahyad/internal/policy.Load. Defaults to
+	// "<repo>/policy.yaml", derived the same way MCPBridgePath/WorkerCmd/
+	// EmbedCmd are - two directories up from the running kahyad
+	// executable. Override via config.yaml's policy_path key or
+	// KAHYA_POLICY_PATH (primarily so a manual verification run can point
+	// kahyad at a deliberately broken fixture without touching the real,
+	// committed repo-root policy.yaml).
+	PolicyPath string `yaml:"policy_path"`
+
 	// LogLevel is the process-wide minimum log level: debug|info|warn|error
 	// (default "info"). main.go passes the resolved value to
 	// kahyad/internal/logx.SetLevel before logx.New. Env override
@@ -142,6 +153,7 @@ type fileConfig struct {
 	WorkerCmd              *[]string `yaml:"worker_cmd"`
 	EmbedCmd               *[]string `yaml:"embed_cmd"`
 	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
+	PolicyPath             *string   `yaml:"policy_path"`
 	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
 	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
 	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
@@ -224,6 +236,7 @@ func defaults(home string) Config {
 		WorkerCmd:            defaultWorkerCmd(),
 		EmbedCmd:             defaultEmbedCmd(),
 		MCPBridgePath:        defaultMCPBridgePath(),
+		PolicyPath:           defaultPolicyPath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -295,6 +308,19 @@ func defaultMCPBridgePath() string {
 	return filepath.Join(repoRoot, "bin", "kahya-mcp")
 }
 
+// defaultPolicyPath resolves the default "<repo>/policy.yaml" path, using
+// the exact same repo-root derivation as defaultWorkerCmd/defaultEmbedCmd/
+// defaultMCPBridgePath (see defaultWorkerCmd's doc comment) - policy.yaml
+// lives at the repo root itself (committed, not under bin/), alongside
+// every other top-level project file.
+func defaultPolicyPath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "policy.yaml")
+}
+
 func loadFile(path string) (fileConfig, bool, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -356,6 +382,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.MCPBridgePath != nil {
 		cfg.MCPBridgePath = expandHome(*fc.MCPBridgePath, home)
 	}
+	if fc.PolicyPath != nil {
+		cfg.PolicyPath = expandHome(*fc.PolicyPath, home)
+	}
 	if fc.DailyBudgetUSD != nil {
 		cfg.DailyBudgetUSD = *fc.DailyBudgetUSD
 	}
@@ -403,6 +432,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
+	}
+	if v := os.Getenv("KAHYA_POLICY_PATH"); v != "" {
+		cfg.PolicyPath = expandHome(v, home)
 	}
 }
 
