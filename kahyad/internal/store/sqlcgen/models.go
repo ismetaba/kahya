@@ -139,6 +139,7 @@ type PendingApproval struct {
 	MintedAt          string         `json:"minted_at"`
 	ExpiresAt         string         `json:"expires_at"`
 	ConsumedAt        sql.NullString `json:"consumed_at"`
+	ToolInput         []byte         `json:"tool_input"`
 }
 
 type Task struct {

@@ -330,6 +330,121 @@ func (c *Client) PolicyUndo(ctx context.Context, traceID, targetTraceID string) 
 	return ur.Tool, nil
 }
 
+// approvalListRow mirrors kahyad's GET /policy/approvals list row shape
+// (kahyad/internal/server.policyApprovalsListRow, W3-06).
+type approvalListRow struct {
+	ID       string `json:"id"`
+	Tool     string `json:"tool"`
+	Class    string `json:"class"`
+	Scope    string `json:"scope"`
+	Summary  string `json:"summary"`
+	AgeS     int64  `json:"age_s"`
+	MintedAt string `json:"minted_at"`
+}
+
+// ListApprovals calls GET /policy/approvals (`kahya approvals`).
+func (c *Client) ListApprovals(ctx context.Context, traceID string) ([]approvalListRow, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/policy/approvals", traceID, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/approvals: status %d", resp.StatusCode)}
+	}
+	var lr struct {
+		Approvals []approvalListRow `json:"approvals"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/approvals: decode response: %w", err)}
+	}
+	return lr.Approvals, nil
+}
+
+// approvalDetail mirrors kahyad's GET /policy/approvals?id=<id> response
+// shape (kahyad/internal/server.policyApprovalDetailResponse, W3-06): the
+// full rendered WYSIWYE diff text `kahya approve <id>` prints verbatim
+// before prompting.
+type approvalDetail struct {
+	ID       string `json:"id"`
+	Tool     string `json:"tool"`
+	Class    string `json:"class"`
+	Scope    string `json:"scope"`
+	Rendered string `json:"rendered"`
+	Error    string `json:"error,omitempty"`
+}
+
+// GetApproval calls GET /policy/approvals?id=<id> (`kahya approve <id>`'s
+// own read-only lookup - does not consume the pending approval).
+func (c *Client) GetApproval(ctx context.Context, traceID, id string) (approvalDetail, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/policy/approvals?id="+url.QueryEscape(id), traceID, nil)
+	if err != nil {
+		return approvalDetail{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return approvalDetail{}, err
+	}
+	defer resp.Body.Close()
+	var ad approvalDetail
+	if err := json.NewDecoder(resp.Body).Decode(&ad); err != nil {
+		return approvalDetail{}, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/approvals detail: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if ad.Error != "" {
+			return approvalDetail{}, fmt.Errorf("%s", ad.Error)
+		}
+		return approvalDetail{}, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/approvals detail: status %d", resp.StatusCode)}
+	}
+	return ad, nil
+}
+
+// PolicyFeedback calls POST /policy/feedback {kind, pending_approval_id,
+// surface} (`kahya approve <id>`'s own approve/deny outcome, W3-02/W3-06).
+// surface is always "local" for an approve issued from this CLI (HANDOFF
+// §5 safety #5: the CLI IS the local surface at W3-W5) - callers pass ""
+// for kind="deny", which ignores surface entirely. Returns the minted
+// token on a successful approve ("" for deny).
+func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingApprovalID, surface string) (string, error) {
+	body, err := json.Marshal(map[string]string{
+		"kind": kind, "pending_approval_id": pendingApprovalID, "surface": surface, "trace_id": traceID,
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/policy/feedback", traceID, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var fr struct {
+		OK    bool   `json:"ok"`
+		Token string `json:"token,omitempty"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&fr); err != nil {
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/feedback: decode response: %w", err)}
+	}
+	if !fr.OK {
+		if fr.Error != "" {
+			return "", fmt.Errorf("%s", fr.Error)
+		}
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/feedback: status %d", resp.StatusCode)}
+	}
+	return fr.Token, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

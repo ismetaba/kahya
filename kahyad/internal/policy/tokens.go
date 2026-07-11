@@ -23,6 +23,7 @@ import (
 	"errors"
 	"time"
 
+	"kahya/kahyad/internal/canon"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -42,12 +43,41 @@ const tokenTTL = 10 * time.Minute
 // sub-reason, as a token_verify_failed event).
 var ErrTokenInvalid = errors.New("policy: approval token invalid, expired, or already consumed")
 
-// approvedBytesHash is the sha256(hex) of b - the WYSIWYE anti-tamper
-// binding a token/pending-approval to the exact tool-call bytes it was
-// minted against (HANDOFF S5 safety #5). Until W3-06 lands the real
-// NFC/bidi/homoglyph-normalizing WYSIWYE pipeline, this hashes the raw
-// serialized tool-call bytes directly - see this task's Out of scope.
-func approvedBytesHash(b []byte) string {
+// approvedBytesHash is the sha256(hex) of toolInput's WYSIWYE-
+// canonicalized form (kahyad/internal/canon.CanonicalizeBytes: NFC-
+// normalize, strip bidi/zero-width/other-Cf-category control code points -
+// confusables are never rewritten, only flagged, so a homoglyph swap
+// still changes this hash) - the anti-tamper binding a token/pending-
+// approval to the exact tool-call bytes it was minted against (HANDOFF S5
+// safety #5, W3-06). Engine.Check (approval/mint time) and ConsumeToken
+// (execution/verify time) both call this SAME function on their own
+// (independently supplied) toolInput bytes - that reuse, not two
+// independently-maintained canonicalizers, is the whole "both sides use
+// the same canonicalization" guarantee: an NFD-vs-NFC difference in a path
+// collapses to an identical hash, while a genuine byte mutation (a
+// trailing space, a homoglyph swap) still produces a different one.
+//
+// NEVER use this for hashing a random TOKEN's own bytes (see
+// rawBytesHash below for that, distinct, purpose) - toolInput here is
+// always human-authored/tool-serialized text (a path, a script, a
+// message body, ...), the only kind of content WYSIWYE canonicalization
+// is meant to apply to.
+func approvedBytesHash(toolInput []byte) string {
+	sum := sha256.Sum256(canon.CanonicalizeBytes(toolInput))
+	return hex.EncodeToString(sum[:])
+}
+
+// rawBytesHash is the PLAIN sha256(hex) of b, with NO WYSIWYE
+// canonicalization - used only to derive a storage-safe lookup key for an
+// opaque credential (the 32 random approval-token bytes themselves,
+// mintToken/ConsumeToken below), which is not human-authored text and has
+// no business being NFC-normalized or bidi/zero-width-stripped: doing so
+// would gain nothing (a random byte string carries no WYSIWYE meaning)
+// and would needlessly risk two DIFFERENT random tokens canonicalizing to
+// the same stripped byte sequence (a token_hash collision this package
+// must never introduce for a purpose that never needed canonicalization
+// in the first place).
+func rawBytesHash(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -65,7 +95,7 @@ func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, cl
 		return "", err
 	}
 	tokenHex := hex.EncodeToString(raw)
-	hash := approvedBytesHash(raw)
+	hash := rawBytesHash(raw)
 
 	now := e.nowUTC()
 	if err := e.store.InsertApprovalToken(ctx, sqlcgen.InsertApprovalTokenParams{
@@ -147,7 +177,7 @@ func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
 		})
 		return ErrTokenInvalid
 	}
-	hash := approvedBytesHash(raw)
+	hash := rawBytesHash(raw)
 	now := e.nowUTC()
 
 	// The single atomic single-use guarantee: only the FIRST caller to run

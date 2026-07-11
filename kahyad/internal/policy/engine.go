@@ -164,6 +164,11 @@ type Store interface {
 	InsertPendingApproval(ctx context.Context, arg sqlcgen.InsertPendingApprovalParams) error
 	GetPendingApproval(ctx context.Context, id string) (sqlcgen.PendingApproval, error)
 	ConsumePendingApproval(ctx context.Context, arg sqlcgen.ConsumePendingApprovalParams) (int64, error)
+	// ListUnconsumedPendingApprovals backs `kahya approvals` (W3-06):
+	// every not-yet-consumed pending_approvals row, oldest first. Expiry
+	// is filtered in Go (ListPendingApprovals below), not SQL - see that
+	// query's own doc comment in queries.sql.
+	ListUnconsumedPendingApprovals(ctx context.Context) ([]sqlcgen.PendingApproval, error)
 
 	InsertUndoWindow(ctx context.Context, arg sqlcgen.InsertUndoWindowParams) (sqlcgen.UndoWindow, error)
 	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error)
@@ -316,8 +321,10 @@ var ErrInvalidPendingApproval = errors.New("policy: invalid or unrecognized pend
 // task_id, trace_id, approved_bytes_hash) Check itself just computed - the
 // id is opaque and self-describing to nobody but this row). Approve/Deny
 // below look this row up by id and never trust anything decoded from the
-// id string itself.
-func (e *Engine) mintPendingApproval(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, hash string) (string, error) {
+// id string itself. toolInput (W3-06) is persisted alongside the hash so
+// `kahya approvals`/`kahya approve <id>` can render the real byte-exact
+// WYSIWYE diff, not just the one-way hash.
+func (e *Engine) mintPendingApproval(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, hash string, toolInput []byte) (string, error) {
 	raw := make([]byte, pendingApprovalIDBytesLen)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -333,6 +340,7 @@ func (e *Engine) mintPendingApproval(ctx context.Context, taskID, traceID, tool 
 		Class:             string(class),
 		Scope:             scope,
 		ApprovedBytesHash: hash,
+		ToolInput:         toolInput,
 		MintedAt:          rfc3339(now),
 		ExpiresAt:         rfc3339(now.Add(pendingApprovalTTL)),
 	}); err != nil {
@@ -453,7 +461,7 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 // approvable by nothing, which is a worse failure mode than an honest
 // deny.
 func (e *Engine) needsApproval(ctx context.Context, in CheckInput, class ActionClass, scope string, level int, hash, reason string) (Decision, error) {
-	id, err := e.mintPendingApproval(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash)
+	id, err := e.mintPendingApproval(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash, in.ToolInput)
 	if err != nil {
 		d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
 		e.ledgerDecision(ctx, in, class, scope, level, d)
@@ -715,9 +723,15 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string)
 	// Checked BEFORE consuming: a W3 pending approval rejected here (wrong
 	// surface) must remain usable for a LATER local approval, not be
 	// burned by the failed attempt.
+	//
+	// Ledger kind is EXACTLY "w3_nonlocal_approval_rejected" (this task's
+	// own spec, verbatim) - Go-side, arrives before W3-07 (Telegram) even
+	// exists, so Telegram can never be wired to approve a W3 action later:
+	// this check runs regardless of which surface ever calls
+	// POST /policy/feedback.
 	if class == ClassW3 && surface != "local" {
-		e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_rejected", map[string]any{
-			"event": "policy_feedback_rejected", "tool": pa.Tool, "reason": "w3_requires_local_surface", "surface": surface,
+		e.ledgerRaw(ctx, pa.TraceID, "w3_nonlocal_approval_rejected", map[string]any{
+			"event": "w3_nonlocal_approval_rejected", "tool": pa.Tool, "class": class, "scope": pa.Scope, "surface": surface,
 		})
 		return FeedbackResult{}, ErrW3RequiresLocalSurface
 	}
@@ -744,7 +758,7 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string)
 		if err := e.saveState(ctx, pa.Tool, class, pa.Scope, int(state.Level), newCount); err == nil {
 			e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_approved", map[string]any{
 				"event": "policy_feedback_approved", "tool": pa.Tool, "class": class,
-				"scope": pa.Scope, "consecutive_approvals": newCount,
+				"scope": pa.Scope, "consecutive_approvals": newCount, "surface": surface,
 			})
 			if newCount == promotionThreshold {
 				e.ledgerRaw(ctx, pa.TraceID, "promotion_suggested", map[string]any{
@@ -816,4 +830,66 @@ func (e *Engine) Promote(ctx context.Context, traceID, tool string, class Action
 // ListState implements GET /policy/state's ladder dump.
 func (e *Engine) ListState(ctx context.Context) ([]sqlcgen.AutonomyState, error) {
 	return e.store.ListAutonomyState(ctx)
+}
+
+// PendingApprovalInfo is one Engine.ListPendingApprovals/GetPendingApprovalDetail
+// row: everything `kahya approvals`/`kahya approve <id>` needs (this
+// task's spec: "id, tool, class, summary, age" for the list; ToolInput
+// additionally for the detail render).
+type PendingApprovalInfo struct {
+	ID        string
+	Tool      string
+	Class     ActionClass
+	Scope     string
+	ToolInput []byte
+	MintedAt  time.Time
+}
+
+// ListPendingApprovals implements `kahya approvals`: every not-yet-
+// consumed, not-yet-EXPIRED pending_approvals row, oldest first. Expiry
+// is checked here in Go (time.Parse+time.After), mirroring
+// getValidPendingApproval's own check, rather than in SQL - see
+// ListUnconsumedPendingApprovals' own doc comment in queries.sql for why.
+func (e *Engine) ListPendingApprovals(ctx context.Context) ([]PendingApprovalInfo, error) {
+	rows, err := e.store.ListUnconsumedPendingApprovals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := e.nowUTC()
+	out := make([]PendingApprovalInfo, 0, len(rows))
+	for _, r := range rows {
+		expiresAt, perr := time.Parse(time.RFC3339Nano, r.ExpiresAt)
+		if perr != nil || now.After(expiresAt) {
+			continue // expired - not "pending" anymore, even though not yet swept
+		}
+		mintedAt, perr := time.Parse(time.RFC3339Nano, r.MintedAt)
+		if perr != nil {
+			mintedAt = now
+		}
+		out = append(out, PendingApprovalInfo{
+			ID: r.ID, Tool: r.Tool, Class: ActionClass(r.Class), Scope: r.Scope,
+			ToolInput: r.ToolInput, MintedAt: mintedAt,
+		})
+	}
+	return out, nil
+}
+
+// GetPendingApprovalDetail implements `kahya approve <id>`'s own lookup:
+// the single pending_approvals row (still valid - not expired/consumed)
+// identified by id, WITHOUT consuming it (a human reviewing the diff
+// before deciding must be able to look, then decide, in two separate
+// steps) - approving/denying is still Approve/Deny's job, unchanged.
+func (e *Engine) GetPendingApprovalDetail(ctx context.Context, id string) (PendingApprovalInfo, error) {
+	pa, err := e.getValidPendingApproval(ctx, id)
+	if err != nil {
+		return PendingApprovalInfo{}, err
+	}
+	mintedAt, perr := time.Parse(time.RFC3339Nano, pa.MintedAt)
+	if perr != nil {
+		mintedAt = e.nowUTC()
+	}
+	return PendingApprovalInfo{
+		ID: pa.ID, Tool: pa.Tool, Class: ActionClass(pa.Class), Scope: pa.Scope,
+		ToolInput: pa.ToolInput, MintedAt: mintedAt,
+	}, nil
 }

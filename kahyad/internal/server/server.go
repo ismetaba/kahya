@@ -252,6 +252,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/policy/check", s.handlePolicyCheck)
 	mux.HandleFunc("/policy/consume-token", s.handlePolicyConsumeToken)
 	mux.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
+	mux.HandleFunc("/policy/approvals", s.handlePolicyApprovals)
 	mux.HandleFunc("/policy/state", s.handlePolicyState)
 	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
 	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)

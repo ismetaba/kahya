@@ -271,7 +271,7 @@ func (q *Queries) GetOpenUndoWindowByTrace(ctx context.Context, traceID string) 
 }
 
 const getPendingApproval = `-- name: GetPendingApproval :one
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
 FROM pending_approvals
 WHERE id = ?
 `
@@ -290,6 +290,7 @@ func (q *Queries) GetPendingApproval(ctx context.Context, id string) (PendingApp
 		&i.MintedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.ToolInput,
 	)
 	return i, err
 }
@@ -545,8 +546,8 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Event
 
 const insertPendingApproval = `-- name: InsertPendingApproval :exec
 
-INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 `
 
 type InsertPendingApprovalParams struct {
@@ -559,6 +560,7 @@ type InsertPendingApprovalParams struct {
 	ApprovedBytesHash string `json:"approved_bytes_hash"`
 	MintedAt          string `json:"minted_at"`
 	ExpiresAt         string `json:"expires_at"`
+	ToolInput         []byte `json:"tool_input"`
 }
 
 // Post-security-review amendment: pending_approvals queries below back the
@@ -569,6 +571,14 @@ type InsertPendingApprovalParams struct {
 // engine.go writes/reads).
 // consumed_at starts NULL (a literal, not a param - see
 // ConsumePendingApproval below for the only statement that ever sets it).
+// tool_input (W3-06) persists the EXACT bytes Engine.Check received, so
+// `kahya approvals`/`kahya approve <id>` can render a real WYSIWYE diff,
+// not just prove after the fact (via approved_bytes_hash) that nothing
+// changed. Listed last (matching the column's physical ALTER-TABLE-added
+// position - see 0005_pending_approval_payload.sql) so GetPendingApproval/
+// ListUnconsumedPendingApprovals below reuse the PendingApproval model
+// type directly instead of sqlc emitting a separate "Row" type for a
+// differently-ordered column list.
 func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error {
 	_, err := q.db.ExecContext(ctx, insertPendingApproval,
 		arg.ID,
@@ -580,6 +590,7 @@ func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingAp
 		arg.ApprovedBytesHash,
 		arg.MintedAt,
 		arg.ExpiresAt,
+		arg.ToolInput,
 	)
 	return err
 }
@@ -862,6 +873,54 @@ func (q *Queries) ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 			&i.OpenedAt,
 			&i.Deadline,
 			&i.State,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnconsumedPendingApprovals = `-- name: ListUnconsumedPendingApprovals :many
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+FROM pending_approvals
+WHERE consumed_at IS NULL
+ORDER BY minted_at ASC
+`
+
+// W3-06 `kahya approvals`: every not-yet-consumed row, oldest first.
+// Expiry is checked in Go (kahyad/internal/policy.Engine.ListPendingApprovals),
+// mirroring getValidPendingApproval's own time.Parse+time.After check,
+// rather than comparing RFC3339Nano strings in SQL (that format's
+// trailing-zero-trimmed fractional seconds do NOT always sort
+// lexicographically in timestamp order).
+func (q *Queries) ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error) {
+	rows, err := q.db.QueryContext(ctx, listUnconsumedPendingApprovals)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PendingApproval{}
+	for rows.Next() {
+		var i PendingApproval
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.TraceID,
+			&i.Tool,
+			&i.Class,
+			&i.Scope,
+			&i.ApprovedBytesHash,
+			&i.MintedAt,
+			&i.ExpiresAt,
+			&i.ConsumedAt,
+			&i.ToolInput,
 		); err != nil {
 			return nil, err
 		}

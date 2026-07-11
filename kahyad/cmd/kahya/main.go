@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"kahya/kahyad/internal/approval"
 	"kahya/kahyad/internal/traceid"
 )
 
@@ -52,6 +53,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runAutonomy(client, args[1:], stdout, stderr)
 	case "undo":
 		return runUndo(client, args[1:], stdout, stderr)
+	case "approvals":
+		return runApprovals(client, stdout, stderr)
+	case "approve":
+		return runApprove(client, args[1:], stdin, stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -240,6 +245,86 @@ func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, MsgUndoTriggered+"\n", tool)
+	return 0
+}
+
+// runApprovals implements `kahya approvals` (W3-06): GET /policy/approvals,
+// printed one line per pending approval (id, tool, class, summary, age) -
+// kahyad/internal/approval.FormatApprovalsList is the SAME formatter the
+// task spec calls for, shared with (a future) W3-07 Telegram listing
+// rather than a second hand-rolled Printf here.
+func runApprovals(client *Client, stdout, stderr io.Writer) int {
+	rows, err := client.ListApprovals(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(stdout, MsgApprovalsEmpty)
+		return 0
+	}
+	items := make([]approval.PendingApprovalSummary, len(rows))
+	for i, r := range rows {
+		items[i] = approval.PendingApprovalSummary{
+			ID: r.ID, Tool: r.Tool, Class: r.Class, Summary: r.Summary,
+			Age: time.Duration(r.AgeS) * time.Second,
+		}
+	}
+	fmt.Fprint(stdout, approval.FormatApprovalsList(items))
+	return 0
+}
+
+// runApprove implements `kahya approve <id>` (W3-06): GET /policy/
+// approvals?id=<id> for the full byte-exact rendered diff, printed in
+// full BEFORE any prompt (WYSIWYE: the human must see reality before
+// deciding), then the class-appropriate decision gate - W1/W2's
+// [e]vet/[h]ayır, or W3's literal-only "onayla" (HANDOFF §5 safety #5:
+// "W3 yazılı 'onayla' YALNIZ yerel yüzeyden kabul edilir" - this CLI IS
+// that local surface at W1-W5, so every approve this command sends
+// carries surface="local"). A decline calls POST /policy/feedback
+// kind="deny" (demoting the ladder, per W3-02), never silently doing
+// nothing.
+func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgApproveUsage)
+		return 2
+	}
+	id := strings.TrimSpace(args[0])
+	traceID := traceid.New()
+
+	detail, err := client.GetApproval(context.Background(), traceID, id)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, detail.Rendered)
+
+	r := bufio.NewReader(stdin)
+	var decision approval.Decision
+	if detail.Class == "W3" {
+		decision, err = approval.PromptLiteral(r, stdout, PromptW3Literal, "onayla")
+	} else {
+		decision, err = approval.PromptYesNo(r, stdout, PromptW1W2YesNo, "e", "evet")
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	if decision != approval.DecisionApprove {
+		if _, err := client.PolicyFeedback(context.Background(), traceID, "deny", id, ""); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		fmt.Fprintln(stdout, MsgApprovalDenied)
+		return 1
+	}
+
+	if _, err := client.PolicyFeedback(context.Background(), traceID, "approve", id, "local"); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, MsgApprovalApproved)
 	return 0
 }
 

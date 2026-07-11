@@ -110,4 +110,34 @@ const (
 	// is delegated to the owning tool (W3-03) - this only reports that the
 	// window closed and the demotion was recorded.
 	MsgUndoTriggered = "Geri alma tetiklendi: %s. (Geri alma tarifi ilgili araç tarafından uygulanır.)"
+
+	// ---- W3-06: kahya approvals / kahya approve <id> ----
+
+	// MsgApprovalsEmpty is printed by `kahya approvals` when there is
+	// nothing pending.
+	MsgApprovalsEmpty = "Bekleyen onay yok."
+
+	// MsgApproveUsage is printed when `kahya approve` is given anything
+	// other than exactly one positional argument (the pending approval
+	// id). Exit 2.
+	MsgApproveUsage = "kullanım: kahya approve <id>"
+
+	// PromptW1W2YesNo is `kahya approve <id>`'s W1/W2 decision prompt (this
+	// task's spec: "[e]vet/[h]ayır").
+	PromptW1W2YesNo = "Onaylıyor musunuz? [e]vet/[h]ayır: "
+
+	// PromptW3Literal is `kahya approve <id>`'s W3 decision prompt -
+	// EXACT, byte-for-byte, per this task's spec (HANDOFF §5 safety #5:
+	// W3 accepts nothing but the literally typed word "onayla", never
+	// "evet", never "y"). Do not reword or add/remove punctuation.
+	PromptW3Literal = "Bu eylem geri alınamaz (W3). Devam etmek için 'onayla' yazın:"
+
+	// MsgApprovalApproved is printed after a successful approve.
+	MsgApprovalApproved = "Onaylandı."
+
+	// MsgApprovalDenied is printed after a decline (W1/W2's [h]ayır, or
+	// anything other than the literal "onayla" for W3) - the CLI always
+	// still calls POST /policy/feedback kind=deny in this case, demoting
+	// the ladder (W3-02), never silently doing nothing. Exit 1.
+	MsgApprovalDenied = "Reddedildi."
 )

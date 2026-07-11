@@ -209,13 +209,33 @@ WHERE id = ?;
 -- name: InsertPendingApproval :exec
 -- consumed_at starts NULL (a literal, not a param - see
 -- ConsumePendingApproval below for the only statement that ever sets it).
-INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
+-- tool_input (W3-06) persists the EXACT bytes Engine.Check received, so
+-- `kahya approvals`/`kahya approve <id>` can render a real WYSIWYE diff,
+-- not just prove after the fact (via approved_bytes_hash) that nothing
+-- changed. Listed last (matching the column's physical ALTER-TABLE-added
+-- position - see 0005_pending_approval_payload.sql) so GetPendingApproval/
+-- ListUnconsumedPendingApprovals below reuse the PendingApproval model
+-- type directly instead of sqlc emitting a separate "Row" type for a
+-- differently-ordered column list.
+INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?);
 
 -- name: GetPendingApproval :one
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
 FROM pending_approvals
 WHERE id = ?;
+
+-- name: ListUnconsumedPendingApprovals :many
+-- W3-06 `kahya approvals`: every not-yet-consumed row, oldest first.
+-- Expiry is checked in Go (kahyad/internal/policy.Engine.ListPendingApprovals),
+-- mirroring getValidPendingApproval's own time.Parse+time.After check,
+-- rather than comparing RFC3339Nano strings in SQL (that format's
+-- trailing-zero-trimmed fractional seconds do NOT always sort
+-- lexicographically in timestamp order).
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+FROM pending_approvals
+WHERE consumed_at IS NULL
+ORDER BY minted_at ASC;
 
 -- name: ConsumePendingApproval :execrows
 -- The single atomic single-use guarantee (the same "UPDATE ... WHERE x IS

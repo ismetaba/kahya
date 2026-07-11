@@ -90,6 +90,14 @@ type Querier interface {
 	// engine.go writes/reads).
 	// consumed_at starts NULL (a literal, not a param - see
 	// ConsumePendingApproval below for the only statement that ever sets it).
+	// tool_input (W3-06) persists the EXACT bytes Engine.Check received, so
+	// `kahya approvals`/`kahya approve <id>` can render a real WYSIWYE diff,
+	// not just prove after the fact (via approved_bytes_hash) that nothing
+	// changed. Listed last (matching the column's physical ALTER-TABLE-added
+	// position - see 0005_pending_approval_payload.sql) so GetPendingApproval/
+	// ListUnconsumedPendingApprovals below reuse the PendingApproval model
+	// type directly instead of sqlc emitting a separate "Row" type for a
+	// differently-ordered column list.
 	InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
@@ -104,6 +112,13 @@ type Querier interface {
 	ListEventsByKind(ctx context.Context, kind string) ([]Event, error)
 	ListEventsByTrace(ctx context.Context, traceID string) ([]Event, error)
 	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
+	// W3-06 `kahya approvals`: every not-yet-consumed row, oldest first.
+	// Expiry is checked in Go (kahyad/internal/policy.Engine.ListPendingApprovals),
+	// mirroring getValidPendingApproval's own time.Parse+time.After check,
+	// rather than comparing RFC3339Nano strings in SQL (that format's
+	// trailing-zero-trimmed fractional seconds do NOT always sort
+	// lexicographically in timestamp order).
+	ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error)
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
 	SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error
 	// Update-half of an application-level upsert (kahyad/internal/policy

@@ -18,6 +18,9 @@ sql:
       - "kahyad/migrations/0003_autonomy_policy.sql"
       # 0004 (W3-05) is a plain table too (egress_budget) - same reasoning.
       - "kahyad/migrations/0004_egress_budget.sql"
+      # 0005 (W3-06) is a plain ALTER TABLE (pending_approvals.tool_input) -
+      # same reasoning.
+      - "kahyad/migrations/0005_pending_approval_payload.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:
