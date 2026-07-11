@@ -18,7 +18,13 @@ LAUNCH_AGENTS_DIR := $(HOME)/Library/LaunchAgents
 PLIST_NAME := com.kahya.kahyad.plist
 REPO_ROOT := $(abspath .)
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12
+# SANDBOX_IMAGE_TAG is the W3-04 shell sandbox image's tag - the exact
+# value config.Config.DockerImageTag defaults to (kahyad/internal/config/
+# config.go); mcp/shell.Runner refuses to run anything until the digest
+# `sandbox-image` pins below matches what's actually built.
+SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
+
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 sandbox-image docker-up
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -43,7 +49,13 @@ venv:
 	test -d $(VENV) || python3 -m venv $(VENV)
 	$(PY) -m pip install --quiet -r worker/requirements.lock
 test: venv build
-	go test -tags $(TEST_TAGS) ./...
+	@if docker info >/dev/null 2>&1; then \
+		echo "docker daemon detected -- exporting KAHYA_DOCKER_TESTS=1 (mcp/shell's container tests must PASS, never skip, from here on)"; \
+		KAHYA_DOCKER_TESTS=1 go test -tags $(TEST_TAGS) ./...; \
+	else \
+		echo "docker daemon not available -- mcp/shell's container-requiring tests are NOT run (KAHYA_DOCKER_TESTS unset); suite stays green"; \
+		go test -tags $(TEST_TAGS) ./...; \
+	fi
 	$(PY) -m unittest discover -s worker/tests -v
 mlx-venv:
 	test -d $(MLX_VENV) || python3 -m venv $(MLX_VENV)
@@ -75,6 +87,34 @@ lint:
 	fi
 generate:   # activated by W12-02 when sqlc.yaml lands
 	if [ -f sqlc.yaml ]; then go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate; else echo "sqlc.yaml not yet present (W12-02)"; fi
+# sandbox-image: builds the W3-04 shell sandbox image and pins its digest
+# into docker/sandbox/IMAGE_DIGEST (committed) - mcp/shell.Runner refuses
+# to run ANY shell_docker request until this file's content matches what
+# `docker image inspect` reports for SANDBOX_IMAGE_TAG (supply-chain pin).
+#
+# DEVIATION (documented in docker/README.md too): a purely local build
+# that has never been pushed to a registry has no RepoDigest -
+# `docker images --digests` shows "<none>" for it (a well-known Docker
+# quirk, not a bug here). This target pins the image ID instead (the
+# sha256 of the image's config, via `docker image inspect --format
+# {{.Id}}`), which changes on ANY layer/config change exactly like a real
+# registry digest would - the identical supply-chain-pin security
+# property, just sourced locally.
+sandbox-image:
+	docker build -t $(SANDBOX_IMAGE_TAG) -f docker/sandbox/Dockerfile docker/sandbox
+	@DIGEST=$$(docker image inspect --format='{{.Id}}' $(SANDBOX_IMAGE_TAG)); \
+	printf '%s\n' "$$DIGEST" > docker/sandbox/IMAGE_DIGEST; \
+	echo "sandbox image built: $(SANDBOX_IMAGE_TAG) $$DIGEST"
+	docker images --digests $(SANDBOX_IMAGE_TAG)
+# docker-up: starts colima (per docker/README.md) if `docker info` isn't
+# already answering; a no-op against an already-running Docker Desktop.
+docker-up:
+	@if docker info >/dev/null 2>&1; then \
+		echo "docker already up"; \
+	else \
+		command -v colima >/dev/null 2>&1 || { echo "colima not installed - see docker/README.md"; exit 1; }; \
+		colima start --cpu 4 --memory 8 --vm-type vz; \
+	fi
 codesign: build
 	codesign -f -s "$(CODESIGN_ID)" bin/kahyad
 install: codesign

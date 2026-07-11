@@ -32,6 +32,7 @@ import (
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
 	"kahya/mcp/memory"
+	mcpshell "kahya/mcp/shell"
 )
 
 // ErrAlreadyRunning is returned by Prepare/Run when a live kahyad instance
@@ -118,6 +119,14 @@ type Server struct {
 	// kahyad/internal/policy.Engine.TriggerUndo has flipped the window and
 	// demoted the ladder state. nil until SetFSTool is called - see fs.go.
 	fsServer *mcpfs.Server
+
+	// shellServer is the W3-04 shell MCP tool set (shell_docker/
+	// shell_host), registered onto the SAME shared /v1/mcp server as
+	// mcp/memory's/mcp/fs's own tools (buildMCPHandler). nil until
+	// SetShellTool is called - see shell.go. Server.Shutdown calls
+	// shellServer.Shutdown to kill every kahya.task_id-labeled container
+	// this daemon may have left running (this task's spec step 7).
+	shellServer *mcpshell.Server
 
 	// anthGovernor/anthNotifier/anthCredential/anthEgressGate wire POST
 	// /v1/task's per-task Anthropic forward-proxy + cost governor
@@ -264,6 +273,16 @@ func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(ctx)
+
+	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled
+	// kahya.task_id" - best-effort, never fails shutdown itself over a
+	// docker-daemon hiccup.
+	if s.shellServer != nil {
+		if killErr := s.shellServer.Shutdown(ctx); killErr != nil {
+			s.log.Warn("shell_shutdown_kill_failed", "err", killErr.Error())
+		}
+	}
+
 	// Safe: we have held the startup flock since Prepare, so no other
 	// daemon can have bound this path in the meantime.
 	_ = os.Remove(s.cfg.Socket)

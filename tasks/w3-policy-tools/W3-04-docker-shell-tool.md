@@ -1,6 +1,6 @@
 # W3-04 — Docker shell tool: runtime, sandbox image, mount policy, network=none
 
-**Status:** todo
+**Status:** done — all acceptance criteria pass LIVE (docker/colima was up during this task's execution; see the closing note below).
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-02
 **Flags:** long-running
@@ -47,13 +47,15 @@ Gotchas:
 8. Tests: mount policy — script `cat /etc/passwd` works (image file) but `ls /Users` fails (not mounted); write outside `/work` fails (read-only root); default network — `getent hosts example.com || curl --max-time 3 https://example.com` exits non-zero; digest pin — runner rejects a mismatched digest; hostexec — `git -c core.pager=evil log` rejected, `find` rejected entirely; container labels present.
 
 ## Acceptance criteria
-- [ ] `make sandbox-image` builds; `docker images --digests kahya-sandbox` matches `docker/sandbox/IMAGE_DIGEST`.
-- [ ] `go test ./mcp/shell/...` green in `make test` (tests that need the Docker daemon fail — not skip — when it is down, so the gate can't silently pass; guard them behind `KAHYA_DOCKER_TESTS=1` exported by `make test` when `docker info` succeeds).
-- [ ] Manual: a `shell_docker` run with default flags cannot reach the network — `docker run` transcript in JSONL logs shows `--network none`, and in-container `curl https://api.telegram.org --max-time 3` exits non-zero (this becomes the automated W3-10 bypass test).
-- [ ] Manual: script writing to `/work/out.txt` succeeds and appears in the host workdir; script writing to `/etc/x` fails.
-- [ ] `shell_host` with `git -c ...` or `tar --checkpoint-action=...` is denied and a `hostexec_denied` ledger event exists (test).
-- [ ] `shell_host` with a VALID argv (`git status`) but no consumed approval token does not execute — the gate chain, not the validator, is the boundary (test with stub executor asserting zero invocations).
-- [ ] Every container run produces a `shell_exec` events row carrying the task's `trace_id` (verify via `sqlite3 brain.db`).
+- [x] `make sandbox-image` builds; `docker images --digests kahya-sandbox` matches `docker/sandbox/IMAGE_DIGEST`. **PASSED LIVE**: built `kahya-sandbox:0.1.0`, both the `docker images --digests` column and the committed `IMAGE_DIGEST` file read `sha256:bbc17a38ab244481bb14f06be4ec15cce98b4c2d4c3647289276216a91c16a4e`.
+- [x] `go test ./mcp/shell/...` green in `make test` (tests that need the Docker daemon fail — not skip — when it is down, so the gate can't silently pass; guard them behind `KAHYA_DOCKER_TESTS=1` exported by `make test` when `docker info` succeeds). **PASSED**: `make test` auto-detected the running daemon, exported `KAHYA_DOCKER_TESTS=1`, and `mcp/shell`'s container tests (`container_test.go`) ran for real and passed.
+- [x] Manual: a `shell_docker` run with default flags cannot reach the network — `docker run` transcript in JSONL logs shows `--network none`, and in-container `curl https://api.telegram.org --max-time 3` exits non-zero (this becomes the automated W3-10 bypass test). **PASSED LIVE** (promoted to an automated test, `TestLive_DefaultNetworkNoneBlocksEgress`): `curl` is intentionally not installed in the minimal image (coreutils/git/python3/jq only per this task's own deliverable), so the live evidence instead used `getent hosts api.telegram.org` (exit 2, "nodename nor servname provided") and `python3 -c "urllib.request.urlopen(...)"` (`socket.gaierror: Temporary failure in name resolution`) — both prove real DNS/network unreachability under `--network none`, not merely a missing binary.
+- [x] Manual: script writing to `/work/out.txt` succeeds and appears in the host workdir; script writing to `/etc/x` fails. **PASSED LIVE** (`TestLive_MountPolicyAndReadOnlyRoot`): `/etc/passwd` readable, `/Users` not mounted, `/work/out.txt` round-trips to the host, `/etc/kahya_test` write fails ("Read-only file system").
+- [x] `shell_host` with `git -c ...` or `tar --checkpoint-action=...` is denied and a `hostexec_denied` ledger event exists (test). **PASSED** (unit test + live curl against the real daemon/brain.db).
+- [x] `shell_host` with a VALID argv (`git status`) but no consumed approval token does not execute — the gate chain, not the validator, is the boundary (test with stub executor asserting zero invocations). **PASSED** (`TestHandle_ValidArgvNoApprovalNeverExecutes`).
+- [x] Every container run produces a `shell_exec` events row carrying the task's `trace_id` (verify via `sqlite3 brain.db`). **PASSED LIVE**: ran the real `bin/kahyad` against a scratch `brain.db`, called `shell_docker` over the real `/v1/mcp` HTTP-over-UDS endpoint, and `sqlite3 brain.db "select trace_id,kind,payload from events where kind='shell_exec'"` returned exactly one row with the request's `trace_id`, `image_digest`, `workdir`, `exit_code`, `bytes_out` all present.
+
+Closing note: docker/colima was already up by the time this task ran, so every criterion above was verified LIVE, not left pending. One deviation worth flagging: `docker images --digests` normally shows `<none>` for a purely local (never-pushed) build — this environment's buildx/containerd configuration happened to populate a real manifest-list digest anyway, so no fallback to the documented image-ID pin (`dockerDigestChecker`'s doc comment in `mcp/shell/runner.go`) was actually needed, though that fallback remains the production-safe behavior if a different Docker configuration ever produces `<none>` again. A second deviation: the sandbox image deliberately excludes `curl` (not in the coreutils/git/python3/jq allowlist), so the network-blocked live check used `getent`/`python3 urllib` instead of the spec's literal `curl` example — same property (DNS/connect failure under `--network none`), different binary.
 
 ## Out of scope
 - The egress proxy + `kahya-egress` internal network + volume budgets — W3-05 (this task only consumes them).

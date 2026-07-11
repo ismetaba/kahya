@@ -128,6 +128,13 @@ func (s *Server) buildMCPHandler() http.Handler {
 	if s.fsServer != nil {
 		s.fsServer.RegisterTools(mcpServer)
 	}
+	// W3-04: shell_docker/shell_host, registered onto this SAME shared
+	// server - see shell.go's SetShellTool doc comment and shellOwnedTools,
+	// which policyGateMiddleware below defers to entirely for these two
+	// tool names (mirrors fsOwnedTools' identical bypass for fs_*).
+	if s.shellServer != nil {
+		s.shellServer.RegisterTools(mcpServer)
+	}
 	mcpServer.AddReceivingMiddleware(s.policyGateMiddleware())
 
 	streamable := mcp.NewStreamableHTTPHandler(
@@ -214,20 +221,23 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: reason}}}, nil
 			}
 
-			// W3-03: fs_read/fs_write/fs_delete run their OWN full gate
-			// chain (deny-glob check BEFORE any policy decision, then
-			// Check, then ConsumeToken - see mcp/fs's package doc comment
-			// and fs.go's fsOwnedTools) instead of this middleware's
+			// W3-03/W3-04: fs_read/fs_write/fs_delete and shell_docker/
+			// shell_host each run their OWN full gate chain (deny-glob/
+			// arg-validator/digest-pin/network checks BEFORE any policy
+			// decision, then Check, then ConsumeToken - see mcp/fs's and
+			// mcp/shell's package doc comments and fs.go's fsOwnedTools /
+			// shell.go's shellOwnedTools) instead of this middleware's
 			// generic Check+auto-consume step: a middleware that always
 			// Check()s first, unconditionally, cannot express "a
 			// fs_write_deny_globs hit denies immediately, with no
 			// approval able to override it, before the ladder is ever
 			// consulted". This bypass runs BEFORE the deny-all check
 			// below too - mcp/fs's own PolicyClient adapter
-			// (enginePolicyClient in fs.go) independently re-checks
-			// s.denyAll and fails closed identically, so a policy.yaml
-			// load failure at boot still denies every fs operation.
-			if fsOwnedTools[canonName] {
+			// (enginePolicyClient in fs.go), reused directly by mcp/shell
+			// (shell.go's doc comment), independently re-checks s.denyAll
+			// and fails closed identically, so a policy.yaml load failure
+			// at boot still denies every fs/shell operation.
+			if fsOwnedTools[canonName] || shellOwnedTools[canonName] {
 				return next(ctx, method, req)
 			}
 

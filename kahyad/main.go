@@ -34,6 +34,7 @@ import (
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
+	mcpshell "kahya/mcp/shell"
 )
 
 func main() {
@@ -250,6 +251,31 @@ func run() int {
 	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log))
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
+
+	// W3-04: shell_docker/shell_host, registered onto the SAME shared
+	// /v1/mcp server as memory's/fs's own tools (server.SetShellTool's doc
+	// comment). fsPolicyClient/server.NewFSLogger(log) are REUSED directly
+	// (not re-adapted) - mcp/shell.PolicyClient/Logger are type aliases of
+	// mcp/fs's own interfaces (kahyad/internal/server/shell.go's doc
+	// comment), so the exact values already built for the fs tool above
+	// satisfy mcp/shell's dependencies with zero new adapter code.
+	// pinnedDigest is docker/sandbox/IMAGE_DIGEST's committed content - a
+	// missing/not-yet-built file resolves to "" (mcpshell.LoadPinnedDigest's
+	// documented fail-closed return), not a boot error, since an
+	// un-built sandbox image should refuse shell_docker at RUN time, not
+	// take down the rest of the daemon.
+	pinnedDigest, err := mcpshell.LoadPinnedDigest(cfg.DockerImageDigestPath)
+	if err != nil {
+		log.Error("shell_pinned_digest_load_failed", "path", cfg.DockerImageDigestPath, "err", err.Error())
+	}
+	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, pol.FSWriteDenyGlobs, fsPolicyClient, st, server.NewFSLogger(log))
+	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
+	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
+	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {
+		log.Warn("docker_unavailable_at_boot", "hint", "make docker-up")
+	} else {
+		log.Info("docker_health_checked", "healthy", true)
+	}
 
 	// POST /v1/task (W12-07): st.Queries already has exactly the
 	// InsertTask/UpdateTaskState/UpdateTaskSession method shape

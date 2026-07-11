@@ -87,6 +87,19 @@ type Config struct {
 	// committed repo-root policy.yaml).
 	PolicyPath string `yaml:"policy_path"`
 
+	// DockerImageTag is the W3-04 shell sandbox image's tag (e.g.
+	// "kahya-sandbox:0.1.0") — the SAME tag `make sandbox-image` builds
+	// and mcp/shell.Runner's DigestChecker inspects before every run.
+	DockerImageTag string `yaml:"docker_image_tag"`
+	// DockerImageDigestPath is the absolute path to docker/sandbox/
+	// IMAGE_DIGEST (W3-04's committed supply-chain pin) — derived the same
+	// way PolicyPath/MCPBridgePath/WorkerCmd/EmbedCmd are (two directories
+	// up from the running kahyad executable). An empty/missing/
+	// not-yet-built file resolves to mcp/shell.LoadPinnedDigest's ""
+	// return, which is itself Runner's fail-closed state (every
+	// shell_docker run refused until `make sandbox-image` has run).
+	DockerImageDigestPath string `yaml:"docker_image_digest_path"`
+
 	// LogLevel is the process-wide minimum log level: debug|info|warn|error
 	// (default "info"). main.go passes the resolved value to
 	// kahyad/internal/logx.SetLevel before logx.New. Env override
@@ -164,6 +177,8 @@ type fileConfig struct {
 	EmbedCmd               *[]string `yaml:"embed_cmd"`
 	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
 	PolicyPath             *string   `yaml:"policy_path"`
+	DockerImageTag         *string   `yaml:"docker_image_tag"`
+	DockerImageDigestPath  *string   `yaml:"docker_image_digest_path"`
 	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
 	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
 	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
@@ -231,23 +246,25 @@ func Load() (Config, error) {
 func defaults(home string) Config {
 	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
 	return Config{
-		DataDir:              dataDir,
-		Socket:               filepath.Join(dataDir, "kahyad.sock"),
-		LogDir:               filepath.Join(dataDir, "logs"),
-		DBPath:               filepath.Join(dataDir, "brain.db"),
-		MemoryDir:            filepath.Join(home, "Kahya", "memory"),
-		AnthropicUpstreamURL: "https://api.anthropic.com",
-		EmbedPort:            8092,
-		DefaultModel:         "claude-sonnet-5",
-		TaskTimeoutMin:       30,
-		ActiveEmbedModelVer:  "qwen3-embedding-0.6b:512:v1",
-		LogLevel:             "info",
-		UndoWindowSeconds:    300,
-		Env:                  EnvProd,
-		WorkerCmd:            defaultWorkerCmd(),
-		EmbedCmd:             defaultEmbedCmd(),
-		MCPBridgePath:        defaultMCPBridgePath(),
-		PolicyPath:           defaultPolicyPath(),
+		DataDir:               dataDir,
+		Socket:                filepath.Join(dataDir, "kahyad.sock"),
+		LogDir:                filepath.Join(dataDir, "logs"),
+		DBPath:                filepath.Join(dataDir, "brain.db"),
+		MemoryDir:             filepath.Join(home, "Kahya", "memory"),
+		AnthropicUpstreamURL:  "https://api.anthropic.com",
+		EmbedPort:             8092,
+		DefaultModel:          "claude-sonnet-5",
+		TaskTimeoutMin:        30,
+		ActiveEmbedModelVer:   "qwen3-embedding-0.6b:512:v1",
+		LogLevel:              "info",
+		UndoWindowSeconds:     300,
+		Env:                   EnvProd,
+		WorkerCmd:             defaultWorkerCmd(),
+		EmbedCmd:              defaultEmbedCmd(),
+		MCPBridgePath:         defaultMCPBridgePath(),
+		PolicyPath:            defaultPolicyPath(),
+		DockerImageTag:        "kahya-sandbox:0.1.0",
+		DockerImageDigestPath: defaultDockerImageDigestPath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -332,6 +349,18 @@ func defaultPolicyPath() string {
 	return filepath.Join(repoRoot, "policy.yaml")
 }
 
+// defaultDockerImageDigestPath resolves the default "<repo>/docker/
+// sandbox/IMAGE_DIGEST" path, using the exact same repo-root derivation as
+// defaultWorkerCmd/defaultEmbedCmd/defaultMCPBridgePath/defaultPolicyPath
+// (see defaultWorkerCmd's doc comment).
+func defaultDockerImageDigestPath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "docker", "sandbox", "IMAGE_DIGEST")
+}
+
 func loadFile(path string) (fileConfig, bool, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -399,6 +428,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.PolicyPath != nil {
 		cfg.PolicyPath = expandHome(*fc.PolicyPath, home)
 	}
+	if fc.DockerImageTag != nil {
+		cfg.DockerImageTag = *fc.DockerImageTag
+	}
+	if fc.DockerImageDigestPath != nil {
+		cfg.DockerImageDigestPath = expandHome(*fc.DockerImageDigestPath, home)
+	}
 	if fc.DailyBudgetUSD != nil {
 		cfg.DailyBudgetUSD = *fc.DailyBudgetUSD
 	}
@@ -449,6 +484,12 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_POLICY_PATH"); v != "" {
 		cfg.PolicyPath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_DOCKER_IMAGE_TAG"); v != "" {
+		cfg.DockerImageTag = v
+	}
+	if v := os.Getenv("KAHYA_DOCKER_IMAGE_DIGEST_PATH"); v != "" {
+		cfg.DockerImageDigestPath = expandHome(v, home)
 	}
 }
 
