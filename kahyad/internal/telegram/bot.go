@@ -55,6 +55,17 @@ import (
 type Config struct {
 	ChatID int64
 	UserID int64
+	// APIURL overrides telebot's own default Bot API base
+	// ("https://api.telegram.org") — empty (the production default) means
+	// "use telebot's own default". This exists SOLELY as a hermetic-testing
+	// seam (W3-10's gate tests): a KAHYA_ENV=dev child kahyad can point this
+	// at a local fake Telegram Bot API server instead of the real one, the
+	// same "dev-only override" posture kahyad/internal/anthproxy's
+	// KAHYA_ANTHROPIC_KEY_OVERRIDE already established — main.go only ever
+	// sets this from config.Config.TelegramAPIURL, which is itself only
+	// ever populated via config.yaml/KAHYA_TELEGRAM_API_URL in a hermetic
+	// test's own config, never in a real deployment.
+	APIURL string
 }
 
 // Enabled reports whether both halves of the allowlist pair are
@@ -166,10 +177,13 @@ type Bot struct {
 // only (a *tele.LongPoller Poller, never a *tele.Webhook, no listen
 // address anywhere in Settings) without needing a live network connection
 // to actually construct a *tele.Bot (task spec step 8: "long-poll config
-// asserted (no webhook)").
-func buildSettings(token string) tele.Settings {
+// asserted (no webhook)"). apiURL empty means "use telebot's own default
+// (https://api.telegram.org)" — see Config.APIURL's doc comment for the
+// one (hermetic-testing-only) case it is ever non-empty.
+func buildSettings(token, apiURL string) tele.Settings {
 	return tele.Settings{
 		Token:  token,
+		URL:    apiURL,
 		Poller: &tele.LongPoller{Timeout: longPollTimeout},
 	}
 }
@@ -196,7 +210,7 @@ func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, en
 		b.logDisabled("keychain read failed: " + err.Error())
 		return b
 	}
-	tb, err := tele.NewBot(buildSettings(tok))
+	tb, err := tele.NewBot(buildSettings(tok, cfg.APIURL))
 	if err != nil {
 		b.logDisabled("telebot construction failed: " + err.Error())
 		return b

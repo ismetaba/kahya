@@ -280,8 +280,8 @@ func run() int {
 	// either way. tgBot consumes the SAME egressGate/policyEngine/st every
 	// other in-process caller uses (HANDOFF §5 safety #1: approval cards
 	// are egress too).
-	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID}
-	tgBot := telegram.New(tgCfg, secrets.NewTelegram(), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
+	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID, APIURL: cfg.TelegramAPIURL}
+	tgBot := telegram.New(tgCfg, buildTelegramTokenSource(cfg, log), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
 	policyEngine.SetPendingApprovalHook(func(info policy.PendingApprovalInfo) {
 		// Fired synchronously from inside Check/Approve's own request path
 		// (kahyad/internal/policy.Engine.pendingApprovalHook's doc
@@ -699,6 +699,44 @@ func buildCredentialSource(cfg config.Config, log *logx.Logger) anthproxy.Creden
 		log.Warn("key_override_ignored", "reason", "KAHYA_ANTHROPIC_KEY_OVERRIDE set outside KAHYA_ENV=dev")
 	}
 	return anthproxy.NewKeychainCredentialSource(secrets.New(), cfg.Env, warnOverrideIgnored)
+}
+
+// telegramTokenOverrideEnvVar is KAHYA_TELEGRAM_TOKEN_OVERRIDE (W3-10
+// gate-testing seam only, mirroring KAHYA_ANTHROPIC_KEY_OVERRIDE's exact
+// posture — kahyad/internal/anthproxy's keychainSource.UpstreamAuth):
+// substitutes a real kahya.telegram Keychain read ONLY when cfg.Env=="dev",
+// so a hermetic child-kahyad gate test never needs a real BotFather token
+// or Keychain item. Ignored — loudly — outside dev, exactly like the
+// Anthropic key override.
+const telegramTokenOverrideEnvVar = "KAHYA_TELEGRAM_TOKEN_OVERRIDE"
+
+// devTelegramTokenSource wraps a real telegram.TokenReader (secrets.
+// NewTelegram()) with the dev-only override above.
+type devTelegramTokenSource struct {
+	real telegram.TokenReader
+	env  string
+	log  *logx.Logger
+}
+
+func (s devTelegramTokenSource) Read() (string, error) {
+	if override := os.Getenv(telegramTokenOverrideEnvVar); override != "" {
+		if s.env == config.EnvDev {
+			return override, nil
+		}
+		if s.log != nil {
+			s.log.Warn("telegram_token_override_ignored", "reason", "KAHYA_TELEGRAM_TOKEN_OVERRIDE set outside KAHYA_ENV=dev")
+		}
+	}
+	return s.real.Read()
+}
+
+// buildTelegramTokenSource selects the telegram.TokenReader tgBot reads its
+// BotFather token from: the real kahya.telegram Keychain item, with the
+// dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE substitution available only under
+// cfg.Env=="dev" (W3-10's hermetic gate tests — no real Keychain item or
+// live token ever required to exercise the Telegram bot's wiring).
+func buildTelegramTokenSource(cfg config.Config, log *logx.Logger) telegram.TokenReader {
+	return devTelegramTokenSource{real: secrets.NewTelegram(), env: cfg.Env, log: log}
 }
 
 // bootFailLine emits a hand-rolled JSONL error line for failures that occur

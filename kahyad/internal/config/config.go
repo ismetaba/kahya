@@ -194,6 +194,13 @@ type Config struct {
 	// config.yaml.
 	TelegramChatID int64 `yaml:"telegram_chat_id"`
 	TelegramUserID int64 `yaml:"telegram_user_id"`
+	// TelegramAPIURL overrides telebot's own default Bot API base
+	// ("https://api.telegram.org") — empty (the default) means "use
+	// telebot's own default". W3-10 gate-testing seam ONLY (see
+	// kahyad/internal/telegram.Config.APIURL's doc comment): a hermetic
+	// test's own config.yaml/KAHYA_TELEGRAM_API_URL points this at a local
+	// fake Telegram Bot API server; never set in a real deployment.
+	TelegramAPIURL string `yaml:"telegram_api_url"`
 
 	// --- W3-08 secret-lane local Qwen3-30B-A3B server ---
 
@@ -274,6 +281,7 @@ type fileConfig struct {
 	EstRequestTokens        *int64    `yaml:"est_request_tokens"`
 	TelegramChatID          *int64    `yaml:"telegram_chat_id"`
 	TelegramUserID          *int64    `yaml:"telegram_user_id"`
+	TelegramAPIURL          *string   `yaml:"telegram_api_url"`
 	QwenCmd                 *[]string `yaml:"qwen_cmd"`
 	QwenModelPath           *string   `yaml:"qwen_model_path"`
 	QwenModelName           *string   `yaml:"qwen_model_name"`
@@ -616,6 +624,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.TelegramUserID != nil {
 		cfg.TelegramUserID = *fc.TelegramUserID
 	}
+	if fc.TelegramAPIURL != nil {
+		cfg.TelegramAPIURL = *fc.TelegramAPIURL
+	}
 	if fc.QwenCmd != nil {
 		cfg.QwenCmd = *fc.QwenCmd
 	}
@@ -687,6 +698,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.TelegramUserID = id
 		}
+	}
+	if v := os.Getenv("KAHYA_TELEGRAM_API_URL"); v != "" {
+		cfg.TelegramAPIURL = v
 	}
 	if v := os.Getenv("KAHYA_QWEN_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {

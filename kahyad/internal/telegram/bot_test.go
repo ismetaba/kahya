@@ -13,7 +13,7 @@ import (
 // - a *tele.Webhook Poller, or any other inbound-network-surface config,
 // would fail this test.
 func TestBuildSettingsLongPollOnly(t *testing.T) {
-	settings := buildSettings("fake-token")
+	settings := buildSettings("fake-token", "")
 
 	poller, ok := settings.Poller.(*tele.LongPoller)
 	if !ok {
