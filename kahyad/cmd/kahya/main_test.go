@@ -180,6 +180,53 @@ func TestOneShotResultErrorNoMessagePrintsFallbackAndExits1(t *testing.T) {
 	}
 }
 
+// TestOneShotProcessedLocallyPrintsBadge guards W3-08's CLI badge: a
+// terminal "result" event with processed_locally:true must print the
+// exact "🔒 yerel işlendi" line to stdout.
+func TestOneShotProcessedLocallyPrintsBadge(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: delta\ndata: {\"text\":\"cevap\"}\n\n")
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\",\"task_id\":\"t_1\",\"session_id\":\"\",\"processed_locally\":true}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"kredi", "kartı", "ekstresi"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), MsgLocallyProcessed) {
+		t.Errorf("stdout = %q, want it to contain %q", stdout.String(), MsgLocallyProcessed)
+	}
+}
+
+// TestOneShotCloudProcessingDoesNotPrintBadge guards the inverse: an
+// ordinary cloud-routed result (processed_locally absent/false) must NEVER
+// print the local-processing badge.
+func TestOneShotCloudProcessingDoesNotPrintBadge(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\",\"task_id\":\"t_1\",\"session_id\":\"\",\"processed_locally\":false}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"merhaba"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), MsgLocallyProcessed) {
+		t.Errorf("stdout = %q, want it NOT to contain %q", stdout.String(), MsgLocallyProcessed)
+	}
+}
+
 func TestREPLExitsOnEOF(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(nil, strings.NewReader(""), &stdout, &stderr)

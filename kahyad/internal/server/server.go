@@ -30,6 +30,7 @@ import (
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
 	"kahya/mcp/memory"
@@ -143,6 +144,16 @@ type Server struct {
 	// egress.Proxy both call — one gate, every in-process caller. See
 	// SetEgressGate's doc comment (egress.go).
 	egressGate *egress.Gate
+
+	// secretLaneClassifier/secretLaneAnswerer/markSensitiveRead wire
+	// W3-08's ingest-time classifier + local-only answer path. nil (the
+	// default) means every task is classified lane="normal"
+	// unconditionally — see SetSecretLane's doc comment (task.go) — so
+	// every pre-W3-08 test/caller that never wires this in keeps its exact
+	// original behavior.
+	secretLaneClassifier *secretlane.Classifier
+	secretLaneAnswerer   secretlane.Answerer
+	markSensitiveRead    func(ctx context.Context, sessionKey, traceID string) error
 
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both

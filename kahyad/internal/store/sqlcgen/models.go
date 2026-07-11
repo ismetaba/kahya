@@ -143,15 +143,17 @@ type PendingApproval struct {
 }
 
 type Task struct {
-	ID        string         `json:"id"`
-	TraceID   string         `json:"trace_id"`
-	SessionID sql.NullString `json:"session_id"`
-	State     string         `json:"state"`
-	TaintTier string         `json:"taint_tier"`
-	Model     sql.NullString `json:"model"`
-	Envelope  sql.NullString `json:"envelope"`
-	UpdatedAt string         `json:"updated_at"`
-	CreatedAt string         `json:"created_at"`
+	ID             string         `json:"id"`
+	TraceID        string         `json:"trace_id"`
+	SessionID      sql.NullString `json:"session_id"`
+	State          string         `json:"state"`
+	TaintTier      string         `json:"taint_tier"`
+	Model          sql.NullString `json:"model"`
+	Envelope       sql.NullString `json:"envelope"`
+	UpdatedAt      string         `json:"updated_at"`
+	CreatedAt      string         `json:"created_at"`
+	Lane           string         `json:"lane"`
+	SecretCategory sql.NullString `json:"secret_category"`
 }
 
 type UndoWindow struct {

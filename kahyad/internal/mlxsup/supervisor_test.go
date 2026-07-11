@@ -2,6 +2,7 @@ package mlxsup
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"testing"
@@ -39,6 +40,10 @@ func testLogger(t *testing.T) *logx.Logger {
 
 func healthURL(port int) string {
 	return "http://127.0.0.1:" + strconv.Itoa(port) + "/health"
+}
+
+func modelsURL(port int) string {
+	return "http://127.0.0.1:" + strconv.Itoa(port) + "/v1/models"
 }
 
 // realConnectTimeout bounds every test below that needs a GENUINE
@@ -132,6 +137,146 @@ func TestEnsureRunningHappyPathThenStop(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := sup.State(); got != StateDown {
 		t.Fatalf("State() after waiting past backoff = %q, want %q (no restart after Stop)", got, StateDown)
+	}
+}
+
+// TestMaxRestartsExceededReachesStateFailed guards W3-08's "crash ->
+// respawn with backoff, max 3, then fail-closed" contract: a child that
+// never becomes healthy and keeps crashing must stop being autonomously
+// respawned once it has crashed more times than Config.MaxRestarts allows,
+// landing in the terminal StateFailed - and a caller's EnsureRunning must
+// then return ErrMaxRestartsExceeded immediately, never spawn attempt #(N+1).
+func TestMaxRestartsExceededReachesStateFailed(t *testing.T) {
+	port := freePort(t)
+	sup := New(Config{
+		Name:         "qwen",
+		Cmd:          []string{"python3", "testdata/crash_immediately.py"},
+		HealthURL:    healthURL(port),
+		PollInterval: 5 * time.Millisecond,
+		StartupGrace: 30 * time.Millisecond,
+		MinBackoff:   5 * time.Millisecond,
+		MaxBackoff:   10 * time.Millisecond,
+		MaxRestarts:  3,
+		Log:          testLogger(t),
+	})
+	t.Cleanup(sup.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = sup.EnsureRunning(ctx) // expected to time out on the very first spawn attempt
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if sup.State() == StateFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("supervisor never reached StateFailed after MaxRestarts=3 (stuck at %q, spawnCount=%d)", sup.State(), sup.spawnCountForTest())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	spawnCountAtFailure := sup.spawnCountForTest()
+	// Give it a few backoff cycles' worth of time: spawnCount must NEVER
+	// increase again once StateFailed is reached (this IS the "fail-closed,
+	// no more autonomous respawn attempts" guarantee).
+	time.Sleep(100 * time.Millisecond)
+	if got := sup.spawnCountForTest(); got != spawnCountAtFailure {
+		t.Fatalf("spawnCount changed after StateFailed: %d -> %d, want no further spawns", spawnCountAtFailure, got)
+	}
+
+	if err := sup.EnsureRunning(context.Background()); !errors.Is(err, ErrMaxRestartsExceeded) {
+		t.Fatalf("EnsureRunning() after StateFailed error = %v, want ErrMaxRestartsExceeded", err)
+	}
+	if got := sup.spawnCountForTest(); got != spawnCountAtFailure {
+		t.Fatalf("EnsureRunning() on a StateFailed supervisor spawned again: spawnCount %d -> %d", spawnCountAtFailure, got)
+	}
+}
+
+// TestEnsureRunningHealthyOnNoStatusField covers the W3-08 generalization
+// of pingHealth: a child answering an OpenAI-compatible `GET /v1/models`
+// list body (no "status" field at all - the shape the real mlx_lm.server
+// answers, standing in for it here so this Go-side test carries no MLX/
+// model dependency) must still be treated as healthy, exactly like
+// healthy_server.py's {"status":"ok"} body is for W12-11's embed service -
+// this is the SAME generic Supervisor, not a fork, serving a differently-
+// shaped health endpoint.
+func TestEnsureRunningHealthyOnNoStatusField(t *testing.T) {
+	port := freePort(t)
+	sup := New(Config{
+		Name:         "qwen",
+		Cmd:          []string{"python3", "testdata/models_list_server.py", strconv.Itoa(port)},
+		HealthURL:    modelsURL(port),
+		PollInterval: 500 * time.Millisecond,
+		StartupGrace: realConnectTimeout,
+		Log:          testLogger(t),
+	})
+	t.Cleanup(sup.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), realConnectTimeout)
+	defer cancel()
+	if err := sup.EnsureRunning(ctx); err != nil {
+		t.Fatalf("EnsureRunning() error = %v, want nil (no-status-field body must count as healthy)", err)
+	}
+	if got := sup.State(); got != StateOK {
+		t.Fatalf("State() = %q, want %q", got, StateOK)
+	}
+}
+
+// TestStopForIdleThenRespawn guards the W3-08 idle-TTL-unload primitive:
+// unlike Stop (permanent, kahyad-shutdown-only), StopForIdle must leave the
+// Supervisor eligible for a LATER EnsureRunning call to lazily respawn it -
+// the whole point of unloading an idle 17GB model without losing the
+// ability to bring it back on the next secret-lane request.
+func TestStopForIdleThenRespawn(t *testing.T) {
+	port := freePort(t)
+	sup := New(Config{
+		Name:         "qwen",
+		Cmd:          []string{"python3", "testdata/healthy_server.py", strconv.Itoa(port)},
+		HealthURL:    healthURL(port),
+		PollInterval: 200 * time.Millisecond,
+		StartupGrace: realConnectTimeout,
+		MinBackoff:   10 * time.Millisecond,
+		MaxBackoff:   50 * time.Millisecond,
+		Log:          testLogger(t),
+	})
+	t.Cleanup(sup.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), realConnectTimeout)
+	defer cancel()
+	if err := sup.EnsureRunning(ctx); err != nil {
+		t.Fatalf("first EnsureRunning() error = %v", err)
+	}
+	firstSpawnCount := sup.spawnCountForTest()
+
+	sup.StopForIdle()
+	if got := sup.State(); got != StateDown {
+		t.Fatalf("State() after StopForIdle = %q, want %q", got, StateDown)
+	}
+
+	// Give the (suppressed) backoff loop a moment to prove it does NOT
+	// bring the child back on its own - StopForIdle must not look like an
+	// unexpected crash to the background supervise goroutine.
+	time.Sleep(100 * time.Millisecond)
+	if got := sup.State(); got != StateDown {
+		t.Fatalf("State() shortly after StopForIdle = %q, want %q (no autonomous restart)", got, StateDown)
+	}
+
+	// A fresh port: the old child (if it somehow survived) held the first
+	// one: reusing a NEW port on the SAME Supervisor proves this is a
+	// genuinely new spawn, not a stale cached-healthy state.
+	port2 := freePort(t)
+	sup.cfg.Cmd = []string{"python3", "testdata/healthy_server.py", strconv.Itoa(port2)}
+	sup.cfg.HealthURL = healthURL(port2)
+
+	if err := sup.EnsureRunning(ctx); err != nil {
+		t.Fatalf("EnsureRunning() after StopForIdle error = %v, want a successful respawn", err)
+	}
+	if got := sup.State(); got != StateOK {
+		t.Fatalf("State() after respawn = %q, want %q", got, StateOK)
+	}
+	if got := sup.spawnCountForTest(); got <= firstSpawnCount {
+		t.Fatalf("spawnCount = %d, want > %d (StopForIdle then EnsureRunning must spawn a NEW process)", got, firstSpawnCount)
 	}
 }
 

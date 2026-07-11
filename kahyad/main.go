@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -28,10 +29,12 @@ import (
 	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/secrets"
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/store"
@@ -397,10 +400,67 @@ func run() int {
 	// bu proxy noktasinda uygulanir"). A sensitive-read-tainted session
 	// cannot even reach the upstream host if it were ever off-allowlist;
 	// the stronger "no secret-lane byte to cloud" content rule is W3-08's
-	// classifier + W3-10's test.
+	// classifier + backstop, wired below.
 	anthropicHost, anthropicPort := hostPortFromURL(cfg.AnthropicUpstreamURL)
 	egressGateFactory := egress.NewAnthproxyEgressGateHook(egressGate, anthropicHost, anthropicPort)
-	srv.SetAnthproxy(governor, governorNotifier, credential, egressGateFactory)
+
+	// W3-08: the local Qwen3-30B-A3B secret-lane server - kahyad-supervised
+	// (mlxsup, REUSED verbatim, never a second supervisor implementation),
+	// spawned lazily on the FIRST request that needs it (HANDOFF §6 timing
+	// note, same "not at boot" posture as the W12-11 embed service above),
+	// fail-closed on insufficient free memory (kahyad/internal/mlx.
+	// HasSufficientMemory), idle-TTL unloaded after cfg.qwen_idle_ttl_seconds
+	// with zero in-flight requests. qwenDir is the mlx/qwen directory the
+	// service's own venv lives under - derived from cfg.QwenCmd the exact
+	// same way embedServiceDir derives mlx/embed's, two lines above.
+	qwenArgv := append(append([]string{}, cfg.QwenCmd...),
+		"--model", cfg.QwenModelPath,
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(cfg.QwenPort),
+	)
+	qwenSup := mlx.New(mlx.Config{
+		Cmd:     qwenArgv,
+		Dir:     embedServiceDir(cfg.QwenCmd),
+		Host:    "127.0.0.1",
+		Port:    cfg.QwenPort,
+		IdleTTL: time.Duration(cfg.QwenIdleTTLSeconds) * time.Second,
+		OnUnloaded: func() {
+			if err := st.LogEvent(context.Background(), bootTraceID, "mlx_unloaded", map[string]any{"name": "qwen"}); err != nil {
+				log.Warn("mlx_unloaded_ledger_error", "err", err.Error())
+			}
+		},
+		Log: log,
+	})
+	secretLaneClassifier := secretlane.NewClassifier(mlx.NewQwenClassifierAdapter(qwenSup, cfg.QwenModelName))
+	secretLaneAnswerer := mlx.NewAnswererAdapter(qwenSup, cfg.QwenModelName)
+	markSensitiveRead := func(ctx context.Context, sessionKey, traceID string) error {
+		return egressGate.MarkSensitiveRead(ctx, sessionKey, traceID)
+	}
+	srv.SetSecretLane(secretLaneClassifier, secretLaneAnswerer, markSensitiveRead)
+
+	// W3-08 proxy backstop: the W12-08 chokepoint's SECOND, independent
+	// enforcement layer (the FIRST is that a secret-lane task never spawns
+	// a worker at all - task.go's own handleSecretLaneTask branch). Even if
+	// that first layer were ever bypassed (a future change routes a
+	// secret-lane task through the worker after all), this consults the
+	// tasks-row lane by task_id on EVERY forwarded request and refuses with
+	// 403 + ledger secretlane_cloud_blocked - "gizli-şerit içerik bulut
+	// çağrısına çıkamıyor" (§6 W3 gate). Composed with (runs BEFORE) the
+	// existing allowlist/budget/sensitive-read gate above - one combined
+	// factory, still exactly one anthEgressGateFactory field.
+	secretLaneLookup := server.NewSecretLaneStoreAdapter(st.Queries)
+	secretLaneBackstopFactory := secretlane.NewProxyBackstopHook(secretLaneLookup, st)
+	combinedEgressGateFactory := func(taskID, traceID string) func(*http.Request) error {
+		secretHook := secretLaneBackstopFactory(taskID, traceID)
+		allowlistHook := egressGateFactory(taskID, traceID)
+		return func(r *http.Request) error {
+			if err := secretHook(r); err != nil {
+				return err
+			}
+			return allowlistHook(r)
+		}
+	}
+	srv.SetAnthproxy(governor, governorNotifier, credential, combinedEgressGateFactory)
 
 	// W3-05: the egress proxy itself - the ONLY route out of the
 	// kahya-egress Docker network mcp/shell's needs_network container
@@ -504,6 +564,9 @@ func run() int {
 	// leave an orphaned mlx/embed/server.py behind. A no-op if it was
 	// never lazily started (StateDisabled/StateDown).
 	embedSup.Stop()
+	// Same shutdown contract for the W3-08 secret-lane Qwen3-30B-A3B
+	// server - also stops its idle-TTL monitor goroutine.
+	qwenSup.Stop()
 
 	if runErr != nil {
 		if errors.Is(runErr, server.ErrAlreadyRunning) {

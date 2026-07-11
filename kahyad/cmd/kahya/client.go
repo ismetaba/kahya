@@ -484,6 +484,11 @@ type taskResult struct {
 	TaskID    string
 	SessionID string
 	ErrMsg    string // set only when the server sent an "error" event; Turkish, user-facing as-is
+	// ProcessedLocally is W3-08's "result" field: true iff this task was
+	// answered entirely by the local secret-lane Qwen3-30B-A3B server
+	// (kahyad/internal/server.handleSecretLaneTask), never a cloud model -
+	// main.go prints the "🔒 yerel işlendi" badge when this is true.
+	ProcessedLocally bool
 }
 
 // sseEvent is one parsed "event: <type>\ndata: <payload>" SSE frame.
@@ -544,9 +549,11 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta
 				// MsgTaskFailed is used below so an error result is never
 				// silently swallowed with no stderr output.
 				Message string `json:"message"`
+				// ProcessedLocally is W3-08's CLI-badge field.
+				ProcessedLocally bool `json:"processed_locally"`
 			}
 			if json.Unmarshal(ev.data, &r) == nil {
-				result = taskResult{Status: r.Status, TaskID: r.TaskID, SessionID: r.SessionID}
+				result = taskResult{Status: r.Status, TaskID: r.TaskID, SessionID: r.SessionID, ProcessedLocally: r.ProcessedLocally}
 				if r.Status == "error" {
 					if r.Message != "" {
 						result.ErrMsg = r.Message

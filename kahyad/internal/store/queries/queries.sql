@@ -25,9 +25,20 @@ WHERE kind = ?
 ORDER BY id ASC;
 
 -- name: InsertTask :one
-INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at;
+-- lane/secret_category (W3-08): the caller ALREADY knows this task's
+-- secret-lane verdict before this row is ever created (kahyad/internal/
+-- server's POST /v1/task handler runs kahyad/internal/secretlane's
+-- classifier BEFORE calling InsertTask - the ordering invariant, HANDOFF
+-- S4 flag - so there is no window where a task row exists with an
+-- unclassified lane). Column order in both the INSERT list and RETURNING
+-- clause matches the TABLE's own physical column order (lane/
+-- secret_category were appended via ALTER TABLE, 0006_secret_lane.sql,
+-- after updated_at/created_at) so sqlc reuses the existing Task model
+-- type here rather than generating a second, differently-ordered
+-- InsertTaskRow type.
+INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category;
 
 -- name: UpdateTaskState :exec
 UPDATE tasks
@@ -43,6 +54,21 @@ WHERE id = ?;
 UPDATE tasks
 SET session_id = ?, updated_at = ?
 WHERE id = ?;
+
+-- W3-08 (secret-lane routing) queries below: lane/secret_category are
+-- STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
+-- never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
+-- comment). kahyad/internal/secretlane.NewProxyBackstopHook (the W12-08
+-- proxy chokepoint) is GetTaskLane's other caller, consulted on EVERY
+-- forwarded model-call request.
+
+-- name: SetTaskLane :exec
+UPDATE tasks
+SET lane = ?, secret_category = ?, updated_at = ?
+WHERE id = ?;
+
+-- name: GetTaskLane :one
+SELECT lane, secret_category FROM tasks WHERE id = ?;
 
 -- name: GetTaskBySession :one
 -- Sessions are not currently guaranteed to map to exactly one task row

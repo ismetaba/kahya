@@ -46,7 +46,9 @@ Single JSON object, written once, then stdin is closed:
   "prompt": "Kadıköy'deki randevuyu hatırlat",
   "model": "claude-sonnet-5",
   "memory_injection": true,
-  "created_at": "2026-07-10T12:00:00Z"
+  "created_at": "2026-07-10T12:00:00Z",
+  "lane": "normal",
+  "category": ""
 }
 ```
 
@@ -60,9 +62,11 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `session_id` | **Always present**, JSON `null` for a new task (Go: a nil `*string` — `encoding/json` renders this as `null` with no extra code). Reserved for W4-02 session resume; W1-2 never sets it on the way in. |
 | `kind` | Always `"chat"` in W1-2. Other kinds (scheduled/background) are later work. |
 | `prompt` | The user's text, non-blank (rejected at `/v1/task` before a task_id is even minted). Turkish text passes through byte-exact — no transliteration, no normalization. |
-| `model` | Must be one of the HANDOFF §9 cloud set: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` (`spawn.AllowedModels`). W1-2 always uses `cfg.default_model` (static); the full intent router (task-type → model) is W4-08 — the routing **decision** is always Go's, never the prompt's. |
+| `model` | Must be one of the HANDOFF §9 cloud set: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` (`spawn.AllowedModels`). W1-2 always uses `cfg.default_model` (static); the full intent router (task-type → model) is W4-08 — the routing **decision** is always Go's, never the prompt's. Set unconditionally even for a `lane:"secret"` task (schema validity) — the ACTUAL enforcement that a secret-lane task never reaches this model is the W3-08 mechanisms `lane`/the proxy backstop describe below, not this field. |
 | `memory_injection` | Always `true` in W1-2. The `<hafiza>` block itself is rendered by `/v1/memory/search?for_injection=true` (W12-05); the worker's `UserPromptSubmit` hook that actually calls it is W12-09. |
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
+| `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
+| `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
 
 ## 3 · Worker environment
 
@@ -119,6 +123,92 @@ known. When the request's own `max_tokens`/body size can't be parsed, the
 estimate falls back to the new `est_request_tokens` config key (committed
 default `50000`) — see `kahyad/internal/anthproxy/governor.go`'s
 `estimateRequestLocked` for the full estimation strategy.
+
+### W3-08 note — secret-lane branch (HANDOFF §4 ⚑ ordering invariant)
+
+`kahyad/internal/secretlane` + `kahyad/internal/mlx` add the Go routing
+branch that makes finans/sağlık/kimlik content physically unable to reach
+a cloud model, without changing anything in §2-§6 above:
+
+- **Classification is deterministic-first, ingest-time, and precedes
+  everything.** `POST /v1/task`'s handler runs
+  `secretlane.ClassifyDeterministic(prompt)` — IBAN/TCKN (checksum-
+  verified)/card-number (Luhn-verified)/CVV regexes, plus a folded
+  (`kahyad/internal/textnorm.Fold`) sağlık/finans/kimlik keyword lexicon —
+  **before** the envelope above is even constructed, i.e. before any
+  worker could be spawned or any Anthropic-proxy listener opened. A hit is
+  final: `lane="secret"`, no model consulted. This call takes **no live
+  Qwen dependency at all** — deliberately narrower than the full
+  `secretlane.Classifier` (deterministic pre-pass + Qwen3-30B-A3B
+  fallback, `kahyad/internal/mlx.Supervisor`-backed, fully implemented and
+  unit/live-tested) that `kahyad/internal/secretlane.Escalate` will wire
+  into memory_write/fs-read/mail-web-Reader ingestion once W4-03 lands
+  those — see that package's own doc comments for the full rationale.
+- **A `lane:"secret"` task is answered ENTIRELY on-device — the worker is
+  never spawned at all.** `kahyad/internal/server`'s `handleSecretLaneTask`
+  calls `secretlane.Answerer` (backed by the same local Qwen3-30B-A3B
+  server, an OpenAI-compatible `mlx_lm.server` kahyad supervises via
+  `kahyad/internal/mlxsup`, reused verbatim — see `mlx/qwen/README.md`)
+  directly, streaming its answer back over the identical SSE contract §5
+  documents (one `delta` event, then `result` with
+  `"processed_locally": true` — the `kahya` CLI prints `🔒 yerel işlendi`
+  on this). There is no code path through which a secret-lane task's
+  content could reach the worker process, let alone the Anthropic proxy —
+  not merely a backstop that blocks it after the fact.
+- **Worker-side wiring status:** the `lane`/`category` envelope fields
+  above exist in the wire schema for a FUTURE worker-side integration, but
+  today's worker (`claude-agent-sdk`) speaks the Anthropic Messages API,
+  not `mlx_lm.server`'s OpenAI-compatible endpoint — rewiring the SDK
+  itself to a local endpoint is out of reach for W3-08 (its own explicit
+  escape hatch). Since the worker is never spawned for a secret-lane task
+  at all (previous bullet), this is not a live gap today; it only matters
+  if some future change ever routes a secret-lane task through the
+  worker, which is exactly what layer 2 below exists for.
+- **Layer 2 — the W12-08 proxy backstop (`secretlane.NewProxyBackstopHook`,
+  composed with `egress.NewAnthproxyEgressGateHook` in `main.go`):** even
+  if a secret-lane task somehow did reach a worker/proxy, the per-task
+  `anthproxy.Proxy`'s `EgressGate` hook consults the task's DURABLY
+  persisted `tasks.lane` row (by `task_id`, fixed per listener) on every
+  single forwarded request and refuses with `403` + ledger
+  `secretlane_cloud_blocked` — this is the enforcement even if a
+  prompt-injected worker tries the cloud URL directly, since the worker
+  never gets to choose or override its own task's lane.
+- **Sticky, persisted lane:** `tasks.lane`/`tasks.secret_category`
+  (`kahyad/migrations/0006_secret_lane.sql`) are set on `InsertTask` (the
+  classification above already ran) and only ever WIDEN thereafter
+  (`secretlane.Escalate`, enforced in Go, not SQL) — once a task is
+  `lane="secret"` it stays secret for its lifetime, including a future
+  W4-02 resume.
+- **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
+  `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
+  fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
+  ~17GB model + 4GB headroom) before every spawn attempt; on-demand load
+  (first secret-lane need, never at boot); idle-TTL unload
+  (`mlx.qwen_idle_ttl_seconds`, default 600s, zero in-flight requests) via
+  `mlxsup.Supervisor.StopForIdle` (a NEW primitive alongside `Stop` —
+  unlike kahyad-shutdown's `Stop`, `StopForIdle` leaves the supervisor
+  eligible for a later on-demand respawn); crash → respawn with backoff,
+  capped at `MaxRestarts` (default 3), then the terminal `StateFailed`
+  (also a new `mlxsup` state, opt-in via `Config.MaxRestarts`, `0` = the
+  original W12-11 unlimited-retry behavior, unaffected). ANY failure mode
+  here (insufficient memory, spawn/health failure, `MaxRestarts` exceeded)
+  collapses to the ONE typed `mlx.ErrLocalModelUnavailable` sentinel —
+  Turkish, byte-exact: `"yerel model için bellek yok"` + guidance
+  `"ComfyUI/Wan kapatıp tekrar deneyin"` — the task's SSE stream ends in
+  `error` with this message; it is NEVER rerouted to cloud.
+- **Live-verified (`KAHYA_MLX_TESTS=1`, `kahyad/internal/mlx/live_test.go`):**
+  a real spawn of the real ~16GB Qwen3-30B-A3B-4bit checkpoint became
+  healthy in ~1.2s on this dev machine's NVMe storage (well under the 120s
+  default `StartupGrace`); a warm classification round-trip measured
+  ~280-1200ms — the task spec's own "<300ms warm" target does not hold in
+  practice for this model size over HTTP on this hardware (a documented
+  tuning finding for W4-08's intent router, which owns the combined
+  routing+classification path going forward, not a correctness bug: every
+  fail-closed/ordering-invariant/proxy-backstop guarantee holds regardless
+  of how long classification actually takes). `mlx_lm.server`'s Qwen3 chat
+  template defaults to an extended "thinking" trace before answering — the
+  classifier and local answerer both pass
+  `chat_template_kwargs:{"enable_thinking":false}` to get a direct answer.
 
 ## 4 · Worker stdout protocol (JSONL)
 
@@ -322,7 +412,14 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   (W12-05/W3-02).
 - `tasks`/`events` schema: `kahyad/migrations/0001_init_schema.sql`
   (W12-02); `autonomy_state`/`approval_tokens`/`undo_windows`:
-  `kahyad/migrations/0003_autonomy_policy.sql` (W3-02).
+  `kahyad/migrations/0003_autonomy_policy.sql` (W3-02); `tasks.lane`/
+  `tasks.secret_category`: `kahyad/migrations/0006_secret_lane.sql`
+  (W3-08).
+- Secret-lane classifier/router/local-answer path: `kahyad/internal/
+  secretlane` (`classifier.go`, `router.go`, `answer.go`, `httpchat.go`);
+  local Qwen3-30B-A3B supervisor: `kahyad/internal/mlx` (`supervisor.go`,
+  `memcheck.go`, `adapters.go`), reusing `kahyad/internal/mlxsup` verbatim;
+  venv/setup: `mlx/qwen/README.md` (W3-08).
 
 ## 8 · Out of scope / what changes later
 
@@ -410,6 +507,12 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — W4-08. W1-2's `model` is
   always the static `cfg.default_model`.
+- **Secret-lane classifier wired into memory_write/fs-read/mail-web
+  Reader ingestion** — W4-03/W4-08. W3-08 (see its own note above) exposes
+  the full `secretlane.Classifier` (deterministic + Qwen fallback) and
+  `secretlane.Escalate` (sticky lane widening) for those tasks to call;
+  `POST /v1/task`'s own classification uses the deterministic pre-pass
+  only, per that note's own reasoning.
 
 ## 9 · W1-2 gate — how to re-run
 

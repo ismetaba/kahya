@@ -23,8 +23,11 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/anthproxy"
+	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
@@ -57,6 +60,11 @@ const (
 	// manage the process (spawn.Run's own error return) - both cases point
 	// the user at the same diagnostic command (%s = trace_id).
 	MsgTaskUnexpectedExit = "Görev beklenmedik şekilde sonlandı. Ayrıntı: kahya log --trace %s"
+	// MsgSecretLaneModelCallFailed is the W3-08 secret-lane task's SSE
+	// "error" event message when the local Qwen3-30B-A3B answer call
+	// itself fails for a reason OTHER than ErrLocalModelUnavailable (which
+	// gets its own exact fail-closed message - see handleSecretLaneTask).
+	MsgSecretLaneModelCallFailed = "Yerel model çağrısı başarısız oldu. Ayrıntı: kahya log --trace %s"
 )
 
 // TaskStore is the tasks-table persistence source POST /v1/task needs
@@ -103,6 +111,30 @@ func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Noti
 	s.anthNotifier = notifier
 	s.anthCredential = credential
 	s.anthEgressGateFactory = egressGateFactory
+}
+
+// SetSecretLane wires W3-08's local-only answer path and (for future
+// ingestion points - see handleTask's own classification comment)
+// Qwen-backed classifier (main.go, once kahyad/internal/mlx's Qwen3-30B-A3B
+// supervisor is constructed). handleTask's OWN chat-prompt classification
+// always runs secretlane.ClassifyDeterministic regardless of whether this
+// method was ever called (it takes no model dependency at all); answerer
+// is what actually answers a lane=="secret" task once classified - nil
+// means a deterministic hit still gets DURABLY persisted onto the task row
+// and the worker is still never spawned, but the SSE response reports
+// MsgSecretLaneModelCallFailed rather than attempting anything (never a
+// cloud fallback either way). markSensitiveRead is kahyad/internal/
+// egress.Gate.MarkSensitiveRead's exact shape (task spec step 6:
+// "classifier hit => POST /session/sensitive-read") - the SAME "keyed on
+// trace_id" convention kahyad/internal/egress.NewAnthproxyEgressGateHook
+// already uses; may be nil (best-effort, matching every other optional
+// hook in this file). classifier itself is stored for a future ingestion
+// point (memory_write/fs-read/mail-web Reader, W4-03) to consult via
+// kahyad/internal/secretlane.Escalate - not read by handleTask today.
+func (s *Server) SetSecretLane(classifier *secretlane.Classifier, answerer secretlane.Answerer, markSensitiveRead func(ctx context.Context, sessionKey, traceID string) error) {
+	s.secretLaneClassifier = classifier
+	s.secretLaneAnswerer = answerer
+	s.markSensitiveRead = markSensitiveRead
 }
 
 // taskRequest is POST /v1/task's request body - the exact shape
@@ -169,8 +201,68 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log := s.log.With(traceID)
 
+	// dbCtx (the request's own context) is used for the writes that happen
+	// BEFORE the worker is spawned, while the client is still known to be
+	// connected - including, since W3-08, the ingest-time classifier itself
+	// (see below): classification MUST complete, and its resulting lane
+	// MUST be durably persisted onto the tasks row, strictly BEFORE any
+	// worker is spawned or any Anthropic-proxy listener is opened (HANDOFF
+	// §4 ⚑ ordering invariant). dbCtx must NOT be used for anything after
+	// spawn.Run returns: r.Context() is cancelled the moment the underlying
+	// connection closes for ANY reason - not only a clean client exit, but
+	// also (verified live during this task's manual verification) the
+	// CLI's OWN 30s idle-read timeout giving up and closing its side while
+	// the server's task_timeout_min is still counting down. Since taskCtx
+	// below is derived FROM dbCtx, that same disconnect also cancels
+	// taskCtx early - which is desirable for spawn.Run (no orphan worker
+	// survives a disappeared client) - but it must never take down the
+	// bookkeeping that RECORDS the outcome: persistCtx (a plain background
+	// context) is used for every write from OnSession onward specifically
+	// so a disconnected/timed-out client can never prevent kahyad from
+	// recording that the task ended (state + ledger).
+	dbCtx := r.Context()
+	persistCtx := context.Background()
+
 	taskID := spawn.NewTaskID()
 	now := rfc3339Now()
+
+	// W3-08: classify BEFORE the envelope/task row are ever constructed -
+	// the ordering invariant's strongest possible form: there is no
+	// envelope, no task row, and no worker/proxy for this task to exist yet
+	// at all until classification has completed.
+	//
+	// Deliberately uses secretlane.ClassifyDeterministic (regex/lexicon
+	// pre-pass ONLY - IBAN/TCKN/card-number/CVV/keyword lexicon), NOT the
+	// full Qwen-backed s.secretLaneClassifier: the task spec's own
+	// ingestion-point list names memory_write content, fs reads flagged for
+	// model consumption, and (W4-03) mail/web Reader input - it does NOT
+	// name the raw chat prompt POST /v1/task carries. Requiring a live,
+	// warm Qwen server just to have an ORDINARY cloud-routed conversation
+	// would take a hard dependency this ingestion point was never meant to
+	// have (and would defeat kahyad/internal/mlx's own "spawn lazily, only
+	// on an ACTUAL secret-lane need" contract). The deterministic pre-pass
+	// alone already needs no model at all and is exactly as strong a
+	// guarantee on a MATCH (IBAN/TCKN/card/keyword hits are unconditionally
+	// final, per HANDOFF's ordering invariant) - only a NON-match's fallback
+	// behavior differs (see ClassifyDeterministic's own doc comment).
+	// s.secretLaneClassifier (deterministic + Qwen fallback, fully wired to
+	// the real local server in main.go) remains available for those THREE
+	// named ingestion points once W4-03 lands them; a later Escalate call
+	// (kahyad/internal/secretlane.Escalate) would STICKILY widen this exact
+	// task's lane to secret if any of them find something the chat prompt
+	// itself did not.
+	lane := spawn.LaneNormal
+	category := ""
+	verdict := secretlane.ClassifyDeterministic(req.Prompt)
+	if verdict.SecretLane {
+		lane = spawn.LaneSecret
+		category = verdict.Category
+		if s.markSensitiveRead != nil {
+			_ = s.markSensitiveRead(dbCtx, traceID, traceID)
+		}
+	}
+	log.Info("secretlane_classified", "lane", lane, "category", category, "reason", verdict.Reason)
+
 	envelope := spawn.Envelope{
 		SchemaVersion:   spawn.SchemaVersion,
 		TaskID:          taskID,
@@ -181,6 +273,8 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		Model:           s.cfg.DefaultModel,
 		MemoryInjection: true,
 		CreatedAt:       now,
+		Lane:            lane,
+		Category:        category,
 	}
 	if err := envelope.Validate(); err != nil {
 		// Only reachable via a misconfigured cfg.default_model - prompt/
@@ -197,34 +291,18 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// dbCtx (the request's own context) is used for the writes that happen
-	// BEFORE the worker is spawned, while the client is still known to be
-	// connected. It must NOT be used for anything after spawn.Run returns:
-	// r.Context() is cancelled the moment the underlying connection closes
-	// for ANY reason - not only a clean client exit, but also (verified
-	// live during this task's manual verification) the CLI's OWN 30s
-	// idle-read timeout giving up and closing its side while the server's
-	// task_timeout_min is still counting down. Since taskCtx below is
-	// derived FROM dbCtx, that same disconnect also cancels taskCtx early -
-	// which is desirable for spawn.Run (no orphan worker survives a
-	// disappeared client) - but it must never take down the bookkeeping
-	// that RECORDS the outcome: persistCtx (a plain background context)
-	// is used for every write from OnSession onward specifically so a
-	// disconnected/timed-out client can never prevent kahyad from
-	// recording that the task ended (state + ledger).
-	dbCtx := r.Context()
-	persistCtx := context.Background()
-
 	if _, err := s.taskStore.InsertTask(dbCtx, sqlcgen.InsertTaskParams{
-		ID:        taskID,
-		TraceID:   traceID,
-		SessionID: sql.NullString{},
-		State:     "running",
-		TaintTier: "untrusted",
-		Model:     sql.NullString{String: envelope.Model, Valid: true},
-		Envelope:  sql.NullString{String: string(envelopeJSON), Valid: true},
-		UpdatedAt: now,
-		CreatedAt: now,
+		ID:             taskID,
+		TraceID:        traceID,
+		SessionID:      sql.NullString{},
+		State:          "running",
+		TaintTier:      "untrusted",
+		Model:          sql.NullString{String: envelope.Model, Valid: true},
+		Envelope:       sql.NullString{String: string(envelopeJSON), Valid: true},
+		UpdatedAt:      now,
+		CreatedAt:      now,
+		Lane:           lane,
+		SecretCategory: sql.NullString{String: category, Valid: category != ""},
 	}); err != nil {
 		log.Error("task_insert_failed", "err", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, "task insert failed")
@@ -233,12 +311,30 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	if s.eventLogger != nil {
 		if err := s.eventLogger.LogEvent(dbCtx, traceID, "task_spawned", map[string]any{
-			"task_id": taskID, "model": envelope.Model,
+			"task_id": taskID, "model": envelope.Model, "lane": lane,
 		}); err != nil {
 			log.Warn("task_spawned_ledger_error", "err", err.Error())
 		}
 	}
-	log.Info("task_spawned", "task_id", taskID, "model", envelope.Model)
+	log.Info("task_spawned", "task_id", taskID, "model", envelope.Model, "lane", lane)
+
+	// W3-08: a secret-lane task is answered ENTIRELY on-device
+	// (kahyad/internal/secretlane.Answerer, backed by the local
+	// Qwen3-30B-A3B server) - kahyad never spawns the claude-agent-sdk
+	// worker or opens an Anthropic forward-proxy listener AT ALL for it.
+	// This is the ordering invariant's strongest form: there is no code
+	// path through which this task's content could even reach the worker
+	// process, let alone the cloud - not merely a backstop that blocks it
+	// after the fact (kahyad/internal/secretlane/answer.go's own doc
+	// comment explains why this bypasses the worker rather than rerouting
+	// the SDK itself to a local OpenAI endpoint). The W12-08 proxy backstop
+	// (kahyad/internal/secretlane.NewProxyBackstopHook, wired in main.go)
+	// is the SECOND, independent layer of defense in case that ever
+	// changes.
+	if lane == spawn.LaneSecret {
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx)
+		return
+	}
 
 	// W12-08: open this task's own ephemeral forward-proxy listener BEFORE
 	// the SSE response starts, so a failure here is still a plain JSON
@@ -370,6 +466,104 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	writeSSE(m.sseEvent, m.ssePayload)
 }
 
+// handleSecretLaneTask answers a lane=="secret" task entirely via
+// s.secretLaneAnswerer (kahyad/internal/secretlane.Answerer, the local
+// Qwen3-30B-A3B server) - see handleTask's own call-site comment for why
+// this bypasses the claude-agent-sdk worker/Anthropic-proxy path entirely
+// rather than merely relying on the proxy backstop. Streams the EXACT
+// SAME SSE contract kahyad/cmd/kahya/client.go already understands: zero
+// or more "delta" events (here, always exactly one - the full answer,
+// non-streamed, since mlx_lm.server's non-streaming response already
+// arrives as one complete string) then a terminal "result" or "error"
+// event.
+func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt string, dbCtx, persistCtx context.Context) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Error("task_streaming_unsupported")
+		writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	writeSSE := func(event string, payload any) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		flusher.Flush()
+	}
+
+	timeoutMin := s.cfg.TaskTimeoutMin
+	taskCtx, cancel := context.WithTimeout(dbCtx, time.Duration(timeoutMin)*time.Minute)
+	defer cancel()
+
+	if s.secretLaneAnswerer == nil {
+		s.finishSecretLaneTask(persistCtx, log, taskID, traceID, writeSSE, "", fmt.Errorf("secretlane: no local answerer wired"))
+		return
+	}
+
+	answer, err := s.secretLaneAnswerer.Answer(taskCtx, prompt)
+	s.finishSecretLaneTask(persistCtx, log, taskID, traceID, writeSSE, answer, err)
+}
+
+// finishSecretLaneTask persists the terminal task state/ledger row and
+// writes the terminal SSE event for a secret-lane task - the "yerel model
+// için bellek yok" fail-closed message (mlx.ErrLocalModelUnavailable,
+// task spec's crown invariant) is distinguished from every other local
+// answer failure so the user sees the EXACT documented Turkish string
+// rather than a generic one.
+func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logger, taskID, traceID string, writeSSE func(string, any), answer string, err error) {
+	if err != nil {
+		msg := fmt.Sprintf(MsgSecretLaneModelCallFailed, traceID)
+		if errors.Is(err, mlx.ErrLocalModelUnavailable) {
+			msg = fmt.Sprintf("%s (%s)", mlx.MsgNoLocalMemory, mlx.MsgNoLocalMemoryGuidance)
+		}
+		log.Error("secretlane_answer_failed", "task_id", taskID, "err", err.Error())
+		if uerr := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+			State: "error", UpdatedAt: rfc3339Now(), ID: taskID,
+		}); uerr != nil {
+			log.Error("task_state_update_failed", "task_id", taskID, "err", uerr.Error())
+		}
+		if s.eventLogger != nil {
+			if lerr := s.eventLogger.LogEvent(persistCtx, traceID, "task_error", map[string]any{
+				"task_id": taskID, "status": "error",
+			}); lerr != nil {
+				log.Warn("task_ledger_error", "kind", "task_error", "err", lerr.Error())
+			}
+		}
+		writeSSE("error", map[string]string{"message": msg})
+		return
+	}
+
+	if uerr := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+		State: "done", UpdatedAt: rfc3339Now(), ID: taskID,
+	}); uerr != nil {
+		log.Error("task_state_update_failed", "task_id", taskID, "err", uerr.Error())
+	}
+	if s.eventLogger != nil {
+		if lerr := s.eventLogger.LogEvent(persistCtx, traceID, "task_done", map[string]any{
+			"task_id": taskID, "status": "ok",
+		}); lerr != nil {
+			log.Warn("task_ledger_error", "kind", "task_done", "err", lerr.Error())
+		}
+	}
+	log.Info("task_done", "task_id", taskID, "processed_locally", true)
+
+	writeSSE("delta", map[string]string{"text": answer})
+	// processed_locally: true is the task spec's own CLI-badge field
+	// ("🔒 yerel işlendi") - this is the ONLY code path that ever sets it
+	// true (mapTaskOutcome's cloud-lane success payload always sets it
+	// false).
+	writeSSE("result", map[string]any{
+		"status": "ok", "task_id": taskID, "session_id": "", "processed_locally": true,
+	})
+}
+
 // taskOutcomeMapping is spawn.Run's terminal outcome translated into the
 // tasks-table state, ledger event kind, and SSE event kahyad answers with
 // - factored out of handleTask into a pure function (mapTaskOutcome) so
@@ -419,7 +613,13 @@ func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string,
 			finalState: "done", ledgerKind: "task_done",
 			sseEvent: "result",
 			ssePayload: map[string]any{
-				"status": "ok", "task_id": taskID, "session_id": outcome.SessionID,
+				// processed_locally is always false here (W3-08 task spec:
+				// "task result payload field processed_locally: true") -
+				// this branch is ONLY ever reached for a cloud-routed
+				// (lane=="normal") task; a lane=="secret" task's terminal
+				// result comes from finishSecretLaneTask instead, which
+				// sets this true.
+				"status": "ok", "task_id": taskID, "session_id": outcome.SessionID, "processed_locally": false,
 			},
 		}
 	}

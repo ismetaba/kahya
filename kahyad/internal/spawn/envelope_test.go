@@ -115,6 +115,49 @@ func TestMarshalPreservesTurkishPromptByteExact(t *testing.T) {
 	}
 }
 
+// --- W3-08: envelope lane pinning ---
+
+func TestValidateAcceptsEmptyLane(t *testing.T) {
+	e := validEnvelope() // Lane left at its zero value ("")
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil (empty lane treated as normal)", err)
+	}
+}
+
+func TestValidateAcceptsSecretAndNormalLane(t *testing.T) {
+	for _, lane := range []string{LaneSecret, LaneNormal} {
+		e := validEnvelope()
+		e.Lane = lane
+		if err := e.Validate(); err != nil {
+			t.Errorf("Validate() with lane=%q error = %v, want nil", lane, err)
+		}
+	}
+}
+
+func TestValidateRejectsUnknownLane(t *testing.T) {
+	e := validEnvelope()
+	e.Lane = "cloud"
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for an unrecognized lane value")
+	}
+}
+
+func TestMarshalRoundTripsLaneAndCategory(t *testing.T) {
+	e := validEnvelope()
+	e.Lane = LaneSecret
+	e.Category = "saglik"
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(b), `"lane":"secret"`) {
+		t.Errorf("Marshal() = %s, want lane:secret present", b)
+	}
+	if !strings.Contains(string(b), `"category":"saglik"`) {
+		t.Errorf("Marshal() = %s, want category:saglik present", b)
+	}
+}
+
 func TestNewTaskIDShapeAndUniqueness(t *testing.T) {
 	a := NewTaskID()
 	b := NewTaskID()

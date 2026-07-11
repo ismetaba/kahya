@@ -34,6 +34,13 @@ const (
 	// trace_id itself precisely so it always has one to show.
 	MsgTraceFooter = "iz: %s"
 
+	// MsgLocallyProcessed is W3-08's CLI badge (task spec, byte-exact):
+	// printed on its own stdout line whenever a task's terminal "result"
+	// event carries processed_locally: true - the task was answered
+	// entirely by the local secret-lane Qwen3-30B-A3B server, never a
+	// cloud model.
+	MsgLocallyProcessed = "🔒 yerel işlendi"
+
 	// MsgLogNotFound is printed (with the queried trace_id substituted) when
 	// `kahya log --trace <id>` finds zero matching JSONL lines. Exit 1.
 	MsgLogNotFound = "Bu trace için kayıt bulunamadı: %s"

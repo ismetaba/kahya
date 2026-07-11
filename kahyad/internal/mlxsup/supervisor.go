@@ -49,10 +49,28 @@ const (
 	StateStarting = "starting"
 	// StateOK means the current child process's /health last answered ok.
 	StateOK = "ok"
+	// StateFailed means Config.MaxRestarts>0 and the child has now crashed
+	// more times in a row than that budget allows (W3-08: "crash -> respawn
+	// with backoff, max 3, then fail-closed") - the background supervise
+	// loop gives up permanently (no further autonomous respawn attempts,
+	// unlike StateDown's ordinary "will be retried" meaning), and
+	// EnsureRunning returns ErrMaxRestartsExceeded immediately rather than
+	// spawning yet again. Terminal, exactly like StateDisabled, EXCEPT that
+	// - unlike StateDisabled, which New sets once and for all - reaching
+	// StateFailed does not itself prevent a caller from constructing a
+	// fresh Supervisor (kahyad process restart) to try again. Never reached
+	// when Config.MaxRestarts==0 (the default - unlimited retries, W12-11's
+	// original, unchanged behavior).
+	StateFailed = "failed"
 )
 
 // ErrDisabled is returned by EnsureRunning when Config.Cmd was empty.
 var ErrDisabled = errors.New("mlxsup: supervisor disabled (empty cmd)")
+
+// ErrMaxRestartsExceeded is returned by EnsureRunning once the child has
+// crashed more times in a row than Config.MaxRestarts allows (StateFailed).
+// Never returned when Config.MaxRestarts==0.
+var ErrMaxRestartsExceeded = errors.New("mlxsup: child exceeded max_restarts, giving up")
 
 // healthPollTimeout bounds a single /health HTTP round trip - short,
 // because a slow/hanging health endpoint must not itself block startup
@@ -99,6 +117,15 @@ type Config struct {
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
 
+	// MaxRestarts caps how many times in a row an UNEXPECTED exit may be
+	// followed by an autonomous respawn before this Supervisor gives up
+	// permanently (StateFailed - W3-08's "crash -> respawn with backoff,
+	// max 3, then fail-closed"). 0 (the default) means unlimited retries -
+	// W12-11's original, unchanged behavior; every existing caller that
+	// never sets this field is completely unaffected. The counter resets
+	// to 0 every time the child successfully becomes healthy again.
+	MaxRestarts int
+
 	// Log is the boot-scoped logger every event=mlx_* line is written
 	// through (never scoped to a request trace_id - a supervised
 	// process's lifecycle spans many requests).
@@ -117,6 +144,7 @@ type Supervisor struct {
 	stopped    bool
 	backoff    time.Duration
 	spawnCount int // incremented once per spawnLocked call; supervisor_test.go uses this to observe an autonomous restart without depending on State()'s exact timing
+	crashCount int // consecutive unexpected exits since the last time the child was healthy; reset to 0 on every successful pingHealth (Config.MaxRestarts)
 }
 
 // spawnCountForTest returns how many times this Supervisor has spawned a
@@ -196,6 +224,9 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 	case StateDisabled:
 		s.mu.Unlock()
 		return ErrDisabled
+	case StateFailed:
+		s.mu.Unlock()
+		return ErrMaxRestartsExceeded
 	case StateOK:
 		s.mu.Unlock()
 		return nil
@@ -217,6 +248,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 			s.mu.Lock()
 			s.state = StateOK
 			s.backoff = s.cfg.MinBackoff
+			s.crashCount = 0
 			s.mu.Unlock()
 			return nil
 		}
@@ -274,6 +306,58 @@ func (s *Supervisor) Stop() {
 // kahyad/internal/spawn's drainGrace reasoning: SIGKILL is not
 // instantaneous, but Stop must never hang indefinitely).
 const stopGrace = 2 * time.Second
+
+// StopForIdle kills the current child's process group (same SIGKILL(-pgid)
+// as Stop) but, UNLIKE Stop, does not permanently disable this Supervisor:
+// it leaves it eligible to be lazily re-spawned by a LATER EnsureRunning
+// call, exactly like a freshly constructed Supervisor that has never
+// spawned anything. This is the primitive W3-08's idle-TTL unload policy
+// is built on (kahyad/internal/mlx.Supervisor): the 17GB Qwen3-30B-A3B
+// server should not stay resident once idle (HANDOFF §4 ⚑ memory
+// pressure), but a LATER secret-lane request must still be able to bring
+// it back on demand - unlike kahyad shutdown (Stop), which must never
+// restart anything again. A no-op when nothing is currently running.
+func (s *Supervisor) StopForIdle() {
+	s.mu.Lock()
+	cmd := s.cmd
+	done := s.done
+	if cmd == nil {
+		s.mu.Unlock()
+		return
+	}
+	// Mark stopped TEMPORARILY: the background supervise() goroutine (racing
+	// this kill concurrently) must treat this exit as intentional and NOT
+	// also try to restart it with backoff - exactly Stop's own reasoning.
+	// Unlike Stop, this flag (and cmd/done) are cleared again once the
+	// process is reaped, below.
+	s.stopped = true
+	if s.state != StateDisabled {
+		s.state = StateDown
+	}
+	s.mu.Unlock()
+
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(stopGrace):
+		}
+	}
+
+	s.mu.Lock()
+	// Only clear these if a NEWER spawn has not already superseded this one
+	// (defensive - EnsureRunning/supervise never race a StopForIdle call in
+	// practice, since idle-unload only ever fires while the caller itself
+	// holds this Supervisor idle, but this guard keeps the method correct
+	// even if that assumption is ever loosened).
+	if s.cmd == cmd {
+		s.stopped = false
+		s.cmd = nil
+		s.done = nil
+		s.backoff = s.cfg.MinBackoff
+	}
+	s.mu.Unlock()
+}
 
 // spawnLocked starts cfg.Cmd as a new process-group leader and launches
 // the background supervise goroutine that reaps it and (unless Stop was
@@ -339,6 +423,21 @@ func (s *Supervisor) supervise(cmd *exec.Cmd, done chan struct{}) {
 	}
 
 	s.logger().Warn("mlx_exit", "name", s.cfg.Name, "err", errString(waitErr))
+
+	if s.cfg.MaxRestarts > 0 {
+		s.mu.Lock()
+		s.crashCount++
+		exceeded := s.crashCount > s.cfg.MaxRestarts
+		if exceeded {
+			s.state = StateFailed
+		}
+		s.mu.Unlock()
+		if exceeded {
+			s.logger().Error("mlx_max_restarts_exceeded", "name", s.cfg.Name, "max_restarts", s.cfg.MaxRestarts)
+			return
+		}
+	}
+
 	s.restartWithBackoff()
 }
 
@@ -368,11 +467,20 @@ func (s *Supervisor) restartWithBackoff() {
 	}
 }
 
-// pingHealth issues one GET against cfg.HealthURL and reports whether it
-// answered 200 with a JSON body whose "status" field is exactly "ok". Any
-// connection failure, non-200 status, or malformed/other-status body is
-// "not healthy" - the caller (EnsureRunning) treats all of these
-// identically as "keep waiting".
+// pingHealth issues one GET against cfg.HealthURL and reports whether the
+// child is ready to serve. Any connection failure or non-200 status is
+// always "not healthy". A 200 response counts as healthy if EITHER: the
+// JSON body has a "status" field equal to "ok" (mlx/embed/server.py's own
+// {"status":"ok",...} shape, W12-11), OR the body is valid JSON with NO
+// "status" field at all (W3-08: mlx_lm.server's OpenAI-compatible
+// `GET /v1/models` answers `{"object":"list","data":[...]}` - it has no
+// notion of a "status" field, and answering 200 at all already means the
+// model finished loading and the server is accepting requests - mlx_lm.
+// server loads the model synchronously before it ever binds the HTTP
+// port). A 200 response whose body fails to parse as JSON at all, or that
+// has a "status" field set to anything OTHER than "ok", is "not healthy" -
+// the caller (EnsureRunning) treats every "not healthy" case identically
+// as "keep waiting".
 func (s *Supervisor) pingHealth() bool {
 	req, err := http.NewRequest(http.MethodGet, s.cfg.HealthURL, nil)
 	if err != nil {
@@ -386,13 +494,19 @@ func (s *Supervisor) pingHealth() bool {
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	var body struct {
-		Status string `json:"status"`
-	}
+	var body map[string]json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return false
 	}
-	return body.Status == "ok"
+	statusRaw, hasStatus := body["status"]
+	if !hasStatus {
+		return true
+	}
+	var status string
+	if err := json.Unmarshal(statusRaw, &status); err != nil {
+		return false
+	}
+	return status == "ok"
 }
 
 func (s *Supervisor) logger() *logx.Logger {

@@ -303,12 +303,24 @@ ORDER BY updated_at DESC
 LIMIT 1
 `
 
+type GetTaskBySessionRow struct {
+	ID        string         `json:"id"`
+	TraceID   string         `json:"trace_id"`
+	SessionID sql.NullString `json:"session_id"`
+	State     string         `json:"state"`
+	TaintTier string         `json:"taint_tier"`
+	Model     sql.NullString `json:"model"`
+	Envelope  sql.NullString `json:"envelope"`
+	UpdatedAt string         `json:"updated_at"`
+	CreatedAt string         `json:"created_at"`
+}
+
 // Sessions are not currently guaranteed to map to exactly one task row
 // (resume/retry may append more), so this returns the most recently
 // updated task for the session.
-func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString) (Task, error) {
+func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString) (GetTaskBySessionRow, error) {
 	row := q.db.QueryRowContext(ctx, getTaskBySession, sessionID)
-	var i Task
+	var i GetTaskBySessionRow
 	err := row.Scan(
 		&i.ID,
 		&i.TraceID,
@@ -320,6 +332,22 @@ func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString
 		&i.UpdatedAt,
 		&i.CreatedAt,
 	)
+	return i, err
+}
+
+const getTaskLane = `-- name: GetTaskLane :one
+SELECT lane, secret_category FROM tasks WHERE id = ?
+`
+
+type GetTaskLaneRow struct {
+	Lane           string         `json:"lane"`
+	SecretCategory sql.NullString `json:"secret_category"`
+}
+
+func (q *Queries) GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, error) {
+	row := q.db.QueryRowContext(ctx, getTaskLane, id)
+	var i GetTaskLaneRow
+	err := row.Scan(&i.Lane, &i.SecretCategory)
 	return i, err
 }
 
@@ -596,23 +624,36 @@ func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingAp
 }
 
 const insertTask = `-- name: InsertTask :one
-INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at
+INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category
 `
 
 type InsertTaskParams struct {
-	ID        string         `json:"id"`
-	TraceID   string         `json:"trace_id"`
-	SessionID sql.NullString `json:"session_id"`
-	State     string         `json:"state"`
-	TaintTier string         `json:"taint_tier"`
-	Model     sql.NullString `json:"model"`
-	Envelope  sql.NullString `json:"envelope"`
-	UpdatedAt string         `json:"updated_at"`
-	CreatedAt string         `json:"created_at"`
+	ID             string         `json:"id"`
+	TraceID        string         `json:"trace_id"`
+	SessionID      sql.NullString `json:"session_id"`
+	State          string         `json:"state"`
+	TaintTier      string         `json:"taint_tier"`
+	Model          sql.NullString `json:"model"`
+	Envelope       sql.NullString `json:"envelope"`
+	UpdatedAt      string         `json:"updated_at"`
+	CreatedAt      string         `json:"created_at"`
+	Lane           string         `json:"lane"`
+	SecretCategory sql.NullString `json:"secret_category"`
 }
 
+// lane/secret_category (W3-08): the caller ALREADY knows this task's
+// secret-lane verdict before this row is ever created (kahyad/internal/
+// server's POST /v1/task handler runs kahyad/internal/secretlane's
+// classifier BEFORE calling InsertTask - the ordering invariant, HANDOFF
+// S4 flag - so there is no window where a task row exists with an
+// unclassified lane). Column order in both the INSERT list and RETURNING
+// clause matches the TABLE's own physical column order (lane/
+// secret_category were appended via ALTER TABLE, 0006_secret_lane.sql,
+// after updated_at/created_at) so sqlc reuses the existing Task model
+// type here rather than generating a second, differently-ordered
+// InsertTaskRow type.
 func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, insertTask,
 		arg.ID,
@@ -624,6 +665,8 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		arg.Envelope,
 		arg.UpdatedAt,
 		arg.CreatedAt,
+		arg.Lane,
+		arg.SecretCategory,
 	)
 	var i Task
 	err := row.Scan(
@@ -636,6 +679,8 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		&i.Envelope,
 		&i.UpdatedAt,
 		&i.CreatedAt,
+		&i.Lane,
+		&i.SecretCategory,
 	)
 	return i, err
 }
@@ -943,6 +988,36 @@ WHERE id = ?
 
 func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, markEpisodeDeleted, id)
+	return err
+}
+
+const setTaskLane = `-- name: SetTaskLane :exec
+
+UPDATE tasks
+SET lane = ?, secret_category = ?, updated_at = ?
+WHERE id = ?
+`
+
+type SetTaskLaneParams struct {
+	Lane           string         `json:"lane"`
+	SecretCategory sql.NullString `json:"secret_category"`
+	UpdatedAt      string         `json:"updated_at"`
+	ID             string         `json:"id"`
+}
+
+// W3-08 (secret-lane routing) queries below: lane/secret_category are
+// STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
+// never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
+// comment). kahyad/internal/secretlane.NewProxyBackstopHook (the W12-08
+// proxy chokepoint) is GetTaskLane's other caller, consulted on EVERY
+// forwarded model-call request.
+func (q *Queries) SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error {
+	_, err := q.db.ExecContext(ctx, setTaskLane,
+		arg.Lane,
+		arg.SecretCategory,
+		arg.UpdatedAt,
+		arg.ID,
+	)
 	return err
 }
 

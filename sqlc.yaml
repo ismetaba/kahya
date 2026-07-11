@@ -21,6 +21,9 @@ sql:
       # 0005 (W3-06) is a plain ALTER TABLE (pending_approvals.tool_input) -
       # same reasoning.
       - "kahyad/migrations/0005_pending_approval_payload.sql"
+      # 0006 (W3-08) is two plain ALTER TABLE statements (tasks.lane,
+      # tasks.secret_category) - same reasoning.
+      - "kahyad/migrations/0006_secret_lane.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

@@ -88,6 +88,11 @@ func execTask(client *Client, traceID, prompt string, stdout, stderr io.Writer) 
 		printTraceFooter(stderr, traceID)
 		return 2
 	}
+	if res.Status == "ok" && res.ProcessedLocally {
+		// W3-08 CLI badge: printed on its own line, after the streamed
+		// answer text, before the trace footer.
+		fmt.Fprintln(stdout, MsgLocallyProcessed)
+	}
 	printTraceFooter(stderr, traceID)
 	if res.Status == "ok" {
 		return 0

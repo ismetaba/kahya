@@ -25,6 +25,19 @@ import (
 // never silently.
 const SchemaVersion = 1
 
+// LaneSecret/LaneNormal are the two values Envelope.Lane may hold (W3-08).
+// This mirrors kahyad/internal/secretlane's OWN identical constants rather
+// than importing that package (the same "duplicate two literals rather
+// than add a dependency" convention kahyad/internal/anthproxy already uses
+// for config.CredentialModeKeychain/Passthrough - see that package's own
+// doc comment) - envelope.go is a low-level IPC-contract file that should
+// not depend on the higher-level secretlane policy package; keep the two
+// copies in sync by hand if either ever changes.
+const (
+	LaneSecret = "secret"
+	LaneNormal = "normal"
+)
+
 // AllowedModels is the HANDOFF §9 cloud model set envelope.Model is
 // validated against. The routing decision is Go's, never the prompt's
 // (HANDOFF §4: "karar Go kodunda, istemde değil") - a static
@@ -53,6 +66,21 @@ type Envelope struct {
 	Model           string  `json:"model"`
 	MemoryInjection bool    `json:"memory_injection"`
 	CreatedAt       string  `json:"created_at"`
+
+	// Lane is W3-08's secret-lane routing decision: "secret" | "normal".
+	// kahyad's ingest-time classifier (kahyad/internal/secretlane) decides
+	// this BEFORE the worker is ever spawned (HANDOFF §4 ⚑ ordering
+	// invariant) - the worker reads it, it NEVER chooses or overrides it.
+	// Empty is treated identically to "normal" (LaneNormal) by every
+	// reader - Validate accepts empty specifically so every envelope built
+	// before W3-08 (and every existing test fixture) keeps validating
+	// unchanged; a real POST /v1/task handler always sets this explicitly
+	// now (never leaves it blank).
+	Lane string `json:"lane,omitempty"`
+	// Category is the secret-lane category the classifier assigned
+	// ("finans"|"saglik"|"kimlik"|"none") - informational only (Telegram
+	// redaction / CLI badge / logs), never itself a security boundary.
+	Category string `json:"category,omitempty"`
 }
 
 // NewTaskID mints a task_id shaped "t_<hex32>" (16 random bytes, hex
@@ -109,6 +137,9 @@ func (e Envelope) Validate() error {
 	}
 	if _, err := time.Parse(time.RFC3339, e.CreatedAt); err != nil {
 		return fmt.Errorf("spawn: created_at = %q not RFC3339: %w", e.CreatedAt, err)
+	}
+	if e.Lane != "" && e.Lane != LaneSecret && e.Lane != LaneNormal {
+		return fmt.Errorf("spawn: lane = %q, want %q, %q, or empty", e.Lane, LaneSecret, LaneNormal)
 	}
 	return nil
 }

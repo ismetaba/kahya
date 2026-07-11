@@ -276,13 +276,14 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 // regression test: a brain.db that only ever saw migration 0001 (as every
 // pre-W12-03 database did) must migrate cleanly up to the latest embedded
 // schema version (chunks_fts_tri/chunks_fts_uni/chunk_vec from 0002,
-// autonomy_state/approval_tokens/undo_windows from 0003, and - since
-// W3-05 - egress_budget from 0004) the next time kahyad boots. The
-// expected latest version is asserted as 4 (0001+0002+0003+0004); bump
-// this literal, deliberately, the next time a new migration file is
-// added - this is the one place in the test suite that pins "the latest
-// goose version kahyad ships" as a number, so a forgotten migration file
-// never silently passes this gate.
+// autonomy_state/approval_tokens/undo_windows from 0003, egress_budget
+// from 0004 (W3-05), pending_approvals.tool_input from 0005 (W3-06), and
+// tasks.lane/tasks.secret_category from 0006 (W3-08)) the next time kahyad
+// boots. The expected latest version is asserted as 6
+// (0001+0002+0003+0004+0005+0006); bump this literal, deliberately, the
+// next time a new migration file is added - this is the one place in the
+// test suite that pins "the latest goose version kahyad ships" as a
+// number, so a forgotten migration file never silently passes this gate.
 func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	cfg := testCfg(t)
 
@@ -320,7 +321,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 5 // 0001-0005; bump alongside each new migration file
+	const latestVersion = 6 // 0001-0006; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}

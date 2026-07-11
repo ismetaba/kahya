@@ -61,7 +61,8 @@ type Querier interface {
 	// Sessions are not currently guaranteed to map to exactly one task row
 	// (resume/retry may append more), so this returns the most recently
 	// updated task for the session.
-	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (Task, error)
+	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (GetTaskBySessionRow, error)
+	GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, error)
 	// Update-half of an application-level upsert (the same "upsert (update
 	// half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
 	// UpdateEpisodeContent above already use in this file) - the common case
@@ -99,6 +100,17 @@ type Querier interface {
 	// type directly instead of sqlc emitting a separate "Row" type for a
 	// differently-ordered column list.
 	InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error
+	// lane/secret_category (W3-08): the caller ALREADY knows this task's
+	// secret-lane verdict before this row is ever created (kahyad/internal/
+	// server's POST /v1/task handler runs kahyad/internal/secretlane's
+	// classifier BEFORE calling InsertTask - the ordering invariant, HANDOFF
+	// S4 flag - so there is no window where a task row exists with an
+	// unclassified lane). Column order in both the INSERT list and RETURNING
+	// clause matches the TABLE's own physical column order (lane/
+	// secret_category were appended via ALTER TABLE, 0006_secret_lane.sql,
+	// after updated_at/created_at) so sqlc reuses the existing Task model
+	// type here rather than generating a second, differently-ordered
+	// InsertTaskRow type.
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
@@ -120,6 +132,13 @@ type Querier interface {
 	// lexicographically in timestamp order).
 	ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error)
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
+	// W3-08 (secret-lane routing) queries below: lane/secret_category are
+	// STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
+	// never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
+	// comment). kahyad/internal/secretlane.NewProxyBackstopHook (the W12-08
+	// proxy chokepoint) is GetTaskLane's other caller, consulted on EVERY
+	// forwarded model-call request.
+	SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error
 	SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error
 	// Update-half of an application-level upsert (kahyad/internal/policy
 	// calls this first; a 0-rows-affected result means no row exists yet, so

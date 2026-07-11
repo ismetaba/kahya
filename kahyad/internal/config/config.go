@@ -195,6 +195,45 @@ type Config struct {
 	TelegramChatID int64 `yaml:"telegram_chat_id"`
 	TelegramUserID int64 `yaml:"telegram_user_id"`
 
+	// --- W3-08 secret-lane local Qwen3-30B-A3B server ---
+
+	// QwenCmd is the local secret-lane server's base invocation
+	// (kahyad/internal/mlxsup.Supervisor reuses this - "REUSE it for the
+	// Qwen server, do NOT fork a second supervisor" per the task spec):
+	// ["<repo>/mlx/qwen/.venv/bin/python", "-m", "mlx_lm.server"]. Unlike
+	// EmbedCmd (a complete invocation - mlx/embed/server.py reads its own
+	// port from an env var), this default deliberately stops short of a
+	// full command line: mlx_lm.server is a third-party CLI whose
+	// --model/--host/--port are ordinary argv flags, not env vars, so
+	// main.go appends those itself from QwenModelPath/QwenPort at wiring
+	// time.
+	QwenCmd []string `yaml:"qwen_cmd"`
+	// QwenModelPath is the local filesystem path to the pinned
+	// Qwen3-30B-A3B-4bit snapshot (docs/models.md: `mlx-community/
+	// Qwen3-30B-A3B-4bit`, revision `d388dead1515f5e085ef7a0431dd8fadf0886c57`)
+	// - the exact on-disk snapshot directory the default Hugging Face
+	// cache resolves that repo id + revision to, so mlx_lm.server loads
+	// this EXACT pinned revision (never "whatever the cache happens to
+	// have most recently"), and works fully offline.
+	QwenModelPath string `yaml:"qwen_model_path"`
+	// QwenModelName is the "model" field every OpenAI-compatible request to
+	// the local server carries. Confirmed LIVE (KAHYA_MLX_TESTS=1):
+	// mlx_lm.server does NOT accept an arbitrary label here the way a
+	// hosted API might - it validates this against its own GET /v1/models
+	// listing (which enumerates every MLX-shaped repo in the local
+	// Hugging Face cache, not just the one loaded via --model) and 401s
+	// on a mismatch. This must be the exact HF repo id docs/models.md
+	// pins.
+	QwenModelName string `yaml:"qwen_model_name"`
+	// QwenPort is cfg.mlx.qwen_port (task spec: default 8765 - NOT 8080,
+	// ComfyUI territory).
+	QwenPort int `yaml:"qwen_port"`
+	// QwenIdleTTLSeconds is cfg.mlx.idle_ttl (task spec default 600 = 10
+	// minutes): with zero in-flight requests for at least this long, the
+	// ~17GB server is unloaded (SIGTERM+reap, ledger `mlx_unloaded`) and
+	// lazily reloaded on the next secret-lane request.
+	QwenIdleTTLSeconds int `yaml:"qwen_idle_ttl_seconds"`
+
 	// Env is KAHYA_ENV ("prod" default | "dev"). It is env-only: there is
 	// no config.yaml key for it, since it exists precisely so tests and the
 	// W7-8 KAHYA_ENV=dev profile can redirect every path independent of any
@@ -235,6 +274,11 @@ type fileConfig struct {
 	EstRequestTokens        *int64    `yaml:"est_request_tokens"`
 	TelegramChatID          *int64    `yaml:"telegram_chat_id"`
 	TelegramUserID          *int64    `yaml:"telegram_user_id"`
+	QwenCmd                 *[]string `yaml:"qwen_cmd"`
+	QwenModelPath           *string   `yaml:"qwen_model_path"`
+	QwenModelName           *string   `yaml:"qwen_model_name"`
+	QwenPort                *int      `yaml:"qwen_port"`
+	QwenIdleTTLSeconds      *int      `yaml:"qwen_idle_ttl_seconds"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -330,7 +374,46 @@ func defaults(home string) Config {
 		// concurrently-reserved requests still can't blow far past the 500K
 		// per-task ceiling before RecordUsage reconciles them.
 		EstRequestTokens: 50_000,
+
+		// W3-08 secret-lane local Qwen3-30B-A3B server defaults (task spec,
+		// verbatim: port 8765 - NOT 8080/ComfyUI; idle_ttl 10 minutes).
+		QwenCmd:            defaultQwenCmd(),
+		QwenModelPath:      defaultQwenModelPath(home),
+		QwenModelName:      "mlx-community/Qwen3-30B-A3B-4bit",
+		QwenPort:           8765,
+		QwenIdleTTLSeconds: 600,
 	}
+}
+
+// defaultQwenCmd resolves the W3-08 base invocation
+// ["<repo>/mlx/qwen/.venv/bin/python", "-m", "mlx_lm.server"], using the
+// exact same repo-root derivation as defaultWorkerCmd/defaultEmbedCmd (see
+// defaultWorkerCmd's doc comment) - mlx_lm.server is a THIRD-PARTY CLI
+// module (unlike mlx/embed/server.py, this repo's own script), so this
+// default deliberately stops at the base command; --model/--host/--port
+// are appended by main.go at wiring time from QwenModelPath/QwenPort.
+func defaultQwenCmd() []string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return []string{
+		filepath.Join(repoRoot, "mlx", "qwen", ".venv", "bin", "python"),
+		"-m", "mlx_lm.server",
+	}
+}
+
+// defaultQwenModelPath resolves the pinned Qwen3-30B-A3B-4bit snapshot's
+// on-disk path under the default Hugging Face cache layout (docs/
+// models.md: `mlx-community/Qwen3-30B-A3B-4bit`, revision
+// `d388dead1515f5e085ef7a0431dd8fadf0886c57`) - pointing mlx_lm.server
+// directly at this exact snapshot directory (rather than passing the bare
+// repo id) pins the EXACT revision docs/models.md committed to and works
+// fully offline, matching W0-03's own download layout.
+func defaultQwenModelPath(home string) string {
+	return filepath.Join(home, ".cache", "huggingface", "hub",
+		"models--mlx-community--Qwen3-30B-A3B-4bit", "snapshots",
+		"d388dead1515f5e085ef7a0431dd8fadf0886c57")
 }
 
 // defaultWorkerCmd resolves the W12-07 step-fixed default
@@ -533,6 +616,21 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.TelegramUserID != nil {
 		cfg.TelegramUserID = *fc.TelegramUserID
 	}
+	if fc.QwenCmd != nil {
+		cfg.QwenCmd = *fc.QwenCmd
+	}
+	if fc.QwenModelPath != nil {
+		cfg.QwenModelPath = expandHome(*fc.QwenModelPath, home)
+	}
+	if fc.QwenModelName != nil {
+		cfg.QwenModelName = *fc.QwenModelName
+	}
+	if fc.QwenPort != nil {
+		cfg.QwenPort = *fc.QwenPort
+	}
+	if fc.QwenIdleTTLSeconds != nil {
+		cfg.QwenIdleTTLSeconds = *fc.QwenIdleTTLSeconds
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -588,6 +686,19 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_TELEGRAM_USER_ID"); v != "" {
 		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
 			cfg.TelegramUserID = id
+		}
+	}
+	if v := os.Getenv("KAHYA_QWEN_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.QwenPort = p
+		}
+	}
+	if v := os.Getenv("KAHYA_QWEN_MODEL_PATH"); v != "" {
+		cfg.QwenModelPath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_QWEN_IDLE_TTL_SECONDS"); v != "" {
+		if s, err := strconv.Atoi(v); err == nil {
+			cfg.QwenIdleTTLSeconds = s
 		}
 	}
 }
