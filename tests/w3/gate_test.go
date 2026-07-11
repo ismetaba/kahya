@@ -477,6 +477,9 @@ func TestGate3_SecretLaneContentRoutesToLocalApprovalOnly(t *testing.T) {
 // stand-in's. Requires Docker (KAHYA_DOCKER_TESTS=1); SKIPS, never fails,
 // when unset.
 func TestGate4_DockerCurlCannotBypassEgressAllowlist(t *testing.T) {
+	// requireDockerTests also acquires mcp/shell's cross-process
+	// LockDockerSharedResources - see that function's own doc comment for
+	// why every live Docker test in EITHER package needs it.
 	requireDockerTests(t)
 
 	// mcp/shell.EgressNetworkEnsurer treats an already-"running"

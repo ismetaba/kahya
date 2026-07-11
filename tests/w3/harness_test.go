@@ -63,7 +63,11 @@ func requireBuilt(t *testing.T, path string) {
 // requireDockerTests skips (never fails) unless KAHYA_DOCKER_TESTS=1 -
 // mirrors mcp/shell/container_test.go's own requireDockerTests exactly
 // (this package cannot import that one - it is unexported - so the
-// identical, tiny contract is reimplemented here).
+// identical, tiny contract is reimplemented here). The cross-process
+// Docker lock this test's Gate 4 shares with mcp/shell's own live Docker
+// tests is held for this WHOLE package's test run instead (TestMain, in
+// testmain_test.go) - see that file's own doc comment for why per-test
+// locking here turned out not to be enough on its own.
 func requireDockerTests(t *testing.T) {
 	t.Helper()
 	if os.Getenv("KAHYA_DOCKER_TESTS") != "1" {
