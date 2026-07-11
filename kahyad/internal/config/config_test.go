@@ -11,7 +11,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID"} {
 		t.Setenv(k, "")
 	}
 }
@@ -89,6 +89,72 @@ func TestLoadDefaults(t *testing.T) {
 	// W3-05 egress proxy default port.
 	if cfg.EgressPort != 3128 {
 		t.Errorf("EgressPort = %d, want 3128", cfg.EgressPort)
+	}
+	// W3-07: empty chat_id/user_id by default => bot disabled.
+	if cfg.TelegramChatID != 0 {
+		t.Errorf("TelegramChatID = %d, want 0 (disabled by default)", cfg.TelegramChatID)
+	}
+	if cfg.TelegramUserID != 0 {
+		t.Errorf("TelegramUserID = %d, want 0 (disabled by default)", cfg.TelegramUserID)
+	}
+}
+
+// TestLoadFileOverridesTelegramIDs proves telegram_chat_id/telegram_user_id
+// are real, independently-overridable config.yaml keys (W3-07: the single
+// fixed chat_id/user_id allowlist pair).
+func TestLoadFileOverridesTelegramIDs(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "telegram_chat_id: 123456789\ntelegram_user_id: 987654321\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TelegramChatID != 123456789 {
+		t.Errorf("TelegramChatID = %d, want 123456789", cfg.TelegramChatID)
+	}
+	if cfg.TelegramUserID != 987654321 {
+		t.Errorf("TelegramUserID = %d, want 987654321", cfg.TelegramUserID)
+	}
+}
+
+// TestLoadEnvOverridesTelegramIDs proves KAHYA_TELEGRAM_CHAT_ID/
+// KAHYA_TELEGRAM_USER_ID override both the default and any config.yaml
+// value, matching every other env-override key's precedence.
+func TestLoadEnvOverridesTelegramIDs(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("telegram_chat_id: 111\ntelegram_user_id: 222\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KAHYA_TELEGRAM_CHAT_ID", "555")
+	t.Setenv("KAHYA_TELEGRAM_USER_ID", "666")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TelegramChatID != 555 {
+		t.Errorf("TelegramChatID = %d, want 555 (env override)", cfg.TelegramChatID)
+	}
+	if cfg.TelegramUserID != 666 {
+		t.Errorf("TelegramUserID = %d, want 666 (env override)", cfg.TelegramUserID)
 	}
 }
 

@@ -180,6 +180,21 @@ type Config struct {
 	// per-task local token).
 	CredentialMode string `yaml:"credential_mode"`
 
+	// --- W3-07 Telegram approval bot ---
+
+	// TelegramChatID/TelegramUserID are the single fixed chat_id/user_id
+	// allowlist pair the Telegram bot's Go-side middleware enforces
+	// (HANDOFF §5 safety #5 ⚑: "tek sabit chat_id/user_id allowlist'i Go
+	// tarafinda uygulanir"). Either being zero (the default - no
+	// config.yaml key, no env override) disables the bot entirely: every
+	// approval/alarm falls back to the local (CLI) surface, exactly as if
+	// the kahya.telegram Keychain item were absent. Populated by the
+	// one-time manual setup (task spec step 7): the user messages the bot
+	// once, the operator reads that update's chat/from ids back into
+	// config.yaml.
+	TelegramChatID int64 `yaml:"telegram_chat_id"`
+	TelegramUserID int64 `yaml:"telegram_user_id"`
+
 	// Env is KAHYA_ENV ("prod" default | "dev"). It is env-only: there is
 	// no config.yaml key for it, since it exists precisely so tests and the
 	// W7-8 KAHYA_ENV=dev profile can redirect every path independent of any
@@ -218,6 +233,8 @@ type fileConfig struct {
 	CacheHitAlarmThreshold  *float64  `yaml:"cache_hit_alarm_threshold"`
 	CredentialMode          *string   `yaml:"credential_mode"`
 	EstRequestTokens        *int64    `yaml:"est_request_tokens"`
+	TelegramChatID          *int64    `yaml:"telegram_chat_id"`
+	TelegramUserID          *int64    `yaml:"telegram_user_id"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -510,6 +527,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.EstRequestTokens != nil {
 		cfg.EstRequestTokens = *fc.EstRequestTokens
 	}
+	if fc.TelegramChatID != nil {
+		cfg.TelegramChatID = *fc.TelegramChatID
+	}
+	if fc.TelegramUserID != nil {
+		cfg.TelegramUserID = *fc.TelegramUserID
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -556,6 +579,16 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_SHELL_WORKDIR_ROOTS"); v != "" {
 		cfg.ShellWorkdirRoots = expandHomeEach(strings.Split(v, ","), home)
+	}
+	if v := os.Getenv("KAHYA_TELEGRAM_CHAT_ID"); v != "" {
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.TelegramChatID = id
+		}
+	}
+	if v := os.Getenv("KAHYA_TELEGRAM_USER_ID"); v != "" {
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.TelegramUserID = id
+		}
 	}
 }
 

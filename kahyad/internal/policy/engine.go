@@ -213,6 +213,19 @@ type Engine struct {
 	// to the package-level undoWindowDuration const by NewEngine) - see
 	// SetUndoWindowDuration's doc comment.
 	undoWindowDuration time.Duration
+	// pendingApprovalHook is W3-07's subscription seam (SetPendingApprovalHook):
+	// called once per freshly-minted pending_approvals row (mintPendingApproval,
+	// AFTER the row is already durably persisted), so the Telegram bot can
+	// deliver a W1/W2 approval card or a W3 notify-only message without this
+	// package needing to know Telegram exists - the exact same "owning
+	// surface subscribes via a nil-by-default hook" pattern undoExpiryHook
+	// already established for W3-03. nil by default (every pre-W3-07
+	// caller/test keeps working unchanged). Called SYNCHRONOUSLY from
+	// mintPendingApproval, which runs inside Check/Approve's own request
+	// path - a real caller MUST keep this fast (fire off a goroutine for
+	// any actual network send) so a slow hook can never delay a policy
+	// decision.
+	pendingApprovalHook func(PendingApprovalInfo)
 }
 
 // NewEngine constructs an Engine. pol is W3-01's loaded tool registry (the
@@ -240,6 +253,15 @@ func (e *Engine) SetUndoWindowDuration(d time.Duration) { e.undoWindowDuration =
 // starts (main.go); nil (the default) means no hook runs.
 func (e *Engine) SetUndoExpiryHook(fn func(traceID, taskID, tool string)) {
 	e.undoExpiryHook = fn
+}
+
+// SetPendingApprovalHook registers fn to be called once for every freshly
+// minted pending_approvals row (see pendingApprovalHook's own doc comment
+// on the Engine struct). Call before any Check/Approve traffic starts
+// flowing; nil (the default) means no hook runs, so every pre-W3-07
+// caller/test is unaffected.
+func (e *Engine) SetPendingApprovalHook(fn func(PendingApprovalInfo)) {
+	e.pendingApprovalHook = fn
 }
 
 // fireUndoExpiryHook calls the registered hook, if any - a small helper so
@@ -345,6 +367,13 @@ func (e *Engine) mintPendingApproval(ctx context.Context, taskID, traceID, tool 
 		ExpiresAt:         rfc3339(now.Add(pendingApprovalTTL)),
 	}); err != nil {
 		return "", err
+	}
+	if e.pendingApprovalHook != nil {
+		e.pendingApprovalHook(PendingApprovalInfo{
+			ID: id, Tool: tool, Class: class, Scope: scope,
+			ToolInput: toolInput, MintedAt: now,
+			TraceID: traceID, TaskID: taskID,
+		})
 	}
 	return id, nil
 }
@@ -843,6 +872,14 @@ type PendingApprovalInfo struct {
 	Scope     string
 	ToolInput []byte
 	MintedAt  time.Time
+	// TraceID/TaskID are the correlation ids Check originally resolved this
+	// decision under (W3-07's pendingApprovalHook needs both: TraceID for
+	// its own egress-checked-send/ledger lines, TaskID purely for
+	// completeness) - not needed by `kahya approvals`/`kahya approve`'s own
+	// CLI rendering, which is why these were absent before W3-07 added the
+	// hook that needs them.
+	TraceID string
+	TaskID  string
 }
 
 // ListPendingApprovals implements `kahya approvals`: every not-yet-
@@ -869,6 +906,7 @@ func (e *Engine) ListPendingApprovals(ctx context.Context) ([]PendingApprovalInf
 		out = append(out, PendingApprovalInfo{
 			ID: r.ID, Tool: r.Tool, Class: ActionClass(r.Class), Scope: r.Scope,
 			ToolInput: r.ToolInput, MintedAt: mintedAt,
+			TraceID: r.TraceID, TaskID: r.TaskID,
 		})
 	}
 	return out, nil
@@ -891,5 +929,6 @@ func (e *Engine) GetPendingApprovalDetail(ctx context.Context, id string) (Pendi
 	return PendingApprovalInfo{
 		ID: pa.ID, Tool: pa.Tool, Class: ActionClass(pa.Class), Scope: pa.Scope,
 		ToolInput: pa.ToolInput, MintedAt: mintedAt,
+		TraceID: pa.TraceID, TaskID: pa.TaskID,
 	}, nil
 }

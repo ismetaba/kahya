@@ -24,6 +24,12 @@ const (
 	defaultAccount = "kahya"
 )
 
+// telegramService is W0-04's second provisioned item ("kahya.anthropic /
+// kahya.telegram / kahya.anchor Keychain items with -T $(which kahyad)"),
+// account "kahya" like every other item this package reads (W3-07: kahyad's
+// Telegram bot's BotFather token).
+const telegramService = "kahya.telegram"
+
 // Keychain reads and caches the Anthropic API key from the macOS Keychain.
 // Safe for concurrent use.
 type Keychain struct {
@@ -43,6 +49,17 @@ type Keychain struct {
 // item (account `kahya`), per W0-04's provisioning command.
 func New() *Keychain {
 	return &Keychain{service: defaultService, account: defaultAccount}
+}
+
+// NewTelegram constructs a Keychain reader for the production
+// `kahya.telegram` item (account `kahya`, same W0-04 provisioning
+// command/ACL convention as New's `kahya.anthropic`) - kahyad/internal/
+// telegram.New's ONLY source for the BotFather token (W3-07). A missing/
+// locked item behaves identically to the Anthropic key's own fail path
+// (Read returns an error, never cached) - the caller (telegram.New) treats
+// that as "bot disabled", never a boot failure.
+func NewTelegram() *Keychain {
+	return &Keychain{service: telegramService, account: defaultAccount}
 }
 
 // Read returns the cached Anthropic API key, invoking

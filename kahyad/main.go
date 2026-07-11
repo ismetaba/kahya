@@ -35,6 +35,7 @@ import (
 	"kahya/kahyad/internal/secrets"
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/telegram"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
 	mcpshell "kahya/mcp/shell"
@@ -267,6 +268,26 @@ func run() int {
 	egressGate := egress.NewGate(pol.Egress, sessions, egressBudget, st, notifier, log)
 	srv.SetEgressGate(egressGate)
 
+	// W3-07: the Telegram approval bot. New NEVER errors - an unconfigured
+	// telegram.chat_id/telegram.user_id pair, a missing/locked
+	// kahya.telegram Keychain item, or a telebot construction failure all
+	// resolve to a DISABLED bot (event=telegram_disabled), never a boot
+	// failure - every other subsystem above/below is wired identically
+	// either way. tgBot consumes the SAME egressGate/policyEngine/st every
+	// other in-process caller uses (HANDOFF §5 safety #1: approval cards
+	// are egress too).
+	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID}
+	tgBot := telegram.New(tgCfg, secrets.NewTelegram(), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
+	policyEngine.SetPendingApprovalHook(func(info policy.PendingApprovalInfo) {
+		// Fired synchronously from inside Check/Approve's own request path
+		// (kahyad/internal/policy.Engine.pendingApprovalHook's doc
+		// comment) - the actual Telegram send happens in its own
+		// goroutine so a slow/blocked send can never delay a policy
+		// decision.
+		go tgBot.OnPendingApproval(context.Background(), info)
+	})
+	log.Info("telegram_bot_wired", "enabled", tgBot.Enabled())
+
 	// BLOCKER B/C: the shared, daemon-lifetime forward-proxy (egress.Proxy,
 	// started below) cannot infer which task a needs_network:true
 	// container's connection belongs to on its own — egressTokens maps the
@@ -335,14 +356,19 @@ func run() int {
 
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
 	// (W12-08). notifier (built above, alongside the egress gate)
-	// logs+ledgers alarms (Telegram delivery is W3-07); governor is
-	// rebuilt once here from every historical model_call ledger event,
-	// then shared across every task for the rest of the process's life
-	// (kahyad/internal/anthproxy.Governor is safe for concurrent use).
-	// credential is selected by cfg.credential_mode - see
-	// kahyad/internal/anthproxy's package doc comment for the OWNER AUTH
-	// DECISION this selects between (passthrough is the owner-decision
-	// default; keychain remains fully implemented as a valid fallback).
+	// logs+ledgers alarms; governorNotifier additionally fans every ALARM-
+	// class event out to Telegram (W3-07: task-paused-at-ceiling, 80%
+	// daily-budget downgrade, cache-hit degradation, daily spend) when
+	// tgBot is enabled, degrading to notifier's own JSONL+ledger-only
+	// behavior otherwise (telegram.NewAlarmNotifier's own doc comment).
+	// governor is rebuilt once here from every historical model_call
+	// ledger event, then shared across every task for the rest of the
+	// process's life (kahyad/internal/anthproxy.Governor is safe for
+	// concurrent use). credential is selected by cfg.credential_mode -
+	// see kahyad/internal/anthproxy's package doc comment for the OWNER
+	// AUTH DECISION this selects between (passthrough is the owner-
+	// decision default; keychain remains fully implemented as a valid
+	// fallback).
 	bootEvents, err := loadAnthproxyBootEvents(context.Background(), st)
 	if err != nil {
 		log.Error("anthproxy_boot_events_failed", "err", err.Error())
@@ -356,7 +382,8 @@ func run() int {
 		CacheHitAlarmThreshold: cfg.CacheHitAlarmThreshold,
 		EstRequestTokens:       cfg.EstRequestTokens,
 	}
-	governor := anthproxy.Boot(bootEvents, limits, nil, notifier)
+	governorNotifier := telegram.NewAlarmNotifier(notifier, tgBot)
+	governor := anthproxy.Boot(bootEvents, limits, nil, governorNotifier)
 	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode)
 
 	credential := buildCredentialSource(cfg, log)
@@ -373,7 +400,7 @@ func run() int {
 	// classifier + W3-10's test.
 	anthropicHost, anthropicPort := hostPortFromURL(cfg.AnthropicUpstreamURL)
 	egressGateFactory := egress.NewAnthproxyEgressGateHook(egressGate, anthropicHost, anthropicPort)
-	srv.SetAnthproxy(governor, notifier, credential, egressGateFactory)
+	srv.SetAnthproxy(governor, governorNotifier, credential, egressGateFactory)
 
 	// W3-05: the egress proxy itself - the ONLY route out of the
 	// kahya-egress Docker network mcp/shell's needs_network container
@@ -447,16 +474,29 @@ func run() int {
 		policyEngine.RunUndoSweeper(ctx, 30*time.Second)
 	}()
 
+	// W3-07: the Telegram bot's long-polling loop - Start blocks internally
+	// until ctx is cancelled (it stops its own poller from a ctx.Done()
+	// goroutine), a no-op on a disabled bot. Same ctx-cancelled-then-joined
+	// pattern as the boot reindex goroutine/undo sweeper above.
+	var telegramDone sync.WaitGroup
+	telegramDone.Add(1)
+	go func() {
+		defer telegramDone.Done()
+		tgBot.Start(ctx)
+	}()
+
 	runErr := srv.Run(ctx)
 
 	// Cancel ctx explicitly (a no-op if a shutdown signal already fired
 	// it) and WAIT for the boot reindex goroutine (and the undo-window
-	// sweeper) to observe the cancellation and finish any in-flight work,
-	// before this function returns - so this always completes strictly
-	// before the deferred st.Close() call above (BLOCKER 2).
+	// sweeper, and the Telegram bot's long-poll loop) to observe the
+	// cancellation and finish any in-flight work, before this function
+	// returns - so this always completes strictly before the deferred
+	// st.Close() call above (BLOCKER 2).
 	stop()
 	reindexDone.Wait()
 	undoSweepDone.Wait()
+	telegramDone.Wait()
 
 	// Stop kills the embed service's entire process GROUP (SIGKILL) and
 	// suppresses its restart-with-backoff loop - launchd holds only

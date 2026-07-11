@@ -47,6 +47,17 @@ func TestKeychainReadMissingItemErrors(t *testing.T) {
 	}
 }
 
+// TestNewTelegramConfiguredCorrectly asserts NewTelegram points at the
+// W0-04-provisioned kahya.telegram/kahya item (never accidentally aliasing
+// New()'s own kahya.anthropic service) - hermetic, no dependency on the
+// item actually existing on this machine.
+func TestNewTelegramConfiguredCorrectly(t *testing.T) {
+	k := NewTelegram()
+	if k.service != "kahya.telegram" || k.account != "kahya" {
+		t.Fatalf("NewTelegram() service/account = %q/%q, want kahya.telegram/kahya", k.service, k.account)
+	}
+}
+
 // TestKeychainReadFailureNotCached proves an error is never cached: two
 // consecutive reads of a missing item both return an error rather than the
 // second call somehow succeeding with a cached blank value.

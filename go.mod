@@ -10,6 +10,7 @@ require (
 	github.com/pressly/goose/v3 v3.27.2
 	golang.org/x/net v0.57.0
 	golang.org/x/text v0.40.0
+	gopkg.in/telebot.v4 v4.0.0-beta.10
 	gopkg.in/yaml.v3 v3.0.1
 )
 

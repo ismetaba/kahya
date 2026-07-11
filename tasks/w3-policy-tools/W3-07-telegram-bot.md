@@ -1,6 +1,6 @@
 # W3-07 — Telegram approval bot (telebot.v4, long-polling, W2-only approvals)
 
-**Status:** todo
+**Status:** blocked-user (code + unit tests complete and green in `make test`; the two manual live-bot acceptance criteria are deferred — see the note below the acceptance list. Needs: the user creates the bot with BotFather, stores the token via `security add-generic-password -s kahya.telegram -a kahya -T "$(which kahyad)" -w`, and sends the bot one DM so the operator can read `telegram.chat_id`/`telegram.user_id` back into config.yaml.)
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-06, W0-04
 **Flags:** user-assist
@@ -47,12 +47,15 @@ Gotchas:
 8. Tests: middleware drops non-matching update and ledgers it; W2 card contains byte-exact diff chunks (fixture with Turkish content `Bütçe raporu ği üşç.md` survives byte-exact); secret-lane fixture produces ONLY the redacted title (assert no payload byte appears in any sent message); forged W3 callback rejected; long-poll config asserted (no webhook).
 
 ## Acceptance criteria
-- [ ] `go test ./kahyad/internal/telegram/...` green in `make test` (fake transport, no network).
-- [ ] Manual (needs live bot): a W2 `fs_write` at L0 sends a Telegram card with the byte-exact diff; tapping `✅ Onayla` executes the action; `sqlite3 brain.db` shows the approval event labeled `remote` with the task's `trace_id`. (Mirrors §6 W3 gate: "W2 bir eylem Telegram'dan byte-tam diff ile onay istiyor".)
-- [ ] Manual: a W3 action produces ONLY the notify message on Telegram (no buttons); `kahya approve <id>` + typed `onayla` completes it. (Gate: "W3 eylem Telegram'dan onaylanamıyor, CLI'dan yazılı "onayla" ile geçiyor".)
-- [ ] Redaction test green: secret-lane-labeled diff never leaves — grep the fake transport's sent messages for any payload substring ⇒ zero matches.
-- [ ] Unauthorized-update test green: drop + `telegram_unauthorized_update` ledger row, no reply sent.
-- [ ] Cost alarm path: fire W12-08's ceiling hook in a test ⇒ Turkish alarm message queued through the egress-checked sender.
+- [x] `go test ./kahyad/internal/telegram/...` green in `make test` (fake transport, no network). 19 tests across bot_test.go/approvals_test.go/redact_test.go/alarms_test.go; the whole repo's `make test` (Go + Python worker suite, Docker-backed mcp/shell tests included) stays green with the bot wired into `kahyad/main.go` and disabled (no Keychain item on this machine).
+- [ ] **DEFERRED (blocked-user, needs live bot)**: a W2 `fs_write` at L0 sends a Telegram card with the byte-exact diff; tapping `✅ Onayla` executes the action; `sqlite3 brain.db` shows the approval event labeled `remote` with the task's `trace_id`. (Mirrors §6 W3 gate: "W2 bir eylem Telegram'dan byte-tam diff ile onay istiyor".) Unit-covered instead by `TestW2ApprovalCardByteExactDiff`, `TestW2ApprovalCardMultiChunkKeyboardOnlyOnLast`, and `TestApprovalCallbackApprovesAndEditsCard` (asserts a real `policy.Engine`'s `policy_feedback_approved` ledger row carries `surface:"telegram"` — the ledger's own `remote` labeling convention for that surface value) against the fake telebot transport.
+- [ ] **DEFERRED (blocked-user, needs live bot)**: a W3 action produces ONLY the notify message on Telegram (no buttons); `kahya approve <id>` + typed `onayla` completes it. (Gate: "W3 eylem Telegram'dan onaylanamıyor, CLI'dan yazılı "onayla" ile geçiyor".) Unit-covered instead by `TestW3NoticeOnlyNoKeyboard` (notify-only, zero buttons) and `TestForgedW3CallbackRejectedAtEngine` (a forged approve callback for a real W3 pending id is rejected by the engine's `w3_nonlocal_approval_rejected` backstop, and the same id remains approvable from `surface="local"` afterward).
+- [x] Redaction test green: secret-lane-labeled diff never leaves — grep the fake transport's sent messages for any payload substring ⇒ zero matches. (`TestSecretLaneRedactedOnlyTitleSent`, `TestSecretLaneDeleteAlsoRedacted`, negative control `TestNonSecretLanePathSendsFullDiff`.)
+- [x] Unauthorized-update test green: drop + `telegram_unauthorized_update` ledger row, no reply sent. (`TestAllowlistMiddlewareDropsMismatch` for a plain message, `TestAllowlistMiddlewareDropsMismatchedCallback` for a button tap, positive control `TestAllowlistMiddlewarePassesMatch`.)
+- [x] Cost alarm path: fire W12-08's ceiling hook in a test ⇒ Turkish alarm message queued through the egress-checked sender. (`TestAlarmNotifierFansOutToTelegram` drives the real `anthproxy.Governor.CheckBeforeForward` ceiling check and mirrors `proxy.go`'s own `onBudgetBlocked` call shape; `TestAlarmNotifierBlockedEgressFallsBackLocally` covers the egress-denied fallback path.)
+
+### Why the two manual criteria are deferred, not faked
+Both require a real BotFather token in the `kahya.telegram` Keychain item (W0-04, still `[!]` — the user has not yet run the `security add-generic-password` provisioning commands) AND the user sending the bot one live Telegram message so `telegram.chat_id`/`telegram.user_id` can be read back into `config.yaml` (task spec step 7). Neither is available in this environment, and per this repo's own instructions these two criteria must not be faked — every OTHER acceptance criterion, and every code path a fake telebot transport can exercise, is done and green. See BACKLOG.md's `[!]` note for exactly what the user needs to supply.
 
 ## Out of scope
 - W3 approval via Telegram — permanently prohibited (§5 #5), not a future toggle.
