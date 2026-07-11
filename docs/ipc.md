@@ -277,12 +277,23 @@ the loaded `policy.yaml` (missing ⇒ `deny`, reason
 `"Tanınmayan araç reddedildi (fail-closed)."`); look up
 `autonomy_state(tool,class,scope)` (missing row ⇒ L0); apply the HANDOFF
 §4 ladder table (R auto at L1+, W1 at L2+ — opening a 5-minute
-`undo_windows` row — W2 at L3+; **W3 never auto-allows, at any level,
-hard-coded in Go**). `allow` on a non-R class mints a one-time approval
-token (bound to `task_id` + a sha256 of `tool_input`) the caller must
-present to `POST /policy/consume-token` before executing; `needs_approval`
-returns an opaque `pending_approval_id` an approval surface later resolves
-via `POST /policy/feedback`.
+`undo_windows` row, idempotently reusing an already-open one for the same
+task_id/tool/trace_id on a retried call — W2 at L3+; **W3 never
+auto-allows, at any level, hard-coded in Go**). `allow` on a non-R class
+mints a one-time approval token (bound to `task_id` + `tool`/`class`/
+`scope` + a sha256 of `tool_input`) the caller must present to
+`POST /policy/consume-token` before executing; `needs_approval` inserts a
+server-issued, single-use `pending_approvals` row (32 random bytes hex,
+bound to the RESOLVED tool/class/scope/task_id/trace_id/
+approved_bytes_hash, 10-minute TTL) and returns its id as
+`pending_approval_id` — an opaque reference an approval surface later
+resolves via `POST /policy/feedback`, never a caller-decodable blob.
+`Engine.Approve`/`Deny` look this row up by id and atomically consume it
+(`consumed_at IS NULL`); a forged, expired, or already-consumed id is
+rejected outright, before any token is minted or any bookkeeping runs -
+and `POST /policy/consume-token` failures demote the token's REAL bound
+`(tool,class,scope)` (recovered from `approval_tokens` by `token_hash`),
+never whatever the request body itself claims.
 
 - **Malformed request body, or one over the 1 MiB cap above, ⇒ HTTP 400 or
   413**, but the body still says `{"decision":"deny",...}` (`rule` still

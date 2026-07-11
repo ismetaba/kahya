@@ -13,6 +13,8 @@ type ApprovalToken struct {
 	TaskID            string         `json:"task_id"`
 	TraceID           string         `json:"trace_id"`
 	Tool              string         `json:"tool"`
+	Class             string         `json:"class"`
+	Scope             string         `json:"scope"`
 	ApprovedBytesHash string         `json:"approved_bytes_hash"`
 	MintedAt          string         `json:"minted_at"`
 	ExpiresAt         string         `json:"expires_at"`
@@ -118,6 +120,19 @@ type Outbox struct {
 	Payload      string         `json:"payload"`
 	DispatchedAt sql.NullString `json:"dispatched_at"`
 	CreatedAt    string         `json:"created_at"`
+}
+
+type PendingApproval struct {
+	ID                string         `json:"id"`
+	TaskID            string         `json:"task_id"`
+	TraceID           string         `json:"trace_id"`
+	Tool              string         `json:"tool"`
+	Class             string         `json:"class"`
+	Scope             string         `json:"scope"`
+	ApprovedBytesHash string         `json:"approved_bytes_hash"`
+	MintedAt          string         `json:"minted_at"`
+	ExpiresAt         string         `json:"expires_at"`
+	ConsumedAt        sql.NullString `json:"consumed_at"`
 }
 
 type Task struct {

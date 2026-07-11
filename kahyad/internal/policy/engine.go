@@ -24,9 +24,9 @@ package policy
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -149,8 +149,17 @@ type Store interface {
 	GetApprovalToken(ctx context.Context, tokenHash string) (sqlcgen.ApprovalToken, error)
 	ConsumeApprovalToken(ctx context.Context, arg sqlcgen.ConsumeApprovalTokenParams) (int64, error)
 
+	// Pending-approval persistence (post-security-review amendment): a
+	// NEEDS_APPROVAL decision's pending_approval_id is now a server-issued,
+	// single-use, DB-tracked reference - never an unsigned caller-decodable
+	// blob. See mintPendingApproval/Approve/Deny below.
+	InsertPendingApproval(ctx context.Context, arg sqlcgen.InsertPendingApprovalParams) error
+	GetPendingApproval(ctx context.Context, id string) (sqlcgen.PendingApproval, error)
+	ConsumePendingApproval(ctx context.Context, arg sqlcgen.ConsumePendingApprovalParams) (int64, error)
+
 	InsertUndoWindow(ctx context.Context, arg sqlcgen.InsertUndoWindowParams) (sqlcgen.UndoWindow, error)
 	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error)
+	GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg sqlcgen.GetOpenUndoWindowByTaskToolTraceParams) (sqlcgen.UndoWindow, error)
 	ListOpenUndoWindows(ctx context.Context) ([]sqlcgen.UndoWindow, error)
 	SetUndoWindowState(ctx context.Context, arg sqlcgen.SetUndoWindowStateParams) error
 }
@@ -231,42 +240,97 @@ type Decision struct {
 	Token string
 }
 
-// approvalTicket is PendingApprovalID's decoded shape: everything
-// Engine.Approve/Deny need to mint a token or ledger a denial, without a
-// dedicated "pending approvals" table (the migration's three tables -
-// autonomy_state, approval_tokens, undo_windows - are the complete W3-02
-// schema; a NEEDS_APPROVAL decision is deliberately NOT persisted as a row
-// anywhere - it exists only as this opaque, self-contained reference,
-// valid for exactly as long as the approval surface holds onto it).
-type approvalTicket struct {
-	Tool              string      `json:"tool"`
-	Class             ActionClass `json:"class"`
-	Scope             string      `json:"scope"`
-	TaskID            string      `json:"task_id"`
-	TraceID           string      `json:"trace_id"`
-	ApprovedBytesHash string      `json:"approved_bytes_hash"`
-}
+// pendingApprovalIDBytesLen is the pending_approval_id's raw (pre-hex)
+// length: 32 random bytes, the same size/entropy convention tokens.go's
+// tokenBytesLen already uses for one-time approval tokens.
+const pendingApprovalIDBytesLen = 32
 
-func encodeTicket(t approvalTicket) string {
-	b, _ := json.Marshal(t)
-	return base64.RawURLEncoding.EncodeToString(b)
-}
+// pendingApprovalTTL is the NEEDS_APPROVAL pending-approval id's
+// time-to-live (this task's spec, verbatim: "TTL 10 dakika" - mirroring
+// tokens.go's tokenTTL).
+const pendingApprovalTTL = 10 * time.Minute
 
+// ErrInvalidPendingApproval is returned by Approve/Deny for every failure
+// branch (forged/unrecognized id, expired, or already-consumed) - callers
+// must treat all of these identically: fail-closed, no token minted, no
+// bookkeeping performed.
 var ErrInvalidPendingApproval = errors.New("policy: invalid or unrecognized pending_approval_id")
 
-func decodeTicket(s string) (approvalTicket, error) {
-	b, err := base64.RawURLEncoding.DecodeString(s)
+// mintPendingApproval is the server-side truth behind a NEEDS_APPROVAL
+// decision's pending_approval_id (post-security-review amendment - this
+// USED TO BE an unsigned base64(json) blob a caller could hand-craft to
+// mint a token for ANY tool/class/scope; it is now 32 random bytes bound
+// to a pending_approvals row holding the RESOLVED (tool, class, scope,
+// task_id, trace_id, approved_bytes_hash) Check itself just computed - the
+// id is opaque and self-describing to nobody but this row). Approve/Deny
+// below look this row up by id and never trust anything decoded from the
+// id string itself.
+func (e *Engine) mintPendingApproval(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, hash string) (string, error) {
+	raw := make([]byte, pendingApprovalIDBytesLen)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	id := hex.EncodeToString(raw)
+
+	now := e.nowUTC()
+	if err := e.store.InsertPendingApproval(ctx, sqlcgen.InsertPendingApprovalParams{
+		ID:                id,
+		TaskID:            taskID,
+		TraceID:           traceID,
+		Tool:              tool,
+		Class:             string(class),
+		Scope:             scope,
+		ApprovedBytesHash: hash,
+		MintedAt:          rfc3339(now),
+		ExpiresAt:         rfc3339(now.Add(pendingApprovalTTL)),
+	}); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// getValidPendingApproval fetches (WITHOUT consuming) a pending_approvals
+// row by id, rejecting a missing, expired, or already-consumed one with
+// ErrInvalidPendingApproval. This is a read-only peek, deliberately kept
+// separate from consumePendingApproval below, so Approve can enforce the
+// W3 surface="local" rule BEFORE burning the id: a Telegram surface
+// rejected on a W3 pending approval must leave that SAME id usable for a
+// later local approval, not consume it on the failed attempt.
+func (e *Engine) getValidPendingApproval(ctx context.Context, id string) (sqlcgen.PendingApproval, error) {
+	pa, err := e.store.GetPendingApproval(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return sqlcgen.PendingApproval{}, ErrInvalidPendingApproval
+	}
 	if err != nil {
-		return approvalTicket{}, ErrInvalidPendingApproval
+		return sqlcgen.PendingApproval{}, err
 	}
-	var t approvalTicket
-	if err := json.Unmarshal(b, &t); err != nil {
-		return approvalTicket{}, ErrInvalidPendingApproval
+	if pa.ConsumedAt.Valid {
+		return sqlcgen.PendingApproval{}, ErrInvalidPendingApproval
 	}
-	if t.Tool == "" || !validClasses[t.Class] {
-		return approvalTicket{}, ErrInvalidPendingApproval
+	if expiresAt, perr := time.Parse(time.RFC3339Nano, pa.ExpiresAt); perr != nil || e.nowUTC().After(expiresAt) {
+		return sqlcgen.PendingApproval{}, ErrInvalidPendingApproval
 	}
-	return t, nil
+	return pa, nil
+}
+
+// consumePendingApproval atomically single-use-burns a pending_approvals
+// row already validated by getValidPendingApproval above (BLOCKER 2:
+// Approve/Deny must never act twice on the same pending_approval_id).
+// Only the FIRST caller to reach this for a given id ever succeeds; a
+// second (or racing concurrent) call affects 0 rows and is rejected -
+// before any token is minted or any bookkeeping happens.
+func (e *Engine) consumePendingApproval(ctx context.Context, id string) error {
+	affected, err := e.store.ConsumePendingApproval(ctx, sqlcgen.ConsumePendingApprovalParams{
+		ConsumedAt: sql.NullString{String: rfc3339(e.nowUTC()), Valid: true},
+		ID:         id,
+	})
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrInvalidPendingApproval
+	}
+	return nil
 }
 
 // Check is the binding policy decision (HANDOFF S5 enforcement plane:
@@ -296,17 +360,14 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	// HARD-CODED: W3 never auto-allows, at any level, ever - see this
 	// file's package doc comment and autoLevelFor's.
 	if class == ClassW3 {
-		id := encodeTicket(approvalTicket{Tool: in.Tool, Class: class, Scope: scope, TaskID: in.TaskID, TraceID: in.TraceID, ApprovedBytesHash: hash})
-		d := Decision{Result: ResultNeedsApproval, Reason: ReasonW3AlwaysApproval, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level, PendingApprovalID: id}
-		e.ledgerDecision(ctx, in, class, scope, level, d)
-		return d, nil
+		return e.needsApproval(ctx, in, class, scope, level, hash, ReasonW3AlwaysApproval)
 	}
 
 	threshold, _ := autoLevelFor(class)
 	if level >= threshold {
 		var token string
 		if class != ClassR {
-			tok, err := e.mintToken(ctx, in.TaskID, in.TraceID, in.Tool, hash)
+			tok, err := e.mintToken(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash)
 			if err != nil {
 				d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
 				e.ledgerDecision(ctx, in, class, scope, level, d)
@@ -329,8 +390,24 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 		return d, nil
 	}
 
-	id := encodeTicket(approvalTicket{Tool: in.Tool, Class: class, Scope: scope, TaskID: in.TaskID, TraceID: in.TraceID, ApprovedBytesHash: hash})
-	d := Decision{Result: ResultNeedsApproval, Reason: ReasonNeedsApproval, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level, PendingApprovalID: id}
+	return e.needsApproval(ctx, in, class, scope, level, hash, ReasonNeedsApproval)
+}
+
+// needsApproval mints the server-side pending_approvals row backing a
+// NEEDS_APPROVAL decision (BLOCKER 1/2: pending_approval_id is server-
+// issued and DB-tracked, never an unsigned caller-decodable blob) and
+// returns the resulting Decision. A mint failure itself fails closed
+// (DENY) - a NEEDS_APPROVAL decision with no corresponding row would be
+// approvable by nothing, which is a worse failure mode than an honest
+// deny.
+func (e *Engine) needsApproval(ctx context.Context, in CheckInput, class ActionClass, scope string, level int, hash, reason string) (Decision, error) {
+	id, err := e.mintPendingApproval(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash)
+	if err != nil {
+		d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
+		e.ledgerDecision(ctx, in, class, scope, level, d)
+		return d, err
+	}
+	d := Decision{Result: ResultNeedsApproval, Reason: reason, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level, PendingApprovalID: id}
 	e.ledgerDecision(ctx, in, class, scope, level, d)
 	return d, nil
 }
@@ -431,8 +508,20 @@ func (e *Engine) demote(ctx context.Context, tool string, class ActionClass, sco
 }
 
 // openUndoWindow inserts an undo_windows row with a 5-minute deadline and
-// ledgers undo_window_opened (HANDOFF S4 ladder L2 row).
+// ledgers undo_window_opened (HANDOFF S4 ladder L2 row). MINOR 5 fix:
+// idempotent open - a retried Check/Approve call for the same (task_id,
+// tool, trace_id) reuses the existing OPEN window instead of opening a
+// second one, so a retry never leaves multiple simultaneously-open undo
+// windows for the same action.
 func (e *Engine) openUndoWindow(ctx context.Context, taskID, tool, traceID string) error {
+	if _, err := e.store.GetOpenUndoWindowByTaskToolTrace(ctx, sqlcgen.GetOpenUndoWindowByTaskToolTraceParams{
+		TaskID: taskID, Tool: tool, TraceID: traceID,
+	}); err == nil {
+		return nil // already open - nothing to do
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
 	now := e.nowUTC()
 	row, err := e.store.InsertUndoWindow(ctx, sqlcgen.InsertUndoWindowParams{
 		TaskID: taskID, Tool: tool, TraceID: traceID,
@@ -551,51 +640,62 @@ type FeedbackResult struct {
 // pending approval exists, it may never itself carry the approval).
 var ErrW3RequiresLocalSurface = errors.New("policy: W3 approval must carry surface=local")
 
-// Approve implements POST /policy/feedback's approve outcome: decode the
-// pending_approval_id, enforce the W3 surface=local hard rule, mint a
-// one-time token bound to the ticket's task_id+approved_bytes_hash, open a
+// Approve implements POST /policy/feedback's approve outcome: look up the
+// pending_approvals row by id (BLOCKER 1 - never trust anything decoded
+// from the id itself), enforce the W3 surface=local hard rule against the
+// ROW's real class, atomically single-use-consume the row (BLOCKER 2 -
+// missing/expired/already-consumed all reject with no token minted), mint
+// a one-time token bound to the row's task_id+approved_bytes_hash, open a
 // W1 undo window (a manually-approved W1 write earns the same 5-minute
 // safety net an auto-allowed one gets), bump consecutive_approvals, and -
 // exactly at the 20th consecutive approval - ledger promotion_suggested
 // (the level itself never changes here; only `kahya autonomy promote`
 // changes it, per HANDOFF S4).
 func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string) (FeedbackResult, error) {
-	ticket, err := decodeTicket(pendingApprovalID)
+	pa, err := e.getValidPendingApproval(ctx, pendingApprovalID)
 	if err != nil {
 		return FeedbackResult{}, err
 	}
+	class := ActionClass(pa.Class)
 
-	if ticket.Class == ClassW3 && surface != "local" {
-		e.ledgerRaw(ctx, ticket.TraceID, "policy_feedback_rejected", map[string]any{
-			"event": "policy_feedback_rejected", "tool": ticket.Tool, "reason": "w3_requires_local_surface", "surface": surface,
+	// Checked BEFORE consuming: a W3 pending approval rejected here (wrong
+	// surface) must remain usable for a LATER local approval, not be
+	// burned by the failed attempt.
+	if class == ClassW3 && surface != "local" {
+		e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_rejected", map[string]any{
+			"event": "policy_feedback_rejected", "tool": pa.Tool, "reason": "w3_requires_local_surface", "surface": surface,
 		})
 		return FeedbackResult{}, ErrW3RequiresLocalSurface
 	}
 
-	token, err := e.mintToken(ctx, ticket.TaskID, ticket.TraceID, ticket.Tool, ticket.ApprovedBytesHash)
+	if err := e.consumePendingApproval(ctx, pendingApprovalID); err != nil {
+		return FeedbackResult{}, err
+	}
+
+	token, err := e.mintToken(ctx, pa.TaskID, pa.TraceID, pa.Tool, class, pa.Scope, pa.ApprovedBytesHash)
 	if err != nil {
 		return FeedbackResult{}, err
 	}
-	if ticket.Class == ClassW1 {
-		if err := e.openUndoWindow(ctx, ticket.TaskID, ticket.Tool, ticket.TraceID); err != nil {
-			e.ledgerRaw(ctx, ticket.TraceID, "undo_window_open_failed", map[string]any{
-				"event": "undo_window_open_failed", "task_id": ticket.TaskID, "tool": ticket.Tool, "err": err.Error(),
+	if class == ClassW1 {
+		if err := e.openUndoWindow(ctx, pa.TaskID, pa.Tool, pa.TraceID); err != nil {
+			e.ledgerRaw(ctx, pa.TraceID, "undo_window_open_failed", map[string]any{
+				"event": "undo_window_open_failed", "task_id": pa.TaskID, "tool": pa.Tool, "err": err.Error(),
 			})
 		}
 	}
 
-	state, err := e.loadState(ctx, ticket.Tool, ticket.Class, ticket.Scope)
+	state, err := e.loadState(ctx, pa.Tool, class, pa.Scope)
 	if err == nil {
 		newCount := int(state.ConsecutiveApprovals) + 1
-		if err := e.saveState(ctx, ticket.Tool, ticket.Class, ticket.Scope, int(state.Level), newCount); err == nil {
-			e.ledgerRaw(ctx, ticket.TraceID, "policy_feedback_approved", map[string]any{
-				"event": "policy_feedback_approved", "tool": ticket.Tool, "class": ticket.Class,
-				"scope": ticket.Scope, "consecutive_approvals": newCount,
+		if err := e.saveState(ctx, pa.Tool, class, pa.Scope, int(state.Level), newCount); err == nil {
+			e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_approved", map[string]any{
+				"event": "policy_feedback_approved", "tool": pa.Tool, "class": class,
+				"scope": pa.Scope, "consecutive_approvals": newCount,
 			})
 			if newCount == promotionThreshold {
-				e.ledgerRaw(ctx, ticket.TraceID, "promotion_suggested", map[string]any{
-					"event": "promotion_suggested", "tool": ticket.Tool, "class": ticket.Class,
-					"scope": ticket.Scope, "consecutive_approvals": newCount,
+				e.ledgerRaw(ctx, pa.TraceID, "promotion_suggested", map[string]any{
+					"event": "promotion_suggested", "tool": pa.Tool, "class": class,
+					"scope": pa.Scope, "consecutive_approvals": newCount,
 				})
 			}
 		}
@@ -604,19 +704,25 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string)
 	return FeedbackResult{Token: token}, nil
 }
 
-// Deny implements POST /policy/feedback's deny outcome: demote the
-// pending ticket's (tool,class,scope) triple (HANDOFF S4: "red -> bir
-// seviye duser") and ledger the denial. No token is minted - there is
-// nothing to execute.
+// Deny implements POST /policy/feedback's deny outcome: look up the
+// pending_approvals row by id (BLOCKER 1), atomically single-use-consume
+// it (BLOCKER 2 - a missing/expired/already-consumed id rejects, and a
+// double-deny can only ever demote once), demote the row's REAL
+// (tool,class,scope) triple (HANDOFF S4: "red -> bir seviye duser"), and
+// ledger the denial. No token is minted - there is nothing to execute.
 func (e *Engine) Deny(ctx context.Context, pendingApprovalID string) error {
-	ticket, err := decodeTicket(pendingApprovalID)
+	pa, err := e.getValidPendingApproval(ctx, pendingApprovalID)
 	if err != nil {
 		return err
 	}
-	e.ledgerRaw(ctx, ticket.TraceID, "policy_feedback_denied", map[string]any{
-		"event": "policy_feedback_denied", "tool": ticket.Tool, "class": ticket.Class, "scope": ticket.Scope,
+	if err := e.consumePendingApproval(ctx, pendingApprovalID); err != nil {
+		return err
+	}
+	class := ActionClass(pa.Class)
+	e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_denied", map[string]any{
+		"event": "policy_feedback_denied", "tool": pa.Tool, "class": class, "scope": pa.Scope,
 	})
-	e.demote(ctx, ticket.Tool, ticket.Class, ticket.Scope, ticket.TraceID, "denied")
+	e.demote(ctx, pa.Tool, class, pa.Scope, pa.TraceID, "denied")
 	return nil
 }
 

@@ -22,11 +22,22 @@
 -- side-effectful tool's POST /policy/consume-token call re-hashes the
 -- bytes it is ABOUT to execute and must match exactly, or the token is
 -- burned (consumed_at set) and the call denied regardless (single
--- presentation, right or wrong, uses up the token). No (tool, class,
--- scope) columns beyond tool: the caller of /policy/consume-token already
--- knows class/scope from its own context (it just resolved the same
--- decision moments earlier) and supplies them back for demotion bookkeeping
--- (kahyad/internal/policy/tokens.go's ConsumeInput).
+-- presentation, right or wrong, uses up the token). class/scope are the
+-- token's own REAL bound identity (post-security-review amendment: a
+-- consume-failure demotion must target THIS triple, recovered by
+-- token_hash, never whatever (tool,class,scope) the /policy/consume-token
+-- caller happens to claim - kahyad/internal/policy/tokens.go's fail path).
+--
+-- pending_approvals: the server-issued, single-use record behind a
+-- NEEDS_APPROVAL decision's pending_approval_id (post-security-review
+-- amendment - the id used to be an unsigned base64(json) blob the caller
+-- could forge; it is now 32 random bytes bound to a DB row Engine.Check
+-- itself inserts, holding the RESOLVED tool/class/scope/task_id/trace_id/
+-- approved_bytes_hash - never trust-on-decode again). Engine.Approve/Deny
+-- look the row up by id and atomically consume it (consumed_at IS NULL -
+-- the same single-use UPDATE pattern approval_tokens already uses), so a
+-- forged id matches no row and a replayed id has already been consumed.
+-- TTL mirrors approval_tokens' 10 minutes.
 --
 -- undo_windows: one row per W1 auto-allow (or manually-approved W1) action
 -- that earned a 5-minute undo grace period (HANDOFF S4 ladder flag: "L2 |
@@ -58,12 +69,32 @@ CREATE TABLE approval_tokens (
     task_id             TEXT NOT NULL,
     trace_id            TEXT NOT NULL,
     tool                TEXT NOT NULL,
+    class               TEXT NOT NULL CHECK (class IN ('R', 'W1', 'W2', 'W3')),
+    scope               TEXT NOT NULL,
     approved_bytes_hash TEXT NOT NULL,
     minted_at           TEXT NOT NULL,
     expires_at          TEXT NOT NULL,
     -- consumed_at is NULL until the single successful
     -- POST /policy/consume-token call flips it (WHERE consumed_at IS NULL
     -- - the single-UPDATE atomic single-use guarantee).
+    consumed_at         TEXT
+);
+
+CREATE TABLE pending_approvals (
+    -- id is 32 random bytes hex, minted by Engine.Check - never decoded
+    -- from (or trusted from) anything a caller supplies.
+    id                  TEXT PRIMARY KEY,
+    task_id             TEXT NOT NULL,
+    trace_id            TEXT NOT NULL,
+    tool                TEXT NOT NULL,
+    class               TEXT NOT NULL CHECK (class IN ('R', 'W1', 'W2', 'W3')),
+    scope               TEXT NOT NULL,
+    approved_bytes_hash TEXT NOT NULL,
+    minted_at           TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    -- consumed_at is NULL until the single successful Engine.Approve/Deny
+    -- call flips it (WHERE consumed_at IS NULL - single-use, mirroring
+    -- approval_tokens' own consumed_at convention).
     consumed_at         TEXT
 );
 
@@ -78,13 +109,16 @@ CREATE TABLE undo_windows (
 );
 
 CREATE INDEX idx_approval_tokens_task_id ON approval_tokens(task_id);
+CREATE INDEX idx_pending_approvals_task_id ON pending_approvals(task_id);
 CREATE INDEX idx_undo_windows_trace_id ON undo_windows(trace_id);
 CREATE INDEX idx_undo_windows_state ON undo_windows(state);
 
 -- +goose Down
 DROP INDEX IF EXISTS idx_undo_windows_state;
 DROP INDEX IF EXISTS idx_undo_windows_trace_id;
+DROP INDEX IF EXISTS idx_pending_approvals_task_id;
 DROP INDEX IF EXISTS idx_approval_tokens_task_id;
 DROP TABLE IF EXISTS undo_windows;
+DROP TABLE IF EXISTS pending_approvals;
 DROP TABLE IF EXISTS approval_tokens;
 DROP TABLE IF EXISTS autonomy_state;

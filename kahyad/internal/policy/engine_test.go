@@ -2,7 +2,11 @@ package policy
 
 import (
 	"context"
+	"database/sql"
+	"encoding/base64"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -45,6 +49,32 @@ func countEvents(t *testing.T, st *store.Store, kind string) int {
 	var n int
 	if err := st.DB().QueryRow(`SELECT count(*) FROM events WHERE kind = ?`, kind).Scan(&n); err != nil {
 		t.Fatalf("count %s events: %v", kind, err)
+	}
+	return n
+}
+
+// countApprovalTokens counts every row ever inserted into approval_tokens
+// (minted, consumed or not) - used by the pending-approval single-use
+// regression tests below to prove a rejected Approve call minted no token
+// at all, not merely that it returned an error.
+func countApprovalTokens(t *testing.T, st *store.Store) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM approval_tokens`).Scan(&n); err != nil {
+		t.Fatalf("count approval_tokens: %v", err)
+	}
+	return n
+}
+
+// countOpenUndoWindows counts OPEN undo_windows rows for one (task_id,
+// tool) pair.
+func countOpenUndoWindows(t *testing.T, st *store.Store, taskID, tool string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(
+		`SELECT count(*) FROM undo_windows WHERE task_id = ? AND tool = ? AND state = 'open'`, taskID, tool,
+	).Scan(&n); err != nil {
+		t.Fatalf("count undo_windows: %v", err)
 	}
 	return n
 }
@@ -355,5 +385,161 @@ func TestPromoteUnknownToolFails(t *testing.T) {
 	e, _ := testEngine(t)
 	if _, err := e.Promote(context.Background(), "trace-x", "no_such_tool", ClassR, "global"); err == nil {
 		t.Fatalf("Promote(unknown tool): err = nil, want an error")
+	}
+}
+
+// ---- BLOCKER 1 regression: forged pending_approval_id is rejected ----
+
+// TestForgedPendingApprovalIDRejected proves pending_approval_id is no
+// longer a caller-decodable, forgeable blob: an id Check never issued
+// (whether a random guess or one shaped exactly like the OLD unsigned
+// base64(json) ticket format) must be rejected by Approve outright, with
+// no token minted - including for a forged ticket that claims class W3,
+// which must stay unapprovable no matter what a forged id claims.
+func TestForgedPendingApprovalIDRejected(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+
+	// A plausible-looking 64-hex-char id nobody ever minted.
+	forged := strings.Repeat("ab", 32)
+	before := countApprovalTokens(t, st)
+	if _, err := e.Approve(ctx, forged, "local"); !errors.Is(err, ErrInvalidPendingApproval) {
+		t.Fatalf("Approve(forged random id): err = %v, want ErrInvalidPendingApproval", err)
+	}
+	if got := countApprovalTokens(t, st); got != before {
+		t.Fatalf("Approve(forged random id) minted a token (approval_tokens rows = %d, want %d)", got, before)
+	}
+
+	// A forged id shaped exactly like the OLD unsigned base64(json) ticket
+	// format, claiming tool=mail_send/class=W3 - Approve must not decode or
+	// trust ANYTHING out of the id string itself anymore.
+	oldStyleForgedW3 := base64.RawURLEncoding.EncodeToString([]byte(
+		`{"tool":"mail_send","class":"W3","scope":"global","task_id":"t1","trace_id":"trace-forge","approved_bytes_hash":"x"}`,
+	))
+	if _, err := e.Approve(ctx, oldStyleForgedW3, "local"); !errors.Is(err, ErrInvalidPendingApproval) {
+		t.Fatalf("Approve(old-ticket-format forged W3 id): err = %v, want ErrInvalidPendingApproval", err)
+	}
+	if got := countApprovalTokens(t, st); got != before {
+		t.Fatalf("Approve(old-ticket-format forged W3 id) minted a token (approval_tokens rows = %d, want %d)", got, before)
+	}
+	// mail_send/W3/global must still be untouched (L0-by-missing-row) by
+	// the forgery attempt - no promotion/demotion bookkeeping ran against
+	// it at all, so no autonomy_state row should exist for it yet.
+	if _, err := st.Queries.GetAutonomyState(ctx, sqlcgen.GetAutonomyStateParams{Tool: "mail_send", Class: "W3", Scope: "global"}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("mail_send/W3/global autonomy_state: err = %v, want sql.ErrNoRows (untouched by the forgery attempt)", err)
+	}
+}
+
+// ---- BLOCKER 2 regression: pending_approval_id is single-use ----
+
+// TestApprovePendingApprovalSingleUse proves a REAL, Check-issued
+// pending_approval_id can only ever be approved once: the second Approve
+// call with the same id must reject, minting no second token and running
+// no second round of undo-window/consecutive-approvals bookkeeping.
+func TestApprovePendingApprovalSingleUse(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	// Below the W1 auto-allow threshold (L2), so Check returns
+	// needs_approval and hands back a real, DB-backed pending_approval_id.
+	seedState(t, st, "fs_write", string(ClassW1), "global", 0)
+
+	d, err := e.Check(ctx, CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-single-use", ToolInput: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Result != ResultNeedsApproval || d.PendingApprovalID == "" {
+		t.Fatalf("Check = %+v, want needs_approval with a pending_approval_id", d)
+	}
+
+	res1, err := e.Approve(ctx, d.PendingApprovalID, "local")
+	if err != nil {
+		t.Fatalf("first Approve: %v", err)
+	}
+	if res1.Token == "" {
+		t.Fatalf("first Approve: want a token")
+	}
+
+	res2, err := e.Approve(ctx, d.PendingApprovalID, "local")
+	if !errors.Is(err, ErrInvalidPendingApproval) {
+		t.Fatalf("second Approve (same pending_approval_id): err = %v, want ErrInvalidPendingApproval", err)
+	}
+	if res2.Token != "" {
+		t.Fatalf("second Approve minted a token despite the pending_approval_id being single-use")
+	}
+
+	if n := countApprovalTokens(t, st); n != 1 {
+		t.Fatalf("approval_tokens rows = %d, want exactly 1 (only the first Approve mints)", n)
+	}
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
+		t.Fatalf("open undo_windows rows = %d, want exactly 1 (only the first Approve opens one)", n)
+	}
+	row := getState(t, st, "fs_write", "W1", "global")
+	if row.ConsecutiveApprovals != 1 {
+		t.Fatalf("consecutive_approvals = %d, want 1 (only the first Approve should have counted)", row.ConsecutiveApprovals)
+	}
+}
+
+// TestDenyPendingApprovalSingleUse mirrors the Approve single-use test for
+// Deny: a second Deny on the same (already-consumed) pending_approval_id
+// must reject and must not demote a second time.
+func TestDenyPendingApprovalSingleUse(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	seedState(t, st, "shell_docker", string(ClassW2), "global", 2)
+
+	d, err := e.Check(ctx, CheckInput{Tool: "shell_docker", TraceID: "trace-deny-twice", ToolInput: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Result != ResultNeedsApproval {
+		t.Fatalf("Result = %q, want needs_approval", d.Result)
+	}
+
+	if err := e.Deny(ctx, d.PendingApprovalID); err != nil {
+		t.Fatalf("first Deny: %v", err)
+	}
+	if err := e.Deny(ctx, d.PendingApprovalID); !errors.Is(err, ErrInvalidPendingApproval) {
+		t.Fatalf("second Deny (same pending_approval_id): err = %v, want ErrInvalidPendingApproval", err)
+	}
+
+	row := getState(t, st, "shell_docker", "W2", "global")
+	if row.Level != 1 {
+		t.Fatalf("level after Deny x2 = %d, want 1 (demoted exactly once from the seeded 2)", row.Level)
+	}
+	if n := countEvents(t, st, "demoted"); n != 1 {
+		t.Fatalf("demoted ledger count = %d, want exactly 1", n)
+	}
+}
+
+// ---- MINOR 5 regression: undo window open is idempotent on retry ----
+
+// TestUndoWindowIdempotentOnRetry proves a retried Check ALLOW call for
+// the same (task_id, tool, trace_id) never leaves more than one OPEN
+// undo_windows row.
+func TestUndoWindowIdempotentOnRetry(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
+
+	in := CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-retry", ToolInput: []byte(`{}`)}
+
+	d1, err := e.Check(ctx, in)
+	if err != nil {
+		t.Fatalf("first Check: %v", err)
+	}
+	if d1.Result != ResultAllow {
+		t.Fatalf("first Check: Result = %q, want allow", d1.Result)
+	}
+
+	d2, err := e.Check(ctx, in)
+	if err != nil {
+		t.Fatalf("second (retried) Check: %v", err)
+	}
+	if d2.Result != ResultAllow {
+		t.Fatalf("second Check: Result = %q, want allow", d2.Result)
+	}
+
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
+		t.Fatalf("open undo_windows rows after 2 identical Check calls = %d, want exactly 1", n)
 	}
 }

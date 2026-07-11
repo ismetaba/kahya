@@ -20,6 +20,14 @@ type Querier interface {
 	// so even a wrong-hash first presentation consumes it (no multi-guess
 	// window against a live token).
 	ConsumeApprovalToken(ctx context.Context, arg ConsumeApprovalTokenParams) (int64, error)
+	// The single atomic single-use guarantee (the same "UPDATE ... WHERE x IS
+	// NULL" pattern ConsumeApprovalToken above already uses for one-time
+	// approval tokens): only the FIRST Engine.Approve/Deny call against a
+	// given pending_approval_id ever affects a row; a second call against the
+	// same id - Approve or Deny, forged or genuine - affects 0 rows, which
+	// kahyad/internal/policy/engine.go treats as already-used/rejects, minting
+	// no token and performing no bookkeeping a second time.
+	ConsumePendingApproval(ctx context.Context, arg ConsumePendingApprovalParams) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
 	GetApprovalToken(ctx context.Context, tokenHash string) (ApprovalToken, error)
 	// W3-02 (autonomy ladder engine) queries below: autonomy_state,
@@ -34,16 +42,27 @@ type Querier interface {
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
 	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error)
+	// Idempotent-open lookup (post-security-review amendment): Engine.Check's
+	// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
+	// reuse an already-OPEN window for the same (task_id, tool, trace_id)
+	// instead of opening a second one on a retried call - a retry must never
+	// leave multiple simultaneously-open undo windows for the same action.
+	GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg GetOpenUndoWindowByTaskToolTraceParams) (UndoWindow, error)
 	// Sessions/tasks are not guaranteed to open exactly one undo window per
 	// trace_id, so this returns the most recently opened OPEN one - the same
 	// "most recent wins" convention GetTaskBySession above already uses.
 	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (UndoWindow, error)
+	GetPendingApproval(ctx context.Context, id string) (PendingApproval, error)
 	// Sessions are not currently guaranteed to map to exactly one task row
 	// (resume/retry may append more), so this returns the most recently
 	// updated task for the session.
 	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (Task, error)
 	// consumed_at starts NULL (a literal, not a param - see
 	// ConsumeApprovalToken below for the only statement that ever sets it).
+	// class/scope persist the token's REAL bound identity (post-security-
+	// review amendment) so a consume-failure demotion can target this exact
+	// triple, recovered by token_hash - never whatever (tool,class,scope) the
+	// /policy/consume-token caller happens to claim.
 	InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error
 	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)
@@ -52,6 +71,15 @@ type Querier interface {
 	// Later tasks add more queries to this file as they need them; sqlc
 	// regenerates the whole package from the union of every *.sql file here.
 	InsertEvent(ctx context.Context, arg InsertEventParams) (Event, error)
+	// Post-security-review amendment: pending_approvals queries below back the
+	// server-issued, single-use pending_approval_id (see
+	// migrations/0003_autonomy_policy.sql's doc comment - a NEEDS_APPROVAL
+	// decision used to hand back an unsigned, caller-decodable blob; it is now
+	// an opaque random id bound to a DB row only kahyad/internal/policy/
+	// engine.go writes/reads).
+	// consumed_at starts NULL (a literal, not a param - see
+	// ConsumePendingApproval below for the only statement that ever sets it).
+	InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)

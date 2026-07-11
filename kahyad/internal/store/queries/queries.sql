@@ -136,11 +136,15 @@ WHERE tool = ? AND class = ? AND scope = ?;
 -- name: InsertApprovalToken :exec
 -- consumed_at starts NULL (a literal, not a param - see
 -- ConsumeApprovalToken below for the only statement that ever sets it).
-INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, NULL);
+-- class/scope persist the token's REAL bound identity (post-security-
+-- review amendment) so a consume-failure demotion can target this exact
+-- triple, recovered by token_hash - never whatever (tool,class,scope) the
+-- /policy/consume-token caller happens to claim.
+INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
 
 -- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
 FROM approval_tokens
 WHERE token_hash = ?;
 
@@ -173,6 +177,18 @@ WHERE trace_id = ? AND state = 'open'
 ORDER BY opened_at DESC
 LIMIT 1;
 
+-- name: GetOpenUndoWindowByTaskToolTrace :one
+-- Idempotent-open lookup (post-security-review amendment): Engine.Check's
+-- W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
+-- reuse an already-OPEN window for the same (task_id, tool, trace_id)
+-- instead of opening a second one on a retried call - a retry must never
+-- leave multiple simultaneously-open undo windows for the same action.
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+FROM undo_windows
+WHERE task_id = ? AND tool = ? AND trace_id = ? AND state = 'open'
+ORDER BY opened_at DESC
+LIMIT 1;
+
 -- name: ListOpenUndoWindows :many
 SELECT id, task_id, tool, trace_id, opened_at, deadline, state
 FROM undo_windows
@@ -182,3 +198,33 @@ WHERE state = 'open';
 UPDATE undo_windows
 SET state = ?
 WHERE id = ?;
+
+-- Post-security-review amendment: pending_approvals queries below back the
+-- server-issued, single-use pending_approval_id (see
+-- migrations/0003_autonomy_policy.sql's doc comment - a NEEDS_APPROVAL
+-- decision used to hand back an unsigned, caller-decodable blob; it is now
+-- an opaque random id bound to a DB row only kahyad/internal/policy/
+-- engine.go writes/reads).
+
+-- name: InsertPendingApproval :exec
+-- consumed_at starts NULL (a literal, not a param - see
+-- ConsumePendingApproval below for the only statement that ever sets it).
+INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
+
+-- name: GetPendingApproval :one
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+FROM pending_approvals
+WHERE id = ?;
+
+-- name: ConsumePendingApproval :execrows
+-- The single atomic single-use guarantee (the same "UPDATE ... WHERE x IS
+-- NULL" pattern ConsumeApprovalToken above already uses for one-time
+-- approval tokens): only the FIRST Engine.Approve/Deny call against a
+-- given pending_approval_id ever affects a row; a second call against the
+-- same id - Approve or Deny, forged or genuine - affects 0 rows, which
+-- kahyad/internal/policy/engine.go treats as already-used/rejects, minting
+-- no token and performing no bookkeeping a second time.
+UPDATE pending_approvals
+SET consumed_at = ?
+WHERE id = ? AND consumed_at IS NULL;

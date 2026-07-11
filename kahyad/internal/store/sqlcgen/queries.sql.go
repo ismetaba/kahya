@@ -38,6 +38,32 @@ func (q *Queries) ConsumeApprovalToken(ctx context.Context, arg ConsumeApprovalT
 	return result.RowsAffected()
 }
 
+const consumePendingApproval = `-- name: ConsumePendingApproval :execrows
+UPDATE pending_approvals
+SET consumed_at = ?
+WHERE id = ? AND consumed_at IS NULL
+`
+
+type ConsumePendingApprovalParams struct {
+	ConsumedAt sql.NullString `json:"consumed_at"`
+	ID         string         `json:"id"`
+}
+
+// The single atomic single-use guarantee (the same "UPDATE ... WHERE x IS
+// NULL" pattern ConsumeApprovalToken above already uses for one-time
+// approval tokens): only the FIRST Engine.Approve/Deny call against a
+// given pending_approval_id ever affects a row; a second call against the
+// same id - Approve or Deny, forged or genuine - affects 0 rows, which
+// kahyad/internal/policy/engine.go treats as already-used/rejects, minting
+// no token and performing no bookkeeping a second time.
+func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePendingApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, consumePendingApproval, arg.ConsumedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
 DELETE FROM chunks WHERE episode_id = ?
 `
@@ -48,7 +74,7 @@ func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) er
 }
 
 const getApprovalToken = `-- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
 FROM approval_tokens
 WHERE token_hash = ?
 `
@@ -61,6 +87,8 @@ func (q *Queries) GetApprovalToken(ctx context.Context, tokenHash string) (Appro
 		&i.TaskID,
 		&i.TraceID,
 		&i.Tool,
+		&i.Class,
+		&i.Scope,
 		&i.ApprovedBytesHash,
 		&i.MintedAt,
 		&i.ExpiresAt,
@@ -161,6 +189,40 @@ func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeB
 	return i, err
 }
 
+const getOpenUndoWindowByTaskToolTrace = `-- name: GetOpenUndoWindowByTaskToolTrace :one
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+FROM undo_windows
+WHERE task_id = ? AND tool = ? AND trace_id = ? AND state = 'open'
+ORDER BY opened_at DESC
+LIMIT 1
+`
+
+type GetOpenUndoWindowByTaskToolTraceParams struct {
+	TaskID  string `json:"task_id"`
+	Tool    string `json:"tool"`
+	TraceID string `json:"trace_id"`
+}
+
+// Idempotent-open lookup (post-security-review amendment): Engine.Check's
+// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
+// reuse an already-OPEN window for the same (task_id, tool, trace_id)
+// instead of opening a second one on a retried call - a retry must never
+// leave multiple simultaneously-open undo windows for the same action.
+func (q *Queries) GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg GetOpenUndoWindowByTaskToolTraceParams) (UndoWindow, error) {
+	row := q.db.QueryRowContext(ctx, getOpenUndoWindowByTaskToolTrace, arg.TaskID, arg.Tool, arg.TraceID)
+	var i UndoWindow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Tool,
+		&i.TraceID,
+		&i.OpenedAt,
+		&i.Deadline,
+		&i.State,
+	)
+	return i, err
+}
+
 const getOpenUndoWindowByTrace = `-- name: GetOpenUndoWindowByTrace :one
 SELECT id, task_id, tool, trace_id, opened_at, deadline, state
 FROM undo_windows
@@ -183,6 +245,30 @@ func (q *Queries) GetOpenUndoWindowByTrace(ctx context.Context, traceID string) 
 		&i.OpenedAt,
 		&i.Deadline,
 		&i.State,
+	)
+	return i, err
+}
+
+const getPendingApproval = `-- name: GetPendingApproval :one
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+FROM pending_approvals
+WHERE id = ?
+`
+
+func (q *Queries) GetPendingApproval(ctx context.Context, id string) (PendingApproval, error) {
+	row := q.db.QueryRowContext(ctx, getPendingApproval, id)
+	var i PendingApproval
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.TraceID,
+		&i.Tool,
+		&i.Class,
+		&i.Scope,
+		&i.ApprovedBytesHash,
+		&i.MintedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
 	)
 	return i, err
 }
@@ -216,8 +302,8 @@ func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString
 }
 
 const insertApprovalToken = `-- name: InsertApprovalToken :exec
-INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
 `
 
 type InsertApprovalTokenParams struct {
@@ -225,6 +311,8 @@ type InsertApprovalTokenParams struct {
 	TaskID            string `json:"task_id"`
 	TraceID           string `json:"trace_id"`
 	Tool              string `json:"tool"`
+	Class             string `json:"class"`
+	Scope             string `json:"scope"`
 	ApprovedBytesHash string `json:"approved_bytes_hash"`
 	MintedAt          string `json:"minted_at"`
 	ExpiresAt         string `json:"expires_at"`
@@ -232,12 +320,18 @@ type InsertApprovalTokenParams struct {
 
 // consumed_at starts NULL (a literal, not a param - see
 // ConsumeApprovalToken below for the only statement that ever sets it).
+// class/scope persist the token's REAL bound identity (post-security-
+// review amendment) so a consume-failure demotion can target this exact
+// triple, recovered by token_hash - never whatever (tool,class,scope) the
+// /policy/consume-token caller happens to claim.
 func (q *Queries) InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error {
 	_, err := q.db.ExecContext(ctx, insertApprovalToken,
 		arg.TokenHash,
 		arg.TaskID,
 		arg.TraceID,
 		arg.Tool,
+		arg.Class,
+		arg.Scope,
 		arg.ApprovedBytesHash,
 		arg.MintedAt,
 		arg.ExpiresAt,
@@ -387,6 +481,47 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Event
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const insertPendingApproval = `-- name: InsertPendingApproval :exec
+
+INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+`
+
+type InsertPendingApprovalParams struct {
+	ID                string `json:"id"`
+	TaskID            string `json:"task_id"`
+	TraceID           string `json:"trace_id"`
+	Tool              string `json:"tool"`
+	Class             string `json:"class"`
+	Scope             string `json:"scope"`
+	ApprovedBytesHash string `json:"approved_bytes_hash"`
+	MintedAt          string `json:"minted_at"`
+	ExpiresAt         string `json:"expires_at"`
+}
+
+// Post-security-review amendment: pending_approvals queries below back the
+// server-issued, single-use pending_approval_id (see
+// migrations/0003_autonomy_policy.sql's doc comment - a NEEDS_APPROVAL
+// decision used to hand back an unsigned, caller-decodable blob; it is now
+// an opaque random id bound to a DB row only kahyad/internal/policy/
+// engine.go writes/reads).
+// consumed_at starts NULL (a literal, not a param - see
+// ConsumePendingApproval below for the only statement that ever sets it).
+func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error {
+	_, err := q.db.ExecContext(ctx, insertPendingApproval,
+		arg.ID,
+		arg.TaskID,
+		arg.TraceID,
+		arg.Tool,
+		arg.Class,
+		arg.Scope,
+		arg.ApprovedBytesHash,
+		arg.MintedAt,
+		arg.ExpiresAt,
+	)
+	return err
 }
 
 const insertTask = `-- name: InsertTask :one

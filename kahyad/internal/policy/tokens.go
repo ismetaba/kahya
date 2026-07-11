@@ -53,10 +53,13 @@ func approvedBytesHash(b []byte) string {
 }
 
 // mintToken generates 32 random bytes, persists only their SHA-256 (plus
-// task_id/trace_id/tool/approved_bytes_hash/expiry), and returns the raw
-// token as lowercase hex - the ONE time the raw value ever exists outside
-// this function's stack.
-func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool, approvedHash string) (string, error) {
+// task_id/trace_id/tool/class/scope/approved_bytes_hash/expiry), and
+// returns the raw token as lowercase hex - the ONE time the raw value ever
+// exists outside this function's stack. class/scope are the token's REAL
+// bound identity (post-security-review amendment): ConsumeToken's fail
+// path below recovers them from this row, never from whatever a consume
+// caller happens to claim.
+func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, approvedHash string) (string, error) {
 	raw := make([]byte, tokenBytesLen)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -70,6 +73,8 @@ func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool, approvedH
 		TaskID:            taskID,
 		TraceID:           traceID,
 		Tool:              tool,
+		Class:             string(class),
+		Scope:             scope,
 		ApprovedBytesHash: approvedHash,
 		MintedAt:          rfc3339(now),
 		ExpiresAt:         rfc3339(now.Add(tokenTTL)),
@@ -81,12 +86,18 @@ func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool, approvedH
 
 // ConsumeInput is Engine.ConsumeToken's input: everything a side-effectful
 // MCP tool already knows from its own just-resolved policy decision (tool,
-// class, scope - supplied back here for the demotion path on failure,
-// since approval_tokens itself carries no class/scope column - see
-// migrations/0003_autonomy_policy.sql's doc comment) plus ToolInput, the
-// EXACT bytes it is about to execute with (hashed here and compared
-// against what was approved at mint time - never trust a caller-supplied
-// hash for this comparison, or the whole WYSIWYE point is defeated).
+// class, scope), plus ToolInput, the EXACT bytes it is about to execute
+// with (hashed here and compared against what was approved at mint time -
+// never trust a caller-supplied hash for this comparison, or the whole
+// WYSIWYE point is defeated). Tool/Class/Scope here are ONLY ever used to
+// populate the token_verify_failed ledger's "tool"/"task_id" fields on a
+// malformed-token failure (where no token row exists to recover a real
+// identity from at all) - every OTHER failure demotes the token's REAL
+// bound (tool,class,scope), recovered from approval_tokens by token_hash,
+// never these caller-supplied fields (post-security-review amendment: a
+// replay/cross-tool/hash-mismatch consume call that declares a DIFFERENT
+// tool/class must not be able to demote that fabricated triple while
+// leaving the REAL violated one untouched - see failFromHash below).
 type ConsumeInput struct {
 	Token     string
 	Tool      string
@@ -97,24 +108,44 @@ type ConsumeInput struct {
 	ToolInput []byte
 }
 
+// failFromHash ledgers token_verify_failed and demotes the token's REAL
+// bound (tool,class,scope) - recovered by re-reading approval_tokens by
+// hash (which works on an already-consumed row too, per that query's own
+// doc comment) - rather than trusting anything the caller's ConsumeInput
+// claims. If hash matches no row at all (a truly unknown token), nothing
+// is demoted at the tool level - there is no real triple to punish - but
+// the ledger event still fires. This single path also covers MINOR 4: a
+// genuine DB error on the burn UPDATE itself, or on this recovery read,
+// still routes through here (best-effort) instead of returning a bare,
+// unledgered error.
+func (e *Engine) failFromHash(ctx context.Context, in ConsumeInput, hash, reason string) error {
+	e.ledgerRaw(ctx, in.TraceID, "token_verify_failed", map[string]any{
+		"event": "token_verify_failed", "tool": in.Tool, "task_id": in.TaskID, "reason": reason,
+	})
+	if row, err := e.store.GetApprovalToken(ctx, hash); err == nil {
+		e.demote(ctx, row.Tool, ActionClass(row.Class), row.Scope, in.TraceID, "token_verify_failed:"+reason)
+	}
+	return ErrTokenInvalid
+}
+
 // ConsumeToken verifies and atomically consumes a one-time approval token
 // (POST /policy/consume-token). Success (nil error) means the caller may
 // proceed to execute; ANY non-nil error means fail-closed DENY - the
 // token is already burned (or was never valid) either way, and a
-// token_verify_failed ledger event + demotion of (Tool,Class,Scope) has
-// already been recorded.
+// token_verify_failed ledger event + demotion of the token's REAL
+// (tool,class,scope) - never the caller-supplied ConsumeInput fields -
+// has already been recorded.
 func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
-	fail := func(reason string) error {
-		e.ledgerRaw(ctx, in.TraceID, "token_verify_failed", map[string]any{
-			"event": "token_verify_failed", "tool": in.Tool, "task_id": in.TaskID, "reason": reason,
-		})
-		e.demote(ctx, in.Tool, in.Class, in.Scope, in.TraceID, "token_verify_failed:"+reason)
-		return ErrTokenInvalid
-	}
-
 	raw, err := hex.DecodeString(in.Token)
 	if err != nil || len(raw) != tokenBytesLen {
-		return fail("malformed_token")
+		// Malformed input carries no token hash at all - there is no row to
+		// recover a real triple from, so this is the one failure mode with
+		// nothing to demote at the tool level (matching failFromHash's own
+		// "unknown token" behavior, just without a hash to look up).
+		e.ledgerRaw(ctx, in.TraceID, "token_verify_failed", map[string]any{
+			"event": "token_verify_failed", "tool": in.Tool, "task_id": in.TaskID, "reason": "malformed_token",
+		})
+		return ErrTokenInvalid
 	}
 	hash := approvedBytesHash(raw)
 	now := e.nowUTC()
@@ -127,25 +158,38 @@ func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
 		TokenHash:  hash,
 	})
 	if err != nil {
-		return err
+		// MINOR 4: a DB error on the burn UPDATE itself must still ledger
+		// token_verify_failed rather than return a bare, unledgered error.
+		return e.failFromHash(ctx, in, hash, "update_error")
 	}
 	if affected == 0 {
-		return fail("replay_or_unknown")
+		// Replay (already consumed) or a hash nobody ever minted - either
+		// way, failFromHash recovers whatever REAL row exists (a replay's
+		// row still exists, already consumed) and demotes that, not
+		// whatever in.Tool/in.Class/in.Scope claims.
+		return e.failFromHash(ctx, in, hash, "replay_or_unknown")
 	}
 
 	row, err := e.store.GetApprovalToken(ctx, hash)
 	if err != nil {
-		return err
+		// MINOR 4: the token WAS just atomically burned above, but this
+		// follow-up read failed - still ledger the violation (best-effort)
+		// instead of returning a bare, unledgered error. failFromHash's own
+		// re-read will most likely fail identically, so nothing further is
+		// demoted at the tool level here either - there is no reliably
+		// recovered real triple to target.
+		return e.failFromHash(ctx, in, hash, "lookup_error")
 	}
+
 	if row.TaskID != in.TaskID || row.Tool != in.Tool {
-		return fail("context_mismatch")
+		return e.failFromHash(ctx, in, hash, "context_mismatch")
 	}
 	expiresAt, perr := time.Parse(time.RFC3339Nano, row.ExpiresAt)
 	if perr != nil || now.After(expiresAt) {
-		return fail("expired")
+		return e.failFromHash(ctx, in, hash, "expired")
 	}
 	if row.ApprovedBytesHash != approvedBytesHash(in.ToolInput) {
-		return fail("hash_mismatch")
+		return e.failFromHash(ctx, in, hash, "hash_mismatch")
 	}
 	return nil
 }
