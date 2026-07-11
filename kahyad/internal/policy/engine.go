@@ -95,8 +95,16 @@ const (
 // earns/spends autonomy under one single, predictable scope value.
 const defaultScope = "global"
 
-// undoWindowDuration is the W1 5-minute undo grace period (HANDOFF S4
-// ladder: "L2 | Eslikci | R, W1 (5-dk geri-alma + defter)").
+// undoWindowDuration is the W1 5-minute undo grace period's PRODUCTION
+// DEFAULT (HANDOFF S4 ladder: "L2 | Eslikci | R, W1 (5-dk geri-alma +
+// defter)"). Engine's own window length is configurable (Engine.
+// undoWindowDuration / SetUndoWindowDuration below, threaded from
+// config.Config.UndoWindowSeconds by main.go) so a test can inject a
+// short window end-to-end (MINOR fix: exercising SweepExpiredUndoWindows
+// -> SetUndoExpiryHook -> the owning tool's own purge, rather than only
+// ever calling that purge directly) — NewEngine still defaults to this
+// exact 5-minute constant, so every caller that never calls
+// SetUndoWindowDuration keeps today's production behavior unchanged.
 const undoWindowDuration = 5 * time.Minute
 
 // promotionThreshold is the "20 ardisik onay + 0 red" terfi-ONERI
@@ -195,6 +203,11 @@ type Engine struct {
 	// package needing to know anything about what that tool stores or
 	// where.
 	undoExpiryHook func(traceID, taskID, tool string)
+	// undoWindowDuration is openUndoWindow's own configurable window
+	// length (MINOR fix: config.Config.UndoWindowSeconds, defaulted here
+	// to the package-level undoWindowDuration const by NewEngine) - see
+	// SetUndoWindowDuration's doc comment.
+	undoWindowDuration time.Duration
 }
 
 // NewEngine constructs an Engine. pol is W3-01's loaded tool registry (the
@@ -202,8 +215,18 @@ type Engine struct {
 // supplied class). store/ledger may not be nil in production; tests pass
 // fakes or a real temp *store.Store (kahyad/internal/store).
 func NewEngine(pol Policy, store Store, ledger Ledger) *Engine {
-	return &Engine{policy: pol, store: store, ledger: ledger, now: time.Now}
+	return &Engine{policy: pol, store: store, ledger: ledger, now: time.Now, undoWindowDuration: undoWindowDuration}
 }
+
+// SetUndoWindowDuration overrides Engine's undo-window length (MINOR fix:
+// config.Config.UndoWindowSeconds, defaulted to the package-level
+// undoWindowDuration const of 5 minutes - see main.go's wiring). Every
+// window opened by a Check/Approve call AFTER this is called uses d;
+// windows already open keep their originally-recorded deadline. Tests
+// use this to inject a short window so purge-on-expiry can be exercised
+// end-to-end through the real SweepExpiredUndoWindows -> SetUndoExpiryHook
+// path instead of only ever calling the owning tool's purge directly.
+func (e *Engine) SetUndoWindowDuration(d time.Duration) { e.undoWindowDuration = d }
 
 // SetUndoExpiryHook registers fn to be called whenever this Engine flips
 // an undo_windows row to "expired" (W3-03 task spec: "Purge fallback
@@ -554,7 +577,7 @@ func (e *Engine) openUndoWindow(ctx context.Context, taskID, tool, traceID strin
 	now := e.nowUTC()
 	row, err := e.store.InsertUndoWindow(ctx, sqlcgen.InsertUndoWindowParams{
 		TaskID: taskID, Tool: tool, TraceID: traceID,
-		OpenedAt: rfc3339(now), Deadline: rfc3339(now.Add(undoWindowDuration)),
+		OpenedAt: rfc3339(now), Deadline: rfc3339(now.Add(e.undoWindowDuration)),
 	})
 	if err != nil {
 		return err

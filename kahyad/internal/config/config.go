@@ -94,6 +94,15 @@ type Config struct {
 	// an invalid KAHYA_ENV (MINOR 5).
 	LogLevel string `yaml:"log_level"`
 
+	// UndoWindowSeconds is the W1 undo grace period's length, in seconds
+	// (HANDOFF S4 ladder: "L2 | Eslikci | R, W1 (5-dk geri-alma +
+	// defter)" - default 300, i.e. 5 minutes). main.go threads this into
+	// kahyad/internal/policy.Engine.SetUndoWindowDuration; tests inject a
+	// much shorter value to exercise undo-window expiry (and the fs
+	// tool's own pre-image purge it triggers) without a real 5-minute
+	// wait.
+	UndoWindowSeconds int `yaml:"undo_window_seconds"`
+
 	// --- W12-08 cost governor (HANDOFF S4 flag, verbatim defaults) ---
 
 	// DailyBudgetUSD / MonthlyBudgetUSD are kahyad/internal/anthproxy's
@@ -150,6 +159,7 @@ type fileConfig struct {
 	TaskTimeoutMin         *int      `yaml:"task_timeout_min"`
 	ActiveEmbedModelVer    *string   `yaml:"active_embed_model_ver"`
 	LogLevel               *string   `yaml:"log_level"`
+	UndoWindowSeconds      *int      `yaml:"undo_window_seconds"`
 	WorkerCmd              *[]string `yaml:"worker_cmd"`
 	EmbedCmd               *[]string `yaml:"embed_cmd"`
 	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
@@ -232,6 +242,7 @@ func defaults(home string) Config {
 		TaskTimeoutMin:       30,
 		ActiveEmbedModelVer:  "qwen3-embedding-0.6b:512:v1",
 		LogLevel:             "info",
+		UndoWindowSeconds:    300,
 		Env:                  EnvProd,
 		WorkerCmd:            defaultWorkerCmd(),
 		EmbedCmd:             defaultEmbedCmd(),
@@ -372,6 +383,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.LogLevel != nil {
 		cfg.LogLevel = *fc.LogLevel
+	}
+	if fc.UndoWindowSeconds != nil {
+		cfg.UndoWindowSeconds = *fc.UndoWindowSeconds
 	}
 	if fc.WorkerCmd != nil {
 		cfg.WorkerCmd = *fc.WorkerCmd

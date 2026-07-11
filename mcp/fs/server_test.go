@@ -57,12 +57,23 @@ type fakePolicyClient struct {
 	consumedTokens map[string]bool
 	checkCalls     int
 	consumeCalls   int
+	// onCheck, if set, runs once per Check call, standing in for the
+	// wall-clock window a REAL PolicyClient.Check (a DB round trip) plus
+	// the ConsumeToken call and checkpointPreImage's own git exec that
+	// follow it in HandleWrite/HandleDelete would otherwise represent —
+	// the TOCTOU regression test below uses this to plant a symlink
+	// "during" that window, after canonicalize/deny-glob already ran but
+	// before the actual mutation.
+	onCheck func()
 }
 
 func (f *fakePolicyClient) Check(_ context.Context, tool, _ /* scope */, _ /* taskID */, _ /* traceID */ string, _ []byte) (PolicyDecision, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkCalls++
+	if f.onCheck != nil {
+		f.onCheck()
+	}
 	if f.checkErr != nil {
 		return PolicyDecision{}, f.checkErr
 	}
@@ -313,5 +324,159 @@ func TestHandleWriteTokenReplayFails(t *testing.T) {
 	content, _ = os.ReadFile(target)
 	if string(content) != "v2" {
 		t.Errorf("after replayed write attempt, content = %q, want unchanged %q", content, "v2")
+	}
+}
+
+// ---- fs_write: TOCTOU symlinked-ancestor race (BLOCKER regression). ----
+
+// TestHandleWriteTOCTOUSymlinkedAncestorCannotRedirectPastDenyGlob is the
+// BLOCKER regression fixture: canonicalize resolves a target whose
+// immediate ancestor does NOT yet exist, the deny-glob check runs
+// against that (non-denied) canonical path, and then — DURING the
+// window Policy.Check/ConsumeToken/checkpointPreImage represent (the
+// fake PolicyClient's onCheck hook stands in for that whole wall-clock
+// window) — an attacker plants a symlink at the missing ancestor,
+// pointing (via a RELATIVE target, so it never "escapes" a broad
+// confinement root either) at a deny-glob-PROTECTED directory that is
+// itself a SIBLING subtree under the same home directory. Before the
+// os.Root confinement fix, atomicWrite's os.MkdirAll/os.CreateTemp/
+// os.Rename transparently followed that symlink and the write's bytes
+// landed inside the protected directory with HandleWrite returning nil.
+// After the fix, HandleWrite must fail closed and NOTHING may land
+// inside the protected directory.
+func TestHandleWriteTOCTOUSymlinkedAncestorCannotRedirectPastDenyGlob(t *testing.T) {
+	home := testHome(t)
+	protectedDir := filepath.Join(home, "Library", "LaunchAgents")
+	mustMkdirAll(t, protectedDir)
+	mustMkdirAll(t, filepath.Join(home, "workspace"))
+
+	// The missing ancestor: ~/workspace/notes does not exist yet at
+	// canonicalize time (nor does .../2026 beneath it) — exactly the
+	// "a target whose ancestor does not exist at canonicalize time"
+	// fixture the finding calls for.
+	missingAncestor := filepath.Join(home, "workspace", "notes")
+	target := "~/workspace/notes/2026/evil.plist"
+
+	raced := false
+	pc := &fakePolicyClient{
+		decision: allowDecision("tok-toctou"),
+		onCheck: func() {
+			raced = true
+			// A RELATIVE symlink target: even a confinement scheme that
+			// only refuses a symlink "escaping" its own root would let
+			// this one through, since ../../Library/LaunchAgents still
+			// resolves to somewhere "under home" — this package's own
+			// descendConfined must refuse it regardless of where it
+			// points, not just when it escapes entirely.
+			if err := os.Symlink(filepath.Join("..", "..", "Library", "LaunchAgents"), missingAncestor); err != nil {
+				t.Fatalf("os.Symlink (race setup): %v", err)
+			}
+		},
+	}
+	led := &fakeLedger{}
+	deny := []string{filepath.Join(home, "Library", "LaunchAgents", "**")}
+	s := newTestServer(t, home, deny, nil, pc, led)
+
+	_, err := s.HandleWrite(context.Background(), "trace-toctou", "task-1", FsWriteArgs{Path: target, ContentBase64: b64("evil payload")})
+	if err == nil {
+		t.Fatal("HandleWrite across a raced symlinked ancestor = nil error, want a fail-closed error")
+	}
+	if !raced {
+		t.Fatal("test bug: the race's onCheck hook never ran")
+	}
+
+	entries, rerr := os.ReadDir(protectedDir)
+	if rerr != nil {
+		t.Fatalf("ReadDir(protectedDir): %v", rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("protected dir %s has %d entries after the raced write, want 0 (nothing may land inside a deny-glob-protected directory)", protectedDir, len(entries))
+	}
+	if got := len(led.find("fs_write")); got != 0 {
+		t.Errorf("fs_write ledger events = %d, want 0 (the write must never be reported as having succeeded)", got)
+	}
+}
+
+// TestHandleWriteTOCTOURacedAbsoluteSymlinkAlsoFailsClosed is a second
+// variant of the same race using an ABSOLUTE symlink target (the more
+// "obvious" attack os.Root's own built-in escape check already refuses
+// on its own) — kept as an explicit regression alongside the relative-
+// symlink variant above so a future refactor that accidentally relies
+// solely on os.Root's default behavior (which this package's own
+// descendConfined intentionally does NOT do — see server.go's "os.Root
+// confinement" section doc comment) still has both shapes covered.
+func TestHandleWriteTOCTOURacedAbsoluteSymlinkAlsoFailsClosed(t *testing.T) {
+	home := testHome(t)
+	protectedDir := filepath.Join(home, "Library", "LaunchAgents")
+	mustMkdirAll(t, protectedDir)
+	mustMkdirAll(t, filepath.Join(home, "workspace"))
+
+	missingAncestor := filepath.Join(home, "workspace", "notes")
+	target := "~/workspace/notes/evil.plist"
+
+	pc := &fakePolicyClient{
+		decision: allowDecision("tok-toctou-abs"),
+		onCheck: func() {
+			if err := os.Symlink(protectedDir, missingAncestor); err != nil {
+				t.Fatalf("os.Symlink (race setup): %v", err)
+			}
+		},
+	}
+	deny := []string{filepath.Join(home, "Library", "LaunchAgents", "**")}
+	s := newTestServer(t, home, deny, nil, pc, &fakeLedger{})
+
+	_, err := s.HandleWrite(context.Background(), "trace-toctou-abs", "task-1", FsWriteArgs{Path: target, ContentBase64: b64("evil payload")})
+	if err == nil {
+		t.Fatal("HandleWrite across a raced absolute-symlinked ancestor = nil error, want a fail-closed error")
+	}
+
+	entries, rerr := os.ReadDir(protectedDir)
+	if rerr != nil {
+		t.Fatalf("ReadDir(protectedDir): %v", rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("protected dir %s has %d entries after the raced write, want 0", protectedDir, len(entries))
+	}
+}
+
+// TestHandleWriteCreatesNestedNotYetExistingDirectories is a non-attack
+// sanity companion to the TOCTOU regression tests above: a brand-new,
+// MULTI-LEVEL nested directory chain (no race, no symlink involved) must
+// still be created correctly through the os.Root-confined write path —
+// proving the BLOCKER fix's descendConfined walk didn't regress the
+// legitimate "write creates its own parent directory tree" capability
+// atomicWrite's original doc comment described.
+func TestHandleWriteCreatesNestedNotYetExistingDirectories(t *testing.T) {
+	home := testHome(t)
+	pc := &fakePolicyClient{decision: allowDecision("tok-nested")}
+	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
+
+	target := filepath.Join(home, "Documents", "notes", "2026", "07", "journal.md")
+	out, err := s.HandleWrite(context.Background(), "trace-nested", "task-1", FsWriteArgs{
+		Path: "~/Documents/notes/2026/07/journal.md", ContentBase64: b64("merhaba"),
+	})
+	if err != nil {
+		t.Fatalf("HandleWrite: %v", err)
+	}
+	if out.PreExisted {
+		t.Fatal("PreExisted = true, want false")
+	}
+	content, err := os.ReadFile(target)
+	if err != nil || string(content) != "merhaba" {
+		t.Fatalf("nested target content = %q (err=%v), want %q", content, err, "merhaba")
+	}
+}
+
+// TestTaskDirNameRejectsTraversal guards defense-in-depth: a task_id with a
+// path separator or ".." must not be used verbatim as an undo subdir name
+// (path-traversal escape from UndoDir).
+func TestTaskDirNameRejectsTraversal(t *testing.T) {
+	for _, bad := range []string{"", ".", "..", "../evil", "a/b", "a\\b", "x..y", "..", "t_../.."} {
+		if got := taskDirName(bad); got != "_unscoped" {
+			t.Errorf("taskDirName(%q) = %q, want _unscoped", bad, got)
+		}
+	}
+	if got := taskDirName("t_abc123"); got != "t_abc123" {
+		t.Errorf("taskDirName(valid) = %q, want t_abc123", got)
 	}
 }

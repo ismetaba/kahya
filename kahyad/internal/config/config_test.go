@@ -63,6 +63,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
 	}
+	if cfg.UndoWindowSeconds != 300 {
+		t.Errorf("UndoWindowSeconds = %d, want 300", cfg.UndoWindowSeconds)
+	}
 	if len(cfg.WorkerCmd) != 3 || cfg.WorkerCmd[1] != "-m" || cfg.WorkerCmd[2] != "kahya_worker" {
 		t.Errorf("WorkerCmd = %v, want [<...>/worker/.venv/bin/python -m kahya_worker]", cfg.WorkerCmd)
 	}
@@ -123,6 +126,36 @@ func TestLoadFileOverridesDefaults(t *testing.T) {
 	// task_timeout_min wasn't set in the file, default should survive.
 	if cfg.TaskTimeoutMin != 30 {
 		t.Errorf("TaskTimeoutMin = %d, want 30 (untouched default)", cfg.TaskTimeoutMin)
+	}
+	// undo_window_seconds wasn't set in the file, default should survive.
+	if cfg.UndoWindowSeconds != 300 {
+		t.Errorf("UndoWindowSeconds = %d, want 300 (untouched default)", cfg.UndoWindowSeconds)
+	}
+}
+
+// TestLoadFileOverridesUndoWindowSeconds proves undo_window_seconds is a
+// real, independently-overridable config.yaml key (MINOR fix: the
+// purge-on-expiry acceptance criterion calls for "inject a short window
+// via config").
+func TestLoadFileOverridesUndoWindowSeconds(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("undo_window_seconds: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.UndoWindowSeconds != 2 {
+		t.Errorf("UndoWindowSeconds = %d, want 2 (file override)", cfg.UndoWindowSeconds)
 	}
 }
 

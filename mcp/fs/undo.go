@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -37,8 +38,16 @@ type undoRecord struct {
 	Tool          string // "fs_write" | "fs_delete"
 	CanonicalPath string // CanonicalPath.Match — for ledger/display only
 	OpPath        string // CanonicalPath.Op — the actual path to restore to/from
-	TaskID        string
-	TraceID       string
+	// AncestorDir/Rel are CanonicalPath's own os.Root confinement split,
+	// captured at the ORIGINAL fs_write/fs_delete call (BLOCKER fix —
+	// server.go's "os.Root confinement" section doc comment): undo_write/
+	// undo_delete reuse these EXACT values (never re-Canonicalize at undo
+	// time) so every restore/remove this file performs is confined
+	// exactly like the operation it is undoing.
+	AncestorDir string
+	Rel         string
+	TaskID      string
+	TraceID     string
 
 	// fs_write fields.
 	HadPrev     bool   // false => the target did not exist before this write
@@ -112,7 +121,7 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 	}
 
 	if !rec.HadPrev {
-		if _, err := moveToTrash(s.TrashDir, rec.OpPath); err != nil {
+		if _, err := moveToTrashConfined(rec.AncestorDir, rec.Rel, s.TrashDir, filepath.Base(rec.OpPath)); err != nil {
 			return fmt.Errorf("fs undo_write: remove newly-created file: %w", err)
 		}
 		s.ledgerUndoExecuted(ctx, traceID, "fs_write", rec.CanonicalPath)
@@ -135,8 +144,10 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 		return fmt.Errorf("fs undo_write: pre-image hash mismatch for %s (got %s, want %s)", rec.CanonicalPath, got, rec.PreHash)
 	}
 
-	if err := atomicWrite(rec.OpPath, preImage); err != nil {
-		return fmt.Errorf("fs undo_write: restore: %w", err)
+	// BLOCKER fix: confined to rec.AncestorDir, exactly like the original
+	// write this undoes — see rootedWrite's doc comment.
+	if err := rootedWrite(rec.AncestorDir, rec.Rel, preImage); err != nil {
+		return fmt.Errorf("fs undo_write: restore (confined): %w", err)
 	}
 
 	if rec.CopyPath != "" {
@@ -149,16 +160,19 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 }
 
 // UndoDelete implements fs_delete's undo recipe: moves the file back from
-// ~/.Trash to its recorded original path (moveFile handles the same EXDEV
-// fallback the original delete did — never a plain unlink/copy-loses-the-
-// original shortcut).
+// ~/.Trash to its recorded original path — restoreFromTrashConfined
+// (server.go) handles the copy+remove recipe (never a plain unlink/
+// copy-loses-the-original shortcut), confined to rec.AncestorDir exactly
+// like a fresh write (BLOCKER fix).
 func (s *Server) UndoDelete(ctx context.Context, traceID string) error {
 	rec, ok := s.registry.Get(traceID)
 	if !ok || rec.Tool != "fs_delete" {
 		return ErrNoUndoRecord
 	}
 
-	if err := moveFile(rec.TrashPath, rec.OpPath); err != nil {
+	// BLOCKER fix: destination confined to rec.AncestorDir, exactly like
+	// a fresh write — see restoreFromTrashConfined's doc comment.
+	if err := restoreFromTrashConfined(rec.TrashPath, rec.AncestorDir, rec.Rel); err != nil {
 		return fmt.Errorf("fs undo_delete: restore from trash: %w", err)
 	}
 

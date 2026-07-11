@@ -45,6 +45,7 @@ package fs
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -434,7 +435,11 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
 	}
 
-	if err := atomicWrite(cp.Op, content); err != nil {
+	// BLOCKER fix: confined to cp.AncestorDir (resolved BEFORE the
+	// Policy.Check/ConsumeToken/checkpointPreImage window above), never
+	// an unconfined os.* call against cp.Op — see rootedWrite's doc
+	// comment for the TOCTOU this closes.
+	if err := rootedWrite(cp.AncestorDir, cp.Rel, content); err != nil {
 		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
 	}
 
@@ -485,13 +490,17 @@ func (s *Server) HandleDelete(ctx context.Context, traceID, taskID string, args 
 		return FsDeleteOutput{}, fmt.Errorf("fs_delete: onay jetonu tüketilemedi: %w", err)
 	}
 
-	trashPath, err := moveToTrash(s.TrashDir, cp.Op)
+	// BLOCKER fix: source resolved through cp.AncestorDir/cp.Rel's os.Root
+	// confinement, exactly like fs_write's atomic write — see
+	// moveToTrashConfined's doc comment.
+	trashPath, err := moveToTrashConfined(cp.AncestorDir, cp.Rel, s.TrashDir, filepath.Base(cp.Op))
 	if err != nil {
 		return FsDeleteOutput{}, fmt.Errorf("fs_delete: %w", err)
 	}
 
 	s.registry.Put(traceID, undoRecord{
 		Tool: "fs_delete", CanonicalPath: cp.Match, OpPath: cp.Op,
+		AncestorDir: cp.AncestorDir, Rel: cp.Rel,
 		TrashPath: trashPath, TaskID: taskID, TraceID: traceID,
 	})
 
@@ -580,43 +589,229 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// atomicWrite writes content to path via temp-file-then-rename in path's
-// own directory (same filesystem, so the rename is atomic) — HANDOFF task
-// spec step (e): "write ATOMICALLY (temp file + rename)". Creates path's
-// parent directory if missing (a brand-new fs_write target's directory
-// tree) — safe: the deny-glob check already ran against the FULL target
-// path, which doublestar's "**" already matches at any depth under a
-// denied prefix, so this can never create a directory under a path that
-// should have been denied.
-func atomicWrite(path string, content []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
+// ---- os.Root confinement (BLOCKER fix): every filesystem MUTATION this
+// package performs (fs_write's atomic write, fs_delete's Trash move,
+// undo_write's restore/remove, undo_delete's restore) is confined to a
+// CanonicalPath's (or undoRecord's) AncestorDir, resolved ONCE at
+// Canonicalize time — BEFORE Policy.Check's DB round trip, ConsumeToken,
+// and checkpointPreImage's own git exec open the wall-clock window a
+// symlink race needs. Confinement alone (a bare os.OpenRoot(ancestorDir)
+// followed by a single multi-component root.MkdirAll/root.ReadFile call)
+// is NOT sufficient: os.Root's own escape check only refuses a symlink
+// whose target would resolve OUTSIDE the opened root, but a RELATIVE
+// symlink pointing at a DIFFERENT subtree that is STILL inside a broad
+// root (e.g. AncestorDir resolves all the way up to the user's home
+// directory, and the symlink points at a relative "../Library/
+// LaunchAgents") is traversed without complaint, defeating the
+// confinement entirely for exactly the deny-glob-protected directories
+// this fix exists to protect. descendConfined/descendConfinedReadOnly
+// below instead walk rel's directory components ONE AT A TIME,
+// explicitly Lstat-checking each and refusing ANY symlink (regardless of
+// where it points, relative or absolute, in-root or not) at a component
+// that did not exist when Canonicalize ran — the only components a
+// post-check race could have introduced. ----
+
+// descendOneLevel ensures name exists as a plain directory directly
+// under cur (creating it if absent) and returns an os.Root confined to
+// it. Fails closed on anything else occupying name — most importantly a
+// symlink, even one whose target is still "inside" cur's own root (see
+// this section's own doc comment for why os.Root's built-in escape check
+// alone does not catch that case).
+func descendOneLevel(cur *os.Root, name string) (*os.Root, error) {
+	if err := cur.Mkdir(name, 0o700); err != nil {
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("mkdir (confined) %s: %w", name, err)
+		}
+		info, lerr := cur.Lstat(name)
+		if lerr != nil {
+			return nil, fmt.Errorf("lstat (confined) %s: %w", name, lerr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("fs: refusing to traverse %q — a symlink appeared after path resolution (possible TOCTOU attack)", name)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("fs: %q exists and is not a directory", name)
+		}
 	}
-	tmp, err := os.CreateTemp(dir, ".kahya-fswrite-*")
+	next, err := cur.OpenRoot(name)
 	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
+		return nil, fmt.Errorf("confine (open) %s: %w", name, err)
 	}
-	tmpName := tmp.Name()
+	return next, nil
+}
+
+// descendOneLevelReadOnly is descendOneLevel's non-creating twin, used
+// where a missing component must be reported as "not found" (preserving
+// os.ErrNotExist semantics for a caller like checkpointPreImage) rather
+// than silently created as a side effect of a READ attempt.
+func descendOneLevelReadOnly(cur *os.Root, name string) (*os.Root, error) {
+	info, err := cur.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("fs: refusing to traverse %q — a symlink appeared after path resolution (possible TOCTOU attack)", name)
+	}
+	next, err := cur.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("confine (open) %s: %w", name, err)
+	}
+	return next, nil
+}
+
+// descendConfined walks rel's directory components (everything but the
+// final leaf) one at a time from root, creating each as needed
+// (descendOneLevel), and returns an os.Root confined to rel's own parent
+// directory plus rel's leaf (base) name — the caller performs its ACTUAL
+// file operation (Create/OpenFile/Rename) against that returned root
+// using ONLY the leaf name, so no os.Root call in this package's write/
+// delete/undo path ever resolves more than one already-verified path
+// component at a time. Returns root itself (never closed by this
+// function) when rel has no directory component; the caller must Close
+// the returned root only when it differs from the one it passed in.
+func descendConfined(root *os.Root, rel string) (leafRoot *os.Root, leaf string, err error) {
+	return walkConfined(root, rel, descendOneLevel)
+}
+
+// descendConfinedReadOnly is descendConfined's read-only twin (used by
+// checkpointPreImage's pre-image read): it never creates a missing
+// directory component, instead propagating that component's Lstat error
+// (os.ErrNotExist) straight to the caller.
+func descendConfinedReadOnly(root *os.Root, rel string) (leafRoot *os.Root, leaf string, err error) {
+	return walkConfined(root, rel, descendOneLevelReadOnly)
+}
+
+func walkConfined(root *os.Root, rel string, step func(*os.Root, string) (*os.Root, error)) (*os.Root, string, error) {
+	rel = filepath.Clean(rel)
+	parts := strings.Split(rel, string(filepath.Separator))
+	cur := root
+	opened := false
+	for _, name := range parts[:len(parts)-1] {
+		next, err := step(cur, name)
+		if opened {
+			cur.Close()
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		cur, opened = next, true
+	}
+	return cur, parts[len(parts)-1], nil
+}
+
+// rootCreateTemp mimics os.CreateTemp's random-suffix, retry-on-collision
+// behavior (pattern's one "*" is replaced by a random hex suffix), but
+// confined to root via os.Root.OpenFile(O_CREATE|O_EXCL) instead of a
+// free-standing os.CreateTemp(dir, pattern) call, so the temp file itself
+// is created through the SAME confinement boundary as the final rename
+// target.
+func rootCreateTemp(root *os.Root, pattern string) (name string, f *os.File, err error) {
+	prefix, suffix := pattern, ""
+	if i := strings.LastIndexByte(pattern, '*'); i >= 0 {
+		prefix, suffix = pattern[:i], pattern[i+1:]
+	}
+	for i := 0; i < 10000; i++ {
+		name = prefix + randHex(8) + suffix
+		f, err = root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return name, f, nil
+		}
+		if !os.IsExist(err) {
+			return "", nil, err
+		}
+	}
+	return "", nil, fmt.Errorf("rootCreateTemp: exhausted attempts confined to %s", root.Name())
+}
+
+// randHex returns n random bytes, hex-encoded — used only to make a temp
+// filename collision-improbable (not itself a security boundary; the
+// security property here comes from os.Root confinement, not from this
+// name being unguessable).
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing here is not something this codebase can
+		// meaningfully recover from anywhere else either; fall back to a
+		// timestamp-based suffix so a temp file name is still produced —
+		// a collision would simply surface as an EEXIST this function's
+		// own retry loop already handles, never a correctness bug.
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// rootedWrite is atomicWrite's os.Root-confined equivalent: the same
+// temp-file-then-rename recipe (HANDOFF task spec step (e): "write
+// ATOMICALLY (temp file + rename)"), but with EVERY filesystem call
+// (descendConfined's own mkdir-as-needed walk, the temp file's create,
+// and the final rename) resolved one path component at a time via
+// os.Root, never as a free-standing absolute path (BLOCKER fix — see
+// this file's "os.Root confinement" section doc comment for the TOCTOU
+// this closes). Fails closed — returns an error, writes nothing — if
+// ancestorDir cannot itself be opened as a Root (e.g. it was removed
+// between Canonicalize and now); never falls back to an unconfined
+// write.
+func rootedWrite(ancestorDir, rel string, content []byte) error {
+	root, err := os.OpenRoot(ancestorDir)
+	if err != nil {
+		return fmt.Errorf("confine write to %s: %w", ancestorDir, err)
+	}
+	defer root.Close()
+
+	leafRoot, leaf, err := descendConfined(root, rel)
+	if err != nil {
+		return fmt.Errorf("fs_write confinement: %w", err)
+	}
+	if leafRoot != root {
+		defer leafRoot.Close()
+	}
+
+	tmpName, tmp, err := rootCreateTemp(leafRoot, ".kahya-fswrite-*")
+	if err != nil {
+		return fmt.Errorf("create temp file (confined): %w", err)
+	}
 	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("write temp file: %w", err)
+		_ = leafRoot.Remove(tmpName)
+		return fmt.Errorf("write temp file (confined): %w", err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("chmod temp file: %w", err)
+		_ = leafRoot.Remove(tmpName)
+		return fmt.Errorf("chmod temp file (confined): %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("close temp file: %w", err)
+		_ = leafRoot.Remove(tmpName)
+		return fmt.Errorf("close temp file (confined): %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("rename %s -> %s: %w", tmpName, path, err)
+	if err := leafRoot.Rename(tmpName, leaf); err != nil {
+		_ = leafRoot.Remove(tmpName)
+		return fmt.Errorf("rename (confined) %s -> %s: %w", tmpName, leaf, err)
 	}
 	return nil
+}
+
+// rootReadFileConfined reads rel's content through an os.Root opened on
+// ancestorDir (BLOCKER fix: the pre-image checkpoint's read must be
+// confined exactly like the write that follows it). Returns an error
+// wrapping os.ErrNotExist when rel does not exist within ancestorDir —
+// checkpointPreImage's errors.Is(err, os.ErrNotExist) check relies on
+// this to distinguish "no pre-image" from a real failure.
+func rootReadFileConfined(ancestorDir, rel string) ([]byte, error) {
+	root, err := os.OpenRoot(ancestorDir)
+	if err != nil {
+		return nil, fmt.Errorf("confine read to %s: %w", ancestorDir, err)
+	}
+	defer root.Close()
+
+	leafRoot, leaf, err := descendConfinedReadOnly(root, rel)
+	if err != nil {
+		return nil, err
+	}
+	if leafRoot != root {
+		defer leafRoot.Close()
+	}
+	return leafRoot.ReadFile(leaf)
 }
 
 // checkpointPreImage implements HANDOFF task spec step (d): reads the
@@ -629,16 +824,20 @@ func atomicWrite(path string, content []byte) error {
 // HadPrev-false branch knows to remove (to Trash) the file this write
 // created instead of restoring bytes.
 func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID string) (undoRecord, error) {
-	data, err := os.ReadFile(cp.Op)
+	// BLOCKER fix: confined to cp.AncestorDir, exactly like the write
+	// that follows this checkpoint — see rootReadFileConfined's doc
+	// comment.
+	data, err := rootReadFileConfined(cp.AncestorDir, cp.Rel)
 	hadPrev := true
 	if errors.Is(err, os.ErrNotExist) {
 		hadPrev, data = false, nil
 	} else if err != nil {
-		return undoRecord{}, fmt.Errorf("read pre-image %s: %w", cp.Op, err)
+		return undoRecord{}, fmt.Errorf("read pre-image (confined) %s: %w", cp.Op, err)
 	}
 
 	rec := undoRecord{
 		Tool: "fs_write", CanonicalPath: cp.Match, OpPath: cp.Op,
+		AncestorDir: cp.AncestorDir, Rel: cp.Rel,
 		HadPrev: hadPrev, PreHash: sha256Hex(data), TaskID: taskID, TraceID: traceID,
 	}
 	if !hadPrev {
@@ -679,8 +878,16 @@ func (s *Server) copyPreImage(taskID, canonicalMatchPath string, data []byte) (s
 // taskDirName is the undo-copy directory name for taskID — a fixed
 // placeholder when taskID is empty (the common case today: task_id is not
 // yet propagated onto the MCP path — see taskHeader's doc comment).
+// taskDirName maps a task_id to a single safe path component under UndoDir.
+// It sanitizes defensively: a task_id containing a path separator or a ".."
+// segment could otherwise escape UndoDir (path traversal). task_id is not
+// attacker-reachable on today's MCP path, but future tools may widen that,
+// so any component that is empty, ".", "..", or contains a separator falls
+// back to a fixed placeholder rather than being used verbatim.
 func taskDirName(taskID string) string {
-	if strings.TrimSpace(taskID) == "" {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" || taskID == "." || taskID == ".." ||
+		strings.ContainsAny(taskID, "/\\") || strings.Contains(taskID, "..") {
 		return "_unscoped"
 	}
 	return taskID
@@ -731,20 +938,72 @@ func describeExitErr(err error) error {
 	return err
 }
 
-// moveToTrash moves opPath into trashDir (creating it if necessary) with
-// a collision-safe filename (HANDOFF task spec: "collision-safe suffix"),
-// NEVER unlinking directly — see moveFile for the actual rename (+EXDEV
-// fallback). Every caller (fs_delete's own recipe, and undo_write's
-// "target did not exist before this write" branch) goes through this one
-// function, so trashDir is guaranteed to exist regardless of which path
-// got there first.
-func moveToTrash(trashDir, opPath string) (string, error) {
+// moveToTrashConfined moves the file at (ancestorDir, rel) into trashDir
+// (creating trashDir if necessary) with a collision-safe filename
+// (HANDOFF task spec: "collision-safe suffix"), NEVER unlinking directly
+// — content is durably copied into trashDir BEFORE rel is ever removed.
+// The SOURCE side is resolved through os.Root confinement exactly like
+// rootedWrite (BLOCKER fix — see this file's "os.Root confinement"
+// section doc comment): a post-check symlink planted at any
+// not-yet-existing (or swapped) component of rel cannot redirect which
+// file actually gets read/removed. Unlike a bare os.Rename (this
+// package's ORIGINAL recipe, retained conceptually for the EXDEV
+// fallback it already needed), this always copies then removes — os.Root
+// has no primitive for renaming to a destination OUTSIDE the confined
+// root, since trashDir is, by construction, a fixed location unrelated
+// to ancestorDir — so the copy+remove path this package's own EXDEV
+// fallback already established as safe is used unconditionally here
+// instead of only cross-device. Every caller (fs_delete's own recipe,
+// and undo_write's "target did not exist before this write" branch)
+// goes through this one function, so trashDir is guaranteed to exist
+// regardless of which path got there first.
+func moveToTrashConfined(ancestorDir, rel, trashDir, baseName string) (string, error) {
+	root, err := os.OpenRoot(ancestorDir)
+	if err != nil {
+		return "", fmt.Errorf("confine %s: %w", ancestorDir, err)
+	}
+	defer root.Close()
+
+	// Read-only descent: deleting/trashing must never CREATE a missing
+	// ancestor directory as a side effect.
+	leafRoot, leaf, err := descendConfinedReadOnly(root, rel)
+	if err != nil {
+		return "", fmt.Errorf("fs delete confinement: %w", err)
+	}
+	if leafRoot != root {
+		defer leafRoot.Close()
+	}
+
 	if err := os.MkdirAll(trashDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", trashDir, err)
 	}
-	dest := collisionSafePath(filepath.Join(trashDir, filepath.Base(opPath)))
-	if err := moveFile(opPath, dest); err != nil {
-		return "", err
+	dest := collisionSafePath(filepath.Join(trashDir, baseName))
+
+	src, err := leafRoot.Open(leaf)
+	if err != nil {
+		return "", fmt.Errorf("open (confined) %s: %w", leaf, err)
+	}
+	defer src.Close()
+	info, err := src.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat (confined) %s: %w", leaf, err)
+	}
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return "", fmt.Errorf("create trash entry %s: %w", dest, err)
+	}
+	if _, err := io.Copy(out, src); err != nil {
+		out.Close()
+		return "", fmt.Errorf("copy (confined) %s -> %s: %w", leaf, dest, err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("close trash entry %s: %w", dest, err)
+	}
+
+	// Only remove the confined source AFTER its bytes are durably in
+	// trashDir (HANDOFF task spec: "never a plain unlink").
+	if err := leafRoot.Remove(leaf); err != nil {
+		return "", fmt.Errorf("remove (confined) source %s: %w", leaf, err)
 	}
 	return dest, nil
 }
@@ -753,7 +1012,9 @@ func moveToTrash(trashDir, opPath string) (string, error) {
 // it finds a name nothing occupies yet (os.Lstat, so an existing symlink
 // counts as occupied too). Not race-free against a concurrent second
 // kahyad process — acceptable: kahyad is brain.db's (and, by the same
-// posture, the Trash-move sequencing's) single writer.
+// posture, the Trash-move sequencing's) single writer. dest is always
+// under s.TrashDir, a fixed, non-attacker-influenced location — no
+// os.Root confinement needed here.
 func collisionSafePath(dest string) string {
 	if _, err := os.Lstat(dest); os.IsNotExist(err) {
 		return dest
@@ -768,45 +1029,57 @@ func collisionSafePath(dest string) string {
 	}
 }
 
-// moveFile renames src to dst, falling back to copy-then-remove on EXDEV
-// (cross-device rename — e.g. an external volume) — HANDOFF task spec
-// gotcha: "os.Rename into ~/.Trash fails cross-device ... detect and fall
-// back to copy+remove ... still never plain unlink". Used by both
-// directions (into Trash, and back out of it for undo_delete).
-func moveFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return fmt.Errorf("rename %s -> %s: %w", src, dst, err)
-	}
-	if err := copyFile(src, dst); err != nil {
-		return fmt.Errorf("cross-device copy %s -> %s: %w", src, dst, err)
-	}
-	if err := os.Remove(src); err != nil {
-		return fmt.Errorf("remove source after cross-device copy %s: %w", src, err)
-	}
-	return nil
-}
-
-// copyFile streams src's bytes (and permission bits) to dst.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+// restoreFromTrashConfined is undo_delete's os.Root-confined restore: the
+// DESTINATION side (rel, under ancestorDir) is resolved through os.Root
+// exactly like rootedWrite, so a symlink planted at any not-yet-existing
+// ancestor of the restore target SINCE the original delete cannot
+// redirect the restored bytes outside ancestorDir (BLOCKER fix — see
+// this file's "os.Root confinement" section doc comment). trashPath (the
+// source) is a fixed, kahyad-owned location, never attacker-
+// influenceable, so it is read via a plain os.Open. Like
+// moveToTrashConfined, this always copies then removes (os.Root has no
+// primitive for a source outside the confined root), which also
+// subsumes the EXDEV-fallback case moveFile's original os.Rename-first
+// recipe needed only for cross-device moves.
+func restoreFromTrashConfined(trashPath, ancestorDir, rel string) error {
+	root, err := os.OpenRoot(ancestorDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("confine restore to %s: %w", ancestorDir, err)
+	}
+	defer root.Close()
+
+	leafRoot, leaf, err := descendConfined(root, rel)
+	if err != nil {
+		return fmt.Errorf("fs undo_delete confinement: %w", err)
+	}
+	if leafRoot != root {
+		defer leafRoot.Close()
+	}
+
+	in, err := os.Open(trashPath)
+	if err != nil {
+		return fmt.Errorf("open trash entry %s: %w", trashPath, err)
 	}
 	defer in.Close()
-
 	info, err := in.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat trash entry %s: %w", trashPath, err)
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+
+	out, err := leafRoot.OpenFile(leaf, os.O_RDWR|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
 	if err != nil {
-		return err
+		return fmt.Errorf("create (confined) restore target %s: %w", leaf, err)
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
-		return err
+		return fmt.Errorf("copy trash entry -> (confined) %s: %w", leaf, err)
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close (confined) restore target %s: %w", leaf, err)
+	}
+
+	if err := os.Remove(trashPath); err != nil {
+		return fmt.Errorf("remove trash entry %s after restore: %w", trashPath, err)
+	}
+	return nil
 }

@@ -219,6 +219,12 @@ func run() int {
 	// itself already short-circuits every caller before the engine would
 	// ever be consulted; see server.Server.SetDenyAll's doc comment).
 	policyEngine := policy.NewEngine(pol, st.Queries, st)
+	// MINOR fix: cfg.UndoWindowSeconds (default 300 = 5 minutes, config.
+	// defaults's doc comment) replaces policy.Engine's own hardcoded
+	// undoWindowDuration const - production behavior is unchanged at the
+	// default, but a shorter config.yaml value (or a test's direct
+	// SetUndoWindowDuration call) now actually takes effect end-to-end.
+	policyEngine.SetUndoWindowDuration(time.Duration(cfg.UndoWindowSeconds) * time.Second)
 	srv.SetPolicyEngine(policyEngine)
 
 	// W3-03: fs_read/fs_write/fs_delete, registered onto the SAME shared

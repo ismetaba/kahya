@@ -42,6 +42,32 @@ type CanonicalPath struct {
 	// field use ONLY this string (HANDOFF §5 safety #6: "Deny-glob
 	// matching runs on the canonical result only").
 	Match string
+	// AncestorDir is the resolved, EXISTING directory server.go must
+	// os.OpenRoot before performing ANY filesystem mutation on this path
+	// (write, delete, undo-restore) — always Op's own parent's deepest
+	// existing ancestor, computed at Canonicalize time, BEFORE the
+	// Policy.Check/ConsumeToken/checkpointPreImage window a fs_write/
+	// fs_delete call's approval gate opens. Unlike Op (which, for a
+	// target that already exists, resolves all the way down through the
+	// target's OWN symlink chain too), AncestorDir always stops one level
+	// ABOVE the leaf being created/replaced/removed, so it is always safe
+	// to os.OpenRoot: an os.Root opened here, plus a component-by-
+	// component descent that refuses ANY symlink at a path segment that
+	// did not exist at this Canonicalize call (server.go's
+	// descendConfined), makes it impossible for a symlink planted DURING
+	// that later window — at any not-yet-existing ancestor of the
+	// target, pointing anywhere at all, even to another location still
+	// "inside" AncestorDir itself — to redirect the eventual mutation
+	// away from the exact path this package's deny-glob check already
+	// ran against (BLOCKER fix: see mcp/fs/server.go's package doc
+	// comment and rootedWrite's doc comment for the full TOCTOU this
+	// closes, and why os.Root's own built-in escape check alone is not
+	// sufficient).
+	AncestorDir string
+	// Rel is Op's path relative to AncestorDir (OS path separators) —
+	// pass this, NEVER Op itself, to every os.Root-confined helper in
+	// server.go once AncestorDir has been os.OpenRoot'd.
+	Rel string
 }
 
 // ErrEmptyPath is returned by Canonicalize for an empty/whitespace-only
@@ -71,12 +97,23 @@ func Canonicalize(home, raw string) (CanonicalPath, error) {
 		return CanonicalPath{}, fmt.Errorf("fs: resolve symlinks for %q: %w", raw, err)
 	}
 
+	// AncestorDir/Rel: the os.Root confinement split (see CanonicalPath's
+	// own doc comment) — always rooted one level ABOVE op's own leaf,
+	// computed here (before any policy/approval window opens) from the
+	// SAME resolveDeepestExisting algorithm, applied to op's parent
+	// directory instead of op itself.
+	ancestorDir, trailingRel, err := splitExistingAncestor(filepath.Dir(op))
+	if err != nil {
+		return CanonicalPath{}, fmt.Errorf("fs: resolve confinement ancestor for %q: %w", raw, err)
+	}
+	rel := filepath.Join(trailingRel, filepath.Base(op))
+
 	match := norm.NFC.String(op)
 	if r, bad := firstForbiddenRune(match); bad {
 		return CanonicalPath{}, fmt.Errorf("fs: path contains a forbidden bidi/zero-width rune U+%04X", r)
 	}
 
-	return CanonicalPath{Op: op, Match: match}, nil
+	return CanonicalPath{Op: op, Match: match, AncestorDir: ancestorDir, Rel: rel}, nil
 }
 
 // expandHome resolves a leading "~" or "~/" in path against home — the
@@ -104,13 +141,33 @@ func expandHome(path, home string) string {
 // a brand-new fs_write target), and HANDOFF's own instruction is explicit
 // that resolution must happen "on the deepest existing ancestor".
 func resolveDeepestExisting(abs string) (string, error) {
+	ancestor, trailingRel, err := splitExistingAncestor(abs)
+	if err != nil {
+		return "", err
+	}
+	if trailingRel == "" {
+		return ancestor, nil
+	}
+	return filepath.Join(ancestor, trailingRel), nil
+}
+
+// splitExistingAncestor walks abs's ancestors upward until it finds one
+// that exists on disk (via os.Lstat — a symlink counts as "existing"; it
+// is resolved, not followed, by the Lstat check itself), resolves THAT
+// ancestor's symlinks (filepath.EvalSymlinks), and returns it SEPARATELY
+// from the not-yet-existing trailing path components (joined with the OS
+// separator, "" if none) — the split resolveDeepestExisting itself joins
+// into Op's single-string contract, and the split CanonicalPath's own
+// AncestorDir/Rel fields need kept apart for server.go's os.Root
+// confinement.
+func splitExistingAncestor(abs string) (ancestorDir, trailingRel string, err error) {
 	cur := abs
 	var trailing []string
 	for {
 		if _, err := os.Lstat(cur); err == nil {
 			break
 		} else if !os.IsNotExist(err) {
-			return "", err
+			return "", "", err
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -126,12 +183,9 @@ func resolveDeepestExisting(abs string) (string, error) {
 
 	resolved, err := filepath.EvalSymlinks(cur)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if len(trailing) == 0 {
-		return resolved, nil
-	}
-	return filepath.Join(append([]string{resolved}, trailing...)...), nil
+	return resolved, filepath.Join(trailing...), nil
 }
 
 // forbiddenRuneHex is the bidi-control/zero-width rune set this package
