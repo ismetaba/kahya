@@ -10,7 +10,10 @@
 // rather than relying on kahyad's generic /v1/mcp policy-gate middleware:
 //
 //  1. mechanical, non-negotiable checks that can NEVER be overridden by an
-//     approval — canonicalize + deny-glob check on the workdir
+//     approval — canonicalize + the workdir SCOPE gate (workdir.go: reject
+//     "/", $HOME, an ancestor of $HOME, a system dir, or a sensitive $HOME
+//     subtree, unless config.Config.ShellWorkdirRoots opts into a
+//     stricter allowlist instead) + the deny-glob check on the workdir
 //     (shell_docker) or the argv validator (shell_host), needs_network
 //     fail-closed, the docker-health check, the image-digest pin — each of
 //     these denies BEFORE any policy decision is even consulted, mirroring
@@ -276,6 +279,15 @@ type Runner struct {
 	// ~-expanded): a task's workdir must not match any of these (this
 	// task's spec step 3).
 	DenyGlobs []string
+	// WorkdirRoots is config.Config.ShellWorkdirRoots (yaml
+	// shell_workdir_roots / env KAHYA_SHELL_WORKDIR_ROOTS), already
+	// ~-expanded — BLOCKER 1 fix's OPTIONAL, stricter opt-in allowlist:
+	// when non-empty, a task's canonical workdir must be one of these
+	// roots or a descendant, full stop, REPLACING the default deny-rule
+	// posture validateWorkdir otherwise applies (workdir.go). Empty
+	// (the default) means every workdir is subject to those deny rules
+	// instead — see validateWorkdir's own doc comment.
+	WorkdirRoots []string
 
 	// ImageTag is the sandbox image's tag (e.g. "kahya-sandbox:0.1.0").
 	ImageTag string
@@ -308,14 +320,17 @@ type Runner struct {
 // NewRunner constructs a production Runner: home is the real user home
 // directory; imageTag/pinnedDigest are typically cfg.DockerImageTag and
 // the content of docker/sandbox/IMAGE_DIGEST (LoadPinnedDigest);
-// denyGlobs is policy.yaml's fs_write_deny_globs.
-func NewRunner(home, imageTag, pinnedDigest string, denyGlobs []string, policy PolicyClient, ledger Ledger, log Logger) *Runner {
+// denyGlobs is policy.yaml's fs_write_deny_globs; workdirRoots is
+// cfg.ShellWorkdirRoots (BLOCKER 1 fix's optional, stricter opt-in
+// allowlist — nil/empty is the normal, common case: see WorkdirRoots'
+// own doc comment).
+func NewRunner(home, imageTag, pinnedDigest string, denyGlobs, workdirRoots []string, policy PolicyClient, ledger Ledger, log Logger) *Runner {
 	if log == nil {
 		log = noopLogger{}
 	}
 	exec := processExecutor{}
 	return &Runner{
-		Home: home, DenyGlobs: denyGlobs, ImageTag: imageTag, PinnedDigest: pinnedDigest,
+		Home: home, DenyGlobs: denyGlobs, WorkdirRoots: workdirRoots, ImageTag: imageTag, PinnedDigest: pinnedDigest,
 		Policy: policy, Ledger: ledger, Log: log,
 		Exec: exec, DigestChecker: dockerDigestChecker{exec: exec}, Health: dockerHealthChecker{exec: exec},
 		EnvLookup: os.LookupEnv, timeoutUnit: time.Second,
@@ -351,6 +366,20 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: %w", err)
 	}
+
+	// BLOCKER 1 fix: the deny-glob check alone let Workdir="/", "~", or a
+	// bare $HOME path canonicalize clean and get bind-mounted rw at
+	// /work — this scope gate (workdir.go) runs FIRST, still entirely
+	// mechanical/pre-policy/never-approval-overridable, exactly like the
+	// deny-glob check right below it.
+	if reasonCode, werr := validateWorkdir(cp, r.Home, r.WorkdirRoots); werr != nil {
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_workdir_rejected", map[string]any{
+			"event": "shell_workdir_rejected", "tool": "shell_docker", "canonical_workdir": cp.Match,
+			"reason": reasonCode, "task_id": taskID,
+		})
+		return RunOutput{}, werr
+	}
+
 	hit, err := mcpfs.MatchesAnyGlobCI(cp.Match, r.DenyGlobs)
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: %w", err)
@@ -404,17 +433,23 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	containerName := containerNameFor(taskID)
 	args := buildDockerRunArgs(dockerRunSpec{
 		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID,
-		Workdir: cp.Op, EnvPairs: r.resolveEnv(in.EnvAllowlist),
+		Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
 	})
 
 	// Logged BEFORE execution so the JSONL transcript this task's own
 	// acceptance criteria grep for ("docker run transcript ... shows
 	// --network none", "container labels present") exists regardless of
-	// how the run itself turns out.
+	// how the run itself turns out. BLOCKER 2 fix, part b: the argv
+	// LOGGED here (and ledgered) is a REDACTED copy — every "-e
+	// NAME=VALUE" becomes "-e NAME=<redacted>" — args itself (unredacted)
+	// is what r.Exec.Run below actually executes, so the container still
+	// receives the real values; only this observability trail is
+	// scrubbed, since env_allowlist values must never sit in cleartext in
+	// a JSONL log file or the append-only brain.db ledger.
 	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_docker_run", map[string]any{
 		"event": "shell_docker_run", "tool": "shell_docker", "task_id": taskID,
 		"container_name": containerName, "image_tag": r.ImageTag, "image_digest": actualDigest,
-		"workdir": cp.Match, "docker_argv": append([]string{"docker"}, args...),
+		"workdir": cp.Match, "docker_argv": append([]string{"docker"}, redactDockerArgv(args)...),
 	})
 
 	unit := r.timeoutUnit
@@ -475,13 +510,28 @@ func (r *Runner) KillAllLabeled(ctx context.Context) error {
 // skipping any name absent from the host environment — RunInput.
 // EnvAllowlist supplies NAMES only; VALUES always come from the host,
 // never from the caller.
-func (r *Runner) resolveEnv(allowlist []string) map[string]string {
+//
+// BLOCKER 2 fix, part a: a model-supplied env_allowlist NAME is looked up
+// in kahyad's OWN process environment (r.EnvLookup, typically
+// os.LookupEnv) — without isForwardableEnvName's restriction, naming e.g.
+// KAHYA_ANTHROPIC_KEY_OVERRIDE would forward that kahyad-internal secret's
+// VALUE straight into the container. A name failing isForwardableEnvName
+// is dropped here — its value is never even looked up, let alone
+// forwarded — and a warn ledger/log line records the rejected NAME only
+// (never a value, since none was looked up).
+func (r *Runner) resolveEnv(ctx context.Context, traceID, taskID string, allowlist []string) map[string]string {
 	lookup := r.EnvLookup
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
 	out := make(map[string]string, len(allowlist))
 	for _, name := range allowlist {
+		if !isForwardableEnvName(name) {
+			warnAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_env_name_rejected", map[string]any{
+				"event": "shell_env_name_rejected", "tool": "shell_docker", "env_name": name, "task_id": taskID,
+			})
+			continue
+		}
 		if v, ok := lookup(name); ok {
 			out[name] = v
 		}
@@ -635,6 +685,24 @@ func logAndLedger(ctx context.Context, ledger Ledger, log Logger, traceID, kind 
 		}
 	}
 	scoped.Info(kind, mapToArgs(payload)...)
+}
+
+// warnAndLedger mirrors logAndLedger exactly (same append-only-ledger-
+// plus-JSONL-line contract), except the JSONL line is logged at WARN
+// rather than INFO — used for shell_env_name_rejected (BLOCKER 2 fix,
+// part a: a dropped env_allowlist name is worth a operator-visible warn,
+// not a routine info line).
+func warnAndLedger(ctx context.Context, ledger Ledger, log Logger, traceID, kind string, payload map[string]any) {
+	if log == nil {
+		log = noopLogger{}
+	}
+	scoped := log.With(traceID)
+	if ledger != nil {
+		if err := ledger.LogEvent(ctx, traceID, kind, payload); err != nil {
+			scoped.Warn(kind+"_ledger_error", "err", err.Error())
+		}
+	}
+	scoped.Warn(kind, mapToArgs(payload)...)
 }
 
 // mapToArgs flattens payload into the alternating key/value... variadic

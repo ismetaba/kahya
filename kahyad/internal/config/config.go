@@ -100,6 +100,18 @@ type Config struct {
 	// shell_docker run refused until `make sandbox-image` has run).
 	DockerImageDigestPath string `yaml:"docker_image_digest_path"`
 
+	// ShellWorkdirRoots is mcp/shell.Runner.WorkdirRoots (BLOCKER 1 fix's
+	// OPTIONAL, stricter opt-in allowlist): when non-empty, a shell_docker
+	// task's canonical workdir must be one of these roots or a descendant,
+	// REPLACING the default deny-rule posture (mcp/shell.validateWorkdir
+	// otherwise rejects "/", $HOME, an ancestor of $HOME, a system dir, or
+	// a sensitive $HOME subtree, and allows everything else including the
+	// OS temp dir and ordinary $HOME subdirectories). Default empty (nil)
+	// - the deny-rule posture applies. Each entry is tilde-expanded against
+	// home, same as every other configured path. Env override
+	// KAHYA_SHELL_WORKDIR_ROOTS is a comma-separated list.
+	ShellWorkdirRoots []string `yaml:"shell_workdir_roots"`
+
 	// LogLevel is the process-wide minimum log level: debug|info|warn|error
 	// (default "info"). main.go passes the resolved value to
 	// kahyad/internal/logx.SetLevel before logx.New. Env override
@@ -179,6 +191,7 @@ type fileConfig struct {
 	PolicyPath             *string   `yaml:"policy_path"`
 	DockerImageTag         *string   `yaml:"docker_image_tag"`
 	DockerImageDigestPath  *string   `yaml:"docker_image_digest_path"`
+	ShellWorkdirRoots      *[]string `yaml:"shell_workdir_roots"`
 	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
 	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
 	TaskTokenCeiling       *int64    `yaml:"task_token_ceiling"`
@@ -434,6 +447,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.DockerImageDigestPath != nil {
 		cfg.DockerImageDigestPath = expandHome(*fc.DockerImageDigestPath, home)
 	}
+	if fc.ShellWorkdirRoots != nil {
+		cfg.ShellWorkdirRoots = expandHomeEach(*fc.ShellWorkdirRoots, home)
+	}
 	if fc.DailyBudgetUSD != nil {
 		cfg.DailyBudgetUSD = *fc.DailyBudgetUSD
 	}
@@ -491,6 +507,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_DOCKER_IMAGE_DIGEST_PATH"); v != "" {
 		cfg.DockerImageDigestPath = expandHome(v, home)
 	}
+	if v := os.Getenv("KAHYA_SHELL_WORKDIR_ROOTS"); v != "" {
+		cfg.ShellWorkdirRoots = expandHomeEach(strings.Split(v, ","), home)
+	}
 }
 
 func validateEnv(env string) error {
@@ -532,6 +551,22 @@ func expandHome(path, home string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+// expandHomeEach applies expandHome to every entry of paths, trimming
+// surrounding whitespace and dropping empty entries first (KAHYA_SHELL_
+// WORKDIR_ROOTS is a comma-separated env value, so " /a , /b " must not
+// yield a stray whitespace-only or empty root).
+func expandHomeEach(paths []string, home string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, expandHome(p, home))
+	}
+	return out
 }
 
 // ExpandHome resolves a leading "~" or "~/" in path against the current

@@ -268,7 +268,7 @@ func run() int {
 	if err != nil {
 		log.Error("shell_pinned_digest_load_failed", "path", cfg.DockerImageDigestPath, "err", err.Error())
 	}
-	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, pol.FSWriteDenyGlobs, fsPolicyClient, st, server.NewFSLogger(log))
+	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, pol.FSWriteDenyGlobs, cfg.ShellWorkdirRoots, fsPolicyClient, st, server.NewFSLogger(log))
 	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
 	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
 	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {

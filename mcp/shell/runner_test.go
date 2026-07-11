@@ -349,10 +349,50 @@ func TestRun_SuccessLogsTranscriptAndLedgersShellExec(t *testing.T) {
 	}
 }
 
+// TestRun_EnvAllowlistOnlyForwardsAllowedNames proves the happy path of
+// BLOCKER 2 fix part a: a NAME actually in safeEnvAllowlist (env_
+// allowlist.go) is still forwarded exactly as before; a name absent from
+// the host env is still silently skipped (unrelated to the safe-name
+// restriction).
 func TestRun_EnvAllowlistOnlyForwardsAllowedNames(t *testing.T) {
 	home, workdir := baseFixture(t)
 	exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
 	r := newTestRunner(home, nil, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, newFakeLogger(), exec,
+		&fakeDigestChecker{digest: "sha256:matching"}, &fakeHealthChecker{healthy: true}, "sha256:matching")
+	r.EnvLookup = func(name string) (string, bool) {
+		if name == "LANG" {
+			return "en_US.UTF-8", true
+		}
+		return "", false
+	}
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{
+		Script: "echo hi", Workdir: workdir, EnvAllowlist: []string{"LANG", "NOT_SET"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	runCalls := exec.callsFor("run")
+	joined := strings.Join(runCalls[0].args, " ")
+	if !strings.Contains(joined, "-e LANG=en_US.UTF-8") {
+		t.Fatalf("expected -e LANG=en_US.UTF-8 in argv: %v", runCalls[0].args)
+	}
+	if strings.Contains(joined, "NOT_SET") {
+		t.Fatalf("NOT_SET must never appear (absent from host env): %v", runCalls[0].args)
+	}
+}
+
+// TestRun_EnvAllowlistRejectsNameNotInSafeAllowlist proves BLOCKER 2 fix
+// part a's "only forward from a small hardcoded SAFE-NAME allowlist" half:
+// a perfectly innocuous-looking name (no secret-shaped substring/prefix at
+// all) is STILL dropped if it is not one of the few names env_allowlist.go
+// hardcodes, since growing the forwardable set must require editing that
+// file, never a model-supplied allowlist entry.
+func TestRun_EnvAllowlistRejectsNameNotInSafeAllowlist(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+	ledger := &fakeLedger{}
+	r := newTestRunner(home, nil, &fakePolicyClient{decision: allowDecision("tok")}, ledger, newFakeLogger(), exec,
 		&fakeDigestChecker{digest: "sha256:matching"}, &fakeHealthChecker{healthy: true}, "sha256:matching")
 	r.EnvLookup = func(name string) (string, bool) {
 		if name == "FOO" {
@@ -362,18 +402,140 @@ func TestRun_EnvAllowlistOnlyForwardsAllowedNames(t *testing.T) {
 	}
 
 	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{
-		Script: "echo hi", Workdir: workdir, EnvAllowlist: []string{"FOO", "NOT_SET"},
+		Script: "echo hi", Workdir: workdir, EnvAllowlist: []string{"FOO"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	runCalls := exec.callsFor("run")
-	joined := strings.Join(runCalls[0].args, " ")
-	if !strings.Contains(joined, "-e FOO=bar") {
-		t.Fatalf("expected -e FOO=bar in argv: %v", runCalls[0].args)
+	if strings.Contains(strings.Join(runCalls[0].args, " "), "FOO") {
+		t.Fatalf("FOO is not in safeEnvAllowlist and must never be forwarded: %v", runCalls[0].args)
 	}
-	if strings.Contains(joined, "NOT_SET") {
-		t.Fatalf("NOT_SET must never appear (absent from host env): %v", runCalls[0].args)
+	if len(ledger.find("shell_env_name_rejected")) != 1 {
+		t.Fatalf("expected exactly one shell_env_name_rejected ledger event, got %d", len(ledger.find("shell_env_name_rejected")))
+	}
+}
+
+// TestRun_EnvAllowlistRejectsSecretShapedNameAndNeverLogsItsValue is
+// BLOCKER 2's central regression: env_allowlist naming a kahyad-process
+// secret-shaped var (KAHYA_ANTHROPIC_KEY_OVERRIDE, kahyad/internal/
+// anthproxy's own dev/CI Keychain substitute — kahyad/internal/spawn's
+// secretEnvDenylist closes the identical worker-facing leak) must NOT be
+// forwarded into the real docker argv, AND the secret's value must appear
+// NOWHERE in any logged or ledgered payload — not even in a rejection
+// event, since resolveEnv must never even call EnvLookup for a name that
+// fails isForwardableEnvName.
+func TestRun_EnvAllowlistRejectsSecretShapedNameAndNeverLogsItsValue(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+	ledger := &fakeLedger{}
+	log := newFakeLogger()
+	r := newTestRunner(home, nil, &fakePolicyClient{decision: allowDecision("tok")}, ledger, log, exec,
+		&fakeDigestChecker{digest: "sha256:matching"}, &fakeHealthChecker{healthy: true}, "sha256:matching")
+	const secretName = "KAHYA_ANTHROPIC_KEY_OVERRIDE"
+	const secretValue = "sk-super-secret-value-must-never-leak"
+	lookedUp := false
+	r.EnvLookup = func(name string) (string, bool) {
+		if name == secretName {
+			lookedUp = true
+			return secretValue, true
+		}
+		return "", false
+	}
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{
+		Script: "echo hi", Workdir: workdir, EnvAllowlist: []string{secretName},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if lookedUp {
+		t.Fatal("a secret-shaped env_allowlist name must never even be looked up in the host environment")
+	}
+
+	runCalls := exec.callsFor("run")
+	joinedArgv := strings.Join(runCalls[0].args, " ")
+	if strings.Contains(joinedArgv, secretName) {
+		t.Fatalf("secret-shaped env name must never be forwarded into the real docker argv: %v", runCalls[0].args)
+	}
+	if strings.Contains(joinedArgv, secretValue) {
+		t.Fatalf("secret value must never appear in the real docker argv: %v", runCalls[0].args)
+	}
+
+	// Nowhere in ANY logged line's args may the secret value appear.
+	for _, ln := range *log.lines {
+		for _, a := range ln.args {
+			switch v := a.(type) {
+			case string:
+				if strings.Contains(v, secretValue) {
+					t.Fatalf("secret value leaked into log line %q: %v", ln.event, ln.args)
+				}
+			case []string:
+				if strings.Contains(strings.Join(v, " "), secretValue) {
+					t.Fatalf("secret value leaked into log line %q argv: %v", ln.event, v)
+				}
+			}
+		}
+	}
+	// Nor in any ledgered payload.
+	for _, ev := range ledger.events {
+		for _, v := range ev.payload {
+			if s, ok := v.(string); ok && strings.Contains(s, secretValue) {
+				t.Fatalf("secret value leaked into ledger event %q: %+v", ev.kind, ev.payload)
+			}
+		}
+	}
+	if len(ledger.find("shell_env_name_rejected")) != 1 {
+		t.Fatalf("expected exactly one shell_env_name_rejected ledger event, got %d", len(ledger.find("shell_env_name_rejected")))
+	}
+}
+
+// TestRun_TranscriptRedactsForwardedEnvValues is BLOCKER 2's part b
+// regression: a NAME that IS forwarded (safe-allowlisted, present in the
+// host env) still must never have its VALUE appear in the logged/ledgered
+// shell_docker_run transcript — only "-e NAME=<redacted>" — while the REAL
+// docker invocation (exec.callsFor("run")) still carries the real value.
+func TestRun_TranscriptRedactsForwardedEnvValues(t *testing.T) {
+	home, workdir := baseFixture(t)
+	exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+	log := newFakeLogger()
+	r := newTestRunner(home, nil, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, log, exec,
+		&fakeDigestChecker{digest: "sha256:matching"}, &fakeHealthChecker{healthy: true}, "sha256:matching")
+	r.EnvLookup = func(name string) (string, bool) {
+		if name == "LANG" {
+			return "en_US.UTF-8", true
+		}
+		return "", false
+	}
+
+	_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{
+		Script: "echo hi", Workdir: workdir, EnvAllowlist: []string{"LANG"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	transcript := log.find("shell_docker_run")
+	if len(transcript) != 1 {
+		t.Fatalf("expected exactly one shell_docker_run transcript line, got %d", len(transcript))
+	}
+	argv, ok := argValue(transcript[0].args, "docker_argv").([]string)
+	if !ok {
+		t.Fatalf("shell_docker_run transcript missing docker_argv: %+v", transcript[0].args)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "-e LANG=<redacted>") {
+		t.Fatalf("expected -e LANG=<redacted> in the logged transcript, got: %v", argv)
+	}
+	if strings.Contains(joined, "en_US.UTF-8") {
+		t.Fatalf("env VALUE must never appear in the logged transcript: %v", argv)
+	}
+
+	// The REAL docker invocation (never logged) must still carry the real
+	// value — redaction is a transcript-only concern.
+	runCalls := exec.callsFor("run")
+	if !strings.Contains(strings.Join(runCalls[0].args, " "), "-e LANG=en_US.UTF-8") {
+		t.Fatalf("the real docker argv must still carry the real env value: %v", runCalls[0].args)
 	}
 }
 

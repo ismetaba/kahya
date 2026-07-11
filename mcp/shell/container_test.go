@@ -113,7 +113,7 @@ func newLiveRunner(t *testing.T) (*Runner, *fakeLogger) {
 		t.Fatal(err)
 	}
 	log := newFakeLogger()
-	r := NewRunner(home, liveImageTag, digest, nil, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, log)
+	r := NewRunner(home, liveImageTag, digest, nil, nil, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, log)
 	return r, log
 }
 

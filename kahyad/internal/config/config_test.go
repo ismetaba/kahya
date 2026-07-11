@@ -11,7 +11,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS"} {
 		t.Setenv(k, "")
 	}
 }
@@ -281,6 +281,81 @@ func TestLoadExpandsTilde(t *testing.T) {
 	want := filepath.Join(home, "tilde-memory")
 	if cfg.MemoryDir != want {
 		t.Errorf("MemoryDir = %q, want %q (tilde expansion)", cfg.MemoryDir, want)
+	}
+}
+
+// TestLoadShellWorkdirRootsDefaultEmpty proves BLOCKER 1 fix's config
+// surface defaults to empty (nil) - config.go's applyFile/applyEnv only
+// ever populate it when the file or env layer explicitly sets it; mcp/shell.
+// Runner treats an empty WorkdirRoots as "apply the deny-rule posture",
+// never as "allow nothing" or "allow everything".
+func TestLoadShellWorkdirRootsDefaultEmpty(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.ShellWorkdirRoots) != 0 {
+		t.Errorf("ShellWorkdirRoots = %v, want empty by default", cfg.ShellWorkdirRoots)
+	}
+}
+
+// TestLoadShellWorkdirRootsFromFile proves shell_workdir_roots is a real,
+// independently-settable config.yaml key, and that each entry is
+// tilde-expanded exactly like every other configured path.
+func TestLoadShellWorkdirRootsFromFile(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "shell_workdir_roots:\n  - \"~/allowed-a\"\n  - \"/absolute/allowed-b\"\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{filepath.Join(home, "allowed-a"), "/absolute/allowed-b"}
+	if len(cfg.ShellWorkdirRoots) != len(want) || cfg.ShellWorkdirRoots[0] != want[0] || cfg.ShellWorkdirRoots[1] != want[1] {
+		t.Errorf("ShellWorkdirRoots = %v, want %v", cfg.ShellWorkdirRoots, want)
+	}
+}
+
+// TestLoadShellWorkdirRootsEnvOverridesFile proves KAHYA_SHELL_WORKDIR_ROOTS
+// (a comma-separated list) overrides config.yaml's shell_workdir_roots,
+// trims whitespace around each entry, drops empty entries, and
+// tilde-expands each surviving one - the same precedence/expansion rule
+// every other configured path follows.
+func TestLoadShellWorkdirRootsEnvOverridesFile(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("shell_workdir_roots:\n  - \"/from-file\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KAHYA_SHELL_WORKDIR_ROOTS", " ~/from-env-a ,/from-env-b,, ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{filepath.Join(home, "from-env-a"), "/from-env-b"}
+	if len(cfg.ShellWorkdirRoots) != len(want) || cfg.ShellWorkdirRoots[0] != want[0] || cfg.ShellWorkdirRoots[1] != want[1] {
+		t.Errorf("ShellWorkdirRoots = %v, want %v (env overrides file, trims, drops empties)", cfg.ShellWorkdirRoots, want)
 	}
 }
 

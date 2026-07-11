@@ -100,8 +100,20 @@ generate:   # activated by W12-02 when sqlc.yaml lands
 # {{.Id}}`), which changes on ANY layer/config change exactly like a real
 # registry digest would - the identical supply-chain-pin security
 # property, just sourced locally.
+#
+# BLOCKER 3 fix: --provenance=false --sbom=false. Without these, BuildKit
+# attaches provenance/SBOM attestations to the image that embed a fresh
+# build TIMESTAMP on every invocation - which changes the image's own
+# config (and therefore `docker image inspect --format {{.Id}}`'s output)
+# even when the Dockerfile and build context are byte-for-byte unchanged.
+# That made the "supply-chain pin" a routine false-positive mismatch
+# rather than a real tamper signal (every rebuild "drifted"). Disabling
+# both attestations makes the image ID a pure function of the Dockerfile +
+# build context again: an unchanged Dockerfile now yields the SAME digest
+# across repeated `make sandbox-image` runs (verified: run it twice, diff
+# docker/sandbox/IMAGE_DIGEST - no diff).
 sandbox-image:
-	docker build -t $(SANDBOX_IMAGE_TAG) -f docker/sandbox/Dockerfile docker/sandbox
+	docker build --provenance=false --sbom=false -t $(SANDBOX_IMAGE_TAG) -f docker/sandbox/Dockerfile docker/sandbox
 	@DIGEST=$$(docker image inspect --format='{{.Id}}' $(SANDBOX_IMAGE_TAG)); \
 	printf '%s\n' "$$DIGEST" > docker/sandbox/IMAGE_DIGEST; \
 	echo "sandbox image built: $(SANDBOX_IMAGE_TAG) $$DIGEST"
