@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -218,7 +219,7 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 		// kahyad/internal/server's handleTask already uses for its own
 		// worker spawn.
 		runCtx := WithTraceID(context.Background(), traceID)
-		runErr := fn(runCtx)
+		runErr := s.runHandlerRecovered(runCtx, traceID, name, fn)
 
 		kind := EventJobCompleted
 		event := "job_completed"
@@ -242,6 +243,30 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 		}
 	}()
 	return nil
+}
+
+// runHandlerRecovered invokes fn(ctx), recovering any panic instead of
+// letting it unwind out of Trigger's goroutine (BLOCKER 1 fix: a panicking
+// Handler — backup/briefing/consolidation all funnel through this exact
+// path in later tasks — must never crash the whole kahyad daemon). A
+// recovered panic is logged as its own JSONL error line (event=job_panic,
+// carrying job_name, trace_id, the recovered value, and a full stack
+// trace via runtime/debug.Stack — information the eventual job.failed
+// ledger row's plain error string cannot carry) and then converted into an
+// ordinary error, so the caller's existing job.completed/job.failed
+// ledgering code (immediately below in Trigger) treats a panicking job
+// exactly as it would a job that returned an error — from the ledger's
+// perspective the two are indistinguishable.
+func (s *Scheduler) runHandlerRecovered(ctx context.Context, traceID, name string, fn Handler) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.jsonl != nil {
+				s.jsonl.With(traceID).Error("job_panic", "job_name", name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			}
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return fn(ctx)
 }
 
 // everySpecPrefix is RegisterTick's own short-interval descriptor prefix:
@@ -309,7 +334,7 @@ func (s *Scheduler) RegisterTick(name, spec string, fn func(ctx context.Context)
 		if s.jsonl != nil {
 			s.jsonl.With(traceID).Info("tick_fired", "name", name)
 		}
-		fn(WithTraceID(context.Background(), traceID))
+		s.runTickRecovered(traceID, name, fn)
 	})
 
 	if delay, ok := parseEverySpec(spec); ok {
@@ -321,6 +346,32 @@ func (s *Scheduler) RegisterTick(name, spec string, fn func(ctx context.Context)
 		return fmt.Errorf("scheduler: register tick %q (spec %q): %w", name, spec, err)
 	}
 	return nil
+}
+
+// runTickRecovered invokes fn under a per-tick trace_id, recovering any
+// panic instead of letting it unwind out of robfig/cron/v3's own job
+// goroutine (BLOCKER 2 fix). This package constructs its *cron.Cron via a
+// bare cron.New() (see New's own s.cron field initialization), which
+// installs an EMPTY job chain — despite cron's own package doc comment
+// claiming a
+// default recovering chain, robfig/cron/v3 v3.0.1's cron.New sets no
+// cron.Recover wrapper unless cron.WithChain(cron.Recover(...)) is passed
+// explicitly — so, absent this wrapper, a panicking tick fn would crash
+// the whole kahyad daemon exactly like BLOCKER 1's unwrapped Trigger
+// goroutine did. A recovered panic is logged as its own JSONL error line
+// (event=tick_panic, carrying name, trace_id, the recovered value, and a
+// full stack trace via runtime/debug.Stack) and then swallowed — the tick
+// simply did not complete this one time, but the cron scheduler's run
+// loop and every subsequent scheduled tick are unaffected.
+func (s *Scheduler) runTickRecovered(traceID, name string, fn func(ctx context.Context)) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.jsonl != nil {
+				s.jsonl.With(traceID).Error("tick_panic", "name", name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			}
+		}
+	}()
+	fn(WithTraceID(context.Background(), traceID))
 }
 
 // StartTicks starts firing every tick registered so far (a no-op if

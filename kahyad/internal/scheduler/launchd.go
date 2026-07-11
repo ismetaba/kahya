@@ -13,6 +13,7 @@ package scheduler
 import (
 	"bytes"
 	_ "embed"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -111,19 +112,54 @@ type plistData struct {
 // must be the absolute path to the kahya-trigger binary; jobLogDir must be
 // the absolute ~/Library/Logs/Kahya directory (both paths are embedded
 // verbatim into the output — launchd never expands "~").
+//
+// MINOR 3 fix: every string value interpolated into plist.tmpl (the
+// launchd Label, the trigger binary's path, the bare job name, the log
+// file path) is passed through escapeXMLString first. plist.tmpl is a
+// plain text/template — text/template performs NO escaping of any kind,
+// unlike html/template — so without this, a job name (or any future
+// caller-supplied value) containing an XML metacharacter (<, &, ", ')
+// would emit malformed or injected plist XML. config.Load's jobNamePattern
+// (DNS-label chars only) already prevents an XML metacharacter from ever
+// reaching a job Name in the normal config.yaml -> Load -> RenderPlist
+// path, so this is a defensive, belt-and-suspenders layer for RenderPlist
+// itself, which is exported and could in principle be called directly
+// with an un-validated JobConfig. Every value RenderPlist has ever
+// actually rendered (DNS-label job names, absolute filesystem paths)
+// contains none of the runes escapeXMLString rewrites, so this is a
+// byte-identical no-op for all of them — the golden-file test
+// (TestRenderPlistGolden) is unaffected.
 func RenderPlist(job config.JobConfig, triggerBinPath, jobLogDir string) (string, error) {
 	data := plistData{
-		Label:           labelFor(job.Name),
-		TriggerBinPath:  triggerBinPath,
-		JobName:         job.Name,
+		Label:           escapeXMLString(labelFor(job.Name)),
+		TriggerBinPath:  escapeXMLString(triggerBinPath),
+		JobName:         escapeXMLString(job.Name),
 		CalendarEntries: calendarEntries(job.Calendar),
-		LogPath:         filepath.Join(jobLogDir, "job-"+job.Name+".log"),
+		LogPath:         escapeXMLString(filepath.Join(jobLogDir, "job-"+job.Name+".log")),
 	}
 	var buf bytes.Buffer
 	if err := plistTemplate.Execute(&buf, data); err != nil {
 		return "", fmt.Errorf("scheduler: render plist for job %q: %w", job.Name, err)
 	}
 	return buf.String(), nil
+}
+
+// escapeXMLString XML-escapes s via encoding/xml.EscapeText — the same
+// escaping the standard library's own xml.Marshal applies to character
+// data — so a string interpolated into plist.tmpl's <string> elements can
+// never produce malformed or injected XML (MINOR 3 fix; see RenderPlist's
+// doc comment for the full rationale).
+func escapeXMLString(s string) string {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
+		// xml.EscapeText only ever errors on a write failure from the
+		// underlying io.Writer — a bytes.Buffer's Write never fails, so
+		// this branch is unreachable in practice. Fail safe (return the
+		// raw string) rather than panic: config.Load's jobNamePattern
+		// remains the primary enforcement layer regardless.
+		return s
+	}
+	return buf.String()
 }
 
 // Runner executes one external command to completion, returning its

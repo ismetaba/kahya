@@ -65,6 +65,16 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 	return run()
 }
 
+// syncJobsRunnerFn resolves the scheduler.Runner runSyncJobs uses to talk
+// to launchctl. A package-level func var — the exact same "swap it in a
+// test" seam kahyad/internal/scheduler.currentUIDFn already uses — purely
+// so a hermetic test can inject a fake Runner instead of shelling out to
+// the real launchctl (MINOR 5 fix: runSyncJobs previously had zero
+// automated coverage precisely because scheduler.NewExecRunner() was
+// called inline here with no way to substitute it). Production code never
+// reassigns this; it always resolves to the real scheduler.NewExecRunner().
+var syncJobsRunnerFn = scheduler.NewExecRunner
+
 // runSyncJobs implements the standalone `kahyad -sync-jobs` mode (W4-01
 // task spec step 5): load config, sync ~/Library/LaunchAgents' set of
 // com.kahya.job.<name> plists to exactly match cfg.Jobs, and exit -
@@ -73,6 +83,20 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 // already up). Idempotent: safe to run repeatedly, e.g. from a shell
 // script after editing config.yaml's jobs: section, without restarting
 // the daemon.
+//
+// MINOR 5: the launchctl Runner is resolved via syncJobsRunnerFn (not a
+// direct scheduler.NewExecRunner() call) so main_test.go's
+// TestRunSyncJobsRendersAndBootstrapsConfiguredJobs can inject a fake
+// Runner and drive this dispatch path end to end (real config.Load, real
+// scheduler.Sync decision logic, real plist rendering to a temp
+// $HOME/Library/LaunchAgents) without ever shelling out to the real
+// launchctl or touching the real user's LaunchAgents directory. The
+// underlying decision logic (which plists get written/removed, when
+// bootout+bootstrap fire) is scheduler.Sync's own responsibility and is
+// already thoroughly unit-tested in kahyad/internal/scheduler/
+// launchd_test.go via the same fakeRunner pattern; this test's job is
+// narrower — proving runSyncJobs' own argv/config/exit-code wiring around
+// that already-tested logic is correct.
 func runSyncJobs(stdout, stderr io.Writer) int {
 	traceID := traceid.New()
 
@@ -99,7 +123,7 @@ func runSyncJobs(stdout, stderr io.Writer) int {
 		JobLogDir:       filepath.Join(home, "Library", "Logs", "Kahya"),
 		TriggerBinPath:  cfg.TriggerBinPath,
 	}
-	if err := scheduler.Sync(cfg.Jobs, opts, scheduler.NewExecRunner(), log); err != nil {
+	if err := scheduler.Sync(cfg.Jobs, opts, syncJobsRunnerFn(), log); err != nil {
 		log.Error("sync_jobs_failed", "err", err.Error())
 		return 1
 	}

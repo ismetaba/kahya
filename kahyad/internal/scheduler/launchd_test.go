@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"encoding/xml"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +57,50 @@ func TestRenderPlistOmitsUnsetCalendarFields(t *testing.T) {
 	for _, wanted := range []string{"<key>Minute</key>\n\t\t<integer>30</integer>", "<key>Hour</key>\n\t\t<integer>8</integer>"} {
 		if !strings.Contains(got, wanted) {
 			t.Errorf("rendered plist missing %q:\n%s", wanted, got)
+		}
+	}
+}
+
+// TestRenderPlistEscapesXMLMetacharacters is the MINOR 3 regression test:
+// RenderPlist must defensively XML-escape every string value it
+// interpolates, even though config.Load's jobNamePattern (DNS-label chars
+// only) already rejects a job name containing an XML metacharacter before
+// it could ever reach here in the normal Load -> RenderPlist path — belt
+// and suspenders, exercised here by calling the exported RenderPlist
+// directly with an un-validated JobConfig, bypassing that upstream gate on
+// purpose.
+func TestRenderPlistEscapesXMLMetacharacters(t *testing.T) {
+	job := config.JobConfig{
+		Name:     `a<b&c"d'e`,
+		Handler:  "smoke",
+		Calendar: config.CalendarSpec{Minute: intPtr(0)},
+	}
+	got, err := RenderPlist(job, "/abs/bin/kahya-trigger", "/abs/logs")
+	if err != nil {
+		t.Fatalf("RenderPlist() error = %v", err)
+	}
+
+	// None of the raw metacharacters may appear unescaped in the output.
+	for _, bad := range []string{"<b&c", `"d'e`, "a<b", `d'e"`} {
+		if strings.Contains(got, bad) {
+			t.Errorf("RenderPlist() output contains an unescaped metacharacter sequence %q:\n%s", bad, got)
+		}
+	}
+	// The escaped form must still be present (proves the name round-trips,
+	// rather than being silently dropped).
+	if !strings.Contains(got, "a&lt;b&amp;c&#34;d&#39;e") {
+		t.Errorf("RenderPlist() output does not contain the expected escaped job name:\n%s", got)
+	}
+
+	// The output must still be well-formed XML (a DOCTYPE-bearing plist,
+	// which encoding/xml's tokenizer accepts as a Directive token).
+	dec := xml.NewDecoder(strings.NewReader(got))
+	for {
+		if _, err := dec.Token(); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("RenderPlist() output is not well-formed XML: %v\n%s", err, got)
 		}
 	}
 }

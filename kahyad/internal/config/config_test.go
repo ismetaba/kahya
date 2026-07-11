@@ -520,3 +520,198 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 		t.Fatal("Load() error = nil, want rejection of invalid KAHYA_LOG_LEVEL")
 	}
 }
+
+// jobsTestIntPtr is a local *int helper for building config.CalendarSpec
+// literals in this file's table-driven tests (mirrors kahyad/internal/
+// scheduler's own intPtr test helper — a separate package, so it cannot be
+// reused directly).
+func jobsTestIntPtr(v int) *int { return &v }
+
+// TestValidateJobs is the MINOR 4 fix: validateJobs' fail-closed rules
+// (DNS-label name, duplicate name, empty handler) previously had zero
+// dedicated test coverage, despite every other Load-level fail-closed
+// rule in this file (KAHYA_ENV, log_level, credential_mode) already having
+// its own rejection test. Table-driven, one (or more) subtest per
+// validateJobs branch — calls validateJobs directly (same package) rather
+// than round-tripping through a config.yaml fixture for every case.
+func TestValidateJobs(t *testing.T) {
+	validCalendar := CalendarSpec{Minute: jobsTestIntPtr(30), Hour: jobsTestIntPtr(8)}
+
+	tests := []struct {
+		name    string
+		jobs    []JobConfig
+		wantErr bool
+		errSub  string
+	}{
+		{
+			name: "valid single job with a full calendar spec",
+			jobs: []JobConfig{{Name: "nightly-backup", Handler: "backup", Calendar: validCalendar}},
+		},
+		{
+			name: "valid multiple distinct jobs",
+			jobs: []JobConfig{
+				{Name: "smoke", Handler: "smoke"},
+				{Name: "briefing", Handler: "briefing", Calendar: validCalendar},
+			},
+		},
+		{
+			name: "empty jobs list",
+			jobs: nil,
+		},
+		{
+			name:    "name containing a space rejected",
+			jobs:    []JobConfig{{Name: "night ly", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			name:    "name containing .. rejected",
+			jobs:    []JobConfig{{Name: "night..ly", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			name:    "name with a leading hyphen rejected",
+			jobs:    []JobConfig{{Name: "-nightly", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			name:    "name with a trailing hyphen rejected",
+			jobs:    []JobConfig{{Name: "nightly-", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			name:    "name containing an XML metacharacter rejected",
+			jobs:    []JobConfig{{Name: "night<ly", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			name:    "empty name rejected",
+			jobs:    []JobConfig{{Name: "", Handler: "backup"}},
+			wantErr: true,
+			errSub:  "invalid, must be DNS-label",
+		},
+		{
+			// jobNamePattern is `[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?`
+			// — mixed/upper case IS accepted (the DNS-label constraint here
+			// is about character class + hyphen placement, not casing) —
+			// documented explicitly so a future stricter-casing change
+			// doesn't silently break this on purpose.
+			name: "mixed-case name accepted (pattern allows upper+lower)",
+			jobs: []JobConfig{{Name: "Nightly-Backup", Handler: "backup"}},
+		},
+		{
+			name: "duplicate name rejected",
+			jobs: []JobConfig{
+				{Name: "nightly", Handler: "backup"},
+				{Name: "nightly", Handler: "backup2"},
+			},
+			wantErr: true,
+			errSub:  "declared more than once",
+		},
+		{
+			name:    "empty handler rejected",
+			jobs:    []JobConfig{{Name: "nightly", Handler: ""}},
+			wantErr: true,
+			errSub:  "handler must not be empty",
+		},
+		{
+			name:    "whitespace-only handler rejected",
+			jobs:    []JobConfig{{Name: "nightly", Handler: "   "}},
+			wantErr: true,
+			errSub:  "handler must not be empty",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateJobs(tc.jobs)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("validateJobs() error = nil, want error containing %q", tc.errSub)
+				}
+				if !strings.Contains(err.Error(), tc.errSub) {
+					t.Errorf("validateJobs() error = %q, want it to contain %q", err.Error(), tc.errSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateJobs() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestLoadFileParsesJobsAndCalendarSpec proves cfg.jobs YAML round-trips
+// through the full Load pipeline into Config.Jobs, including a complete
+// CalendarSpec (MINOR 4: "a valid CalendarSpec parses") and that an unset
+// calendar field stays nil (never a spurious zero value).
+func TestLoadFileParsesJobsAndCalendarSpec(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "jobs:\n" +
+		"  - name: briefing\n" +
+		"    handler: briefing\n" +
+		"    calendar:\n" +
+		"      Hour: 8\n" +
+		"      Minute: 30\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Jobs) != 1 {
+		t.Fatalf("Jobs = %v, want exactly 1 entry", cfg.Jobs)
+	}
+	job := cfg.Jobs[0]
+	if job.Name != "briefing" || job.Handler != "briefing" {
+		t.Errorf("Jobs[0] = %+v, want Name=briefing Handler=briefing", job)
+	}
+	if job.Calendar.Hour == nil || *job.Calendar.Hour != 8 {
+		t.Errorf("Jobs[0].Calendar.Hour = %v, want 8", job.Calendar.Hour)
+	}
+	if job.Calendar.Minute == nil || *job.Calendar.Minute != 30 {
+		t.Errorf("Jobs[0].Calendar.Minute = %v, want 30", job.Calendar.Minute)
+	}
+	if job.Calendar.Day != nil {
+		t.Errorf("Jobs[0].Calendar.Day = %v, want nil (unset)", job.Calendar.Day)
+	}
+	if job.Calendar.Weekday != nil {
+		t.Errorf("Jobs[0].Calendar.Weekday = %v, want nil (unset)", job.Calendar.Weekday)
+	}
+}
+
+// TestLoadRejectsInvalidJobName proves Load's fail-closed posture actually
+// extends to cfg.jobs end to end (not merely validateJobs in isolation,
+// covered above) — an invalid job name in config.yaml must fail Load
+// itself, the same as every other fail-closed config rule in this file.
+func TestLoadRejectsInvalidJobName(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "jobs:\n  - name: \"bad name\"\n    handler: smoke\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want rejection of an invalid jobs[].name")
+	}
+}
