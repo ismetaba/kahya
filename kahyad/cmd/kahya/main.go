@@ -48,6 +48,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runHealth(client, stdout, stderr)
 	case "reindex":
 		return runReindex(client, args[1:], stdout, stderr)
+	case "autonomy":
+		return runAutonomy(client, args[1:], stdout, stderr)
+	case "undo":
+		return runUndo(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -159,6 +163,83 @@ func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgReindexSummary+"\n", rr.FilesIndexed, rr.Chunks, rr.DurationMs)
+	return 0
+}
+
+// runAutonomy implements `kahya autonomy` (list ladder state) and
+// `kahya autonomy promote <tool> <class> <scope>` (W3-02's ONLY
+// promotion path - the user must invoke this by hand; nothing else in
+// the system ever raises a ladder level on its own).
+func runAutonomy(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		return runAutonomyList(client, stdout, stderr)
+	}
+	if args[0] == "promote" {
+		return runAutonomyPromote(client, args[1:], stdout, stderr)
+	}
+	fmt.Fprintln(stderr, MsgAutonomyUsage)
+	return 2
+}
+
+// runAutonomyList implements `kahya autonomy`: GET /policy/state, printed
+// as one line per (tool, class, scope) triple.
+func runAutonomyList(client *Client, stdout, stderr io.Writer) int {
+	states, err := client.PolicyState(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if len(states) == 0 {
+		fmt.Fprintln(stdout, MsgAutonomyEmpty)
+		return 0
+	}
+	for _, st := range states {
+		fmt.Fprintf(stdout, MsgAutonomyRow+"\n", st.Tool, st.Class, st.Scope, st.Level, st.ConsecutiveApprovals)
+	}
+	return 0
+}
+
+// runAutonomyPromote implements `kahya autonomy promote <tool> <class>
+// <scope>`.
+func runAutonomyPromote(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 3 {
+		fmt.Fprintln(stderr, MsgAutonomyPromoteUsage)
+		return 2
+	}
+	tool, class, scope := args[0], args[1], args[2]
+	level, err := client.PolicyPromote(context.Background(), traceid.New(), tool, class, scope)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgAutonomyPromoted+"\n", tool, class, scope, level)
+	return 0
+}
+
+// runUndo implements `kahya undo --trace <id>`: triggers the registered
+// undo window for that trace while it is still open (HANDOFF S4 ladder
+// L2 row - 5-minute grace period on an auto-allowed W1 write). Recipe
+// EXECUTION itself is delegated to the owning tool (W3-03) - this command
+// only opens/closes the window server-side.
+func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("undo", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	trace := fs.String("trace", "", "geri al: bu trace_id'nin acik geri-alma penceresini tetikle")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	*trace = strings.TrimSpace(*trace)
+	if *trace == "" {
+		fmt.Fprintln(stderr, MsgUndoTraceRequired)
+		return 2
+	}
+
+	tool, err := client.PolicyUndo(context.Background(), traceid.New(), *trace)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 1
+	}
+	fmt.Fprintf(stdout, MsgUndoTriggered+"\n", tool)
 	return 0
 }
 

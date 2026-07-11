@@ -8,6 +8,26 @@ import (
 	"database/sql"
 )
 
+type ApprovalToken struct {
+	TokenHash         string         `json:"token_hash"`
+	TaskID            string         `json:"task_id"`
+	TraceID           string         `json:"trace_id"`
+	Tool              string         `json:"tool"`
+	ApprovedBytesHash string         `json:"approved_bytes_hash"`
+	MintedAt          string         `json:"minted_at"`
+	ExpiresAt         string         `json:"expires_at"`
+	ConsumedAt        sql.NullString `json:"consumed_at"`
+}
+
+type AutonomyState struct {
+	Tool                 string `json:"tool"`
+	Class                string `json:"class"`
+	Scope                string `json:"scope"`
+	Level                int64  `json:"level"`
+	ConsecutiveApprovals int64  `json:"consecutive_approvals"`
+	UpdatedAt            string `json:"updated_at"`
+}
+
 type Chunk struct {
 	ID          int64  `json:"id"`
 	EpisodeID   int64  `json:"episode_id"`
@@ -110,4 +130,14 @@ type Task struct {
 	Envelope  sql.NullString `json:"envelope"`
 	UpdatedAt string         `json:"updated_at"`
 	CreatedAt string         `json:"created_at"`
+}
+
+type UndoWindow struct {
+	ID       int64  `json:"id"`
+	TaskID   string `json:"task_id"`
+	Tool     string `json:"tool"`
+	TraceID  string `json:"trace_id"`
+	OpenedAt string `json:"opened_at"`
+	Deadline string `json:"deadline"`
+	State    string `json:"state"`
 }

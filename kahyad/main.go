@@ -208,6 +208,18 @@ func run() int {
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(cfg.MemoryDir, idx)
 
+	// W3-02: the binding autonomy-ladder decision engine, consulted by
+	// POST /policy/check, POST /policy/consume-token, POST /policy/
+	// feedback, GET /policy/state, POST /policy/promote, POST /policy/undo,
+	// and mcp.go's /v1/mcp policyGateMiddleware. pol is the SAME loaded
+	// (or, on load failure, zero-value) Policy resolved above for
+	// deny-all's own decision - constructed unconditionally so
+	// s.policyEngine is never a bare nil even in deny-all mode (denyAll
+	// itself already short-circuits every caller before the engine would
+	// ever be consulted; see server.Server.SetDenyAll's doc comment).
+	policyEngine := policy.NewEngine(pol, st.Queries, st)
+	srv.SetPolicyEngine(policyEngine)
+
 	// POST /v1/task (W12-07): st.Queries already has exactly the
 	// InsertTask/UpdateTaskState/UpdateTaskSession method shape
 	// server.TaskStore needs, so it satisfies the interface directly with
@@ -288,15 +300,28 @@ func run() int {
 		}
 	}()
 
+	// W3-02: sweep expired undo_windows rows (deadline passed, still
+	// state="open" -> "expired" + ledger undo_window_expired) every 30s,
+	// for as long as kahyad runs. Same ctx-cancelled-then-joined pattern as
+	// the boot reindex goroutine above (BLOCKER 2's reasoning applies
+	// identically: a sweep must never race st.Close() on shutdown).
+	var undoSweepDone sync.WaitGroup
+	undoSweepDone.Add(1)
+	go func() {
+		defer undoSweepDone.Done()
+		policyEngine.RunUndoSweeper(ctx, 30*time.Second)
+	}()
+
 	runErr := srv.Run(ctx)
 
 	// Cancel ctx explicitly (a no-op if a shutdown signal already fired
-	// it) and WAIT for the boot reindex goroutine to observe the
-	// cancellation and finish its in-flight per-file transaction, before
-	// this function returns - so this always completes strictly before the
-	// deferred st.Close() call above (BLOCKER 2).
+	// it) and WAIT for the boot reindex goroutine (and the undo-window
+	// sweeper) to observe the cancellation and finish any in-flight work,
+	// before this function returns - so this always completes strictly
+	// before the deferred st.Close() call above (BLOCKER 2).
 	stop()
 	reindexDone.Wait()
+	undoSweepDone.Wait()
 
 	// Stop kills the embed service's entire process GROUP (SIGKILL) and
 	// suppresses its restart-with-backoff loop - launchd holds only

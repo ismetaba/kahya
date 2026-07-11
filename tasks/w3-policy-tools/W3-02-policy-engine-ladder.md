@@ -1,6 +1,6 @@
 # W3-02 — Policy engine: autonomy ladder + one-time approval tokens
 
-**Status:** todo
+**Status:** done
 **Phase:** W3 — Policy + tools
 **Depends on:** W3-01, W12-07
 **Flags:** none

@@ -10,7 +10,23 @@ import (
 )
 
 type Querier interface {
+	// The single atomic single-use guarantee (HANDOFF S5 safety #5): only the
+	// FIRST caller to run this UPDATE against a given token_hash ever affects
+	// a row (consumed_at IS NULL is only ever true once); every later call
+	// against the same token_hash - correct bytes or not - affects 0 rows and
+	// kahyad/internal/policy/tokens.go treats that as a replay/unknown-token
+	// failure. Bytes-hash/expiry comparison happens in Go, in a follow-up
+	// GetApprovalToken call, AFTER this UPDATE has already burned the token -
+	// so even a wrong-hash first presentation consumes it (no multi-guess
+	// window against a live token).
+	ConsumeApprovalToken(ctx context.Context, arg ConsumeApprovalTokenParams) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
+	GetApprovalToken(ctx context.Context, tokenHash string) (ApprovalToken, error)
+	// W3-02 (autonomy ladder engine) queries below: autonomy_state,
+	// approval_tokens, undo_windows. See migrations/0003_autonomy_policy.sql
+	// for the schema and kahyad/internal/policy/engine.go + tokens.go for the
+	// only two callers.
+	GetAutonomyState(ctx context.Context, arg GetAutonomyStateParams) (AutonomyState, error)
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (Episode, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 	// filter by source, which is fine for callers that only ever use one
@@ -18,10 +34,18 @@ type Querier interface {
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
 	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error)
+	// Sessions/tasks are not guaranteed to open exactly one undo window per
+	// trace_id, so this returns the most recently opened OPEN one - the same
+	// "most recent wins" convention GetTaskBySession above already uses.
+	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (UndoWindow, error)
 	// Sessions are not currently guaranteed to map to exactly one task row
 	// (resume/retry may append more), so this returns the most recently
 	// updated task for the session.
 	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (Task, error)
+	// consumed_at starts NULL (a literal, not a param - see
+	// ConsumeApprovalToken below for the only statement that ever sets it).
+	InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error
+	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (Episode, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
@@ -29,7 +53,9 @@ type Querier interface {
 	// regenerates the whole package from the union of every *.sql file here.
 	InsertEvent(ctx context.Context, arg InsertEventParams) (Event, error)
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
+	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
+	ListAutonomyState(ctx context.Context) ([]AutonomyState, error)
 	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
 	// W12-08 (anthproxy cost governor): boot-time rebuild reads every
 	// historical event of one kind (e.g. 'model_call') and replays it into
@@ -38,7 +64,14 @@ type Querier interface {
 	// row into an anthproxy.BootEvent.
 	ListEventsByKind(ctx context.Context, kind string) ([]Event, error)
 	ListEventsByTrace(ctx context.Context, traceID string) ([]Event, error)
+	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
+	SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error
+	// Update-half of an application-level upsert (kahyad/internal/policy
+	// calls this first; a 0-rows-affected result means no row exists yet, so
+	// it falls back to InsertAutonomyState - the same "upsert (update half)"
+	// pattern UpdateEpisodeContent above already uses in this file).
+	UpdateAutonomyState(ctx context.Context, arg UpdateAutonomyStateParams) (int64, error)
 	// Upserts (update half) an existing memory_file episode in place on
 	// new/changed content: same id, fresh hash/tier, status forced back to
 	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).

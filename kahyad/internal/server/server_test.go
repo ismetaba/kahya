@@ -18,8 +18,44 @@ import (
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/store"
 )
+
+// testPolicyDoc is a small, hand-built policy.Policy covering every tool
+// name this package's tests exercise - memory_search/memory_write/
+// memory_forget (R/W1/W1) plus fs_write (W1) and mail_send (W3) for
+// engine-wiring coverage. Built directly (not via policy.Load) so tests
+// don't depend on the repo-root policy.yaml's exact contents.
+func testPolicyDoc() policy.Policy {
+	tools := []policy.ToolRule{
+		{Name: "memory_search", Class: policy.ClassR, ScopeKey: "global"},
+		{Name: "memory_write", Class: policy.ClassW1, ScopeKey: "global"},
+		{Name: "memory_forget", Class: policy.ClassW1, ScopeKey: "global"},
+		{Name: "fs_write", Class: policy.ClassW1, ScopeKey: "global"},
+		{Name: "mail_send", Class: policy.ClassW3, ScopeKey: "global"},
+	}
+	byName := make(map[string]policy.ToolRule, len(tools))
+	for _, t := range tools {
+		byName[t.Name] = t
+	}
+	return policy.Policy{Tools: tools, ToolsByName: byName}
+}
+
+// seedAutonomyState directly inserts an autonomy_state row (bypassing the
+// engine's own Promote path) so a test can exercise an ALREADY-earned
+// ladder level without going through 20 real approvals + a promote call.
+func seedAutonomyState(t *testing.T, st *store.Store, tool, class, scope string, level int) {
+	t.Helper()
+	_, err := st.DB().Exec(
+		`INSERT INTO autonomy_state (tool, class, scope, level, consecutive_approvals, updated_at) VALUES (?, ?, ?, ?, 0, ?)`,
+		tool, class, scope, level, "2026-01-01T00:00:00Z",
+	)
+	if err != nil {
+		t.Fatalf("seed autonomy_state: %v", err)
+	}
+}
 
 // shortSocketDir returns a short-path temp dir suitable for unix sockets.
 // macOS unix socket paths are capped around ~104 bytes; t.TempDir() nests

@@ -274,8 +274,14 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 
 // TestMigrationFromV1UpgradesToV2 is the W12-03 acceptance-criterion
 // regression test: a brain.db that only ever saw migration 0001 (as every
-// pre-W12-03 database did) must migrate cleanly up to schema version 2
-// (chunks_fts_tri/chunks_fts_uni/chunk_vec) the next time kahyad boots.
+// pre-W12-03 database did) must migrate cleanly up to the latest embedded
+// schema version (chunks_fts_tri/chunks_fts_uni/chunk_vec from 0002, and -
+// since W3-02 - autonomy_state/approval_tokens/undo_windows from 0003) the
+// next time kahyad boots. The expected latest version is asserted as 3
+// (0001+0002+0003); bump this literal, deliberately, the next time a new
+// migration file is added - this is the one place in the test suite that
+// pins "the latest goose version kahyad ships" as a number, so a forgotten
+// migration file never silently passes this gate.
 func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	cfg := testCfg(t)
 
@@ -313,21 +319,22 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	if s.SchemaVersion() != 2 {
-		t.Errorf("SchemaVersion() after upgrade = %d, want 2", s.SchemaVersion())
+	const latestVersion = 3
+	if s.SchemaVersion() != latestVersion {
+		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}
 	var userVersion int64
 	if err := s.DB().QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatalf("PRAGMA user_version: %v", err)
 	}
-	if userVersion != 2 {
-		t.Errorf("PRAGMA user_version after upgrade = %d, want 2", userVersion)
+	if userVersion != latestVersion {
+		t.Errorf("PRAGMA user_version after upgrade = %d, want %d", userVersion, latestVersion)
 	}
 
 	got = tableNames(t, s.DB())
-	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec"} {
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows"} {
 		if !got[name] {
-			t.Errorf("table %q missing after v1->v2 upgrade; tables = %v", name, got)
+			t.Errorf("table %q missing after v1->latest upgrade; tables = %v", name, got)
 		}
 	}
 }

@@ -75,6 +75,7 @@ func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	srv.SetSearcher(searcher)
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(memDir, idx)
+	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -178,6 +179,7 @@ func newMCPTestFixtureDenyAll(t *testing.T) mcpTestFixture {
 	srv.SetSearcher(searcher)
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(memDir, idx)
+	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
 	srv.SetDenyAll()
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -217,8 +219,9 @@ func TestMCPGateDenyAllModeDeniesEvenMemorySearch(t *testing.T) {
 
 // TestMCPGateDeniesMemoryWriteWithTurkishReasonAndLedgers is the first
 // half of the step-9 gate test: a memory_write tools/call THROUGH
-// /v1/mcp is denied with the interim policy's exact Turkish reason, no
-// file/commit is created, and a policy_decision ledger row is added.
+// /v1/mcp, at fresh (L0) autonomy state, needs approval (W1 requires L2)
+// with the ladder engine's exact Turkish reason, no file/commit is
+// created, and a policy_decision ledger row is added.
 func TestMCPGateDeniesMemoryWriteWithTurkishReasonAndLedgers(t *testing.T) {
 	f := newMCPTestFixture(t)
 
@@ -232,9 +235,9 @@ func TestMCPGateDeniesMemoryWriteWithTurkishReasonAndLedgers(t *testing.T) {
 		t.Fatalf("decode: %v\nbody=%s", err, body)
 	}
 	if !parsed.Result.IsError {
-		t.Fatalf("result.isError = false, want true (denied); body=%s", body)
+		t.Fatalf("result.isError = false, want true (needs approval); body=%s", body)
 	}
-	wantReason := "W3 politika altyapısı gelene dek yalnız hafıza araması (memory_search) açık."
+	wantReason := policy.ReasonNeedsApproval
 	if len(parsed.Result.Content) == 0 || parsed.Result.Content[0].Text != wantReason {
 		t.Fatalf("deny message = %+v, want %q", parsed.Result.Content, wantReason)
 	}
@@ -294,11 +297,15 @@ func TestMCPGateDeniesMemoryForgetAndUnknownTool(t *testing.T) {
 }
 
 // TestMCPGateAllowsMemorySearchThroughHTTP is the allow-side complement:
-// memory_search is not denied, and it too gets ledgered as a
-// policy_decision (allow), matching /policy/check's "one ledger insert
-// per decision" convention regardless of outcome.
+// once memory_search/R/global has been promoted to L1 (the ladder's
+// auto-R threshold - a fresh, unpromoted L0 state needs approval even for
+// reads, per HANDOFF S4's ladder table), a memory_search call is not
+// denied, and it too gets ledgered as a policy_decision (allow), matching
+// /policy/check's "one ledger insert per decision" convention regardless
+// of outcome.
 func TestMCPGateAllowsMemorySearchThroughHTTP(t *testing.T) {
 	f := newMCPTestFixture(t)
+	seedAutonomyState(t, f.store, "memory_search", "R", "global", 1)
 
 	resp := postMCP(t, f.client, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"test"}}}`)
 	defer resp.Body.Close()

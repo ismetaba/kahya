@@ -26,9 +26,9 @@ import (
 // (kahyad/internal/server.Server.SetDenyAll): every /policy/check and
 // /v1/mcp tools/call answer is deny, for every tool name (including
 // memory_search), because policy.yaml failed to load/validate at boot.
-// This is a DIFFERENT rule string from RuleInterimStaticV1 (interim.go)
+// This is a DIFFERENT rule string from RuleLadderV1 (engine.go)
 // specifically so a deny-all-mode decision is visibly distinguishable, in
-// the ledger/response, from an ordinary interim-table deny.
+// the ledger/response, from an ordinary ladder-engine deny.
 const RuleDenyAllV1 = "deny-all-v1"
 
 // ReasonDenyAll is the Turkish user-facing deny reason returned for EVERY

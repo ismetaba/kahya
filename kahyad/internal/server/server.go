@@ -104,6 +104,12 @@ type Server struct {
 	// 4). See SetTaskStore's doc comment.
 	taskStore TaskStore
 
+	// policyEngine is the W3-02 autonomy-ladder decision engine consulted
+	// by handlePolicyCheck (task.go) and policyGateMiddleware (mcp.go),
+	// once s.denyAll itself is not already overriding the decision. See
+	// SetPolicyEngine's doc comment (mcp.go).
+	policyEngine *policy.Engine
+
 	// anthGovernor/anthNotifier/anthCredential/anthEgressGate wire POST
 	// /v1/task's per-task Anthropic forward-proxy + cost governor
 	// (W12-08). See SetAnthproxy's doc comment (task.go).
@@ -218,6 +224,11 @@ func (s *Server) Prepare() error {
 	mux.Handle("/v1/mcp", s.buildMCPHandler())
 	mux.HandleFunc("/v1/task", s.handleTask)
 	mux.HandleFunc("/policy/check", s.handlePolicyCheck)
+	mux.HandleFunc("/policy/consume-token", s.handlePolicyConsumeToken)
+	mux.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
+	mux.HandleFunc("/policy/state", s.handlePolicyState)
+	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
+	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

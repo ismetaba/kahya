@@ -227,6 +227,109 @@ func (c *Client) Reindex(ctx context.Context, traceID string, full, reEmbed bool
 	return rr, nil
 }
 
+// policyStateRow mirrors kahyad's GET /policy/state row shape
+// (kahyad/internal/server.policyStateRow, W3-02).
+type policyStateRow struct {
+	Tool                 string `json:"tool"`
+	Class                string `json:"class"`
+	Scope                string `json:"scope"`
+	Level                int64  `json:"level"`
+	ConsecutiveApprovals int64  `json:"consecutive_approvals"`
+	UpdatedAt            string `json:"updated_at"`
+}
+
+// PolicyState calls GET /policy/state (`kahya autonomy`'s ladder dump).
+func (c *Client) PolicyState(ctx context.Context, traceID string) ([]policyStateRow, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/policy/state", traceID, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/state: status %d", resp.StatusCode)}
+	}
+	var sr struct {
+		States []policyStateRow `json:"states"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/state: decode response: %w", err)}
+	}
+	return sr.States, nil
+}
+
+// PolicyPromote calls POST /policy/promote {tool,class,scope}
+// (`kahya autonomy promote <tool> <class> <scope>` - the ONLY promotion
+// path, W3-02). Returns the new (post-promotion) level.
+func (c *Client) PolicyPromote(ctx context.Context, traceID, tool, class, scope string) (int, error) {
+	body, err := json.Marshal(map[string]string{"trace_id": traceID, "tool": tool, "class": class, "scope": scope})
+	if err != nil {
+		return 0, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/policy/promote", traceID, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	var pr struct {
+		Level int    `json:"level"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/promote: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if pr.Error != "" {
+			return 0, fmt.Errorf("%s", pr.Error)
+		}
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/promote: status %d", resp.StatusCode)}
+	}
+	return pr.Level, nil
+}
+
+// PolicyUndo calls POST /policy/undo {trace_id} (`kahya undo --trace
+// <id>`, W3-02). Returns the tool name whose undo window was triggered.
+func (c *Client) PolicyUndo(ctx context.Context, traceID, targetTraceID string) (string, error) {
+	body, err := json.Marshal(map[string]string{"trace_id": targetTraceID})
+	if err != nil {
+		return "", err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/policy/undo", traceID, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var ur struct {
+		OK    bool   `json:"ok"`
+		Tool  string `json:"tool,omitempty"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ur); err != nil {
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK || !ur.OK {
+		if ur.Error != "" {
+			return "", fmt.Errorf("%s", ur.Error)
+		}
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: status %d", resp.StatusCode)}
+	}
+	return ur.Tool, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

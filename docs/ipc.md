@@ -246,31 +246,47 @@ Request:
 `mcp__<server>__<tool>` prefix (e.g.
 `mcp__kahya_memory__memory_search`) is stripped down to the bare tool name
 (`memory_search`) — built-in tools arrive bare already
-(`kahyad/internal/policy.Canonicalize`).
+(`kahyad/internal/policy.Canonicalize`). `scope` is optional (defaults to
+`"global"`) — the ladder's third key dimension alongside `tool`; `class`
+is never accepted from the caller, only ever resolved from the loaded
+`policy.yaml`.
 
 Response:
 
 ```json
-{"decision": "allow", "rule": "interim-static-v1"}
+{"decision": "allow", "rule": "ladder-v1", "token": "<hex, only for a side-effectful class>"}
 ```
 
 or
 
 ```json
-{"decision": "deny", "reason": "<Turkish>", "rule": "interim-static-v1"}
+{"decision": "needs_approval", "reason": "<Turkish>", "rule": "ladder-v1", "pending_approval_id": "<opaque>"}
 ```
 
-**Interim static table** (`kahyad/internal/policy`, package doc: "one
-table, two mount points, never a second copy" — this SAME table also
-gates `POST /v1/mcp`'s `tools/call` dispatch, W12-05). Binding until
-W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
+or
 
-- **Allow, exactly:** `memory_search`.
-- **Deny** (reason `"W3 politika altyapısı gelene dek yalnız hafıza araması (memory_search) açık."`): `memory_write`, `memory_forget`, and every SDK built-in R-class tool — `Read`, `Glob`, `Grep` — plus `Bash`, `WebFetch`, `WebSearch`, `Write`, `Edit`. `Read`/`Glob`/`Grep` are denied *even though R-class actions are nominally auto-approved* per the §4 autonomy ladder, because no secret-lane classification exists before W3-01's `policy.yaml` globs land — HANDOFF §4's ordering invariant ("hiçbir bayt, gizli-şerit sınıflandırması yerel/deterministik olarak tamamlanmadan bulut modele gitmez") means an allowed file read could put unclassified bytes in front of a cloud model with no classification having happened. `memory_search`'s corpus is the user-reviewed seed, which is a designed exception.
-- **Deny, unknown tool** (reason `"Tanınmayan araç reddedildi (fail-closed)."`): any tool name not in the table at all — a distinct reason from the known-deny case, so a typo'd or future tool name is visibly distinguishable in logs/ledger.
+```json
+{"decision": "deny", "reason": "<Turkish>", "rule": "ladder-v1"}
+```
+
+**W3-02 autonomy-ladder engine** (`kahyad/internal/policy/engine.go`,
+replacing W12-07's interim static table — "one engine, two mount points,
+never a second copy": the SAME engine also gates `POST /v1/mcp`'s
+`tools/call` dispatch). Given (tool, class, scope): look up the tool in
+the loaded `policy.yaml` (missing ⇒ `deny`, reason
+`"Tanınmayan araç reddedildi (fail-closed)."`); look up
+`autonomy_state(tool,class,scope)` (missing row ⇒ L0); apply the HANDOFF
+§4 ladder table (R auto at L1+, W1 at L2+ — opening a 5-minute
+`undo_windows` row — W2 at L3+; **W3 never auto-allows, at any level,
+hard-coded in Go**). `allow` on a non-R class mints a one-time approval
+token (bound to `task_id` + a sha256 of `tool_input`) the caller must
+present to `POST /policy/consume-token` before executing; `needs_approval`
+returns an opaque `pending_approval_id` an approval surface later resolves
+via `POST /policy/feedback`.
+
 - **Malformed request body, or one over the 1 MiB cap above, ⇒ HTTP 400 or
   413**, but the body still says `{"decision":"deny",...}` (`rule` still
-  `"interim-static-v1"`, `reason` `"Geçersiz istek gövdesi
+  `"ladder-v1"`, `reason` `"Geçersiz istek gövdesi
   (fail-closed)."`) — so a sloppy client cannot parse an "allow" out of a
   transport-level error. A best-effort `policy_decision` ledger row IS
   still written for this case, under the `trace_id` `withTraceLogging`
@@ -279,20 +295,23 @@ W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
   too, so evidence that a deny happened is never silently dropped just
   because the body couldn't be parsed.
 
-**Ledger:** every well-formed decision writes exactly one
-`kind='policy_decision'` event, payload = the full request (`trace_id`,
-`task_id`, `session_id`, `tool_name`, `tool_input`) plus the decision
-(`decision`, `rule`, and `reason` when denied) — under the request's own
-`trace_id`.
+**Ledger:** every decision writes exactly one `kind='policy_decision'`
+event, payload includes `event`, `tool`, `class`, `scope`, `level`,
+`decision`, `task_id` (and `reason` when not `allow`) — under the
+request's own `trace_id`. See `kahyad/internal/policy/README.md` for the
+full wire schema of `/policy/consume-token`, `/policy/feedback`,
+`/policy/state`, `/policy/promote`, and `/policy/undo`.
 
 ## 7 · Cross-references
 
 - SSE contract, CLI-side: `kahyad/cmd/kahya/client.go` (`StreamTask`,
   `readSSE`), frozen in W12-06's task file.
-- Interim policy table + `/v1/mcp` gate: `kahyad/internal/policy`,
-  `kahyad/internal/server/mcp.go` (W12-05).
+- Autonomy-ladder engine + `/v1/mcp` gate: `kahyad/internal/policy`
+  (`engine.go`, `tokens.go`, `README.md`), `kahyad/internal/server/mcp.go`
+  (W12-05/W3-02).
 - `tasks`/`events` schema: `kahyad/migrations/0001_init_schema.sql`
-  (W12-02).
+  (W12-02); `autonomy_state`/`approval_tokens`/`undo_windows`:
+  `kahyad/migrations/0003_autonomy_policy.sql` (W3-02).
 
 ## 8 · Out of scope / what changes later
 
@@ -312,10 +331,16 @@ W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
   nil/always-allow stub until W3-05 fills in the real allowlist, and the
   "→yerel" downgrade rung stays unavailable (ledgered as
   `budget_downgrade_unavailable`) until W3-08's local lane lands.
-- **Real policy** (`policy.yaml`, autonomy ladder, one-time approval
-  tokens, W1 5-minute undo) — W3-01/W3-02. This document's §6 table is
-  explicitly interim and will be replaced; the endpoint's request/response
-  *shape* is what's frozen, not today's allow/deny table.
+- **Approval surface rendering** (Telegram inline buttons, CLI "onayla" +
+  byte-exact WYSIWYE diff, Hammerspoon cards) — W3-06/W3-07/W6-01. W3-02
+  only exposes the engine API those surfaces call
+  (`POST /policy/feedback`'s `approve`/`deny`, and the `pending_approval_id`
+  a decision returns); until then, an approval can only be driven by hand
+  (`curl`/tests) or via `kahya autonomy promote`.
+- **Undo recipe implementations** (Trash restore, git checkpoint restore,
+  ...) — W3-03. `kahya undo --trace <id>` / `POST /policy/undo` only
+  trigger the window + demotion; executing the actual recipe is the owning
+  tool's job.
 - **Session resume, receipts, retries, outbox dispatch** — W4-02.
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — W4-08. W1-2's `model` is

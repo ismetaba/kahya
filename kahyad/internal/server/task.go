@@ -414,23 +414,30 @@ func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string,
 }
 
 // policyCheckRequest is POST /policy/check's request body (HANDOFF §4 IPC
-// ⚑, frozen in docs/ipc.md).
+// ⚑, frozen in docs/ipc.md; W3-02 adds scope - the ladder's third key
+// dimension alongside tool/class, class itself is NEVER accepted from the
+// caller, only ever resolved from the loaded policy.yaml).
 type policyCheckRequest struct {
 	TraceID   string          `json:"trace_id"`
 	TaskID    string          `json:"task_id"`
 	SessionID *string         `json:"session_id"`
 	ToolName  string          `json:"tool_name"`
 	ToolInput json.RawMessage `json:"tool_input"`
+	Scope     string          `json:"scope,omitempty"`
 }
 
-// policyCheckResponse is POST /policy/check's response body. Reason is
-// omitted (not just empty) on an allow decision - the task spec's example
-// only shows it present on deny, and omitempty keeps an allow response
-// minimal.
+// policyCheckResponse is POST /policy/check's response body (W3-02 adds
+// pending_approval_id/token). Reason/PendingApprovalID/Token are omitted
+// (not just empty) whenever they don't apply to the returned decision:
+// PendingApprovalID only appears on "needs_approval"; Token only appears
+// on "allow" for a side-effectful (non-R) class, so the calling tool can
+// present it to POST /policy/consume-token before executing.
 type policyCheckResponse struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason,omitempty"`
-	Rule     string `json:"rule"`
+	Decision          string `json:"decision"`
+	Reason            string `json:"reason,omitempty"`
+	Rule              string `json:"rule"`
+	PendingApprovalID string `json:"pending_approval_id,omitempty"`
+	Token             string `json:"token,omitempty"`
 }
 
 // malformedBodyDeny is the fixed response body a malformed POST
@@ -438,17 +445,18 @@ type policyCheckResponse struct {
 // per the task spec, "so a sloppy client can't parse an allow out of an
 // error" - fail-closed applies to the transport layer too.
 var malformedBodyDeny = policyCheckResponse{
-	Decision: "deny",
+	Decision: policy.ResultDeny,
 	Reason:   "Geçersiz istek gövdesi (fail-closed).",
-	Rule:     policy.RuleInterimStaticV1,
+	Rule:     policy.RuleLadderV1,
 }
 
 // handlePolicyCheck implements POST /policy/check (HANDOFF §4 IPC ⚑:
 // HTTP-over-UDS, 5s caller-side timeout, fail-closed on any error/timeout).
-// It reuses kahyad/internal/policy's interim static table - the EXACT SAME
-// one mcp.go's /v1/mcp gate already consults (one table, two mount
-// points). No I/O beyond a single ledger insert per decision, well inside
-// the caller's 5s budget.
+// It consults kahyad/internal/policy's W3-02 autonomy-ladder Engine - the
+// EXACT SAME one mcp.go's /v1/mcp gate already consults (one engine, two
+// mount points). No I/O beyond what Engine.Check itself does (one
+// autonomy_state read, at most one approval_tokens/undo_windows write, one
+// ledger insert), well inside the caller's 5s budget.
 func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	// BLOCKER 3: cap the body BEFORE decoding - the endpoint's whole 5s
 	// fail-closed budget (HANDOFF §4 IPC ⚑) must never be at risk from an
@@ -476,42 +484,51 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W3-01: deny-all mode overrides the interim table entirely - even
-	// memory_search - whenever policy.yaml failed to load/validate at
-	// boot (see kahyad/internal/server.Server.SetDenyAll's doc comment).
-	var decision policy.Decision
-	if s.denyAll {
-		decision = policy.Decision{Allow: false, Reason: policy.ReasonDenyAll, Rule: policy.RuleDenyAllV1}
-	} else {
-		decision = policy.Check(req.ToolName)
-	}
-
 	traceID := req.TraceID
 	if traceID == "" {
 		traceID = traceIDFromContext(r)
 	}
-	if s.eventLogger != nil {
-		payload := map[string]any{
-			"trace_id":   traceID,
-			"task_id":    req.TaskID,
-			"session_id": req.SessionID,
-			"tool_name":  req.ToolName,
-			"tool_input": req.ToolInput,
-			"decision":   allowDenyString(decision.Allow),
-			"rule":       decision.Rule,
+
+	// W3-01: deny-all mode overrides the ladder engine entirely - even
+	// memory_search - whenever policy.yaml failed to load/validate at
+	// boot (see kahyad/internal/server.Server.SetDenyAll's doc comment).
+	// Engine.Check is never called in this mode, so the deny is ledgered
+	// here by hand instead (mirrors mcp.go's policyGateMiddleware).
+	if s.denyAll {
+		if s.eventLogger != nil {
+			payload := map[string]any{
+				"event": "policy_decision", "tool": policy.Canonicalize(req.ToolName),
+				"task_id": req.TaskID, "decision": policy.ResultDeny,
+				"rule": policy.RuleDenyAllV1, "reason": policy.ReasonDenyAll,
+			}
+			if err := s.eventLogger.LogEvent(r.Context(), traceID, "policy_decision", payload); err != nil {
+				s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
+			}
 		}
-		if decision.Reason != "" {
-			payload["reason"] = decision.Reason
-		}
-		if err := s.eventLogger.LogEvent(r.Context(), traceID, "policy_decision", payload); err != nil {
-			s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
-		}
+		writeJSON(w, http.StatusOK, policyCheckResponse{Decision: policy.ResultDeny, Reason: policy.ReasonDenyAll, Rule: policy.RuleDenyAllV1})
+		return
+	}
+	if s.policyEngine == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "policy engine not available")
+		return
+	}
+
+	decision, err := s.policyEngine.Check(r.Context(), policy.CheckInput{
+		Tool: req.ToolName, Scope: req.Scope, TaskID: req.TaskID, TraceID: traceID, ToolInput: req.ToolInput,
+	})
+	if err != nil {
+		// Engine.Check already returned a fail-closed Deny decision AND
+		// ledgered it even on error (its own doc comment) - err here is
+		// purely diagnostic (e.g. a DB error), logged but not re-ledgered.
+		s.log.With(traceID).Warn("policy_check_engine_error", "tool", req.ToolName, "err", err.Error())
 	}
 
 	writeJSON(w, http.StatusOK, policyCheckResponse{
-		Decision: allowDenyString(decision.Allow),
-		Reason:   decision.Reason,
-		Rule:     decision.Rule,
+		Decision:          decision.Result,
+		Reason:            decision.Reason,
+		Rule:              decision.Rule,
+		PendingApprovalID: decision.PendingApprovalID,
+		Token:             decision.Token,
 	})
 }
 

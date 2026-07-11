@@ -10,6 +10,34 @@ import (
 	"database/sql"
 )
 
+const consumeApprovalToken = `-- name: ConsumeApprovalToken :execrows
+UPDATE approval_tokens
+SET consumed_at = ?
+WHERE token_hash = ? AND consumed_at IS NULL
+`
+
+type ConsumeApprovalTokenParams struct {
+	ConsumedAt sql.NullString `json:"consumed_at"`
+	TokenHash  string         `json:"token_hash"`
+}
+
+// The single atomic single-use guarantee (HANDOFF S5 safety #5): only the
+// FIRST caller to run this UPDATE against a given token_hash ever affects
+// a row (consumed_at IS NULL is only ever true once); every later call
+// against the same token_hash - correct bytes or not - affects 0 rows and
+// kahyad/internal/policy/tokens.go treats that as a replay/unknown-token
+// failure. Bytes-hash/expiry comparison happens in Go, in a follow-up
+// GetApprovalToken call, AFTER this UPDATE has already burned the token -
+// so even a wrong-hash first presentation consumes it (no multi-guess
+// window against a live token).
+func (q *Queries) ConsumeApprovalToken(ctx context.Context, arg ConsumeApprovalTokenParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, consumeApprovalToken, arg.ConsumedAt, arg.TokenHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
 DELETE FROM chunks WHERE episode_id = ?
 `
@@ -17,6 +45,59 @@ DELETE FROM chunks WHERE episode_id = ?
 func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) error {
 	_, err := q.db.ExecContext(ctx, deleteChunksByEpisode, episodeID)
 	return err
+}
+
+const getApprovalToken = `-- name: GetApprovalToken :one
+SELECT token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at
+FROM approval_tokens
+WHERE token_hash = ?
+`
+
+func (q *Queries) GetApprovalToken(ctx context.Context, tokenHash string) (ApprovalToken, error) {
+	row := q.db.QueryRowContext(ctx, getApprovalToken, tokenHash)
+	var i ApprovalToken
+	err := row.Scan(
+		&i.TokenHash,
+		&i.TaskID,
+		&i.TraceID,
+		&i.Tool,
+		&i.ApprovedBytesHash,
+		&i.MintedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+	)
+	return i, err
+}
+
+const getAutonomyState = `-- name: GetAutonomyState :one
+
+SELECT tool, class, scope, level, consecutive_approvals, updated_at
+FROM autonomy_state
+WHERE tool = ? AND class = ? AND scope = ?
+`
+
+type GetAutonomyStateParams struct {
+	Tool  string `json:"tool"`
+	Class string `json:"class"`
+	Scope string `json:"scope"`
+}
+
+// W3-02 (autonomy ladder engine) queries below: autonomy_state,
+// approval_tokens, undo_windows. See migrations/0003_autonomy_policy.sql
+// for the schema and kahyad/internal/policy/engine.go + tokens.go for the
+// only two callers.
+func (q *Queries) GetAutonomyState(ctx context.Context, arg GetAutonomyStateParams) (AutonomyState, error) {
+	row := q.db.QueryRowContext(ctx, getAutonomyState, arg.Tool, arg.Class, arg.Scope)
+	var i AutonomyState
+	err := row.Scan(
+		&i.Tool,
+		&i.Class,
+		&i.Scope,
+		&i.Level,
+		&i.ConsecutiveApprovals,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getEpisodeByPath = `-- name: GetEpisodeByPath :one
@@ -80,6 +161,32 @@ func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeB
 	return i, err
 }
 
+const getOpenUndoWindowByTrace = `-- name: GetOpenUndoWindowByTrace :one
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+FROM undo_windows
+WHERE trace_id = ? AND state = 'open'
+ORDER BY opened_at DESC
+LIMIT 1
+`
+
+// Sessions/tasks are not guaranteed to open exactly one undo window per
+// trace_id, so this returns the most recently opened OPEN one - the same
+// "most recent wins" convention GetTaskBySession above already uses.
+func (q *Queries) GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (UndoWindow, error) {
+	row := q.db.QueryRowContext(ctx, getOpenUndoWindowByTrace, traceID)
+	var i UndoWindow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Tool,
+		&i.TraceID,
+		&i.OpenedAt,
+		&i.Deadline,
+		&i.State,
+	)
+	return i, err
+}
+
 const getTaskBySession = `-- name: GetTaskBySession :one
 SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at
 FROM tasks
@@ -106,6 +213,62 @@ func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const insertApprovalToken = `-- name: InsertApprovalToken :exec
+INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, approved_bytes_hash, minted_at, expires_at, consumed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+`
+
+type InsertApprovalTokenParams struct {
+	TokenHash         string `json:"token_hash"`
+	TaskID            string `json:"task_id"`
+	TraceID           string `json:"trace_id"`
+	Tool              string `json:"tool"`
+	ApprovedBytesHash string `json:"approved_bytes_hash"`
+	MintedAt          string `json:"minted_at"`
+	ExpiresAt         string `json:"expires_at"`
+}
+
+// consumed_at starts NULL (a literal, not a param - see
+// ConsumeApprovalToken below for the only statement that ever sets it).
+func (q *Queries) InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error {
+	_, err := q.db.ExecContext(ctx, insertApprovalToken,
+		arg.TokenHash,
+		arg.TaskID,
+		arg.TraceID,
+		arg.Tool,
+		arg.ApprovedBytesHash,
+		arg.MintedAt,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
+const insertAutonomyState = `-- name: InsertAutonomyState :exec
+INSERT INTO autonomy_state (tool, class, scope, level, consecutive_approvals, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+`
+
+type InsertAutonomyStateParams struct {
+	Tool                 string `json:"tool"`
+	Class                string `json:"class"`
+	Scope                string `json:"scope"`
+	Level                int64  `json:"level"`
+	ConsecutiveApprovals int64  `json:"consecutive_approvals"`
+	UpdatedAt            string `json:"updated_at"`
+}
+
+func (q *Queries) InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error {
+	_, err := q.db.ExecContext(ctx, insertAutonomyState,
+		arg.Tool,
+		arg.Class,
+		arg.Scope,
+		arg.Level,
+		arg.ConsecutiveApprovals,
+		arg.UpdatedAt,
+	)
+	return err
 }
 
 const insertChunk = `-- name: InsertChunk :one
@@ -271,6 +434,41 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 	return i, err
 }
 
+const insertUndoWindow = `-- name: InsertUndoWindow :one
+INSERT INTO undo_windows (task_id, tool, trace_id, opened_at, deadline, state)
+VALUES (?, ?, ?, ?, ?, 'open')
+RETURNING id, task_id, tool, trace_id, opened_at, deadline, state
+`
+
+type InsertUndoWindowParams struct {
+	TaskID   string `json:"task_id"`
+	Tool     string `json:"tool"`
+	TraceID  string `json:"trace_id"`
+	OpenedAt string `json:"opened_at"`
+	Deadline string `json:"deadline"`
+}
+
+func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error) {
+	row := q.db.QueryRowContext(ctx, insertUndoWindow,
+		arg.TaskID,
+		arg.Tool,
+		arg.TraceID,
+		arg.OpenedAt,
+		arg.Deadline,
+	)
+	var i UndoWindow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Tool,
+		&i.TraceID,
+		&i.OpenedAt,
+		&i.Deadline,
+		&i.State,
+	)
+	return i, err
+}
+
 const listActiveMemoryFileEpisodes = `-- name: ListActiveMemoryFileEpisodes :many
 SELECT id, source_path FROM episodes
 WHERE source = 'memory_file' AND status = 'active'
@@ -291,6 +489,42 @@ func (q *Queries) ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiv
 	for rows.Next() {
 		var i ListActiveMemoryFileEpisodesRow
 		if err := rows.Scan(&i.ID, &i.SourcePath); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAutonomyState = `-- name: ListAutonomyState :many
+SELECT tool, class, scope, level, consecutive_approvals, updated_at
+FROM autonomy_state
+ORDER BY tool, class, scope
+`
+
+func (q *Queries) ListAutonomyState(ctx context.Context) ([]AutonomyState, error) {
+	rows, err := q.db.QueryContext(ctx, listAutonomyState)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AutonomyState{}
+	for rows.Next() {
+		var i AutonomyState
+		if err := rows.Scan(
+			&i.Tool,
+			&i.Class,
+			&i.Scope,
+			&i.Level,
+			&i.ConsecutiveApprovals,
+			&i.UpdatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -410,6 +644,43 @@ func (q *Queries) ListEventsByTrace(ctx context.Context, traceID string) ([]Even
 	return items, nil
 }
 
+const listOpenUndoWindows = `-- name: ListOpenUndoWindows :many
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+FROM undo_windows
+WHERE state = 'open'
+`
+
+func (q *Queries) ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenUndoWindows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UndoWindow{}
+	for rows.Next() {
+		var i UndoWindow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Tool,
+			&i.TraceID,
+			&i.OpenedAt,
+			&i.Deadline,
+			&i.State,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markEpisodeDeleted = `-- name: MarkEpisodeDeleted :exec
 UPDATE episodes
 SET status = 'deleted'
@@ -419,6 +690,56 @@ WHERE id = ?
 func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, markEpisodeDeleted, id)
 	return err
+}
+
+const setUndoWindowState = `-- name: SetUndoWindowState :exec
+UPDATE undo_windows
+SET state = ?
+WHERE id = ?
+`
+
+type SetUndoWindowStateParams struct {
+	State string `json:"state"`
+	ID    int64  `json:"id"`
+}
+
+func (q *Queries) SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error {
+	_, err := q.db.ExecContext(ctx, setUndoWindowState, arg.State, arg.ID)
+	return err
+}
+
+const updateAutonomyState = `-- name: UpdateAutonomyState :execrows
+UPDATE autonomy_state
+SET level = ?, consecutive_approvals = ?, updated_at = ?
+WHERE tool = ? AND class = ? AND scope = ?
+`
+
+type UpdateAutonomyStateParams struct {
+	Level                int64  `json:"level"`
+	ConsecutiveApprovals int64  `json:"consecutive_approvals"`
+	UpdatedAt            string `json:"updated_at"`
+	Tool                 string `json:"tool"`
+	Class                string `json:"class"`
+	Scope                string `json:"scope"`
+}
+
+// Update-half of an application-level upsert (kahyad/internal/policy
+// calls this first; a 0-rows-affected result means no row exists yet, so
+// it falls back to InsertAutonomyState - the same "upsert (update half)"
+// pattern UpdateEpisodeContent above already uses in this file).
+func (q *Queries) UpdateAutonomyState(ctx context.Context, arg UpdateAutonomyStateParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateAutonomyState,
+		arg.Level,
+		arg.ConsecutiveApprovals,
+		arg.UpdatedAt,
+		arg.Tool,
+		arg.Class,
+		arg.Scope,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const updateEpisodeContent = `-- name: UpdateEpisodeContent :exec

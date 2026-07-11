@@ -78,4 +78,36 @@ const (
 	// progressed or completed server-side, so the message points at
 	// `kahya log` rather than implying the daemon is down.
 	MsgStreamIncomplete = "Görev yanıtı yarıda kesildi, sonuç alınamadı. Kontrol: kahya log --trace %s"
+
+	// ---- W3-02: kahya autonomy / kahya undo ----
+
+	// MsgAutonomyUsage is printed when `kahya autonomy <bad-subcommand>` is
+	// given anything other than no args or "promote". Exit 2.
+	MsgAutonomyUsage = "kullanım: kahya autonomy | kahya autonomy promote <araç> <sınıf> <alan>"
+
+	// MsgAutonomyEmpty is printed by `kahya autonomy` when the ladder has
+	// no earned state at all yet (every tool is still at fresh L0).
+	MsgAutonomyEmpty = "Henüz kazanılmış otonomi yok (her şey L0 - Gözlemci)."
+
+	// MsgAutonomyRow is one `kahya autonomy` ladder-state line: tool,
+	// class, scope, level, consecutive_approvals, in that order.
+	MsgAutonomyRow = "%-20s %-4s %-20s L%d  (%d ardışık onay)"
+
+	// MsgAutonomyPromoteUsage is printed when `kahya autonomy promote` is
+	// given anything other than exactly 3 positional args. Exit 2.
+	MsgAutonomyPromoteUsage = "kullanım: kahya autonomy promote <araç> <sınıf> <alan>"
+
+	// MsgAutonomyPromoted is `kahya autonomy promote`'s success line: tool,
+	// class, scope, new level, in that order.
+	MsgAutonomyPromoted = "%s / %s / %s artık L%d seviyesinde."
+
+	// MsgUndoTraceRequired is printed when `kahya undo` is run without
+	// --trace. Exit 2.
+	MsgUndoTraceRequired = "undo komutu için --trace gerekli."
+
+	// MsgUndoTriggered is `kahya undo --trace <id>`'s success line (%s =
+	// the tool whose undo window was triggered). Recipe EXECUTION itself
+	// is delegated to the owning tool (W3-03) - this only reports that the
+	// window closed and the demotion was recorded.
+	MsgUndoTriggered = "Geri alma tetiklendi: %s. (Geri alma tarifi ilgili araç tarafından uygulanır.)"
 )

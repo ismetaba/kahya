@@ -140,6 +140,7 @@ func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTe
 		DowngradeAtRatio:       0.8,
 		CacheHitAlarmThreshold: 0.5,
 	}, nil, nil), nil, anthproxy.NewPassthroughCredentialSource(), nil)
+	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -422,10 +423,13 @@ func TestPolicyCheckTableDriven(t *testing.T) {
 		toolName string
 		want     string
 	}{
-		{"memory_search allowed", "memory_search", "allow"},
-		{"mcp-prefixed memory_search allowed", "mcp__kahya_memory__memory_search", "allow"},
-		{"memory_write denied", "memory_write", "deny"},
-		{"Read denied (ordering invariant)", "Read", "deny"},
+		// Fresh (L0) autonomy state: R needs L1 and W1 needs L2 to
+		// auto-allow (HANDOFF S4 ladder), so both need approval - only an
+		// UNKNOWN tool name is a flat DENY at this stage.
+		{"memory_search needs approval at fresh state", "memory_search", "needs_approval"},
+		{"mcp-prefixed memory_search needs approval at fresh state", "mcp__kahya_memory__memory_search", "needs_approval"},
+		{"memory_write needs approval at fresh state", "memory_write", "needs_approval"},
+		{"Read denied (unknown tool - not in policy.yaml)", "Read", "deny"},
 		{"unknown tool denied fail-closed", "some_future_tool", "deny"},
 	}
 	for _, c := range cases {

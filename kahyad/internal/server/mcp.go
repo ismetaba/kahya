@@ -24,6 +24,15 @@ import (
 	"kahya/mcp/memory"
 )
 
+// SetPolicyEngine wires the W3-02 autonomy-ladder decision engine that
+// policyGateMiddleware (this file) and handlePolicyCheck (task.go) both
+// consult. Call before Prepare(); nil is a valid (if useless) value in
+// deny-all mode, where s.denyAll always short-circuits before the engine
+// is ever consulted.
+func (s *Server) SetPolicyEngine(e *policy.Engine) {
+	s.policyEngine = e
+}
+
 // EventLogger is the append-only ledger sink this package's own MCP
 // wiring needs: the policy gate's policy_decision rows (this file) and
 // /v1/memory/search's hafiza_injected rows (server.go's
@@ -139,19 +148,31 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 }
 
 // policyGateMiddleware is THE binding boundary (HANDOFF §5 ⚑, W12-05 step
-// 6): it runs before ANY "tools/call" method is dispatched to a tool
-// handler, canonicalizes the tool name (stripping an SDK-style
-// "mcp__<server>__" prefix - kahyad/internal/policy.Check already does
-// this internally too, so a caller that forgot to canonicalize still gets
-// the right answer), and either lets the call through (policy.Check
-// allowed it - currently only memory_search) or short-circuits it with a
-// CallToolResult carrying IsError:true and the Turkish deny reason as its
-// text content (an MCP "tool error", not a JSON-RPC protocol-level error -
-// the caller/model sees exactly why the call failed). EVERY decision
-// (allow or deny) is ledgered as a policy_decision event, matching
-// W12-07's /policy/check endpoint's own "one ledger insert per decision"
-// behavior - one interim table, two mount points, one ledgering
-// convention.
+// 6 / W3-02): it runs before ANY "tools/call" method is dispatched to a
+// tool handler, canonicalizes the tool name (stripping an SDK-style
+// "mcp__<server>__" prefix - kahyad/internal/policy.Engine.Check does this
+// internally too, so a caller that forgot to canonicalize still gets the
+// right answer), consults the W3-02 autonomy-ladder engine, and either
+// lets the call through (ResultAllow - consuming the freshly-minted token
+// itself, in-process, for any side-effectful class before doing so - see
+// below) or short-circuits it with a CallToolResult carrying IsError:true
+// and the Turkish deny/needs-approval reason as its text content (an MCP
+// "tool error", not a JSON-RPC protocol-level error - the caller/model
+// sees exactly why the call failed). EVERY decision is ledgered as a
+// policy_decision event (kahyad/internal/policy/engine.go's own
+// ledgerDecision call inside Engine.Check), matching /policy/check's
+// "one ledger insert per decision" behavior - one engine, two mount
+// points, one ledgering convention.
+//
+// Consuming the token in-process, right here, rather than requiring a
+// second HTTP round-trip to POST /policy/consume-token, is deliberate:
+// this middleware itself IS the "side-effectful tool"'s enforcement
+// point for every tool mounted on /v1/mcp (memory_write/memory_forget
+// today) - kahyad owns both the decision and the execution of these
+// tools in the same process, so there is no separate out-of-process
+// caller that needs the HTTP endpoint for this pair specifically (W3-03/
+// 04's fs/shell tools, running as SEPARATE processes, are the ones that
+// actually need to call POST /policy/consume-token over the wire).
 //
 // This middleware is installed on the *mcp.Server itself
 // (AddReceivingMiddleware), which is invoked by the MCP SDK's dispatch
@@ -171,17 +192,7 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			}
 
 			rawName := callReq.Params.Name
-
-			// W3-01: deny-all mode overrides the interim table entirely -
-			// even memory_search - whenever policy.yaml failed to
-			// load/validate at boot (see
-			// kahyad/internal/server.Server.SetDenyAll's doc comment).
-			var decision policy.Decision
-			if s.denyAll {
-				decision = policy.Decision{Allow: false, Reason: policy.ReasonDenyAll, Rule: policy.RuleDenyAllV1}
-			} else {
-				decision = policy.Check(rawName)
-			}
+			canonName := policy.Canonicalize(rawName)
 
 			traceID := ""
 			if callReq.Extra != nil && callReq.Extra.Header != nil {
@@ -190,37 +201,59 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			if traceID == "" {
 				traceID = traceid.New()
 			}
-
-			if s.eventLogger != nil {
-				payload := map[string]any{
-					"tool":     policy.Canonicalize(rawName),
-					"raw_tool": rawName,
-					"decision": allowDenyString(decision.Allow),
-					"rule":     decision.Rule,
-				}
-				if decision.Reason != "" {
-					payload["reason"] = decision.Reason
-				}
-				if err := s.eventLogger.LogEvent(ctx, traceID, "policy_decision", payload); err != nil {
-					s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
-				}
+			deny := func(reason string) (mcp.Result, error) {
+				s.log.With(traceID).Info("mcp_tool_denied", "tool", canonName, "reason", reason)
+				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: reason}}}, nil
 			}
 
-			if !decision.Allow {
-				s.log.With(traceID).Info("mcp_tool_denied", "tool", policy.Canonicalize(rawName), "reason", decision.Reason)
-				return &mcp.CallToolResult{
-					IsError: true,
-					Content: []mcp.Content{&mcp.TextContent{Text: decision.Reason}},
-				}, nil
+			// W3-01: deny-all mode overrides the ladder engine entirely - even
+			// memory_search - whenever policy.yaml failed to load/validate at
+			// boot (see kahyad/internal/server.Server.SetDenyAll's doc
+			// comment). This is ledgered by hand (rather than through
+			// Engine.Check, which is never called in this mode) so a
+			// deny-all decision stays visible in the same policy_decision
+			// ledger stream.
+			if s.denyAll {
+				if s.eventLogger != nil {
+					payload := map[string]any{
+						"event": "policy_decision", "tool": canonName, "raw_tool": rawName,
+						"decision": "deny", "rule": policy.RuleDenyAllV1, "reason": policy.ReasonDenyAll,
+					}
+					if err := s.eventLogger.LogEvent(ctx, traceID, "policy_decision", payload); err != nil {
+						s.log.With(traceID).Warn("policy_decision_ledger_error", "err", err.Error())
+					}
+				}
+				return deny(policy.ReasonDenyAll)
+			}
+			if s.policyEngine == nil {
+				s.log.With(traceID).Error("mcp_policy_engine_unavailable", "tool", canonName)
+				return deny(policy.ReasonPolicyStateError)
+			}
+
+			var argBytes []byte
+			if callReq.Params.Arguments != nil {
+				argBytes = []byte(callReq.Params.Arguments)
+			}
+			decision, _ := s.policyEngine.Check(ctx, policy.CheckInput{
+				Tool: rawName, TraceID: traceID, ToolInput: argBytes,
+			})
+			if decision.Result != policy.ResultAllow {
+				return deny(decision.Reason)
+			}
+
+			// Side-effectful classes (W1/W2 - never R, never W3, which never
+			// reaches ResultAllow at all) must present the freshly-minted
+			// token back before executing (HANDOFF §5 enforcement plane).
+			if decision.Class != policy.ClassR {
+				if err := s.policyEngine.ConsumeToken(ctx, policy.ConsumeInput{
+					Token: decision.Token, Tool: canonName, Class: decision.Class, Scope: decision.Scope,
+					TraceID: traceID, ToolInput: argBytes,
+				}); err != nil {
+					s.log.With(traceID).Error("mcp_consume_token_failed", "tool", canonName, "err", err.Error())
+					return deny(policy.ReasonPolicyStateError)
+				}
 			}
 			return next(ctx, method, req)
 		}
 	}
-}
-
-func allowDenyString(allow bool) string {
-	if allow {
-		return "allow"
-	}
-	return "deny"
 }
