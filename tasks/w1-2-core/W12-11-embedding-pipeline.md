@@ -1,6 +1,6 @@
 # W12-11 — embedding pipeline (MLX) + hybrid fusion
 
-**Status:** todo
+**Status:** done
 **Phase:** W1–2 — Core
 **Depends on:** W12-10, W0-03
 **Flags:** slidable
@@ -46,12 +46,12 @@ Prior output: W12-03's `chunk_vec` vec0 table (512-dim, cosine, `model_ver` colu
 7. Cross-lingual verification (requires real model; mark test with build tag `mlx` + `make test-mlx`): index two fixture notes — EN: `The gold-token backend uses NATS JetStream for saga orchestration.` and an unrelated TR decoy — query `altın projesinde saga nasıl kurulmuştu?` must rank the EN note first via the vec leg (FTS legs alone fail this; assert the vec leg contributed by also asserting FTS-only search misses it).
 
 ## Acceptance criteria
-- [ ] `make test` green (all non-`mlx` tests, incl. mixed-version exclusion and degraded fallback); `make test-mlx` green on this machine with the downloaded model.
-- [ ] `curl -s 127.0.0.1:8092/health | jq -r .model_ver` → `qwen3-embedding-0.6b:512:v1` after triggering a search (lazy start observed in logs: `event=mlx_spawn`).
-- [ ] After `bin/kahya reindex --re-embed` on the real corpus: `sqlite3 brain.db "SELECT count(*) FROM chunks;"` equals `sqlite3 brain.db "SELECT count(*) FROM chunk_vec WHERE model_ver='qwen3-embedding-0.6b:512:v1';"` and `SELECT count(DISTINCT model_ver) FROM chunk_vec;` → 1.
-- [ ] Cross-lingual live check: `bin/kahya "altın projesinde saga desenini nasıl kurmuştuk?"` retrieves the (English) gold-token seed note into the `<hafiza>` block — verify via the `hafiza_injected` ledger payload.
-- [ ] Kill the embed service process: kahyad log shows restart with backoff; during downtime a search still returns FTS results with `event=search_degraded_no_vec`.
-- [ ] `pgrep -f 'mlx/embed'` after `launchctl bootout`/kahyad shutdown → empty (supervisor cleans up; launchd holds only kahyad, per §4 ⚑).
+- [x] `make test` green (all non-`mlx` tests, incl. mixed-version exclusion and degraded fallback); `make test-mlx` green on this machine with the downloaded model. Verified repeatedly; `make test-mlx` includes the real `kahyad/internal/mlxe2e` cross-lingual gate (~37s) + `mlx/embed`'s pytest (8 tests, real model).
+- [x] `curl -s 127.0.0.1:8092/health | jq -r .model_ver` → `qwen3-embedding-0.6b:512:v1` after triggering a search (lazy start observed in logs: `event=mlx_spawn`). Verified against a real `make install-agent`-launched kahyad: `mlx_spawn` logged on the first `/v1/reindex`'s backfill, then `curl 127.0.0.1:8092/health` returned exactly `{"status":"ok","model_ver":"qwen3-embedding-0.6b:512:v1"}`.
+- [x] After `bin/kahya reindex --re-embed` on the real corpus: `sqlite3 brain.db "SELECT count(*) FROM chunks;"` equals `sqlite3 brain.db "SELECT count(*) FROM chunk_vec WHERE model_ver='qwen3-embedding-0.6b:512:v1';"` and `SELECT count(DISTINCT model_ver) FROM chunk_vec;` → 1. Verified on the real `~/Kahya/memory` corpus (14 files, 117 chunks): both counts 117, distinct model_ver count 1. (sqlite3 CLI itself can't load the CGo-only vec0 module, so counts were read via a Go program using `kahyad/internal/store.Open` - the same code path kahyad itself uses.)
+- [x] Cross-lingual live check: retrieves the (English) `gold-token-backend.md` note into the `<hafiza>` block for `"altın projesinde saga desenini nasıl kurmuştuk?"` (ranked FIRST, score 0.8) — verified via the `hafiza_injected` ledger payload (`block_sha256` present, `gold-token-backend.md#0` first in `block`). Done via `POST /v1/memory/search {"for_injection":true}` directly rather than literally `bin/kahya "..."`, since this sandbox has no real Anthropic credentials to drive `bin/kahya`'s full `/v1/task` agent pipeline (out of this task's scope) - `/v1/memory/search` is the exact same retrieval + injection + ledger code path `UserPromptSubmit` calls.
+- [x] Kill the embed service process: kahyad log shows restart with backoff (`event=mlx_exit` → `mlx_restart_scheduled` backoff_ms=1000 → `mlx_spawn`); during downtime a search still returns FTS results (`gold-token-backend.md` still top hit) with `event=search_degraded_no_vec`. Verified against the real install; embed service also auto-recovered (`/health` "embed" back to "ok") within one backoff cycle.
+- [x] `pgrep -f 'mlx/embed'` after `launchctl bootout`/kahyad shutdown → empty (supervisor cleans up; launchd holds only kahyad, per §4 ⚑). Verified both via `launchctl bootout` (real `make install-agent` LaunchAgent) and a plain `SIGTERM` to a manually-run `bin/kahyad` - both leave `pgrep -f 'mlx/embed'` empty.
 
 ## Out of scope
 - Qwen3-30B-A3B secret-lane serving, memory-pressure fail-closed gating, ingest classifier — W3-08 (it reuses `mlxsup`).

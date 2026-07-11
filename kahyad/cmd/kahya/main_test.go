@@ -374,6 +374,32 @@ func TestReindexFullFlagReachesRequestBody(t *testing.T) {
 	}
 }
 
+// TestReindexReEmbedFlagReachesRequestBody guards `kahya reindex
+// --re-embed` (W12-11 step 5).
+func TestReindexReEmbedFlagReachesRequestBody(t *testing.T) {
+	var gotReEmbed bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotReEmbed, _ = body["re_embed"].(bool)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"files_indexed": 1, "chunks": 1, "duration_ms": 1,
+		})
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"reindex", "--re-embed"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !gotReEmbed {
+		t.Error("server did not see re_embed=true in the request body")
+	}
+}
+
 func TestFormatLogLineOmitsTraceIDColumnButKeepsExtras(t *testing.T) {
 	line := formatLogLine(map[string]any{
 		"ts": "2026-07-10T09:15:00.5Z", "level": "WARN", "proc": "worker",

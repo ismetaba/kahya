@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -20,8 +21,10 @@ import (
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secrets"
@@ -94,20 +97,47 @@ func run() int {
 
 	srv := server.New(cfg, log, buildinfo.Version, st)
 	srv.AdoptStartupLock(lock)
-	// /v1/memory/search (W12-03 step 4). Its own JSONL logging is scoped
-	// per-request (from the request body's trace_id, or a freshly minted
-	// one), not to bootTraceID.
-	srv.SetSearcher(search.New(st.DB(), log, search.DefaultConfig()))
 
-	// /v1/reindex (W12-04 step 5). idx is shared between this route and the
+	// Local MLX embedding service (W12-11): kahyad-supervised, lazily
+	// spawned on first embedding need (never at boot - HANDOFF §6 timing
+	// note), 127.0.0.1-only (HANDOFF §4 ⚑ supervision contract). embedDir
+	// is the mlx/embed directory the service's own script/venv live under
+	// - derived from cfg.EmbedCmd (a two-element
+	// [".../.venv/bin/python", ".../server.py"] slice) so the child runs
+	// with that directory as its cwd regardless of kahyad's own.
+	embedSup := mlxsup.New(mlxsup.Config{
+		Name:      "embed",
+		Cmd:       cfg.EmbedCmd,
+		Dir:       embedServiceDir(cfg.EmbedCmd),
+		ExtraEnv:  []string{fmt.Sprintf("KAHYA_EMBED_PORT=%d", cfg.EmbedPort)},
+		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", cfg.EmbedPort),
+		Log:       log,
+	})
+	srv.SetEmbedHealth(embedSup)
+	embedClient := embed.New(fmt.Sprintf("http://127.0.0.1:%d", cfg.EmbedPort), embedSup)
+
+	// /v1/memory/search (W12-03 step 4; W12-11 step 4 adds the KNN leg).
+	// Its own JSONL logging is scoped per-request (from the request
+	// body's trace_id, or a freshly minted one), not to bootTraceID.
+	searcher := search.New(st.DB(), log, search.DefaultConfig())
+	searcher.SetEmbedder(embedClient, cfg.ActiveEmbedModelVer)
+	srv.SetSearcher(searcher)
+
+	// /v1/reindex (W12-04 step 5; W12-11 steps 3/5 add the vector
+	// backfill/re_embed pass). idx is shared between this route and the
 	// boot-time incremental reindex kicked off just below, so its internal
 	// mutex correctly serializes the two against each other. It is ALSO
 	// shared with /v1/mcp's memory_write/memory_forget tools (W12-05,
 	// SetMCPMemory below): a single Indexer instance means its mutex
 	// correctly serializes a full corpus reindex against a single-file
 	// ReindexFile call regardless of which route triggered which.
+	// reindexBackfiller composes idx with a Backfiller so both the
+	// boot-time hook below and POST /v1/reindex keep chunk_vec in
+	// lockstep with chunks - see kahyad/internal/embed's package doc.
 	idx := indexer.New(st.DB(), cfg.MemoryDir, log)
-	srv.SetReindexer(idx)
+	backfiller := embed.NewBackfiller(st.DB(), embedClient, cfg.ActiveEmbedModelVer, log, st)
+	reindexBackfiller := embed.NewReindexBackfiller(idx, backfiller, log)
+	srv.SetReindexer(reindexBackfiller)
 
 	// POST /v1/mcp (W12-05): the append-only events ledger (policy_decision,
 	// hafiza_injected, and - passed through to mcp/memory.Server - its own
@@ -182,12 +212,15 @@ func run() int {
 	reindexDone.Add(1)
 	go func() {
 		defer reindexDone.Done()
-		// idx.Reindex logs event=reindex_done (or event=reindex_cancelled
-		// if ctx was cancelled mid-run) itself, scoped to bootTraceID since
-		// it is passed in non-empty here - see
+		// idx.Reindex (inside reindexBackfiller.Reindex) logs
+		// event=reindex_done (or event=reindex_cancelled if ctx was
+		// cancelled mid-run) itself, scoped to bootTraceID since it is
+		// passed in non-empty here - see
 		// kahyad/internal/indexer.Indexer.Reindex's doc comment - so there
-		// is nothing left to log a second time on success.
-		if _, err := idx.Reindex(ctx, bootTraceID, false); err != nil {
+		// is nothing left to log a second time on success. full=false,
+		// reEmbed=false: an ordinary boot-time incremental reindex, not a
+		// forced full rechunk or a version-switch re-embed.
+		if _, err := reindexBackfiller.Reindex(ctx, bootTraceID, false, false); err != nil {
 			log.With(bootTraceID).Error("reindex_failed", "err", err.Error())
 		}
 	}()
@@ -202,6 +235,13 @@ func run() int {
 	stop()
 	reindexDone.Wait()
 
+	// Stop kills the embed service's entire process GROUP (SIGKILL) and
+	// suppresses its restart-with-backoff loop - launchd holds only
+	// kahyad itself (HANDOFF §4 ⚑), so kahyad shutting down must never
+	// leave an orphaned mlx/embed/server.py behind. A no-op if it was
+	// never lazily started (StateDisabled/StateDown).
+	embedSup.Stop()
+
 	if runErr != nil {
 		if errors.Is(runErr, server.ErrAlreadyRunning) {
 			// server.Run already logged event=already_running.
@@ -213,6 +253,22 @@ func run() int {
 
 	log.Info("shutdown_complete")
 	return 0
+}
+
+// embedServiceDir derives the working directory the embed service child
+// process should run with: the directory containing cmd's own script
+// path (cmd[1], e.g. ".../mlx/embed/server.py" -> ".../mlx/embed"). Empty
+// cmd (or a single-element cmd - should not happen with
+// config.defaultEmbedCmd or any sane override) leaves the child running
+// with kahyad's own cwd instead (mlxsup.Config.Dir's documented zero-value
+// behavior) - a harmless fallback, since the embed service locates its
+// model purely via the user-home-based HF cache, never via a relative
+// path of its own.
+func embedServiceDir(cmd []string) string {
+	if len(cmd) < 2 {
+		return ""
+	}
+	return filepath.Dir(cmd[1])
 }
 
 // parseLogLevel maps config.Config.LogLevel's four validated values

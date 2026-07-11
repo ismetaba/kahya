@@ -54,11 +54,25 @@ type Searcher interface {
 }
 
 // Reindexer is the corpus-indexing source POST /v1/reindex reports
-// (W12-04 step 5). It is a narrow interface - *indexer.Indexer satisfies
-// it without any adapter code - so tests can fake it without a real
-// brain.db or memory-dir corpus.
+// (W12-04 step 5; W12-11 step 5 adds reEmbed). It is a narrow interface -
+// kahyad/internal/embed.ReindexBackfiller satisfies it without any
+// adapter code - so tests can fake it without a real brain.db or
+// memory-dir corpus.
 type Reindexer interface {
-	Reindex(ctx context.Context, traceID string, full bool) (indexer.Result, error)
+	// Reindex re-walks the corpus (full forces indexer.Indexer's own
+	// rechunk-regardless-of-hash behavior) and then backfills chunk
+	// vectors (reEmbed forces re-embedding EVERY chunk + purging stale
+	// model_ver rows, HANDOFF §4 ⚑ model_ver rule - the W12-11 step 5
+	// re_embed trigger).
+	Reindex(ctx context.Context, traceID string, full, reEmbed bool) (indexer.Result, error)
+}
+
+// EmbedHealth is the local embedding service's supervisor status source
+// /health reports under "embed" (W12-11 step 2: "ok|starting|down|
+// disabled"). kahyad/internal/mlxsup.Supervisor satisfies it without any
+// adapter code.
+type EmbedHealth interface {
+	State() string
 }
 
 const (
@@ -70,12 +84,13 @@ const (
 
 // Server is kahyad's HTTP-over-UDS control-plane server.
 type Server struct {
-	cfg     config.Config
-	log     *logx.Logger
-	version string
-	db      DBHealth
-	search  Searcher
-	reindex Reindexer
+	cfg         config.Config
+	log         *logx.Logger
+	version     string
+	db          DBHealth
+	search      Searcher
+	reindex     Reindexer
+	embedHealth EmbedHealth
 
 	// eventLogger, mcpMemoryDir, mcpIndexer wire POST /v1/mcp and
 	// /v1/memory/search's for_injection ledgering (W12-05) - see
@@ -136,6 +151,14 @@ func (s *Server) SetSearcher(searcher Searcher) {
 // answers 503 until a Reindexer is set.
 func (s *Server) SetReindexer(r Reindexer) {
 	s.reindex = r
+}
+
+// SetEmbedHealth wires /health's "embed" field to sup (W12-11 step 2).
+// Call this before Prepare/Run. Kept as a setter, matching SetSearcher's
+// rationale: every existing New(...) call site keeps working unchanged;
+// /health reports "embed":"disabled" until an EmbedHealth is set.
+func (s *Server) SetEmbedHealth(sup EmbedHealth) {
+	s.embedHealth = sup
 }
 
 // Prepare resolves the socket takeover logic (HANDOFF §4 IPC step 3) and
@@ -335,11 +358,18 @@ type healthResponse struct {
 	Version       string `json:"version"`
 	DB            string `json:"db"`
 	SchemaVersion int64  `json:"schema_version"`
+	// Embed is the local MLX embedding service's supervisor status
+	// (W12-11 step 2): "ok"|"starting"|"down"|"disabled". "disabled" is
+	// also what a kahyad build with no EmbedHealth wired at all reports -
+	// never claiming readiness for a capability that was never
+	// configured (same fail-safe posture as DB's "error" default below).
+	Embed string `json:"embed"`
 }
 
 // handleHealth reports process liveness plus brain.db reachability and
-// schema version (W12-02 step "extend /health"). db is "ok" only when a
-// live ping against brain.db succeeds; any ping failure or a nil db (should
+// schema version (W12-02 step "extend /health"), plus the local embedding
+// service's supervisor state (W12-11 step 2). db is "ok" only when a live
+// ping against brain.db succeeds; any ping failure or a nil db (should
 // never happen outside of misconfigured tests) reports "error" — this
 // endpoint never claims the database is fine when it hasn't verified that.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -353,6 +383,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	embedStatus := "disabled"
+	if s.embedHealth != nil {
+		embedStatus = s.embedHealth.State()
+	}
+
 	resp := healthResponse{
 		Status:        "ok",
 		PID:           os.Getpid(),
@@ -360,6 +395,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Version:       s.version,
 		DB:            dbStatus,
 		SchemaVersion: schemaVersion,
+		Embed:         embedStatus,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -527,6 +563,11 @@ const quarantinedSourceTier = "agent_derived"
 type reindexRequest struct {
 	Full    bool   `json:"full"`
 	TraceID string `json:"trace_id"`
+	// ReEmbed is the W12-11 step 5 trigger: re-embeds EVERY chunk under
+	// cfg.ActiveEmbedModelVer and purges chunk_vec rows left under any
+	// other (stale) model_ver. {"full":false,"re_embed":true} is the
+	// documented version-switch procedure's shape (mlx/embed/README.md).
+	ReEmbed bool `json:"re_embed"`
 }
 
 // reindexResponse is exactly the five-key schema the task spec fixes:
@@ -563,7 +604,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		traceID = traceIDFromContext(r)
 	}
 
-	res, err := s.reindex.Reindex(r.Context(), traceID, req.Full)
+	res, err := s.reindex.Reindex(r.Context(), traceID, req.Full, req.ReEmbed)
 	if err != nil {
 		if errors.Is(err, indexer.ErrReindexInProgress) {
 			writeJSONError(w, http.StatusConflict, "reindex zaten çalışıyor")

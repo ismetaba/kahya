@@ -195,9 +195,12 @@ type reindexResponse struct {
 	DurationMs     int64 `json:"duration_ms"`
 }
 
-// Reindex calls POST /v1/reindex {"full": full}.
-func (c *Client) Reindex(ctx context.Context, traceID string, full bool) (reindexResponse, error) {
-	body, err := json.Marshal(map[string]bool{"full": full})
+// Reindex calls POST /v1/reindex {"full": full, "re_embed": reEmbed}
+// (W12-11 step 5 adds re_embed: the version-switch trigger - re-embeds
+// EVERY chunk under the active embed model_ver and purges chunk_vec rows
+// left under any other model_ver).
+func (c *Client) Reindex(ctx context.Context, traceID string, full, reEmbed bool) (reindexResponse, error) {
+	body, err := json.Marshal(map[string]bool{"full": full, "re_embed": reEmbed})
 	if err != nil {
 		return reindexResponse{}, err
 	}

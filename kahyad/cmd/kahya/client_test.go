@@ -210,15 +210,45 @@ func TestClientReindexSendsFullFlagAndParsesResponse(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	rr, err := client.Reindex(context.Background(), "trace-reindex", true)
+	rr, err := client.Reindex(context.Background(), "trace-reindex", true, false)
 	if err != nil {
 		t.Fatalf("Reindex() error = %v", err)
 	}
 	if gotBody["full"] != true {
 		t.Errorf("request body full = %v, want true", gotBody["full"])
 	}
+	if gotBody["re_embed"] != false {
+		t.Errorf("request body re_embed = %v, want false", gotBody["re_embed"])
+	}
 	if rr.FilesIndexed != 7 || rr.Chunks != 21 || rr.DurationMs != 55 {
 		t.Errorf("Reindex() = %+v", rr)
+	}
+}
+
+// TestClientReindexSendsReEmbedFlag guards the W12-11 step 5 wiring:
+// Reindex's reEmbed argument must reach the request body's "re_embed"
+// field.
+func TestClientReindexSendsReEmbedFlag(t *testing.T) {
+	var gotBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"files_indexed": 0, "files_unchanged": 0, "files_removed": 0,
+			"chunks": 0, "duration_ms": 5,
+		})
+	})
+	sock := startFakeServer(t, handler)
+	client := newClient(sock)
+
+	if _, err := client.Reindex(context.Background(), "trace-reembed", false, true); err != nil {
+		t.Fatalf("Reindex() error = %v", err)
+	}
+	if gotBody["re_embed"] != true {
+		t.Errorf("request body re_embed = %v, want true", gotBody["re_embed"])
+	}
+	if gotBody["full"] != false {
+		t.Errorf("request body full = %v, want false", gotBody["full"])
 	}
 }
 

@@ -1,0 +1,58 @@
+# mlx/embed's OWN pinned dependency set (W12-11): a SEPARATE venv
+# (mlx/embed/.venv) from worker/'s (HANDOFF §4 three-process architecture -
+# the MLX helper process's Python deps never mix with the Agent SDK
+# worker's). Full pip-freeze lock, mirroring worker/requirements.lock's own
+# convention (as opposed to a bare top-level requirements.in) - regenerate
+# with:
+#   mlx/embed/.venv/bin/pip install --upgrade -r <top-level deps below>
+#   mlx/embed/.venv/bin/pip freeze | grep -v '^pip==' > mlx/embed/requirements.txt
+#
+# transformers is pinned to 5.8.0 deliberately, not "latest": at the time
+# this was pinned, transformers==5.13.0 (and other very recent 5.x builds)
+# broke mlx-lm==0.31.3's import at module load with
+# "AttributeError: 'str' object has no attribute '__module__'" (a
+# transformers-side regression in AutoTokenizer.register, confirmed
+# empirically by bisecting transformers releases against this exact
+# mlx-lm version) - 5.8.0 is the newest verified-working release as of
+# this pin.
+#
+# pytest/pluggy/iniconfig are the test_server.py runner (`make test-mlx`);
+# everything else below is server.py's own runtime dependency set.
+annotated-doc==0.0.4
+anyio==4.14.1
+certifi==2026.6.17
+click==8.4.2
+filelock==3.29.7
+fsspec==2026.6.0
+h11==0.16.0
+hf-xet==1.5.1
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.23.0
+idna==3.18
+iniconfig==2.3.0
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mlx==0.32.0
+mlx-lm==0.31.3
+mlx-metal==0.32.0
+numpy==2.5.1
+packaging==26.2
+pluggy==1.6.0
+protobuf==7.35.1
+Pygments==2.20.0
+pytest==9.1.1
+PyYAML==6.0.3
+regex==2026.7.10
+rich==15.0.0
+safetensors==0.8.0
+sentencepiece==0.2.1
+shellingham==1.5.4
+tokenizers==0.22.2
+tqdm==4.68.4
+transformers==5.8.0
+typer==0.26.8
+typer-slim==0.24.0
+typing_extensions==4.16.0

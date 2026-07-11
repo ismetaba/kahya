@@ -58,6 +58,14 @@ type Config struct {
 	// to read the command from.
 	WorkerCmd []string `yaml:"worker_cmd"`
 
+	// EmbedCmd is cfg.embed_cmd (W12-11): the local MLX embedding
+	// service's argv, same derivation pattern as WorkerCmd - defaults to
+	// the repo-local mlx/embed/.venv/bin/python running mlx/embed/
+	// server.py (its OWN venv, separate from worker/'s - HANDOFF §4's
+	// three-process architecture). kahyad/internal/mlxsup.Supervisor
+	// spawns this lazily, on first embedding need, never at boot.
+	EmbedCmd []string `yaml:"embed_cmd"`
+
 	// MCPBridgePath is the absolute path to the kahya-mcp stdio<->UDS
 	// bridge binary (W12-05: kahyad/cmd/kahya-mcp, built to
 	// bin/kahya-mcp). W12-09's worker execs this as its "kahya_memory" MCP
@@ -132,6 +140,7 @@ type fileConfig struct {
 	ActiveEmbedModelVer    *string   `yaml:"active_embed_model_ver"`
 	LogLevel               *string   `yaml:"log_level"`
 	WorkerCmd              *[]string `yaml:"worker_cmd"`
+	EmbedCmd               *[]string `yaml:"embed_cmd"`
 	MCPBridgePath          *string   `yaml:"mcp_bridge_path"`
 	DailyBudgetUSD         *float64  `yaml:"daily_budget_usd"`
 	MonthlyBudgetUSD       *float64  `yaml:"monthly_budget_usd"`
@@ -213,6 +222,7 @@ func defaults(home string) Config {
 		LogLevel:             "info",
 		Env:                  EnvProd,
 		WorkerCmd:            defaultWorkerCmd(),
+		EmbedCmd:             defaultEmbedCmd(),
 		MCPBridgePath:        defaultMCPBridgePath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
@@ -252,6 +262,23 @@ func defaultWorkerCmd() []string {
 	return []string{
 		filepath.Join(repoRoot, "worker", ".venv", "bin", "python"),
 		"-m", "kahya_worker",
+	}
+}
+
+// defaultEmbedCmd resolves the W12-11 step-fixed default
+// ["<repo>/mlx/embed/.venv/bin/python","<repo>/mlx/embed/server.py"],
+// using the exact same repo-root derivation as defaultWorkerCmd (see its
+// doc comment). Unlike the worker (invoked as `-m kahya_worker`, a
+// package import that needs no absolute script path), the embed service
+// is a plain script, so BOTH argv entries are absolute paths here.
+func defaultEmbedCmd() []string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return []string{
+		filepath.Join(repoRoot, "mlx", "embed", ".venv", "bin", "python"),
+		filepath.Join(repoRoot, "mlx", "embed", "server.py"),
 	}
 }
 
@@ -322,6 +349,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.WorkerCmd != nil {
 		cfg.WorkerCmd = *fc.WorkerCmd
+	}
+	if fc.EmbedCmd != nil {
+		cfg.EmbedCmd = *fc.EmbedCmd
 	}
 	if fc.MCPBridgePath != nil {
 		cfg.MCPBridgePath = expandHome(*fc.MCPBridgePath, home)

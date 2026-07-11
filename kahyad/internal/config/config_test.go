@@ -69,6 +69,15 @@ func TestLoadDefaults(t *testing.T) {
 	if want := filepath.Join("worker", ".venv", "bin", "python"); !strings.HasSuffix(cfg.WorkerCmd[0], want) {
 		t.Errorf("WorkerCmd[0] = %q, want suffix %q", cfg.WorkerCmd[0], want)
 	}
+	if len(cfg.EmbedCmd) != 2 {
+		t.Fatalf("EmbedCmd = %v, want exactly 2 elements (python, server.py)", cfg.EmbedCmd)
+	}
+	if want := filepath.Join("mlx", "embed", ".venv", "bin", "python"); !strings.HasSuffix(cfg.EmbedCmd[0], want) {
+		t.Errorf("EmbedCmd[0] = %q, want suffix %q", cfg.EmbedCmd[0], want)
+	}
+	if want := filepath.Join("mlx", "embed", "server.py"); !strings.HasSuffix(cfg.EmbedCmd[1], want) {
+		t.Errorf("EmbedCmd[1] = %q, want suffix %q", cfg.EmbedCmd[1], want)
+	}
 	// BLOCKER 2's fail-closed reservation-estimate fallback (see the
 	// field's own doc comment) - committed default 50000.
 	if cfg.EstRequestTokens != 50_000 {
@@ -142,6 +151,35 @@ func TestLoadFileOverridesWorkerCmd(t *testing.T) {
 	for i := range want {
 		if cfg.WorkerCmd[i] != want[i] {
 			t.Errorf("WorkerCmd[%d] = %q, want %q", i, cfg.WorkerCmd[i], want[i])
+		}
+	}
+}
+
+func TestLoadFileOverridesEmbedCmd(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "embed_cmd:\n  - \"/tmp/fake-embed.sh\"\n  - \"--flag\"\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"/tmp/fake-embed.sh", "--flag"}
+	if len(cfg.EmbedCmd) != len(want) {
+		t.Fatalf("EmbedCmd = %v, want %v", cfg.EmbedCmd, want)
+	}
+	for i := range want {
+		if cfg.EmbedCmd[i] != want[i] {
+			t.Errorf("EmbedCmd[%d] = %q, want %q", i, cfg.EmbedCmd[i], want[i])
 		}
 	}
 }

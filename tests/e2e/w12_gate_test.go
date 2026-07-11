@@ -342,7 +342,14 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 		t.Fatalf("mkdir config dir: %v", err)
 	}
 	content := fmt.Sprintf(
-		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\n",
+		// embed_cmd: [] (W12-11) disables the local embedding service
+		// supervisor entirely for this gate: this hermetic FTS5-only test
+		// predates W12-11 and asserts nothing about embeddings, and
+		// leaving embed_cmd at its repo-relative default would make it
+		// depend on whatever mlx/embed/.venv happens to exist on the
+		// machine running `make test` (HANDOFF §6 timing note: W1-2
+		// acceptance is FTS5-only by design).
+		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\nembed_cmd: []\n",
 		upstreamURL,
 	)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {

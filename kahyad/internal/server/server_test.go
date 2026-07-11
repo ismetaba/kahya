@@ -153,6 +153,9 @@ func TestHealthEndpoint(t *testing.T) {
 	if body["schema_version"] != float64(1) {
 		t.Errorf("schema_version field = %v, want 1", body["schema_version"])
 	}
+	if body["embed"] != "disabled" {
+		t.Errorf("embed field = %v, want disabled (no EmbedHealth wired)", body["embed"])
+	}
 
 	info, err := os.Stat(socketPath)
 	if err != nil {
@@ -628,18 +631,53 @@ func TestMemorySearchEndpointSearcherErrorIs400(t *testing.T) {
 	}
 }
 
+// fakeEmbedHealth is a minimal EmbedHealth stand-in (W12-11 step 2).
+type fakeEmbedHealth struct{ state string }
+
+func (f fakeEmbedHealth) State() string { return f.state }
+
+// TestHealthEndpointReportsEmbedState guards SetEmbedHealth's wiring
+// (W12-11 step 2): /health's "embed" field must reflect whatever the
+// wired EmbedHealth currently reports, verbatim.
+func TestHealthEndpointReportsEmbedState(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	srv := New(testConfig(socketPath), testLogger(t), "v-test-embed", healthyDB)
+	srv.SetEmbedHealth(fakeEmbedHealth{state: "starting"})
+
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp, err := unixHTTPClient(socketPath).Get("http://kahyad/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["embed"] != "starting" {
+		t.Errorf("embed field = %v, want starting", body["embed"])
+	}
+}
+
 // fakeReindexer is a minimal Reindexer stand-in (W12-04 step 5) so server
 // tests can exercise POST /v1/reindex without a real brain.db or
 // memory-dir corpus.
 type fakeReindexer struct {
-	res      indexer.Result
-	err      error
-	lastFull bool
-	lastTID  string
+	res         indexer.Result
+	err         error
+	lastFull    bool
+	lastReEmbed bool
+	lastTID     string
 }
 
-func (f *fakeReindexer) Reindex(_ context.Context, traceID string, full bool) (indexer.Result, error) {
-	f.lastTID, f.lastFull = traceID, full
+func (f *fakeReindexer) Reindex(_ context.Context, traceID string, full, reEmbed bool) (indexer.Result, error) {
+	f.lastTID, f.lastFull, f.lastReEmbed = traceID, full, reEmbed
 	if f.err != nil {
 		return indexer.Result{}, f.err
 	}
@@ -702,6 +740,36 @@ func TestReindexEndpointReturnsSummary(t *testing.T) {
 
 	if !fr.lastFull || fr.lastTID != "tid-reindex-1" {
 		t.Errorf("Reindexer.Reindex called with (traceID=%q, full=%v), want (tid-reindex-1, true)", fr.lastTID, fr.lastFull)
+	}
+	if fr.lastReEmbed {
+		t.Errorf("Reindexer.Reindex called with reEmbed=true, want false (request body omitted re_embed)")
+	}
+}
+
+// TestReindexEndpointReEmbedFlagReachesReindexer guards the W12-11 step 5
+// wiring: {"re_embed":true} in the request body must reach Reindexer.
+// Reindex's reEmbed parameter.
+func TestReindexEndpointReEmbedFlagReachesReindexer(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fr := &fakeReindexer{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetReindexer(fr)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	resp := postReindex(t, unixHTTPClient(socketPath), `{"full":false,"re_embed":true}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !fr.lastReEmbed {
+		t.Error("Reindexer.Reindex called with reEmbed=false, want true")
+	}
+	if fr.lastFull {
+		t.Error("Reindexer.Reindex called with full=true, want false (re_embed is independent of full)")
 	}
 }
 

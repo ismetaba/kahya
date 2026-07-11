@@ -16,6 +16,7 @@ import (
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/textnorm"
+	"kahya/kahyad/internal/vecenc"
 )
 
 // ErrEmptyQuery is returned by Search when q is empty or all whitespace
@@ -27,17 +28,28 @@ var ErrEmptyQuery = errors.New("search: query must not be empty")
 const DefaultK = 8
 
 // Config holds Search's tunable, committed-default fusion parameters
-// (HANDOFF §4 ⚑: BM25 fusion; W12-03 step 3c).
+// (HANDOFF §4 ⚑: BM25 fusion; W12-03 step 3c; W12-11 step 4 adds the
+// third, vector leg).
 type Config struct {
-	// TriWeight/UniWeight are the fusion weights: fused =
-	// TriWeight*triScore + UniWeight*uniScore, each a per-chunk leg score
-	// in [0,1] (a missing leg contributes 0). The unicode61 leg's score is
-	// a plain min-max normalization of its raw bm25 rows. The trigram
-	// leg's score is either a scan-floor hit (fixed at ScanFloorScore) or
-	// a genuine MATCH hit, min-max normalized and then rescaled into
-	// [2*ScanFloorScore, 1.0] - see ScanFloorScore below.
+	// TriWeight/UniWeight/VecWeight are the fusion weights: fused =
+	// TriWeight*triScore + UniWeight*uniScore + VecWeight*vecScore, each a
+	// per-chunk leg score in [0,1] (a missing leg contributes 0). The
+	// unicode61 leg's score is a plain min-max normalization of its raw
+	// bm25 rows. The trigram leg's score is either a scan-floor hit
+	// (fixed at ScanFloorScore) or a genuine MATCH hit, min-max
+	// normalized and then rescaled into [2*ScanFloorScore, 1.0] - see
+	// ScanFloorScore below. The vector leg's score is `1 - distance`
+	// (cosine distance from sqlite-vec, HANDOFF §4 model_ver rule),
+	// min-max normalized like the other two legs (W12-11 step 4).
 	TriWeight float64
 	UniWeight float64
+	VecWeight float64
+
+	// VecLimit caps how many chunk_vec KNN rows are considered before
+	// fusion (mirrors UniLimit's role for the unicode61 leg) - passed as
+	// vec0's own `k` constraint, so it is also the number of nearest
+	// neighbors sqlite-vec itself computes.
+	VecLimit int
 
 	// ScanFloorScore is the FIXED, post-normalization score given to a
 	// trigram-leg hit found only by the Go substring scan below the
@@ -66,14 +78,38 @@ type Config struct {
 	LadderStartMax int
 }
 
-// DefaultConfig returns the committed-default fusion weights (HANDOFF §4:
-// "fused = 0.6*tri + 0.4*uni").
+// DefaultConfig returns the committed-default 3-way fusion weights
+// (W12-11 step 4: "tri 0.3, uni 0.2, vec 0.5") - the full hybrid-search
+// configuration, used whenever the vector leg is actually available.
+// Search itself automatically falls back to FTSOnlyConfig's weights
+// whenever the vector leg is unavailable or a query-embed call fails (see
+// Search's own doc comment) - callers never need to choose between the
+// two configs themselves.
 func DefaultConfig() Config {
+	return Config{
+		TriWeight:      0.3,
+		UniWeight:      0.2,
+		VecWeight:      0.5,
+		ScanFloorScore: 0.1,
+		UniLimit:       50,
+		VecLimit:       50,
+		LadderStartMax: 32,
+	}
+}
+
+// FTSOnlyConfig returns the W12-03 FTS-only fusion weights ("fused =
+// 0.6*tri + 0.4*uni", vec 0) - Search's automatic degraded-mode fallback
+// (W12-11 step 4) whenever the embed service is down or a query-embed
+// call fails: search never hard-fails on the vector leg, it just quietly
+// reverts to exactly W12-03's pre-embedding behavior for that one call.
+func FTSOnlyConfig() Config {
 	return Config{
 		TriWeight:      0.6,
 		UniWeight:      0.4,
+		VecWeight:      0,
 		ScanFloorScore: 0.1,
 		UniLimit:       50,
+		VecLimit:       50,
 		LadderStartMax: 32,
 	}
 }
@@ -92,21 +128,46 @@ type Hit struct {
 	SourceTier string
 }
 
-// Searcher runs fused BM25 search over chunks_fts_tri/chunks_fts_uni. Build
-// one with New and reuse it - it is safe for concurrent use (every method
-// only reads brain.db; the FTS5 writes live in ftswrite.go and always run
-// inside the same transaction as the chunks write, elsewhere).
+// Embedder is the query-embedding dependency Search's vector leg needs
+// (kahyad/internal/embed.Client satisfies it without an adapter). Kept
+// narrow and Searcher-private so tests can fake it without a real embed
+// service; SetEmbedder is the only way to wire one in.
+type Embedder interface {
+	EmbedQuery(ctx context.Context, text string) ([]float32, error)
+}
+
+// Searcher runs fused BM25+KNN search over chunks_fts_tri/chunks_fts_uni/
+// chunk_vec. Build one with New and reuse it - it is safe for concurrent
+// use (every method only reads brain.db; the FTS5/vec writes live in
+// ftswrite.go and kahyad/internal/embed, and always run in their own
+// transactions/statements against kahyad's single brain.db connection).
 type Searcher struct {
-	db  *sql.DB
-	log *logx.Logger
-	cfg Config
+	db             *sql.DB
+	log            *logx.Logger
+	cfg            Config
+	embed          Embedder
+	activeModelVer string
 }
 
 // New constructs a Searcher. log is the boot-scoped logger; each Search
 // call scopes a child logger to that call's trace_id via
-// kahyad/internal/logx.Logger.With.
+// kahyad/internal/logx.Logger.With. The vector leg starts DISABLED (as if
+// the embed service were permanently down - Search always falls back to
+// FTSOnlyConfig's weights) until SetEmbedder wires a real Embedder; this
+// keeps every existing FTS-only caller/test working unchanged.
 func New(db *sql.DB, log *logx.Logger, cfg Config) *Searcher {
 	return &Searcher{db: db, log: log, cfg: cfg}
+}
+
+// SetEmbedder wires the vector leg (W12-11 step 4). activeModelVer is
+// cfg.ActiveEmbedModelVer - the ONE model_ver the KNN query is ALWAYS
+// filtered to (HANDOFF §4 ⚑ model_ver rule: mixed-version KNN is
+// forbidden). Call this before Search is ever invoked concurrently with
+// it; kahyad/main.go calls it once, right after constructing the
+// Searcher, before the server starts serving.
+func (s *Searcher) SetEmbedder(e Embedder, activeModelVer string) {
+	s.embed = e
+	s.activeModelVer = activeModelVer
 }
 
 // Search returns up to k chunks ranked by fused BM25 score for q (W12-03
@@ -138,7 +199,30 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		return nil, fmt.Errorf("search: trigram leg: %w", err)
 	}
 
-	fused := fuse(s.cfg, triScores, uniScores)
+	// Vector leg (W12-11 step 4): embed the query (1 call), then a KNN
+	// query ALWAYS filtered to the single active model_ver (HANDOFF §4 ⚑
+	// model_ver rule - vecLeg has no parameter to omit this filter).
+	// Search NEVER hard-fails on this leg: an unwired embedder, a failed
+	// embed call, or a failed vec0 query all degrade to FTSOnlyConfig's
+	// weights with a warn log, never an error return.
+	cfg := s.cfg
+	vecScores := map[int64]float64{}
+	vecHits := 0
+	if s.embed == nil {
+		cfg = FTSOnlyConfig()
+		log.Warn("search_degraded_no_vec", "reason", "no embedder wired")
+	} else if qVec, embedErr := s.embed.EmbedQuery(ctx, q); embedErr != nil {
+		cfg = FTSOnlyConfig()
+		log.Warn("search_degraded_no_vec", "reason", "query embed failed", "err", embedErr.Error())
+	} else if raw, n, vecErr := s.vecLeg(ctx, qVec); vecErr != nil {
+		cfg = FTSOnlyConfig()
+		log.Warn("search_degraded_no_vec", "reason", "vec0 query failed", "err", vecErr.Error())
+	} else {
+		vecScores = raw
+		vecHits = n
+	}
+
+	fused := fuse(cfg, triScores, uniScores, vecScores)
 
 	ids := make([]int64, 0, len(fused))
 	for id := range fused {
@@ -166,10 +250,43 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		"uni_hits", uniHits,
 		"tri_match_hits", matchHits,
 		"tri_scan_hits", scanHits,
+		"vec_hits", vecHits,
 		"result_count", len(hits),
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return hits, nil
+}
+
+// vecLeg runs the chunk_vec KNN leg (W12-11 step 4): queryVec against the
+// top cfg.VecLimit nearest neighbors, ALWAYS filtered to
+// s.activeModelVer (HANDOFF §4 ⚑ model_ver rule - "mixed-version KNN
+// yasak" - this is the ONLY query this package ever issues against
+// chunk_vec, and it has no parameter or code path that can omit the
+// model_ver filter). Score is `1 - distance` (cosine distance -> cosine
+// similarity, higher=better), min-max normalized like the other two legs.
+func (s *Searcher) vecLeg(ctx context.Context, queryVec []float32) (map[int64]float64, int, error) {
+	blob := vecenc.Encode(queryVec)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT chunk_id, distance FROM chunk_vec WHERE embedding MATCH ? AND k = ? AND model_ver = ?`,
+		blob, s.cfg.VecLimit, s.activeModelVer)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query chunk_vec: %w", err)
+	}
+	defer rows.Close()
+
+	raw := map[int64]float64{}
+	for rows.Next() {
+		var id int64
+		var dist float64
+		if err := rows.Scan(&id, &dist); err != nil {
+			return nil, 0, err
+		}
+		raw[id] = 1 - dist
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return minMaxNormalize(raw), len(raw), nil
 }
 
 // uniLeg runs the unicode61 leg (W12-03 step 3a): every whitespace token of
@@ -424,20 +541,25 @@ func scanSubstring(chunks []chunkText, stem string) []int64 {
 	return ids
 }
 
-// fuse combines the two legs' normalized per-chunk scores (W12-03 step 3c):
-// fused = TriWeight*tri + UniWeight*uni. A chunk missing from a leg simply
-// is not a key in that leg's map, so Go's zero-value map lookup already
-// gives "missing leg contributes 0" for free.
-func fuse(cfg Config, tri, uni map[int64]float64) map[int64]float64 {
-	out := make(map[int64]float64, len(tri)+len(uni))
+// fuse combines the three legs' normalized per-chunk scores (W12-03 step
+// 3c, extended by W12-11 step 4): fused = TriWeight*tri + UniWeight*uni +
+// VecWeight*vec. A chunk missing from a leg simply is not a key in that
+// leg's map, so Go's zero-value map lookup already gives "missing leg
+// contributes 0" for free - this is also exactly how a degraded (vec-less)
+// call behaves, since Search passes an empty vec map in that case.
+func fuse(cfg Config, tri, uni, vec map[int64]float64) map[int64]float64 {
+	out := make(map[int64]float64, len(tri)+len(uni)+len(vec))
 	for id := range tri {
 		out[id] = 0
 	}
 	for id := range uni {
 		out[id] = 0
 	}
+	for id := range vec {
+		out[id] = 0
+	}
 	for id := range out {
-		out[id] = cfg.TriWeight*tri[id] + cfg.UniWeight*uni[id]
+		out[id] = cfg.TriWeight*tri[id] + cfg.UniWeight*uni[id] + cfg.VecWeight*vec[id]
 	}
 	return out
 }

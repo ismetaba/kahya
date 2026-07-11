@@ -141,17 +141,19 @@ func runHealth(client *Client, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// runReindex implements `kahya reindex [--full]` (W12-06 step 6): POST
-// /v1/reindex, print the Turkish summary from the response.
+// runReindex implements `kahya reindex [--full] [--re-embed]` (W12-06 step
+// 6; W12-11 step 5 adds --re-embed): POST /v1/reindex, print the Turkish
+// summary from the response.
 func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reindex", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	full := fs.Bool("full", false, "tam yeniden indeksleme")
+	reEmbed := fs.Bool("re-embed", false, "tum parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	rr, err := client.Reindex(context.Background(), traceid.New(), *full)
+	rr, err := client.Reindex(context.Background(), traceid.New(), *full, *reEmbed)
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return 2

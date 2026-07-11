@@ -1,6 +1,13 @@
 SQLC_VERSION ?= v1.30.0        # pin; bump deliberately, never 'latest'
 VENV := worker/.venv
 PY := $(VENV)/bin/python
+# MLX_VENV is mlx/embed's OWN venv (W12-11) - separate process, separate
+# deps from worker/'s (HANDOFF §4 three-process architecture). Never
+# installed/activated by the plain `test`/`venv` targets: the embedding
+# pipeline needs the real downloaded Qwen3-Embedding-0.6B model to do
+# anything meaningful, so it is `test-mlx`'s dependency alone.
+MLX_VENV := mlx/embed/.venv
+MLX_PY := $(MLX_VENV)/bin/python
 
 CODESIGN_ID ?= Kahya Dev
 
@@ -11,7 +18,7 @@ LAUNCH_AGENTS_DIR := $(HOME)/Library/LaunchAgents
 PLIST_NAME := com.kahya.kahyad.plist
 REPO_ROOT := $(abspath .)
 
-.PHONY: build test lint venv generate codesign install run-daemon install-agent uninstall-agent accept-w12
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -38,10 +45,29 @@ venv:
 test: venv build
 	go test -tags $(TEST_TAGS) ./...
 	$(PY) -m unittest discover -s worker/tests -v
+mlx-venv:
+	test -d $(MLX_VENV) || python3 -m venv $(MLX_VENV)
+	$(MLX_PY) -m pip install --quiet -r mlx/embed/requirements.txt
+# test-mlx: the W12-11 LIVE-model gate. Separate from `test` on purpose -
+# it needs the real downloaded Qwen3-Embedding-0.6B model (W0-03) and this
+# machine's actual MLX runtime, neither of which a hermetic CI box can be
+# assumed to have; `test` itself must stay green with no model present
+# (search.Searcher's vector leg degrades to FTS-only automatically - see
+# kahyad/internal/search's own degraded-fallback tests). Runs:
+#   1. the "mlx"-tagged Go tests (kahyad/internal/mlxe2e's real end-to-end
+#      cross-lingual gate - spawns a real bin/kahyad, which lazily spawns
+#      the real mlx/embed/server.py);
+#   2. mlx/embed's own pytest suite (test_server.py - skips cleanly if the
+#      model snapshot is somehow missing, though `build`+`mlx-venv` above
+#      being prerequisites here means it never should be).
+test-mlx: mlx-venv build
+	go test -tags $(GOTAGS),mlx ./... -v
+	$(MLX_PY) -m pytest mlx/embed/test_server.py -v
 lint:
 	test -z "$$(gofmt -l .)"
 	go vet -tags $(GOTAGS) ./...
 	go vet -tags $(TEST_TAGS) ./...
+	go vet -tags $(GOTAGS),mlx ./...
 	if [ -f sqlc.yaml ]; then \
 		go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate && \
 		git diff --exit-code -- kahyad/internal/store/sqlcgen || \
