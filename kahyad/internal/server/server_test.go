@@ -420,6 +420,37 @@ func postMemorySearch(t *testing.T, client *http.Client, body string) *http.Resp
 	return resp
 }
 
+// TestMemorySearchDenyAllReturns403 guards the W3-01 deny-all fail-closed
+// fix: when policy.yaml failed to load, /v1/memory/search must NOT serve
+// memory content (it feeds the <hafiza> block reaching the cloud model),
+// even though a Searcher is wired.
+func TestMemorySearchDenyAllReturns403(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 7, EpisodeID: 3, Path: "note-a.md", Text: "gizli", Score: 0.9, SourceTier: "user_asserted"},
+	}}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	srv.SetDenyAll() // simulate a policy.yaml load failure at boot.
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+
+	client := unixHTTPClient(socketPath)
+	resp := postMemorySearch(t, client, `{"query":"gizli","k":3,"for_injection":true,"task_id":"t1"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (deny-all must gate memory search)", resp.StatusCode)
+	}
+	var buf bytes.Buffer
+	buf.ReadFrom(resp.Body)
+	if strings.Contains(buf.String(), "gizli") {
+		t.Fatalf("deny-all response leaked memory content: %s", buf.String())
+	}
+}
+
 // TestMemorySearchEndpointReturnsResults guards W12-03 step 4's happy path:
 // a valid request reaches the wired Searcher and its hits round-trip as
 // JSON with every documented field.

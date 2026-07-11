@@ -189,10 +189,18 @@ func validateEgress(e EgressConfig) error {
 	if len(e.Allowlist) == 0 {
 		return fmt.Errorf("policy: egress.allowlist must not be empty")
 	}
+	seenHost := make(map[string]bool, len(e.Allowlist))
 	for _, a := range e.Allowlist {
 		if strings.TrimSpace(a.Host) == "" {
 			return fmt.Errorf("policy: egress.allowlist has an entry with an empty host")
 		}
+		// Reject duplicate hosts (mirrors the duplicate-tool-name check): a
+		// second, broader entry silently coexisting with a narrower one would
+		// make the effective allowlist for a host ambiguous.
+		if seenHost[a.Host] {
+			return fmt.Errorf("policy: duplicate egress.allowlist host %q", a.Host)
+		}
+		seenHost[a.Host] = true
 		for _, p := range a.Ports {
 			if p <= 0 || p > 65535 {
 				return fmt.Errorf("policy: egress.allowlist host %q has out-of-range port %d", a.Host, p)

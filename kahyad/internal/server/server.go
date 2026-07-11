@@ -27,6 +27,7 @@ import (
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/notify"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/traceid"
 	"kahya/mcp/memory"
@@ -481,6 +482,17 @@ type errorResponse struct {
 // (or one that is all whitespace) is a 400, never a panic; k<=0 defaults to
 // 8 inside search.Searcher.Search.
 func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
+	// Deny-all fail-closed (W3-01): policy.yaml failed to load, so no policy
+	// decision can be trusted. /v1/memory/search is the endpoint the worker's
+	// UserPromptSubmit hook calls to build the <hafiza> block that reaches the
+	// cloud model, so it must NOT serve memory content while policy is
+	// untrusted (deny-all must override even memory_search here, not only at
+	// /policy/check and /v1/mcp). The worker hook treats a non-200 as
+	// "continue without injection" — a safe degrade.
+	if s.DenyAll() {
+		writeJSONError(w, http.StatusForbidden, policy.ReasonDenyAll)
+		return
+	}
 	if s.search == nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "memory search not available")
 		return

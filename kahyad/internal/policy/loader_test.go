@@ -157,6 +157,16 @@ func TestLoadRejectsBadGlobSyntax(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsDuplicateEgressHost(t *testing.T) {
+	_, err := Load(testdataPath(t, "invalid_duplicate_egress_host.yaml"))
+	if err == nil {
+		t.Fatal("Load(invalid_duplicate_egress_host.yaml) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "duplicate egress.allowlist host") {
+		t.Errorf("error = %q, want it to flag the duplicate egress host", err.Error())
+	}
+}
+
 func TestLoadRejectsMissingMandatoryDenyGlob(t *testing.T) {
 	_, err := Load(testdataPath(t, "invalid_missing_deny_glob.yaml"))
 	if err == nil {
