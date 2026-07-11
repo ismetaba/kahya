@@ -1,16 +1,20 @@
-// Package approval implements the W3-06 WYSIWYE approval payload: a
-// deterministic, per-kind serializer (payload.go) whose SHA-256 the policy
-// engine binds a one-time approval token to, and a byte-exact diff
-// renderer (diff.go) that shows a human EXACTLY those bytes before they
-// ever execute (HANDOFF §5 safety #5). The SAME Build* function runs at
-// approval-mint time and at execution-verify time — that reuse (not two
-// independently-maintained serializers) is the whole WYSIWYE invariant:
-// kahyad/internal/policy's approvedBytesHash additionally routes every
-// hash through kahyad/internal/canon.CanonicalizeBytes, so this package
-// does not need to re-derive NFC/bidi/homoglyph handling itself for the
-// low-level token-binding hash — it focuses on RENDERING (this package's
-// own Hash field is a convenience for logging/display, not the value the
-// policy engine's token is bound to).
+// Package approval implements the W3-06 WYSIWYE approval RENDERING layer: a
+// deterministic, per-kind serializer (payload.go) and a byte-exact diff
+// renderer (diff.go) that show a human EXACTLY the bytes an action will
+// execute, before it executes (HANDOFF §5 safety #5).
+//
+// IMPORTANT — where the security boundary actually lives: this package is
+// the DISPLAY path (it backs the read-only GET /policy/approvals rendering
+// only). It is NOT what the one-time approval token is bound to. The
+// token-binding hash is kahyad/internal/policy's approvedBytesHash, computed
+// over the raw tool_input bytes routed through
+// kahyad/internal/canon.CanonicalizeBytes, and re-checked at
+// /policy/consume-token — that recompute-over-the-same-tool_input is the
+// enforced "executed bytes == approved bytes" invariant. This package's
+// Build*/Hash render a FAITHFUL view of that same tool_input for the human;
+// its Hash field is for logging/display, never the value the token is bound
+// to. Keeping the two in sync (display faithfully shows the hashed bytes) is
+// the WYSIWYE contract; the token binding is enforced in policy, not here.
 package approval
 
 import (
