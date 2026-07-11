@@ -502,6 +502,22 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"ANTHROPIC_API_KEY=" + cfg.APIKey,
 		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
 		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
+		// The claude-agent-sdk worker spawns the bundled `claude` CLI, which
+		// otherwise opens its OWN outbound HTTPS to telemetry / auto-update /
+		// error-reporting / feature-flag hosts, independent of
+		// ANTHROPIC_BASE_URL. That is an uncontrolled egress side-channel from
+		// the worker, which contradicts "egress is a first-class gated
+		// capability" (§5 safety #1): every off-box byte must pass a kahyad
+		// gate, and the model call already does (via the per-task proxy). Shut
+		// the side-channel off at the source so the ONLY traffic the worker's
+		// CLI makes is the /v1/messages call through kahyad's proxy. The
+		// umbrella flag plus the individual ones (belt-and-braces across CLI
+		// versions).
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DISABLE_TELEMETRY=1",
+		"DISABLE_ERROR_REPORTING=1",
+		"DISABLE_AUTOUPDATER=1",
+		"DISABLE_BUG_COMMAND=1",
 	}
 	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
 		pythonPath := wd

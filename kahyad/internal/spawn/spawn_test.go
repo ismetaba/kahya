@@ -457,6 +457,31 @@ func TestBuildEnvIncludesMCPBridgeAndCredentialMode(t *testing.T) {
 	}
 }
 
+// TestBuildEnvDisablesCLISideChannelEgress guards the §5-safety-#1 hardening:
+// the worker's bundled `claude` CLI must not phone home to telemetry /
+// auto-update / error-reporting hosts outside kahyad's egress gate. BuildEnv
+// sets the disabling env vars for every spawned worker.
+func TestBuildEnvDisablesCLISideChannelEgress(t *testing.T) {
+	got := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs"}, Envelope{TaskID: "t", TraceID: "tr"})
+	resolved := map[string]string{}
+	for _, kv := range got {
+		if parts := strings.SplitN(kv, "=", 2); len(parts) == 2 {
+			resolved[parts[0]] = parts[1]
+		}
+	}
+	for _, k := range []string{
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+		"DISABLE_TELEMETRY",
+		"DISABLE_ERROR_REPORTING",
+		"DISABLE_AUTOUPDATER",
+		"DISABLE_BUG_COMMAND",
+	} {
+		if resolved[k] != "1" {
+			t.Errorf("%s = %q, want \"1\" (worker CLI side-channel egress must be disabled)", k, resolved[k])
+		}
+	}
+}
+
 // TestBuildEnvSetsPythonPathForRealVenvLayout is BLOCKER 1's BuildEnv-level
 // unit test: when cfg.Cmd[0] sits inside a real ".venv/bin/..." layout
 // (the shape config.defaultWorkerCmd produces), BuildEnv must add a
