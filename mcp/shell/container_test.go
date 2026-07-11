@@ -28,6 +28,9 @@ func requireDockerTests(t *testing.T) {
 	if os.Getenv("KAHYA_DOCKER_TESTS") != "1" {
 		t.Skip("KAHYA_DOCKER_TESTS not set — docker daemon not confirmed up; see docker/README.md")
 	}
+	// The cross-process Docker lock (TestMain, testmain_test.go) is held
+	// for this whole package's test run, not per-test here - see that
+	// file's own doc comment for why.
 }
 
 // liveImageTag/liveDigestPath resolve the SAME committed image tag/digest

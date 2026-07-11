@@ -23,8 +23,10 @@ package shell
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Docker network/sidecar names and ports (this task's spec, verbatim) —
@@ -41,6 +43,39 @@ const (
 
 	egressSidecarBaseImage = "alpine/socat"
 )
+
+// dockerSharedResourceLockPath is a fixed, well-known path used to
+// serialize every test process (in this package OR any other, e.g.
+// tests/w3's W3-10 Gate 4) that creates/uses/removes the kahya-egress-fwd
+// sidecar / kahya-egress network by their fixed, well-known,
+// process-wide-singleton names above. Those names are deliberately fixed
+// (a single system-wide sidecar, matching the real daemon's own posture),
+// which is exactly why two DIFFERENT test binaries touching them at the
+// same time (Go's `go test ./...` runs different packages concurrently by
+// default) race each other's create/recreate/remove calls on the SAME
+// Docker-global resource — confirmed empirically once a second package
+// (tests/w3) started exercising this same egress-network path.
+const dockerSharedResourceLockPath = "/tmp/kahya-egress-docker-shared-test.lock"
+
+// LockDockerSharedResources acquires an exclusive, cross-process flock on
+// dockerSharedResourceLockPath and returns a release func (call via
+// t.Cleanup). Every test — in this package or another — that drives a
+// needs_network:true shell_docker job by the fixed EgressNetworkName/
+// EgressSidecarName must hold this for the whole test.
+func LockDockerSharedResources() (release func(), err error) {
+	f, err := os.OpenFile(dockerSharedResourceLockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("shell: open docker shared-resource lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("shell: flock docker shared-resource lock: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
 
 // reasonEgressNetworkFailed is the EXACT Turkish string this task's spec
 // fixes verbatim: "Egress ağı kurulamadı" — every failure path in this
