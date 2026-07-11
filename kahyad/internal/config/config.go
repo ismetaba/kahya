@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -246,47 +247,100 @@ type Config struct {
 	// W7-8 KAHYA_ENV=dev profile can redirect every path independent of any
 	// on-disk config file.
 	Env string `yaml:"-"`
+
+	// --- W4-01 two-tier scheduler ---
+
+	// Jobs is cfg.jobs (HANDOFF §4 stack ⚑ scheduling): the wall-clock jobs
+	// kahyad installs as launchd LaunchAgents (StartCalendarInterval, NOT
+	// an in-daemon cron — Go's darwin monotonic clock stops during sleep,
+	// golang/go#24595). Each entry's Handler must name a Go handler
+	// registered via kahyad/internal/scheduler.Scheduler.RegisterHandler;
+	// LoadJobs resolves this list against that registry at boot. Default
+	// empty: no job is declared until config.yaml opts one in (this task
+	// ships only the built-in "smoke" handler for tests —
+	// backup-nightly/memory-push/briefing/consolidation are declared by
+	// their own later tasks, W4-06/W5-01/W5-02).
+	Jobs []JobConfig `yaml:"jobs"`
+
+	// TriggerBinPath is the absolute path to the kahya-trigger binary
+	// (kahyad/cmd/kahya-trigger) launchd execs for every declared job —
+	// derived the same way MCPBridgePath/PolicyPath/etc. are (two
+	// directories up from the running kahyad executable):
+	// "<repo>/bin/kahya-trigger".
+	TriggerBinPath string `yaml:"trigger_bin_path"`
+}
+
+// JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
+// DNS-label chars only (kahyad/internal/scheduler renders it into a
+// "com.kahya.job.<name>" launchd Label and a "job-<name>.log" filename —
+// both need this constraint to stay filesystem/launchd-safe); Calendar
+// mirrors launchd's own StartCalendarInterval dict keys (a nil field means
+// "every" for that unit, matching StartCalendarInterval's own documented
+// omitted-key semantics); Handler names a Go handler registered via
+// kahyad/internal/scheduler.Scheduler.RegisterHandler — not necessarily
+// equal to Name (multiple jobs could in principle share one handler).
+type JobConfig struct {
+	Name     string       `yaml:"name"`
+	Calendar CalendarSpec `yaml:"calendar"`
+	Handler  string       `yaml:"handler"`
+}
+
+// CalendarSpec mirrors launchd's StartCalendarInterval dict (task spec
+// step 1): Minute/Hour/Day/Weekday, each *int so "unset" (launchd's
+// "every") is distinguishable from an explicit 0. Field names are
+// capitalized to match launchd's own dict keys 1:1 — deliberately NOT
+// this file's usual lower_snake_case yaml convention — so
+// kahyad/internal/scheduler.RenderPlist's output and config.yaml's
+// calendar: block read as the same StartCalendarInterval dict, just in
+// two different serializations.
+type CalendarSpec struct {
+	Minute  *int `yaml:"Minute,omitempty"`
+	Hour    *int `yaml:"Hour,omitempty"`
+	Day     *int `yaml:"Day,omitempty"`
+	Weekday *int `yaml:"Weekday,omitempty"`
 }
 
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir                 *string   `yaml:"data_dir"`
-	Socket                  *string   `yaml:"socket"`
-	LogDir                  *string   `yaml:"log_dir"`
-	DBPath                  *string   `yaml:"db_path"`
-	MemoryDir               *string   `yaml:"memory_dir"`
-	AnthropicUpstreamURL    *string   `yaml:"anthropic_upstream_url"`
-	EmbedPort               *int      `yaml:"embed_port"`
-	DefaultModel            *string   `yaml:"default_model"`
-	TaskTimeoutMin          *int      `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer     *string   `yaml:"active_embed_model_ver"`
-	LogLevel                *string   `yaml:"log_level"`
-	UndoWindowSeconds       *int      `yaml:"undo_window_seconds"`
-	WorkerCmd               *[]string `yaml:"worker_cmd"`
-	EmbedCmd                *[]string `yaml:"embed_cmd"`
-	MCPBridgePath           *string   `yaml:"mcp_bridge_path"`
-	PolicyPath              *string   `yaml:"policy_path"`
-	EgressPort              *int      `yaml:"egress_port"`
-	DockerImageTag          *string   `yaml:"docker_image_tag"`
-	DockerImageDigestPath   *string   `yaml:"docker_image_digest_path"`
-	EgressSidecarDigestPath *string   `yaml:"egress_sidecar_digest_path"`
-	ShellWorkdirRoots       *[]string `yaml:"shell_workdir_roots"`
-	DailyBudgetUSD          *float64  `yaml:"daily_budget_usd"`
-	MonthlyBudgetUSD        *float64  `yaml:"monthly_budget_usd"`
-	TaskTokenCeiling        *int64    `yaml:"task_token_ceiling"`
-	DowngradeAtRatio        *float64  `yaml:"downgrade_at_ratio"`
-	CacheHitAlarmThreshold  *float64  `yaml:"cache_hit_alarm_threshold"`
-	CredentialMode          *string   `yaml:"credential_mode"`
-	EstRequestTokens        *int64    `yaml:"est_request_tokens"`
-	TelegramChatID          *int64    `yaml:"telegram_chat_id"`
-	TelegramUserID          *int64    `yaml:"telegram_user_id"`
-	TelegramAPIURL          *string   `yaml:"telegram_api_url"`
-	QwenCmd                 *[]string `yaml:"qwen_cmd"`
-	QwenModelPath           *string   `yaml:"qwen_model_path"`
-	QwenModelName           *string   `yaml:"qwen_model_name"`
-	QwenPort                *int      `yaml:"qwen_port"`
-	QwenIdleTTLSeconds      *int      `yaml:"qwen_idle_ttl_seconds"`
+	DataDir                 *string      `yaml:"data_dir"`
+	Socket                  *string      `yaml:"socket"`
+	LogDir                  *string      `yaml:"log_dir"`
+	DBPath                  *string      `yaml:"db_path"`
+	MemoryDir               *string      `yaml:"memory_dir"`
+	AnthropicUpstreamURL    *string      `yaml:"anthropic_upstream_url"`
+	EmbedPort               *int         `yaml:"embed_port"`
+	DefaultModel            *string      `yaml:"default_model"`
+	TaskTimeoutMin          *int         `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer     *string      `yaml:"active_embed_model_ver"`
+	LogLevel                *string      `yaml:"log_level"`
+	UndoWindowSeconds       *int         `yaml:"undo_window_seconds"`
+	WorkerCmd               *[]string    `yaml:"worker_cmd"`
+	EmbedCmd                *[]string    `yaml:"embed_cmd"`
+	MCPBridgePath           *string      `yaml:"mcp_bridge_path"`
+	PolicyPath              *string      `yaml:"policy_path"`
+	EgressPort              *int         `yaml:"egress_port"`
+	DockerImageTag          *string      `yaml:"docker_image_tag"`
+	DockerImageDigestPath   *string      `yaml:"docker_image_digest_path"`
+	EgressSidecarDigestPath *string      `yaml:"egress_sidecar_digest_path"`
+	ShellWorkdirRoots       *[]string    `yaml:"shell_workdir_roots"`
+	DailyBudgetUSD          *float64     `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD        *float64     `yaml:"monthly_budget_usd"`
+	TaskTokenCeiling        *int64       `yaml:"task_token_ceiling"`
+	DowngradeAtRatio        *float64     `yaml:"downgrade_at_ratio"`
+	CacheHitAlarmThreshold  *float64     `yaml:"cache_hit_alarm_threshold"`
+	CredentialMode          *string      `yaml:"credential_mode"`
+	EstRequestTokens        *int64       `yaml:"est_request_tokens"`
+	TelegramChatID          *int64       `yaml:"telegram_chat_id"`
+	TelegramUserID          *int64       `yaml:"telegram_user_id"`
+	TelegramAPIURL          *string      `yaml:"telegram_api_url"`
+	QwenCmd                 *[]string    `yaml:"qwen_cmd"`
+	QwenModelPath           *string      `yaml:"qwen_model_path"`
+	QwenModelName           *string      `yaml:"qwen_model_name"`
+	QwenPort                *int         `yaml:"qwen_port"`
+	QwenIdleTTLSeconds      *int         `yaml:"qwen_idle_ttl_seconds"`
+	Jobs                    *[]JobConfig `yaml:"jobs"`
+	TriggerBinPath          *string      `yaml:"trigger_bin_path"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -321,6 +375,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateCredentialMode(cfg.CredentialMode); err != nil {
+		return Config{}, err
+	}
+	if err := validateJobs(cfg.Jobs); err != nil {
 		return Config{}, err
 	}
 
@@ -390,7 +447,23 @@ func defaults(home string) Config {
 		QwenModelName:      "mlx-community/Qwen3-30B-A3B-4bit",
 		QwenPort:           8765,
 		QwenIdleTTLSeconds: 600,
+
+		// W4-01 scheduler defaults: no jobs declared out of the box (see
+		// Config.Jobs's doc comment); TriggerBinPath follows the same
+		// repo-root derivation as every other default*Path helper below.
+		TriggerBinPath: defaultTriggerBinPath(),
 	}
+}
+
+// defaultTriggerBinPath resolves the default "<repo>/bin/kahya-trigger"
+// path, using the exact same repo-root derivation as defaultMCPBridgePath/
+// defaultPolicyPath (see defaultWorkerCmd's doc comment).
+func defaultTriggerBinPath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "bin", "kahya-trigger")
 }
 
 // defaultQwenCmd resolves the W3-08 base invocation
@@ -642,6 +715,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.QwenIdleTTLSeconds != nil {
 		cfg.QwenIdleTTLSeconds = *fc.QwenIdleTTLSeconds
 	}
+	if fc.Jobs != nil {
+		cfg.Jobs = *fc.Jobs
+	}
+	if fc.TriggerBinPath != nil {
+		cfg.TriggerBinPath = expandHome(*fc.TriggerBinPath, home)
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -744,6 +823,37 @@ func validateLogLevel(level string) error {
 func validateCredentialMode(mode string) error {
 	if mode != CredentialModeKeychain && mode != CredentialModePassthrough {
 		return fmt.Errorf("config: credential_mode=%q invalid, must be %q or %q", mode, CredentialModeKeychain, CredentialModePassthrough)
+	}
+	return nil
+}
+
+// jobNamePattern is the DNS-label constraint cfg.jobs[].name must satisfy
+// (task spec step 1) — letters/digits/hyphen, 1-63 chars, never
+// starting/ending with a hyphen. kahyad/internal/scheduler renders a job
+// name verbatim into a launchd Label (com.kahya.job.<name>) and a log
+// filename (job-<name>.log), both of which need exactly this constraint;
+// scheduler cannot depend back on this package's own validator (it
+// already imports config), so this is the ONE place the constraint is
+// enforced — at config.Load, fail-closed, before any job ever reaches
+// kahyad/internal/scheduler at all.
+var jobNamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
+// validateJobs fails Load closed (same posture as validateEnv/
+// validateLogLevel/validateCredentialMode) on any cfg.jobs entry with a
+// non-DNS-label name, a duplicate name, or an empty handler.
+func validateJobs(jobs []JobConfig) error {
+	seen := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		if !jobNamePattern.MatchString(j.Name) {
+			return fmt.Errorf("config: jobs[].name=%q invalid, must be DNS-label chars only (letters/digits/hyphen, 1-63 chars, no leading/trailing hyphen)", j.Name)
+		}
+		if seen[j.Name] {
+			return fmt.Errorf("config: jobs[].name=%q declared more than once", j.Name)
+		}
+		seen[j.Name] = true
+		if strings.TrimSpace(j.Handler) == "" {
+			return fmt.Errorf("config: jobs[].handler must not be empty (job %q)", j.Name)
+		}
 	}
 	return nil
 }

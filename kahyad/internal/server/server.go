@@ -163,6 +163,13 @@ type Server struct {
 	secretLaneAnswerer   secretlane.Answerer
 	markSensitiveRead    func(ctx context.Context, sessionKey, traceID string) error
 
+	// scheduler wires POST /jobs/trigger/{name} (W4-01): job registry,
+	// resolution, and async dispatch+ledgering all live in
+	// kahyad/internal/scheduler.Scheduler (jobs.go's SetScheduler doc
+	// comment); nil until SetScheduler is called - the route answers 503
+	// the same "unwired dependency" way SetSearcher/SetReindexer do.
+	scheduler JobScheduler
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -276,6 +283,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
 	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
 	mux.HandleFunc("/session/sensitive-read", s.handleSensitiveRead)
+	mux.HandleFunc(jobTriggerPrefix, s.handleJobTrigger)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

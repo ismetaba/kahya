@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.kahya.job.smoke</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/abs/repo/bin/kahya-trigger</string>
+		<string>smoke</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/abs/home/Library/Logs/Kahya/job-smoke.log</string>
+	<key>StandardErrorPath</key>
+	<string>/abs/home/Library/Logs/Kahya/job-smoke.log</string>
+</dict>
+</plist>

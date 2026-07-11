@@ -33,6 +33,7 @@ import (
 	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/scheduler"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/secrets"
@@ -49,16 +50,61 @@ func main() {
 	os.Exit(dispatch(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// dispatch handles kahyad's argv-based subcommands. Currently the only one
-// is "policy validate" (W3-01 acceptance criterion); any other argv
-// (including none at all) runs the daemon itself (run()), matching every
-// prior release's behavior exactly - kahyad has never taken positional
-// arguments before this task.
+// dispatch handles kahyad's argv-based subcommands: "policy validate"
+// (W3-01 acceptance criterion) and "-sync-jobs" (W4-01: renders/installs/
+// removes launchd job LaunchAgents once, per cfg.Jobs, and exits - see
+// runSyncJobs). Any other argv (including none at all) runs the daemon
+// itself (run()).
 func dispatch(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "policy" {
 		return runPolicyCLI(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "-sync-jobs" {
+		return runSyncJobs(stdout, stderr)
+	}
 	return run()
+}
+
+// runSyncJobs implements the standalone `kahyad -sync-jobs` mode (W4-01
+// task spec step 5): load config, sync ~/Library/LaunchAgents' set of
+// com.kahya.job.<name> plists to exactly match cfg.Jobs, and exit -
+// without opening brain.db or binding the UDS socket at all (this mode
+// touches neither, so it is safe to run even while a real kahyad is
+// already up). Idempotent: safe to run repeatedly, e.g. from a shell
+// script after editing config.yaml's jobs: section, without restarting
+// the daemon.
+func runSyncJobs(stdout, stderr io.Writer) int {
+	traceID := traceid.New()
+
+	cfg, err := config.Load()
+	if err != nil {
+		bootFailLine(traceID, "config_load_failed", err)
+		return 1
+	}
+	logx.SetLevel(parseLogLevel(cfg.LogLevel))
+	log, err := logx.New(cfg.LogDir, traceID)
+	if err != nil {
+		bootFailLine(traceID, "logger_init_failed", err)
+		return 1
+	}
+	defer log.Close()
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Error("sync_jobs_home_dir_failed", "err", err.Error())
+		return 1
+	}
+	opts := scheduler.SyncOptions{
+		LaunchAgentsDir: filepath.Join(home, "Library", "LaunchAgents"),
+		JobLogDir:       filepath.Join(home, "Library", "Logs", "Kahya"),
+		TriggerBinPath:  cfg.TriggerBinPath,
+	}
+	if err := scheduler.Sync(cfg.Jobs, opts, scheduler.NewExecRunner(), log); err != nil {
+		log.Error("sync_jobs_failed", "err", err.Error())
+		return 1
+	}
+	log.Info("sync_jobs_done", "jobs", len(cfg.Jobs))
+	return 0
 }
 
 // runPolicyCLI implements `kahyad policy validate [path]` (W3-01): loads
@@ -502,6 +548,32 @@ func run() int {
 	}
 	defer egressProxy.Close()
 	log.Info("egress_proxy_started", "addr", egressProxy.Addr)
+
+	// W4-01: the two-tier scheduler - job registry (scheduler.New itself
+	// registers the built-in "smoke" handler) + trigger dispatch, wired to
+	// POST /jobs/trigger/{name} (kahyad/internal/server/jobs.go). LoadJobs
+	// resolves cfg.Jobs against every handler registered by this point in
+	// boot - main.go registers no handler beyond the built-in "smoke" one
+	// until W4-05/W4-06/W5-01/W5-02 add their own RegisterHandler calls
+	// here.
+	sched := scheduler.New(st, log)
+	sched.LoadJobs(cfg.Jobs)
+	srv.SetScheduler(sched)
+
+	// Startup sync (task spec step 5): keep ~/Library/LaunchAgents' set of
+	// com.kahya.job.<name> plists in exact sync with cfg.Jobs on every
+	// normal boot too - not only via the standalone `kahyad -sync-jobs`
+	// flag (runSyncJobs below, for scripting/idempotent re-sync without a
+	// full daemon restart). Best-effort: a launchctl hiccup here must
+	// never prevent the rest of the daemon from serving.
+	schedSyncOpts := scheduler.SyncOptions{
+		LaunchAgentsDir: filepath.Join(home, "Library", "LaunchAgents"),
+		JobLogDir:       filepath.Join(home, "Library", "Logs", "Kahya"),
+		TriggerBinPath:  cfg.TriggerBinPath,
+	}
+	if err := scheduler.Sync(cfg.Jobs, schedSyncOpts, scheduler.NewExecRunner(), log); err != nil {
+		log.Error("job_sync_failed", "err", err.Error())
+	}
 
 	// ctx is created here (BEFORE the boot reindex goroutine below is
 	// spawned, not after) so that goroutine can share the SAME

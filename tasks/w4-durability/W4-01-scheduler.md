@@ -1,6 +1,6 @@
 # W4-01 — Scheduler: launchd wall-clock jobs + in-daemon ticks
 
-**Status:** todo
+**Status:** done
 **Phase:** W4 — Durability
 **Depends on:** W12-01
 **Flags:** none
@@ -77,18 +77,18 @@ Binding decision (HANDOFF §4, stack table, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green, including `kahyad/internal/scheduler` tests (golden plist, trigger
+- [x] `make test` green, including `kahyad/internal/scheduler` tests (golden plist, trigger
       endpoint, tick cadence).
-- [ ] With a `smoke` job declared (`Minute: 0` any hour), after `kahyad -sync-jobs`:
+- [x] With a `smoke` job declared (`Minute: 0` any hour), after `kahyad -sync-jobs`:
       `launchctl print gui/$(id -u)/com.kahya.job.smoke` exits 0 and shows the trigger binary.
-- [ ] `launchctl kickstart gui/$(id -u)/com.kahya.job.smoke` then
+- [x] `launchctl kickstart gui/$(id -u)/com.kahya.job.smoke` then
       `sqlite3 ~/Library/Application\ Support/Kahya/brain.db "SELECT kind FROM events WHERE json_extract(payload,'$.job_name')='smoke' ORDER BY id DESC LIMIT 2;"`
       returns `job.completed` and `job.triggered`.
-- [ ] The JSONL daemon log contains lines for that run whose `trace_id` equals the one in the
+- [x] The JSONL daemon log contains lines for that run whose `trace_id` equals the one in the
       `job.triggered` event payload (grep to verify — README "single trace_id" convention).
-- [ ] Removing the `smoke` job from config and re-running `kahyad -sync-jobs` deletes
+- [x] Removing the `smoke` job from config and re-running `kahyad -sync-jobs` deletes
       `~/Library/LaunchAgents/com.kahya.job.smoke.plist` and `launchctl print` now fails.
-- [ ] `./kahya-trigger no-such-job` exits non-zero and prints the 404 body.
+- [x] `./kahya-trigger no-such-job` exits non-zero and prints the 404 body.
 
 ## Out of scope
 

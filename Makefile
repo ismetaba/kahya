@@ -45,6 +45,7 @@ build:
 	go build -tags $(GOTAGS) -ldflags "-X kahya/kahyad/internal/buildinfo.Version=$(KAHYA_VERSION)" -o bin/kahyad ./kahyad
 	go build -tags $(GOTAGS) -o bin/kahya ./kahyad/cmd/kahya
 	go build -tags $(GOTAGS) -o bin/kahya-mcp ./kahyad/cmd/kahya-mcp
+	go build -tags $(GOTAGS) -o bin/kahya-trigger ./kahyad/cmd/kahya-trigger
 venv:
 	test -d $(VENV) || python3 -m venv $(VENV)
 	$(PY) -m pip install --quiet -r worker/requirements.lock
@@ -82,10 +83,11 @@ test-mlx: mlx-venv build
 # short allowlist below is every net.Dial call this codebase had BEFORE
 # W3-05 and still has after it - all of them dial a LOCAL UDS socket or
 # 127.0.0.1 loopback, never an off-box host, so they are not egress at
-# all: kahyad/cmd/kahya/client.go + kahyad/cmd/kahya-mcp/main.go (the UDS
-# control-socket clients), kahyad/internal/server/server.go's probeHealth
-# (dials kahyad's own UDS socket) + its test, kahyad/internal/mlxe2e's
-# test (dials the local MLX embed service's loopback TCP port), and
+# all: kahyad/cmd/kahya/client.go + kahyad/cmd/kahya-mcp/main.go +
+# kahyad/cmd/kahya-trigger/main.go (the UDS control-socket clients),
+# kahyad/internal/server/server.go's probeHealth (dials kahyad's own UDS
+# socket) + its test, kahyad/internal/mlxe2e's test (dials the local MLX
+# embed service's loopback TCP port), and
 # mcp/shell/egress_integration_test.go's stand-in test proxy (this
 # package cannot import kahyad/internal/egress - Go's internal-package
 # boundary - so its Docker-integration test builds a small, independent,
@@ -107,7 +109,7 @@ lint:
 	@echo "checking W3-05 single-egress-gate invariant..."
 	@matches=$$(grep -rn 'http\.ProxyFromEnvironment\|net\.Dial' kahyad mcp worker 2>/dev/null \
 		| grep -v '^kahyad/internal/egress/' \
-		| grep -vE '^(kahyad/cmd/kahya/client\.go|kahyad/cmd/kahya-mcp/main\.go|kahyad/internal/server/server\.go|kahyad/internal/server/server_test\.go|kahyad/internal/mlxe2e/cross_lingual_test\.go|mcp/shell/egress_integration_test\.go):'); \
+		| grep -vE '^(kahyad/cmd/kahya/client\.go|kahyad/cmd/kahya-mcp/main\.go|kahyad/cmd/kahya-trigger/main\.go|kahyad/internal/server/server\.go|kahyad/internal/server/server_test\.go|kahyad/internal/mlxe2e/cross_lingual_test\.go|mcp/shell/egress_integration_test\.go):'); \
 	if [ -n "$$matches" ]; then \
 		echo "single-egress-gate violation: net.Dial/http.ProxyFromEnvironment found outside kahyad/internal/egress/ and the reviewed local-only allowlist (every OTHER off-box dial must go through egress.Check):"; \
 		echo "$$matches"; \

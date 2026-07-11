@@ -8,6 +8,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/modelcontextprotocol/go-sdk v1.0.0
 	github.com/pressly/goose/v3 v3.27.2
+	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/net v0.57.0
 	golang.org/x/text v0.40.0
 	gopkg.in/telebot.v4 v4.0.0-beta.10
