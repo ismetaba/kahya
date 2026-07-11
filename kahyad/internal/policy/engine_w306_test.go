@@ -86,6 +86,68 @@ func TestApproveW3LocalSurfaceSucceeds(t *testing.T) {
 	}
 }
 
+// TestApproveTelegramSurfaceLabeledRemote is MINOR B's regression test:
+// HANDOFF §5 + BACKLOG require every Telegram-originated approval to be
+// ledgered with a "remote" label, not merely surface:"telegram" - a
+// ledger reader must be able to select "every remotely approved action"
+// without special-casing every current/future non-local surface name by
+// its literal string. The policy_feedback_approved event itself must
+// carry remote:true whenever surface != "local".
+func TestApproveTelegramSurfaceLabeledRemote(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+
+	d, err := e.Check(ctx, CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-remote-label", ToolInput: []byte(`{"path":"~/notes.md"}`)})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Result != ResultNeedsApproval {
+		t.Fatalf("Check = %+v, want NEEDS_APPROVAL", d)
+	}
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "telegram"); err != nil {
+		t.Fatalf("Approve(surface=telegram): %v", err)
+	}
+
+	var payload string
+	if err := st.DB().QueryRow(
+		`SELECT payload FROM events WHERE trace_id = ? AND kind = 'policy_feedback_approved'`, "trace-remote-label",
+	).Scan(&payload); err != nil {
+		t.Fatalf("query policy_feedback_approved payload: %v", err)
+	}
+	if !strings.Contains(payload, `"remote":true`) {
+		t.Fatalf("policy_feedback_approved payload = %s, want it to contain remote:true for surface=telegram", payload)
+	}
+	if !strings.Contains(payload, `"surface":"telegram"`) {
+		t.Fatalf("policy_feedback_approved payload = %s, want it to still contain surface:\"telegram\" alongside the new label", payload)
+	}
+}
+
+// TestApproveLocalSurfaceNotLabeledRemote is the negative control: a
+// surface="local" approval's policy_feedback_approved event must NOT
+// carry any "remote" key at all.
+func TestApproveLocalSurfaceNotLabeledRemote(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+
+	d, err := e.Check(ctx, CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-local-no-remote", ToolInput: []byte(`{"path":"~/notes.md"}`)})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local"); err != nil {
+		t.Fatalf("Approve(surface=local): %v", err)
+	}
+
+	var payload string
+	if err := st.DB().QueryRow(
+		`SELECT payload FROM events WHERE trace_id = ? AND kind = 'policy_feedback_approved'`, "trace-local-no-remote",
+	).Scan(&payload); err != nil {
+		t.Fatalf("query policy_feedback_approved payload: %v", err)
+	}
+	if strings.Contains(payload, `"remote"`) {
+		t.Fatalf("policy_feedback_approved payload = %s, want NO remote label for surface=local", payload)
+	}
+}
+
 // TestListPendingApprovals lists a fresh NEEDS_APPROVAL row (with its
 // tool_input intact for rendering) and stops listing it once consumed.
 func TestListPendingApprovals(t *testing.T) {

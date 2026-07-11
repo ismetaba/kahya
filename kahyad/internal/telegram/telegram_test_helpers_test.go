@@ -164,6 +164,29 @@ func newDenyGate(t *testing.T) *egress.Gate {
 	return egress.NewGate(policy.EgressConfig{}, nil, nil, nil, nil, nil)
 }
 
+// fakeEgressGate is a directly-controllable EgressGate double - it records
+// every SessionInfo a Check call carries (so a MINOR D test can assert
+// SessionID was actually populated, without depending on the real Gate's
+// sensitive-tracking mechanics) and returns a single canned Decision/error
+// for every call (so a MINOR C test can force a block and assert the
+// caller degrades gracefully).
+type fakeEgressGate struct {
+	mu       sync.Mutex
+	calls    []egress.SessionInfo
+	decision egress.Decision
+	err      error
+}
+
+func (f *fakeEgressGate) Check(ctx context.Context, target egress.Target, nbytes int64, session egress.SessionInfo) (egress.Decision, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, session)
+	if f.err != nil {
+		return egress.Decision{}, f.err
+	}
+	return f.decision, nil
+}
+
 // ---- real policy.Engine + store.Store fixture (approvals_test.go /
 // redact_test.go need a REAL engine so Approve/Deny's own W3 backstop and
 // pending-approval bookkeeping are exercised authentically, not faked) ----
@@ -269,6 +292,20 @@ func callbackUpdate(chatID, userID int64, data string) tele.Update {
 func textUpdate(chatID, userID int64, text string) tele.Update {
 	return tele.Update{
 		Message: &tele.Message{
+			Sender: &tele.User{ID: userID},
+			Chat:   &tele.Chat{ID: chatID},
+			Text:   text,
+		},
+	}
+}
+
+// editedUpdate builds an incoming EDITED-message Update from (chatID,
+// userID) - MINOR A's regression fixture: telebot dispatches this via
+// tele.OnEdited (update.go's own ProcessContext: "if u.EditedMessage !=
+// nil { b.handle(OnEdited, c) }"), never OnText.
+func editedUpdate(chatID, userID int64, text string) tele.Update {
+	return tele.Update{
+		EditedMessage: &tele.Message{
 			Sender: &tele.User{ID: userID},
 			Chat:   &tele.Chat{ID: chatID},
 			Text:   text,

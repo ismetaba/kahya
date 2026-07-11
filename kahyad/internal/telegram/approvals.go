@@ -112,6 +112,23 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 	if !b.Enabled() {
 		return
 	}
+	// BLOCKER fix: the secret-lane check now runs BEFORE branching on
+	// class, and gates ALL three classes alike. A secret-lane-labeled
+	// action can be classified W1, W2, OR W3 (a valid policy.yaml config:
+	// an fs_write/fs_delete rule with class: W3, reversible: false) - this
+	// check used to live ONLY inside the W1/W2 case below, so a
+	// secret-lane W3 action fell straight through to sendW3Notice, which
+	// renders the REAL path via renderPendingApprovalPayload into
+	// msgW3WaitFmt and sends it to Telegram. HANDOFF §5 safety #5 ⚑
+	// ("gizli-şerit etiketli tek bir bayt Telegram'a gönderilmez") draws
+	// no exception for W3, so every class now gets ONLY the redacted
+	// title (redact.go) when secret-lane-labeled - no path, no summary,
+	// no diff, ever, regardless of class. See redact_test.go's
+	// TestSecretLaneW3StillRedacted/TestSecretLaneW3DeleteAlsoRedacted.
+	if isSecretLane(b.home, b.secretLaneGlobs, info.Tool, info.ToolInput) {
+		b.sendRedactedNotice(ctx, info)
+		return
+	}
 	switch info.Class {
 	case policy.ClassW3:
 		// W3: NOTIFICATION ONLY, ever — no buttons, no handler that could
@@ -122,10 +139,6 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 		// TestForgedW3CallbackRejectedAtEngine.
 		b.sendW3Notice(ctx, info)
 	case policy.ClassW1, policy.ClassW2:
-		if isSecretLane(b.home, b.secretLaneGlobs, info.Tool, info.ToolInput) {
-			b.sendRedactedNotice(ctx, info)
-			return
-		}
 		b.sendApprovalCard(ctx, info)
 	}
 }
@@ -200,7 +213,11 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	}
 	action, id, err := decodeCallbackData(cb.Data)
 	if err != nil {
-		b.respond(cb, msgInvalidCallback)
+		// No card was ever looked up yet (the id itself failed to decode)
+		// so there is no TraceID to attribute this toast to - respond's
+		// own egress.Check treats an empty SessionID/TraceID as simply "no
+		// session to taint-check", never a denial on that basis alone.
+		b.respond(cb, "", msgInvalidCallback)
 		return nil
 	}
 
@@ -208,8 +225,18 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	card, seen := b.cards[id]
 	alreadyResolved := seen && card.resolved
 	b.mu.Unlock()
+
+	// MINOR D: traceID is the originating card's TraceID when known - the
+	// SAME per-task trace id every other egress.Check call in this
+	// package now keys SessionInfo.SessionID on (see respond/send/
+	// editCard), matching anthproxy_hook.go's convention.
+	var traceID string
+	if seen {
+		traceID = card.TraceID
+	}
+
 	if alreadyResolved {
-		b.respond(cb, msgAlreadyHandled)
+		b.respond(cb, traceID, msgAlreadyHandled)
 		return nil
 	}
 
@@ -223,7 +250,7 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		feedbackErr = b.engine.Deny(context.Background(), id)
 		suffix, toast = suffixRejected, toastRejected
 	default:
-		b.respond(cb, msgInvalidCallback)
+		b.respond(cb, traceID, msgInvalidCallback)
 		return nil
 	}
 
@@ -239,12 +266,12 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		// "⏰ Süresi doldu" and marked resolved so a repeat of the SAME
 		// forged/stale callback answers "Zaten işlendi" instead of
 		// re-hitting the engine forever.
-		b.respond(cb, msgExpired)
+		b.respond(cb, traceID, msgExpired)
 		b.markResolved(id, suffixExpired)
 		return nil
 	}
 
-	b.respond(cb, toast)
+	b.respond(cb, traceID, toast)
 	b.markResolved(id, suffix)
 	return nil
 }
@@ -270,7 +297,13 @@ func (b *Bot) editCard(card *cardState, suffix string) {
 		return
 	}
 	newText := card.Text + suffix
-	dec, err := b.egress.Check(context.Background(), egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(newText)), egress.SessionInfo{TraceID: card.TraceID})
+	// MINOR D fix: SessionID is now set (== card.TraceID, the same value
+	// TraceID carries) so a sensitive-read session's Telegram edits are
+	// actually subject to the sensitive-read egress rule, matching
+	// anthproxy_hook.go's per-task-trace-id-is-the-session-key convention
+	// - previously SessionID was always empty here, so that rule could
+	// never apply to this package's sends at all.
+	dec, err := b.egress.Check(context.Background(), egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(newText)), egress.SessionInfo{SessionID: card.TraceID, TraceID: card.TraceID})
 	if err != nil || !dec.Allow {
 		return
 	}
@@ -278,8 +311,28 @@ func (b *Bot) editCard(card *cardState, suffix string) {
 	_, _ = b.sender.Edit(stored, newText)
 }
 
-func (b *Bot) respond(cb *tele.Callback, text string) {
+// respond answers cb with a short "toast" callback response (Onaylandı /
+// Reddedildi / Zaten işlendi / etc.) — MINOR C fix: this used to call
+// b.sender.Respond directly, the ONE outbound path in this package that
+// skipped egress.Check entirely, even though a toast is still an off-box
+// byte exactly like every card send/edit. traceID keys BOTH
+// SessionInfo.SessionID and TraceID (MINOR D fix, same convention as
+// send/editCard above) — the originating card's TraceID when
+// handleCallback found one, empty otherwise (never a denial on that basis
+// alone; see egress.SessionInfo's own doc comment). A blocked/erroring
+// Check degrades gracefully here — logged, never returned as an error —
+// since the toast is non-critical: the card itself (editCard) already
+// carries the terminal state the user needs to see, regardless of whether
+// this toast itself gets through.
+func (b *Bot) respond(cb *tele.Callback, traceID, text string) {
 	if b.sender == nil {
+		return
+	}
+	dec, err := b.egress.Check(context.Background(), egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(text)), egress.SessionInfo{SessionID: traceID, TraceID: traceID})
+	if err != nil || !dec.Allow {
+		if b.log != nil {
+			b.log.With(traceID).Warn("telegram_respond_blocked")
+		}
 		return
 	}
 	_ = b.sender.Respond(cb, &tele.CallbackResponse{Text: text})

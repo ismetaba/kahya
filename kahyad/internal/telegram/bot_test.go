@@ -126,3 +126,55 @@ func TestAllowlistMiddlewarePassesMatch(t *testing.T) {
 		t.Errorf("telegram_unauthorized_update ledger rows = %d, want 0 for an allowlisted update", n)
 	}
 }
+
+// TestAllowlistMiddlewareDropsMismatchedEditedMessage is MINOR A's
+// regression test: before the fix, an edited-message update had no
+// Handle() registered for tele.OnEdited at all, so telebot dropped it
+// BEFORE the allowlist middleware ever ran (update.go's own
+// ProcessContext/b.handle: a missing handlers[end] entry is a silent
+// no-op) - an unauthorized sender's edited message left NO
+// telegram_unauthorized_update ledger row, an audit-trail gap. Now
+// OnEdited is registered (b.noop) so it funnels through the SAME
+// allowlistMiddleware every other update kind does.
+func TestAllowlistMiddlewareDropsMismatchedEditedMessage(t *testing.T) {
+	sender := &fakeSender{}
+	ledger := &fakeLedger{}
+	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), nil, nil)
+
+	const wrongChat, wrongUser = int64(9999), int64(8888)
+	b.tb.ProcessUpdate(editedUpdate(wrongChat, wrongUser, "merhaba (edited)"))
+
+	if got := len(sender.responded); got != 0 {
+		t.Errorf("responded count = %d, want 0 (no reply on a dropped update)", got)
+	}
+	if got := len(sender.sent); got != 0 {
+		t.Errorf("sent count = %d, want 0 (no reply on a dropped update)", got)
+	}
+	if n := ledger.countKind("telegram_unauthorized_update"); n != 1 {
+		t.Fatalf("telegram_unauthorized_update ledger rows = %d, want 1", n)
+	}
+	ev := ledger.events[0]
+	if ev.Payload["chat_id"] != wrongChat || ev.Payload["user_id"] != wrongUser {
+		t.Errorf("ledger payload = %+v, want chat_id=%d user_id=%d", ev.Payload, wrongChat, wrongUser)
+	}
+}
+
+// TestAllowlistMiddlewarePassesMatchedEditedMessage is the positive
+// counterpart: an authorized sender's edited-message update passes the
+// middleware and reaches b.noop - no ledger row, no reply, no crash. This
+// is the "for an authorized sender on a non-actionable kind, just no-op"
+// half of MINOR A's fix.
+func TestAllowlistMiddlewarePassesMatchedEditedMessage(t *testing.T) {
+	sender := &fakeSender{}
+	ledger := &fakeLedger{}
+	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), nil, nil)
+
+	b.tb.ProcessUpdate(editedUpdate(testChatID, testUserID, "merhaba (edited)"))
+
+	if n := ledger.countKind("telegram_unauthorized_update"); n != 0 {
+		t.Errorf("telegram_unauthorized_update ledger rows = %d, want 0 for an allowlisted edited-message update", n)
+	}
+	if got := len(sender.sent); got != 0 {
+		t.Errorf("sent count = %d, want 0 (edited-message is non-actionable, b.noop sends nothing)", got)
+	}
+}

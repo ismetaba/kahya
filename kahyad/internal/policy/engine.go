@@ -785,10 +785,23 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string)
 	if err == nil {
 		newCount := int(state.ConsecutiveApprovals) + 1
 		if err := e.saveState(ctx, pa.Tool, class, pa.Scope, int(state.Level), newCount); err == nil {
-			e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_approved", map[string]any{
+			approvedPayload := map[string]any{
 				"event": "policy_feedback_approved", "tool": pa.Tool, "class": class,
 				"scope": pa.Scope, "consecutive_approvals": newCount, "surface": surface,
-			})
+			}
+			// MINOR B fix: HANDOFF §5 + BACKLOG require every
+			// non-local-surface (today: Telegram) approval be ledgered
+			// with a "remote" label, not merely surface:"<name>" - a
+			// ledger reader must be able to select "every remotely
+			// approved action" without hardcoding every current/future
+			// non-local surface name. surface=="local" never gets this
+			// key at all (rather than remote:false), matching this
+			// package's existing "presence of a key signals the
+			// condition" convention elsewhere in this event vocabulary.
+			if surface != "local" {
+				approvedPayload["remote"] = true
+			}
+			e.ledgerRaw(ctx, pa.TraceID, "policy_feedback_approved", approvedPayload)
 			if newCount == promotionThreshold {
 				e.ledgerRaw(ctx, pa.TraceID, "promotion_suggested", map[string]any{
 					"event": "promotion_suggested", "tool": pa.Tool, "class": class,

@@ -221,17 +221,38 @@ func (b *Bot) logDisabled(reason string) {
 // spec step 2: "This runs before ANY handler" — telebot.Bot.Use appends to
 // the bot's Group, which every subsequent Handle call combines with, so
 // calling Use first here is what makes that guarantee hold) and registers
-// the two endpoints this bot ever acts on: OnText (a no-op past the
-// middleware — this bot has no chat commands, only push notifications and
-// button taps, but registering it means an ordinary stray DM from a
-// non-allowlisted chat still gets ledgered by the SAME middleware every
-// other update goes through) and OnCallback (approve/deny button taps,
-// handleCallback in approvals.go).
+// every endpoint this bot ever sees: OnCallback is the ONE actionable
+// endpoint (approve/deny button taps, handleCallback in approvals.go).
+// OnText, OnEdited, OnChannelPost, and OnQuery are a small, deliberately
+// explicit set of otherwise-inert endpoints (b.noop — no handler here
+// acts on any of their content) registered anyway so an update of THAT
+// kind still passes through the SAME allowlistMiddleware every other
+// update does (MINOR A fix: an endpoint with no Handle call at all is
+// dropped by telebot BEFORE middleware ever runs — see update.go's own
+// b.handle, which no-ops when b.handlers[end] is absent — so an
+// unauthorized sender's edited-message/channel-post/inline-query update
+// used to vanish with NO telegram_unauthorized_update ledger row at all:
+// an audit-trail gap, never an authz hole, since nothing could have acted
+// on any of these kinds either way). This bot's real Telegram-side surface
+// is deliberately just text/callback (BotFather never enables inline
+// mode, group membership, or channel posting for it), so this set covers
+// the realistic remainder without registering all ~60 of telebot's
+// endpoints.
 func (b *Bot) registerHandlers() {
 	b.tb.Use(b.allowlistMiddleware)
-	b.tb.Handle(tele.OnText, func(tele.Context) error { return nil })
+	b.tb.Handle(tele.OnText, b.noop)
 	b.tb.Handle(tele.OnCallback, b.handleCallback)
+	b.tb.Handle(tele.OnEdited, b.noop)
+	b.tb.Handle(tele.OnChannelPost, b.noop)
+	b.tb.Handle(tele.OnQuery, b.noop)
 }
+
+// noop is the shared no-op body for every non-actionable endpoint
+// registerHandlers wires up (its own doc comment) — reaching here at all
+// already means allowlistMiddleware let the update through (an
+// unauthorized one is dropped + ledgered before ever reaching a
+// handler), and this bot has nothing further to do with any of them.
+func (b *Bot) noop(tele.Context) error { return nil }
 
 // allowlistMiddleware is HANDOFF §5 safety #5's Go-side enforcement: every
 // update's chat_id AND user_id must equal the configured pair; mismatch ⇒
@@ -299,7 +320,14 @@ func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.Reply
 	if !b.Enabled() {
 		return nil
 	}
-	dec, err := b.egress.Check(ctx, egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(text)), egress.SessionInfo{TraceID: traceID})
+	// MINOR D fix: SessionID is now set (== traceID) alongside TraceID, so
+	// a sensitive-read session's Telegram sends are actually subject to
+	// the sensitive-read egress rule (kahyad/internal/egress.Gate.Check's
+	// decision order, step 1) - matching anthproxy_hook.go's per-task
+	// trace-id-is-the-session-key convention. Previously SessionID was
+	// always left empty here, so that rule could never fire for anything
+	// this package ever sent.
+	dec, err := b.egress.Check(ctx, egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(text)), egress.SessionInfo{SessionID: traceID, TraceID: traceID})
 	if err != nil || !dec.Allow {
 		b.fallbackLocal(ctx, traceID, "telegram_send_blocked", "Telegram gönderimi engellendi; onay/alarm CLI/yerel yüzeyden takip edilmeli.")
 		return nil
