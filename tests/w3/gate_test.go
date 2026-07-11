@@ -521,7 +521,13 @@ else
 fi
 
 echo "=== step2: direct-IP bypass (--noproxy) must be unreachable ==="
-if curl -s --max-time 5 --noproxy '*' https://1.1.1.1 >/dev/null 2>&1; then
+# -k (skip TLS verify) is REQUIRED: the sandbox image ships no ca-certificates,
+# so a plain https curl fails TLS verification whether or not a route exists —
+# which would confound this probe into always printing UNREACHABLE. With -k the
+# request completes iff there is a real route out, so this genuinely detects a
+# network-isolation regression (verified by mutation: dropping --internal makes
+# this REACHABLE and STEP2 fail).
+if curl -sk --max-time 5 --noproxy '*' https://1.1.1.1 >/dev/null 2>&1; then
   echo STEP2_FAIL_REACHABLE
   FAIL=1
 else
