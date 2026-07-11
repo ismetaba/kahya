@@ -193,6 +193,18 @@ def main(argv: list[str] | None = None) -> int:
     socket_path = os.environ.get("KAHYA_SOCKET", "")
     mcp_bridge = os.environ.get("KAHYA_MCP_BRIDGE", "")
 
+    # HANDOFF §4 IPC ⚑ ("Tüm süreçler her satırda trace_id içeren JSONL
+    # loglar") / the W1-2 gate's "single trace_id" acceptance criterion
+    # (docs/ipc.md, tasks/w1-2-core/W12-10) requires worker.jsonl to carry
+    # this task's trace_id on at least one line - unconditionally, not only
+    # on an error/tool-call path. Without this line, a fully successful
+    # task that never hits a memory-search failure and never has the model
+    # attempt a tool call (both of the only two other call sites that log
+    # anything - hooks.make_user_prompt_submit_hook's warn-on-failure and
+    # make_can_use_tool's per-decision info line) would leave worker.jsonl
+    # empty, silently violating that invariant on exactly the happy path.
+    wlog.log("info", "task_started", task_id=envelope.task_id, model=envelope.model)
+
     return asyncio.run(_run_session(envelope, socket_path, mcp_bridge))
 
 
@@ -306,6 +318,7 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
         )
         return 1
 
+    wlog.log("info", "task_done", task_id=envelope.task_id)
     _print_protocol_line({"type": "result", "status": "ok"})
     return 0
 

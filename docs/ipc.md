@@ -320,3 +320,47 @@ W3-01/W3-02 replace it with the real `policy.yaml` + autonomy ladder:
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — W4-08. W1-2's `model` is
   always the static `cfg.default_model`.
+
+## 9 · W1-2 gate — how to re-run
+
+W12-10 froze the HANDOFF §6 W1-2 acceptance sentence — a CLI question
+answered with a `<hafiza>` injection, `'evlerimizden'` finding the `'ev'`
+seed note, one `trace_id` spanning every JSONL log, every injected
+`<hafiza>` block in the ledger — as two runnable checks:
+
+1. **`make test`** — the HERMETIC gate
+   (`tests/e2e/w12_gate_test.go`, build tag `e2e`; `make test`'s own
+   `test: venv build` prerequisite chain is what guarantees the binaries
+   and worker venv this test needs already exist, so it is never silently
+   skipped). Everything real *except* the cloud: real `kahyad`, the real
+   Python worker (`worker/kahya_worker`), the real pinned
+   `claude-agent-sdk`/bundled `claude` CLI, and a real (throwaway, fixture)
+   seeded corpus — with `anthropic_upstream_url` pointed at
+   `tests/e2e/mockanthropic`'s mock `/v1/messages` server instead of the
+   real API. `KAHYA_ENV=dev` + `KAHYA_ANTHROPIC_KEY_OVERRIDE` (W12-08's
+   dev-only seam) substitute for a real Keychain credential, so this run
+   needs neither a Keychain item nor a real `ANTHROPIC_API_KEY`. Asserts,
+   as named subtests: `retrieval`, `injection_into_model_call`, `answer`,
+   `single_trace_id`, `ledger_forensics`, `derived_index_property` (delete
+   `brain.db`, restart, reindex, re-run retrieval — same top hit, proving
+   SQLite is genuinely rebuilt from the markdown source of truth).
+
+2. **`make install-agent`** (or, for a quick foreground run instead of a
+   launchd-managed one, `make run-daemon` in a separate terminal) — brings
+   up a REAL `kahyad` against the real `~/Kahya` corpus (W0-01) and,
+   depending on `credential_mode`, a real Keychain item or an already
+   logged-in Claude Code SDK session. Skip this step if a live `kahyad` is
+   already running.
+
+3. **`make accept-w12`** — the LIVE gate (`scripts/accept-w12.sh`): `kahya
+   health`, an `'evlerimizden'` search against the real corpus (top-3 must
+   contain a seed note containing `'ev'` — the seeded iOS home-design note,
+   not this repo's hermetic fixture), the actual
+   `bin/kahya "Evlerimizden ne konuşmuştuk?"` call, a trace_id check across
+   `kahyad.jsonl`/`worker.jsonl`, and the `hafiza_injected` ledger
+   sha256 self-consistency check. Prints one `PASS`/`FAIL`/`DEFERRED` line
+   per criterion and a summary; exits nonzero on any `FAIL`. A criterion
+   that needs a real Anthropic credential/Claude Code session this
+   environment does not have prints `DEFERRED`, not a false `PASS` — see
+   the W12-10 closing commit for this repo's own deferred run and exactly
+   why.
