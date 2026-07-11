@@ -30,15 +30,16 @@ ORDER BY id ASC;
 -- server's POST /v1/task handler runs kahyad/internal/secretlane's
 -- classifier BEFORE calling InsertTask - the ordering invariant, HANDOFF
 -- S4 flag - so there is no window where a task row exists with an
--- unclassified lane). Column order in both the INSERT list and RETURNING
--- clause matches the TABLE's own physical column order (lane/
--- secret_category were appended via ALTER TABLE, 0006_secret_lane.sql,
--- after updated_at/created_at) so sqlc reuses the existing Task model
--- type here rather than generating a second, differently-ordered
--- InsertTaskRow type.
+-- unclassified lane). The RETURNING clause lists every physical column
+-- (including status/next_retry_at/attempts, W4-02's 0007_task_durability
+-- ALTER TABLEs - left OUT of the INSERT column/VALUES list itself, so
+-- every existing caller keeps inserting a row that takes their DEFAULTs
+-- unchanged: status='intent', attempts=0, next_retry_at=NULL) so sqlc
+-- reuses the existing Task model type here rather than generating a
+-- second, differently-ordered InsertTaskRow type.
 INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category;
+RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts;
 
 -- name: UpdateTaskState :exec
 UPDATE tasks
@@ -294,3 +295,180 @@ INSERT INTO egress_budget (host, day, bytes) VALUES (?, ?, ?);
 UPDATE egress_budget
 SET bytes = bytes + ?
 WHERE host = ? AND day = ?;
+
+-- W4-02 (task durability state machine + receipts + outbox redelivery)
+-- queries below. See migrations/0007_task_durability.sql for the schema;
+-- kahyad/internal/task (machine.go/receipts.go/resume.go) and
+-- kahyad/internal/outbox (dispatcher.go) are the only callers.
+
+-- name: GetTaskByID :one
+-- Column list matches tasks' own physical column order exactly, so sqlc
+-- reuses the existing Task model type here rather than emitting a second,
+-- differently-ordered Row type (the same convention InsertTask's own doc
+-- comment already established for lane/secret_category).
+SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
+FROM tasks
+WHERE id = ?;
+
+-- name: SetTaskStatus :exec
+-- The ONLY writer of tasks.status is kahyad/internal/task.Machine.Transition
+-- - every status change is preceded by that function's own legal-transition
+-- check and followed by a task.transition (or task.illegal_transition)
+-- ledger event; this query performs no validation of its own.
+UPDATE tasks
+SET status = ?, updated_at = ?
+WHERE id = ?;
+
+-- name: IncrementTaskAttempts :one
+-- Bumps tasks.attempts by one and returns the new value - used both by
+-- Machine.Transition (every fresh dispatch INTO 'executing') and by the
+-- resume scan's within-cap W1 receipt-less retry path (which re-dispatches
+-- without any status change, since the task never leaves 'executing').
+UPDATE tasks
+SET attempts = attempts + 1, updated_at = ?
+WHERE id = ?
+RETURNING attempts;
+
+-- name: ListExecutingTasks :many
+-- The resume scan's candidate set (kahyad startup + periodic tick):
+-- every task currently recorded as 'executing'. kahyad/internal/task's
+-- own LiveRegistry then filters this down to the ones with NO live worker
+-- PID - a live task is simply skipped (the daemon itself is still running
+-- it).
+SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
+FROM tasks
+WHERE status = 'executing'
+ORDER BY updated_at ASC;
+
+-- name: InsertToolCallIntent :one
+-- Step 1 of the intent -> executing -> {receipt, failed} lifecycle
+-- (kahyad/internal/task.Receipts.Execute): one row per side-effectful
+-- (W1/W2/W3) tool-call ATTEMPT - seq lets the SAME (task_id, tool_name,
+-- args_hash) triple be re-attempted (a fresh row at a higher seq) after an
+-- earlier attempt at that exact triple was marked 'failed' by the resume
+-- scan, while the idempotent-replay lookup (GetReceiptToolCall below)
+-- only ever matches an attempt that reached 'receipt'.
+INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?)
+RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at;
+
+-- name: NextToolCallSeq :one
+-- The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
+-- never-attempted triple).
+SELECT COALESCE(MAX(seq), 0) + 1 FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?;
+
+-- name: MarkToolCallExecuting :exec
+UPDATE tool_calls
+SET status = 'executing', started_at = ?
+WHERE id = ?;
+
+-- name: MarkToolCallReceipt :exec
+-- The terminal success state: receipt_json (result + result hash) is
+-- written in the SAME database transaction that commits the tool's own
+-- DB-side effects, immediately once the side effect completes (task spec
+-- step 3) - kahyad/internal/task.Receipts.Execute runs this inside the
+-- same *sql.Tx as the caller-supplied effect function whenever that
+-- effect writes to brain.db itself.
+UPDATE tool_calls
+SET status = 'receipt', receipt_json = ?, finished_at = ?
+WHERE id = ?;
+
+-- name: MarkToolCallFailed :exec
+-- Used both when a tool's own effect function returns an error (genuine
+-- execution failure) AND by the resume scan, which marks a receipt-less
+-- 'intent'/'executing' row 'failed' before deciding whether to auto-retry
+-- (W1, within cap) or escalate to blocked_user (W1 past cap, or any
+-- W2/W3).
+UPDATE tool_calls
+SET status = 'failed', finished_at = ?
+WHERE id = ?;
+
+-- name: GetReceiptToolCall :one
+-- The idempotent-replay lookup (task spec step 4): the most recent
+-- status='receipt' row for this exact (task_id, tool_name, args_hash)
+-- triple, if any. A hit means "do not re-execute - return this stored
+-- receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
+-- the mechanism that makes resume double-execution-safe.
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ? AND tool_name = ? AND args_hash = ? AND status = 'receipt'
+ORDER BY seq DESC
+LIMIT 1;
+
+-- name: ListReceiptlessToolCalls :many
+-- Every tool_calls row for task_id still stuck at 'intent'/'executing' -
+-- i.e. a side-effectful call whose kahyad-side execution was interrupted
+-- (worker died, kahyad crashed) before a receipt (or a failure) was ever
+-- recorded. Ordered most-recent-first: the resume scan (task spec step 6)
+-- only ever needs the single most recent one - realistically there is at
+-- most one such row per task at any moment, but the scan itself is
+-- defensive about that.
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ? AND status IN ('intent', 'executing')
+ORDER BY id DESC;
+
+-- name: CountToolCallAttempts :one
+-- The per-(task_id, tool_name, args_hash) attempt count the resume scan
+-- compares against task.retry.w1_max_auto (task spec step 6: "at most
+-- w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
+-- every row ever inserted for this exact triple (every seq), regardless
+-- of its current status.
+SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?;
+
+-- name: ListToolCallsByTask :many
+-- `kahya task show <id>`'s tool_calls listing, oldest attempt first.
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ?
+ORDER BY seq ASC, id ASC;
+
+-- W4-02 outbox lease/redelivery queries. See migrations/
+-- 0007_task_durability.sql for the added columns and
+-- kahyad/internal/outbox/dispatcher.go for the only caller.
+
+-- name: InsertOutboxRow :one
+-- available_at defaults to "now" (immediately dispatchable); lease_until
+-- starts NULL (never claimed) and attempts starts 0 - both only ever
+-- change via ClaimOutboxRow below.
+INSERT INTO outbox (trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts)
+VALUES (?, ?, ?, NULL, ?, ?, NULL, 0)
+RETURNING id, trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts;
+
+-- name: ListDueOutboxRows :many
+-- Candidate rows for one dispatcher claim pass: not yet delivered,
+-- available (available_at <= now), and not currently leased by another
+-- dispatcher (lease_until IS NULL, i.e. never claimed, OR lease_until has
+-- already passed, i.e. a previous claim's lease expired without being
+-- acknowledged - the crash-safe re-claim path). Listing candidates and
+-- claiming them are two separate steps ON PURPOSE (ClaimOutboxRow below)
+-- so two concurrent dispatchers racing on the SAME candidate list each
+-- only ever win the atomic UPDATE for rows the other hasn't already
+-- claimed first.
+SELECT id, trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts
+FROM outbox
+WHERE dispatched_at IS NULL
+  AND available_at <= ?
+  AND (lease_until IS NULL OR lease_until < ?)
+ORDER BY id ASC
+LIMIT ?;
+
+-- name: ClaimOutboxRow :execrows
+-- The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
+-- ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"
+-- pattern elsewhere in this file): only the FIRST dispatcher to run this
+-- UPDATE against a given row - while its lease is still unheld or already
+-- expired - ever affects a row; a losing concurrent dispatcher's identical
+-- call affects 0 rows and must not touch that row at all. attempts is
+-- incremented on every successful claim (task spec step 7: "attempts
+-- increments on each claim"), including a crash-safe re-claim after a
+-- previous lease expired without the row ever being acknowledged.
+UPDATE outbox
+SET lease_until = ?, attempts = attempts + 1
+WHERE id = ? AND dispatched_at IS NULL AND (lease_until IS NULL OR lease_until < ?);
+
+-- name: MarkOutboxDelivered :exec
+-- Terminal success: the re-spawned worker exited 0 (task spec step 7).
+UPDATE outbox
+SET dispatched_at = ?
+WHERE id = ?;

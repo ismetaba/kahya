@@ -121,6 +121,39 @@ class TestParseEnvelope(unittest.TestCase):
         with self.assertRaises(EnvelopeError):
             parse_envelope(encode(d))
 
+    # --- W4-02: resume ---
+
+    def test_resume_defaults_to_false_when_absent(self) -> None:
+        env = parse_envelope(encode(valid_envelope_dict()))
+        self.assertFalse(env.resume)
+
+    def test_accepts_resume_true_with_session_id(self) -> None:
+        d = valid_envelope_dict()
+        d["session_id"] = "sess-123"
+        d["resume"] = True
+        env = parse_envelope(encode(d))
+        self.assertTrue(env.resume)
+        self.assertEqual(env.session_id, "sess-123")
+
+    def test_rejects_resume_true_without_session_id(self) -> None:
+        d = valid_envelope_dict()
+        d["resume"] = True  # session_id left None
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_resume_true_with_blank_session_id(self) -> None:
+        d = valid_envelope_dict()
+        d["session_id"] = "   "
+        d["resume"] = True
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_non_bool_resume(self) -> None:
+        d = valid_envelope_dict()
+        d["resume"] = "true"
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,7 +48,8 @@ Single JSON object, written once, then stdin is closed:
   "memory_injection": true,
   "created_at": "2026-07-10T12:00:00Z",
   "lane": "normal",
-  "category": ""
+  "category": "",
+  "resume": false
 }
 ```
 
@@ -67,6 +68,7 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
 | `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
 | `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
+| `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). |
 
 ## 3 · Worker environment
 
@@ -503,7 +505,14 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   ...) — W3-03. `kahya undo --trace <id>` / `POST /policy/undo` only
   trigger the window + demotion; executing the actual recipe is the owning
   tool's job.
-- **Session resume, receipts, retries, outbox dispatch** — W4-02.
+- **Session resume, receipts, retries, outbox dispatch** — landed in
+  W4-02 as `kahyad/internal/task` (state machine `machine.go`, receipt/
+  idempotent-replay lifecycle `receipts.go`, resume-scan `resume.go`) and
+  `kahyad/internal/outbox` (lease-based redelivery `dispatcher.go`); the
+  `resume`/`session_id` envelope fields above are that task's own wire
+  addition. Cloud-retry taxonomy and `bekliyor-yeniden-deneme`
+  *population* remain W4-04; `user_halted` *semantics* remain W6-03 (only
+  the enum value + the dispatcher's never-redeliver guard exist so far).
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — W4-08. W1-2's `model` is
   always the static `cfg.default_model`.

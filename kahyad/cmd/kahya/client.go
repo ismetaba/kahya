@@ -445,6 +445,85 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 	return fr.Token, nil
 }
 
+// taskStatusToolCall mirrors kahyad's GET /v1/task/status response's
+// tool_calls row shape (kahyad/internal/server.taskStatusToolCallView,
+// W4-02).
+type taskStatusToolCall struct {
+	Seq      int64  `json:"seq"`
+	Tool     string `json:"tool"`
+	Class    string `json:"class"`
+	Status   string `json:"status"`
+	ArgsHash string `json:"args_hash"`
+}
+
+// taskStatus mirrors kahyad's GET /v1/task/status response body
+// (kahyad/internal/server.taskStatusResponse, W4-02).
+type taskStatus struct {
+	ID        string               `json:"id"`
+	Status    string               `json:"status"`
+	SessionID string               `json:"session_id,omitempty"`
+	Attempts  int64                `json:"attempts"`
+	PID       int                  `json:"pid,omitempty"`
+	ToolCalls []taskStatusToolCall `json:"tool_calls"`
+}
+
+// TaskStatus calls GET /v1/task/status?id=<id> (`kahya task show <id>`).
+func (c *Client) TaskStatus(ctx context.Context, traceID, taskID string) (taskStatus, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/v1/task/status?id="+url.QueryEscape(taskID), traceID, nil)
+	if err != nil {
+		return taskStatus{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return taskStatus{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return taskStatus{}, fmt.Errorf("%s", msg)
+		}
+		return taskStatus{}, &unreachableError{sock: c.sock, err: fmt.Errorf("task/status: status %d", resp.StatusCode)}
+	}
+	var ts taskStatus
+	if err := json.NewDecoder(resp.Body).Decode(&ts); err != nil {
+		return taskStatus{}, &unreachableError{sock: c.sock, err: fmt.Errorf("task/status: decode response: %w", err)}
+	}
+	return ts, nil
+}
+
+// TaskResolve calls POST /v1/task/resolve {task_id, action, trace_id}
+// (`kahya task resolve <id> --retry|--abort`). action is "retry" or
+// "abort".
+func (c *Client) TaskResolve(ctx context.Context, traceID, taskID, action string) error {
+	body, err := json.Marshal(map[string]string{"task_id": taskID, "action": action, "trace_id": traceID})
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/task/resolve", traceID, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var rr struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("task/resolve: decode response: %w", err)}
+	}
+	if !rr.OK {
+		if rr.Error != "" {
+			return fmt.Errorf("%s", rr.Error)
+		}
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("task/resolve: status %d", resp.StatusCode)}
+	}
+	return nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

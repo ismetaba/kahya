@@ -147,4 +147,39 @@ const (
 	// still calls POST /policy/feedback kind=deny in this case, demoting
 	// the ladder (W3-02), never silently doing nothing. Exit 1.
 	MsgApprovalDenied = "Reddedildi."
+
+	// ---- W4-02: kahya task show <id> / kahya task resolve <id> ----
+
+	// MsgTaskUsage is printed when `kahya task` is given anything other
+	// than a recognized "show"/"resolve" subcommand. Exit 2.
+	MsgTaskUsage = "kullanım: kahya task show <id> | kahya task resolve <id> --retry|--abort"
+
+	// MsgTaskShowUsage is printed when `kahya task show` is given anything
+	// other than exactly one positional argument (the task id). Exit 2.
+	MsgTaskShowUsage = "kullanım: kahya task show <id>"
+
+	// MsgTaskResolveUsage is printed when `kahya task resolve` is missing
+	// the task id, or given neither (or both) of --retry/--abort. Exit 2.
+	MsgTaskResolveUsage = "kullanım: kahya task resolve <id> --retry|--abort"
+
+	// MsgTaskShowHeader/Status/Session/PID/Attempts/ToolCallsHeader/
+	// ToolCallRow together render `kahya task show <id>`'s output, one
+	// line each.
+	MsgTaskShowHeader        = "Görev %s"
+	MsgTaskShowStatus        = "Durum: %s"
+	MsgTaskShowSession       = "Oturum: %s"
+	MsgTaskShowPID           = "Aktif işlemci (PID): %s"
+	MsgTaskShowAttempts      = "Deneme sayısı: %d"
+	MsgTaskShowToolCallsNone = "Araç çağrısı yok."
+	MsgTaskShowToolCallsHead = "Araç çağrıları:"
+	MsgTaskShowToolCallRow   = "  #%d %s [%s] durum=%s"
+
+	// MsgTaskShowNone fills MsgTaskShowSession/MsgTaskShowPID when there is
+	// no session_id/no live worker PID.
+	MsgTaskShowNone = "yok"
+
+	// MsgTaskResolvedRetry/Abort are `kahya task resolve <id>`'s success
+	// lines.
+	MsgTaskResolvedRetry = "Görev yeniden kuyruğa alındı: %s"
+	MsgTaskResolvedAbort = "Görev durduruldu (failed): %s"
 )

@@ -97,6 +97,33 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TelegramUserID != 0 {
 		t.Errorf("TelegramUserID = %d, want 0 (disabled by default)", cfg.TelegramUserID)
 	}
+	// W4-02: receipt-less W1 auto-retry cap default.
+	if cfg.TaskRetryW1MaxAuto != 3 {
+		t.Errorf("TaskRetryW1MaxAuto = %d, want 3", cfg.TaskRetryW1MaxAuto)
+	}
+}
+
+// TestLoadFileOverridesTaskRetryW1MaxAuto proves task_retry_w1_max_auto is
+// a real, independently-overridable config.yaml key (W4-02).
+func TestLoadFileOverridesTaskRetryW1MaxAuto(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("task_retry_w1_max_auto: 5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TaskRetryW1MaxAuto != 5 {
+		t.Errorf("TaskRetryW1MaxAuto = %d, want 5", cfg.TaskRetryW1MaxAuto)
+	}
 }
 
 // TestLoadFileOverridesTelegramIDs proves telegram_chat_id/telegram_user_id

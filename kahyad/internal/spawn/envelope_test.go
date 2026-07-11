@@ -158,6 +158,53 @@ func TestMarshalRoundTripsLaneAndCategory(t *testing.T) {
 	}
 }
 
+// --- W4-02: envelope session resume ---
+
+func TestValidateRejectsResumeWithoutSessionID(t *testing.T) {
+	e := validEnvelope()
+	e.Resume = true // SessionID left nil
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for resume=true with no session_id")
+	}
+}
+
+func TestValidateRejectsResumeWithBlankSessionID(t *testing.T) {
+	e := validEnvelope()
+	blank := "   "
+	e.SessionID = &blank
+	e.Resume = true
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for resume=true with a blank session_id")
+	}
+}
+
+func TestValidateAcceptsResumeWithSessionID(t *testing.T) {
+	e := validEnvelope()
+	sid := "sess-123"
+	e.SessionID = &sid
+	e.Resume = true
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestMarshalRoundTripsResumeAndSessionID(t *testing.T) {
+	e := validEnvelope()
+	sid := "sess-abc"
+	e.SessionID = &sid
+	e.Resume = true
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(b), `"resume":true`) {
+		t.Errorf("Marshal() = %s, want resume:true present", b)
+	}
+	if !strings.Contains(string(b), `"session_id":"sess-abc"`) {
+		t.Errorf("Marshal() = %s, want session_id:\"sess-abc\" present", b)
+	}
+}
+
 func TestNewTaskIDShapeAndUniqueness(t *testing.T) {
 	a := NewTaskID()
 	b := NewTaskID()

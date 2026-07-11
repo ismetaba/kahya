@@ -213,9 +213,17 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
     2): model/system_prompt/mcp_servers/allowed_tools/hooks/can_use_tool
     exactly as the task spec fixes. Factored out of _run_session so tests
     can inspect the constructed options directly without opening a real
-    SDK session."""
+    SDK session.
+
+    W4-02: when envelope.resume is true, resume=envelope.session_id is
+    passed so the SDK subprocess resumes the stored conversation instead
+    of starting a fresh one (docs/ipc.md's own W4-02 note) - streaming
+    input mode stays in force either way (HANDOFF §4 ⚑: hooks/
+    can_use_tool do not run under one-shot query()), so nothing else in
+    this function's shape changes for a resumed task."""
     return ClaudeAgentOptions(
         model=envelope.model,
+        resume=envelope.session_id if envelope.resume else None,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={
             "kahya_memory": {

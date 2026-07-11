@@ -73,6 +73,15 @@ class Envelope:
     model: str
     memory_injection: bool
     created_at: str
+    # resume (W4-02, docs/ipc.md's own W4-02 note): true iff kahyad/
+    # internal/outbox.Dispatcher is re-spawning this worker for a task
+    # that already has a persisted session_id - kahya_worker.__main__.
+    # _build_options then constructs ClaudeAgentOptions with
+    # resume=session_id instead of starting a fresh conversation. Optional
+    # on the wire (omitted, via Go's `omitempty`, whenever false - see
+    # parse_envelope below); defaults to False so every pre-W4-02
+    # envelope/test still parses unchanged.
+    resume: bool = False
 
 
 def parse_envelope(raw: bytes) -> Envelope:
@@ -133,6 +142,15 @@ def parse_envelope(raw: bytes) -> Envelope:
     if not isinstance(created_at, str) or not created_at.strip():
         raise EnvelopeError("created_at must be a non-blank string")
 
+    # resume (W4-02): optional on the wire, like lane/category - absent
+    # means False (a fresh, non-resumed spawn), mirroring Go's
+    # `omitempty`/zero-value convention exactly.
+    resume = obj.get("resume", False)
+    if not isinstance(resume, bool):
+        raise EnvelopeError("resume must be a boolean")
+    if resume and (session_id is None or not session_id.strip()):
+        raise EnvelopeError("resume = true requires a non-empty session_id")
+
     return Envelope(
         schema_version=schema_version,
         task_id=task_id,
@@ -143,4 +161,5 @@ def parse_envelope(raw: bytes) -> Envelope:
         model=model,
         memory_injection=memory_injection,
         created_at=created_at,
+        resume=resume,
     )

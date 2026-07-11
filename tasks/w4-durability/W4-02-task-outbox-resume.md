@@ -1,6 +1,6 @@
 # W4-02 — Task state machine, outbox redelivery, session resume
 
-**Status:** todo
+**Status:** done
 **Phase:** W4 — Durability
 **Depends on:** W12-07, W12-02
 **Flags:** none
@@ -117,17 +117,17 @@ Binding decisions (HANDOFF, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green including all step-10 tests.
-- [ ] Integration test: task runs a stub W2 tool whose kahyad-side execution completes while the
+- [x] `make test` green including all step-10 tests.
+- [x] Integration test: task runs a stub W2 tool whose kahyad-side execution completes while the
       (stub) worker is SIGKILLed mid-call; after dispatcher resume, `SELECT COUNT(*) FROM
       tool_calls WHERE task_id=? AND status='receipt'` = 1, stub side-effect counter = 1, and a
       `tool.replayed` event exists. (This is the CI-speed precursor of the W4-07 gate.)
-- [ ] Integration test: same scenario but the tool never wrote a receipt → task row is
+- [x] Integration test: same scenario but the tool never wrote a receipt → task row is
       `blocked_user`, notification event payload contains the exact Turkish string from step 6,
       and `kahya task resolve <id> --abort` moves it to `failed`.
-- [ ] Grep test: every task/tool state transition ledger event carries the task's `trace_id`
+- [x] Grep test: every task/tool state transition ledger event carries the task's `trace_id`
       (JSONL log + events rows agree).
-- [ ] `sqlite3 brain.db "PRAGMA foreign_key_check;"` clean after migration; goose up/down/up
+- [x] `sqlite3 brain.db "PRAGMA foreign_key_check;"` clean after migration; goose up/down/up
       passes on an empty DB.
 
 ## Out of scope

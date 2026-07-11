@@ -10,6 +10,35 @@ import (
 	"database/sql"
 )
 
+const claimOutboxRow = `-- name: ClaimOutboxRow :execrows
+UPDATE outbox
+SET lease_until = ?, attempts = attempts + 1
+WHERE id = ? AND dispatched_at IS NULL AND (lease_until IS NULL OR lease_until < ?)
+`
+
+type ClaimOutboxRowParams struct {
+	LeaseUntil   sql.NullString `json:"lease_until"`
+	ID           int64          `json:"id"`
+	LeaseUntil_2 sql.NullString `json:"lease_until_2"`
+}
+
+// The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
+// ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"
+// pattern elsewhere in this file): only the FIRST dispatcher to run this
+// UPDATE against a given row - while its lease is still unheld or already
+// expired - ever affects a row; a losing concurrent dispatcher's identical
+// call affects 0 rows and must not touch that row at all. attempts is
+// incremented on every successful claim (task spec step 7: "attempts
+// increments on each claim"), including a crash-safe re-claim after a
+// previous lease expired without the row ever being acknowledged.
+func (q *Queries) ClaimOutboxRow(ctx context.Context, arg ClaimOutboxRowParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimOutboxRow, arg.LeaseUntil, arg.ID, arg.LeaseUntil_2)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const consumeApprovalToken = `-- name: ConsumeApprovalToken :execrows
 UPDATE approval_tokens
 SET consumed_at = ?
@@ -62,6 +91,28 @@ func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePending
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const countToolCallAttempts = `-- name: CountToolCallAttempts :one
+SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?
+`
+
+type CountToolCallAttemptsParams struct {
+	TaskID   string `json:"task_id"`
+	ToolName string `json:"tool_name"`
+	ArgsHash string `json:"args_hash"`
+}
+
+// The per-(task_id, tool_name, args_hash) attempt count the resume scan
+// compares against task.retry.w1_max_auto (task spec step 6: "at most
+// w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
+// every row ever inserted for this exact triple (every seq), regardless
+// of its current status.
+func (q *Queries) CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countToolCallAttempts, arg.TaskID, arg.ToolName, arg.ArgsHash)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
@@ -295,6 +346,82 @@ func (q *Queries) GetPendingApproval(ctx context.Context, id string) (PendingApp
 	return i, err
 }
 
+const getReceiptToolCall = `-- name: GetReceiptToolCall :one
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ? AND tool_name = ? AND args_hash = ? AND status = 'receipt'
+ORDER BY seq DESC
+LIMIT 1
+`
+
+type GetReceiptToolCallParams struct {
+	TaskID   string `json:"task_id"`
+	ToolName string `json:"tool_name"`
+	ArgsHash string `json:"args_hash"`
+}
+
+// The idempotent-replay lookup (task spec step 4): the most recent
+// status='receipt' row for this exact (task_id, tool_name, args_hash)
+// triple, if any. A hit means "do not re-execute - return this stored
+// receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
+// the mechanism that makes resume double-execution-safe.
+func (q *Queries) GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCallParams) (ToolCall, error) {
+	row := q.db.QueryRowContext(ctx, getReceiptToolCall, arg.TaskID, arg.ToolName, arg.ArgsHash)
+	var i ToolCall
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.ToolName,
+		&i.Class,
+		&i.ArgsHash,
+		&i.ApprovalTokenID,
+		&i.Status,
+		&i.ReceiptJson,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getTaskByID = `-- name: GetTaskByID :one
+
+SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
+FROM tasks
+WHERE id = ?
+`
+
+// W4-02 (task durability state machine + receipts + outbox redelivery)
+// queries below. See migrations/0007_task_durability.sql for the schema;
+// kahyad/internal/task (machine.go/receipts.go/resume.go) and
+// kahyad/internal/outbox (dispatcher.go) are the only callers.
+// Column list matches tasks' own physical column order exactly, so sqlc
+// reuses the existing Task model type here rather than emitting a second,
+// differently-ordered Row type (the same convention InsertTask's own doc
+// comment already established for lane/secret_category).
+func (q *Queries) GetTaskByID(ctx context.Context, id string) (Task, error) {
+	row := q.db.QueryRowContext(ctx, getTaskByID, id)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.TraceID,
+		&i.SessionID,
+		&i.State,
+		&i.TaintTier,
+		&i.Model,
+		&i.Envelope,
+		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.Lane,
+		&i.SecretCategory,
+		&i.Status,
+		&i.NextRetryAt,
+		&i.Attempts,
+	)
+	return i, err
+}
+
 const getTaskBySession = `-- name: GetTaskBySession :one
 SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at
 FROM tasks
@@ -373,6 +500,29 @@ func (q *Queries) IncrementEgressBudget(ctx context.Context, arg IncrementEgress
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const incrementTaskAttempts = `-- name: IncrementTaskAttempts :one
+UPDATE tasks
+SET attempts = attempts + 1, updated_at = ?
+WHERE id = ?
+RETURNING attempts
+`
+
+type IncrementTaskAttemptsParams struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+// Bumps tasks.attempts by one and returns the new value - used both by
+// Machine.Transition (every fresh dispatch INTO 'executing') and by the
+// resume scan's within-cap W1 receipt-less retry path (which re-dispatches
+// without any status change, since the task never leaves 'executing').
+func (q *Queries) IncrementTaskAttempts(ctx context.Context, arg IncrementTaskAttemptsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, incrementTaskAttempts, arg.UpdatedAt, arg.ID)
+	var attempts int64
+	err := row.Scan(&attempts)
+	return attempts, err
 }
 
 const insertApprovalToken = `-- name: InsertApprovalToken :exec
@@ -572,6 +722,50 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Event
 	return i, err
 }
 
+const insertOutboxRow = `-- name: InsertOutboxRow :one
+
+INSERT INTO outbox (trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts)
+VALUES (?, ?, ?, NULL, ?, ?, NULL, 0)
+RETURNING id, trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts
+`
+
+type InsertOutboxRowParams struct {
+	TraceID     string         `json:"trace_id"`
+	Kind        string         `json:"kind"`
+	Payload     string         `json:"payload"`
+	CreatedAt   string         `json:"created_at"`
+	AvailableAt sql.NullString `json:"available_at"`
+}
+
+// W4-02 outbox lease/redelivery queries. See migrations/
+// 0007_task_durability.sql for the added columns and
+// kahyad/internal/outbox/dispatcher.go for the only caller.
+// available_at defaults to "now" (immediately dispatchable); lease_until
+// starts NULL (never claimed) and attempts starts 0 - both only ever
+// change via ClaimOutboxRow below.
+func (q *Queries) InsertOutboxRow(ctx context.Context, arg InsertOutboxRowParams) (Outbox, error) {
+	row := q.db.QueryRowContext(ctx, insertOutboxRow,
+		arg.TraceID,
+		arg.Kind,
+		arg.Payload,
+		arg.CreatedAt,
+		arg.AvailableAt,
+	)
+	var i Outbox
+	err := row.Scan(
+		&i.ID,
+		&i.TraceID,
+		&i.Kind,
+		&i.Payload,
+		&i.DispatchedAt,
+		&i.CreatedAt,
+		&i.AvailableAt,
+		&i.LeaseUntil,
+		&i.Attempts,
+	)
+	return i, err
+}
+
 const insertPendingApproval = `-- name: InsertPendingApproval :exec
 
 INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input)
@@ -626,7 +820,7 @@ func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingAp
 const insertTask = `-- name: InsertTask :one
 INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category
+RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
 `
 
 type InsertTaskParams struct {
@@ -648,12 +842,13 @@ type InsertTaskParams struct {
 // server's POST /v1/task handler runs kahyad/internal/secretlane's
 // classifier BEFORE calling InsertTask - the ordering invariant, HANDOFF
 // S4 flag - so there is no window where a task row exists with an
-// unclassified lane). Column order in both the INSERT list and RETURNING
-// clause matches the TABLE's own physical column order (lane/
-// secret_category were appended via ALTER TABLE, 0006_secret_lane.sql,
-// after updated_at/created_at) so sqlc reuses the existing Task model
-// type here rather than generating a second, differently-ordered
-// InsertTaskRow type.
+// unclassified lane). The RETURNING clause lists every physical column
+// (including status/next_retry_at/attempts, W4-02's 0007_task_durability
+// ALTER TABLEs - left OUT of the INSERT column/VALUES list itself, so
+// every existing caller keeps inserting a row that takes their DEFAULTs
+// unchanged: status='intent', attempts=0, next_retry_at=NULL) so sqlc
+// reuses the existing Task model type here rather than generating a
+// second, differently-ordered InsertTaskRow type.
 func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, insertTask,
 		arg.ID,
@@ -681,6 +876,60 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		&i.CreatedAt,
 		&i.Lane,
 		&i.SecretCategory,
+		&i.Status,
+		&i.NextRetryAt,
+		&i.Attempts,
+	)
+	return i, err
+}
+
+const insertToolCallIntent = `-- name: InsertToolCallIntent :one
+INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?)
+RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+`
+
+type InsertToolCallIntentParams struct {
+	TaskID          string         `json:"task_id"`
+	Seq             int64          `json:"seq"`
+	ToolName        string         `json:"tool_name"`
+	Class           string         `json:"class"`
+	ArgsHash        string         `json:"args_hash"`
+	ApprovalTokenID sql.NullString `json:"approval_token_id"`
+	CreatedAt       string         `json:"created_at"`
+}
+
+// Step 1 of the intent -> executing -> {receipt, failed} lifecycle
+// (kahyad/internal/task.Receipts.Execute): one row per side-effectful
+// (W1/W2/W3) tool-call ATTEMPT - seq lets the SAME (task_id, tool_name,
+// args_hash) triple be re-attempted (a fresh row at a higher seq) after an
+// earlier attempt at that exact triple was marked 'failed' by the resume
+// scan, while the idempotent-replay lookup (GetReceiptToolCall below)
+// only ever matches an attempt that reached 'receipt'.
+func (q *Queries) InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error) {
+	row := q.db.QueryRowContext(ctx, insertToolCallIntent,
+		arg.TaskID,
+		arg.Seq,
+		arg.ToolName,
+		arg.Class,
+		arg.ArgsHash,
+		arg.ApprovalTokenID,
+		arg.CreatedAt,
+	)
+	var i ToolCall
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.ToolName,
+		&i.Class,
+		&i.ArgsHash,
+		&i.ApprovalTokenID,
+		&i.Status,
+		&i.ReceiptJson,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -816,6 +1065,64 @@ func (q *Queries) ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([
 	return items, nil
 }
 
+const listDueOutboxRows = `-- name: ListDueOutboxRows :many
+SELECT id, trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts
+FROM outbox
+WHERE dispatched_at IS NULL
+  AND available_at <= ?
+  AND (lease_until IS NULL OR lease_until < ?)
+ORDER BY id ASC
+LIMIT ?
+`
+
+type ListDueOutboxRowsParams struct {
+	AvailableAt sql.NullString `json:"available_at"`
+	LeaseUntil  sql.NullString `json:"lease_until"`
+	Limit       int64          `json:"limit"`
+}
+
+// Candidate rows for one dispatcher claim pass: not yet delivered,
+// available (available_at <= now), and not currently leased by another
+// dispatcher (lease_until IS NULL, i.e. never claimed, OR lease_until has
+// already passed, i.e. a previous claim's lease expired without being
+// acknowledged - the crash-safe re-claim path). Listing candidates and
+// claiming them are two separate steps ON PURPOSE (ClaimOutboxRow below)
+// so two concurrent dispatchers racing on the SAME candidate list each
+// only ever win the atomic UPDATE for rows the other hasn't already
+// claimed first.
+func (q *Queries) ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsParams) ([]Outbox, error) {
+	rows, err := q.db.QueryContext(ctx, listDueOutboxRows, arg.AvailableAt, arg.LeaseUntil, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Outbox{}
+	for rows.Next() {
+		var i Outbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.Kind,
+			&i.Payload,
+			&i.DispatchedAt,
+			&i.CreatedAt,
+			&i.AvailableAt,
+			&i.LeaseUntil,
+			&i.Attempts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsByKind = `-- name: ListEventsByKind :many
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
@@ -895,6 +1202,56 @@ func (q *Queries) ListEventsByTrace(ctx context.Context, traceID string) ([]Even
 	return items, nil
 }
 
+const listExecutingTasks = `-- name: ListExecutingTasks :many
+SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
+FROM tasks
+WHERE status = 'executing'
+ORDER BY updated_at ASC
+`
+
+// The resume scan's candidate set (kahyad startup + periodic tick):
+// every task currently recorded as 'executing'. kahyad/internal/task's
+// own LiveRegistry then filters this down to the ones with NO live worker
+// PID - a live task is simply skipped (the daemon itself is still running
+// it).
+func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
+	rows, err := q.db.QueryContext(ctx, listExecutingTasks)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Task{}
+	for rows.Next() {
+		var i Task
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.SessionID,
+			&i.State,
+			&i.TaintTier,
+			&i.Model,
+			&i.Envelope,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.Lane,
+			&i.SecretCategory,
+			&i.Status,
+			&i.NextRetryAt,
+			&i.Attempts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOpenUndoWindows = `-- name: ListOpenUndoWindows :many
 SELECT id, task_id, tool, trace_id, opened_at, deadline, state
 FROM undo_windows
@@ -918,6 +1275,100 @@ func (q *Queries) ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 			&i.OpenedAt,
 			&i.Deadline,
 			&i.State,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReceiptlessToolCalls = `-- name: ListReceiptlessToolCalls :many
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ? AND status IN ('intent', 'executing')
+ORDER BY id DESC
+`
+
+// Every tool_calls row for task_id still stuck at 'intent'/'executing' -
+// i.e. a side-effectful call whose kahyad-side execution was interrupted
+// (worker died, kahyad crashed) before a receipt (or a failure) was ever
+// recorded. Ordered most-recent-first: the resume scan (task spec step 6)
+// only ever needs the single most recent one - realistically there is at
+// most one such row per task at any moment, but the scan itself is
+// defensive about that.
+func (q *Queries) ListReceiptlessToolCalls(ctx context.Context, taskID string) ([]ToolCall, error) {
+	rows, err := q.db.QueryContext(ctx, listReceiptlessToolCalls, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ToolCall{}
+	for rows.Next() {
+		var i ToolCall
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.ToolName,
+			&i.Class,
+			&i.ArgsHash,
+			&i.ApprovalTokenID,
+			&i.Status,
+			&i.ReceiptJson,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listToolCallsByTask = `-- name: ListToolCallsByTask :many
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+FROM tool_calls
+WHERE task_id = ?
+ORDER BY seq ASC, id ASC
+`
+
+// `kahya task show <id>`'s tool_calls listing, oldest attempt first.
+func (q *Queries) ListToolCallsByTask(ctx context.Context, taskID string) ([]ToolCall, error) {
+	rows, err := q.db.QueryContext(ctx, listToolCallsByTask, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ToolCall{}
+	for rows.Next() {
+		var i ToolCall
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.ToolName,
+			&i.Class,
+			&i.ArgsHash,
+			&i.ApprovalTokenID,
+			&i.Status,
+			&i.ReceiptJson,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -991,6 +1442,102 @@ func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
 	return err
 }
 
+const markOutboxDelivered = `-- name: MarkOutboxDelivered :exec
+UPDATE outbox
+SET dispatched_at = ?
+WHERE id = ?
+`
+
+type MarkOutboxDeliveredParams struct {
+	DispatchedAt sql.NullString `json:"dispatched_at"`
+	ID           int64          `json:"id"`
+}
+
+// Terminal success: the re-spawned worker exited 0 (task spec step 7).
+func (q *Queries) MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error {
+	_, err := q.db.ExecContext(ctx, markOutboxDelivered, arg.DispatchedAt, arg.ID)
+	return err
+}
+
+const markToolCallExecuting = `-- name: MarkToolCallExecuting :exec
+UPDATE tool_calls
+SET status = 'executing', started_at = ?
+WHERE id = ?
+`
+
+type MarkToolCallExecutingParams struct {
+	StartedAt sql.NullString `json:"started_at"`
+	ID        int64          `json:"id"`
+}
+
+func (q *Queries) MarkToolCallExecuting(ctx context.Context, arg MarkToolCallExecutingParams) error {
+	_, err := q.db.ExecContext(ctx, markToolCallExecuting, arg.StartedAt, arg.ID)
+	return err
+}
+
+const markToolCallFailed = `-- name: MarkToolCallFailed :exec
+UPDATE tool_calls
+SET status = 'failed', finished_at = ?
+WHERE id = ?
+`
+
+type MarkToolCallFailedParams struct {
+	FinishedAt sql.NullString `json:"finished_at"`
+	ID         int64          `json:"id"`
+}
+
+// Used both when a tool's own effect function returns an error (genuine
+// execution failure) AND by the resume scan, which marks a receipt-less
+// 'intent'/'executing' row 'failed' before deciding whether to auto-retry
+// (W1, within cap) or escalate to blocked_user (W1 past cap, or any
+// W2/W3).
+func (q *Queries) MarkToolCallFailed(ctx context.Context, arg MarkToolCallFailedParams) error {
+	_, err := q.db.ExecContext(ctx, markToolCallFailed, arg.FinishedAt, arg.ID)
+	return err
+}
+
+const markToolCallReceipt = `-- name: MarkToolCallReceipt :exec
+UPDATE tool_calls
+SET status = 'receipt', receipt_json = ?, finished_at = ?
+WHERE id = ?
+`
+
+type MarkToolCallReceiptParams struct {
+	ReceiptJson sql.NullString `json:"receipt_json"`
+	FinishedAt  sql.NullString `json:"finished_at"`
+	ID          int64          `json:"id"`
+}
+
+// The terminal success state: receipt_json (result + result hash) is
+// written in the SAME database transaction that commits the tool's own
+// DB-side effects, immediately once the side effect completes (task spec
+// step 3) - kahyad/internal/task.Receipts.Execute runs this inside the
+// same *sql.Tx as the caller-supplied effect function whenever that
+// effect writes to brain.db itself.
+func (q *Queries) MarkToolCallReceipt(ctx context.Context, arg MarkToolCallReceiptParams) error {
+	_, err := q.db.ExecContext(ctx, markToolCallReceipt, arg.ReceiptJson, arg.FinishedAt, arg.ID)
+	return err
+}
+
+const nextToolCallSeq = `-- name: NextToolCallSeq :one
+SELECT COALESCE(MAX(seq), 0) + 1 FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?
+`
+
+type NextToolCallSeqParams struct {
+	TaskID   string `json:"task_id"`
+	ToolName string `json:"tool_name"`
+	ArgsHash string `json:"args_hash"`
+}
+
+// The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
+// never-attempted triple).
+func (q *Queries) NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, nextToolCallSeq, arg.TaskID, arg.ToolName, arg.ArgsHash)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const setTaskLane = `-- name: SetTaskLane :exec
 
 UPDATE tasks
@@ -1018,6 +1565,27 @@ func (q *Queries) SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error 
 		arg.UpdatedAt,
 		arg.ID,
 	)
+	return err
+}
+
+const setTaskStatus = `-- name: SetTaskStatus :exec
+UPDATE tasks
+SET status = ?, updated_at = ?
+WHERE id = ?
+`
+
+type SetTaskStatusParams struct {
+	Status    string `json:"status"`
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+// The ONLY writer of tasks.status is kahyad/internal/task.Machine.Transition
+// - every status change is preceded by that function's own legal-transition
+// check and followed by a task.transition (or task.illegal_transition)
+// ledger event; this query performs no validation of its own.
+func (q *Queries) SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) error {
+	_, err := q.db.ExecContext(ctx, setTaskStatus, arg.Status, arg.UpdatedAt, arg.ID)
 	return err
 }
 

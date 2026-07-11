@@ -31,6 +31,7 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secretlane"
+	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
 	"kahya/mcp/memory"
@@ -163,6 +164,22 @@ type Server struct {
 	secretLaneAnswerer   secretlane.Answerer
 	markSensitiveRead    func(ctx context.Context, sessionKey, traceID string) error
 
+	// taskResolver/taskDurabilityStore/taskLive wire GET /v1/task/status
+	// and POST /v1/task/resolve (W4-02) - see task_durability.go's
+	// SetTaskDurability doc comment. nil until that setter is called - both
+	// routes answer 503 the same "unwired dependency" way SetSearcher/
+	// SetReindexer do.
+	taskResolver        *task.Resolver
+	taskDurabilityStore TaskDurabilityStore
+	taskLive            LivePIDLookup
+	// taskLiveRegistry additionally receives Register/Unregister calls
+	// around every worker handleTask spawns (task.go) - see
+	// SetTaskLiveRegistry's doc comment. May be the exact same value as
+	// taskLive (both interfaces a *task.LiveRegistry satisfies), kept as a
+	// separate field only because the two are conceptually different
+	// capabilities (read-only lookup vs. register/unregister).
+	taskLiveRegistry TaskLiveRegistry
+
 	// scheduler wires POST /jobs/trigger/{name} (W4-01): job registry,
 	// resolution, and async dispatch+ledgering all live in
 	// kahyad/internal/scheduler.Scheduler (jobs.go's SetScheduler doc
@@ -284,6 +301,8 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
 	mux.HandleFunc("/session/sensitive-read", s.handleSensitiveRead)
 	mux.HandleFunc(jobTriggerPrefix, s.handleJobTrigger)
+	mux.HandleFunc("/v1/task/status", s.handleTaskStatus)
+	mux.HandleFunc("/v1/task/resolve", s.handleTaskResolve)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

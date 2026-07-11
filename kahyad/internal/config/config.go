@@ -262,6 +262,21 @@ type Config struct {
 	// their own later tasks, W4-06/W5-01/W5-02).
 	Jobs []JobConfig `yaml:"jobs"`
 
+	// --- W4-02 task durability ---
+
+	// TaskRetryW1MaxAuto is `task.retry.w1_max_auto` (task spec, default 3):
+	// the cap on receipt-less W1 tool-call auto-retries kahyad/internal/
+	// task's resume scan applies per (task_id, tool_name, args_hash) triple
+	// before it gives up and moves the task to blocked_user instead. Named
+	// as a flat field (rather than a nested `task: {retry: {w1_max_auto:
+	// ...}}}` YAML block) to match every other key in this file — this
+	// codebase's config.yaml convention is one flat namespace of
+	// lower_snake_case keys, not nested dotted paths (see e.g.
+	// UndoWindowSeconds/TaskTimeoutMin above); `task_retry_w1_max_auto` is
+	// this task's own key, spelled out for readability rather than as a
+	// dotted string.
+	TaskRetryW1MaxAuto int `yaml:"task_retry_w1_max_auto"`
+
 	// TriggerBinPath is the absolute path to the kahya-trigger binary
 	// (kahyad/cmd/kahya-trigger) launchd execs for every declared job —
 	// derived the same way MCPBridgePath/PolicyPath/etc. are (two
@@ -341,6 +356,7 @@ type fileConfig struct {
 	QwenIdleTTLSeconds      *int         `yaml:"qwen_idle_ttl_seconds"`
 	Jobs                    *[]JobConfig `yaml:"jobs"`
 	TriggerBinPath          *string      `yaml:"trigger_bin_path"`
+	TaskRetryW1MaxAuto      *int         `yaml:"task_retry_w1_max_auto"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -452,6 +468,9 @@ func defaults(home string) Config {
 		// Config.Jobs's doc comment); TriggerBinPath follows the same
 		// repo-root derivation as every other default*Path helper below.
 		TriggerBinPath: defaultTriggerBinPath(),
+
+		// W4-02 task durability default (task spec, verbatim: "default 3").
+		TaskRetryW1MaxAuto: 3,
 	}
 }
 
@@ -720,6 +739,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.TriggerBinPath != nil {
 		cfg.TriggerBinPath = expandHome(*fc.TriggerBinPath, home)
+	}
+	if fc.TaskRetryW1MaxAuto != nil {
+		cfg.TaskRetryW1MaxAuto = *fc.TaskRetryW1MaxAuto
 	}
 }
 

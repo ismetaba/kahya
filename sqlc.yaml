@@ -24,6 +24,10 @@ sql:
       # 0006 (W3-08) is two plain ALTER TABLE statements (tasks.lane,
       # tasks.secret_category) - same reasoning.
       - "kahyad/migrations/0006_secret_lane.sql"
+      # 0007 (W4-02) is plain ALTER TABLE + CREATE TABLE/INDEX statements
+      # (tasks.status/next_retry_at/attempts, tool_calls, outbox lease
+      # columns) - same reasoning.
+      - "kahyad/migrations/0007_task_durability.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

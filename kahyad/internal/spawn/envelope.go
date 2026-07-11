@@ -81,6 +81,18 @@ type Envelope struct {
 	// ("finans"|"saglik"|"kimlik"|"none") - informational only (Telegram
 	// redaction / CLI badge / logs), never itself a security boundary.
 	Category string `json:"category,omitempty"`
+
+	// Resume is W4-02's session-resume flag: true iff kahyad/internal/
+	// outbox.Dispatcher is re-spawning a worker for a task that already has
+	// a persisted SessionID (HANDOFF §4 IPC ⚑: "W4 oturum devami session_id
+	// ile"). false (the default, omitted from the wire form) is every
+	// ordinary first-spawn envelope - the exact same shape every pre-W4-02
+	// caller/test already builds. When true, SessionID MUST be non-nil and
+	// non-empty (Validate enforces this); the worker (kahya_worker.
+	// __main__._build_options) then constructs ClaudeAgentOptions with
+	// resume=<session_id> instead of starting a fresh conversation - see
+	// docs/ipc.md's W4-02 note.
+	Resume bool `json:"resume,omitempty"`
 }
 
 // NewTaskID mints a task_id shaped "t_<hex32>" (16 random bytes, hex
@@ -140,6 +152,9 @@ func (e Envelope) Validate() error {
 	}
 	if e.Lane != "" && e.Lane != LaneSecret && e.Lane != LaneNormal {
 		return fmt.Errorf("spawn: lane = %q, want %q, %q, or empty", e.Lane, LaneSecret, LaneNormal)
+	}
+	if e.Resume && (e.SessionID == nil || strings.TrimSpace(*e.SessionID) == "") {
+		return fmt.Errorf("spawn: resume = true requires a non-empty session_id")
 	}
 	return nil
 }

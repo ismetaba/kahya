@@ -351,6 +351,47 @@ class TestBuildOptions(unittest.TestCase):
         self.assertFalse(warning, f"can_use_tool is shadowed and would never fire: {warning!r}")
 
 
+class TestResumeOptionWiring(unittest.TestCase):
+    """W4-02: _build_options must translate envelope.resume/session_id
+    into ClaudeAgentOptions(resume=...) - streaming input mode (and
+    therefore hooks/can_use_tool) stays in force regardless, per
+    TestBuildOptions above."""
+
+    def test_resume_true_passes_session_id_as_resume_option(self) -> None:
+        from kahya_worker.envelope import parse_envelope
+
+        d = dict(VALID_ENVELOPE)
+        d["session_id"] = "sess-original-123"
+        d["resume"] = True
+        env = parse_envelope(json.dumps(d).encode("utf-8"))
+
+        options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+        self.assertEqual(options.resume, "sess-original-123")
+
+    def test_resume_false_leaves_resume_option_unset(self) -> None:
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(VALID_ENVELOPE).encode("utf-8"))
+        options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+        self.assertIsNone(options.resume)
+
+    def test_resumed_session_still_reaches_can_use_tool(self) -> None:
+        """The BLOCKER-2-fixed can_use_tool shadowing check must ALSO hold
+        for a resumed session's options - resume must never accidentally
+        route through a bypass permission mode or a whole-tool allow."""
+        from claude_agent_sdk.types import _get_can_use_tool_shadowed_warning
+        from kahya_worker.envelope import parse_envelope
+
+        d = dict(VALID_ENVELOPE)
+        d["session_id"] = "sess-original-123"
+        d["resume"] = True
+        env = parse_envelope(json.dumps(d).encode("utf-8"))
+        options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+
+        warning = _get_can_use_tool_shadowed_warning(options.permission_mode, options.allowed_tools)
+        self.assertFalse(warning, f"can_use_tool is shadowed on resume and would never fire: {warning!r}")
+
+
 class TestSessionIDCapture(unittest.TestCase):
     """MINOR 4 fix: the init SystemMessage carries session_id inside
     `.data`, not as a top-level attribute - _run_session must fall back to

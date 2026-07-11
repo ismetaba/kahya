@@ -57,6 +57,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runApprovals(client, stdout, stderr)
 	case "approve":
 		return runApprove(client, args[1:], stdin, stdout, stderr)
+	case "task":
+		return runTask(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -330,6 +332,106 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgApprovalApproved)
+	return 0
+}
+
+// runTask implements `kahya task show <id>` and `kahya task resolve <id>
+// --retry|--abort` (W4-02).
+func runTask(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgTaskUsage)
+		return 2
+	}
+	switch args[0] {
+	case "show":
+		return runTaskShow(client, args[1:], stdout, stderr)
+	case "resolve":
+		return runTaskResolve(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgTaskUsage)
+		return 2
+	}
+}
+
+// runTaskShow implements `kahya task show <id>`: GET /v1/task/status,
+// printed as status/session_id/live-worker-PID/attempts/tool_calls - the
+// W4-07 gate script kills the worker via this exact PID.
+func runTaskShow(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgTaskShowUsage)
+		return 2
+	}
+	id := strings.TrimSpace(args[0])
+
+	ts, err := client.TaskStatus(context.Background(), traceid.New(), id)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	session := MsgTaskShowNone
+	if ts.SessionID != "" {
+		session = ts.SessionID
+	}
+	pid := MsgTaskShowNone
+	if ts.PID != 0 {
+		pid = fmt.Sprintf("%d", ts.PID)
+	}
+
+	fmt.Fprintf(stdout, MsgTaskShowHeader+"\n", ts.ID)
+	fmt.Fprintf(stdout, MsgTaskShowStatus+"\n", ts.Status)
+	fmt.Fprintf(stdout, MsgTaskShowSession+"\n", session)
+	fmt.Fprintf(stdout, MsgTaskShowPID+"\n", pid)
+	fmt.Fprintf(stdout, MsgTaskShowAttempts+"\n", ts.Attempts)
+	if len(ts.ToolCalls) == 0 {
+		fmt.Fprintln(stdout, MsgTaskShowToolCallsNone)
+		return 0
+	}
+	fmt.Fprintln(stdout, MsgTaskShowToolCallsHead)
+	for _, c := range ts.ToolCalls {
+		fmt.Fprintf(stdout, MsgTaskShowToolCallRow+"\n", c.Seq, c.Tool, c.Class, c.Status)
+	}
+	return 0
+}
+
+// runTaskResolve implements `kahya task resolve <id> --retry|--abort`
+// (W4-02). The task id is a positional argument BEFORE the flag (unlike
+// every other flag.FlagSet use in this file), so it is peeled off by hand
+// first - flag.Parse stops at the first non-flag argument, which would
+// otherwise swallow --retry/--abort as positional args instead of
+// recognizing them.
+func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgTaskResolveUsage)
+		return 2
+	}
+	id := strings.TrimSpace(args[0])
+
+	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	retry := fs.Bool("retry", false, "yarıda kesilen aracı yeniden dene (fresh onay ile)")
+	abort := fs.Bool("abort", false, "görevi durdur (failed)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if *retry == *abort { // neither, or both
+		fmt.Fprintln(stderr, MsgTaskResolveUsage)
+		return 2
+	}
+
+	action := "retry"
+	if *abort {
+		action = "abort"
+	}
+	if err := client.TaskResolve(context.Background(), traceid.New(), id, action); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 1
+	}
+	if *abort {
+		fmt.Fprintf(stdout, MsgTaskResolvedAbort+"\n", id)
+	} else {
+		fmt.Fprintf(stdout, MsgTaskResolvedRetry+"\n", id)
+	}
 	return 0
 }
 

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,6 +144,70 @@ func TestUserVersionMatchesLatestMigration(t *testing.T) {
 	}
 }
 
+// TestForeignKeyCheckCleanAfterMigration is W4-02's own migration
+// acceptance criterion, verbatim: "sqlite3 brain.db 'PRAGMA
+// foreign_key_check;' clean after migration" - tool_calls.task_id
+// REFERENCES tasks(id) (migrations/0007_task_durability.sql) is the new
+// foreign key this task adds; a dangling reference (or any other
+// violation anywhere in the schema) would show up as a non-empty result
+// set here.
+func TestForeignKeyCheckCleanAfterMigration(t *testing.T) {
+	s, err := Open(testCfg(t))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	rows, err := s.DB().Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatalf("PRAGMA foreign_key_check: %v", err)
+	}
+	defer rows.Close()
+
+	var violations []string
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("rows.Columns: %v", err)
+	}
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("scan foreign_key_check row: %v", err)
+		}
+		violations = append(violations, fmtRow(cols, vals))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate foreign_key_check: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("PRAGMA foreign_key_check reported %d violation(s): %v", len(violations), violations)
+	}
+}
+
+// fmtRow renders one foreign_key_check result row for a failing test's
+// error message.
+func fmtRow(cols []string, vals []any) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = c + "=" + toStringAny(vals[i])
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+func toStringAny(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
 func TestEventsIsAppendOnly(t *testing.T) {
 	s, err := Open(testCfg(t))
 	if err != nil {
@@ -277,13 +342,14 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 // pre-W12-03 database did) must migrate cleanly up to the latest embedded
 // schema version (chunks_fts_tri/chunks_fts_uni/chunk_vec from 0002,
 // autonomy_state/approval_tokens/undo_windows from 0003, egress_budget
-// from 0004 (W3-05), pending_approvals.tool_input from 0005 (W3-06), and
-// tasks.lane/tasks.secret_category from 0006 (W3-08)) the next time kahyad
-// boots. The expected latest version is asserted as 6
-// (0001+0002+0003+0004+0005+0006); bump this literal, deliberately, the
-// next time a new migration file is added - this is the one place in the
-// test suite that pins "the latest goose version kahyad ships" as a
-// number, so a forgotten migration file never silently passes this gate.
+// from 0004 (W3-05), pending_approvals.tool_input from 0005 (W3-06),
+// tasks.lane/tasks.secret_category from 0006 (W3-08), and
+// tasks.status/tool_calls/outbox lease columns from 0007 (W4-02)) the
+// next time kahyad boots. The expected latest version is asserted as 7
+// (0001..0007); bump this literal, deliberately, the next time a new
+// migration file is added - this is the one place in the test suite that
+// pins "the latest goose version kahyad ships" as a number, so a
+// forgotten migration file never silently passes this gate.
 func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	cfg := testCfg(t)
 
@@ -321,7 +387,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 6 // 0001-0006; bump alongside each new migration file
+	const latestVersion = 7 // 0001-0007; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}
@@ -334,7 +400,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 
 	got = tableNames(t, s.DB())
-	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget"} {
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget", "tool_calls"} {
 		if !got[name] {
 			t.Errorf("table %q missing after v1->latest upgrade; tables = %v", name, got)
 		}

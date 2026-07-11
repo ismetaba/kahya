@@ -443,9 +443,21 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		CredentialMode: s.cfg.CredentialMode,
 	}
 
+	// W4-02: register this task's worker pid with the live registry (if
+	// wired) for the whole time spawn.Run is actually running it - the
+	// resume scan's LiveChecker consults this so it never treats a task
+	// the daemon itself is still actively running as crashed, and GET
+	// /v1/task/status (`kahya task show <id>`) reports the live pid.
+	if s.taskLiveRegistry != nil {
+		defer s.taskLiveRegistry.Unregister(taskID)
+	}
+
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
 		OnStart: func(pid int) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
+			if s.taskLiveRegistry != nil {
+				s.taskLiveRegistry.Register(taskID, pid)
+			}
 		},
 		OnDelta: func(text string) {
 			writeSSE("delta", map[string]string{"text": text})

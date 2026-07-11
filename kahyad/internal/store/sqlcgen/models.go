@@ -126,6 +126,9 @@ type Outbox struct {
 	Payload      string         `json:"payload"`
 	DispatchedAt sql.NullString `json:"dispatched_at"`
 	CreatedAt    string         `json:"created_at"`
+	AvailableAt  sql.NullString `json:"available_at"`
+	LeaseUntil   sql.NullString `json:"lease_until"`
+	Attempts     int64          `json:"attempts"`
 }
 
 type PendingApproval struct {
@@ -154,6 +157,24 @@ type Task struct {
 	CreatedAt      string         `json:"created_at"`
 	Lane           string         `json:"lane"`
 	SecretCategory sql.NullString `json:"secret_category"`
+	Status         string         `json:"status"`
+	NextRetryAt    sql.NullString `json:"next_retry_at"`
+	Attempts       int64          `json:"attempts"`
+}
+
+type ToolCall struct {
+	ID              int64          `json:"id"`
+	TaskID          string         `json:"task_id"`
+	Seq             int64          `json:"seq"`
+	ToolName        string         `json:"tool_name"`
+	Class           string         `json:"class"`
+	ArgsHash        string         `json:"args_hash"`
+	ApprovalTokenID sql.NullString `json:"approval_token_id"`
+	Status          string         `json:"status"`
+	ReceiptJson     sql.NullString `json:"receipt_json"`
+	StartedAt       sql.NullString `json:"started_at"`
+	FinishedAt      sql.NullString `json:"finished_at"`
+	CreatedAt       string         `json:"created_at"`
 }
 
 type UndoWindow struct {

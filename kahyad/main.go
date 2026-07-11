@@ -32,13 +32,16 @@ import (
 	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
+	"kahya/kahyad/internal/outbox"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/scheduler"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/secrets"
 	"kahya/kahyad/internal/server"
+	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/telegram"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
@@ -449,6 +452,24 @@ func run() int {
 	// no adapter.
 	srv.SetTaskStore(st.Queries)
 
+	// W4-02: task durability state machine + receipts + resume scan +
+	// outbox dispatcher (HANDOFF §6 W4 ⚑). taskLive is the live-worker-PID
+	// registry shared by the resume scan's LiveChecker, the outbox
+	// dispatcher's own re-spawn bookkeeping, and GET /v1/task/status
+	// (`kahya task show <id>`'s PID field - the W4-07 gate script kills
+	// the worker via this exact PID); server.SetTaskDurability wires GET
+	// /v1/task/status + POST /v1/task/resolve.
+	taskMachine := task.NewMachine(st.Queries, st)
+	// Every transition is also logged as JSONL (HANDOFF §4 ⚑: "her satir
+	// trace_id iceren JSONL"), alongside the DB ledger row Machine already
+	// writes - the task spec's own grep-test acceptance criterion needs
+	// both to exist and agree.
+	taskMachine.SetJSONLLogger(log)
+	taskResolver := task.NewResolver(st.Queries, st.Queries, taskMachine)
+	taskLive := task.NewLiveRegistry()
+	srv.SetTaskDurability(taskResolver, st.Queries, taskLive)
+	srv.SetTaskLiveRegistry(taskLive)
+
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
 	// (W12-08). notifier (built above, alongside the egress gate)
 	// logs+ledgers alarms; governorNotifier additionally fans every ALARM-
@@ -583,6 +604,50 @@ func run() int {
 	sched := scheduler.New(st, log)
 	sched.LoadJobs(cfg.Jobs)
 	srv.SetScheduler(sched)
+
+	// W4-02: the resume scan (kahyad/internal/task.Resume) and the outbox
+	// redelivery dispatcher (kahyad/internal/outbox.Dispatcher) share the
+	// SAME taskMachine/taskLive built above. dispatcherSpawnCfg mirrors
+	// POST /v1/task's own spawn.Config fields (WorkerCmd/Socket/LogDir/
+	// MCPBridgePath/CredentialMode); AnthropicBaseURL/APIKey are left unset
+	// here - a genuinely resumed worker that needs to make a NEW model
+	// call would need its own fresh per-dispatch anthproxy.Proxy listener
+	// (the same per-task construction handleTask performs, kahyad/
+	// internal/server/task.go), which is intentionally deferred (a
+	// resumed worker's model-call path is exercised end-to-end by the
+	// W4-07 gate, not this task - see this task's own commit notes).
+	dispatcherSpawnCfg := spawn.Config{
+		Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
+		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
+	}
+	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, taskLive, cfg.TaskRetryW1MaxAuto)
+	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)
+
+	runResumeScan := func(ctx context.Context) {
+		if _, err := taskResume.Scan(ctx); err != nil {
+			log.Error("task_resume_scan_failed", "err", err.Error())
+		}
+	}
+	runOutboxDispatch := func(ctx context.Context) {
+		if _, err := taskDispatcher.ClaimAndDispatch(ctx); err != nil {
+			log.Error("outbox_dispatch_failed", "err", err.Error())
+		}
+	}
+	// Startup scan: every task.go's own comment on "no live worker PID"
+	// applies in its strongest form here - taskLive is still EMPTY (no
+	// spawn has registered into it yet this process), so every
+	// tasks.status='executing' row left over from a previous kahyad
+	// process (crash, SIGKILL, machine restart) is correctly treated as
+	// interrupted.
+	runResumeScan(context.Background())
+	if err := sched.RegisterTick("task_resume_scan", "@every 30s", runResumeScan); err != nil {
+		log.Error("task_resume_scan_tick_register_failed", "err", err.Error())
+	}
+	if err := sched.RegisterTick("outbox_dispatch", "@every 5s", runOutboxDispatch); err != nil {
+		log.Error("outbox_dispatch_tick_register_failed", "err", err.Error())
+	}
+	sched.StartTicks()
+	defer sched.StopTicks()
 
 	// Startup sync (task spec step 5): keep ~/Library/LaunchAgents' set of
 	// com.kahya.job.<name> plists in exact sync with cfg.Jobs on every
