@@ -684,6 +684,77 @@ func (c *Client) consolidationAction(ctx context.Context, traceID, path string) 
 	return nil
 }
 
+// factActionResponse mirrors kahyad's POST /v1/fact/*, /v1/entity/* JSON
+// body (kahyad/internal/server.factActionResponse, W5-04).
+type factActionResponse struct {
+	OK    bool   `json:"ok"`
+	ID    int64  `json:"id,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// factAction POSTs body (already-marshaled JSON) to path and decodes a
+// factActionResponse - the shared plumbing every one of the four W5-04
+// fact/entity routes below uses, mirroring consolidationAction's identical
+// shape.
+func (c *Client) factAction(ctx context.Context, traceID, path string, body any) (int64, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return 0, fmt.Errorf("%s: marshal request: %w", path, err)
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, path, traceID, bytes.NewReader(b))
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var ar factActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
+	}
+	if !ar.OK {
+		if ar.Error != "" {
+			return 0, fmt.Errorf("%s", ar.Error)
+		}
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
+	}
+	return ar.ID, nil
+}
+
+// ConfirmFact calls POST /v1/fact/confirm (`kahya fact confirm <id>`).
+func (c *Client) ConfirmFact(ctx context.Context, traceID string, factID int64) error {
+	_, err := c.factAction(ctx, traceID, "/v1/fact/confirm", map[string]any{"fact_id": factID})
+	return err
+}
+
+// RetractFact calls POST /v1/fact/retract (`kahya fact retract <özne>
+// <yüklem> <nesne> [oturum_id]`), returning the retracted fact's id.
+func (c *Client) RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error) {
+	return c.factAction(ctx, traceID, "/v1/fact/retract", map[string]any{
+		"subject": subject, "predicate": predicate, "object": object, "session_id": sessionID,
+	})
+}
+
+// MergeEntities calls POST /v1/entity/merge (`kahya entity merge <a> <b>
+// --evidence <fact_id>`: b merges INTO a), returning the new
+// merge_ledger row's id.
+func (c *Client) MergeEntities(ctx context.Context, traceID string, dstEntityID, srcEntityID, evidenceFactID int64, actor string) (int64, error) {
+	return c.factAction(ctx, traceID, "/v1/entity/merge", map[string]any{
+		"dst_entity_id": dstEntityID, "src_entity_id": srcEntityID, "evidence_fact_id": evidenceFactID, "actor": actor,
+	})
+}
+
+// SplitEntities calls POST /v1/entity/split (`kahya entity split
+// <merge_ledger_id>`), returning the new split merge_ledger row's id.
+func (c *Client) SplitEntities(ctx context.Context, traceID string, mergeLedgerID int64, actor string) (int64, error) {
+	return c.factAction(ctx, traceID, "/v1/entity/split", map[string]any{
+		"merge_ledger_id": mergeLedgerID, "actor": actor,
+	})
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

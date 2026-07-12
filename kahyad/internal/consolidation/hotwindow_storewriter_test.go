@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/taint"
 )
 
 // TestStoreFactWriterAgainstRealBrainDB is a real-SQLite integration test
@@ -51,8 +53,9 @@ func TestStoreFactWriterAgainstRealBrainDB(t *testing.T) {
 		t.Fatalf("InsertChunk() error = %v", err)
 	}
 
-	writer := StoreFactWriter{Q: st.Queries}
-	promoted, err := PromoteHotWindow(ctx, writer, now)
+	engine := factengine.New(st.Queries, taint.New(st.Queries, st), st)
+	writer := StoreFactWriter{Q: st.Queries, Engine: engine}
+	promoted, err := PromoteHotWindow(ctx, writer, "trace-test", now)
 	if err != nil {
 		t.Fatalf("PromoteHotWindow() error = %v", err)
 	}

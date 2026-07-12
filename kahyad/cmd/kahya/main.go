@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,6 +69,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runJob(client, args[1:], stdout, stderr)
 	case "consolidation":
 		return runConsolidation(client, args[1:], stdin, stdout, stderr)
+	case "fact":
+		return runFact(client, args[1:], stdout, stderr)
+	case "entity":
+		return runEntity(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -317,6 +322,144 @@ func runConsolidationReject(client *Client, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgConsolidationRejected)
+	return 0
+}
+
+// runFact implements `kahya fact confirm <id>` and `kahya fact retract
+// <özne> <yüklem> <nesne> [oturum_id]` (W5-04).
+func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	switch args[0] {
+	case "confirm":
+		return runFactConfirm(client, args[1:], stdout, stderr)
+	case "retract":
+		return runFactRetract(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+}
+
+// runFactConfirm implements `kahya fact confirm <id>`: lifts an
+// agent_derived fact's quarantine (kahyad/internal/factengine.Engine.
+// ConfirmFact) - the human confirmation half of HANDOFF S5 memory #1.
+func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
+	if err != nil || id == 0 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	if err := client.ConfirmFact(context.Background(), traceid.New(), id); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgFactConfirmed+"\n", id)
+	return 0
+}
+
+// runFactRetract implements `kahya fact retract <özne> <yüklem> <nesne>
+// [oturum_id]`: closes the ACTIVE fact matching that triple
+// (status=retracted, valid_to set, negative evidence row - never a
+// delete, HANDOFF S5 memory #3).
+func runFactRetract(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 3 || len(args) > 4 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	subject, predicate, object := args[0], args[1], args[2]
+	sessionID := ""
+	if len(args) == 4 {
+		sessionID = args[3]
+	}
+	id, err := client.RetractFact(context.Background(), traceid.New(), subject, predicate, object, sessionID)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgFactRetracted+"\n", id)
+	return 0
+}
+
+// runEntity implements `kahya entity merge <a> <b> --evidence <fact_id>`
+// and `kahya entity split <merge_ledger_id>` (W5-04).
+func runEntity(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgEntityUsage)
+		return 2
+	}
+	switch args[0] {
+	case "merge":
+		return runEntityMerge(client, args[1:], stdout, stderr)
+	case "split":
+		return runEntitySplit(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgEntityUsage)
+		return 2
+	}
+}
+
+// runEntityMerge implements `kahya entity merge <a> <b> --evidence
+// <fact_id>`: b (src) merges INTO a (dst, survives) - --evidence MUST
+// name a real, existing fact (HANDOFF S5 memory #2: name similarity
+// alone never suffices). The two entity-id positionals come BEFORE the
+// flag (mirroring runTaskResolve's identical "positional id, then
+// flag.Parse the rest" shape), since flag.Parse would otherwise stop at
+// the first non-flag argument.
+func runEntityMerge(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, MsgEntityMergeUsage)
+		return 2
+	}
+	aStr, bStr := args[0], args[1]
+
+	fs := flag.NewFlagSet("merge", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	evidence := fs.Int64("evidence", 0, "ayirt edici kanit olgu id'si (zorunlu)")
+	if err := fs.Parse(args[2:]); err != nil {
+		return 2
+	}
+
+	dstID, err1 := strconv.ParseInt(strings.TrimSpace(aStr), 10, 64)
+	srcID, err2 := strconv.ParseInt(strings.TrimSpace(bStr), 10, 64)
+	if err1 != nil || err2 != nil || *evidence == 0 {
+		fmt.Fprintln(stderr, MsgEntityMergeUsage)
+		return 2
+	}
+
+	id, err := client.MergeEntities(context.Background(), traceid.New(), dstID, srcID, *evidence, "user")
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgEntityMerged+"\n", id)
+	return 0
+}
+
+// runEntitySplit implements `kahya entity split <merge_ledger_id>`:
+// restores both entities to their pre-merge state.
+func runEntitySplit(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgEntitySplitUsage)
+		return 2
+	}
+	mergeLedgerID, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
+	if err != nil {
+		fmt.Fprintln(stderr, MsgEntitySplitUsage)
+		return 2
+	}
+	id, err := client.SplitEntities(context.Background(), traceid.New(), mergeLedgerID, "user")
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgEntitySplit+"\n", id)
 	return 0
 }
 

@@ -60,6 +60,7 @@ type Entity struct {
 	Kind          sql.NullString `json:"kind"`
 	Status        string         `json:"status"`
 	CreatedAt     string         `json:"created_at"`
+	Provisional   int64          `json:"provisional"`
 }
 
 type EntityAlias struct {
@@ -99,6 +100,7 @@ type Evidence struct {
 	SessionID sql.NullString `json:"session_id"`
 	Polarity  int64          `json:"polarity"`
 	CreatedAt string         `json:"created_at"`
+	Weight    float64        `json:"weight"`
 }
 
 type Fact struct {
@@ -117,6 +119,7 @@ type Fact struct {
 	ExtractorVer  sql.NullString `json:"extractor_ver"`
 	UpdatedAt     string         `json:"updated_at"`
 	CreatedAt     string         `json:"created_at"`
+	ConfirmedAt   sql.NullString `json:"confirmed_at"`
 }
 
 type LedgerDigestState struct {

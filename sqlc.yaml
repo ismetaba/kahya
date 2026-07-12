@@ -40,6 +40,9 @@ sql:
       # 0011 (W5-02) is a plain ALTER TABLE (episodes.cooled_at) + a plain
       # CREATE INDEX - same reasoning.
       - "kahyad/migrations/0011_consolidation.sql"
+      # 0012 (W5-04) is three plain ALTER TABLE statements (entities.
+      # provisional, facts.confirmed_at, evidence.weight) - same reasoning.
+      - "kahyad/migrations/0012_factengine.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

@@ -31,6 +31,7 @@ import (
 	"kahya/kahyad/internal/consolidation"
 	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/embed"
+	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/mlx"
@@ -478,6 +479,16 @@ func run() int {
 	// a documented legacy/test fallback, never a production posture).
 	policyEngine.SetSessionResolver(policy.NewStoreSessionResolver(st.Queries))
 
+	// W5-04: the SINGLE fact-write path (source-trust lattice + log-odds
+	// confidence + retraction + evidence-gated entity merge/split) -
+	// shares taintTracker above (the SAME W4-03 clean/tainted read
+	// factengine.Engine's ProvenanceUserAsserted gate consults) and st
+	// itself as the append-only events ledger. Wired into both the
+	// nightly hot-window promotion (HotWindow below) and the CLI-facing
+	// /v1/fact*, /v1/entity* routes (SetFactEngine).
+	factEngine := factengine.New(st.Queries, taintTracker, st)
+	srv.SetFactEngine(factEngine)
+
 	// W4-02: task durability state machine + receipts + resume scan +
 	// outbox dispatcher (HANDOFF §6 W4 ⚑). taskLive is the live-worker-PID
 	// registry shared by the resume scan's LiveChecker, the outbox
@@ -785,7 +796,7 @@ func run() int {
 		EventReader: consolidation.StoreEventReader{Q: st.Queries},
 		Reindexer:   reindexBackfiller,
 		Pusher:      pusher,
-		HotWindow:   consolidation.StoreFactWriter{Q: st.Queries},
+		HotWindow:   consolidation.StoreFactWriter{Q: st.Queries, Engine: factEngine},
 		Log:         log,
 	}
 	sched.RegisterHandler("nightly-consolidation", func(ctx context.Context) error {

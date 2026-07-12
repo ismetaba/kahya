@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"kahya/kahyad/internal/backup"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/store"
@@ -70,6 +71,11 @@ type Indexer struct {
 	memoryDir string
 	log       *logx.Logger
 
+	// git is the W5-04 user_edit git-author check's runner (gitauthor.go).
+	// Defaults to the real `git` binary (backup.NewExecGitRunner()) - see
+	// SetGitRunner for how tests override it with a fake.
+	git backup.GitRunner
+
 	mu sync.Mutex
 }
 
@@ -79,7 +85,16 @@ type Indexer struct {
 // call scopes a child logger to that call's trace_id, matching
 // kahyad/internal/search.Searcher's own logging pattern.
 func New(db *sql.DB, memoryDir string, log *logx.Logger) *Indexer {
-	return &Indexer{db: db, q: sqlcgen.New(db), memoryDir: memoryDir, log: log}
+	return &Indexer{db: db, q: sqlcgen.New(db), memoryDir: memoryDir, log: log, git: backup.NewExecGitRunner()}
+}
+
+// SetGitRunner overrides the git runner gitauthor.go's resolveUserEditTier
+// uses (tests only; production always keeps New's real-git default). Not
+// concurrency-safe against an in-flight Reindex/ReindexFile call, matching
+// every other test-only setter in this codebase's convention of "call
+// before first use".
+func (idx *Indexer) SetGitRunner(g backup.GitRunner) {
+	idx.git = g
 }
 
 // fileEntry is one *.md file found by walkFiles, already filtered past the
@@ -437,6 +452,11 @@ func (idx *Indexer) processFile(ctx context.Context, e fileEntry, full bool) (fi
 	if err != nil {
 		return 0, 0, fmt.Errorf("%s: %w", e.relPath, err)
 	}
+	// W5-04: reach the top of the source-trust lattice (user_edit) via a
+	// real `user <user@kahya.local>` git commit author, when one applies -
+	// fail-safe, never overrides tier on any git error/ambiguity (see
+	// gitauthor.go's own doc comment).
+	tier = resolveUserEditTier(ctx, idx.git, idx.memoryDir, e.relPath, tier)
 
 	existing, err := idx.q.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
 		Source:     sourceMemoryFile,

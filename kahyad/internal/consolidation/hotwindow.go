@@ -46,6 +46,7 @@ import (
 	"strings"
 	"time"
 
+	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -227,6 +228,10 @@ type Chunk struct {
 // InsertFact. SourceTier/Evidentiality are always agentDerivedSourceTier/
 // inferredEvidentiality (PromoteHotWindow sets both; CandidateFact simply
 // carries whatever the caller put there, same as every other field).
+// TraceID is threaded through to the W5-04 factengine.Engine's own
+// ledgering (StoreFactWriter.InsertFact is the ONLY reader of this
+// field - the in-memory fakeFactStore this package's own tests use simply
+// ignores it, same as every other field it does not care about).
 type CandidateFact struct {
 	Subject       string
 	Predicate     string
@@ -237,11 +242,12 @@ type CandidateFact struct {
 	Importance    float64
 	Evidence      string
 	ExtractorVer  string
+	TraceID       string
 }
 
 // FactStore is the narrow brain.db seam PromoteHotWindow needs -
-// StoreFactWriter (below) adapts *kahyad/internal/store/sqlcgen.Queries;
-// tests inject an in-memory fake instead.
+// StoreFactWriter (below) adapts kahyad/internal/factengine.Engine (W5-04's
+// single fact-write path); tests inject an in-memory fake instead.
 type FactStore interface {
 	ListUncooledEpisodesOlderThan(ctx context.Context, cutoff time.Time) ([]Episode, error)
 	ListChunksByEpisode(ctx context.Context, episodeID int64) ([]Chunk, error)
@@ -255,8 +261,12 @@ type FactStore interface {
 // fact (evidence = that exact episode+chunk, never a prior summary -
 // enforced via ValidateSummaryEvidence before every InsertFact call), and
 // ONLY THEN is the episode marked cooled. Returns the total fact count
-// promoted across every episode this pass touched.
-func PromoteHotWindow(ctx context.Context, store FactStore, now time.Time) (int, error) {
+// promoted across every episode this pass touched. traceID correlates
+// every fact this run writes with the nightly consolidation run's own
+// JSONL/ledger lines (HANDOFF S4 logging invariant); the production
+// FactStore (StoreFactWriter) is what actually reads CandidateFact.TraceID
+// - see that type's own doc comment.
+func PromoteHotWindow(ctx context.Context, store FactStore, traceID string, now time.Time) (int, error) {
 	cutoff := now.AddDate(0, 0, -HotWindowDays)
 	episodes, err := store.ListUncooledEpisodesOlderThan(ctx, cutoff)
 	if err != nil {
@@ -276,15 +286,27 @@ func PromoteHotWindow(ctx context.Context, store FactStore, now time.Time) (int,
 					return promoted, err
 				}
 				fact := CandidateFact{
-					Subject:       fmt.Sprintf("episode:%d", ep.ID),
-					Predicate:     string(atom.Kind),
-					Object:        atom.Text,
+					Subject:   fmt.Sprintf("episode:%d", ep.ID),
+					Predicate: string(atom.Kind),
+					Object:    atom.Text,
+					// SourceTier/Confidence are DOCUMENTATION here, not
+					// what actually lands in the row: the W5-04 factengine
+					// (StoreFactWriter.InsertFact, below) assigns
+					// source_tier Go-side from Provenance (always
+					// agent_derived for this Go-authored, non-extractor
+					// candidate - HANDOFF S5 memory #1) and computes
+					// confidence itself from the tier's log-odds cap
+					// (HANDOFF S5 memory #3), never from a caller-supplied
+					// value - kept here so this struct's own literal
+					// still reads as "what a hot-window candidate always
+					// was" for anyone grepping it.
 					SourceTier:    agentDerivedSourceTier,
 					Evidentiality: inferredEvidentiality,
-					Confidence:    0, // log-odds 0 == p=0.5: an unconfirmed candidate, deliberately neutral
+					Confidence:    0,
 					Importance:    0,
 					Evidence:      formatEvidence(refs),
 					ExtractorVer:  HotWindowExtractorVersion,
+					TraceID:       traceID,
 				}
 				if _, err := store.InsertFact(ctx, fact); err != nil {
 					return promoted, fmt.Errorf("consolidation: insert candidate fact for episode %d: %w", ep.ID, err)
@@ -299,10 +321,27 @@ func PromoteHotWindow(ctx context.Context, store FactStore, now time.Time) (int,
 	return promoted, nil
 }
 
-// StoreFactWriter adapts *sqlcgen.Queries to FactStore - the production
-// implementation.
+// FactEngine is the narrow W5-04 factengine.Engine surface StoreFactWriter
+// needs - kept as an interface (rather than a direct *factengine.Engine
+// field) purely so this package's own tests could inject a fake if they
+// ever needed to (none currently do: hotwindow_storewriter_test.go wires
+// a real Engine over a real temp brain.db, matching that file's own
+// "never a fake standing in for the schema itself" rationale).
+type FactEngine interface {
+	WriteFact(ctx context.Context, traceID string, c factengine.Candidate) (int64, error)
+}
+
+// StoreFactWriter adapts kahyad/internal/factengine.Engine (W5-04's SINGLE
+// fact-write path) to FactStore for ListUncooledEpisodesOlderThan/
+// ListChunksByEpisode/MarkEpisodeCooled (still plain *sqlcgen.Queries
+// reads/writes - those three are not fact-shaped, so W5-04 does not own
+// them) and InsertFact (which now goes through Engine.WriteFact instead of
+// a raw sqlc INSERT - HANDOFF S5 memory #1: source_tier is assigned
+// Go-side by the engine itself, never trusted from a candidate struct,
+// even one this package's own deterministic detail-atom extractor built).
 type StoreFactWriter struct {
-	Q *sqlcgen.Queries
+	Q      *sqlcgen.Queries
+	Engine FactEngine
 }
 
 var _ FactStore = StoreFactWriter{}
@@ -339,26 +378,26 @@ func (w StoreFactWriter) ListChunksByEpisode(ctx context.Context, episodeID int6
 	return out, nil
 }
 
+// InsertFact routes f through the W5-04 factengine.Engine's WriteFact -
+// the single fact-write path every writer in this codebase now goes
+// through (grep for "INSERT INTO facts" outside kahyad/internal/
+// factengine/kahyad/internal/store/sqlcgen: this is the one call site
+// that used to be a second one, before W5-04). f.SourceTier/f.Confidence
+// are NOT passed through: WriteFact assigns tier from Provenance
+// (ProvenanceAgentDerived's zero value, since this candidate came from
+// this package's own deterministic Go extractor, never an LLM) and
+// computes confidence itself.
 func (w StoreFactWriter) InsertFact(ctx context.Context, f CandidateFact) (int64, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	row, err := w.Q.InsertFact(ctx, sqlcgen.InsertFactParams{
-		Subject:       f.Subject,
-		Predicate:     f.Predicate,
-		Object:        f.Object,
-		SourceTier:    f.SourceTier,
+	return w.Engine.WriteFact(ctx, f.TraceID, factengine.Candidate{
+		Subject: f.Subject, Predicate: f.Predicate, Object: f.Object,
+		// Provenance left at its zero value ("") - factengine.WriteFact
+		// defaults that to ProvenanceAgentDerived, exactly right for a
+		// hot-window-promoted candidate (HANDOFF S5 memory #1).
 		Evidentiality: f.Evidentiality,
-		Confidence:    f.Confidence,
 		Importance:    f.Importance,
-		Status:        "active",
-		Evidence:      nullString(f.Evidence),
-		ExtractorVer:  nullString(f.ExtractorVer),
-		UpdatedAt:     now,
-		CreatedAt:     now,
+		Evidence:      f.Evidence,
+		ExtractorVer:  f.ExtractorVer,
 	})
-	if err != nil {
-		return 0, err
-	}
-	return row.ID, nil
 }
 
 func (w StoreFactWriter) MarkEpisodeCooled(ctx context.Context, episodeID int64, at time.Time) error {

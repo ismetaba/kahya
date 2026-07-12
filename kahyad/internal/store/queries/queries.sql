@@ -719,4 +719,153 @@ UPDATE episodes SET cooled_at = ? WHERE id = ?;
 -- never a prior summary.
 INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at;
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at;
+
+-- W5-04 (memory-correctness-engine) queries below: the single fact-write
+-- path (kahyad/internal/factengine) is the ONLY caller of InsertFact
+-- above and everything in this section - see that package's own doc
+-- comment for the source-trust lattice / log-odds / entity-merge rules
+-- these back.
+
+-- name: GetFact :one
+-- Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
+-- engine's own recompute-from-evidence path.
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE id = ?;
+
+-- name: GetActiveFactByTriple :one
+-- WriteFact's upsert lookup: an existing ACTIVE fact for this exact
+-- (subject, predicate, object) gets a new evidence row instead of a
+-- duplicate fact row (HANDOFF S5 memory #3: repeated assertions
+-- accumulate evidence on ONE fact, they never mint a second one). A
+-- retracted/closed fact is deliberately excluded (status='active' only)
+-- so a later re-assertion after a retraction creates a FRESH fact rather
+-- than reviving the closed one in place - the retracted row stays exactly
+-- as HANDOFF S5 memory #3 requires (closed, never deleted, never
+-- reopened).
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
+ORDER BY id DESC
+LIMIT 1;
+
+-- name: UpdateFactConfidence :exec
+-- The engine recomputes confidence from the fact's own evidence rows
+-- (sum of weights, deduped by (session_id, polarity), clamped to the
+-- highest positive tier cap represented - never a noisy-OR ratchet) and
+-- writes the result back here after every WriteFact/DenyFact call.
+UPDATE facts SET confidence = ?, updated_at = ? WHERE id = ?;
+
+-- name: ConfirmFact :exec
+-- `kahya fact confirm <id>` (or a W5-03 ritual Dogru answer): lifts the
+-- agent_derived quarantine half of the injection-eligibility predicate.
+-- Never touches source_tier or confidence - an agent_derived fact stays
+-- agent_derived, capped at that tier's ceiling, forever (HANDOFF S5
+-- memory #1).
+UPDATE facts SET confirmed_at = ?, updated_at = ? WHERE id = ?;
+
+-- name: RetractFact :exec
+-- Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
+-- valid_to set, status='retracted' - NEVER a DELETE. The caller
+-- (kahyad/internal/factengine/retract.go) always inserts a negative
+-- evidence row in the SAME logical operation, never this alone.
+UPDATE facts SET status = 'retracted', valid_to = ?, updated_at = ? WHERE id = ?;
+
+-- name: ListEvidenceByFact :many
+-- Every evidence row for one fact, in insertion order - the engine's
+-- confidence-recompute path sums .weight over these (deduped by
+-- (session_id, polarity) defensively, though WriteFact/DenyFact already
+-- refuse to insert a second row for a (fact_id, session_id, polarity)
+-- already on file - HANDOFF S5 memory #3's "ayni-oturum tekrari tek kanit
+-- sayilir").
+SELECT id, fact_id, episode_id, session_id, polarity, weight, created_at
+FROM evidence
+WHERE fact_id = ?
+ORDER BY id ASC;
+
+-- name: GetEvidenceByFactSessionPolarity :one
+-- The per-(fact_id, session_id, polarity) dedupe check (HANDOFF S5
+-- memory #3): sql.ErrNoRows means this session has not yet evidenced
+-- this fact at this polarity, so a NEW evidence row is due; a hit means
+-- the existing row already covers it and no second row is ever inserted
+-- (a repeat within the SAME session is not a second, independent
+-- observation).
+SELECT id, fact_id, episode_id, session_id, polarity, weight, created_at
+FROM evidence
+WHERE fact_id = ? AND session_id = ? AND polarity = ?;
+
+-- name: InsertEvidence :one
+-- weight is the signed log-odds delta this ONE row contributes (positive
+-- for a supporting tier's fixed constant, the fixed user-denial constant
+-- for a negative/retraction row) - see this file's own migrations/
+-- 0012_factengine.sql comment on evidence.weight for why this column
+-- exists at all.
+INSERT INTO evidence (fact_id, episode_id, session_id, polarity, weight, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING id, fact_id, episode_id, session_id, polarity, weight, created_at;
+
+-- name: InsertEntity :one
+-- provisional=1 marks a suspicious same-name entity (HANDOFF S5 memory
+-- #2: "supheli ayni-isim -> yeni gecici varlik") - kahyad/internal/
+-- factengine/entity.go sets this whenever canonical_name already
+-- collides with an EXISTING entity's alias; 0 for the first entity ever
+-- seen under a given name.
+INSERT INTO entities (canonical_name, kind, status, provisional, created_at)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, canonical_name, kind, status, provisional, created_at;
+
+-- name: GetEntity :one
+SELECT id, canonical_name, kind, status, provisional, created_at
+FROM entities
+WHERE id = ?;
+
+-- name: UpdateEntityStatus :exec
+-- Merge marks the LOSING entity 'merged' (never deleted - merge_ledger
+-- plus this status flip is the whole audit trail); split flips it back
+-- to 'active'.
+UPDATE entities SET status = ? WHERE id = ?;
+
+-- name: ListEntityIDsByAlias :many
+-- Every DISTINCT existing entity already registered under alias - empty
+-- means "no collision, safe to create the first entity for this name";
+-- one or more existing ids means a NEW entity must be created provisional
+-- (HANDOFF S5 memory #2: name similarity alone never auto-merges).
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ?;
+
+-- name: InsertEntityAlias :one
+INSERT INTO entity_aliases (entity_id, alias, created_at)
+VALUES (?, ?, ?)
+RETURNING id, entity_id, alias, created_at;
+
+-- name: ListEntityAliasesByEntity :many
+-- Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
+-- so Split can restore exactly this set back onto the losing entity.
+SELECT id, entity_id, alias, created_at
+FROM entity_aliases
+WHERE entity_id = ?
+ORDER BY id ASC;
+
+-- name: UpdateEntityAliasEntityByID :exec
+-- Moves ONE alias row (by its own id, never by entity_id bulk-match) onto
+-- a different entity - Merge moves every alias row it snapshotted off the
+-- losing entity onto the surviving one; Split moves that EXACT same set
+-- of row ids back, which a bulk "WHERE entity_id = ?" reassignment could
+-- not do once the surviving entity ALSO owns its own pre-existing aliases
+-- (a bulk move-back would wrongly sweep those up too).
+UPDATE entity_aliases SET entity_id = ? WHERE id = ?;
+
+-- name: InsertMergeLedger :one
+-- One row per merge AND per split (HANDOFF S5 memory #2: "Merge-defteri +
+-- varlik-bolme operasyonu") - never updated, never deleted, matching the
+-- append-only posture the events ledger enforces at the SQL level (this
+-- table has no such trigger, but kahyad/internal/factengine never issues
+-- an UPDATE/DELETE against it either).
+INSERT INTO merge_ledger (op, src_entity_id, dst_entity_id, evidence, actor, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING id, op, src_entity_id, dst_entity_id, evidence, actor, created_at;
+
+-- name: GetMergeLedger :one
+SELECT id, op, src_entity_id, dst_entity_id, evidence, actor, created_at
+FROM merge_ledger
+WHERE id = ?;

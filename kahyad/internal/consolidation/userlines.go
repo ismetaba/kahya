@@ -30,18 +30,19 @@ import (
 // worktree.go) so every file in this package that needs either literal
 // reads it from one place.
 //
-// SCOPE NOTE (W5-02 review): these authors drive TWO things this package DOES
-// implement - the same-day user-touched-line set (ComputeUserTouchedLines
-// filters `git log --author=UserCommitAuthor`) and blame/audit. They do NOT
-// yet drive the memory SOURCE-TRUST TIER: the W12-04 indexer derives
-// source_tier only from a file's kahya_source_tier front-matter key
-// (defaulting to user_asserted), with zero git-author awareness - so a
-// same-day user edit committed here is currently reindexed as user_asserted,
-// NOT user_edit. Deriving the top-of-lattice user_edit tier from an
-// author=user ~/Kahya/memory commit is a W5-04 (memory-correctness-engine)
-// deliverable that this task's commit discipline is the PREREQUISITE for, not
-// the implementer of. Do not assume user commits reach user_edit until W5-04
-// lands that indexer-path derivation. See [[kahya-user-edit-tier-gap]].
+// SCOPE NOTE (W5-02 review, closed by W5-04): these authors drive THREE
+// things now - the same-day user-touched-line set (ComputeUserTouchedLines
+// filters `git log --author=UserCommitAuthor`), blame/audit, AND (as of
+// W5-04) the memory SOURCE-TRUST TIER: kahyad/internal/indexer/gitauthor.go's
+// resolveUserEditTier derives source_tier=user_edit for a ~/Kahya/memory
+// file whose latest git commit author is EXACTLY this literal string
+// (duplicated there rather than imported - THIS package already imports
+// kahyad/internal/indexer, see consolidation.go's own package doc, so the
+// reverse import would cycle). A same-day user edit committed here is
+// therefore reindexed as user_edit, not merely user_asserted, PROVIDED the
+// file's working-tree copy is clean (no uncommitted changes) at reindex
+// time - a dirty file falls back to the existing front-matter/default
+// derivation, fail-safe.
 const (
 	UserCommitAuthor  = "user <user@kahya.local>"
 	KahyaCommitAuthor = "kahyad <kahyad@kahya.local>"

@@ -26,6 +26,7 @@ import (
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/egress"
+	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/notify"
@@ -233,6 +234,12 @@ type Server struct {
 	// SetReindexer/SetLedgerVerifier do.
 	consolidation ConsolidationRunner
 
+	// factEngine wires /v1/fact/confirm, /v1/fact/retract, /v1/entity/
+	// merge, /v1/entity/split (W5-04, factengine.go's own doc comment);
+	// nil until SetFactEngine is called - same "unwired dependency"
+	// convention as consolidation above.
+	factEngine FactEngineRunner
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -353,6 +360,10 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/consolidation", s.handleConsolidationShow)
 	mux.HandleFunc("/v1/consolidation/approve", s.handleConsolidationApprove)
 	mux.HandleFunc("/v1/consolidation/reject", s.handleConsolidationReject)
+	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
+	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
+	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
+	mux.HandleFunc("/v1/entity/split", s.handleEntitySplit)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
@@ -669,17 +680,21 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W12-05 step 1a: for_injection=true excludes 'agent_derived' episodes
-	// (HANDOFF §5 memory #1 quarantine - the other four source tiers stay
-	// injectable in W1-2; per-fact confidence gating arrives with W5-04).
-	// This filters BOTH the returned results AND what the renderer/ledger
-	// below ever sees - "absent with for_injection:true" means absent from
-	// the response entirely, not merely excluded from hafiza_block.
+	// W12-05 step 1a / W5-04: for_injection=true excludes 'agent_derived'
+	// episodes via kahyad/internal/factengine.TierInjectionEligible - the
+	// SAME tier-quarantine rule facts.Fact rows are held to
+	// (factengine.InjectionEligible), applied here to CHUNK/episode hits
+	// (which carry only source_tier, never a per-fact confirmed_at) with
+	// confirmed always false - a chunk has no per-item human confirmation
+	// mechanism of its own, only facts do (kahya fact confirm). This
+	// filters BOTH the returned results AND what the renderer/ledger below
+	// ever sees - "absent with for_injection:true" means absent from the
+	// response entirely, not merely excluded from hafiza_block.
 	filtered := hits
 	if req.ForInjection {
 		filtered = make([]search.Hit, 0, len(hits))
 		for _, h := range hits {
-			if h.SourceTier == quarantinedSourceTier {
+			if !factengine.TierInjectionEligible(h.SourceTier, false) {
 				continue
 			}
 			filtered = append(filtered, h)
@@ -732,11 +747,6 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }
-
-// quarantinedSourceTier is the one source_tier for_injection=true excludes
-// (HANDOFF §5 memory #1, verbatim: "Ajan-turevi karantinada, kullanici
-// onaylayana dek profil kartindan/enjeksiyondan haric").
-const quarantinedSourceTier = "agent_derived"
 
 // reindexRequest is POST /v1/reindex's request body (W12-04 step 5).
 // {"full": false} is the default (an empty/omitted body also defaults

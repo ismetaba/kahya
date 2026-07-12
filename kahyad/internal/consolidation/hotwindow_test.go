@@ -115,7 +115,7 @@ func TestPromoteHotWindowPromotesBeforeCooling(t *testing.T) {
 		},
 	}
 
-	promoted, err := PromoteHotWindow(context.Background(), store, now)
+	promoted, err := PromoteHotWindow(context.Background(), store, "trace-test", now)
 	if err != nil {
 		t.Fatalf("PromoteHotWindow() error = %v", err)
 	}
@@ -148,7 +148,7 @@ func TestPromoteHotWindowSkipsFreshEpisode(t *testing.T) {
 		episodes:   []Episode{{ID: 7, CreatedAt: fresh}},
 		chunksByEp: map[int64][]Chunk{7: {{ID: 1, Text: "1000 TL, 01.01.2026, \"alinti\", karar verdim."}}},
 	}
-	promoted, err := PromoteHotWindow(context.Background(), store, now)
+	promoted, err := PromoteHotWindow(context.Background(), store, "trace-test", now)
 	if err != nil {
 		t.Fatalf("PromoteHotWindow() error = %v", err)
 	}
@@ -169,12 +169,12 @@ func TestPromoteHotWindowIdempotentAcrossRuns(t *testing.T) {
 		episodes:   []Episode{{ID: 5, CreatedAt: old}},
 		chunksByEp: map[int64][]Chunk{5: {{ID: 9, Text: "Karar verdim ki 200 TL odenecek 01.01.2026 tarihinde."}}},
 	}
-	if _, err := PromoteHotWindow(context.Background(), store, now); err != nil {
+	if _, err := PromoteHotWindow(context.Background(), store, "trace-test", now); err != nil {
 		t.Fatalf("first PromoteHotWindow() error = %v", err)
 	}
 	firstCount := len(store.inserted)
 
-	if _, err := PromoteHotWindow(context.Background(), store, now); err != nil {
+	if _, err := PromoteHotWindow(context.Background(), store, "trace-test", now); err != nil {
 		t.Fatalf("second PromoteHotWindow() error = %v", err)
 	}
 	if len(store.inserted) != firstCount {

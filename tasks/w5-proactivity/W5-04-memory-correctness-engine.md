@@ -1,6 +1,6 @@
 # W5-04 — Memory correctness engine
 
-**Status:** todo
+**Status:** done
 **Phase:** W5 — Proactivity + consolidation
 **Depends on:** W5-02
 **Flags:** none
@@ -61,16 +61,16 @@ HANDOFF §5 memory #1–#4 verbatim — these are the spec; implement them liter
 
 ## Acceptance criteria
 
-- [ ] `make test` green including all fixtures above.
-- [ ] Test: an `agent_derived` fact is absent from `memory_search` injection-eligible output; after `kahya fact confirm <id>` (or a W5-03 ✅ Doğru) it appears; its confidence never exceeds the 0.4 tier cap.
-- [ ] Test: two same-session assertions of one fact produce exactly one evidence row; a third from a different session produces a second row and raises log-odds (no noisy-OR ratchet — assert exact expected values).
-- [ ] Test: a user denial drops a p≈0.8 fact below 0.3 ⇒ excluded from injection; ledger event recorded.
-- [ ] Test: the namesake fixture yields 2 entities and 0 `merge_ledger` merge rows without distinguishing evidence; merge then split round-trips via `merge_ledger` (row count 2: one merge, one split).
-- [ ] Test: retraction fixture closes the fact (`status=retracted`, `valid_to NOT NULL`) and the retracted fact no longer injects.
-- [ ] `grep -rn "INSERT INTO facts" kahyad/ --include='*.go' --include='*.sql'` shows writes only in the factengine/sqlc path (no bypass writers).
-- [ ] Test: an extractor candidate struct claiming `source_tier=user_asserted` is stored as `agent_derived` (quarantined, excluded from injection) and the clamping is ledgered — the model cannot mint trust.
-- [ ] Test: a candidate marked direct-user-utterance from a session with taint tier `untrusted` (or with no W4-03 taint record at all) is NOT stored as `user_asserted` (fail-closed).
-- [ ] Test: a secret-lane candidate whose extraction would require the cloud model is rejected fail-closed with the Turkish notice, never proxied to Anthropic (assert via forward-proxy log).
+- [x] `make test` green including all fixtures above.
+- [x] Test: an `agent_derived` fact is absent from `memory_search` injection-eligible output; after `kahya fact confirm <id>` (or a W5-03 ✅ Doğru) it appears; its confidence never exceeds the 0.4 tier cap.
+- [x] Test: two same-session assertions of one fact produce exactly one evidence row; a third from a different session produces a second row and raises log-odds (no noisy-OR ratchet — assert exact expected values).
+- [x] Test: a user denial drops a p≈0.8 fact below 0.3 ⇒ excluded from injection; ledger event recorded.
+- [x] Test: the namesake fixture yields 2 entities and 0 `merge_ledger` merge rows without distinguishing evidence; merge then split round-trips via `merge_ledger` (row count 2: one merge, one split).
+- [x] Test: retraction fixture closes the fact (`status=retracted`, `valid_to NOT NULL`) and the retracted fact no longer injects.
+- [x] `grep -rn "INSERT INTO facts" kahyad/ --include='*.go' --include='*.sql'` shows writes only in the factengine/sqlc path (no bypass writers).
+- [x] Test: an extractor candidate struct claiming `source_tier=user_asserted` is stored as `agent_derived` (quarantined, excluded from injection) and the clamping is ledgered — the model cannot mint trust.
+- [x] Test: a candidate marked direct-user-utterance from a session with taint tier `untrusted` (or with no W4-03 taint record at all) is NOT stored as `user_asserted` (fail-closed).
+- [x] Test: a secret-lane candidate whose extraction would require the cloud model is rejected fail-closed with the Turkish notice, never proxied to Anthropic (assert via forward-proxy log).
 
 ## Out of scope
 

@@ -26,6 +26,12 @@ type Querier interface {
 	// increments on each claim"), including a crash-safe re-claim after a
 	// previous lease expired without the row ever being acknowledged.
 	ClaimOutboxRow(ctx context.Context, arg ClaimOutboxRowParams) (int64, error)
+	// `kahya fact confirm <id>` (or a W5-03 ritual Dogru answer): lifts the
+	// agent_derived quarantine half of the injection-eligibility predicate.
+	// Never touches source_tier or confidence - an agent_derived fact stays
+	// agent_derived, capped at that tier's ceiling, forever (HANDOFF S5
+	// memory #1).
+	ConfirmFact(ctx context.Context, arg ConfirmFactParams) error
 	// The single atomic single-use guarantee (HANDOFF S5 safety #5): only the
 	// FIRST caller to run this UPDATE against a given token_hash ever affects
 	// a row (consumed_at IS NULL is only ever true once); every later call
@@ -63,6 +69,16 @@ type Querier interface {
 	// of its current status.
 	CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
+	// WriteFact's upsert lookup: an existing ACTIVE fact for this exact
+	// (subject, predicate, object) gets a new evidence row instead of a
+	// duplicate fact row (HANDOFF S5 memory #3: repeated assertions
+	// accumulate evidence on ONE fact, they never mint a second one). A
+	// retracted/closed fact is deliberately excluded (status='active' only)
+	// so a later re-assertion after a retraction creates a FRESH fact rather
+	// than reviving the closed one in place - the retracted row stays exactly
+	// as HANDOFF S5 memory #3 requires (closed, never deleted, never
+	// reopened).
+	GetActiveFactByTriple(ctx context.Context, arg GetActiveFactByTripleParams) (Fact, error)
 	GetApprovalToken(ctx context.Context, tokenHash string) (ApprovalToken, error)
 	// W3-02 (autonomy ladder engine) queries below: autonomy_state,
 	// approval_tokens, undo_windows. See migrations/0003_autonomy_policy.sql
@@ -74,6 +90,7 @@ type Querier interface {
 	// migrations/0004_egress_budget.sql for the schema and
 	// kahyad/internal/egress/budget.go for the only caller.
 	GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error)
+	GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (GetEpisodeByPathRow, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 	// filter by source, which is fine for callers that only ever use one
@@ -81,6 +98,21 @@ type Querier interface {
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
 	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (GetEpisodeBySourceAndPathRow, error)
+	// The per-(fact_id, session_id, polarity) dedupe check (HANDOFF S5
+	// memory #3): sql.ErrNoRows means this session has not yet evidenced
+	// this fact at this polarity, so a NEW evidence row is due; a hit means
+	// the existing row already covers it and no second row is ever inserted
+	// (a repeat within the SAME session is not a second, independent
+	// observation).
+	GetEvidenceByFactSessionPolarity(ctx context.Context, arg GetEvidenceByFactSessionPolarityParams) (GetEvidenceByFactSessionPolarityRow, error)
+	// W5-04 (memory-correctness-engine) queries below: the single fact-write
+	// path (kahyad/internal/factengine) is the ONLY caller of InsertFact
+	// above and everything in this section - see that package's own doc
+	// comment for the source-trust lattice / log-odds / entity-merge rules
+	// these back.
+	// Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
+	// engine's own recompute-from-evidence path.
+	GetFact(ctx context.Context, id int64) (Fact, error)
 	// The most recent anchor_log row of ANY status - push.go's
 	// claimPendingRow uses this to decide whether there is already an
 	// in-flight 'pending' row to retry (offline case, task spec step 5) before
@@ -97,6 +129,7 @@ type Querier interface {
 	// cross-check against its own from-genesis recompute) are read-only
 	// callers.
 	GetLedgerDigestState(ctx context.Context) (LedgerDigestState, error)
+	GetMergeLedger(ctx context.Context, id int64) (MergeLedger, error)
 	// Idempotent-open lookup (post-security-review amendment): Engine.Check's
 	// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
 	// reuse an already-OPEN window for the same (task_id, tool, trace_id)
@@ -174,11 +207,24 @@ type Querier interface {
 	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)
 	InsertEgressBudget(ctx context.Context, arg InsertEgressBudgetParams) error
+	// provisional=1 marks a suspicious same-name entity (HANDOFF S5 memory
+	// #2: "supheli ayni-isim -> yeni gecici varlik") - kahyad/internal/
+	// factengine/entity.go sets this whenever canonical_name already
+	// collides with an EXISTING entity's alias; 0 for the first entity ever
+	// seen under a given name.
+	InsertEntity(ctx context.Context, arg InsertEntityParams) (InsertEntityRow, error)
+	InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error)
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
 	// Later tasks add more queries to this file as they need them; sqlc
 	// regenerates the whole package from the union of every *.sql file here.
 	InsertEvent(ctx context.Context, arg InsertEventParams) (Event, error)
+	// weight is the signed log-odds delta this ONE row contributes (positive
+	// for a supporting tier's fixed constant, the fixed user-denial constant
+	// for a negative/retraction row) - see this file's own migrations/
+	// 0012_factengine.sql comment on evidence.weight for why this column
+	// exists at all.
+	InsertEvidence(ctx context.Context, arg InsertEvidenceParams) (InsertEvidenceRow, error)
 	// One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
 	// here (quarantined from profile-card/injection until a human confirms -
 	// kahyad/internal/server's own quarantinedSourceTier), evidentiality is
@@ -189,6 +235,12 @@ type Querier interface {
 	// episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
 	// never a prior summary.
 	InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error)
+	// One row per merge AND per split (HANDOFF S5 memory #2: "Merge-defteri +
+	// varlik-bolme operasyonu") - never updated, never deleted, matching the
+	// append-only posture the events ledger enforces at the SQL level (this
+	// table has no such trigger, but kahyad/internal/factengine never issues
+	// an UPDATE/DELETE against it either).
+	InsertMergeLedger(ctx context.Context, arg InsertMergeLedgerParams) (MergeLedger, error)
 	// W4-02 outbox lease/redelivery queries. See migrations/
 	// 0007_task_durability.sql for the added columns and
 	// kahyad/internal/outbox/dispatcher.go for the only caller.
@@ -290,6 +342,14 @@ type Querier interface {
 	// only ever win the atomic UPDATE for rows the other hasn't already
 	// claimed first.
 	ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsParams) ([]Outbox, error)
+	// Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
+	// so Split can restore exactly this set back onto the losing entity.
+	ListEntityAliasesByEntity(ctx context.Context, entityID int64) ([]EntityAlias, error)
+	// Every DISTINCT existing entity already registered under alias - empty
+	// means "no collision, safe to create the first entity for this name";
+	// one or more existing ids means a NEW entity must be created provisional
+	// (HANDOFF S5 memory #2: name similarity alone never auto-merges).
+	ListEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error)
 	// W12-08 (anthproxy cost governor): boot-time rebuild reads every
 	// historical event of one kind (e.g. 'model_call') and replays it into
 	// the in-memory governor totals - kahyad/internal/anthproxy stays
@@ -297,6 +357,13 @@ type Querier interface {
 	// row into an anthproxy.BootEvent.
 	ListEventsByKind(ctx context.Context, kind string) ([]Event, error)
 	ListEventsByTrace(ctx context.Context, traceID string) ([]Event, error)
+	// Every evidence row for one fact, in insertion order - the engine's
+	// confidence-recompute path sums .weight over these (deduped by
+	// (session_id, polarity) defensively, though WriteFact/DenyFact already
+	// refuse to insert a second row for a (fact_id, session_id, polarity)
+	// already on file - HANDOFF S5 memory #3's "ayni-oturum tekrari tek kanit
+	// sayilir").
+	ListEvidenceByFact(ctx context.Context, factID int64) ([]ListEvidenceByFactRow, error)
 	// The resume scan's candidate set (kahyad startup + periodic tick):
 	// every task currently recorded as 'executing'. kahyad/internal/task's
 	// own LiveRegistry then filters this down to the ones with NO live worker
@@ -380,6 +447,11 @@ type Querier interface {
 	// already marked delivered (or that somehow no longer exists) must never
 	// have its lease resurrected.
 	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
+	// Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
+	// valid_to set, status='retracted' - NEVER a DELETE. The caller
+	// (kahyad/internal/factengine/retract.go) always inserts a negative
+	// evidence row in the SAME logical operation, never this alone.
+	RetractFact(ctx context.Context, arg RetractFactParams) error
 	// W3-08 (secret-lane routing) queries below: lane/secret_category are
 	// STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
 	// never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
@@ -413,10 +485,26 @@ type Querier interface {
 	// it falls back to InsertAutonomyState - the same "upsert (update half)"
 	// pattern UpdateEpisodeContent above already uses in this file).
 	UpdateAutonomyState(ctx context.Context, arg UpdateAutonomyStateParams) (int64, error)
+	// Moves ONE alias row (by its own id, never by entity_id bulk-match) onto
+	// a different entity - Merge moves every alias row it snapshotted off the
+	// losing entity onto the surviving one; Split moves that EXACT same set
+	// of row ids back, which a bulk "WHERE entity_id = ?" reassignment could
+	// not do once the surviving entity ALSO owns its own pre-existing aliases
+	// (a bulk move-back would wrongly sweep those up too).
+	UpdateEntityAliasEntityByID(ctx context.Context, arg UpdateEntityAliasEntityByIDParams) error
+	// Merge marks the LOSING entity 'merged' (never deleted - merge_ledger
+	// plus this status flip is the whole audit trail); split flips it back
+	// to 'active'.
+	UpdateEntityStatus(ctx context.Context, arg UpdateEntityStatusParams) error
 	// Upserts (update half) an existing memory_file episode in place on
 	// new/changed content: same id, fresh hash/tier, status forced back to
 	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
 	UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error
+	// The engine recomputes confidence from the fact's own evidence rows
+	// (sum of weights, deduped by (session_id, polarity), clamped to the
+	// highest positive tier cap represented - never a noisy-OR ratchet) and
+	// writes the result back here after every WriteFact/DenyFact call.
+	UpdateFactConfidence(ctx context.Context, arg UpdateFactConfidenceParams) error
 	// Persists a worker-reported session_id onto the task row (W12-07 step 3:
 	// kahyad "persists session_id onto the task row" as the worker's
 	// {"type":"session",...} stdout line arrives). Session RESUME itself

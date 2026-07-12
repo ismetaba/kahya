@@ -321,7 +321,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// doc comment on HotWindow's write-boundary carve-out). Best-effort:
 	// a failure here never blocks tonight's markdown suggestion.
 	if c.HotWindow != nil {
-		if n, err := PromoteHotWindow(ctx, c.HotWindow, now); err != nil {
+		if n, err := PromoteHotWindow(ctx, c.HotWindow, traceID, now); err != nil {
 			c.logWarn("consolidation_hotwindow_failed", "trace_id", traceID, "err", err.Error())
 		} else if n > 0 {
 			c.logWarn("consolidation_hotwindow_promoted", "trace_id", traceID, "facts", n)

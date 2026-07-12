@@ -227,4 +227,38 @@ const (
 	// MsgConsolidationApproved/Rejected are the two terminal outcomes.
 	MsgConsolidationApproved = "Konsolidasyon onaylandı."
 	MsgConsolidationRejected = "Konsolidasyon reddedildi."
+
+	// ---- W5-04: kahya fact confirm|retract, kahya entity merge|split ----
+
+	// MsgFactUsage is printed when `kahya fact` is given anything other
+	// than a recognized "confirm"/"retract" subcommand. Exit 2.
+	MsgFactUsage = "kullanım: kahya fact confirm <id> | kahya fact retract <özne> <yüklem> <nesne> [oturum_id]"
+
+	// MsgFactConfirmed is `kahya fact confirm <id>`'s success line: %d =
+	// the fact id.
+	MsgFactConfirmed = "Olgu onaylandı: %d"
+
+	// MsgFactRetracted is `kahya fact retract ...`'s success line: %d =
+	// the retracted fact's id.
+	MsgFactRetracted = "Olgu geri çekildi: %d"
+
+	// MsgEntityUsage is printed when `kahya entity` is given anything
+	// other than a recognized "merge"/"split" subcommand. Exit 2.
+	MsgEntityUsage = "kullanım: kahya entity merge <a> <b> --evidence <olgu_id> | kahya entity split <birleştirme_defteri_id>"
+
+	// MsgEntityMergeUsage is printed when `kahya entity merge` is missing
+	// its two entity-id positional args or its required --evidence flag.
+	MsgEntityMergeUsage = "kullanım: kahya entity merge <a> <b> --evidence <olgu_id>"
+
+	// MsgEntityMerged is `kahya entity merge`'s success line: %d = the
+	// new merge_ledger row's id (needed later for `kahya entity split`).
+	MsgEntityMerged = "Varlıklar birleştirildi (birleştirme defteri kaydı: %d)."
+
+	// MsgEntitySplitUsage is printed when `kahya entity split` is missing
+	// its merge_ledger id positional arg.
+	MsgEntitySplitUsage = "kullanım: kahya entity split <birleştirme_defteri_id>"
+
+	// MsgEntitySplit is `kahya entity split`'s success line: %d = the new
+	// split merge_ledger row's id.
+	MsgEntitySplit = "Varlıklar ayrıldı (birleştirme defteri kaydı: %d)."
 )

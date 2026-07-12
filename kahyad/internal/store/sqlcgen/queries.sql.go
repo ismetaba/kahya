@@ -60,6 +60,26 @@ func (q *Queries) ClaimOutboxRow(ctx context.Context, arg ClaimOutboxRowParams) 
 	return result.RowsAffected()
 }
 
+const confirmFact = `-- name: ConfirmFact :exec
+UPDATE facts SET confirmed_at = ?, updated_at = ? WHERE id = ?
+`
+
+type ConfirmFactParams struct {
+	ConfirmedAt sql.NullString `json:"confirmed_at"`
+	UpdatedAt   string         `json:"updated_at"`
+	ID          int64          `json:"id"`
+}
+
+// `kahya fact confirm <id>` (or a W5-03 ritual Dogru answer): lifts the
+// agent_derived quarantine half of the injection-eligibility predicate.
+// Never touches source_tier or confidence - an agent_derived fact stays
+// agent_derived, capped at that tier's ceiling, forever (HANDOFF S5
+// memory #1).
+func (q *Queries) ConfirmFact(ctx context.Context, arg ConfirmFactParams) error {
+	_, err := q.db.ExecContext(ctx, confirmFact, arg.ConfirmedAt, arg.UpdatedAt, arg.ID)
+	return err
+}
+
 const consumeApprovalToken = `-- name: ConsumeApprovalToken :execrows
 UPDATE approval_tokens
 SET consumed_at = ?
@@ -172,6 +192,53 @@ func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) er
 	return err
 }
 
+const getActiveFactByTriple = `-- name: GetActiveFactByTriple :one
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
+ORDER BY id DESC
+LIMIT 1
+`
+
+type GetActiveFactByTripleParams struct {
+	Subject   string `json:"subject"`
+	Predicate string `json:"predicate"`
+	Object    string `json:"object"`
+}
+
+// WriteFact's upsert lookup: an existing ACTIVE fact for this exact
+// (subject, predicate, object) gets a new evidence row instead of a
+// duplicate fact row (HANDOFF S5 memory #3: repeated assertions
+// accumulate evidence on ONE fact, they never mint a second one). A
+// retracted/closed fact is deliberately excluded (status='active' only)
+// so a later re-assertion after a retraction creates a FRESH fact rather
+// than reviving the closed one in place - the retracted row stays exactly
+// as HANDOFF S5 memory #3 requires (closed, never deleted, never
+// reopened).
+func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactByTripleParams) (Fact, error) {
+	row := q.db.QueryRowContext(ctx, getActiveFactByTriple, arg.Subject, arg.Predicate, arg.Object)
+	var i Fact
+	err := row.Scan(
+		&i.ID,
+		&i.Subject,
+		&i.Predicate,
+		&i.Object,
+		&i.SourceTier,
+		&i.Evidentiality,
+		&i.Confidence,
+		&i.Importance,
+		&i.ValidFrom,
+		&i.ValidTo,
+		&i.Status,
+		&i.Evidence,
+		&i.ExtractorVer,
+		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.ConfirmedAt,
+	)
+	return i, err
+}
+
 const getApprovalToken = `-- name: GetApprovalToken :one
 SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
 FROM approval_tokens
@@ -245,6 +312,35 @@ func (q *Queries) GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams
 	row := q.db.QueryRowContext(ctx, getEgressBudget, arg.Host, arg.Day)
 	var i EgressBudget
 	err := row.Scan(&i.Host, &i.Day, &i.Bytes)
+	return i, err
+}
+
+const getEntity = `-- name: GetEntity :one
+SELECT id, canonical_name, kind, status, provisional, created_at
+FROM entities
+WHERE id = ?
+`
+
+type GetEntityRow struct {
+	ID            int64          `json:"id"`
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+func (q *Queries) GetEntity(ctx context.Context, id int64) (GetEntityRow, error) {
+	row := q.db.QueryRowContext(ctx, getEntity, id)
+	var i GetEntityRow
+	err := row.Scan(
+		&i.ID,
+		&i.CanonicalName,
+		&i.Kind,
+		&i.Status,
+		&i.Provisional,
+		&i.CreatedAt,
+	)
 	return i, err
 }
 
@@ -335,6 +431,87 @@ func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeB
 	return i, err
 }
 
+const getEvidenceByFactSessionPolarity = `-- name: GetEvidenceByFactSessionPolarity :one
+SELECT id, fact_id, episode_id, session_id, polarity, weight, created_at
+FROM evidence
+WHERE fact_id = ? AND session_id = ? AND polarity = ?
+`
+
+type GetEvidenceByFactSessionPolarityParams struct {
+	FactID    int64          `json:"fact_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Polarity  int64          `json:"polarity"`
+}
+
+type GetEvidenceByFactSessionPolarityRow struct {
+	ID        int64          `json:"id"`
+	FactID    int64          `json:"fact_id"`
+	EpisodeID sql.NullInt64  `json:"episode_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Polarity  int64          `json:"polarity"`
+	Weight    float64        `json:"weight"`
+	CreatedAt string         `json:"created_at"`
+}
+
+// The per-(fact_id, session_id, polarity) dedupe check (HANDOFF S5
+// memory #3): sql.ErrNoRows means this session has not yet evidenced
+// this fact at this polarity, so a NEW evidence row is due; a hit means
+// the existing row already covers it and no second row is ever inserted
+// (a repeat within the SAME session is not a second, independent
+// observation).
+func (q *Queries) GetEvidenceByFactSessionPolarity(ctx context.Context, arg GetEvidenceByFactSessionPolarityParams) (GetEvidenceByFactSessionPolarityRow, error) {
+	row := q.db.QueryRowContext(ctx, getEvidenceByFactSessionPolarity, arg.FactID, arg.SessionID, arg.Polarity)
+	var i GetEvidenceByFactSessionPolarityRow
+	err := row.Scan(
+		&i.ID,
+		&i.FactID,
+		&i.EpisodeID,
+		&i.SessionID,
+		&i.Polarity,
+		&i.Weight,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getFact = `-- name: GetFact :one
+
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE id = ?
+`
+
+// W5-04 (memory-correctness-engine) queries below: the single fact-write
+// path (kahyad/internal/factengine) is the ONLY caller of InsertFact
+// above and everything in this section - see that package's own doc
+// comment for the source-trust lattice / log-odds / entity-merge rules
+// these back.
+// Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
+// engine's own recompute-from-evidence path.
+func (q *Queries) GetFact(ctx context.Context, id int64) (Fact, error) {
+	row := q.db.QueryRowContext(ctx, getFact, id)
+	var i Fact
+	err := row.Scan(
+		&i.ID,
+		&i.Subject,
+		&i.Predicate,
+		&i.Object,
+		&i.SourceTier,
+		&i.Evidentiality,
+		&i.Confidence,
+		&i.Importance,
+		&i.ValidFrom,
+		&i.ValidTo,
+		&i.Status,
+		&i.Evidence,
+		&i.ExtractorVer,
+		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.ConfirmedAt,
+	)
+	return i, err
+}
+
 const getLatestAnchorLog = `-- name: GetLatestAnchorLog :one
 SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
 FROM anchor_log
@@ -379,6 +556,27 @@ func (q *Queries) GetLedgerDigestState(ctx context.Context) (LedgerDigestState, 
 	row := q.db.QueryRowContext(ctx, getLedgerDigestState)
 	var i LedgerDigestState
 	err := row.Scan(&i.ID, &i.LastEventID, &i.Digest)
+	return i, err
+}
+
+const getMergeLedger = `-- name: GetMergeLedger :one
+SELECT id, op, src_entity_id, dst_entity_id, evidence, actor, created_at
+FROM merge_ledger
+WHERE id = ?
+`
+
+func (q *Queries) GetMergeLedger(ctx context.Context, id int64) (MergeLedger, error) {
+	row := q.db.QueryRowContext(ctx, getMergeLedger, id)
+	var i MergeLedger
+	err := row.Scan(
+		&i.ID,
+		&i.Op,
+		&i.SrcEntityID,
+		&i.DstEntityID,
+		&i.Evidence,
+		&i.Actor,
+		&i.CreatedAt,
+	)
 	return i, err
 }
 
@@ -848,6 +1046,78 @@ func (q *Queries) InsertEgressBudget(ctx context.Context, arg InsertEgressBudget
 	return err
 }
 
+const insertEntity = `-- name: InsertEntity :one
+INSERT INTO entities (canonical_name, kind, status, provisional, created_at)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, canonical_name, kind, status, provisional, created_at
+`
+
+type InsertEntityParams struct {
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+type InsertEntityRow struct {
+	ID            int64          `json:"id"`
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+// provisional=1 marks a suspicious same-name entity (HANDOFF S5 memory
+// #2: "supheli ayni-isim -> yeni gecici varlik") - kahyad/internal/
+// factengine/entity.go sets this whenever canonical_name already
+// collides with an EXISTING entity's alias; 0 for the first entity ever
+// seen under a given name.
+func (q *Queries) InsertEntity(ctx context.Context, arg InsertEntityParams) (InsertEntityRow, error) {
+	row := q.db.QueryRowContext(ctx, insertEntity,
+		arg.CanonicalName,
+		arg.Kind,
+		arg.Status,
+		arg.Provisional,
+		arg.CreatedAt,
+	)
+	var i InsertEntityRow
+	err := row.Scan(
+		&i.ID,
+		&i.CanonicalName,
+		&i.Kind,
+		&i.Status,
+		&i.Provisional,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertEntityAlias = `-- name: InsertEntityAlias :one
+INSERT INTO entity_aliases (entity_id, alias, created_at)
+VALUES (?, ?, ?)
+RETURNING id, entity_id, alias, created_at
+`
+
+type InsertEntityAliasParams struct {
+	EntityID  int64  `json:"entity_id"`
+	Alias     string `json:"alias"`
+	CreatedAt string `json:"created_at"`
+}
+
+func (q *Queries) InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error) {
+	row := q.db.QueryRowContext(ctx, insertEntityAlias, arg.EntityID, arg.Alias, arg.CreatedAt)
+	var i EntityAlias
+	err := row.Scan(
+		&i.ID,
+		&i.EntityID,
+		&i.Alias,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertEpisode = `-- name: InsertEpisode :one
 INSERT INTO episodes (source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -945,10 +1215,62 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Event
 	return i, err
 }
 
+const insertEvidence = `-- name: InsertEvidence :one
+INSERT INTO evidence (fact_id, episode_id, session_id, polarity, weight, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING id, fact_id, episode_id, session_id, polarity, weight, created_at
+`
+
+type InsertEvidenceParams struct {
+	FactID    int64          `json:"fact_id"`
+	EpisodeID sql.NullInt64  `json:"episode_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Polarity  int64          `json:"polarity"`
+	Weight    float64        `json:"weight"`
+	CreatedAt string         `json:"created_at"`
+}
+
+type InsertEvidenceRow struct {
+	ID        int64          `json:"id"`
+	FactID    int64          `json:"fact_id"`
+	EpisodeID sql.NullInt64  `json:"episode_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Polarity  int64          `json:"polarity"`
+	Weight    float64        `json:"weight"`
+	CreatedAt string         `json:"created_at"`
+}
+
+// weight is the signed log-odds delta this ONE row contributes (positive
+// for a supporting tier's fixed constant, the fixed user-denial constant
+// for a negative/retraction row) - see this file's own migrations/
+// 0012_factengine.sql comment on evidence.weight for why this column
+// exists at all.
+func (q *Queries) InsertEvidence(ctx context.Context, arg InsertEvidenceParams) (InsertEvidenceRow, error) {
+	row := q.db.QueryRowContext(ctx, insertEvidence,
+		arg.FactID,
+		arg.EpisodeID,
+		arg.SessionID,
+		arg.Polarity,
+		arg.Weight,
+		arg.CreatedAt,
+	)
+	var i InsertEvidenceRow
+	err := row.Scan(
+		&i.ID,
+		&i.FactID,
+		&i.EpisodeID,
+		&i.SessionID,
+		&i.Polarity,
+		&i.Weight,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertFact = `-- name: InsertFact :one
 INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
 `
 
 type InsertFactParams struct {
@@ -1010,6 +1332,49 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		&i.Evidence,
 		&i.ExtractorVer,
 		&i.UpdatedAt,
+		&i.CreatedAt,
+		&i.ConfirmedAt,
+	)
+	return i, err
+}
+
+const insertMergeLedger = `-- name: InsertMergeLedger :one
+INSERT INTO merge_ledger (op, src_entity_id, dst_entity_id, evidence, actor, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING id, op, src_entity_id, dst_entity_id, evidence, actor, created_at
+`
+
+type InsertMergeLedgerParams struct {
+	Op          string         `json:"op"`
+	SrcEntityID sql.NullInt64  `json:"src_entity_id"`
+	DstEntityID sql.NullInt64  `json:"dst_entity_id"`
+	Evidence    sql.NullString `json:"evidence"`
+	Actor       string         `json:"actor"`
+	CreatedAt   string         `json:"created_at"`
+}
+
+// One row per merge AND per split (HANDOFF S5 memory #2: "Merge-defteri +
+// varlik-bolme operasyonu") - never updated, never deleted, matching the
+// append-only posture the events ledger enforces at the SQL level (this
+// table has no such trigger, but kahyad/internal/factengine never issues
+// an UPDATE/DELETE against it either).
+func (q *Queries) InsertMergeLedger(ctx context.Context, arg InsertMergeLedgerParams) (MergeLedger, error) {
+	row := q.db.QueryRowContext(ctx, insertMergeLedger,
+		arg.Op,
+		arg.SrcEntityID,
+		arg.DstEntityID,
+		arg.Evidence,
+		arg.Actor,
+		arg.CreatedAt,
+	)
+	var i MergeLedger
+	err := row.Scan(
+		&i.ID,
+		&i.Op,
+		&i.SrcEntityID,
+		&i.DstEntityID,
+		&i.Evidence,
+		&i.Actor,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -1594,6 +1959,74 @@ func (q *Queries) ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsPa
 	return items, nil
 }
 
+const listEntityAliasesByEntity = `-- name: ListEntityAliasesByEntity :many
+SELECT id, entity_id, alias, created_at
+FROM entity_aliases
+WHERE entity_id = ?
+ORDER BY id ASC
+`
+
+// Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
+// so Split can restore exactly this set back onto the losing entity.
+func (q *Queries) ListEntityAliasesByEntity(ctx context.Context, entityID int64) ([]EntityAlias, error) {
+	rows, err := q.db.QueryContext(ctx, listEntityAliasesByEntity, entityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []EntityAlias{}
+	for rows.Next() {
+		var i EntityAlias
+		if err := rows.Scan(
+			&i.ID,
+			&i.EntityID,
+			&i.Alias,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEntityIDsByAlias = `-- name: ListEntityIDsByAlias :many
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ?
+`
+
+// Every DISTINCT existing entity already registered under alias - empty
+// means "no collision, safe to create the first entity for this name";
+// one or more existing ids means a NEW entity must be created provisional
+// (HANDOFF S5 memory #2: name similarity alone never auto-merges).
+func (q *Queries) ListEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listEntityIDsByAlias, alias)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsByKind = `-- name: ListEventsByKind :many
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
@@ -1658,6 +2091,60 @@ func (q *Queries) ListEventsByTrace(ctx context.Context, traceID string) ([]Even
 			&i.Ts,
 			&i.Kind,
 			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEvidenceByFact = `-- name: ListEvidenceByFact :many
+SELECT id, fact_id, episode_id, session_id, polarity, weight, created_at
+FROM evidence
+WHERE fact_id = ?
+ORDER BY id ASC
+`
+
+type ListEvidenceByFactRow struct {
+	ID        int64          `json:"id"`
+	FactID    int64          `json:"fact_id"`
+	EpisodeID sql.NullInt64  `json:"episode_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Polarity  int64          `json:"polarity"`
+	Weight    float64        `json:"weight"`
+	CreatedAt string         `json:"created_at"`
+}
+
+// Every evidence row for one fact, in insertion order - the engine's
+// confidence-recompute path sums .weight over these (deduped by
+// (session_id, polarity) defensively, though WriteFact/DenyFact already
+// refuse to insert a second row for a (fact_id, session_id, polarity)
+// already on file - HANDOFF S5 memory #3's "ayni-oturum tekrari tek kanit
+// sayilir").
+func (q *Queries) ListEvidenceByFact(ctx context.Context, factID int64) ([]ListEvidenceByFactRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEvidenceByFact, factID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListEvidenceByFactRow{}
+	for rows.Next() {
+		var i ListEvidenceByFactRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.FactID,
+			&i.EpisodeID,
+			&i.SessionID,
+			&i.Polarity,
+			&i.Weight,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -2199,6 +2686,25 @@ func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeasePara
 	return err
 }
 
+const retractFact = `-- name: RetractFact :exec
+UPDATE facts SET status = 'retracted', valid_to = ?, updated_at = ? WHERE id = ?
+`
+
+type RetractFactParams struct {
+	ValidTo   sql.NullString `json:"valid_to"`
+	UpdatedAt string         `json:"updated_at"`
+	ID        int64          `json:"id"`
+}
+
+// Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
+// valid_to set, status='retracted' - NEVER a DELETE. The caller
+// (kahyad/internal/factengine/retract.go) always inserts a negative
+// evidence row in the SAME logical operation, never this alone.
+func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) error {
+	_, err := q.db.ExecContext(ctx, retractFact, arg.ValidTo, arg.UpdatedAt, arg.ID)
+	return err
+}
+
 const setTaskLane = `-- name: SetTaskLane :exec
 
 UPDATE tasks
@@ -2340,6 +2846,43 @@ func (q *Queries) UpdateAutonomyState(ctx context.Context, arg UpdateAutonomySta
 	return result.RowsAffected()
 }
 
+const updateEntityAliasEntityByID = `-- name: UpdateEntityAliasEntityByID :exec
+UPDATE entity_aliases SET entity_id = ? WHERE id = ?
+`
+
+type UpdateEntityAliasEntityByIDParams struct {
+	EntityID int64 `json:"entity_id"`
+	ID       int64 `json:"id"`
+}
+
+// Moves ONE alias row (by its own id, never by entity_id bulk-match) onto
+// a different entity - Merge moves every alias row it snapshotted off the
+// losing entity onto the surviving one; Split moves that EXACT same set
+// of row ids back, which a bulk "WHERE entity_id = ?" reassignment could
+// not do once the surviving entity ALSO owns its own pre-existing aliases
+// (a bulk move-back would wrongly sweep those up too).
+func (q *Queries) UpdateEntityAliasEntityByID(ctx context.Context, arg UpdateEntityAliasEntityByIDParams) error {
+	_, err := q.db.ExecContext(ctx, updateEntityAliasEntityByID, arg.EntityID, arg.ID)
+	return err
+}
+
+const updateEntityStatus = `-- name: UpdateEntityStatus :exec
+UPDATE entities SET status = ? WHERE id = ?
+`
+
+type UpdateEntityStatusParams struct {
+	Status string `json:"status"`
+	ID     int64  `json:"id"`
+}
+
+// Merge marks the LOSING entity 'merged' (never deleted - merge_ledger
+// plus this status flip is the whole audit trail); split flips it back
+// to 'active'.
+func (q *Queries) UpdateEntityStatus(ctx context.Context, arg UpdateEntityStatusParams) error {
+	_, err := q.db.ExecContext(ctx, updateEntityStatus, arg.Status, arg.ID)
+	return err
+}
+
 const updateEpisodeContent = `-- name: UpdateEpisodeContent :exec
 UPDATE episodes
 SET source_hash = ?, source_tier = ?, status = ?
@@ -2363,6 +2906,25 @@ func (q *Queries) UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeCon
 		arg.Status,
 		arg.ID,
 	)
+	return err
+}
+
+const updateFactConfidence = `-- name: UpdateFactConfidence :exec
+UPDATE facts SET confidence = ?, updated_at = ? WHERE id = ?
+`
+
+type UpdateFactConfidenceParams struct {
+	Confidence float64 `json:"confidence"`
+	UpdatedAt  string  `json:"updated_at"`
+	ID         int64   `json:"id"`
+}
+
+// The engine recomputes confidence from the fact's own evidence rows
+// (sum of weights, deduped by (session_id, polarity), clamped to the
+// highest positive tier cap represented - never a noisy-OR ratchet) and
+// writes the result back here after every WriteFact/DenyFact call.
+func (q *Queries) UpdateFactConfidence(ctx context.Context, arg UpdateFactConfidenceParams) error {
+	_, err := q.db.ExecContext(ctx, updateFactConfidence, arg.Confidence, arg.UpdatedAt, arg.ID)
 	return err
 }
 
