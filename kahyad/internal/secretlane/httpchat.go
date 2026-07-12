@@ -96,3 +96,20 @@ func postChatCompletion(ctx context.Context, client *http.Client, baseURL, model
 	}
 	return strings.TrimSpace(chatResp.Choices[0].Message.Content), nil
 }
+
+// PostChatJSON is a generic single-turn (system+user) OpenAI-compatible
+// chat-completion call against baseURL, exported for other in-process
+// local-lane callers that need the EXACT SAME wire protocol this package's
+// own HTTPQwenClassifier/LocalAnswerer already speak but with their own
+// system prompt/temperature/max_tokens rather than this package's two
+// fixed ones - kahyad/internal/reader's local-lane transport (W4-03) is
+// the first such caller: the Reader's system prompt asks for a single
+// strict-JSON object matching a registered schema, a different shape from
+// both classifier.go's tiny classification JSON and answer.go's free-text
+// chat reply.
+func PostChatJSON(ctx context.Context, client *http.Client, baseURL, model, systemPrompt, userContent string, temperature float64, maxTokens int) (string, error) {
+	return postChatCompletion(ctx, client, baseURL, model, []chatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userContent},
+	}, temperature, maxTokens)
+}

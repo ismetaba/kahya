@@ -205,6 +205,56 @@ func TestMarshalRoundTripsResumeAndSessionID(t *testing.T) {
 	}
 }
 
+// --- W4-03: envelope reader mode ---
+
+func TestValidateAcceptsModeReaderWithSchema(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeReader
+	e.Schema = "mail_summary_v1"
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestValidateRejectsModeReaderWithoutSchema(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeReader
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for mode=reader with no schema")
+	}
+}
+
+func TestValidateRejectsUnknownMode(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = "actor"
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for an unrecognized mode")
+	}
+}
+
+func TestValidateAcceptsEmptyModeUnchanged(t *testing.T) {
+	e := validEnvelope()
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil (empty mode is every pre-W4-03 envelope)", err)
+	}
+}
+
+func TestMarshalRoundTripsModeAndSchema(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeReader
+	e.Schema = "webpage_extract_v1"
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(b), `"mode":"reader"`) {
+		t.Errorf("Marshal() = %s, want mode:reader present", b)
+	}
+	if !strings.Contains(string(b), `"schema":"webpage_extract_v1"`) {
+		t.Errorf("Marshal() = %s, want schema:webpage_extract_v1 present", b)
+	}
+}
+
 func TestNewTaskIDShapeAndUniqueness(t *testing.T) {
 	a := NewTaskID()
 	b := NewTaskID()

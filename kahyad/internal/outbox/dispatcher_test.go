@@ -14,6 +14,7 @@ import (
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/taint"
 	"kahya/kahyad/internal/task"
 )
 
@@ -153,6 +154,51 @@ func TestDispatcherResumesWithOriginalSessionIDAndTraceID(t *testing.T) {
 	}
 	if env.TaskID != "t1" {
 		t.Errorf("env.TaskID = %q, want t1", env.TaskID)
+	}
+}
+
+// TestDispatcherResumeNeverInsertsSessionTaintRow is the W4-03 step-8
+// permanent regression test, verbatim: "a resumed unknown session_id does
+// NOT get [a clean row]". insertTaskWithEnvelope's session_id
+// ("sess-original-123") never went through kahyad/internal/server's own
+// OnSession -> persistSessionStarted transactional insert (this fixture
+// bypasses the HTTP path entirely) - after a full resume dispatch
+// completes successfully through this exact session_id, taint.Get must
+// STILL resolve it to TierTainted (fail-closed: no row was ever inserted,
+// and this package's own OnSession callback - dispatcher.go, a
+// deliberately SEPARATE code path from kahyad/internal/server's - never
+// calls kahyad/internal/taint at all, structurally, not merely by
+// runtime luck).
+func TestDispatcherResumeNeverInsertsSessionTaintRow(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-original-123")
+	enqueueResumeRow(t, st, "t1")
+	m := task.NewMachine(st.Queries, st)
+	d := newTestDispatcher(st, m, []string{"python3", "testdata/echo_session_worker.py"})
+
+	claimed, err := d.ClaimAndDispatch(context.Background())
+	if err != nil {
+		t.Fatalf("ClaimAndDispatch() error = %v", err)
+	}
+	if claimed != 1 {
+		t.Fatalf("claimed = %d, want 1", claimed)
+	}
+
+	got, err := st.Queries.GetTaskByID(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("GetTaskByID: %v", err)
+	}
+	if got.Status != task.StatusDone {
+		t.Fatalf("status = %q, want %q (resume must still have completed)", got.Status, task.StatusDone)
+	}
+
+	tr := taint.New(st.Queries, st)
+	tier, terr := tr.Get(context.Background(), "sess-original-123")
+	if terr != nil {
+		t.Fatalf("taint.Get: %v", terr)
+	}
+	if tier != taint.TierTainted {
+		t.Fatalf("tier for resumed session_id = %q, want %q (resume must never insert a clean row)", tier, taint.TierTainted)
 	}
 }
 

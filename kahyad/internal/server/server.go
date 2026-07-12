@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -179,6 +180,17 @@ type Server struct {
 	// separate field only because the two are conceptually different
 	// capabilities (read-only lookup vs. register/unregister).
 	taskLiveRegistry TaskLiveRegistry
+
+	// sessionTaintDB is the raw *sql.DB handle handleTask's OnSession
+	// callback opens its own transaction against (W4-03 task spec step 1a:
+	// insert this task's session_taint(tier=clean) row in the SAME
+	// transaction as UpdateTaskSession's own session_started persistence).
+	// See SetSessionTaintDB's doc comment. nil (the default) means that
+	// callback falls back to the plain, non-transactional UpdateTaskSession
+	// call every pre-W4-03 caller/test already made - no session_taint row
+	// is inserted in that configuration (this package's usual "unwired
+	// dependency" posture).
+	sessionTaintDB *sql.DB
 
 	// scheduler wires POST /jobs/trigger/{name} (W4-01): job registry,
 	// resolution, and async dispatch+ledgering all live in

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/taint"
 )
 
 // Canonicalize strips an SDK-style "mcp__<server>__<tool>" prefix down to
@@ -71,6 +72,16 @@ const (
 // the ledger/response.
 const RuleLadderV1 = "ladder-v1"
 
+// RuleTaintedSessionV1 identifies a DENY produced by the W4-03 taint check
+// below - distinct from RuleLadderV1/RuleDenyAllV1 for the same
+// provenance-visibility reason, and deliberately the literal string
+// "tainted_session" (not "-v1" suffixed like the other two Rule
+// constants) so a JSONL/ledger grep for "tainted_session" - this task's
+// own acceptance criterion wording, verbatim - finds it directly in
+// either the HTTP response's "rule" field or the policy_decision ledger
+// row's "rule" payload key.
+const RuleTaintedSessionV1 = "tainted_session"
+
 // Decision.Result values (HANDOFF S4 ladder: "Sonuc ALLOW/NEEDS_APPROVAL/
 // DENY olur"). Kept lower-case to match the retired W12-07 interim
 // table's allow/deny wire convention - NEEDS_APPROVAL is the one new
@@ -87,6 +98,13 @@ const (
 	ReasonNeedsApproval    = "Bu eylem için onay gerekiyor (otonomi seviyesi yetersiz)."
 	ReasonW3AlwaysApproval = "W3 sınıfı eylemler her zaman yazılı yerel onay gerektirir."
 	ReasonPolicyStateError = "Politika durumu okunamadı; güvenlik gereği reddedildi (fail-closed)."
+	// ReasonTaintedSession is the W4-03 taint-check deny reason: HANDOFF §5
+	// safety #2's operational definition, verbatim - "güvenilmez katman =
+	// yalnız R-sınıfı araçlar + kullanıcıya bildirim". Returned for EVERY
+	// non-R class (W1 included, W3-hardcoded-always-approval never even
+	// reached) whenever the caller's SessionID resolves to
+	// taint.TierTainted.
+	ReasonTaintedSession = "Bu oturum güvenilmez içerik gördü (tainted); yalnızca salt-okuma (R) araçlarına ve bildirime izin veriliyor."
 )
 
 // defaultScope is substituted whenever a caller supplies an empty scope -
@@ -188,6 +206,22 @@ type Ledger interface {
 	LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error
 }
 
+// TaintChecker is the narrow W4-03 session-tier read Engine.Check needs -
+// *kahyad/internal/taint.Tracker satisfies this directly, with no adapter
+// (a narrow structural interface defined here rather than depending on
+// that package's own Store/Ledger types - the same "consumer defines the
+// interface it needs" convention this file already uses for Store/Ledger
+// above). import_graph_test.go's forbidden-import list does not include
+// kahyad/internal/taint (it is not memory/search/index-derived), so this
+// package still imports it directly for the taint.TierTainted constant
+// Check compares against below. Get's contract (kahyad/internal/taint.
+// Tracker.Get's own doc comment) is load-bearing here: ANY error - missing
+// row or a genuine read failure alike - must resolve tier to
+// taint.TierTainted, never silently "clean".
+type TaintChecker interface {
+	Get(ctx context.Context, sessionID string) (tier string, err error)
+}
+
 // Engine is the W3-02 ladder decision engine: one per kahyad process,
 // sharing the single *store.Store the rest of the daemon uses.
 type Engine struct {
@@ -226,6 +260,15 @@ type Engine struct {
 	// any actual network send) so a slow hook can never delay a policy
 	// decision.
 	pendingApprovalHook func(PendingApprovalInfo)
+	// taintChecker is W4-03's session-tier read (SetTaintChecker). nil (the
+	// default) means the taint check is skipped entirely - matching every
+	// other not-yet-wired dependency's "unwired means no-op" posture in
+	// this package (undoExpiryHook, pendingApprovalHook above). main.go
+	// MUST wire a real *kahyad/internal/taint.Tracker before serving any
+	// traffic for the HANDOFF S5 safety #2 invariant to actually hold in
+	// production - this is a hook, not a security boundary unto itself; the
+	// boundary is Check's own use of it once wired.
+	taintChecker TaintChecker
 }
 
 // NewEngine constructs an Engine. pol is W3-01's loaded tool registry (the
@@ -264,6 +307,19 @@ func (e *Engine) SetPendingApprovalHook(fn func(PendingApprovalInfo)) {
 	e.pendingApprovalHook = fn
 }
 
+// SetTaintChecker wires the W4-03 session-tier read Check consults FIRST
+// (before the ladder) whenever a CheckInput carries a non-empty
+// SessionID. Call before any /policy/check traffic starts flowing in
+// production - main.go passes the SAME *kahyad/internal/taint.Tracker
+// instance kahyad/internal/server's OnSession callback and
+// kahyad/internal/reader/actor_seed.go both write session_taint rows
+// through, so a decision here always sees the up-to-date tier. nil (the
+// default, every pre-W4-03 caller/test) means the taint check is skipped
+// entirely - see the Engine.taintChecker field's own doc comment.
+func (e *Engine) SetTaintChecker(tc TaintChecker) {
+	e.taintChecker = tc
+}
+
 // fireUndoExpiryHook calls the registered hook, if any - a small helper so
 // SweepExpiredUndoWindows and TriggerUndo's own expiry branch share
 // exactly one nil-check instead of duplicating it.
@@ -290,11 +346,24 @@ func rfc3339(t time.Time) string { return t.Format(time.RFC3339Nano) }
 // (sha256) to bind a freshly-minted token/pending-approval to these exact
 // bytes (HANDOFF S5 safety #5 WYSIWYE, until W3-06 lands the real
 // normalize+hash pipeline - see approvedBytesHash's doc comment).
+//
+// SessionID (W4-03) is the caller's Agent SDK session_id, when it has
+// one - task.go's handlePolicyCheck threads req.SessionID through here
+// verbatim (the worker's own can_use_tool callback already sends
+// session_id on every /policy/check POST - see worker/kahya_worker/
+// hooks.py's make_can_use_tool). Empty means "no session concept applies
+// to this call" (e.g. a caller with no worker session at all) - the taint
+// check below is skipped entirely for an empty SessionID, exactly like
+// every other not-yet-wired dependency in this package defaults to a
+// no-op. This is NOT the same as "SessionID present but its row is
+// missing" - THAT resolves to tainted (kahyad/internal/taint.Tracker.Get's
+// own fail-closed contract), and Check enforces it the same way.
 type CheckInput struct {
 	Tool      string
 	Scope     string
 	TaskID    string
 	TraceID   string
+	SessionID string
 	ToolInput []byte
 }
 
@@ -438,6 +507,35 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	class := tool.Class
 	hash := approvedBytesHash(in.ToolInput)
 
+	// W4-03: resolve the session's taint tier FIRST, strictly before the
+	// ladder check (task spec step 3, verbatim) - including before the
+	// class==W3 hardcoded-always-approval branch just below, since a
+	// tainted session must be denied outright for ANY non-R class, never
+	// even offered an approval prompt (HANDOFF §5 safety #2's operational
+	// definition: "güvenilmez katman = yalnız R-sınıfı araçlar +
+	// kullanıcıya bildirim" - notifications are kahyad-emitted and need no
+	// tool call at all, so this denial never blocks that tier's own
+	// "+notify" half). Skipped entirely when SessionID is empty (no
+	// session concept for this call) or no TaintChecker is wired
+	// (SetTaintChecker's own doc comment) - every pre-W4-03 caller/test is
+	// therefore unaffected.
+	if e.taintChecker != nil && in.SessionID != "" && class != ClassR {
+		tier, terr := e.taintChecker.Get(ctx, in.SessionID)
+		if terr != nil {
+			// Get itself already fail-closed tier to taint.TierTainted on any
+			// read error (kahyad/internal/taint.Tracker.Get's own doc
+			// comment) - terr is purely diagnostic here.
+			e.ledgerRaw(ctx, in.TraceID, "taint_check_read_error", map[string]any{
+				"event": "taint_check_read_error", "session_id": in.SessionID, "err": terr.Error(),
+			})
+		}
+		if tier == taint.TierTainted {
+			d := Decision{Result: ResultDeny, Reason: ReasonTaintedSession, Rule: RuleTaintedSessionV1, Class: class, Scope: scope}
+			e.ledgerDecision(ctx, in, class, scope, 0, d)
+			return d, nil
+		}
+	}
+
 	state, err := e.loadState(ctx, in.Tool, class, scope)
 	if err != nil {
 		d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope}
@@ -520,6 +618,7 @@ func (e *Engine) ledgerDecision(ctx context.Context, in CheckInput, class Action
 		"level":    level,
 		"decision": d.Result,
 		"task_id":  in.TaskID,
+		"rule":     d.Rule,
 	}
 	if d.Reason != "" {
 		payload["reason"] = d.Reason

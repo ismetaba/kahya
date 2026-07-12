@@ -205,6 +205,16 @@ def main(argv: list[str] | None = None) -> int:
     # empty, silently violating that invariant on exactly the happy path.
     wlog.log("info", "task_started", task_id=envelope.task_id, model=envelope.model)
 
+    # W4-03: mode="reader" runs the TOOLLESS Reader session instead of the
+    # ordinary Actor/chat one - no MCP servers, no memory-injection hook,
+    # no can_use_tool consultation of kahyad at all (a can_use_tool IS
+    # still wired, but it unconditionally denies - see
+    # _reader_deny_all_tools - belt-and-braces against any SDK built-in
+    # tool the model might otherwise attempt, on top of tools=[] disabling
+    # the built-in set outright).
+    if envelope.mode == "reader":
+        return asyncio.run(_run_reader_session(envelope))
+
     return asyncio.run(_run_session(envelope, socket_path, mcp_bridge))
 
 
@@ -327,6 +337,86 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
         return 1
 
     wlog.log("info", "task_done", task_id=envelope.task_id)
+    _print_protocol_line({"type": "result", "status": "ok"})
+    return 0
+
+
+# --- W4-03: Reader mode (toolless, cloud-Haiku half of the Reader/Actor
+# split - kahyad/internal/reader's own doc comment). The secret-lane half
+# never reaches this process at all: kahyad talks to the local Qwen server
+# directly over HTTP (kahyad/internal/reader.NewLocalModel), never through
+# ClaudeSDKClient - see that package's doc comment for why. ---
+
+
+async def _reader_deny_all_tools(tool_name: str, tool_input: dict[str, Any], ctx: Any) -> Any:
+    """The Reader session's can_use_tool: unconditionally denies every
+    call. Belt-and-braces on top of ClaudeAgentOptions(tools=[]) (which
+    already disables every SDK built-in tool outright) and mcp_servers={}
+    (no MCP server is even wired) - a Reader session is toolless by design
+    (HANDOFF §5 safety #2: "araçsız 'Okuyucu'"), and this is the third,
+    independent layer that guarantees it."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    return PermissionResultDeny(message="Reader oturumu araçsızdır (toolless).")
+
+
+def _build_reader_options(envelope: Envelope) -> ClaudeAgentOptions:
+    """Builds the toolless Reader session's ClaudeAgentOptions: no MCP
+    servers, no built-in tools (tools=[]), no memory-injection hook, a
+    can_use_tool that denies everything regardless, and system_prompt=""
+    (the Reader's actual extraction instructions are already part of
+    envelope.prompt itself - kahyad/internal/reader constructs that single
+    combined string, since the envelope wire schema carries one prompt
+    field, not a separate system/user split - an empty system_prompt here
+    suppresses the SDK's own default Claude-Code-persona system prompt
+    entirely, so nothing but envelope.prompt's own instructions reaches
+    the model)."""
+    return ClaudeAgentOptions(
+        model=envelope.model,
+        system_prompt="",
+        tools=[],
+        mcp_servers={},
+        allowed_tools=[],
+        permission_mode="default",
+        can_use_tool=_reader_deny_all_tools,
+    )
+
+
+async def _run_reader_session(envelope: Envelope) -> int:
+    """Runs one toolless Reader session: sends envelope.prompt, relays
+    every assistant text delta as an ordinary "delta" protocol line
+    (kahyad accumulates these into the single JSON object it then parses/
+    validates - kahyad/internal/reader.WorkerCloudModel's own doc
+    comment), and maps the outcome onto exactly one terminal protocol
+    line + exit code - the SAME protocol/exit-code contract
+    _run_session uses, so kahyad/internal/spawn.Run needs no Reader-
+    specific parsing of its own."""
+    options = _build_reader_options(envelope)
+
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(envelope.prompt)
+
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            _print_protocol_line({"type": "delta", "text": block.text})
+                elif isinstance(message, ResultMessage):
+                    if message.is_error:
+                        wlog.log("error", "reader_model_call_failed", result=str(message.result))
+                        _print_protocol_line(
+                            {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
+                        )
+                        return 1
+    except Exception as e:  # noqa: BLE001 - any SDK/transport failure surfaces as one user-facing error line.
+        wlog.log("error", "reader_sdk_error", error=str(e))
+        _print_protocol_line(
+            {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
+        )
+        return 1
+
+    wlog.log("info", "reader_task_done", task_id=envelope.task_id, schema=envelope.schema)
     _print_protocol_line({"type": "result", "status": "ok"})
     return 0
 

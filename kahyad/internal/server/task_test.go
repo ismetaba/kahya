@@ -129,6 +129,12 @@ func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTe
 	srv := New(cfg, log, "v-task-test", healthyDB)
 	srv.SetEventLogger(st)
 	srv.SetTaskStore(st.Queries)
+	// W4-03: the SAME store.Store.DB() handle production wires (main.go's
+	// srv.SetSessionTaintDB(st.DB()) call) - every fixture built through
+	// this helper now exercises the real transactional session_started +
+	// session_taint(clean) insert (task spec step 1a), matching production
+	// wiring exactly rather than only the plain UpdateTaskSession fallback.
+	srv.SetSessionTaintDB(st.DB())
 	// W12-08: handleTask now requires an anthproxy Governor to be wired
 	// (same "unwired dependency -> 503" posture as taskStore). Generous
 	// limits so none of these pre-existing W12-07 fixtures ever trip a

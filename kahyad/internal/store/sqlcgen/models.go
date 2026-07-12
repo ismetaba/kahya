@@ -145,6 +145,13 @@ type PendingApproval struct {
 	ToolInput         []byte         `json:"tool_input"`
 }
 
+type SessionTaint struct {
+	SessionID string         `json:"session_id"`
+	Tier      string         `json:"tier"`
+	Reason    sql.NullString `json:"reason"`
+	UpdatedAt string         `json:"updated_at"`
+}
+
 type Task struct {
 	ID             string         `json:"id"`
 	TraceID        string         `json:"trace_id"`

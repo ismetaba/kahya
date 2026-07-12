@@ -154,6 +154,46 @@ class TestParseEnvelope(unittest.TestCase):
         with self.assertRaises(EnvelopeError):
             parse_envelope(encode(d))
 
+    # --- W4-03: reader mode/schema ---
+
+    def test_mode_defaults_to_empty_when_absent(self) -> None:
+        env = parse_envelope(encode(valid_envelope_dict()))
+        self.assertEqual(env.mode, "")
+        self.assertIsNone(env.schema)
+
+    def test_accepts_mode_reader_with_schema(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "reader"
+        d["schema"] = "mail_summary_v1"
+        env = parse_envelope(encode(d))
+        self.assertEqual(env.mode, "reader")
+        self.assertEqual(env.schema, "mail_summary_v1")
+
+    def test_rejects_mode_reader_without_schema(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "reader"
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_mode_reader_with_blank_schema(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "reader"
+        d["schema"] = "   "
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_unknown_mode(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "actor"
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_non_string_mode(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = 1
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
 
 if __name__ == "__main__":
     unittest.main()

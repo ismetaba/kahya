@@ -495,3 +495,44 @@ WHERE id = ?;
 UPDATE outbox
 SET lease_until = ?
 WHERE id = ? AND dispatched_at IS NULL;
+
+-- W4-03 (taint tiers + Reader/Actor split) queries below. See
+-- migrations/0009_session_taint.sql for the schema and
+-- kahyad/internal/taint/taint.go for the only caller (a narrow Store
+-- interface there - never sqlcgen directly - so kahyad/internal/policy's
+-- taint-check hook and kahyad/internal/reader's actor-seeding path both
+-- depend on that package's own contract, not on sqlc's generated shapes).
+
+-- name: GetSessionTaint :one
+SELECT session_id, tier, reason, updated_at FROM session_taint WHERE session_id = ?;
+
+-- name: InsertSessionTaintClean :exec
+-- The ONLY way a 'clean' row is ever created (task spec step 1): a plain
+-- INSERT, never an upsert - a session_id that already has ANY row (clean
+-- or tainted) makes this fail on the PRIMARY KEY constraint, which
+-- kahyad/internal/taint.Tracker.InsertClean treats as a "lowering
+-- attempt" (ledgered taint.lower_attempt, rejected) rather than silently
+-- overwriting an existing row. reason is always NULL for a clean insert -
+-- there is nothing to explain about a session starting clean, unlike
+-- RaiseSessionTaint below.
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'clean', NULL, ?);
+
+-- name: RaiseSessionTaint :exec
+-- The ONLY tier-transition statement in this file: upserts session_id to
+-- tier='tainted', creating the row if it did not exist yet (a
+-- content-sourced tool output can raise taint on a session before that
+-- session's OWN 'clean' row ever landed - the ordering invariant is "no
+-- byte reaches the worker before this Raise call", not "the row must
+-- already exist") or flipping an existing 'clean' row to 'tainted' (and
+-- leaving an already-'tainted' row at 'tainted', updating reason/
+-- updated_at regardless - taint only ever rises, so re-raising a
+-- different reason is fine, re-raising the SAME tier is a no-op by
+-- definition). There is no corresponding statement anywhere in this
+-- codebase that ever sets tier back to 'clean' on an existing row.
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'tainted', ?, ?)
+ON CONFLICT (session_id) DO UPDATE SET
+    tier = 'tainted',
+    reason = excluded.reason,
+    updated_at = excluded.updated_at;

@@ -49,6 +49,19 @@ type ToolRule struct {
 	// normalize step, so every ToolRule leaving Load has a non-empty
 	// ScopeKey.
 	ScopeKey string `yaml:"scope_key,omitempty"`
+	// UntrustedOutput marks a CONTENT-SOURCED tool (web fetch, mail read -
+	// W4-03 task spec step 2) whose OUTPUT is untrusted bytes, never its
+	// tool_input. When such a tool's output is returned to a session,
+	// kahyad calls kahyad/internal/taint.Tracker.Raise on that session's
+	// taint row in the SAME code path, BEFORE the bytes ever reach the
+	// worker (HANDOFF §5 safety #2). This is metadata only - loader.go
+	// performs no validation of it beyond the strict-YAML unknown-key
+	// reject every other field already gets; the actual Raise call lives
+	// wherever that content-sourced tool's own handler returns its result
+	// (no such tool exists in this codebase yet - "Out of scope: Outlook/
+	// mail MCP tools themselves" - this field exists so a FUTURE one has
+	// somewhere to declare itself without another schema migration).
+	UntrustedOutput bool `yaml:"untrusted_output,omitempty"`
 }
 
 // EgressAllowEntry is one `egress.allowlist[]` entry (HANDOFF §5 safety

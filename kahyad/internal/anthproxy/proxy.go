@@ -56,6 +56,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kahya/kahyad/internal/notify"
@@ -185,6 +186,24 @@ type Proxy struct {
 	rp  *httputil.ReverseProxy
 
 	keychainWarnedOnce sync.Once
+
+	// requestCount is a test-only observability hook (W4-03's no-cloud-
+	// fallback regression test - kahyad/internal/reader's own tests spin up
+	// a REAL Proxy and assert this stays 0 for a secret-lane Reader job, or
+	// a secret-lane job with the local model unavailable, proving
+	// structurally that no byte from that job ever reached this - or any -
+	// forward-proxy instance, not merely that a fake CloudModel double was
+	// never called). Incremented at the very top of ServeHTTP, before
+	// auth/budget/anything else runs, so it counts every inbound request
+	// this Proxy instance EVER received, regardless of outcome.
+	requestCount int64
+}
+
+// RequestCount returns the number of inbound HTTP requests this Proxy
+// instance has received so far. See the Proxy.requestCount field's own
+// doc comment.
+func (p *Proxy) RequestCount() int64 {
+	return atomic.LoadInt64(&p.requestCount)
 }
 
 // New constructs a Proxy for one task. Call Start to bind the ephemeral
@@ -308,6 +327,7 @@ const proxyRequestMaxBytes = 16 << 20 // 16 MiB: generous for a /v1/messages bod
 // defer ever runs; ReleaseReservation is idempotent, so this is always
 // safe, never a double-subtraction.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&p.requestCount, 1)
 	ctx := r.Context()
 
 	if !p.checkLocalAuth(r) {

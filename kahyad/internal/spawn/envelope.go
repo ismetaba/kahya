@@ -93,7 +93,30 @@ type Envelope struct {
 	// resume=<session_id> instead of starting a fresh conversation - see
 	// docs/ipc.md's W4-02 note.
 	Resume bool `json:"resume,omitempty"`
+
+	// Mode is W4-03's Reader-mode flag: "" (the default, every pre-W4-03
+	// envelope/test) is an ordinary Actor/chat session exactly as before;
+	// ModeReader spawns the worker TOOLLESS (no MCP servers, no memory
+	// injection hook, no can_use_tool wiring at all - kahya_worker.
+	// __main__._run_reader_session) for the cloud-Haiku half of the W4-03
+	// Reader/Actor split (kahyad/internal/reader.Runner never picks this
+	// path for secret-lane content - that goes straight to the local Qwen
+	// server over HTTP, never through this envelope/worker at all - see
+	// that package's own doc comment). Schema MUST be non-empty when Mode
+	// is ModeReader (Validate enforces this) - it names the registered Go
+	// struct (kahyad/internal/reader.JobTypeMailSummary/
+	// JobTypeWebpageExtract) the caller will parse the worker's single JSON
+	// object response into; the worker itself does nothing with Schema
+	// beyond echoing it into its own JSONL logs - schema enforcement is
+	// entirely Go-side, after this envelope's own job is done.
+	Mode string `json:"mode,omitempty"`
+	// Schema names the registered Reader job type (see Mode's own doc
+	// comment). Empty unless Mode == ModeReader.
+	Schema string `json:"schema,omitempty"`
 }
+
+// ModeReader is Envelope.Mode's one non-empty value (W4-03).
+const ModeReader = "reader"
 
 // NewTaskID mints a task_id shaped "t_<hex32>" (16 random bytes, hex
 // encoded - the same entropy/encoding convention as
@@ -155,6 +178,12 @@ func (e Envelope) Validate() error {
 	}
 	if e.Resume && (e.SessionID == nil || strings.TrimSpace(*e.SessionID) == "") {
 		return fmt.Errorf("spawn: resume = true requires a non-empty session_id")
+	}
+	if e.Mode != "" && e.Mode != ModeReader {
+		return fmt.Errorf("spawn: mode = %q, want %q or empty", e.Mode, ModeReader)
+	}
+	if e.Mode == ModeReader && strings.TrimSpace(e.Schema) == "" {
+		return fmt.Errorf("spawn: mode = %q requires a non-empty schema", ModeReader)
 	}
 	return nil
 }

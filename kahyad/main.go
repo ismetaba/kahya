@@ -41,6 +41,7 @@ import (
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/taint"
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/telegram"
 	"kahya/kahyad/internal/traceid"
@@ -451,6 +452,19 @@ func run() int {
 	// server.TaskStore needs, so it satisfies the interface directly with
 	// no adapter.
 	srv.SetTaskStore(st.Queries)
+	// W4-03: the raw *sql.DB handle handleTask's OnSession callback opens
+	// its own transaction against, so a freshly-spawned user-initiated
+	// task's session_taint(tier=clean) row commits atomically with its own
+	// tasks.session_id write (task spec step 1a) - see
+	// server.Server.SetSessionTaintDB's doc comment.
+	srv.SetSessionTaintDB(st.DB())
+
+	// W4-03: the session-tier tracker Engine.Check's taint-check hook
+	// consults, and the SAME instance kahyad/internal/reader/actor_seed.go
+	// (wired below, alongside the Reader runner) writes clean rows
+	// through for a freshly Actor-seeded session.
+	taintTracker := taint.New(st.Queries, st)
+	policyEngine.SetTaintChecker(taintTracker)
 
 	// W4-02: task durability state machine + receipts + resume scan +
 	// outbox dispatcher (HANDOFF §6 W4 ⚑). taskLive is the live-worker-PID

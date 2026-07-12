@@ -468,5 +468,83 @@ class TestTraceIDLeakRedaction(unittest.TestCase):
         self.assertEqual(leak_line.get("var"), "KAHYA_TRACE_ID")
 
 
+class TestReaderMode(unittest.TestCase):
+    """W4-03: mode="reader" builds a TOOLLESS ClaudeAgentOptions (no MCP
+    servers, no built-in tools, a can_use_tool that denies everything
+    regardless, empty system_prompt) and runs through
+    _run_reader_session, never _run_session/_build_options."""
+
+    READER_ENVELOPE = {
+        **VALID_ENVELOPE,
+        "mode": "reader",
+        "schema": "mail_summary_v1",
+        "model": "claude-haiku-4-5",
+        "memory_injection": False,
+    }
+
+    def test_build_reader_options_is_toolless(self) -> None:
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(self.READER_ENVELOPE).encode("utf-8"))
+        options = worker_main._build_reader_options(env)
+
+        self.assertEqual(options.tools, [])
+        self.assertEqual(options.mcp_servers, {})
+        self.assertEqual(options.allowed_tools, [])
+        self.assertEqual(options.system_prompt, "")
+        self.assertEqual(options.permission_mode, "default")
+        self.assertIs(options.can_use_tool, worker_main._reader_deny_all_tools)
+
+    def test_reader_deny_all_tools_denies_everything(self) -> None:
+        import asyncio
+
+        from claude_agent_sdk import PermissionResultDeny
+
+        result = asyncio.run(worker_main._reader_deny_all_tools("Bash", {"command": "ls"}, None))
+        self.assertIsInstance(result, PermissionResultDeny)
+
+    def test_run_main_with_mode_reader_streams_deltas_and_result(self) -> None:
+        messages = [
+            AssistantMessage(
+                content=[TextBlock(text='{"from_display":"","subject":"",'), TextBlock(text='"summary":"s","dates":[],"amounts":[]}')],
+                model="claude-haiku-4-5",
+            ),
+            ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="sess-reader", total_cost_usd=0.0),
+        ]
+        factory = fake_client_factory(messages=messages)
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = base_env(log_dir)
+            code, out = run_main_with(dict(self.READER_ENVELOPE), env, client_factory=factory)
+
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1], {"type": "result", "status": "ok"})
+        delta_texts = [l["text"] for l in lines if l["type"] == "delta"]
+        joined = "".join(delta_texts)
+        self.assertEqual(
+            json.loads(joined),
+            {"from_display": "", "subject": "", "summary": "s", "dates": [], "amounts": []},
+        )
+        # No "session" protocol line is required for reader mode (the Go
+        # side keys purely on the accumulated delta content, not a
+        # session_id) - but emitting none must not be treated as an error
+        # either, which the exit code / result line above already prove.
+
+    def test_run_main_with_mode_reader_error_result_maps_to_error_line(self) -> None:
+        messages = [
+            ResultMessage(subtype="error", duration_ms=1, duration_api_ms=1, is_error=True, num_turns=1, session_id="sess-reader", total_cost_usd=0.0, result="boom"),
+        ]
+        factory = fake_client_factory(messages=messages)
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = base_env(log_dir)
+            code, out = run_main_with(dict(self.READER_ENVELOPE), env, client_factory=factory)
+
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 1)
+        self.assertEqual(lines[-1]["type"], "error")
+
+
 if __name__ == "__main__":
     unittest.main()

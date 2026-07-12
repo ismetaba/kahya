@@ -28,6 +28,12 @@ sql:
       # (tasks.status/next_retry_at/attempts, tool_calls, outbox lease
       # columns) - same reasoning.
       - "kahyad/migrations/0007_task_durability.sql"
+      # 0008 (W4-02 BLOCKER 1 fix) is a plain CREATE UNIQUE INDEX - same
+      # reasoning.
+      - "kahyad/migrations/0008_tool_calls_live_unique.sql"
+      # 0009 (W4-03) is a plain CREATE TABLE (session_taint) - same
+      # reasoning.
+      - "kahyad/migrations/0009_session_taint.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

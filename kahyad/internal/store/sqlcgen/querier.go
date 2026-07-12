@@ -80,6 +80,13 @@ type Querier interface {
 	// receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
 	// the mechanism that makes resume double-execution-safe.
 	GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCallParams) (ToolCall, error)
+	// W4-03 (taint tiers + Reader/Actor split) queries below. See
+	// migrations/0009_session_taint.sql for the schema and
+	// kahyad/internal/taint/taint.go for the only caller (a narrow Store
+	// interface there - never sqlcgen directly - so kahyad/internal/policy's
+	// taint-check hook and kahyad/internal/reader's actor-seeding path both
+	// depend on that package's own contract, not on sqlc's generated shapes).
+	GetSessionTaint(ctx context.Context, sessionID string) (SessionTaint, error)
 	// W4-02 (task durability state machine + receipts + outbox redelivery)
 	// queries below. See migrations/0007_task_durability.sql for the schema;
 	// kahyad/internal/task (machine.go/receipts.go/resume.go) and
@@ -143,6 +150,15 @@ type Querier interface {
 	// type directly instead of sqlc emitting a separate "Row" type for a
 	// differently-ordered column list.
 	InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error
+	// The ONLY way a 'clean' row is ever created (task spec step 1): a plain
+	// INSERT, never an upsert - a session_id that already has ANY row (clean
+	// or tainted) makes this fail on the PRIMARY KEY constraint, which
+	// kahyad/internal/taint.Tracker.InsertClean treats as a "lowering
+	// attempt" (ledgered taint.lower_attempt, rejected) rather than silently
+	// overwriting an existing row. reason is always NULL for a clean insert -
+	// there is nothing to explain about a session starting clean, unlike
+	// RaiseSessionTaint below.
+	InsertSessionTaintClean(ctx context.Context, arg InsertSessionTaintCleanParams) error
 	// lane/secret_category (W3-08): the caller ALREADY knows this task's
 	// secret-lane verdict before this row is ever created (kahyad/internal/
 	// server's POST /v1/task handler runs kahyad/internal/secretlane's
@@ -229,6 +245,18 @@ type Querier interface {
 	// The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
 	// never-attempted triple).
 	NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams) (int64, error)
+	// The ONLY tier-transition statement in this file: upserts session_id to
+	// tier='tainted', creating the row if it did not exist yet (a
+	// content-sourced tool output can raise taint on a session before that
+	// session's OWN 'clean' row ever landed - the ordering invariant is "no
+	// byte reaches the worker before this Raise call", not "the row must
+	// already exist") or flipping an existing 'clean' row to 'tainted' (and
+	// leaving an already-'tainted' row at 'tainted', updating reason/
+	// updated_at regardless - taint only ever rises, so re-raising a
+	// different reason is fine, re-raising the SAME tier is a no-op by
+	// definition). There is no corresponding statement anywhere in this
+	// codebase that ever sets tier back to 'clean' on an existing row.
+	RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintParams) error
 	// Task durability BLOCKER 2(b) fix: kahyad/internal/outbox.Dispatcher's
 	// heartbeat goroutine calls this every leaseDuration/3 for as long as
 	// spawn.Run blocks on a claimed row's re-spawned worker, so a

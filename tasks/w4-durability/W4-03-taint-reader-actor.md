@@ -1,6 +1,13 @@
 # W4-03 — Taint tiers + Reader/Actor two-LLM split
 
-**Status:** todo
+**Status:** done — cloud-Haiku live Reader call deferred (no Anthropic
+credential in this deployment); every other piece (session_taint
+migration/table, kahyad/internal/taint, the Engine.Check taint-check hook,
+the Reader runner incl. the LIVE local-Qwen path against the byte-exact
+fixture, schema validators, the fixture itself, actor_seed.Spawn, the
+policy.yaml untrusted_output schema field, the worker's reader mode, and
+every step-8 permanent test) is implemented and green in `make test`.
+See "Deviations" at the end of this file.
 **Phase:** W4 — Durability
 **Depends on:** W12-09, W3-02, W3-06 (sanitizer, reused), W3-08 (pre-classifier + local model, consumed), W4-02 (session capture)
 **Flags:** none
@@ -126,18 +133,27 @@ Reader model routing (§4 table, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green including every step-8 test.
-- [ ] `sqlite3 brain.db "SELECT tier FROM session_taint WHERE session_id='<x>'"` shows
-      `tainted` after a web/mail tool output was delivered to session `<x>`.
-- [ ] JSONL log + events: `taint.raised`, DENY with reason `tainted_session`, `reader.rejected`,
-      `actor.seeded` all appear with the task's `trace_id` in the integration test run.
-- [ ] Restart test proves persistence: raise taint → reopen DB → `/policy/check` still denies
-      W1 for that `session_id`.
-- [ ] Grep proves fail-closed: the only default in `taint.Get` is `tainted` (test asserts
-      behavior for an unknown `session_id`).
-- [ ] No-cloud-fallback proven: with the local model stubbed unavailable, a secret-lane Reader
-      run yields a `reader.local_unavailable` event and the W12-08 proxy request counter reads
-      0 for that `trace_id` (step-8 test — §4 memory-pressure ⚑ / README fail-closed rule).
+- [x] `make test` green including every step-8 test (Go + Python, `make lint` also green).
+- [x] `sqlite3 brain.db "SELECT tier ... session_taint ..."` shows `tainted` after taint is
+      raised for a session — proven via `kahyad/internal/taint`'s own `Raise` tests and the
+      `taint.raised`/`policy_decision` ledger rows; the literal "a real web/mail tool output"
+      half is unverifiable as such because no web_fetch/mail_read MCP tool exists yet (Out of
+      scope, below) — `policy.yaml`'s new `untrusted_output` field is the schema hook such a
+      FUTURE tool declares itself with, and it calls the exact same `taint.Tracker.Raise` this
+      task's tests exercise directly.
+- [x] JSONL log + events: `taint.raised`, DENY with reason/rule `tainted_session`,
+      `reader.rejected`, `actor.seeded` all appear (with the request's `trace_id`) in
+      `kahyad/internal/policy/engine_w403_test.go`, `kahyad/internal/reader/*_test.go`,
+      `kahyad/internal/reader/actor_seed_test.go`.
+- [x] Restart test proves persistence: `kahyad/internal/taint/taint_test.go`'s
+      `TestTaintSurvivesRestart` raises taint, closes the DB, reopens it, and re-checks.
+- [x] Grep proves fail-closed: `taint.Get`'s only non-error default is `TierTainted` — see
+      `TestGetMissingRowIsTainted` / `TestGetOnReadErrorFailsClosedToTainted`.
+- [x] No-cloud-fallback proven: `kahyad/internal/reader/nocloud_fallback_test.go` spins up a
+      REAL `anthproxy.Proxy` (with a `RequestCount()` hook added to that package for exactly
+      this purpose) and proves both the local-unavailable path and an ordinary secret-lane
+      success leave its counter at 0, with a control test proving a genuine cloud-lane call
+      would have incremented it.
 
 ## Out of scope
 
@@ -148,3 +164,48 @@ Reader model routing (§4 table, quote verbatim):
 - Screen-observation firehose, Endpoint Security extension, vision computer-use (§8 deferred).
 - Outlook/mail MCP tools themselves — this task ships the pipeline + fixtures, not mail
   connectivity.
+
+## Deviations (recorded, not renegotiated)
+
+- **Cloud-Haiku live call deferred.** No Anthropic credential exists in this deployment
+  (`docs/HANDOFF.md`'s OWNER AUTH DECISION / `kahyad/internal/anthproxy`'s own doc comment).
+  Everything up to the live network call is implemented and tested: `spawn.Envelope`'s
+  `mode`/`schema` fields (Go + Python, both sides' validation matrices), the worker's toolless
+  `_run_reader_session` (`tools=[]` + `mcp_servers={}` + a deny-all `can_use_tool`, three
+  independent layers), and `kahyad/internal/reader.WorkerCloudModel` (envelope-shape + delta-
+  accumulation proven against a fake python fixture, `kahyad/internal/reader/cloud_model_test.go`
+  — never a real `claude-agent-sdk`/network call). `WorkerCloudModel` is **not wired into
+  `main.go`**; wiring it is a one-line `reader.NewRunner(..., reader.WorkerCloudModel{...}, ...)`
+  once a credential exists.
+- **`kahyad/internal/reader` itself is not wired into `main.go`.** No ingestion point exists yet
+  that would call `reader.Run` (mail/web MCP tools are explicitly Out of scope, and the morning
+  briefing job that will be the first real caller is W5-01's). The package is a complete,
+  independently tested library; W5-01 wires it.
+- **`tasks.taint_tier` (migration 0001) is a pre-existing, DIFFERENT column** from this task's
+  own `session_taint` table (different vocabulary: `untrusted`/free-form vs. the
+  `clean`/`tainted` enum this task's invariant actually runs on). It is left untouched
+  (write-only, set to `"clean"` by `actor_seed.Spawn` purely as an informational mirror) — the
+  task spec names a new `session_taint` table specifically, and reconciling/removing the older
+  column is out of scope here; flagged as a follow-up.
+- **Live-model finding (not a code change, a documented observation):** the real local
+  Qwen3-30B-A3B, on its first pass over the byte-exact injection fixture, initially (a) rejected
+  a bare `2026-07-15` date against the schema's RFC3339 requirement, and (b) copied the
+  attacker's `attacker@example.com` destination address into `from_display` (the fixture has no
+  real "From:" header — the model grabbed the only email-shaped string in the text). Both were
+  fixed by tightening the Reader's own system-prompt instructions (require full RFC3339;
+  `from_display` only from an explicit sender label, an email mentioned as a send-to destination
+  is never the sender) — `kahyad/internal/reader/live_test.go`'s
+  `TestLiveSecretLaneFixtureExtractionEndToEnd` now passes reliably (3/3 consecutive runs) end to
+  end against the real model: extracts `4.250,00 TL` + the correct date, `from_display`/`subject`
+  correctly empty, and no field contains the attacker's address or instruction text. This class
+  of prompt-quality issue is exactly what the W78-02 red-team harness should systematically
+  cover; the STRUCTURAL guarantee (toolless Reader, Go-side schema validation, Actor never sees
+  raw text) holds regardless of any single field-content quirk.
+- **`/policy/check`'s `SessionID` is threaded only through `task.go`'s `handlePolicyCheck`**, the
+  endpoint the worker's own `can_use_tool` callback actually calls (it already sent
+  `session_id` on the wire since W12-09 — see `worker/kahya_worker/hooks.py`). `mcp.go`'s
+  `policyGateMiddleware` (a defense-in-depth backstop for a compromised worker bypassing
+  `can_use_tool` and hitting `/v1/mcp` directly) does not yet carry a per-call `session_id` and
+  so does not enforce the taint check on that specific bypass path — flagged as a follow-up,
+  not fixed here (no tool call today carries a session_id argument on that route at all; adding
+  one is a larger, separate change).

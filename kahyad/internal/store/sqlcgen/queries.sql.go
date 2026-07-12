@@ -385,6 +385,29 @@ func (q *Queries) GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCall
 	return i, err
 }
 
+const getSessionTaint = `-- name: GetSessionTaint :one
+
+SELECT session_id, tier, reason, updated_at FROM session_taint WHERE session_id = ?
+`
+
+// W4-03 (taint tiers + Reader/Actor split) queries below. See
+// migrations/0009_session_taint.sql for the schema and
+// kahyad/internal/taint/taint.go for the only caller (a narrow Store
+// interface there - never sqlcgen directly - so kahyad/internal/policy's
+// taint-check hook and kahyad/internal/reader's actor-seeding path both
+// depend on that package's own contract, not on sqlc's generated shapes).
+func (q *Queries) GetSessionTaint(ctx context.Context, sessionID string) (SessionTaint, error) {
+	row := q.db.QueryRowContext(ctx, getSessionTaint, sessionID)
+	var i SessionTaint
+	err := row.Scan(
+		&i.SessionID,
+		&i.Tier,
+		&i.Reason,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTaskByID = `-- name: GetTaskByID :one
 
 SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts
@@ -814,6 +837,29 @@ func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingAp
 		arg.ExpiresAt,
 		arg.ToolInput,
 	)
+	return err
+}
+
+const insertSessionTaintClean = `-- name: InsertSessionTaintClean :exec
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'clean', NULL, ?)
+`
+
+type InsertSessionTaintCleanParams struct {
+	SessionID string `json:"session_id"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// The ONLY way a 'clean' row is ever created (task spec step 1): a plain
+// INSERT, never an upsert - a session_id that already has ANY row (clean
+// or tainted) makes this fail on the PRIMARY KEY constraint, which
+// kahyad/internal/taint.Tracker.InsertClean treats as a "lowering
+// attempt" (ledgered taint.lower_attempt, rejected) rather than silently
+// overwriting an existing row. reason is always NULL for a clean insert -
+// there is nothing to explain about a session starting clean, unlike
+// RaiseSessionTaint below.
+func (q *Queries) InsertSessionTaintClean(ctx context.Context, arg InsertSessionTaintCleanParams) error {
+	_, err := q.db.ExecContext(ctx, insertSessionTaintClean, arg.SessionID, arg.UpdatedAt)
 	return err
 }
 
@@ -1536,6 +1582,37 @@ func (q *Queries) NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const raiseSessionTaint = `-- name: RaiseSessionTaint :exec
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'tainted', ?, ?)
+ON CONFLICT (session_id) DO UPDATE SET
+    tier = 'tainted',
+    reason = excluded.reason,
+    updated_at = excluded.updated_at
+`
+
+type RaiseSessionTaintParams struct {
+	SessionID string         `json:"session_id"`
+	Reason    sql.NullString `json:"reason"`
+	UpdatedAt string         `json:"updated_at"`
+}
+
+// The ONLY tier-transition statement in this file: upserts session_id to
+// tier='tainted', creating the row if it did not exist yet (a
+// content-sourced tool output can raise taint on a session before that
+// session's OWN 'clean' row ever landed - the ordering invariant is "no
+// byte reaches the worker before this Raise call", not "the row must
+// already exist") or flipping an existing 'clean' row to 'tainted' (and
+// leaving an already-'tainted' row at 'tainted', updating reason/
+// updated_at regardless - taint only ever rises, so re-raising a
+// different reason is fine, re-raising the SAME tier is a no-op by
+// definition). There is no corresponding statement anywhere in this
+// codebase that ever sets tier back to 'clean' on an existing row.
+func (q *Queries) RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintParams) error {
+	_, err := q.db.ExecContext(ctx, raiseSessionTaint, arg.SessionID, arg.Reason, arg.UpdatedAt)
+	return err
 }
 
 const renewOutboxLease = `-- name: RenewOutboxLease :exec

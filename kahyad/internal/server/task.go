@@ -30,6 +30,7 @@ import (
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/taint"
 )
 
 // Request body size caps (BLOCKER 3 hardening: an unbounded body reaching
@@ -84,6 +85,86 @@ type TaskStore interface {
 // elsewhere in this package).
 func (s *Server) SetTaskStore(ts TaskStore) {
 	s.taskStore = ts
+}
+
+// SetSessionTaintDB wires the raw *sql.DB handle handleTask's OnSession
+// callback needs to insert session_taint(tier=clean) in the SAME
+// transaction as its own UpdateTaskSession write (W4-03 task spec step
+// 1a). Call before Prepare(); main.go passes store.Store.DB() - the exact
+// same underlying connection s.taskStore's sqlc Queries already run
+// against, so a transaction opened here sees (and is seen by) the rest of
+// this process consistently. nil (the default) is a documented no-op -
+// see the Server.sessionTaintDB field's own doc comment.
+func (s *Server) SetSessionTaintDB(db *sql.DB) {
+	s.sessionTaintDB = db
+}
+
+// persistSessionStarted implements the W4-03 task spec step 1a: persist
+// the worker-reported session_id onto this task's row (the pre-existing
+// UpdateTaskSession write - W4-02) AND insert this task's OWN
+// session_taint(tier=clean) row IN THE SAME DATABASE TRANSACTION (HANDOFF
+// §5 safety #2: clean rows are born in exactly two places; a
+// user-initiated task's own worker session, at the moment its session_id
+// is first captured, is the FIRST of the two). Called only from
+// handleTask's OnSession callback above - a FRESH spawn, never a resumed
+// one (kahyad/internal/outbox.Dispatcher's own OnSession callback is a
+// SEPARATE code path that never calls this, so a resumed unknown
+// session_id correctly never gets a clean row inserted for it - the task
+// spec's own "resume never inserts" rule holds structurally, by which
+// code path even CAN reach this function, not by an extra runtime check).
+//
+// If sessionTaintDB was never wired (SetSessionTaintDB's "unwired
+// dependency" doc comment), this falls back to the plain, non-
+// transactional UpdateTaskSession call every pre-W4-03 caller/test already
+// made - no session_taint row is inserted in that configuration.
+func (s *Server) persistSessionStarted(ctx context.Context, traceID, taskID, sessionID string) error {
+	now := rfc3339Now()
+	if s.sessionTaintDB == nil {
+		return s.taskStore.UpdateTaskSession(ctx, sqlcgen.UpdateTaskSessionParams{
+			SessionID: sql.NullString{String: sessionID, Valid: true},
+			UpdatedAt: now,
+			ID:        taskID,
+		})
+	}
+
+	tx, err := s.sessionTaintDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("session_started: begin tx: %w", err)
+	}
+	txq := sqlcgen.New(tx)
+	if err := txq.UpdateTaskSession(ctx, sqlcgen.UpdateTaskSessionParams{
+		SessionID: sql.NullString{String: sessionID, Valid: true},
+		UpdatedAt: now,
+		ID:        taskID,
+	}); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("session_started: update task session: %w", err)
+	}
+	// A throwaway Tracker over the SAME tx-scoped Queries - see
+	// kahyad/internal/taint.Store's own doc comment for why this is exactly
+	// how a caller gets a transactional InsertClean without that package
+	// needing to know anything about *sql.Tx itself. ledger is deliberately
+	// nil here (NOT s.eventLogger): brain.db's connection pool is capped at
+	// exactly 1 (kahyad/internal/store.Store's own doc comment), and this
+	// goroutine is already holding that single connection via tx - a
+	// ledger write through s.eventLogger's ORDINARY (non-tx) *sqlcgen.
+	// Queries would try to acquire a SECOND connection from the same
+	// exhausted pool and deadlock against itself. The should-never-happen
+	// lower-attempt case is instead ledgered manually, below, AFTER
+	// Rollback has released the connection.
+	if err := taint.New(txq, nil).InsertClean(ctx, traceID, sessionID); err != nil {
+		_ = tx.Rollback()
+		if s.eventLogger != nil && errors.Is(err, taint.ErrLowerAttempt) {
+			_ = s.eventLogger.LogEvent(ctx, traceID, taint.EventLowerAttempt, map[string]any{
+				"event": taint.EventLowerAttempt, "session_id": sessionID,
+			})
+		}
+		return fmt.Errorf("session_started: insert session_taint clean: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("session_started: commit: %w", err)
+	}
+	return nil
 }
 
 // SetAnthproxy wires POST /v1/task's per-task Anthropic forward-proxy +
@@ -466,11 +547,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 			if sessionID == "" {
 				return
 			}
-			if err := s.taskStore.UpdateTaskSession(persistCtx, sqlcgen.UpdateTaskSessionParams{
-				SessionID: sql.NullString{String: sessionID, Valid: true},
-				UpdatedAt: rfc3339Now(),
-				ID:        taskID,
-			}); err != nil {
+			if err := s.persistSessionStarted(persistCtx, traceID, taskID, sessionID); err != nil {
 				log.Warn("task_session_update_failed", "task_id", taskID, "err", err.Error())
 			}
 		},
@@ -760,8 +837,22 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// W4-03: req.SessionID (already part of this endpoint's frozen wire
+	// schema - worker/kahya_worker/hooks.py's make_can_use_tool has sent it
+	// on every /policy/check POST since W12-09) threads straight through
+	// to Engine.Check's own taint-check hook. A nil pointer (no session yet
+	// - e.g. the very first tool call before the worker's init message
+	// carried a session_id) becomes "" - Check treats an empty SessionID as
+	// "skip the taint check", not as a session that fails closed; a real,
+	// non-empty session_id that resolves to no session_taint row at all
+	// (or an explicitly tainted one) is what actually fails closed.
+	sessionID := ""
+	if req.SessionID != nil {
+		sessionID = *req.SessionID
+	}
 	decision, err := s.policyEngine.Check(r.Context(), policy.CheckInput{
-		Tool: req.ToolName, Scope: req.Scope, TaskID: req.TaskID, TraceID: traceID, ToolInput: req.ToolInput,
+		Tool: req.ToolName, Scope: req.Scope, TaskID: req.TaskID, TraceID: traceID,
+		SessionID: sessionID, ToolInput: req.ToolInput,
 	})
 	if err != nil {
 		// Engine.Check already returned a fail-closed Deny decision AND

@@ -82,6 +82,18 @@ class Envelope:
     # parse_envelope below); defaults to False so every pre-W4-02
     # envelope/test still parses unchanged.
     resume: bool = False
+    # mode/schema (W4-03): mode="" (default) is an ordinary Actor/chat
+    # session, unchanged from every pre-W4-03 envelope. mode="reader" spawns
+    # a TOOLLESS session (no MCP servers, no memory-injection hook, no
+    # can_use_tool wiring at all - kahya_worker.__main__._run_reader_session)
+    # for the W4-03 Reader/Actor split's cloud-Haiku half; schema then names
+    # the registered Go-side struct (kahyad/internal/reader.
+    # JobTypeMailSummary/JobTypeWebpageExtract) the caller will parse this
+    # session's single JSON object response into - this worker does
+    # nothing with schema beyond echoing it into its own JSONL logs, since
+    # schema ENFORCEMENT is entirely Go-side, after this process exits.
+    mode: str = ""
+    schema: str | None = None
 
 
 def parse_envelope(raw: bytes) -> Envelope:
@@ -151,6 +163,21 @@ def parse_envelope(raw: bytes) -> Envelope:
     if resume and (session_id is None or not session_id.strip()):
         raise EnvelopeError("resume = true requires a non-empty session_id")
 
+    # mode/schema (W4-03): optional on the wire, like resume - absent means
+    # mode="" (an ordinary Actor/chat session), mirroring
+    # kahyad/internal/spawn.Envelope.Validate's own rules exactly: mode must
+    # be "" or "reader"; mode="reader" requires a non-blank schema.
+    mode = obj.get("mode", "")
+    if not isinstance(mode, str):
+        raise EnvelopeError("mode must be a string")
+    if mode not in ("", "reader"):
+        raise EnvelopeError(f'mode = {mode!r}, want "reader" or empty')
+    schema = obj.get("schema")
+    if schema is not None and not isinstance(schema, str):
+        raise EnvelopeError("schema must be a string or null")
+    if mode == "reader" and not (schema and schema.strip()):
+        raise EnvelopeError('mode = "reader" requires a non-blank schema')
+
     return Envelope(
         schema_version=schema_version,
         task_id=task_id,
@@ -162,4 +189,6 @@ def parse_envelope(raw: bytes) -> Envelope:
         memory_injection=memory_injection,
         created_at=created_at,
         resume=resume,
+        mode=mode,
+        schema=schema,
     )
