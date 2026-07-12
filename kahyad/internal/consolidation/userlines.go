@@ -29,6 +29,19 @@ import (
 // Steps 2 and 7, verbatim). KahyaCommitAuthor is defined here (rather than
 // worktree.go) so every file in this package that needs either literal
 // reads it from one place.
+//
+// SCOPE NOTE (W5-02 review): these authors drive TWO things this package DOES
+// implement - the same-day user-touched-line set (ComputeUserTouchedLines
+// filters `git log --author=UserCommitAuthor`) and blame/audit. They do NOT
+// yet drive the memory SOURCE-TRUST TIER: the W12-04 indexer derives
+// source_tier only from a file's kahya_source_tier front-matter key
+// (defaulting to user_asserted), with zero git-author awareness - so a
+// same-day user edit committed here is currently reindexed as user_asserted,
+// NOT user_edit. Deriving the top-of-lattice user_edit tier from an
+// author=user ~/Kahya/memory commit is a W5-04 (memory-correctness-engine)
+// deliverable that this task's commit discipline is the PREREQUISITE for, not
+// the implementer of. Do not assume user commits reach user_edit until W5-04
+// lands that indexer-path derivation. See [[kahya-user-edit-tier-gap]].
 const (
 	UserCommitAuthor  = "user <user@kahya.local>"
 	KahyaCommitAuthor = "kahyad <kahyad@kahya.local>"

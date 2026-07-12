@@ -97,6 +97,34 @@ func ApplyUserEditWins(original, proposed string, userTouchedLines1Based map[int
 	proposedLines := splitLinesKeepEmpty(proposed)
 	ops := diffLines(origLines, proposedLines)
 
+	// Duplicate-line ambiguity guard: when a user-touched original line's
+	// content appears MORE THAN ONCE in the original, the LCS is free to
+	// designate any identical occurrence as the surviving "equal" and delete
+	// a different one (the two are byte-identical, so the tie-break is
+	// arbitrary) - so a hunk that removes one such duplicate can carry an
+	// opDelete whose origLine1 is a NEIGHBORING untouched occurrence while the
+	// user's own physical line was attributed to an equal at the hunk
+	// boundary, leaving `touched` falsely unset. Treat a delete of any
+	// content that matches a DUPLICATED user-touched line as touched too:
+	// user_edit-wins is a safety invariant (never silently overwrite a line
+	// the user edited today), so erring conservatively - reverting a
+	// same-content dedup when the user touched one of the duplicates - is
+	// correct even at the cost of occasionally skipping a legitimate,
+	// far-away dedup for one nightly run (the user still reviews the diff in
+	// suggestion mode).
+	ambiguousUserContents := map[string]bool{}
+	{
+		counts := make(map[string]int, len(origLines))
+		for _, l := range origLines {
+			counts[l]++
+		}
+		for n := range userTouchedLines1Based {
+			if n >= 1 && n <= len(origLines) && counts[origLines[n-1]] > 1 {
+				ambiguousUserContents[origLines[n-1]] = true
+			}
+		}
+	}
+
 	var out []string
 	i := 0
 	for i < len(ops) {
@@ -112,7 +140,7 @@ func ApplyUserEditWins(original, proposed string, userTouchedLines1Based map[int
 		for j < len(ops) && ops[j].kind != opEqual {
 			if ops[j].kind == opDelete {
 				origSideLines = append(origSideLines, ops[j].text)
-				if userTouchedLines1Based[ops[j].origLine1] {
+				if userTouchedLines1Based[ops[j].origLine1] || ambiguousUserContents[ops[j].text] {
 					touched = true
 				}
 			}

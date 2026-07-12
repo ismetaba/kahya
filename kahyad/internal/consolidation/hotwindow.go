@@ -22,13 +22,20 @@
 // ValidateSummaryEvidence is the Go-side guard for the OTHER half of the
 // §5 memory #4 rule ("her ozet ham kanittan uretilir, asla alt-ozetten"):
 // it rejects any evidence list that cites a prior summary rather than a
-// raw episode/chunk - every fact PromoteHotWindow inserts is built from
-// exactly two EvidenceRefs (its own episode + chunk), so this call can
-// never actually fail in this file; it exists as the single, reusable,
-// independently-tested enforcement point kahyad/internal/consolidation's
-// OWN markdown-merge summaries are held to as well (a merged topic file
-// citing "the file I merged yesterday" instead of the original raw notes
-// would fail this same check).
+// raw episode/chunk. It applies to the STRUCTURED fact-promotion path -
+// PromoteHotWindow, the only place in this package that produces a "summary
+// from evidence" with a citation structure - where every fact is built from
+// exactly two EvidenceRefs (its own episode + chunk); the guard enforces,
+// by construction AND by this explicit check, that a promoted fact can never
+// be sourced from a prior summary.
+//
+// SCOPE NOTE (W5-02 review): the nightly MARKDOWN-MERGE session output
+// (session.go/localsession.go) is a ref-less whole-file rewrite with no
+// evidence-citation structure at all, so this check does NOT (and cannot
+// meaningfully) run over it - "summary drift across successive merges" for
+// the topic-file text is not what this ref-based guard addresses. The §5
+// "from raw evidence, never a sub-summary" invariant is enforced where it
+// has a citation structure to check: the fact promotion here.
 package consolidation
 
 import (
