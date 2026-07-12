@@ -467,12 +467,9 @@ func Load() (Config, error) {
 	// memory_dir/socket/kahya_dir/backup_dir themselves already reflect the
 	// dev profile (~/Library/Application Support/Kahya-dev, ~/Kahya-dev,
 	// kahyad-dev.sock) whenever KAHYA_ENV=dev, with no config.yaml key
-	// needed for it (Config.Env's own doc comment: "env-only"). This also
-	// means <data_dir>/config.yaml itself is looked up under the DEV
-	// data_dir for a dev-profile process below - a fully separate profile
-	// end to end (HANDOFF §6 W7-8 ⚑: "ayrı brain.db + ayrı
-	// ~/Kahya-dev/memory"), not merely a same-paths-different-label
-	// process.
+	// needed for it (Config.Env's own doc comment: "env-only") - the
+	// separate brain.db/memory/socket/launchd-label a dev profile requires
+	// (HANDOFF §6 W7-8 ⚑: "ayrı brain.db + ayrı ~/Kahya-dev/memory").
 	env := os.Getenv("KAHYA_ENV")
 	if env == "" {
 		env = EnvProd
@@ -480,10 +477,24 @@ func Load() (Config, error) {
 
 	cfg := defaults(home, env)
 
-	// The config file lives under the *default* data_dir: at this point in
-	// the pipeline data_dir has not yet been touched by the file or env
-	// layers, so there is exactly one unambiguous place to look.
-	fileCfgPath := filepath.Join(cfg.DataDir, "config.yaml")
+	// config.yaml itself, HOWEVER, has ONE canonical, env-INDEPENDENT
+	// location: the prod (HOME-derived) data_dir, ALWAYS - never the
+	// dev-profile data_dir, even under KAHYA_ENV=dev. Two reasons: (1) it is
+	// the documented contract every hermetic gate that runs under
+	// KAHYA_ENV=dev already relies on (tests/w3, tests/e2e - each redirects
+	// HOME to a temp dir and writes ONE config.yaml under
+	// <HOME>/Library/Application Support/Kahya; making the read location
+	// track the dev profile silently stopped that config from ever being
+	// read, disabling the Telegram bot / mock upstream and breaking those
+	// gates). (2) The §6 W7-8 dev profile is about DATA isolation (a
+	// separate brain.db/memory the dev process cannot confuse with prod) -
+	// NOT a separate config file; a dev daemon reading the same config.yaml
+	// as prod but writing its data under Kahya-dev is exactly the intended
+	// separation (and refuseDevProfileOpeningProdDB below still guarantees
+	// the DB path itself is never the prod one). At this point in the
+	// pipeline data_dir has not yet been touched by the file or env layers,
+	// so there is exactly one unambiguous place to look.
+	fileCfgPath := filepath.Join(defaults(home, EnvProd).DataDir, "config.yaml")
 
 	var explicitSocket, explicitLogDir, explicitDBPath bool
 

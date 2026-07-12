@@ -137,8 +137,31 @@ func tamperEarliestEventPayload(t *testing.T, dbPath string) {
 	if _, err := db.Exec(`DROP TRIGGER events_no_update`); err != nil {
 		t.Fatalf("drop events_no_update trigger: %v", err)
 	}
-	if _, err := db.Exec(`UPDATE events SET payload=json_set(payload,'$.k','tampered') WHERE id=(SELECT MIN(id) FROM events)`); err != nil {
+	res, err := db.Exec(`UPDATE events SET payload=json_set(payload,'$.k','tampered') WHERE id=(SELECT MIN(id) FROM events)`)
+	if err != nil {
 		t.Fatalf("tamper earliest event payload: %v", err)
+	}
+	// The tamper MUST durably land before the daemon restarts and serves
+	// `kahya ledger verify`, and it MUST actually change the earliest event.
+	// Skipping these lets a rare WAL-handoff race (the fresh WAL frame this
+	// separate connection wrote not yet visible to the restarted daemon's own
+	// connection) silently un-tamper the ledger, so verify passes and the
+	// gate goes vacuously green - the ~1-2% false-negative the W4-07 review
+	// caught. Assert exactly one row changed, then checkpoint(TRUNCATE) so the
+	// tamper is folded into the main db file (not left in a -wal the restart
+	// might race), then read it back to prove it is there.
+	if n, aerr := res.RowsAffected(); aerr != nil || n != 1 {
+		t.Fatalf("tamper UPDATE affected %d rows (err=%v), want exactly 1", n, aerr)
+	}
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint tamper into main db: %v", err)
+	}
+	var tamperedPayload string
+	if err := db.QueryRow(`SELECT payload FROM events WHERE id=(SELECT MIN(id) FROM events)`).Scan(&tamperedPayload); err != nil {
+		t.Fatalf("read back tampered event: %v", err)
+	}
+	if !strings.Contains(tamperedPayload, "tampered") {
+		t.Fatalf("tamper did not take: earliest event payload = %q, want it to contain \"tampered\"", tamperedPayload)
 	}
 }
 

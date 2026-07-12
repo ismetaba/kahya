@@ -147,13 +147,21 @@ prepare_daemon() {
 	local name="$1" config_body="$2"
 	local root="$SCRATCH_BASE/$name"
 	D_HOME="$root/home"; D_MEM="$root/home/memory"
+	# Runtime DATA (brain.db) lives under the dev-profile Kahya-dev dir (a
+	# non-prod path, so config.Load's refuseDevProfileOpeningProdDB is
+	# satisfied); config.yaml, however, has ONE canonical env-independent
+	# location - the prod (HOME-derived) Kahya dir - which is the ONLY place
+	# config.Load ever reads it from, even under KAHYA_ENV=dev (see config.go
+	# Load's own doc comment). Writing it under Kahya-dev would make it a
+	# silent no-op.
 	D_DATA="$root/home/Library/Application Support/Kahya-dev"
+	D_CONFIG="$root/home/Library/Application Support/Kahya"
 	D_SOCK="$root/k.sock"; D_DB="$D_DATA/brain.db"
 	D_POLICY="$root/policy.yaml"
 	D_OUT="$root/kahyad.stdout.log"; D_ERR="$root/kahyad.stderr.log"
-	mkdir -p "$D_MEM" "$D_DATA"
+	mkdir -p "$D_MEM" "$D_DATA" "$D_CONFIG"
 	(cd "$D_MEM" && git init -q && git config user.email "kahya-accept-w4@example.invalid" && git config user.name "Kahya accept-w4")
-	printf '%s\n' "$config_body" > "$D_DATA/config.yaml"
+	printf '%s\n' "$config_body" > "$D_CONFIG/config.yaml"
 	cp "$FIXTURES_DIR/policy.yaml" "$D_POLICY"
 }
 

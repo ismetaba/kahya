@@ -50,14 +50,13 @@ venv:
 	test -d $(VENV) || python3 -m venv $(VENV)
 	$(PY) -m pip install --quiet -r worker/requirements.lock
 test: venv build
-	@if docker info >/dev/null 2>&1; then \
-		echo "docker daemon detected -- exporting KAHYA_DOCKER_TESTS=1 (mcp/shell's container tests must PASS, never skip, from here on)"; \
-		KAHYA_DOCKER_TESTS=1 go test -tags $(TEST_TAGS) ./...; \
-	else \
-		echo "docker daemon not available -- mcp/shell's container-requiring tests are NOT run (KAHYA_DOCKER_TESTS unset); suite stays green"; \
-		go test -tags $(TEST_TAGS) ./...; \
-	fi
-	$(PY) -m unittest discover -s worker/tests -v
+	@# W4-07 acceptance gate runs FIRST, before the main suite, so its
+	@# anti-vacuous-green guard is ALWAYS reached: make aborts a target at the
+	@# first recipe line that exits nonzero, so a failure in the main
+	@# `go test ./...` below would otherwise skip this step entirely and the
+	@# guard would never run (a dropped `acceptance` build tag while some
+	@# other suite is red would be invisible). Fast (~17s) and it is the phase
+	@# gate, so running it up front is the right order.
 	@echo "running W4-07 acceptance gate (tests/acceptance/w4, CI-speed A/B/C)..."
 	@ACCEPT_OUT=$$(go test -tags $(GOTAGS),acceptance ./tests/acceptance/... -v 2>&1); \
 	STATUS=$$?; \
@@ -71,6 +70,14 @@ test: venv build
 		echo "W4-07 acceptance gate FAILED (tests/acceptance/w4)" >&2; \
 		exit 1; \
 	fi
+	@if docker info >/dev/null 2>&1; then \
+		echo "docker daemon detected -- exporting KAHYA_DOCKER_TESTS=1 (mcp/shell's container tests must PASS, never skip, from here on)"; \
+		KAHYA_DOCKER_TESTS=1 go test -tags $(TEST_TAGS) ./...; \
+	else \
+		echo "docker daemon not available -- mcp/shell's container-requiring tests are NOT run (KAHYA_DOCKER_TESTS unset); suite stays green"; \
+		go test -tags $(TEST_TAGS) ./...; \
+	fi
+	$(PY) -m unittest discover -s worker/tests -v
 mlx-venv:
 	test -d $(MLX_VENV) || python3 -m venv $(MLX_VENV)
 	$(MLX_PY) -m pip install --quiet -r mlx/embed/requirements.txt

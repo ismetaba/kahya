@@ -306,21 +306,19 @@ func dumpLogs(homeDir string) string {
 
 // --- config.yaml + policy.yaml + env ---
 
-// writeConfigYAML writes <homeDir>/Library/Application Support/Kahya-dev/
-// config.yaml - the ONE place config.Load ever reads it from: it is ALWAYS
-// derived from the DEFAULT data_dir (config.go's own Load doc comment:
-// "the config file lives under the *default* data_dir"), which - since
-// every daemon in this package sets KAHYA_ENV=dev - is itself the W4-07
-// dev-profile default, Kahya-dev (never plain Kahya), REGARDLESS of this
-// package's own separate KAHYA_DATA_DIR override (buildKahyadEnv) pointing
-// the daemon's ACTUAL runtime data_dir somewhere else entirely. Getting
-// this ONE path wrong silently makes every knob this function writes
-// (worker_cmd, cloud_retry_*, resume_scan_interval_seconds, ...) a no-op -
-// confirmed the hard way against a real kahyad process before landing this
-// comment.
+// writeConfigYAML writes <homeDir>/Library/Application Support/Kahya/
+// config.yaml - the ONE place config.Load ever reads it from: config.yaml
+// has a single canonical, env-INDEPENDENT location, the prod (HOME-derived)
+// data_dir, ALWAYS - even under KAHYA_ENV=dev (config.go's own Load doc
+// comment). It is NOT the dev-profile Kahya-dev dir, and NOT this package's
+// own separate KAHYA_DATA_DIR override (buildKahyadEnv), which points the
+// daemon's ACTUAL runtime data_dir (brain.db/socket) somewhere else
+// entirely. Getting this ONE path wrong silently makes every knob this
+// function writes (worker_cmd, cloud_retry_*, resume_scan_interval_seconds,
+// ...) a no-op - confirmed the hard way against a real kahyad process.
 func writeConfigYAML(t *testing.T, homeDir string, opts daemonOpts) {
 	t.Helper()
-	dataDir := filepath.Join(homeDir, "Library", "Application Support", "Kahya-dev")
+	dataDir := filepath.Join(homeDir, "Library", "Application Support", "Kahya")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatalf("mkdir data dir: %v", err)
 	}
