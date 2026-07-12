@@ -16,19 +16,19 @@ import (
 
 // Alarm-kind literals this sink specially formats — mirror kahyad/internal/
 // anthproxy's own Event* constants (EventTaskPausedBudget,
-// EventBudgetDowngradeOn, EventBudgetDowngradeUnavail, EventCacheHitAlarm,
-// EventSpendAlarm80/100), duplicated here rather than imported so this
-// package never needs an import-edge onto kahyad/internal/anthproxy just
-// for six string literals — the same "kept in sync by hand" convention
-// this codebase already uses for config.CredentialModeKeychain/
-// anthproxy.CredentialModeKeychain.
+// EventBudgetDowngradeOn, EventCacheHitAlarm, EventSpendAlarm80/100),
+// duplicated here rather than imported so this package never needs an
+// import-edge onto kahyad/internal/anthproxy just for these string literals
+// — the same "kept in sync by hand" convention this codebase already uses
+// for config.CredentialModeKeychain/anthproxy.CredentialModeKeychain.
+// (budget_downgrade_unavailable was retired in W4-08 — the local lane now
+// exists, so no code path ever emits it again; see governor.go.)
 const (
-	kindTaskPausedBudget           = "task_paused_budget"
-	kindBudgetDowngradeOn          = "budget_downgrade_on"
-	kindBudgetDowngradeUnavailable = "budget_downgrade_unavailable"
-	kindCacheHitAlarm              = "cache_hit_alarm"
-	kindSpendAlarm80               = "spend_alarm_80"
-	kindSpendAlarm100              = "spend_alarm_100"
+	kindTaskPausedBudget  = "task_paused_budget"
+	kindBudgetDowngradeOn = "budget_downgrade_on"
+	kindCacheHitAlarm     = "cache_hit_alarm"
+	kindSpendAlarm80      = "spend_alarm_80"
+	kindSpendAlarm100     = "spend_alarm_100"
 )
 
 // AlarmNotifier implements notify.Notifier — W12-08's alarm sink interface
@@ -88,7 +88,7 @@ func formatAlarmText(kind, message, traceID string, payload map[string]any) stri
 	switch kind {
 	case kindTaskPausedBudget:
 		return fmt.Sprintf("⚠️ Görev duraklatıldı: %s (trace: %s)", message, traceID)
-	case kindBudgetDowngradeOn, kindBudgetDowngradeUnavailable:
+	case kindBudgetDowngradeOn:
 		return fmt.Sprintf("📉 Model kademesi düştü: %s (trace: %s)", message, traceID)
 	case kindCacheHitAlarm:
 		if pct, ok := percentFromPayload(payload); ok {
