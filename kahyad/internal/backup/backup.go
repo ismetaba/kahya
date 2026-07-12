@@ -107,15 +107,23 @@ func (s *Snapshotter) SetVerifier(v Verifier) { s.verifier = v }
 // for the same-day-rerun test.
 func (s *Snapshotter) SetClock(now func() time.Time) { s.now = now }
 
-// Run executes one backup-nightly cycle (task spec step 1): VACUUM INTO
-// a fresh brain-YYYYMMDD.db snapshot (deleting a same-day leftover from an
-// earlier rerun first — VACUUM INTO refuses to overwrite an existing
-// target), verify it, and on success ledger `backup.completed` +
+// Run executes one backup-nightly cycle (task spec step 1): VACUUM INTO a
+// STAGING file, verify it, and only once it is proven good atomically
+// rename it over brain-YYYYMMDD.db, then ledger `backup.completed` +
 // {path,bytes,sha256} and prune to the newest 7 copies. Any failure from
 // VACUUM INTO itself or from a non-"ok" verify result is fail-closed
-// (HANDOFF hard rule): the corrupt/partial copy is deleted, every OLDER
-// copy is left completely untouched, prune never runs, and
+// (HANDOFF hard rule): only the unverified STAGING copy is deleted, and
+// today's prior good copy (from an earlier same-day run) plus every OLDER
+// copy are left completely untouched — prune never runs, and
 // `backup.failed` + the exact Turkish alarm fire via Notifier.Alarm.
+//
+// The staging-then-rename discipline (review BLOCKER fix) is what makes a
+// same-day RERUN safe: the naive "delete today's target, then vacuum a new
+// one" order meant a rerun whose vacuum/verify failed for any transient
+// reason (disk full, I/O blip) went from "one good backup today" to ZERO —
+// the exact "sıfır veri-kaybı" violation this task exists to prevent. By
+// never touching target until a verified-good replacement is in hand, a
+// failed rerun leaves the prior good copy exactly as it was.
 func (s *Snapshotter) Run(ctx context.Context, traceID string) error {
 	if err := os.MkdirAll(s.backupDir, 0o700); err != nil {
 		return fmt.Errorf("backup: create backup dir %s: %w", s.backupDir, err)
@@ -123,31 +131,39 @@ func (s *Snapshotter) Run(ctx context.Context, traceID string) error {
 
 	date := s.now().Format("20060102")
 	target := filepath.Join(s.backupDir, fmt.Sprintf("brain-%s.db", date))
+	staging := target + ".staging"
 
-	// Same-day rerun: VACUUM INTO fails if target already exists (task
-	// spec step 1a) — a rerun REPLACES, never appends, so delete any
-	// leftover from an earlier run today before vacuuming again.
-	if _, err := os.Stat(target); err == nil {
-		if err := os.Remove(target); err != nil {
-			return s.fail(ctx, traceID, target, fmt.Errorf("remove same-day leftover %s: %w", target, err))
-		}
+	// Remove only a leftover STAGING file from an earlier crashed run — a
+	// staging file is by definition never a verified-good copy, so deleting
+	// it can never lose good data (unlike target). VACUUM INTO also refuses
+	// to overwrite an existing file, so staging must not pre-exist.
+	if err := os.Remove(staging); err != nil && !os.IsNotExist(err) {
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("remove stale staging %s: %w", staging, err))
 	}
 
-	if _, err := s.store.DB().ExecContext(ctx, "VACUUM INTO ?", target); err != nil {
-		return s.fail(ctx, traceID, target, fmt.Errorf("VACUUM INTO %s: %w", target, err))
+	if _, err := s.store.DB().ExecContext(ctx, "VACUUM INTO ?", staging); err != nil {
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("VACUUM INTO %s: %w", staging, err))
 	}
 
-	result, verr := s.verifier.Verify(target)
+	result, verr := s.verifier.Verify(staging)
 	if verr != nil {
-		return s.fail(ctx, traceID, target, verr)
+		return s.fail(ctx, traceID, staging, target, verr)
 	}
 	if result != "ok" {
-		return s.fail(ctx, traceID, target, fmt.Errorf("integrity_check returned %q, want \"ok\"", result))
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("integrity_check returned %q, want \"ok\"", result))
 	}
 
-	sum, size, err := sha256File(target)
+	sum, size, err := sha256File(staging)
 	if err != nil {
-		return s.fail(ctx, traceID, target, fmt.Errorf("hash %s: %w", target, err))
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("hash %s: %w", staging, err))
+	}
+
+	// Atomic replace: only NOW, with a verified-good staging file in hand,
+	// does today's prior target (if any) get overwritten. os.Rename is
+	// atomic within one directory on POSIX and replaces the destination, so
+	// there is never a window where target is missing or half-written.
+	if err := os.Rename(staging, target); err != nil {
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("rename %s -> %s: %w", staging, target, err))
 	}
 
 	if err := s.store.LogEvent(ctx, traceID, EventBackupCompleted, map[string]any{
@@ -156,20 +172,21 @@ func (s *Snapshotter) Run(ctx context.Context, traceID string) error {
 		return fmt.Errorf("backup: ledger backup.completed: %w", err)
 	}
 
-	// Prune runs ONLY after a successful verify (HANDOFF hard rule: never
-	// reduce the count of good copies on a failure night).
+	// Prune runs ONLY after a successful verify+rename (HANDOFF hard rule:
+	// never reduce the count of good copies on a failure night).
 	return s.prune()
 }
 
 // fail is Run's single fail-closed exit path (HARD CONSTRAINT: any verify
-// error/non-"ok" result is treated as backup FAILED). It deletes the
-// corrupt/partial copy at target (best-effort — target may not even exist
-// yet if VACUUM INTO itself never completed), leaves every older copy in
-// BackupDir untouched, ledgers `backup.failed`, and alarms with the exact
+// error/non-"ok" result is treated as backup FAILED). It deletes ONLY the
+// unverified staging copy (best-effort — staging may not even exist yet if
+// VACUUM INTO never completed); target is NEVER touched here, so today's
+// prior good copy and every older copy in BackupDir survive a failure
+// night intact. It ledgers `backup.failed` and alarms with the exact
 // Turkish string (Notifier.Alarm performs both in one call — see this
 // package's doc comment). It never prunes.
-func (s *Snapshotter) fail(ctx context.Context, traceID, target string, cause error) error {
-	_ = os.Remove(target) // best-effort; target may not exist
+func (s *Snapshotter) fail(ctx context.Context, traceID, staging, target string, cause error) error {
+	_ = os.Remove(staging) // best-effort; staging may not exist. NEVER remove target.
 
 	reason := cause.Error()
 	if s.notifier != nil {
