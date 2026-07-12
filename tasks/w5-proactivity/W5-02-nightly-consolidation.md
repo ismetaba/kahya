@@ -1,6 +1,6 @@
 # W5-02 — Nightly consolidation
 
-**Status:** todo
+**Status:** done
 **Phase:** W5 — Proactivity + consolidation
 **Depends on:** W4-01, W12-04, W12-09
 **Flags:** none
@@ -51,14 +51,14 @@ A nightly (03:00) consolidation job exists: an Agent SDK session merges/organize
 
 ## Acceptance criteria
 
-- [ ] `kahya job run nightly-consolidation` on a seeded corpus produces a pending diff; `kahya consolidation show` renders it; `kahya consolidation approve` results in `git log ~/Kahya` showing a separate `author=kahyad <kahyad@kahya.local>` commit (and, if the tree was dirty, a preceding `author=user` commit) — mirrors §6 W5 gate "gece külliyat konsolide olup diff commit ediliyor".
-- [ ] Test in `make test`: a line edited by the user the same day is byte-identical after consolidation even when the model proposed changing it (user_edit wins).
-- [ ] Test in `make test`: a file matching a secret-lane glob never appears in a cloud-lane envelope (assert against the forward-proxy/request log); with local model unavailable the file is skipped and the Turkish notice is emitted — no cloud fallback.
-- [ ] Test in `make test`: consolidation performs zero writes outside the `~/Kahya` worktree and never opens brain.db; reindex is observed only as a kahyad-triggered event after approval.
-- [ ] Test in `make test`: synthetic 91-day-old episode fixture gets its detail atoms promoted to `source_tier=agent_derived` facts before cooling; a summary referencing a sub-summary as evidence is rejected.
-- [ ] With no `eval.mini.pass` event present, setting `consolidation.auto_commit: true` makes kahyad log an error and stay in suggestion mode (test).
-- [ ] Test in `make test`: a second nightly run while a suggestion is pending deletes the stale branch, ledgers `consolidation.superseded`, and produces a fresh pending diff — the stale diff is never merged.
-- [ ] After approve, `git -C ~/Kahya log origin/main..main` is empty (nightly push ran).
+- [x] `kahya job run nightly-consolidation` on a seeded corpus produces a pending diff; `kahya consolidation show` renders it; `kahya consolidation approve` results in `git log ~/Kahya` showing a separate `author=kahyad <kahyad@kahya.local>` commit (and, if the tree was dirty, a preceding `author=user` commit) — mirrors §6 W5 gate "gece külliyat konsolide olup diff commit ediliyor". (`kahyad/internal/consolidation/consolidation_test.go: TestRunProducesPendingDiffAndApproveShowsCommitDiscipline` drives `Consolidator.Run/Show/Approve` directly against a real temp git repo and asserts the exact git-log author/subject sequence; `kahyad/cmd/kahya/consolidation_test.go` covers the CLI `show`/`approve` surface against a fake kahyad; `nightly-consolidation` job registration covered by `kahyad/internal/config/config_test.go: TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush`. The real `bin/kahya job run nightly-consolidation` → real launchd/live-daemon path is not separately re-verified here — same "test the Go method, not the live binary" convention W5-01/W4-06 already use for their own job handlers.)
+- [x] Test in `make test`: a line edited by the user the same day is byte-identical after consolidation even when the model proposed changing it (user_edit wins). (`diff_test.go: TestApplyUserEditWinsProtectsTouchedLine` (unit) + `consolidation_test.go: TestRunUserEditWinsFullCycle` (full Run→Approve cycle against a real git repo).)
+- [x] Test in `make test`: a file matching a secret-lane glob never appears in a cloud-lane envelope (assert against the forward-proxy/request log); with local model unavailable the file is skipped and the Turkish notice is emitted — no cloud fallback. (`consolidation_test.go: TestRunSecretLaneFileNeverInCloudEnvelope`, `TestRunLocalUnavailableSkipsFailClosedNeverCloudFallback`; `localsession_test.go: TestLocalSessionConsolidateLocalUnavailableNeverCallsHTTP`.)
+- [x] Test in `make test`: consolidation performs zero writes outside the `~/Kahya` worktree and never opens brain.db; reindex is observed only as a kahyad-triggered event after approval. (`consolidation_test.go: TestRunWriteBoundaryAndReindexOnlyAfterApprove`; structurally, `Session`/`Cloud`/`Local` carry no DB handle at all — see session.go's doc comment.)
+- [x] Test in `make test`: synthetic 91-day-old episode fixture gets its detail atoms promoted to `source_tier=agent_derived` facts before cooling; a summary referencing a sub-summary as evidence is rejected. (`hotwindow_test.go: TestPromoteHotWindowPromotesBeforeCooling`, `TestValidateSummaryEvidenceRejectsSummary`; `hotwindow_storewriter_test.go` proves the same against a real temp brain.db.)
+- [x] With no `eval.mini.pass` event present, setting `consolidation.auto_commit: true` makes kahyad log an error and stay in suggestion mode (test). (`consolidation_test.go: TestRunAutoCommitRefusedWithoutEvalMiniPass`; positive case `TestRunAutoCommitProceedsWithRecentEvalMiniPass`.)
+- [x] Test in `make test`: a second nightly run while a suggestion is pending deletes the stale branch, ledgers `consolidation.superseded`, and produces a fresh pending diff — the stale diff is never merged. (`consolidation_test.go: TestRunSupersedesStalePendingAndRegeneratesAgainstCurrentMain`.)
+- [x] After approve, `git -C ~/Kahya log origin/main..main` is empty (nightly push ran). (`consolidation_test.go: TestApprovePushesToRemote`, asserted with the literal command from this criterion against a `file://` remote.)
 
 ## Out of scope
 

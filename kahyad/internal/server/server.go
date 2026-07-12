@@ -225,6 +225,14 @@ type Server struct {
 	// the same "unwired dependency" way SetSearcher/SetReindexer do.
 	ledgerVerifier LedgerVerifier
 
+	// consolidation wires GET/POST /v1/consolidation* (W5-02): the nightly
+	// consolidation show/approve/reject control routes live in
+	// kahyad/internal/consolidation.Consolidator (consolidation.go's
+	// SetConsolidation doc comment); nil until that setter is called - the
+	// routes answer 503 the same "unwired dependency" way SetSearcher/
+	// SetReindexer/SetLedgerVerifier do.
+	consolidation ConsolidationRunner
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -342,6 +350,9 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/task/status", s.handleTaskStatus)
 	mux.HandleFunc("/v1/task/resolve", s.handleTaskResolve)
 	mux.HandleFunc("/v1/ledger/verify", s.handleLedgerVerify)
+	mux.HandleFunc("/v1/consolidation", s.handleConsolidationShow)
+	mux.HandleFunc("/v1/consolidation/approve", s.handleConsolidationApprove)
+	mux.HandleFunc("/v1/consolidation/reject", s.handleConsolidationReject)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

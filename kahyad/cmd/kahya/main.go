@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -65,6 +66,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runAsk(client, args[1:], stdout, stderr)
 	case "job":
 		return runJob(client, args[1:], stdout, stderr)
+	case "consolidation":
+		return runConsolidation(client, args[1:], stdin, stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -227,6 +230,93 @@ func runJob(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgJobTriggered+"\n", name, traceID)
+	return 0
+}
+
+// runConsolidation implements `kahya consolidation show|approve|reject`
+// (W5-02): show renders the pending suggestion's diff (empty + Turkish
+// notice when there is none); approve prints the diff again (WYSIWYE:
+// the human sees exactly what will be merged before deciding) then gates
+// on the literal "onayla" word (PromptConsolidationApprove), exactly like
+// `kahya approve <id>`'s own W3 gate; reject is immediate, no diff
+// re-render needed (nothing is being applied).
+func runConsolidation(client *Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgConsolidationUsage)
+		return 2
+	}
+	switch args[0] {
+	case "show":
+		return runConsolidationShow(client, stdout, stderr)
+	case "approve":
+		return runConsolidationApprove(client, stdin, stdout, stderr)
+	case "reject":
+		return runConsolidationReject(client, stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgConsolidationUsage)
+		return 2
+	}
+}
+
+func runConsolidationShow(client *Client, stdout, stderr io.Writer) int {
+	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if !found {
+		fmt.Fprintln(stdout, MsgConsolidationEmpty)
+		return 0
+	}
+	fmt.Fprint(stdout, diff)
+	return 0
+}
+
+func runConsolidationApprove(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
+	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if !found {
+		fmt.Fprintln(stdout, MsgConsolidationEmpty)
+		return 0
+	}
+	fmt.Fprint(stdout, diff)
+
+	r := bufio.NewReader(stdin)
+	decision, err := approval.PromptLiteral(r, stdout, PromptConsolidationApprove, "onayla")
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if decision != approval.DecisionApprove {
+		fmt.Fprintln(stdout, MsgApprovalDenied)
+		return 1
+	}
+
+	if err := client.ApproveConsolidation(context.Background(), traceid.New()); err != nil {
+		if errors.Is(err, errConsolidationNoPending) {
+			fmt.Fprintln(stdout, MsgConsolidationEmpty)
+			return 0
+		}
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, MsgConsolidationApproved)
+	return 0
+}
+
+func runConsolidationReject(client *Client, stdout, stderr io.Writer) int {
+	if err := client.RejectConsolidation(context.Background(), traceid.New()); err != nil {
+		if errors.Is(err, errConsolidationNoPending) {
+			fmt.Fprintln(stdout, MsgConsolidationEmpty)
+			return 0
+		}
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, MsgConsolidationRejected)
 	return 0
 }
 

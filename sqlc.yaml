@@ -37,6 +37,9 @@ sql:
       # 0010 (W4-05) is two plain CREATE TABLEs (ledger_digest_state,
       # anchor_log) - same reasoning.
       - "kahyad/migrations/0010_ledger_anchor.sql"
+      # 0011 (W5-02) is a plain ALTER TABLE (episodes.cooled_at) + a plain
+      # CREATE INDEX - same reasoning.
+      - "kahyad/migrations/0011_consolidation.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

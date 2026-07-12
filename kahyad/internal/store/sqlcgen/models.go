@@ -80,6 +80,7 @@ type Episode struct {
 	Status     string         `json:"status"`
 	Meta       sql.NullString `json:"meta"`
 	CreatedAt  string         `json:"created_at"`
+	CooledAt   sql.NullString `json:"cooled_at"`
 }
 
 type Event struct {

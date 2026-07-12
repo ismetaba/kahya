@@ -255,9 +255,22 @@ WHERE source_path = ?
 LIMIT 1
 `
 
-func (q *Queries) GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (Episode, error) {
+type GetEpisodeByPathRow struct {
+	ID         int64          `json:"id"`
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+	SourceHash sql.NullString `json:"source_hash"`
+	SourceTier string         `json:"source_tier"`
+	StartedAt  sql.NullString `json:"started_at"`
+	EndedAt    sql.NullString `json:"ended_at"`
+	Status     string         `json:"status"`
+	Meta       sql.NullString `json:"meta"`
+	CreatedAt  string         `json:"created_at"`
+}
+
+func (q *Queries) GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (GetEpisodeByPathRow, error) {
 	row := q.db.QueryRowContext(ctx, getEpisodeByPath, sourcePath)
-	var i Episode
+	var i GetEpisodeByPathRow
 	err := row.Scan(
 		&i.ID,
 		&i.Source,
@@ -286,14 +299,27 @@ type GetEpisodeBySourceAndPathParams struct {
 	SourcePath sql.NullString `json:"source_path"`
 }
 
+type GetEpisodeBySourceAndPathRow struct {
+	ID         int64          `json:"id"`
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+	SourceHash sql.NullString `json:"source_hash"`
+	SourceTier string         `json:"source_tier"`
+	StartedAt  sql.NullString `json:"started_at"`
+	EndedAt    sql.NullString `json:"ended_at"`
+	Status     string         `json:"status"`
+	Meta       sql.NullString `json:"meta"`
+	CreatedAt  string         `json:"created_at"`
+}
+
 // W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 // filter by source, which is fine for callers that only ever use one
 // source, but the indexer must scope its hash-compare lookup to
 // source='memory_file' specifically (task spec step 3), so it gets its own
 // query rather than overloading GetEpisodeByPath's signature.
-func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error) {
+func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (GetEpisodeBySourceAndPathRow, error) {
 	row := q.db.QueryRowContext(ctx, getEpisodeBySourceAndPath, arg.Source, arg.SourcePath)
-	var i Episode
+	var i GetEpisodeBySourceAndPathRow
 	err := row.Scan(
 		&i.ID,
 		&i.Source,
@@ -840,7 +866,20 @@ type InsertEpisodeParams struct {
 	CreatedAt  string         `json:"created_at"`
 }
 
-func (q *Queries) InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (Episode, error) {
+type InsertEpisodeRow struct {
+	ID         int64          `json:"id"`
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+	SourceHash sql.NullString `json:"source_hash"`
+	SourceTier string         `json:"source_tier"`
+	StartedAt  sql.NullString `json:"started_at"`
+	EndedAt    sql.NullString `json:"ended_at"`
+	Status     string         `json:"status"`
+	Meta       sql.NullString `json:"meta"`
+	CreatedAt  string         `json:"created_at"`
+}
+
+func (q *Queries) InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error) {
 	row := q.db.QueryRowContext(ctx, insertEpisode,
 		arg.Source,
 		arg.SourcePath,
@@ -852,7 +891,7 @@ func (q *Queries) InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (E
 		arg.Meta,
 		arg.CreatedAt,
 	)
-	var i Episode
+	var i InsertEpisodeRow
 	err := row.Scan(
 		&i.ID,
 		&i.Source,
@@ -901,6 +940,76 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (Event
 		&i.Ts,
 		&i.Kind,
 		&i.Payload,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertFact = `-- name: InsertFact :one
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at
+`
+
+type InsertFactParams struct {
+	Subject       string         `json:"subject"`
+	Predicate     string         `json:"predicate"`
+	Object        string         `json:"object"`
+	SourceTier    string         `json:"source_tier"`
+	Evidentiality string         `json:"evidentiality"`
+	Confidence    float64        `json:"confidence"`
+	Importance    float64        `json:"importance"`
+	ValidFrom     sql.NullString `json:"valid_from"`
+	ValidTo       sql.NullString `json:"valid_to"`
+	Status        string         `json:"status"`
+	Evidence      sql.NullString `json:"evidence"`
+	ExtractorVer  sql.NullString `json:"extractor_ver"`
+	UpdatedAt     string         `json:"updated_at"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+// One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
+// here (quarantined from profile-card/injection until a human confirms -
+// kahyad/internal/server's own quarantinedSourceTier), evidentiality is
+// 'inferred' (the extractor read the raw chunk text, it did not witness
+// or get told the fact directly), confidence is a caller-supplied
+// log-odds value (this column is LOG-ODDS, never a bare probability -
+// 0001_init_schema.sql's own header note), evidence cites the raw
+// episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
+// never a prior summary.
+func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error) {
+	row := q.db.QueryRowContext(ctx, insertFact,
+		arg.Subject,
+		arg.Predicate,
+		arg.Object,
+		arg.SourceTier,
+		arg.Evidentiality,
+		arg.Confidence,
+		arg.Importance,
+		arg.ValidFrom,
+		arg.ValidTo,
+		arg.Status,
+		arg.Evidence,
+		arg.ExtractorVer,
+		arg.UpdatedAt,
+		arg.CreatedAt,
+	)
+	var i Fact
+	err := row.Scan(
+		&i.ID,
+		&i.Subject,
+		&i.Predicate,
+		&i.Object,
+		&i.SourceTier,
+		&i.Evidentiality,
+		&i.Confidence,
+		&i.Importance,
+		&i.ValidFrom,
+		&i.ValidTo,
+		&i.Status,
+		&i.Evidence,
+		&i.ExtractorVer,
+		&i.UpdatedAt,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -1381,6 +1490,52 @@ func (q *Queries) ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([
 	return items, nil
 }
 
+const listChunksByEpisode = `-- name: ListChunksByEpisode :many
+
+SELECT id, episode_id, seq, text, content_hash, created_at
+FROM chunks
+WHERE episode_id = ?
+ORDER BY seq ASC
+`
+
+// W5-02 (nightly consolidation) queries below: hot-window detail-atom
+// promotion (facts INSERT, episodes.cooled_at) - see
+// kahyad/internal/consolidation/hotwindow.go.
+// Raw chunk text for one episode, in sequence order - hotwindow.go scans
+// this text for detail atoms (numbers/dates/quotes/decisions/promises).
+// Every fact promoted from it cites these chunk ids as evidence, never a
+// prior summary (HANDOFF S5 memory #4: "her ozet ham kanittan uretilir,
+// asla alt-ozetten").
+func (q *Queries) ListChunksByEpisode(ctx context.Context, episodeID int64) ([]Chunk, error) {
+	rows, err := q.db.QueryContext(ctx, listChunksByEpisode, episodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Chunk{}
+	for rows.Next() {
+		var i Chunk
+		if err := rows.Scan(
+			&i.ID,
+			&i.EpisodeID,
+			&i.Seq,
+			&i.Text,
+			&i.ContentHash,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDueOutboxRows = `-- name: ListDueOutboxRows :many
 SELECT id, trace_id, kind, payload, dispatched_at, created_at, available_at, lease_until, attempts
 FROM outbox
@@ -1787,6 +1942,65 @@ func (q *Queries) ListUnconsumedPendingApprovals(ctx context.Context) ([]Pending
 	return items, nil
 }
 
+const listUncooledEpisodesOlderThan = `-- name: ListUncooledEpisodesOlderThan :many
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
+FROM episodes
+WHERE status = 'active' AND cooled_at IS NULL AND created_at <= ?
+ORDER BY id ASC
+`
+
+type ListUncooledEpisodesOlderThanRow struct {
+	ID         int64          `json:"id"`
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+	SourceHash sql.NullString `json:"source_hash"`
+	SourceTier string         `json:"source_tier"`
+	StartedAt  sql.NullString `json:"started_at"`
+	EndedAt    sql.NullString `json:"ended_at"`
+	Status     string         `json:"status"`
+	Meta       sql.NullString `json:"meta"`
+	CreatedAt  string         `json:"created_at"`
+}
+
+// Active episodes not yet hot-window-cooled, created at or before cutoff
+// (RFC3339 UTC string compare - every created_at this codebase writes is
+// already normalized to that format, so a plain string comparison sorts
+// correctly, matching CountEventsByKindAndDate's own date()-free
+// convention above for the same reason).
+func (q *Queries) ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUncooledEpisodesOlderThan, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUncooledEpisodesOlderThanRow{}
+	for rows.Next() {
+		var i ListUncooledEpisodesOlderThanRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Source,
+			&i.SourcePath,
+			&i.SourceHash,
+			&i.SourceTier,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.Status,
+			&i.Meta,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markAnchorPushed = `-- name: MarkAnchorPushed :exec
 UPDATE anchor_log
 SET status = 'pushed', remote_ref = ?
@@ -1803,6 +2017,22 @@ type MarkAnchorPushedParams struct {
 // step 3: "On success mark pushed").
 func (q *Queries) MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error {
 	_, err := q.db.ExecContext(ctx, markAnchorPushed, arg.RemoteRef, arg.ID)
+	return err
+}
+
+const markEpisodeCooled = `-- name: MarkEpisodeCooled :exec
+UPDATE episodes SET cooled_at = ? WHERE id = ?
+`
+
+type MarkEpisodeCooledParams struct {
+	CooledAt sql.NullString `json:"cooled_at"`
+	ID       int64          `json:"id"`
+}
+
+// Stamped ONLY after this episode's detail atoms have been promoted to
+// facts (task spec step 6: "only then mark cooled").
+func (q *Queries) MarkEpisodeCooled(ctx context.Context, arg MarkEpisodeCooledParams) error {
+	_, err := q.db.ExecContext(ctx, markEpisodeCooled, arg.CooledAt, arg.ID)
 	return err
 }
 

@@ -169,10 +169,10 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	// W5-01 added a third default entry (morning-briefing) - see the block
-	// below.
-	if len(cfg.Jobs) != 3 {
-		t.Fatalf("Jobs = %+v, want exactly 3 default entries", cfg.Jobs)
+	// W5-01 added a third default entry (morning-briefing); W5-02 added a
+	// fourth (nightly-consolidation) - see the blocks below.
+	if len(cfg.Jobs) != 4 {
+		t.Fatalf("Jobs = %+v, want exactly 4 default entries", cfg.Jobs)
 	}
 
 	byName := make(map[string]JobConfig, len(cfg.Jobs))
@@ -224,6 +224,24 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 	if cfg.BriefingHour != 8 || cfg.BriefingMinute != 30 {
 		t.Errorf("BriefingHour/Minute = %d/%d, want 8/30", cfg.BriefingHour, cfg.BriefingMinute)
+	}
+
+	// W5-02: the 03:00 nightly-consolidation job.
+	consolidation, ok := byName["nightly-consolidation"]
+	if !ok {
+		t.Fatalf("Jobs missing nightly-consolidation: %+v", cfg.Jobs)
+	}
+	if consolidation.Handler != "nightly-consolidation" {
+		t.Errorf("nightly-consolidation.Handler = %q, want %q", consolidation.Handler, "nightly-consolidation")
+	}
+	if consolidation.Calendar.Hour == nil || *consolidation.Calendar.Hour != 3 {
+		t.Errorf("nightly-consolidation.Calendar.Hour = %v, want 3", consolidation.Calendar.Hour)
+	}
+	if consolidation.Calendar.Minute == nil || *consolidation.Calendar.Minute != 0 {
+		t.Errorf("nightly-consolidation.Calendar.Minute = %v, want 0", consolidation.Calendar.Minute)
+	}
+	if cfg.ConsolidationAutoCommit {
+		t.Errorf("ConsolidationAutoCommit = true, want false (suggestion mode is the default)")
 	}
 
 	// validateJobs must still accept the default set (DNS-label names, no

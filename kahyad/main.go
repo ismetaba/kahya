@@ -28,6 +28,7 @@ import (
 	"kahya/kahyad/internal/briefing"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/consolidation"
 	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/indexer"
@@ -752,6 +753,45 @@ func run() int {
 		_, err := briefingOrchestrator.Run(ctx, scheduler.TraceIDFromContext(ctx))
 		return err
 	})
+
+	// W5-02: the 03:00 nightly consolidation (HANDOFF §6 W5 ⚑ + §5 memory
+	// #4). Cloud lane reuses the SAME toolless Reader-mode worker profile/
+	// per-task forward-proxy construction as the briefing orchestrator
+	// above (srv.NewTaskProxy); local (secret) lane calls the SAME
+	// kahyad-supervised Qwen3-30B-A3B server (qwenSup) directly over HTTP,
+	// never through the worker (HANDOFF §4 ⚑: "makineden cikmaz"). pusher
+	// is the EXACT SAME W4-06 memory-push handler already registered
+	// above - consolidation's own approve step invokes it again at the
+	// end of a successful merge (task spec step 8), never a second git-
+	// push implementation.
+	consolidator := &consolidation.Consolidator{
+		Cfg: consolidation.Config{
+			KahyaDir:        cfg.KahyaDir,
+			MemoryDir:       cfg.MemoryDir,
+			SecretLaneGlobs: pol.SecretLaneGlobs,
+			AutoCommit:      cfg.ConsolidationAutoCommit,
+		},
+		Git: backup.NewExecGitRunner(),
+		Cloud: consolidation.CloudSession{Spawner: consolidation.ProcessSpawner{
+			Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
+			MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
+			ProxyOpener: func(taskID, traceID string) (string, string, func() error, error) {
+				return srv.NewTaskProxy(taskID, traceID)
+			},
+		}},
+		Local:       consolidation.LocalSession{Sup: qwenSup, Model: cfg.QwenModelName},
+		Notifier:    tgBot,
+		EventLogger: st,
+		EventReader: consolidation.StoreEventReader{Q: st.Queries},
+		Reindexer:   reindexBackfiller,
+		Pusher:      pusher,
+		HotWindow:   consolidation.StoreFactWriter{Q: st.Queries},
+		Log:         log,
+	}
+	sched.RegisterHandler("nightly-consolidation", func(ctx context.Context) error {
+		return consolidator.Run(ctx, scheduler.TraceIDFromContext(ctx))
+	})
+	srv.SetConsolidation(consolidator)
 
 	sched.LoadJobs(cfg.Jobs)
 	srv.SetScheduler(sched)

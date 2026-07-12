@@ -74,13 +74,13 @@ type Querier interface {
 	// migrations/0004_egress_budget.sql for the schema and
 	// kahyad/internal/egress/budget.go for the only caller.
 	GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error)
-	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (Episode, error)
+	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (GetEpisodeByPathRow, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 	// filter by source, which is fine for callers that only ever use one
 	// source, but the indexer must scope its hash-compare lookup to
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
-	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error)
+	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (GetEpisodeBySourceAndPathRow, error)
 	// The most recent anchor_log row of ANY status - push.go's
 	// claimPendingRow uses this to decide whether there is already an
 	// in-flight 'pending' row to retry (offline case, task spec step 5) before
@@ -174,11 +174,21 @@ type Querier interface {
 	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)
 	InsertEgressBudget(ctx context.Context, arg InsertEgressBudgetParams) error
-	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (Episode, error)
+	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
 	// Later tasks add more queries to this file as they need them; sqlc
 	// regenerates the whole package from the union of every *.sql file here.
 	InsertEvent(ctx context.Context, arg InsertEventParams) (Event, error)
+	// One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
+	// here (quarantined from profile-card/injection until a human confirms -
+	// kahyad/internal/server's own quarantinedSourceTier), evidentiality is
+	// 'inferred' (the extractor read the raw chunk text, it did not witness
+	// or get told the fact directly), confidence is a caller-supplied
+	// log-odds value (this column is LOG-ODDS, never a bare probability -
+	// 0001_init_schema.sql's own header note), evidence cites the raw
+	// episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
+	// never a prior summary.
+	InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error)
 	// W4-02 outbox lease/redelivery queries. See migrations/
 	// 0007_task_durability.sql for the added columns and
 	// kahyad/internal/outbox/dispatcher.go for the only caller.
@@ -261,6 +271,15 @@ type Querier interface {
 	ListAnchorLogs(ctx context.Context) ([]AnchorLog, error)
 	ListAutonomyState(ctx context.Context) ([]AutonomyState, error)
 	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
+	// W5-02 (nightly consolidation) queries below: hot-window detail-atom
+	// promotion (facts INSERT, episodes.cooled_at) - see
+	// kahyad/internal/consolidation/hotwindow.go.
+	// Raw chunk text for one episode, in sequence order - hotwindow.go scans
+	// this text for detail atoms (numbers/dates/quotes/decisions/promises).
+	// Every fact promoted from it cites these chunk ids as evidence, never a
+	// prior summary (HANDOFF S5 memory #4: "her ozet ham kanittan uretilir,
+	// asla alt-ozetten").
+	ListChunksByEpisode(ctx context.Context, episodeID int64) ([]Chunk, error)
 	// Candidate rows for one dispatcher claim pass: not yet delivered,
 	// available (available_at <= now), and not currently leased by another
 	// dispatcher (lease_until IS NULL, i.e. never claimed, OR lease_until has
@@ -306,10 +325,19 @@ type Querier interface {
 	// trailing-zero-trimmed fractional seconds do NOT always sort
 	// lexicographically in timestamp order).
 	ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error)
+	// Active episodes not yet hot-window-cooled, created at or before cutoff
+	// (RFC3339 UTC string compare - every created_at this codebase writes is
+	// already normalized to that format, so a plain string comparison sorts
+	// correctly, matching CountEventsByKindAndDate's own date()-free
+	// convention above for the same reason).
+	ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error)
 	// The ONLY statement that ever flips a row from 'pending' to 'pushed' -
 	// called once the git push has actually landed on the remote (task spec
 	// step 3: "On success mark pushed").
 	MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error
+	// Stamped ONLY after this episode's detail atoms have been promoted to
+	// facts (task spec step 6: "only then mark cooled").
+	MarkEpisodeCooled(ctx context.Context, arg MarkEpisodeCooledParams) error
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
 	// Terminal success: the re-spawned worker exited 0 (task spec step 7).
 	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error

@@ -675,3 +675,48 @@ ORDER BY id ASC;
 -- fired-on-wake plus the regular 08:30 run can therefore never deliver
 -- two notifications the same date.
 SELECT count(*) FROM events WHERE kind = ? AND date(created_at) = ?;
+
+-- W5-02 (nightly consolidation) queries below: hot-window detail-atom
+-- promotion (facts INSERT, episodes.cooled_at) - see
+-- kahyad/internal/consolidation/hotwindow.go.
+
+-- name: ListChunksByEpisode :many
+-- Raw chunk text for one episode, in sequence order - hotwindow.go scans
+-- this text for detail atoms (numbers/dates/quotes/decisions/promises).
+-- Every fact promoted from it cites these chunk ids as evidence, never a
+-- prior summary (HANDOFF S5 memory #4: "her ozet ham kanittan uretilir,
+-- asla alt-ozetten").
+SELECT id, episode_id, seq, text, content_hash, created_at
+FROM chunks
+WHERE episode_id = ?
+ORDER BY seq ASC;
+
+-- name: ListUncooledEpisodesOlderThan :many
+-- Active episodes not yet hot-window-cooled, created at or before cutoff
+-- (RFC3339 UTC string compare - every created_at this codebase writes is
+-- already normalized to that format, so a plain string comparison sorts
+-- correctly, matching CountEventsByKindAndDate's own date()-free
+-- convention above for the same reason).
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
+FROM episodes
+WHERE status = 'active' AND cooled_at IS NULL AND created_at <= ?
+ORDER BY id ASC;
+
+-- name: MarkEpisodeCooled :exec
+-- Stamped ONLY after this episode's detail atoms have been promoted to
+-- facts (task spec step 6: "only then mark cooled").
+UPDATE episodes SET cooled_at = ? WHERE id = ?;
+
+-- name: InsertFact :one
+-- One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
+-- here (quarantined from profile-card/injection until a human confirms -
+-- kahyad/internal/server's own quarantinedSourceTier), evidentiality is
+-- 'inferred' (the extractor read the raw chunk text, it did not witness
+-- or get told the fact directly), confidence is a caller-supplied
+-- log-odds value (this column is LOG-ODDS, never a bare probability -
+-- 0001_init_schema.sql's own header note), evidence cites the raw
+-- episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
+-- never a prior summary.
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at;

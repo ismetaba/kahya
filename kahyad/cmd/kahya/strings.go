@@ -206,4 +206,25 @@ const (
 	// job name, %s = the trace_id this run was assigned (so the user can
 	// follow up with `kahya log --trace <id>`).
 	MsgJobTriggered = "İş tetiklendi: %s (iz: %s)"
+
+	// ---- W5-02: kahya consolidation show|approve|reject ----
+
+	// MsgConsolidationUsage is printed when `kahya consolidation` is given
+	// anything other than a recognized "show"/"approve"/"reject"
+	// subcommand. Exit 2.
+	MsgConsolidationUsage = "kullanım: kahya consolidation show|approve|reject"
+
+	// MsgConsolidationEmpty is printed by `kahya consolidation show` (and
+	// approve/reject) when there is no pending suggestion at all.
+	MsgConsolidationEmpty = "Bekleyen konsolidasyon önerisi yok."
+
+	// PromptConsolidationApprove is `kahya consolidation approve`'s
+	// decision prompt - literal-only, mirroring PromptW3Literal's own
+	// "onayla" gate (this is a W1 memory-write, not W3, but the task spec
+	// names the SAME literal confirm word for this specific action).
+	PromptConsolidationApprove = "Konsolidasyon önerisini ana dala birleştirmek istiyor musunuz? Devam etmek için 'onayla' yazın:"
+
+	// MsgConsolidationApproved/Rejected are the two terminal outcomes.
+	MsgConsolidationApproved = "Konsolidasyon onaylandı."
+	MsgConsolidationRejected = "Konsolidasyon reddedildi."
 )

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -597,6 +598,90 @@ func (c *Client) LedgerVerify(ctx context.Context, traceID string) (ledgerVerify
 		return ledgerVerifyResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("ledger/verify: decode response: %w", err)}
 	}
 	return lr, nil
+}
+
+// consolidationShowResponse mirrors kahyad's GET /v1/consolidation JSON
+// body (kahyad/internal/server.consolidationShowResponse, W5-02).
+type consolidationShowResponse struct {
+	Found bool   `json:"found"`
+	Diff  string `json:"diff,omitempty"`
+}
+
+// ShowConsolidation calls GET /v1/consolidation (`kahya consolidation
+// show`).
+func (c *Client) ShowConsolidation(ctx context.Context, traceID string) (found bool, diff string, err error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/v1/consolidation", traceID, nil)
+	if err != nil {
+		return false, "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return false, "", fmt.Errorf("%s", msg)
+		}
+		return false, "", &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: status %d", resp.StatusCode)}
+	}
+	var sr consolidationShowResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return false, "", &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: decode response: %w", err)}
+	}
+	return sr.Found, sr.Diff, nil
+}
+
+// consolidationActionResponse mirrors kahyad's POST /v1/consolidation/
+// approve|reject JSON body (kahyad/internal/server.consolidationActionResponse).
+type consolidationActionResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// errConsolidationNoPending is returned by ApproveConsolidation/
+// RejectConsolidation when kahyad answers 404 (no pending suggestion,
+// kahyad/internal/consolidation.ErrNoPending) - main.go checks this via
+// errors.Is to print the Turkish MsgConsolidationEmpty line rather than a
+// raw (English) server error string.
+var errConsolidationNoPending = errors.New("consolidation: no pending suggestion")
+
+// ApproveConsolidation calls POST /v1/consolidation/approve (`kahya
+// consolidation approve`, after the local 'onayla' confirm).
+func (c *Client) ApproveConsolidation(ctx context.Context, traceID string) error {
+	return c.consolidationAction(ctx, traceID, "/v1/consolidation/approve")
+}
+
+// RejectConsolidation calls POST /v1/consolidation/reject (`kahya
+// consolidation reject`).
+func (c *Client) RejectConsolidation(ctx context.Context, traceID string) error {
+	return c.consolidationAction(ctx, traceID, "/v1/consolidation/reject")
+}
+
+func (c *Client) consolidationAction(ctx context.Context, traceID, path string) error {
+	req, err := c.newRequest(ctx, http.MethodPost, path, traceID, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errConsolidationNoPending
+	}
+	var ar consolidationActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
+	}
+	if !ar.OK {
+		if ar.Error != "" {
+			return fmt.Errorf("%s", ar.Error)
+		}
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
+	}
+	return nil
 }
 
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded

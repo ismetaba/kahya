@@ -398,6 +398,19 @@ type Config struct {
 	// calendar the Automation grant can see" - kahyad/internal/briefing's
 	// own JXA snippet treats an empty list as "no name filter".
 	BriefingCalendarNames []string `yaml:"briefing_calendar_names"`
+
+	// --- W5-02 nightly consolidation ---
+
+	// ConsolidationAutoCommit is cfg.consolidation.auto_commit (HANDOFF §6
+	// W5 flag: "otomatik commit W7 mini-eval yesiliyle acilir"). Default
+	// false - suggestion mode (diff + `kahya consolidation approve`) for
+	// the first 2 weeks, unconditionally. kahyad/internal/consolidation
+	// REFUSES to honor true unless an "eval.mini.pass" ledger event (W78-01)
+	// exists in the last 30 days - logs an error and stays in suggestion
+	// mode otherwise (task spec acceptance criterion) - this field alone
+	// never bypasses that runtime guard, it only expresses the operator's
+	// intent once the guard would actually pass.
+	ConsolidationAutoCommit bool `yaml:"consolidation_auto_commit"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -487,6 +500,7 @@ type fileConfig struct {
 	BriefingGHRepos               *[]string    `yaml:"briefing_gh_repos"`
 	BriefingFileGlobs             *[]string    `yaml:"briefing_file_globs"`
 	BriefingCalendarNames         *[]string    `yaml:"briefing_calendar_names"`
+	ConsolidationAutoCommit       *bool        `yaml:"consolidation_auto_commit"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -747,6 +761,11 @@ func defaults(home, env string) Config {
 			// (both literals, never one field reading another in this same
 			// composite literal).
 			{Name: "morning-briefing", Handler: "morning-briefing", Calendar: CalendarSpec{Hour: intPtr(defaultBriefingHour), Minute: intPtr(defaultBriefingMinute)}},
+			// W5-02 nightly consolidation (HANDOFF §6 W5 ⚑: 03:00 launchd
+			// StartCalendarInterval job - never an in-daemon cron tick, same
+			// wall-clock-scheduling rule backup-nightly/memory-push/
+			// morning-briefing above already follow).
+			{Name: "nightly-consolidation", Handler: "nightly-consolidation", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(0)}},
 		},
 
 		// W4-05 ledger external anchor defaults (task spec, verbatim:
@@ -766,6 +785,14 @@ func defaults(home, env string) Config {
 		// an error - see each field's own doc comment).
 		BriefingHour:   defaultBriefingHour,
 		BriefingMinute: defaultBriefingMinute,
+
+		// W5-02 nightly consolidation: suggestion mode is the ONLY mode for
+		// the first 2 weeks, unconditionally (HANDOFF §6 W5 ⚑) - kahyad
+		// refuses true here anyway (at run time) without a recent
+		// eval.mini.pass ledger event, but the default itself is also false
+		// so an operator must opt in explicitly even once that gate would
+		// pass.
+		ConsolidationAutoCommit: false,
 	}
 }
 
@@ -1098,6 +1125,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.BriefingCalendarNames != nil {
 		cfg.BriefingCalendarNames = *fc.BriefingCalendarNames
+	}
+	if fc.ConsolidationAutoCommit != nil {
+		cfg.ConsolidationAutoCommit = *fc.ConsolidationAutoCommit
 	}
 }
 
