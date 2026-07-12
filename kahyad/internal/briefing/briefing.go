@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
@@ -221,7 +222,14 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// Once-per-day idempotency (task spec step 3 / acceptance criterion):
 	// a missed-run-fired-on-wake plus the regular scheduled run must never
 	// both deliver. Checked FIRST, before a single collector runs, so a
-	// duplicate run does the least possible work.
+	// duplicate run does the least possible work. This check-then-act is
+	// safe because every production invocation of this job (launchd
+	// catch-up, the 08:30 fire, a manual `kahya job run morning-briefing`)
+	// funnels through the SAME daemon's scheduler.Trigger, which serializes
+	// same-name job runs with a per-name lock (kahyad/internal/scheduler's
+	// runLocks) - so a second concurrent fire only reaches this check AFTER
+	// the first run has finished and recorded its EventDelivered row, and
+	// then no-ops here instead of racing it.
 	if o.Dedupe != nil {
 		already, err := o.Dedupe.AlreadyDeliveredToday(ctx, date)
 		if err != nil {
@@ -353,7 +361,19 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	redacted := make([]string, len(validated.Lines))
 	for i, l := range validated.Lines {
 		redacted[i] = l
-		if v, _ := o.Classifier.Classify(ctx, l); v.SecretLane {
+		// FAIL-CLOSED, and time-bounded: a classifier ERROR (Qwen
+		// unavailable/timeout at exactly this later backstop call) must
+		// REDACT the line, never deliver it verbatim - the same fail-closed
+		// rule gate.go applies at collection time. Discarding the error and
+		// treating the zero-value Verdict{SecretLane:false} as "safe" would
+		// ship a secret-lane line in the clear precisely when the classifier
+		// hiccups, defeating this defense-in-depth backstop. The budget
+		// timeout (independent of the deadline-less production ctx) keeps a
+		// hung classifier from wedging delivery forever.
+		cctx, cancel := context.WithTimeout(ctx, secretlane.DefaultBudget)
+		v, cerr := o.Classifier.Classify(cctx, l)
+		cancel()
+		if cerr != nil || v.SecretLane {
 			redacted[i] = PlaceholderSecretLane
 		}
 	}

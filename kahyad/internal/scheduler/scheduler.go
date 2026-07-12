@@ -112,6 +112,20 @@ type Scheduler struct {
 	jsonl *logx.Logger
 
 	cron *cron.Cron
+
+	// runLocksMu guards runLocks; runLocks holds one lock PER JOB NAME so
+	// Trigger serializes concurrent invocations of the SAME job (a launchd
+	// missed-run-on-wake catch-up racing the regular scheduled fire, or two
+	// manual `kahya job run <name>` calls) - every such invocation reaches
+	// this ONE daemon's Trigger, so an in-process per-name lock is the
+	// complete fix. Without it, two overlapping runs of an idempotent job
+	// (e.g. the morning briefing) could each pass their own once-per-day DB
+	// check before either recorded its delivery, double-delivering. Distinct
+	// job names never contend (they take different locks); the map is
+	// bounded by the small, fixed set of configured job names, so it needs no
+	// eviction.
+	runLocksMu sync.Mutex
+	runLocks   map[string]*sync.Mutex
 }
 
 // New constructs a Scheduler. log/jsonl may be nil (tests that only
@@ -128,6 +142,7 @@ func New(log EventLogger, jsonl *logx.Logger) *Scheduler {
 		log:            log,
 		jsonl:          jsonl,
 		cron:           cron.New(),
+		runLocks:       make(map[string]*sync.Mutex),
 	}
 	s.RegisterHandler(smokeHandlerName, s.smokeHandler)
 	return s
@@ -212,6 +227,16 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 	}
 
 	go func() {
+		// Serialize same-name invocations (see runLocks' doc comment): a
+		// second concurrent fire of this job blocks here until the first
+		// finishes, then runs - so an idempotent job's own once-per-day (or
+		// similar) guard, re-checked after the lock is acquired, sees the
+		// first run's result and no-ops instead of racing it. Held for the
+		// whole handler run + result ledgering below.
+		lock := s.jobRunLock(name)
+		lock.Lock()
+		defer lock.Unlock()
+
 		// A fresh, independent context: the run must survive the
 		// triggering HTTP request's own context being cancelled (the
 		// caller disconnecting must not abort an in-flight job), the same
@@ -243,6 +268,21 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 		}
 	}()
 	return nil
+}
+
+// jobRunLock returns the per-job-name serialization lock for name,
+// creating it on first use (see runLocks' doc comment). Concurrent
+// invocations of the SAME job take the SAME lock and run one-at-a-time;
+// different job names take different locks and never contend.
+func (s *Scheduler) jobRunLock(name string) *sync.Mutex {
+	s.runLocksMu.Lock()
+	defer s.runLocksMu.Unlock()
+	m, ok := s.runLocks[name]
+	if !ok {
+		m = &sync.Mutex{}
+		s.runLocks[name] = m
+	}
+	return m
 }
 
 // runHandlerRecovered invokes fn(ctx), recovering any panic instead of

@@ -95,11 +95,22 @@ func gateItem(ctx context.Context, classifier Classifier, globs GlobMatcher, ite
 		// bytes through to a cloud-facing prompt.
 		return gateOutcome{Item: item, Line: PlaceholderSecretLane, Dropped: true, DropReason: DropReasonClassifierUnavailable}
 	}
-	verdict, err := classifier.Classify(ctx, item.Text)
+	// Bound the classify call by the warm-model budget (secretlane.
+	// DefaultBudget, 300ms) INDEPENDENTLY of the ctx the caller passed: the
+	// production caller (the scheduler handler) invokes Run with
+	// context.Background() (no deadline), so a genuinely HUNG local Qwen
+	// (connection accepted, never answers - HTTPQwenClassifier has no timeout
+	// of its own) would otherwise wedge the entire briefing forever with no
+	// fail-closed degradation. On deadline the Classify call returns a
+	// context error, which the err branch below already treats fail-closed.
+	cctx, cancel := context.WithTimeout(ctx, secretlane.DefaultBudget)
+	defer cancel()
+	verdict, err := classifier.Classify(cctx, item.Text)
 	if err != nil {
 		// FAIL-CLOSED (task spec, verbatim): "If the local classifier
 		// CANNOT run (model/memory failure), classification is
-		// FAIL-CLOSED: treat the item as secret-lane and DROP it."
+		// FAIL-CLOSED: treat the item as secret-lane and DROP it." A hung
+		// classifier surfaces here as context.DeadlineExceeded (see above).
 		return gateOutcome{Item: item, Line: PlaceholderSecretLane, Dropped: true, DropReason: DropReasonClassifyFailed}
 	}
 	if verdict.SecretLane {
