@@ -543,7 +543,30 @@ func (e *Engine) recomputeConfidence(ctx context.Context, factID int64) error {
 	maxCap := 0.0
 	hasCap := false
 	for _, r := range rows {
-		key := r.SessionID.String + "|" + strconv.FormatInt(r.Polarity, 10)
+		// Dedup key, by polarity:
+		//   POSITIVE (supporting): key by TIER (its weight IS the tier cap, so
+		//   equal weights are the same tier). Every distinct tier contributes
+		//   its cap exactly ONCE - so different tiers SUM
+		//   (agent_derived + external_doc, the cross-session test), while
+		//   repeated same-tier observations SATURATE at that tier's cap
+		//   instead of piling further. Without this, a tier whose cap is
+		//   NEGATIVE (agent_derived, logit(0.4) < 0) summed each extra positive
+		//   observation DOWNWARD, past its own ceiling - more supporting
+		//   evidence wrongly LOWERING confidence (the W5-04 review's #2/#3).
+		//   NEGATIVE (denial): key by (session, polarity) so a same-session
+		//   repeat is one denial while independent-session denials accumulate.
+		var key string
+		if r.Polarity > 0 {
+			key = "pos|" + strconv.FormatFloat(r.Weight, 'g', -1, 64)
+		} else {
+			sk := r.SessionID.String
+			if !r.SessionID.Valid || sk == "" {
+				// No session context (e.g. hot-window promotion) - key by the
+				// row's own identity so distinct observations are not collapsed.
+				sk = "row:" + strconv.FormatInt(r.ID, 10)
+			}
+			key = "neg|" + sk
+		}
 		if seen[key] {
 			continue
 		}

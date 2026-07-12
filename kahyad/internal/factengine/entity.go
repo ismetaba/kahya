@@ -42,6 +42,51 @@ import (
 // merge two entities without a real fact backing the decision.
 var ErrMergeRequiresEvidence = errors.New("factengine: entity merge requires >=1 distinguishing evidence (a real fact_id)")
 
+// ErrMergeEvidenceUnusable is returned by MergeEntities when the cited fact
+// EXISTS but cannot serve as distinguishing evidence: it is not active
+// (retracted/closed), or it references neither entity being merged (a
+// totally-unrelated fact). HANDOFF S5 memory #2's "en az bir ayirt edici
+// kanit" means evidence that actually distinguishes THESE two entities, not
+// merely any row in the facts table.
+var ErrMergeEvidenceUnusable = errors.New("factengine: cited merge evidence is not a usable distinguishing fact")
+
+// entityNames returns entityID's canonical name plus every alias on file -
+// the set of surface strings a distinguishing fact must mention to count as
+// referencing this entity.
+func (e *Engine) entityNames(ctx context.Context, entityID int64, canonical string) ([]string, error) {
+	aliases, err := e.store.ListEntityAliasesByEntity(ctx, entityID)
+	if err != nil {
+		return nil, fmt.Errorf("factengine: list aliases for entity %d: %w", entityID, err)
+	}
+	names := make([]string, 0, len(aliases)+1)
+	if canonical != "" {
+		names = append(names, canonical)
+	}
+	for _, a := range aliases {
+		if a.Alias != "" {
+			names = append(names, a.Alias)
+		}
+	}
+	return names, nil
+}
+
+// factReferencesAnyName reports whether subject or object mentions any of
+// names (case-insensitive substring). Substring (not exact) so a fact whose
+// subject is "Emre (gold-token ekibinden)" still counts as referencing the
+// "Emre" entity.
+func factReferencesAnyName(subject, object string, names []string) bool {
+	hay := strings.ToLower(subject + "\x00" + object)
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if strings.Contains(hay, strings.ToLower(n)) {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrMergeLedgerNotFound is returned by SplitEntities when
 // mergeLedgerID does not exist.
 var ErrMergeLedgerNotFound = errors.New("factengine: merge_ledger row not found")
@@ -115,17 +160,47 @@ func (e *Engine) MergeEntities(ctx context.Context, traceID string, dstEntityID,
 	if dstEntityID == srcEntityID {
 		return 0, errors.New("factengine: cannot merge an entity into itself")
 	}
-	if _, err := e.store.GetFact(ctx, evidenceFactID); err != nil {
+	evFact, err := e.store.GetFact(ctx, evidenceFactID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, ErrMergeRequiresEvidence
 		}
 		return 0, fmt.Errorf("factengine: merge evidence lookup: %w", err)
 	}
-	if _, err := e.store.GetEntity(ctx, dstEntityID); err != nil {
+	dstEnt, err := e.store.GetEntity(ctx, dstEntityID)
+	if err != nil {
 		return 0, fmt.Errorf("factengine: merge: entity %d: %w", dstEntityID, err)
 	}
-	if _, err := e.store.GetEntity(ctx, srcEntityID); err != nil {
+	srcEnt, err := e.store.GetEntity(ctx, srcEntityID)
+	if err != nil {
 		return 0, fmt.Errorf("factengine: merge: entity %d: %w", srcEntityID, err)
+	}
+
+	// The cited fact must actually be usable as distinguishing evidence
+	// (HANDOFF S5 memory #2 "en az bir ayirt edici kanit sart"), not merely
+	// exist: (a) it must be ACTIVE - a retracted/closed fact is not evidence
+	// of anything current; (b) it must REFERENCE at least one of the two
+	// entities being merged (its subject or object mentions that entity's
+	// canonical name or an alias) - otherwise a totally-unrelated fact_id
+	// would satisfy the gate, which the W5-04 review reproduced (merging two
+	// "Emre" namesakes citing "unrelated-user-9999 likes kahve", and citing a
+	// RETRACTED fact, both wrongly succeeded). The FINAL distinguishing
+	// judgment is the user's (the CLI shows the cited fact - see runEntityMerge),
+	// but the engine refuses evidence that is closed or unrelated outright.
+	if evFact.Status != "active" {
+		return 0, fmt.Errorf("%w: cited fact %d is not active (status=%s)", ErrMergeEvidenceUnusable, evidenceFactID, evFact.Status)
+	}
+	names, err := e.entityNames(ctx, dstEntityID, dstEnt.CanonicalName)
+	if err != nil {
+		return 0, err
+	}
+	srcNames, err := e.entityNames(ctx, srcEntityID, srcEnt.CanonicalName)
+	if err != nil {
+		return 0, err
+	}
+	names = append(names, srcNames...)
+	if !factReferencesAnyName(evFact.Subject, evFact.Object, names) {
+		return 0, fmt.Errorf("%w: cited fact %d references neither entity being merged", ErrMergeEvidenceUnusable, evidenceFactID)
 	}
 
 	srcAliasRows, err := e.store.ListEntityAliasesByEntity(ctx, srcEntityID)
