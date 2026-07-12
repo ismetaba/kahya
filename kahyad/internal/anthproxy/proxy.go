@@ -759,7 +759,41 @@ func (p *Proxy) handleUpstreamError(w http.ResponseWriter, r *http.Request, err 
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", MsgCloudUnreachableMarker)
 		return
 	}
+	// A TRANSPORT-level NonRetryable failure (retry.go's ErrNonRetryable):
+	// there is no HTTP response to route through ModifyResponse, so this is
+	// the ONLY place OnNonRetryableFailure can fire for it - exactly as
+	// wrapResponseBody fires it for the HTTP-status NonRetryable path. Without
+	// this branch the task would never leave 'executing' and the outbox loop
+	// would re-dispatch it forever with no give-up.
+	if errors.Is(err, ErrNonRetryable) {
+		p.onNonRetryableTransport(r)
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "Yukari akis baglantisi basarisiz.")
+		return
+	}
 	writeAnthropicError(w, http.StatusBadGateway, "api_error", "Yukari akis baglantisi basarisiz.")
+}
+
+// onNonRetryableTransport fires OnNonRetryableFailure for a transport-level
+// NonRetryable failure (ErrNonRetryable) - the ErrorHandler-path twin of
+// wrapResponseBody's own NonRetryable hook. reqData.NonRetryableReason was
+// set by retryTransport.RoundTrip before it returned the wrapped error
+// (retry.go); this reads it back the same way onCloudUnreachable reads
+// RetryAttempts. context.Background(), not r.Context(): the inbound request
+// context is already being torn down on this error path, but kahyad must
+// still record the task's failure (mirroring wrapResponseBody's own
+// persistCtx rationale).
+func (p *Proxy) onNonRetryableTransport(r *http.Request) {
+	data, _ := r.Context().Value(reqDataCtxKey{}).(*reqData)
+	reason := ""
+	if data != nil {
+		reason = data.NonRetryableReason
+	}
+	if reason == "" {
+		reason = "transport_error"
+	}
+	if p.cfg.OnNonRetryableFailure != nil {
+		_ = p.cfg.OnNonRetryableFailure(context.Background(), p.cfg.TaskID, reason)
+	}
 }
 
 // onCloudUnreachable implements task spec step 3's exhaustion path:

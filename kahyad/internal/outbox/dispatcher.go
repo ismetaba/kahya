@@ -408,10 +408,45 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		return
 	}
 
-	// Non-zero exit (or a spawn-level error) WITHOUT a terminal task
-	// state: leave the row unacknowledged (task spec step 7) - lease
-	// expiry drives the re-claim, and ClaimOutboxRow already incremented
-	// outbox.attempts for THIS claim regardless of how it turns out.
+	// Not a clean success. The W4-04 cloud-retry callbacks
+	// (anthproxy.OnCloudUnreachable -> task.CloudRetry.ParkOrGiveUp,
+	// anthproxy.OnNonRetryableFailure -> task.CloudRetry.FailNonRetryable)
+	// fire SYNCHRONOUSLY mid-spawn.Run, so by the time we get here the task
+	// may already have been re-parked or moved to a terminal state. Reload
+	// it and decide THIS claimed row's fate by that final status:
+	//
+	//   - bekliyor-yeniden-deneme (re-parked): ParkOrGiveUp already enqueued
+	//     a FRESH outbox row scheduled at next_retry_at
+	//     (1m/5m/15m/60m/hourly) that now owns the next attempt. THIS row
+	//     must be marked delivered - otherwise its short claim-lease
+	//     (leaseDuration, default 2m) re-claims the task far earlier than the
+	//     park's own next_retry_at, bypassing the backoff schedule entirely
+	//     and spawning a brand-new stale row on every subsequent failure.
+	//   - done/failed/user_halted/blocked_user (terminal): nothing more to
+	//     redeliver; mark delivered so it is never re-claimed.
+	//   - still executing/intent (a genuine crash - the worker died with
+	//     nothing having parked or failed the task): leave the row
+	//     unacknowledged (task spec step 7) so lease expiry re-claims it,
+	//     the original W4-02 at-least-once recovery path.
+	cur, gerr := d.store.GetTaskByID(ctx, t.ID)
+	if gerr != nil {
+		// Can't determine the task's post-run state - leave the row for
+		// lease-expiry re-claim rather than risk dropping a needed
+		// redelivery (fail toward "retry", never toward "silently drop").
+		d.ledgerRaw(ctx, t.TraceID, "outbox.task_reload_failed", map[string]any{
+			"event": "outbox.task_reload_failed", "task_id": t.ID, "outbox_id": row.ID, "err": gerr.Error(),
+		})
+		return
+	}
+	switch cur.Status {
+	case task.StatusRetryWait, task.StatusDone, task.StatusFailed,
+		task.StatusUserHalted, task.StatusBlockedUser:
+		d.markDelivered(ctx, row.ID)
+	default:
+		// still executing/intent: genuine crash, leave unacknowledged for
+		// lease-expiry re-claim (ClaimOutboxRow already bumped
+		// outbox.attempts for THIS claim regardless of outcome).
+	}
 }
 
 // renewLeaseWhileRunning extends outboxID's lease every leaseDuration/3

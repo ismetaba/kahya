@@ -25,6 +25,24 @@ const defaultMaxInlineRetries = 3
 // other outcome).
 var ErrRetriesExhausted = errors.New("anthproxy: cloud upstream retries exhausted")
 
+// ErrNonRetryable is the sentinel retryTransport.RoundTrip wraps around a
+// TRANSPORT-level NonRetryable failure (resp==nil, err!=nil - e.g. a TLS
+// certificate error or a scheme mismatch that cloudretry.Classify verdicts
+// NonRetryable). An HTTP-STATUS NonRetryable outcome (a real 4xx response,
+// resp!=nil, err==nil) is returned as (resp, nil) and reaches
+// ModifyResponse (wrapResponseBody), which is where OnNonRetryableFailure
+// fires for it. But a transport-level failure has no response at all, so
+// RoundTrip must return a non-nil error - and httputil.ReverseProxy routes
+// EVERY non-nil RoundTrip error to the ErrorHandler
+// (Proxy.handleUpstreamError), NEVER ModifyResponse. Without a sentinel to
+// distinguish it from a bug-shaped generic error, that path would fall
+// through to a plain 502 and NEVER fire OnNonRetryableFailure - leaving the
+// task stuck in 'executing' and (via the outbox redispatch loop)
+// re-dispatched forever with no give-up. handleUpstreamError branches on
+// this sentinel to fire OnNonRetryableFailure exactly as the HTTP-status
+// path's ModifyResponse does.
+var ErrNonRetryable = errors.New("anthproxy: cloud upstream non-retryable transport failure")
+
 // retryAttemptLogger is called once per upstream attempt (task spec step
 // 2: "each retry logs JSONL with trace_id, attempt number, status").
 // errMsg is empty on a real HTTP response, even an error-status one.
@@ -100,10 +118,30 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			data.RetryAttempts = attempt
 		}
 		if class == cloudretry.NonRetryable {
-			if data != nil {
-				data.NonRetryableReason = cloudretry.ReasonForStatus(status)
+			reason := cloudretry.ReasonForStatus(status)
+			if status == 0 {
+				// Transport-level NonRetryable: there is no HTTP status, so
+				// ReasonForStatus(0) would yield the meaningless "http_0" -
+				// use a stable, English transport identifier instead (this is
+				// the <sebep> substituted into the Turkish failure string).
+				reason = "transport_error"
 			}
-			return resp, err // forwarded to the worker unchanged - a single attempt, never retried
+			if data != nil {
+				data.NonRetryableReason = reason
+			}
+			if err != nil {
+				// Transport-level NonRetryable (resp==nil): a non-nil RoundTrip
+				// error is routed by httputil.ReverseProxy to the ErrorHandler
+				// (handleUpstreamError), NOT ModifyResponse - so
+				// wrapResponseBody's OnNonRetryableFailure hook can never fire
+				// for this path. Wrap in ErrNonRetryable so handleUpstreamError
+				// fires it there instead. (See ErrNonRetryable's doc comment.)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				return nil, fmt.Errorf("%w: %v", ErrNonRetryable, err)
+			}
+			return resp, err // HTTP-status NonRetryable: (resp, nil) -> ModifyResponse fires the hook
 		}
 
 		// Retryable: close this attempt's response body (never returned to
