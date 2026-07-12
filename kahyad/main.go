@@ -494,6 +494,21 @@ func run() int {
 	srv.SetTaskDurability(taskResolver, st.Queries, taskLive)
 	srv.SetTaskLiveRegistry(taskLive)
 
+	// W4-07 acceptance gate: the dev-only w2_slow_stub MCP tool
+	// (kahyad/internal/server/devstub.go) is the ONLY thing that drives the
+	// REAL kahyad/internal/task.Receipts intent->executing->receipt
+	// lifecycle end to end - fs_write/shell_docker/applescript_run do not
+	// (yet) call Receipts.Execute at all (see receipts.go's own doc comment
+	// history; the memory note "kahya-w4-receipt-gap" tracks closing that
+	// gap for the REAL tools separately, before W78-06 dogfood). Registered
+	// onto the shared MCP server ONLY under KAHYA_ENV=dev - never
+	// reachable in production regardless of what a (also dev-only)
+	// policy.yaml overlay declares the tool as.
+	if cfg.Env == config.EnvDev {
+		taskReceipts := task.NewReceipts(st.DB(), st.Queries, st)
+		srv.SetDevStub(taskReceipts)
+	}
+
 	// W4-04: cloud-call error taxonomy - task-side park/give-up/fail-
 	// immediately decision (kahyad/internal/task.CloudRetry), driven by
 	// kahyad/internal/anthproxy's inline retry loop via
@@ -735,10 +750,16 @@ func run() int {
 	// process (crash, SIGKILL, machine restart) is correctly treated as
 	// interrupted.
 	runResumeScan(context.Background())
-	if err := sched.RegisterTick("task_resume_scan", "@every 30s", runResumeScan); err != nil {
+	// W4-07: the tick intervals themselves are now cfg-driven (default 30s/
+	// 5s, unchanged from the literal specs this replaced) so a hermetic
+	// acceptance gate (tests/acceptance/w4, scripts/accept_w4.sh) can
+	// override them down to a couple of seconds via config.yaml, instead of
+	// a CI-speed run having to wait out the full production cadence for the
+	// resume scan/outbox dispatcher to notice a crashed/killed worker.
+	if err := sched.RegisterTick("task_resume_scan", fmt.Sprintf("@every %ds", cfg.ResumeScanIntervalSeconds), runResumeScan); err != nil {
 		log.Error("task_resume_scan_tick_register_failed", "err", err.Error())
 	}
-	if err := sched.RegisterTick("outbox_dispatch", "@every 5s", runOutboxDispatch); err != nil {
+	if err := sched.RegisterTick("outbox_dispatch", fmt.Sprintf("@every %ds", cfg.OutboxDispatchIntervalSeconds), runOutboxDispatch); err != nil {
 		log.Error("outbox_dispatch_tick_register_failed", "err", err.Error())
 	}
 
@@ -759,9 +780,12 @@ func run() int {
 	// does.
 	anchorRepoDir := filepath.Join(cfg.DataDir, "anchor-repo")
 	anchorGitRunner := anchor.NewExecGitRunner()
-	anchorPusher := anchor.NewPusher(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir, cfg.AnchorLocalFallbackPath, cfg.AnchorIntervalHours)
+	warnAnchorKeyOverrideIgnored := func() {
+		log.Warn("anchor_key_override_ignored", "reason", "KAHYA_ANCHOR_KEY_OVERRIDE set outside KAHYA_ENV=dev")
+	}
+	anchorPusher := anchor.NewPusher(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir, cfg.AnchorLocalFallbackPath, cfg.AnchorIntervalHours, cfg.Env, warnAnchorKeyOverrideIgnored)
 	anchorPusher.SetJSONLLogger(log)
-	anchorVerifier := anchor.NewVerifier(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir)
+	anchorVerifier := anchor.NewVerifier(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir, cfg.Env, warnAnchorKeyOverrideIgnored)
 	anchorVerifier.SetJSONLLogger(log)
 	srv.SetLedgerVerifier(anchorVerifier)
 

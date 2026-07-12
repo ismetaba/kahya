@@ -775,15 +775,60 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// task already parked in bekliyor-yeniden-deneme must NOT also be
 	// forced to 'done'/'failed' here - it is correctly still in flight,
 	// waiting for the outbox dispatcher's own later redelivery).
-	if s.taskMachine != nil {
+	//
+	// W4-07 fix (defect the acceptance gate surfaced): spawn.Run returning
+	// with anything OTHER than a clean StatusOK success no longer forces
+	// this task straight to 'failed' here. Two independent problems with
+	// the old unconditional "not OK -> failed" branch, both found building
+	// this gate's scenario A (kill -9 the worker mid a W2 tool call):
+	//
+	//  1. spawn.Run returning only ever means the WORKER PROCESS exited -
+	//     it says nothing about whether a side-effectful tool call that
+	//     worker started is still genuinely executing INSIDE KAHYAD's own
+	//     process. Receipts.Execute's effect runs on the HTTP goroutine
+	//     that served the worker's /v1/mcp call, entirely independent of
+	//     the worker process's own lifetime (kill -9 on just the worker
+	//     pid - exactly how `kahya task show <id>`'s PID is meant to be
+	//     killed - never touches that goroutine). Forcing 'failed' here
+	//     strands the task in a TERMINAL state before kahyad/internal/
+	//     task.Resume's own periodic scan ever gets a chance to evaluate
+	//     it - defeating the entire W4-02 double-execution-safety
+	//     guarantee (a resumed replay needs the task to still be
+	//     'executing' for the resume scan to ever look at it at all).
+	//  2. A DB-query-based guard here (an earlier version of this fix
+	//     checked "is any tool_calls row still receipt-less" before
+	//     deciding) does not actually work: kahyad/internal/store opens
+	//     brain.db with a single connection (SetMaxOpenConns(1) - "long
+	//     transactions block everything"), and Receipts.Execute holds
+	//     that ONE connection for the effect's entire duration. A guard
+	//     query issued the instant spawn.Run returns BLOCKS on that same
+	//     connection until the in-flight effect's transaction commits -
+	//     by which time the row is no longer receipt-less (confirmed
+	//     empirically: such a guard query never once observed "in
+	//     flight", it always returned right after the receipt had
+	//     already landed).
+	//
+	// The fix that actually holds under that constraint: never decide
+	// "failed" HERE at all - only 'done' (spawn.Run's own StatusOK,
+	// requiring absolutely no further DB read to trust) is decided
+	// eagerly; every non-OK outcome is left at 'executing', deferred
+	// ENTIRELY to kahyad/internal/task.Resume's own periodic scan
+	// (main.go's task_resume_scan tick, which runs on its own schedule and
+	// is never blocked by THIS request's goroutine) - exactly the
+	// authority table task spec step 6 already defines: no receipt-less
+	// tool_calls row -> resume; W1 receipt-less within cap -> auto-retry;
+	// W1 past cap or any W2/W3 receipt-less -> blocked_user. This also
+	// means an ordinary transient worker crash (no tool call in flight at
+	// all) now auto-resumes via that same scan rather than being
+	// permanently marked 'failed' - the resume scan's own decision tree
+	// already covers that case correctly (a genuinely broken worker still
+	// eventually surfaces to the user via blocked_user/W1's retry cap, it
+	// simply takes one more tick to get there).
+	if s.taskMachine != nil && runErr == nil && outcome.Status == spawn.StatusOK {
 		current, gerr := s.taskDurabilityStatus(persistCtx, taskID)
 		if gerr == nil && current == task.StatusExecuting {
-			to := task.StatusDone
-			if runErr != nil || outcome.Status != spawn.StatusOK {
-				to = task.StatusFailed
-			}
-			if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, to); terr != nil {
-				log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", to, "err", terr.Error())
+			if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, task.StatusDone); terr != nil {
+				log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", task.StatusDone, "err", terr.Error())
 			}
 		}
 	}

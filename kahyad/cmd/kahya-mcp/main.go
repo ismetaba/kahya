@@ -50,6 +50,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,6 +63,34 @@ import (
 // W12-05 acceptance test's "process exits non-zero within 5s" budget,
 // never left to hang on a slow/stuck connection.
 const requestTimeout = 4 * time.Second
+
+// requestTimeoutOverrideEnvVar lets a caller widen requestTimeout for ONE
+// deliberately long-running tool call (W4-07: the dev-only w2_slow_stub
+// acceptance-gate stub genuinely blocks kahyad-side for the call's own
+// duration_ms - up to the real-time evidence run's >=600s - and this
+// bridge's fixed 4s default would otherwise misreport that as "kahyad
+// unreachable" well before the call could ever legitimately finish).
+// Absent (the default, every production/ordinary-test invocation), the 4s
+// default is unchanged. This does not weaken the "dead daemon detected
+// fast" property that default protects: it is an explicit, deliberate
+// per-invocation opt-in, never a silent global loosening.
+const requestTimeoutOverrideEnvVar = "KAHYA_MCP_REQUEST_TIMEOUT_S"
+
+// resolveRequestTimeout returns requestTimeout, widened by
+// requestTimeoutOverrideEnvVar when it is set to a valid positive integer
+// number of seconds - any other value (unset, non-numeric, non-positive)
+// falls back to the unchanged 4s default.
+func resolveRequestTimeout() time.Duration {
+	v := os.Getenv(requestTimeoutOverrideEnvVar)
+	if v == "" {
+		return requestTimeout
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds <= 0 {
+		return requestTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 // mcpEndpoint is kahyad's fixed MCP route. The host part is a fake
 // hostname (never resolved - the Transport's DialContext always dials the
@@ -80,6 +109,17 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	if traceID == "" {
 		traceID = traceid.New()
 	}
+	// taskID (KAHYA_TASK_ID - kahyad/internal/spawn.BuildEnv already sets
+	// this on the worker's own environment, which this bridge process
+	// inherits as the worker's child) is forwarded as X-Kahya-Task-Id on
+	// every relayed request (W4-07: kahyad/internal/server/mcp.go's
+	// taskHeader doc comment names this exact seam - "a future bridge MAY
+	// propagate a task_id through as [X-Kahya-Task-Id]... kahya-mcp does
+	// not send this today"). Empty is fine (relay simply omits the
+	// header): kahyad's own policyGateMiddleware/taskIDFromRequest already
+	// treat an absent header as "resolve by trace_id alone", exactly
+	// today's pre-existing behavior.
+	taskID := os.Getenv("KAHYA_TASK_ID")
 
 	sock, err := resolveSocket()
 	if err != nil {
@@ -89,7 +129,7 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	logLine(stderr, traceID, "info", "bridge_start", "socket="+sock)
 
 	client := &http.Client{
-		Timeout: requestTimeout,
+		Timeout: resolveRequestTimeout(),
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -110,7 +150,7 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 		// readLogLines documents for its own line-at-a-time JSONL scan).
 		line, readErr := reader.ReadString('\n')
 		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			status := relay(client, traceID, trimmed, writer, stderr)
+			status := relay(client, traceID, taskID, trimmed, writer, stderr)
 			writer.Flush()
 			if status != 0 {
 				return status
@@ -137,7 +177,7 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 // of silence. Any OTHER response (including a non-2xx HTTP status from
 // kahyad) is relayed to out verbatim - this binary has no opinion on MCP
 // semantics, per the package doc.
-func relay(client *http.Client, traceID, line string, out io.Writer, stderr io.Writer) int {
+func relay(client *http.Client, traceID, taskID, line string, out io.Writer, stderr io.Writer) int {
 	req, err := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewBufferString(line))
 	if err != nil {
 		writeTransportError(out, line, err)
@@ -147,6 +187,9 @@ func relay(client *http.Client, traceID, line string, out io.Writer, stderr io.W
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("X-Kahya-Trace-Id", traceID)
+	if taskID != "" {
+		req.Header.Set("X-Kahya-Task-Id", taskID)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

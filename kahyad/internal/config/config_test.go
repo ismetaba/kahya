@@ -16,6 +16,23 @@ func clearEnv(t *testing.T) {
 	}
 }
 
+// writeConfigYAML writes <home>/Library/Application Support/Kahya/
+// config.yaml with the given raw yaml body - the prod data_dir specifically
+// (not env-dependent), matching every pre-existing inline config.yaml
+// writer in this file (e.g. TestLoadFileOverridesAnchorKeys): tests that
+// need the yaml under a DIFFERENT (e.g. dev-profile) data_dir must still
+// write it there themselves.
+func writeConfigYAML(t *testing.T, home, yaml string) {
+	t.Helper()
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	clearEnv(t)
 	home := t.TempDir()
@@ -781,6 +798,168 @@ func TestLoadRejectsInvalidEnv(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("Load() error = nil, want rejection of invalid KAHYA_ENV")
+	}
+}
+
+// TestLoadDevProfileDerivesSeparatePaths guards W4-07's dev-profile
+// plumbing: KAHYA_ENV=dev, with no other override, must derive an entirely
+// separate set of paths (data_dir/socket/memory_dir/kahya_dir/backup_dir)
+// from the production defaults - never sharing a single file on disk with
+// a prod kahyad by construction.
+func TestLoadDevProfileDerivesSeparatePaths(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	wantDataDir := filepath.Join(home, "Library", "Application Support", "Kahya-dev")
+	if cfg.DataDir != wantDataDir {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, wantDataDir)
+	}
+	if want := filepath.Join(wantDataDir, "kahyad-dev.sock"); cfg.Socket != want {
+		t.Errorf("Socket = %q, want %q", cfg.Socket, want)
+	}
+	if want := filepath.Join(wantDataDir, "brain.db"); cfg.DBPath != want {
+		t.Errorf("DBPath = %q, want %q", cfg.DBPath, want)
+	}
+	if want := filepath.Join(home, "Kahya-dev", "memory"); cfg.MemoryDir != want {
+		t.Errorf("MemoryDir = %q, want %q", cfg.MemoryDir, want)
+	}
+	if want := filepath.Join(home, "Kahya-dev"); cfg.KahyaDir != want {
+		t.Errorf("KahyaDir = %q, want %q", cfg.KahyaDir, want)
+	}
+	if want := filepath.Join(home, "Kahya-dev", "backups"); cfg.BackupDir != want {
+		t.Errorf("BackupDir = %q, want %q", cfg.BackupDir, want)
+	}
+
+	// Never collides with the prod defaults on any of these paths.
+	prod, err := loadWithEnv(t, home, "prod")
+	if err != nil {
+		t.Fatalf("Load() (prod) error = %v", err)
+	}
+	if cfg.DataDir == prod.DataDir || cfg.Socket == prod.Socket || cfg.DBPath == prod.DBPath ||
+		cfg.MemoryDir == prod.MemoryDir || cfg.KahyaDir == prod.KahyaDir || cfg.BackupDir == prod.BackupDir {
+		t.Fatalf("dev profile path collided with prod: dev=%+v prod=%+v", cfg, prod)
+	}
+}
+
+// loadWithEnv re-invokes Load() under home with KAHYA_ENV=env, clearing
+// every other config-relevant env var first (t.Setenv itself already
+// restores the previous value on subtest cleanup).
+func loadWithEnv(t *testing.T, home, env string) (Config, error) {
+	t.Helper()
+	clearEnv(t)
+	t.Setenv("HOME", home)
+	if env != "" {
+		t.Setenv("KAHYA_ENV", env)
+	}
+	return Load()
+}
+
+// TestLoadDevProfileRefusesProdDBPath guards the W4-07 HARD CONSTRAINT: a
+// dev-profile process whose db_path (however that got set - here, a
+// direct KAHYA_DB_PATH override) still resolves to the real production
+// brain.db path must fail Load closed, never silently open it.
+func TestLoadDevProfileRefusesProdDBPath(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+	prodDBPath := filepath.Join(home, "Library", "Application Support", "Kahya", "brain.db")
+	t.Setenv("KAHYA_DB_PATH", prodDBPath)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want refusal: dev profile must never open the prod brain.db path")
+	}
+}
+
+// TestLoadDevProfileAllowsOwnDBPath guards against an over-broad refusal:
+// a dev profile using ITS OWN (non-prod) db_path - whether derived by
+// default or explicitly overridden to some other path entirely - must load
+// cleanly.
+func TestLoadDevProfileAllowsOwnDBPath(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v, want dev profile's own default db_path accepted", err)
+	}
+
+	t.Setenv("KAHYA_DB_PATH", filepath.Join(home, "somewhere-else", "brain.db"))
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v, want an explicit non-prod db_path accepted under dev", err)
+	}
+}
+
+// TestLoadTickIntervalDefaults guards the W4-07 tick-interval knobs'
+// unchanged-production-cadence defaults (30s/5s).
+func TestLoadTickIntervalDefaults(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ResumeScanIntervalSeconds != 30 {
+		t.Errorf("ResumeScanIntervalSeconds = %d, want 30", cfg.ResumeScanIntervalSeconds)
+	}
+	if cfg.OutboxDispatchIntervalSeconds != 5 {
+		t.Errorf("OutboxDispatchIntervalSeconds = %d, want 5", cfg.OutboxDispatchIntervalSeconds)
+	}
+}
+
+// TestLoadFileOverridesTickIntervals guards the config.yaml override path a
+// hermetic acceptance gate (tests/acceptance/w4, scripts/accept_w4.sh)
+// relies on to run CI-speed instead of waiting out the full production
+// cadence.
+func TestLoadFileOverridesTickIntervals(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, "resume_scan_interval_seconds: 2\noutbox_dispatch_interval_seconds: 1\n")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ResumeScanIntervalSeconds != 2 {
+		t.Errorf("ResumeScanIntervalSeconds = %d, want 2", cfg.ResumeScanIntervalSeconds)
+	}
+	if cfg.OutboxDispatchIntervalSeconds != 1 {
+		t.Errorf("OutboxDispatchIntervalSeconds = %d, want 1", cfg.OutboxDispatchIntervalSeconds)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidTickIntervals guards validateTickIntervals'
+// fail-closed posture (mirrors every other validate* test in this file).
+func TestLoadFailsClosedOnInvalidTickIntervals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{"resume_scan_zero", "resume_scan_interval_seconds: 0\n"},
+		{"outbox_dispatch_negative", "outbox_dispatch_interval_seconds: -1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() error = nil, want rejection of a non-positive tick interval")
+			}
+		})
 	}
 }
 

@@ -62,13 +62,16 @@ type Verifier struct {
 }
 
 // NewVerifier constructs a production Verifier, wired to the real
-// kahya.anchor Keychain deploy key (AnchorDeployKey) - the ONLY
-// constructor kahyad/main.go (or any other caller outside this package)
-// may use, mirroring NewPusher's own doc comment exactly (the same
-// anchor_import_guard_test.go enforces this for both). notifier/ledger may
-// be nil, matching every other constructor in this package.
-func NewVerifier(store VerifyStore, ledger Ledger, notifier Notifier, runner GitRunner, remote, repoDir string) *Verifier {
-	return newVerifier(store, ledger, notifier, runner, AnchorDeployKey(), remote, repoDir)
+// kahya.anchor Keychain deploy key (AnchorDeployKey, via resolveDeployKey's
+// W4-07 dev-only override - see that function's own doc comment) - the
+// ONLY constructor kahyad/main.go (or any other caller outside this
+// package) may use, mirroring NewPusher's own doc comment exactly (the
+// same anchor_import_guard_test.go enforces this for both). notifier/
+// ledger may be nil, matching every other constructor in this package. env/
+// onOverrideOutsideDev mirror NewPusher's own identically-named
+// parameters.
+func NewVerifier(store VerifyStore, ledger Ledger, notifier Notifier, runner GitRunner, remote, repoDir string, env string, onOverrideOutsideDev func()) *Verifier {
+	return newVerifier(store, ledger, notifier, runner, resolveDeployKey(env, onOverrideOutsideDev), remote, repoDir)
 }
 
 // newVerifier is Verifier's real constructor, parameterized on deployKey -

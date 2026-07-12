@@ -61,19 +61,23 @@ type Pusher struct {
 }
 
 // NewPusher constructs a production Pusher, wired to the real kahya.anchor
-// Keychain deploy key (AnchorDeployKey) - the ONLY constructor kahyad/
-// main.go (or any other caller outside this package) may use; that is
-// exactly what anchor_import_guard_test.go enforces (AnchorDeployKey
-// itself is referenced only here, inside this package). notifier/ledger
-// may be nil (best-effort, matching this codebase's "unwired dependency"
-// convention). remote=="" makes Run a permanent no-op (task spec's own
-// gating note: "ONLY attempt a real push when anchor.remote is
-// configured", mirroring how W4-06 gates real side effects so dev/test
-// never push to a real remote) - main.go always constructs a Pusher, but
-// dev/test's default empty anchor.remote makes every call here inert
-// without needing a separate KAHYA_ENV check.
-func NewPusher(store PushStore, ledger Ledger, notifier Notifier, runner GitRunner, remote, repoDir, localFallbackPath string, intervalHours int) *Pusher {
-	return newPusher(store, ledger, notifier, runner, AnchorDeployKey(), remote, repoDir, localFallbackPath, intervalHours)
+// Keychain deploy key (AnchorDeployKey, via resolveDeployKey's W4-07
+// dev-only override - see that function's own doc comment) - the ONLY
+// constructor kahyad/main.go (or any other caller outside this package)
+// may use; that is exactly what anchor_import_guard_test.go enforces
+// (AnchorDeployKey itself is referenced only here, inside this package).
+// notifier/ledger may be nil (best-effort, matching this codebase's
+// "unwired dependency" convention). remote=="" makes Run a permanent no-op
+// (task spec's own gating note: "ONLY attempt a real push when
+// anchor.remote is configured", mirroring how W4-06 gates real side
+// effects so dev/test never push to a real remote) - main.go always
+// constructs a Pusher, but dev/test's default empty anchor.remote makes
+// every call here inert without needing a separate KAHYA_ENV check. env is
+// config.Config.Env ("prod"/"dev") and onOverrideOutsideDev is called
+// (optionally) whenever AnchorKeyOverrideEnvVar is set outside env=="dev" -
+// see resolveDeployKey's own doc comment.
+func NewPusher(store PushStore, ledger Ledger, notifier Notifier, runner GitRunner, remote, repoDir, localFallbackPath string, intervalHours int, env string, onOverrideOutsideDev func()) *Pusher {
+	return newPusher(store, ledger, notifier, runner, resolveDeployKey(env, onOverrideOutsideDev), remote, repoDir, localFallbackPath, intervalHours)
 }
 
 // newPusher is Pusher's real constructor, parameterized on deployKey so

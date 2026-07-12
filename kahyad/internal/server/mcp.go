@@ -155,6 +155,15 @@ func (s *Server) buildMCPHandler() http.Handler {
 	if s.osascriptServer != nil {
 		s.osascriptServer.RegisterTools(mcpServer)
 	}
+	// W4-07: w2_slow_stub, registered onto this SAME shared server ONLY
+	// when SetDevStub has been called (main.go: only under KAHYA_ENV=dev) -
+	// see devstub.go's own package doc comment. Unlike fs/shell/osascript,
+	// this tool has no separate gate chain - it is NOT added to
+	// fsOwnedTools/shellOwnedTools/osascriptOwnedTools, so it goes through
+	// policyGateMiddleware's generic Check+ConsumeToken path below.
+	if s.devStubReceipts != nil {
+		s.registerDevStubTool(mcpServer)
+	}
 	mcpServer.AddReceivingMiddleware(s.policyGateMiddleware())
 
 	streamable := mcp.NewStreamableHTTPHandler(
@@ -320,10 +329,28 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			// Side-effectful classes (W1/W2 - never R, never W3, which never
 			// reaches ResultAllow at all) must present the freshly-minted
 			// token back before executing (HANDOFF §5 enforcement plane).
+			//
+			// W4-07 fix (defect the acceptance gate surfaced): this call used
+			// to omit TaskID entirely. Engine.ConsumeToken compares the
+			// token's REAL bound task_id (row.TaskID, recovered from
+			// approval_tokens - set at mint time from Check's OWN
+			// CheckInput.TaskID, taskID's own value from the SAME request)
+			// against ConsumeInput.TaskID and fails closed
+			// (ErrTokenInvalid/"context_mismatch") on any mismatch. As long as
+			// taskID was ALWAYS "" on both sides (kahya-mcp never forwarded
+			// X-Kahya-Task-Id - see taskHeader's own doc comment history),
+			// "" == "" always matched, silently masking this omission. Once
+			// the bridge started forwarding a REAL task_id (W4-07's own fix,
+			// needed for w2_slow_stub/Receipts.Execute to key tool_calls
+			// correctly), row.TaskID became non-empty while this call's
+			// in.TaskID stayed "" - a guaranteed mismatch that denied EVERY
+			// side-effectful /v1/mcp call (memory_write/memory_forget
+			// included, not just the new dev-only tool). Passing taskID here
+			// closes that gap.
 			if decision.Class != policy.ClassR {
 				if err := s.policyEngine.ConsumeToken(ctx, policy.ConsumeInput{
 					Token: decision.Token, Tool: canonName, Class: decision.Class, Scope: decision.Scope,
-					TraceID: traceID, ToolInput: argBytes,
+					TaskID: taskID, TraceID: traceID, ToolInput: argBytes,
 				}); err != nil {
 					s.log.With(traceID).Error("mcp_consume_token_failed", "tool", canonName, "err", err.Error())
 					return deny(policy.ReasonPolicyStateError)

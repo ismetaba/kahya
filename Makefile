@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 sandbox-image docker-up
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 sandbox-image docker-up
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -58,6 +58,19 @@ test: venv build
 		go test -tags $(TEST_TAGS) ./...; \
 	fi
 	$(PY) -m unittest discover -s worker/tests -v
+	@echo "running W4-07 acceptance gate (tests/acceptance/w4, CI-speed A/B/C)..."
+	@ACCEPT_OUT=$$(go test -tags $(GOTAGS),acceptance ./tests/acceptance/... -v 2>&1); \
+	STATUS=$$?; \
+	echo "$$ACCEPT_OUT"; \
+	if echo "$$ACCEPT_OUT" | grep -q '\[no test files\]' || echo "$$ACCEPT_OUT" | grep -q 'no packages to test'; then \
+		echo ""; \
+		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: tests/acceptance/w4 reported '[no test files]' -- the W4-07 acceptance gate did NOT actually run (a build-tag-gated test package that plain go test silently skips is a forbidden vacuously-green result, tasks/README.md gate rule). Check that -tags includes 'acceptance' and that tests/acceptance/w4/*_test.go all carry the //go:build acceptance constraint." >&2; \
+		exit 1; \
+	fi; \
+	if [ $$STATUS -ne 0 ]; then \
+		echo "W4-07 acceptance gate FAILED (tests/acceptance/w4)" >&2; \
+		exit 1; \
+	fi
 mlx-venv:
 	test -d $(MLX_VENV) || python3 -m venv $(MLX_VENV)
 	$(MLX_PY) -m pip install --quiet -r mlx/embed/requirements.txt
@@ -101,6 +114,7 @@ lint:
 	go vet -tags $(GOTAGS) ./...
 	go vet -tags $(TEST_TAGS) ./...
 	go vet -tags $(GOTAGS),mlx ./...
+	go vet -tags $(GOTAGS),acceptance ./tests/acceptance/...
 	if [ -f sqlc.yaml ]; then \
 		go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate && \
 		git diff --exit-code -- kahyad/internal/store/sqlcgen || \
@@ -183,3 +197,14 @@ uninstall-agent:
 # appendix.
 accept-w12: build
 	bash scripts/accept-w12.sh
+# accept-w4: the W4-07 durability acceptance gate (HANDOFF §6 W4) - an
+# orchestrated REAL-daemon (dev profile) run of scenarios A (kill-resume
+# no-double-execution), B (offline -> reconnect), and C (ledger tamper vs
+# remote anchor). Fast by default (~90s); W4_REAL=1 switches scenario A to
+# the real-time (>=600s) evidence run tasks/w4-durability/
+# W4-07-w4-acceptance.md's own acceptance criteria require once. Cloud-free
+# and headless - no real Anthropic session/API key/Keychain item needed
+# (scripted fixture workers + a local fake upstream + KAHYA_ANCHOR_KEY_
+# OVERRIDE's dev-only escape hatch stand in for all three).
+accept-w4: build
+	bash scripts/accept_w4.sh

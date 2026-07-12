@@ -193,6 +193,13 @@ type Server struct {
 	taskMachine    *task.Machine
 	taskCloudRetry *task.CloudRetry
 
+	// devStubReceipts wires the W4-07 acceptance-gate-only w2_slow_stub MCP
+	// tool (devstub.go) - see SetDevStub's own doc comment. nil (the
+	// default, and ALWAYS nil in production - main.go only calls SetDevStub
+	// under KAHYA_ENV=dev) means buildMCPHandler (mcp.go) never registers
+	// the tool onto the shared MCP server at all.
+	devStubReceipts *task.Receipts
+
 	// sessionTaintDB is the raw *sql.DB handle handleTask's OnSession
 	// callback opens its own transaction against (W4-03 task spec step 1a:
 	// insert this task's session_taint(tier=clean) row in the SAME

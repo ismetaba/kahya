@@ -350,6 +350,23 @@ type Config struct {
 	// append-only file the docs/runbooks/anchor-setup.md offline-fallback
 	// block describes (`chflags sappnd`). Default "" (disabled).
 	AnchorLocalFallbackPath string `yaml:"anchor_local_fallback_path"`
+
+	// --- W4-07 acceptance gate: tick-interval knobs ---
+
+	// ResumeScanIntervalSeconds is the kahyad/internal/task.Resume periodic
+	// scan's own tick interval in seconds (main.go's "task_resume_scan"
+	// RegisterTick spec, default 30 - unchanged production cadence). A
+	// hermetic gate (tests/acceptance/w4, scripts/accept_w4.sh) overrides
+	// this down to a couple of seconds via config.yaml so a CI-speed run
+	// does not have to wait out the full 30s production cadence for the
+	// resume scan to notice a crashed/killed worker's task.
+	ResumeScanIntervalSeconds int `yaml:"resume_scan_interval_seconds"`
+	// OutboxDispatchIntervalSeconds is kahyad/internal/outbox.Dispatcher's
+	// own claim-and-dispatch tick interval in seconds (main.go's
+	// "outbox_dispatch" RegisterTick spec, default 5 - unchanged production
+	// cadence). Same CI-speed-gate override rationale as
+	// ResumeScanIntervalSeconds above.
+	OutboxDispatchIntervalSeconds int `yaml:"outbox_dispatch_interval_seconds"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -385,53 +402,55 @@ type CalendarSpec struct {
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir                 *string      `yaml:"data_dir"`
-	Socket                  *string      `yaml:"socket"`
-	LogDir                  *string      `yaml:"log_dir"`
-	DBPath                  *string      `yaml:"db_path"`
-	MemoryDir               *string      `yaml:"memory_dir"`
-	AnthropicUpstreamURL    *string      `yaml:"anthropic_upstream_url"`
-	EmbedPort               *int         `yaml:"embed_port"`
-	DefaultModel            *string      `yaml:"default_model"`
-	TaskTimeoutMin          *int         `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer     *string      `yaml:"active_embed_model_ver"`
-	LogLevel                *string      `yaml:"log_level"`
-	UndoWindowSeconds       *int         `yaml:"undo_window_seconds"`
-	WorkerCmd               *[]string    `yaml:"worker_cmd"`
-	EmbedCmd                *[]string    `yaml:"embed_cmd"`
-	MCPBridgePath           *string      `yaml:"mcp_bridge_path"`
-	PolicyPath              *string      `yaml:"policy_path"`
-	EgressPort              *int         `yaml:"egress_port"`
-	DockerImageTag          *string      `yaml:"docker_image_tag"`
-	DockerImageDigestPath   *string      `yaml:"docker_image_digest_path"`
-	EgressSidecarDigestPath *string      `yaml:"egress_sidecar_digest_path"`
-	ShellWorkdirRoots       *[]string    `yaml:"shell_workdir_roots"`
-	DailyBudgetUSD          *float64     `yaml:"daily_budget_usd"`
-	MonthlyBudgetUSD        *float64     `yaml:"monthly_budget_usd"`
-	TaskTokenCeiling        *int64       `yaml:"task_token_ceiling"`
-	DowngradeAtRatio        *float64     `yaml:"downgrade_at_ratio"`
-	CacheHitAlarmThreshold  *float64     `yaml:"cache_hit_alarm_threshold"`
-	CredentialMode          *string      `yaml:"credential_mode"`
-	EstRequestTokens        *int64       `yaml:"est_request_tokens"`
-	TelegramChatID          *int64       `yaml:"telegram_chat_id"`
-	TelegramUserID          *int64       `yaml:"telegram_user_id"`
-	TelegramAPIURL          *string      `yaml:"telegram_api_url"`
-	QwenCmd                 *[]string    `yaml:"qwen_cmd"`
-	QwenModelPath           *string      `yaml:"qwen_model_path"`
-	QwenModelName           *string      `yaml:"qwen_model_name"`
-	QwenPort                *int         `yaml:"qwen_port"`
-	QwenIdleTTLSeconds      *int         `yaml:"qwen_idle_ttl_seconds"`
-	Jobs                    *[]JobConfig `yaml:"jobs"`
-	TriggerBinPath          *string      `yaml:"trigger_bin_path"`
-	TaskRetryW1MaxAuto      *int         `yaml:"task_retry_w1_max_auto"`
-	CloudRetryMaxInline     *int         `yaml:"cloud_retry_max_inline"`
-	CloudRetryTaskSchedule  *[]string    `yaml:"cloud_retry_task_schedule"`
-	CloudRetryGiveUpAfter   *string      `yaml:"cloud_retry_give_up_after"`
-	KahyaDir                *string      `yaml:"kahya_dir"`
-	BackupDir               *string      `yaml:"backup_dir"`
-	AnchorRemote            *string      `yaml:"anchor_remote"`
-	AnchorIntervalHours     *int         `yaml:"anchor_interval_hours"`
-	AnchorLocalFallbackPath *string      `yaml:"anchor_local_fallback_path"`
+	DataDir                       *string      `yaml:"data_dir"`
+	Socket                        *string      `yaml:"socket"`
+	LogDir                        *string      `yaml:"log_dir"`
+	DBPath                        *string      `yaml:"db_path"`
+	MemoryDir                     *string      `yaml:"memory_dir"`
+	AnthropicUpstreamURL          *string      `yaml:"anthropic_upstream_url"`
+	EmbedPort                     *int         `yaml:"embed_port"`
+	DefaultModel                  *string      `yaml:"default_model"`
+	TaskTimeoutMin                *int         `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer           *string      `yaml:"active_embed_model_ver"`
+	LogLevel                      *string      `yaml:"log_level"`
+	UndoWindowSeconds             *int         `yaml:"undo_window_seconds"`
+	WorkerCmd                     *[]string    `yaml:"worker_cmd"`
+	EmbedCmd                      *[]string    `yaml:"embed_cmd"`
+	MCPBridgePath                 *string      `yaml:"mcp_bridge_path"`
+	PolicyPath                    *string      `yaml:"policy_path"`
+	EgressPort                    *int         `yaml:"egress_port"`
+	DockerImageTag                *string      `yaml:"docker_image_tag"`
+	DockerImageDigestPath         *string      `yaml:"docker_image_digest_path"`
+	EgressSidecarDigestPath       *string      `yaml:"egress_sidecar_digest_path"`
+	ShellWorkdirRoots             *[]string    `yaml:"shell_workdir_roots"`
+	DailyBudgetUSD                *float64     `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD              *float64     `yaml:"monthly_budget_usd"`
+	TaskTokenCeiling              *int64       `yaml:"task_token_ceiling"`
+	DowngradeAtRatio              *float64     `yaml:"downgrade_at_ratio"`
+	CacheHitAlarmThreshold        *float64     `yaml:"cache_hit_alarm_threshold"`
+	CredentialMode                *string      `yaml:"credential_mode"`
+	EstRequestTokens              *int64       `yaml:"est_request_tokens"`
+	TelegramChatID                *int64       `yaml:"telegram_chat_id"`
+	TelegramUserID                *int64       `yaml:"telegram_user_id"`
+	TelegramAPIURL                *string      `yaml:"telegram_api_url"`
+	QwenCmd                       *[]string    `yaml:"qwen_cmd"`
+	QwenModelPath                 *string      `yaml:"qwen_model_path"`
+	QwenModelName                 *string      `yaml:"qwen_model_name"`
+	QwenPort                      *int         `yaml:"qwen_port"`
+	QwenIdleTTLSeconds            *int         `yaml:"qwen_idle_ttl_seconds"`
+	Jobs                          *[]JobConfig `yaml:"jobs"`
+	TriggerBinPath                *string      `yaml:"trigger_bin_path"`
+	TaskRetryW1MaxAuto            *int         `yaml:"task_retry_w1_max_auto"`
+	CloudRetryMaxInline           *int         `yaml:"cloud_retry_max_inline"`
+	CloudRetryTaskSchedule        *[]string    `yaml:"cloud_retry_task_schedule"`
+	CloudRetryGiveUpAfter         *string      `yaml:"cloud_retry_give_up_after"`
+	KahyaDir                      *string      `yaml:"kahya_dir"`
+	BackupDir                     *string      `yaml:"backup_dir"`
+	AnchorRemote                  *string      `yaml:"anchor_remote"`
+	AnchorIntervalHours           *int         `yaml:"anchor_interval_hours"`
+	AnchorLocalFallbackPath       *string      `yaml:"anchor_local_fallback_path"`
+	ResumeScanIntervalSeconds     *int         `yaml:"resume_scan_interval_seconds"`
+	OutboxDispatchIntervalSeconds *int         `yaml:"outbox_dispatch_interval_seconds"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -442,7 +461,24 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: resolve home dir: %w", err)
 	}
 
-	cfg := defaults(home)
+	// W4-07 dev-profile plumbing: KAHYA_ENV is read HERE, before defaults()
+	// ever runs (not only later, in applyEnv, which still runs and simply
+	// re-assigns the SAME value to cfg.Env) - so the DEFAULT data_dir/
+	// memory_dir/socket/kahya_dir/backup_dir themselves already reflect the
+	// dev profile (~/Library/Application Support/Kahya-dev, ~/Kahya-dev,
+	// kahyad-dev.sock) whenever KAHYA_ENV=dev, with no config.yaml key
+	// needed for it (Config.Env's own doc comment: "env-only"). This also
+	// means <data_dir>/config.yaml itself is looked up under the DEV
+	// data_dir for a dev-profile process below - a fully separate profile
+	// end to end (HANDOFF §6 W7-8 ⚑: "ayrı brain.db + ayrı
+	// ~/Kahya-dev/memory"), not merely a same-paths-different-label
+	// process.
+	env := os.Getenv("KAHYA_ENV")
+	if env == "" {
+		env = EnvProd
+	}
+
+	cfg := defaults(home, env)
 
 	// The config file lives under the *default* data_dir: at this point in
 	// the pipeline data_dir has not yet been touched by the file or env
@@ -477,12 +513,20 @@ func Load() (Config, error) {
 	if err := validateAnchorIntervalHours(cfg.AnchorIntervalHours); err != nil {
 		return Config{}, err
 	}
+	if err := validateTickIntervals(cfg.ResumeScanIntervalSeconds, cfg.OutboxDispatchIntervalSeconds); err != nil {
+		return Config{}, err
+	}
 
 	// Any of the data_dir-derived fields not explicitly set by the file or
 	// env layers follow the *final* data_dir (so overriding just
-	// KAHYA_DATA_DIR moves socket/log_dir/db_path along with it).
+	// KAHYA_DATA_DIR moves socket/log_dir/db_path along with it). The
+	// socket's own FILENAME (not just its directory) still reflects the dev
+	// profile (kahyad-dev.sock, never plain kahyad.sock) whenever
+	// cfg.Env==dev, so this fallback can never silently un-do defaults()'s
+	// own dev-profile socket name merely because data_dir happened to be
+	// overridden without socket also being set explicitly.
 	if !explicitSocket {
-		cfg.Socket = filepath.Join(cfg.DataDir, "kahyad.sock")
+		cfg.Socket = filepath.Join(cfg.DataDir, socketFileName(cfg.Env))
 	}
 	if !explicitLogDir {
 		cfg.LogDir = filepath.Join(cfg.DataDir, "logs")
@@ -495,17 +539,93 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	// W4-07 HARD CONSTRAINT: a dev-profile process must NEVER end up
+	// pointed at the real production brain.db path, however that happened
+	// (an operator hand-editing config.yaml, a stray KAHYA_DB_PATH/
+	// KAHYA_DATA_DIR export left over from a prod shell) - fail Load
+	// closed rather than let a dev kahyad silently read/write the real
+	// database. Checked LAST, against the fully-resolved cfg.DBPath, so
+	// every override layer (file, env, the data_dir-derived fallback just
+	// above) has already had its say.
+	if err := refuseDevProfileOpeningProdDB(cfg, home); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
 }
 
-func defaults(home string) Config {
-	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+// socketFileName is the control-socket's own filename for env ("dev" gets
+// its own kahyad-dev.sock, never plain kahyad.sock - HANDOFF §6 W7-8 ⚑
+// dev-profile: a separate launchd label/socket per profile so a dev and a
+// prod kahyad could in principle run side by side without colliding).
+func socketFileName(env string) string {
+	if env == EnvDev {
+		return "kahyad-dev.sock"
+	}
+	return "kahyad.sock"
+}
+
+// refuseDevProfileOpeningProdDB implements the W4-07 HARD CONSTRAINT: fail
+// Load closed when cfg.Env==dev but the fully-resolved cfg.DBPath is
+// nonetheless the real production database path (defaults(home, EnvProd)'s
+// own db_path) - see Load's own call-site comment for why this is checked
+// last, against the final resolved value, not merely against whichever
+// layer happened to set it.
+func refuseDevProfileOpeningProdDB(cfg Config, home string) error {
+	if cfg.Env != EnvDev {
+		return nil
+	}
+	prodDBPath := defaults(home, EnvProd).DBPath
+	if cfg.DBPath == prodDBPath {
+		return fmt.Errorf("config: KAHYA_ENV=dev refuses to open the production brain.db (%s) - dev profile must use a separate db_path/KAHYA_DATA_DIR/KAHYA_DB_PATH", prodDBPath)
+	}
+	return nil
+}
+
+// defaultTickIntervalSeconds mirrors main.go's own pre-W4-07 hardcoded
+// "@every 30s"/"@every 5s" tick specs - unchanged production cadence; only
+// a hermetic gate's own config.yaml overlay ever sets these lower.
+const (
+	defaultResumeScanIntervalSeconds     = 30
+	defaultOutboxDispatchIntervalSeconds = 5
+)
+
+// validateTickIntervals fails Load closed (same posture as every other
+// validate* function above) on a non-positive tick interval - main.go
+// renders these straight into a cron.ParseStandard "@every <n>s" spec,
+// where n<=0 is nonsensical (and, for "@every 0s", would busy-loop the
+// scheduler).
+func validateTickIntervals(resumeScanSeconds, outboxDispatchSeconds int) error {
+	if resumeScanSeconds < 1 {
+		return fmt.Errorf("config: resume_scan_interval_seconds=%d invalid, must be >= 1", resumeScanSeconds)
+	}
+	if outboxDispatchSeconds < 1 {
+		return fmt.Errorf("config: outbox_dispatch_interval_seconds=%d invalid, must be >= 1", outboxDispatchSeconds)
+	}
+	return nil
+}
+
+// defaults returns Config's built-in defaults for env ("prod" or "dev" -
+// Load always passes a value validateEnv would accept; defaults itself
+// does not re-validate it). W4-07: env=="dev" derives an entirely separate
+// profile - data_dir/memory_dir/kahya_dir/backup_dir/socket all move to
+// their own "-dev"-suffixed paths (~/Library/Application Support/
+// Kahya-dev, ~/Kahya-dev, kahyad-dev.sock) - so a dev-profile kahyad never
+// shares a single file on disk with a production one, by construction,
+// before any override layer even runs.
+func defaults(home, env string) Config {
+	dataDirName, kahyaDirName := "Kahya", "Kahya"
+	if env == EnvDev {
+		dataDirName, kahyaDirName = "Kahya-dev", "Kahya-dev"
+	}
+	dataDir := filepath.Join(home, "Library", "Application Support", dataDirName)
+	kahyaDir := filepath.Join(home, kahyaDirName)
 	return Config{
 		DataDir:                 dataDir,
-		Socket:                  filepath.Join(dataDir, "kahyad.sock"),
+		Socket:                  filepath.Join(dataDir, socketFileName(env)),
 		LogDir:                  filepath.Join(dataDir, "logs"),
 		DBPath:                  filepath.Join(dataDir, "brain.db"),
-		MemoryDir:               filepath.Join(home, "Kahya", "memory"),
+		MemoryDir:               filepath.Join(kahyaDir, "memory"),
 		AnthropicUpstreamURL:    "https://api.anthropic.com",
 		EmbedPort:               8092,
 		DefaultModel:            "claude-sonnet-5",
@@ -513,7 +633,7 @@ func defaults(home string) Config {
 		ActiveEmbedModelVer:     "qwen3-embedding-0.6b:512:v1",
 		LogLevel:                "info",
 		UndoWindowSeconds:       300,
-		Env:                     EnvProd,
+		Env:                     env,
 		WorkerCmd:               defaultWorkerCmd(),
 		EmbedCmd:                defaultEmbedCmd(),
 		MCPBridgePath:           defaultMCPBridgePath(),
@@ -562,13 +682,14 @@ func defaults(home string) Config {
 		CloudRetryGiveUpAfter:  "24h",
 
 		// W4-06 backups: KahyaDir/BackupDir follow MemoryDir's own
-		// ~/Kahya derivation above (KahyaDir = filepath.Dir(MemoryDir) in
-		// every default deployment); backup-nightly/memory-push are the
-		// first two real cfg.Jobs entries this codebase ships (task spec
-		// step 4, verbatim times) — Config.Jobs's own doc comment names
-		// this task as the one that adds them.
-		KahyaDir:  filepath.Join(home, "Kahya"),
-		BackupDir: filepath.Join(home, "Kahya", "backups"),
+		// ~/Kahya (or, under KAHYA_ENV=dev, ~/Kahya-dev) derivation above
+		// (KahyaDir = filepath.Dir(MemoryDir) in every default deployment);
+		// backup-nightly/memory-push are the first two real cfg.Jobs
+		// entries this codebase ships (task spec step 4, verbatim times) —
+		// Config.Jobs's own doc comment names this task as the one that
+		// adds them.
+		KahyaDir:  kahyaDir,
+		BackupDir: filepath.Join(kahyaDir, "backups"),
 		Jobs: []JobConfig{
 			{Name: "backup-nightly", Handler: "backup-nightly", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(30)}},
 			{Name: "memory-push", Handler: "memory-push", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(45)}},
@@ -578,6 +699,11 @@ func defaults(home string) Config {
 		// interval_hours default 6). AnchorRemote/AnchorLocalFallbackPath
 		// default empty - see their own doc comments.
 		AnchorIntervalHours: 6,
+
+		// W4-07 acceptance-gate tick intervals (unchanged production
+		// cadence - see each field's own doc comment).
+		ResumeScanIntervalSeconds:     defaultResumeScanIntervalSeconds,
+		OutboxDispatchIntervalSeconds: defaultOutboxDispatchIntervalSeconds,
 	}
 }
 
@@ -879,6 +1005,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.AnchorLocalFallbackPath != nil {
 		cfg.AnchorLocalFallbackPath = expandHome(*fc.AnchorLocalFallbackPath, home)
+	}
+	if fc.ResumeScanIntervalSeconds != nil {
+		cfg.ResumeScanIntervalSeconds = *fc.ResumeScanIntervalSeconds
+	}
+	if fc.OutboxDispatchIntervalSeconds != nil {
+		cfg.OutboxDispatchIntervalSeconds = *fc.OutboxDispatchIntervalSeconds
 	}
 }
 

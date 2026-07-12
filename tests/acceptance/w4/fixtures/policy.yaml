@@ -1,0 +1,113 @@
+# tests/acceptance/w4/fixtures/policy.yaml — the W4-07 DEV-ONLY policy.yaml
+# overlay: an exact copy of the repo-root production policy.yaml PLUS one
+# extra tool declaration, w2_slow_stub (class W2, reversible: false) — the
+# W4-07 acceptance-gate stub tool (kahyad/internal/server/devstub.go) that
+# is NEVER declared in the real, committed repo-root policy.yaml and is
+# unreachable in production regardless (main.go only calls
+# Server.SetDevStub under KAHYA_ENV=dev).
+#
+# Used ONLY by tests/acceptance/w4/w4_gate_test.go (CI-speed) and
+# scripts/accept_w4.sh (real-daemon dev-profile run) via KAHYA_POLICY_PATH -
+# never referenced by production kahyad, which always loads the repo-root
+# policy.yaml.
+#
+# The egress.allowlist block below is patched at RUNTIME by both callers
+# (mirrors tests/w3/harness_test.go's writeFixturePolicyYAML/
+# hermeticEgressAllowlistAnchor technique exactly, for the identical
+# reason): scenario B's "anthropic upstream" is a loopback 127.0.0.1:<port>
+# address whose port is only known once chosen at test/script run time, and
+# kahyad/internal/egress.Gate denies loopback hosts unless explicitly
+# allowlisted — the literal anchor text "egress:\n  allowlist:\n" below is
+# replaced with a patched block naming that exact host:port before this
+# file is ever handed to kahyad via KAHYA_POLICY_PATH.
+
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+  - name: memory_write
+    class: W1
+    reversible: true
+    undo: "git revert of the memory commit"
+
+  - name: memory_forget
+    class: W1
+    reversible: true
+    undo: "git revert"
+
+  - name: fs_read
+    class: R
+    reversible: false
+
+  - name: fs_write
+    class: W1
+    reversible: true
+    undo: "pre-op git checkpoint restore"
+
+  - name: fs_delete
+    class: W1
+    reversible: true
+    undo: "move back from Trash"
+
+  - name: shell_docker
+    class: W2
+    reversible: false
+
+  - name: shell_host
+    class: W2
+    reversible: false
+
+  - name: applescript_run
+    class: W2
+    reversible: false
+
+  - name: jxa_run
+    class: W2
+    reversible: false
+
+  - name: shortcuts_run
+    class: W2
+    reversible: false
+
+  - name: mail_draft
+    class: W1
+    reversible: true
+    undo: "taslak-asla-gönderme — draft is never sent, delete draft"
+
+  - name: mail_send
+    class: W3
+    reversible: false
+
+  - name: telegram_send
+    class: W2
+    reversible: false
+
+  # W4-07 acceptance-gate-only stub — see this file's own header comment.
+  - name: w2_slow_stub
+    class: W2
+    reversible: false
+
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+egress:
+  allowlist:
+    - host: api.anthropic.com
+    - host: api.telegram.org
+    - host: api.github.com
+    - host: github.com
+  default_daily_byte_budget: 26214400
