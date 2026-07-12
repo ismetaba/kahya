@@ -117,6 +117,101 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CloudRetryGiveUpAfter != "24h" {
 		t.Errorf("CloudRetryGiveUpAfter = %q, want 24h", cfg.CloudRetryGiveUpAfter)
 	}
+	// W4-06: KahyaDir/BackupDir default to ~/Kahya and ~/Kahya/backups.
+	if want := filepath.Join(home, "Kahya"); cfg.KahyaDir != want {
+		t.Errorf("KahyaDir = %q, want %q", cfg.KahyaDir, want)
+	}
+	if want := filepath.Join(home, "Kahya", "backups"); cfg.BackupDir != want {
+		t.Errorf("BackupDir = %q, want %q", cfg.BackupDir, want)
+	}
+}
+
+// TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush proves W4-06's own
+// two default cfg.jobs entries (task spec step 4, verbatim times) are
+// present out of the box — config.Config.Jobs's doc comment names this
+// task as the one that adds them.
+func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.Jobs) != 2 {
+		t.Fatalf("Jobs = %+v, want exactly 2 default entries", cfg.Jobs)
+	}
+
+	byName := make(map[string]JobConfig, len(cfg.Jobs))
+	for _, j := range cfg.Jobs {
+		byName[j.Name] = j
+	}
+
+	backup, ok := byName["backup-nightly"]
+	if !ok {
+		t.Fatalf("Jobs missing backup-nightly: %+v", cfg.Jobs)
+	}
+	if backup.Handler != "backup-nightly" {
+		t.Errorf("backup-nightly.Handler = %q, want %q", backup.Handler, "backup-nightly")
+	}
+	if backup.Calendar.Hour == nil || *backup.Calendar.Hour != 3 {
+		t.Errorf("backup-nightly.Calendar.Hour = %v, want 3", backup.Calendar.Hour)
+	}
+	if backup.Calendar.Minute == nil || *backup.Calendar.Minute != 30 {
+		t.Errorf("backup-nightly.Calendar.Minute = %v, want 30", backup.Calendar.Minute)
+	}
+
+	push, ok := byName["memory-push"]
+	if !ok {
+		t.Fatalf("Jobs missing memory-push: %+v", cfg.Jobs)
+	}
+	if push.Handler != "memory-push" {
+		t.Errorf("memory-push.Handler = %q, want %q", push.Handler, "memory-push")
+	}
+	if push.Calendar.Hour == nil || *push.Calendar.Hour != 3 {
+		t.Errorf("memory-push.Calendar.Hour = %v, want 3", push.Calendar.Hour)
+	}
+	if push.Calendar.Minute == nil || *push.Calendar.Minute != 45 {
+		t.Errorf("memory-push.Calendar.Minute = %v, want 45", push.Calendar.Minute)
+	}
+
+	// validateJobs must still accept the default set (DNS-label names, no
+	// duplicates, non-empty handlers) — Load() above already proves this
+	// implicitly (it would have failed closed otherwise), asserted here
+	// explicitly too for a clearer failure message if it ever regresses.
+	if err := validateJobs(cfg.Jobs); err != nil {
+		t.Errorf("validateJobs(defaults) error = %v, want nil", err)
+	}
+}
+
+// TestLoadFileOverridesKahyaDirAndBackupDir proves both W4-06 fields are
+// real, independently tilde-expanding config.yaml keys, same convention
+// as every other configured path in this file.
+func TestLoadFileOverridesKahyaDirAndBackupDir(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "kahya_dir: ~/CustomKahya\nbackup_dir: ~/CustomKahya/snapshots\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := filepath.Join(home, "CustomKahya"); cfg.KahyaDir != want {
+		t.Errorf("KahyaDir = %q, want %q", cfg.KahyaDir, want)
+	}
+	if want := filepath.Join(home, "CustomKahya", "snapshots"); cfg.BackupDir != want {
+		t.Errorf("BackupDir = %q, want %q", cfg.BackupDir, want)
+	}
 }
 
 // TestLoadFileOverridesCloudRetryKeys proves the three W4-04 cloud_retry_*

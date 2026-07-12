@@ -308,6 +308,23 @@ type Config struct {
 	// directories up from the running kahyad executable):
 	// "<repo>/bin/kahya-trigger".
 	TriggerBinPath string `yaml:"trigger_bin_path"`
+
+	// --- W4-06 backups ---
+
+	// KahyaDir is the ~/Kahya memory-repo root (task spec: "the Kahya repo
+	// root is filepath.Dir(MemoryDir) = ~/Kahya") — kahyad/internal/backup.
+	// Pusher's `git -C <KahyaDir> push origin HEAD` target and
+	// backup.EnsureGitignoreEntry's target directory. Kept as its OWN
+	// explicit field (not derived at use-time via
+	// filepath.Dir(cfg.MemoryDir)) so a config.yaml override that moves
+	// MemoryDir alone does not silently also move the git-push target
+	// unless the operator means it to.
+	KahyaDir string `yaml:"kahya_dir"`
+
+	// BackupDir is ~/Kahya/backups (task spec step 1a: "Target
+	// ~/Kahya/backups/brain-YYYYMMDD.db") — kahyad/internal/backup.
+	// Snapshotter's nightly VACUUM INTO target directory.
+	BackupDir string `yaml:"backup_dir"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -385,6 +402,8 @@ type fileConfig struct {
 	CloudRetryMaxInline     *int         `yaml:"cloud_retry_max_inline"`
 	CloudRetryTaskSchedule  *[]string    `yaml:"cloud_retry_task_schedule"`
 	CloudRetryGiveUpAfter   *string      `yaml:"cloud_retry_give_up_after"`
+	KahyaDir                *string      `yaml:"kahya_dir"`
+	BackupDir               *string      `yaml:"backup_dir"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -510,8 +529,27 @@ func defaults(home string) Config {
 		CloudRetryMaxInline:    3,
 		CloudRetryTaskSchedule: []string{"1m", "5m", "15m", "60m"},
 		CloudRetryGiveUpAfter:  "24h",
+
+		// W4-06 backups: KahyaDir/BackupDir follow MemoryDir's own
+		// ~/Kahya derivation above (KahyaDir = filepath.Dir(MemoryDir) in
+		// every default deployment); backup-nightly/memory-push are the
+		// first two real cfg.Jobs entries this codebase ships (task spec
+		// step 4, verbatim times) — Config.Jobs's own doc comment names
+		// this task as the one that adds them.
+		KahyaDir:  filepath.Join(home, "Kahya"),
+		BackupDir: filepath.Join(home, "Kahya", "backups"),
+		Jobs: []JobConfig{
+			{Name: "backup-nightly", Handler: "backup-nightly", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(30)}},
+			{Name: "memory-push", Handler: "memory-push", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(45)}},
+		},
 	}
 }
+
+// intPtr returns a pointer to v — CalendarSpec's fields are all *int (nil
+// means launchd's own StartCalendarInterval "every" semantics), so
+// defaults' own backup-nightly/memory-push entries need a literal-friendly
+// way to populate an explicit Hour/Minute.
+func intPtr(v int) *int { return &v }
 
 // defaultTriggerBinPath resolves the default "<repo>/bin/kahya-trigger"
 // path, using the exact same repo-root derivation as defaultMCPBridgePath/
@@ -791,6 +829,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.CloudRetryGiveUpAfter != nil {
 		cfg.CloudRetryGiveUpAfter = *fc.CloudRetryGiveUpAfter
 	}
+	if fc.KahyaDir != nil {
+		cfg.KahyaDir = expandHome(*fc.KahyaDir, home)
+	}
+	if fc.BackupDir != nil {
+		cfg.BackupDir = expandHome(*fc.BackupDir, home)
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -1005,9 +1049,11 @@ func validateASCIIPaths(cfg Config) error {
 		"log_dir":    cfg.LogDir,
 		"db_path":    cfg.DBPath,
 		"memory_dir": cfg.MemoryDir,
+		"kahya_dir":  cfg.KahyaDir,
+		"backup_dir": cfg.BackupDir,
 	}
 	// Deterministic order for reproducible error messages.
-	for _, key := range []string{"data_dir", "socket", "log_dir", "db_path", "memory_dir"} {
+	for _, key := range []string{"data_dir", "socket", "log_dir", "db_path", "memory_dir", "kahya_dir", "backup_dir"} {
 		p := paths[key]
 		for _, r := range p {
 			if r > 127 {

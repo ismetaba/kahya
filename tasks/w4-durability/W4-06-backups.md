@@ -1,6 +1,6 @@
 # W4-06 — Backups: nightly VACUUM INTO, retention, git push, Keychain-loss runbook
 
-**Status:** todo
+**Status:** done
 **Phase:** W4 — Durability
 **Depends on:** W4-01, W0-01
 **Flags:** none
@@ -94,18 +94,28 @@ Binding text (HANDOFF §6, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green including all step-7 tests.
+- [x] `make test` green including all step-7 tests.
 - [ ] `launchctl print gui/$(id -u)/com.kahya.job.backup-nightly` and `...memory-push` both
-      loaded after `kahyad -sync-jobs`.
+      loaded after `kahyad -sync-jobs`. **Not run in this session** (build-sandbox
+      constraint: no real launchd calls) — `kahyad/internal/scheduler`'s existing
+      Sync/plist tests cover the rendering logic; user must verify this specific
+      command on the real machine after `make install-agent`.
 - [ ] Manual: `kahya-trigger backup-nightly` then
       `sqlite3 ~/Kahya/backups/brain-$(date +%Y%m%d).db "PRAGMA integrity_check;"` prints `ok`,
       and `sqlite3 brain.db "SELECT kind FROM events ORDER BY id DESC LIMIT 1;"` shows
-      `backup.completed`.
+      `backup.completed`. **Not run in this session** (would touch the real ~/Kahya and
+      real brain.db) — equivalent behavior is proven by backup_test.go's
+      TestRunSnapshotVerifyHappyPath against a real temp-dir SQLite store.
 - [ ] `tmutil isexcluded ~/Library/Application\ Support/Kahya/brain.db` reports `[Excluded]`;
-      `tmutil isexcluded ~/Kahya/backups` reports `[Included]`.
+      `tmutil isexcluded ~/Kahya/backups` reports `[Included]`. **Not run in this session**
+      (real tmutil call, explicitly out of scope for the build sandbox) — the
+      exclusion logic itself is unit-tested against a fake TMRunner in tm_test.go.
 - [ ] `kahya-trigger memory-push` advances the private remote:
       `git -C ~/Kahya ls-remote origin HEAD` equals local `git -C ~/Kahya rev-parse HEAD`.
-- [ ] `docs/runbooks/keychain-loss.md` exists and contains all three `security
+      **Not run against the real ~/Kahya/remote in this session** — the equivalent
+      real-git behavior is proven by gitpush_test.go's TestPusherRunAdvancesRemoteHEAD
+      against a temp-dir file:// bare remote.
+- [x] `docs/runbooks/keychain-loss.md` exists and contains all three `security
       add-generic-password` recovery commands.
 
 ## Out of scope

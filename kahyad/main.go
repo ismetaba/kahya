@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/anthproxy"
+	"kahya/kahyad/internal/backup"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/egress"
@@ -643,14 +644,53 @@ func run() int {
 	defer egressProxy.Close()
 	log.Info("egress_proxy_started", "addr", egressProxy.Addr)
 
+	// W4-06: idempotent Time Machine setup (task spec step 3) - exclude
+	// the live WAL brain.db (so Time Machine only ever backs up the
+	// VACUUM snapshot below) and detect a missing backup destination.
+	// Bounded by tmCtx (10s) and NEVER allowed to fail/block boot: any
+	// tmutil error is logged by TimeMachine itself and otherwise ignored.
+	// governorNotifier (not the bare `notifier`) is reused here so the
+	// no-offsite alarm reaches Telegram exactly like a cost-governor
+	// alarm does - HANDOFF §6 backup ⚑'s "sıfır veri-kaybı" prerequisite
+	// is exactly the kind of risk that must not wait for the user to
+	// notice a JSONL line. Skipped entirely outside cfg.Env==prod - the
+	// SAME "dev is a fully sandboxed profile" posture buildCredentialSource/
+	// buildTelegramTokenSource already apply to secrets above: a
+	// KAHYA_ENV=dev process (every hermetic gate test under tests/e2e,
+	// tests/w3, the eventual W78-02 red-team profile) must never shell out
+	// to the real /usr/bin/tmutil or touch the real machine's Time Machine
+	// exclusion list/alarm channel (HARD CONSTRAINT: no real tmutil call
+	// in any code path that runs during `make test`).
+	if cfg.Env == config.EnvProd {
+		tmCtx, tmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		tm := backup.NewTimeMachine(backup.NewExecTMRunner(), governorNotifier, backup.RealClock{}, log)
+		tm.EnsureExclusions(tmCtx, cfg.DBPath, cfg.BackupDir)
+		tm.CheckOffsite(tmCtx, bootTraceID)
+		tmCancel()
+	}
+
 	// W4-01: the two-tier scheduler - job registry (scheduler.New itself
 	// registers the built-in "smoke" handler) + trigger dispatch, wired to
 	// POST /jobs/trigger/{name} (kahyad/internal/server/jobs.go). LoadJobs
 	// resolves cfg.Jobs against every handler registered by this point in
-	// boot - main.go registers no handler beyond the built-in "smoke" one
-	// until W4-05/W4-06/W5-01/W5-02 add their own RegisterHandler calls
-	// here.
+	// boot.
 	sched := scheduler.New(st, log)
+
+	// W4-06: the backup-nightly (VACUUM INTO + verify + prune) and
+	// memory-push (`git -C ~/Kahya push`) job handlers - registered
+	// BEFORE LoadJobs below so cfg.Jobs' own default backup-nightly
+	// (03:30)/memory-push (03:45) entries (config.defaults' doc comment)
+	// resolve to real handlers on the very first boot, not just after a
+	// later `kahyad -sync-jobs`/restart.
+	snapshotter := backup.NewSnapshotter(st, governorNotifier, cfg.BackupDir)
+	pusher := backup.NewPusher(backup.NewExecGitRunner(), governorNotifier, cfg.KahyaDir)
+	sched.RegisterHandler("backup-nightly", func(ctx context.Context) error {
+		return snapshotter.Run(ctx, scheduler.TraceIDFromContext(ctx))
+	})
+	sched.RegisterHandler("memory-push", func(ctx context.Context) error {
+		return pusher.Run(ctx, scheduler.TraceIDFromContext(ctx))
+	})
+
 	sched.LoadJobs(cfg.Jobs)
 	srv.SetScheduler(sched)
 
