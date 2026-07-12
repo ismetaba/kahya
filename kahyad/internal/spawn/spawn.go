@@ -50,7 +50,24 @@ const (
 	// the one documented exception that can survive this - see Run's doc
 	// comment.
 	StatusTimeout = "timeout"
+	// StatusCloudUnreachable means a {"event":"cloud_unreachable"} stdout
+	// line arrived (W4-04: worker/kahya_worker/__main__.py's
+	// _is_cloud_unreachable branch) - kahyad's own forward-proxy exhausted
+	// its inline retry budget for this task's cloud call. This value is
+	// diagnostic/UX only: kahyad/internal/task.CloudRetry has ALREADY
+	// parked the task in bekliyor-yeniden-deneme synchronously, mid-call,
+	// via the proxy's own OnCloudUnreachable callback
+	// (kahyad/internal/anthproxy), well before this terminal line - or the
+	// worker's own exit - is ever observed here.
+	StatusCloudUnreachable = "cloud_unreachable"
 )
+
+// cloudUnreachableEvent is the exact "event" field value
+// worker/kahya_worker/__main__.py's cloud_unreachable protocol line
+// carries - a SEPARATE top-level JSON key from every other stdout
+// protocol line's "type" (stdoutLine.Event, never conflated with
+// stdoutLine.Type).
+const cloudUnreachableEvent = "cloud_unreachable"
 
 // Config bundles everything Run needs to launch and instrument one worker
 // process for one task (HANDOFF §4 IPC ⚑, frozen in docs/ipc.md).
@@ -137,6 +154,10 @@ type stdoutLine struct {
 	SessionID string `json:"session_id"`
 	Status    string `json:"status"`
 	Message   string `json:"message"`
+	// Event carries the W4-04 {"event":"cloud_unreachable"} protocol line
+	// (worker/kahya_worker/__main__.py's _is_cloud_unreachable branch) - a
+	// deliberately SEPARATE top-level key from Type/"type".
+	Event string `json:"event"`
 }
 
 // Run spawns cfg.Cmd as a per-task worker process (HANDOFF §4 IPC ⚑): it
@@ -248,6 +269,11 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 			var sl stdoutLine
 			if err := json.Unmarshal([]byte(raw), &sl); err != nil {
 				return // malformed line: skip, don't fail the whole task
+			}
+			if sl.Event == cloudUnreachableEvent {
+				outcome.Status = StatusCloudUnreachable
+				sawTerminal = true
+				return
 			}
 			switch sl.Type {
 			case "delta":

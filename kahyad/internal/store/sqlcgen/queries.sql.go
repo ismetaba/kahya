@@ -1695,6 +1695,28 @@ func (q *Queries) SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error 
 	return err
 }
 
+const setTaskNextRetry = `-- name: SetTaskNextRetry :exec
+UPDATE tasks
+SET next_retry_at = ?, updated_at = ?
+WHERE id = ?
+`
+
+type SetTaskNextRetryParams struct {
+	NextRetryAt sql.NullString `json:"next_retry_at"`
+	UpdatedAt   string         `json:"updated_at"`
+	ID          string         `json:"id"`
+}
+
+// W4-04: writes tasks.next_retry_at when kahyad/internal/task.CloudRetry
+// parks a task in 'bekliyor-yeniden-deneme' (the status change itself
+// goes through Machine.Transition/SetTaskStatus, same as every other
+// transition - this query ONLY ever touches next_retry_at, so a caller
+// always calls both, never this alone).
+func (q *Queries) SetTaskNextRetry(ctx context.Context, arg SetTaskNextRetryParams) error {
+	_, err := q.db.ExecContext(ctx, setTaskNextRetry, arg.NextRetryAt, arg.UpdatedAt, arg.ID)
+	return err
+}
+
 const setTaskStatus = `-- name: SetTaskStatus :execrows
 UPDATE tasks
 SET status = ?, updated_at = ?

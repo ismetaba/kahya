@@ -316,6 +316,30 @@ func TestRunReportsWorkerErrorLine(t *testing.T) {
 	}
 }
 
+// TestRunReportsCloudUnreachableEventLine covers the W4-04
+// {"event":"cloud_unreachable"} protocol line (worker/kahya_worker/
+// __main__.py's _is_cloud_unreachable branch) - a deliberately SEPARATE
+// top-level key from every other line's "type" - proving Run recognizes
+// it as StatusCloudUnreachable rather than silently dropping it (no
+// "type" key at all means it would otherwise match no switch case).
+func TestRunReportsCloudUnreachableEventLine(t *testing.T) {
+	env := testEnvelope(t)
+	cfg := testConfig("-c")
+	cfg.Cmd = []string{"python3", "-c",
+		`import sys; sys.stdin.buffer.read(); print('{"event":"cloud_unreachable"}')`,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	outcome, err := Run(ctx, cfg, env, Callbacks{})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Status != StatusCloudUnreachable {
+		t.Fatalf("outcome.Status = %q, want %q", outcome.Status, StatusCloudUnreachable)
+	}
+}
+
 // TestRunPersistsSessionID covers the {"type":"session","session_id":...}
 // line: OnSession must fire with the reported id, and it must also surface
 // on the final Outcome.

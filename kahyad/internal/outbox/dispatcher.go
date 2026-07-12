@@ -122,13 +122,30 @@ type LiveRegistry interface {
 
 var _ LiveRegistry = (*task.LiveRegistry)(nil)
 
+// AnthproxyOpener opens a fresh per-redispatch Anthropic forward-proxy
+// listener for taskID (W4-04's fix for the gap this package's own doc
+// comment used to note: "a genuinely resumed worker that needs to make a
+// NEW model call would need its own fresh per-dispatch anthproxy.Proxy
+// listener ... intentionally deferred"). Mirrors kahyad/internal/server's
+// own per-task construction in handleTask - same governor/notifier/
+// credential/egress-gate/cloud-retry-callback wiring, just invoked again
+// at REDISPATCH time instead of at first-spawn time. Returns the base URL/
+// token to set on the resumed envelope's spawn.Config and a close func to
+// release the listener once spawn.Run returns. May be nil (pre-W4-04
+// behavior: AnthropicBaseURL/APIKey stay empty on the resumed
+// spawn.Config - a resumed cloud-lane task can never actually reach the
+// cloud again; only a caller that has wired this can retry a genuinely
+// cloud-lane task through the outbox).
+type AnthproxyOpener func(ctx context.Context, taskID, traceID string) (baseURL, apiKey string, closeFn func() error, err error)
+
 // Dispatcher is the W4-02 outbox redelivery loop.
 type Dispatcher struct {
-	store    Store
-	ledger   Ledger
-	machine  *task.Machine
-	spawnCfg spawn.Config
-	live     LiveRegistry
+	store           Store
+	ledger          Ledger
+	machine         *task.Machine
+	spawnCfg        spawn.Config
+	live            LiveRegistry
+	anthproxyOpener AnthproxyOpener
 
 	batchSize     int
 	leaseDuration time.Duration
@@ -166,6 +183,10 @@ func (d *Dispatcher) SetBatchSize(n int) { d.batchSize = n }
 // it becomes re-claimable again (default 2 minutes). Tests use a much
 // shorter value to exercise lease-expiry re-claim without a real wait.
 func (d *Dispatcher) SetLeaseDuration(d2 time.Duration) { d.leaseDuration = d2 }
+
+// SetAnthproxyOpener wires opener - see AnthproxyOpener's own doc
+// comment. Safe to leave unset (nil is the pre-W4-04 default posture).
+func (d *Dispatcher) SetAnthproxyOpener(opener AnthproxyOpener) { d.anthproxyOpener = opener }
 
 // SetClock overrides Dispatcher's clock (tests only).
 func (d *Dispatcher) SetClock(now func() time.Time) { d.now = now }
@@ -302,8 +323,50 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		return
 	}
 
+	// W4-04: a row claimed while the task sits in bekliyor-yeniden-deneme
+	// (kahyad/internal/task.CloudRetry.park's own outbox row, enqueued at
+	// next_retry_at) must move back to 'executing' before redispatch -
+	// bekliyor-yeniden-deneme's only legal edges are {executing,
+	// user_halted} (kahyad/internal/task.allowedTransitions), so without
+	// this the eventual done/failed transition below would be illegal and
+	// the task would stay stuck parked forever even after a genuinely
+	// successful resumed call. A no-op (Machine.Transition's own from==to
+	// short-circuit, no ledger row, no attempts bump) for the ordinary
+	// crash-recovery case where the task was already 'executing' the
+	// whole time (resume.go's enqueueResume never changes status either).
+	if err := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusExecuting); err != nil {
+		d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
+			"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
+		})
+		return
+	}
+
 	if d.live != nil {
 		defer d.live.Unregister(t.ID)
+	}
+
+	// W4-04: open a FRESH per-redispatch Anthropic forward-proxy listener
+	// for this exact call - see AnthproxyOpener's own doc comment for why
+	// this is needed at all (a resumed cloud-lane task cannot make ANY
+	// model call without one). spawnCfg is a per-call COPY of d.spawnCfg
+	// (never mutating the shared Dispatcher-wide config), with
+	// AnthropicBaseURL/APIKey overridden - exactly the two fields
+	// kahyad/internal/server's own per-task construction sets, nothing
+	// else differs from d.spawnCfg.
+	spawnCfg := d.spawnCfg
+	if d.anthproxyOpener != nil {
+		baseURL, apiKey, closeProxy, err := d.anthproxyOpener(ctx, t.ID, t.TraceID)
+		if err != nil {
+			d.ledgerRaw(ctx, t.TraceID, "outbox.anthproxy_open_failed", map[string]any{
+				"event": "outbox.anthproxy_open_failed", "task_id": t.ID, "err": err.Error(),
+			})
+			return
+		}
+		spawnCfg.AnthropicBaseURL = baseURL
+		spawnCfg.APIKey = apiKey
+		if closeProxy != nil {
+			defer func() { _ = closeProxy() }()
+		}
 	}
 
 	// BLOCKER 2(b) fix: renew this row's lease every leaseDuration/3 for as
@@ -315,7 +378,7 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	defer close(heartbeatDone)
 	go d.renewLeaseWhileRunning(row.ID, heartbeatDone)
 
-	outcome, runErr := spawn.Run(ctx, d.spawnCfg, env, spawn.Callbacks{
+	outcome, runErr := spawn.Run(ctx, spawnCfg, env, spawn.Callbacks{
 		OnStart: func(pid int) {
 			if d.live != nil {
 				d.live.Register(t.ID, pid)

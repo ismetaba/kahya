@@ -116,6 +116,9 @@ type Store interface {
 	// Transition's own doc comment).
 	SetTaskStatus(ctx context.Context, arg sqlcgen.SetTaskStatusParams) (int64, error)
 	IncrementTaskAttempts(ctx context.Context, arg sqlcgen.IncrementTaskAttemptsParams) (int64, error)
+	// SetTaskNextRetry writes tasks.next_retry_at (W4-04's CloudRetry.park
+	// - see cloudretry.go's own doc comment).
+	SetTaskNextRetry(ctx context.Context, arg sqlcgen.SetTaskNextRetryParams) error
 	// ListExecutingTasks is resume.go's resume-scan candidate query
 	// (kahyad startup + a periodic tick) - included here (rather than a
 	// separate interface) so kahyad/internal/task.Resume can share this

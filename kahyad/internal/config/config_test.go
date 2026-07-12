@@ -101,6 +101,93 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TaskRetryW1MaxAuto != 3 {
 		t.Errorf("TaskRetryW1MaxAuto = %d, want 3", cfg.TaskRetryW1MaxAuto)
 	}
+	// W4-04: cloud-call error taxonomy defaults (task spec, verbatim).
+	if cfg.CloudRetryMaxInline != 3 {
+		t.Errorf("CloudRetryMaxInline = %d, want 3", cfg.CloudRetryMaxInline)
+	}
+	if got, want := cfg.CloudRetryTaskSchedule, []string{"1m", "5m", "15m", "60m"}; len(got) != len(want) {
+		t.Errorf("CloudRetryTaskSchedule = %v, want %v", got, want)
+	} else {
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("CloudRetryTaskSchedule[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	}
+	if cfg.CloudRetryGiveUpAfter != "24h" {
+		t.Errorf("CloudRetryGiveUpAfter = %q, want 24h", cfg.CloudRetryGiveUpAfter)
+	}
+}
+
+// TestLoadFileOverridesCloudRetryKeys proves the three W4-04 cloud_retry_*
+// keys are real, independently-overridable config.yaml keys.
+func TestLoadFileOverridesCloudRetryKeys(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yamlBody := "cloud_retry_max_inline: 5\n" +
+		"cloud_retry_task_schedule: [\"30s\", \"2m\"]\n" +
+		"cloud_retry_give_up_after: \"1h\"\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CloudRetryMaxInline != 5 {
+		t.Errorf("CloudRetryMaxInline = %d, want 5", cfg.CloudRetryMaxInline)
+	}
+	if want := []string{"30s", "2m"}; len(cfg.CloudRetryTaskSchedule) != 2 || cfg.CloudRetryTaskSchedule[0] != want[0] || cfg.CloudRetryTaskSchedule[1] != want[1] {
+		t.Errorf("CloudRetryTaskSchedule = %v, want %v", cfg.CloudRetryTaskSchedule, want)
+	}
+	if cfg.CloudRetryGiveUpAfter != "1h" {
+		t.Errorf("CloudRetryGiveUpAfter = %q, want 1h", cfg.CloudRetryGiveUpAfter)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidCloudRetryScheduleEntry proves a malformed
+// cloud_retry_task_schedule entry fails Load outright (fail-closed),
+// rather than surfacing as a silent zero-delay retry loop later.
+func TestLoadFailsClosedOnInvalidCloudRetryScheduleEntry(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("cloud_retry_task_schedule: [\"not-a-duration\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want an error for the malformed schedule entry")
+	}
+}
+
+// TestLoadFailsClosedOnInvalidCloudRetryMaxInline proves cloud_retry_max_
+// inline < 1 fails Load outright.
+func TestLoadFailsClosedOnInvalidCloudRetryMaxInline(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("cloud_retry_max_inline: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want an error for max_inline=0")
+	}
 }
 
 // TestLoadFileOverridesTaskRetryW1MaxAuto proves task_retry_w1_max_auto is

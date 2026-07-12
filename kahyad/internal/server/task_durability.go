@@ -69,6 +69,19 @@ func (s *Server) SetTaskDurability(resolver *task.Resolver, store TaskDurability
 	s.taskLive = live
 }
 
+// SetTaskCloudRetry wires the W4-04 cloud-call error taxonomy: machine
+// drives handleTask's own intent->executing transition at first spawn
+// (task.go); cloudRetry is kahyad/internal/task.CloudRetry, the target of
+// NewTaskProxy's OnCloudUnreachable/OnNonRetryableFailure callbacks
+// (task.go's own doc comment). Call before Prepare(); either argument may
+// be nil (the pre-W4-04 posture: handleTask's transition attempt/the
+// proxy's own callbacks simply no-op, matching this package's usual
+// unwired-dependency posture elsewhere).
+func (s *Server) SetTaskCloudRetry(machine *task.Machine, cloudRetry *task.CloudRetry) {
+	s.taskMachine = machine
+	s.taskCloudRetry = cloudRetry
+}
+
 // taskStatusToolCallView is one tool_calls row as `kahya task show <id>`
 // renders it.
 type taskStatusToolCallView struct {

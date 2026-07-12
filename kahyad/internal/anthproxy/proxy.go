@@ -59,8 +59,37 @@ import (
 	"sync/atomic"
 	"time"
 
+	"kahya/kahyad/internal/cloudretry"
+	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/notify"
 )
+
+// Ledger event kinds this file's W4-04 additions append (dotted
+// "proxy.*" naming - matching the task spec's own literal event names,
+// rather than this package's older flat W12-08 event style, e.g.
+// EventProxyAuthReject).
+const (
+	// EventFable5Shaped fires every time a request body names
+	// claude-fable-5 (task spec step 7) - regardless of whether betas/
+	// fallbacks needed to actually change that time (see
+	// shapeFable5Body's own doc comment).
+	EventFable5Shaped = "proxy.fable5_shaped"
+	// EventCloudUnreachable fires once per logical call whose inline
+	// retries were exhausted (task spec step 3), right before
+	// ProxyConfig.OnCloudUnreachable is invoked.
+	EventCloudUnreachable = "proxy.cloud_unreachable"
+)
+
+// MsgCloudUnreachableMarker is embedded in the Anthropic-shaped error
+// body the proxy returns to the worker once inline retries are exhausted
+// (task spec step 3's "typed error"). kahya_worker.__main__ looks for
+// this exact marker (see worker/kahya_worker/__main__.py's
+// _is_cloud_unreachable) to tell "kahyad's own retry budget ran out" apart
+// from an ordinary model-call failure - kept in English (CLAUDE.md:
+// technical/internal identifiers stay English) and never shown to the
+// user directly; the user-facing Turkish "parked" notification is sent
+// independently, synchronously, by ProxyConfig.OnCloudUnreachable.
+const MsgCloudUnreachableMarker = "kahya_cloud_unreachable: upstream retries exhausted after inline backoff"
 
 // CredentialMode values (mirrors kahyad/internal/config's
 // CredentialModeKeychain/CredentialModePassthrough literals — this
@@ -176,6 +205,41 @@ type ProxyConfig struct {
 
 	// Now defaults to time.Now; tests inject a fixed/controllable clock.
 	Now func() time.Time
+
+	// --- W4-04 cloud-call error taxonomy / retry / Fable-5 shaping ---
+
+	// MaxInlineRetries is cfg.cloud_retry_max_inline (task spec default
+	// 3): the max total upstream attempts for one logical call before
+	// giving up inline. <= 0 defaults to 3 (defaultMaxInlineRetries).
+	MaxInlineRetries int
+	// Backoff is the jittered exponential backoff schedule between inline
+	// retry attempts (task spec step 2). The zero value still works
+	// (cloudretry.Backoff.Delay's own zero-value defaults resolve it to
+	// cloudretry.DefaultBackoff()'s shape); tests substitute a
+	// Backoff{Rand: fixedFunc} for determinism.
+	Backoff cloudretry.Backoff
+	// Sleep is the inline retry loop's injectable "wait between attempts"
+	// hook - nil defaults to time.Sleep. Tests substitute a function that
+	// records the requested delay and returns immediately, so a
+	// 1s/2s/4s backoff schedule can be asserted without a slow test.
+	Sleep func(d time.Duration)
+	// JSONLLog is the OPTIONAL per-attempt JSONL sink (task spec step 2:
+	// "each retry logs JSONL with trace_id, attempt number, status"). nil
+	// skips JSONL logging.
+	JSONLLog *logx.Logger
+
+	// OnCloudUnreachable is called EXACTLY once, synchronously, the
+	// moment inline retries are exhausted for this task's logical call
+	// (task spec step 3: park the task in bekliyor-yeniden-deneme). May
+	// be nil (best-effort, matching PauseBudget's own posture) - kahyad
+	// wires this to kahyad/internal/task's park-for-retry logic.
+	OnCloudUnreachable func(ctx context.Context, taskID string) error
+	// OnNonRetryableFailure is called EXACTLY once, synchronously, when a
+	// SINGLE attempt (never retried) comes back with a NonRetryable
+	// status (task spec step 6: task -> failed immediately). reasonID is
+	// cloudretry.ReasonForStatus(status) - a short English API error id.
+	// May be nil.
+	OnNonRetryableFailure func(ctx context.Context, taskID, reasonID string) error
 }
 
 // Proxy is kahyad's per-task forward-proxy listener.
@@ -257,9 +321,38 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 			}
 		},
 		ModifyResponse: p.wrapResponseBody,
-		ErrorHandler:   handleUpstreamError,
+		ErrorHandler:   p.handleUpstreamError,
+		// W4-04: the retry transport wraps net/http's own default
+		// transport (the same one httputil.ReverseProxy would otherwise
+		// use unset) with the inline retry loop (retry.go) - this is the
+		// ONE place a request is actually sent upstream, so it is the
+		// single choke point both the retry loop and the Fable-5 shaping
+		// (ServeHTTP, before this ever runs) need to sit at.
+		Transport: &retryTransport{
+			base:      http.DefaultTransport,
+			maxInline: cfg.MaxInlineRetries,
+			backoff:   cfg.Backoff,
+			sleep:     cfg.Sleep,
+			log:       p.logRetryAttempt,
+		},
 	}
 	return p, nil
+}
+
+// logRetryAttempt is retryTransport's retryAttemptLogger (task spec step
+// 2: "each retry logs JSONL with trace_id, attempt number, status") - a
+// no-op whenever ProxyConfig.JSONLLog was never wired (matching this
+// package's usual "unwired dependency" posture elsewhere).
+func (p *Proxy) logRetryAttempt(attempt int, status int, errMsg string) {
+	if p.cfg.JSONLLog == nil {
+		return
+	}
+	l := p.cfg.JSONLLog.With(p.cfg.TraceID)
+	if errMsg != "" {
+		l.Info("proxy.cloud_call_attempt", "task_id", p.cfg.TaskID, "attempt", attempt, "status", status, "err", errMsg)
+		return
+	}
+	l.Info("proxy.cloud_call_attempt", "task_id", p.cfg.TaskID, "attempt", attempt, "status", status)
 }
 
 // Start binds an ephemeral 127.0.0.1 listener and begins serving in the
@@ -304,6 +397,23 @@ type reqData struct {
 	SystemHash  string
 	Start       time.Time
 	Reservation ReservationID
+
+	// --- W4-04: populated by retryTransport.RoundTrip as it runs, read
+	// back by wrapResponseBody (ModifyResponse)/Proxy.handleUpstreamError
+	// (ErrorHandler) - see retry.go's own doc comment for why exactly one
+	// of these two ever fires per logical call. ---
+
+	// RetryAttempts is the total number of upstream attempts this logical
+	// call actually made (1 when the first attempt already succeeded or
+	// was NonRetryable).
+	RetryAttempts int
+	// NonRetryableReason is set (non-empty) exactly when the FIRST
+	// attempt's outcome classified NonRetryable - cloudretry.
+	// ReasonForStatus(status), a short English API error id.
+	NonRetryableReason string
+	// Exhausted is set true exactly when every one of MaxInlineRetries
+	// attempts classified Retryable (task spec step 3).
+	Exhausted bool
 }
 
 const proxyRequestMaxBytes = 16 << 20 // 16 MiB: generous for a /v1/messages body
@@ -349,6 +459,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Istek govdesi okunamadi.")
 		return
 	}
+
+	// W4-04 step 7: Fable-5 request shaping happens HERE, before the body
+	// is probed for governor sizing/model routing or ever reaches the
+	// retry transport - every downstream consumer (governor, upstream,
+	// every retry attempt's replayed body) sees the SAME, already-shaped
+	// bytes.
+	if shapedBody, shaped := shapeFable5Body(bodyBytes); shaped {
+		bodyBytes = shapedBody
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.ContentLength = int64(len(bodyBytes))
+		if p.cfg.EventLedger != nil {
+			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventFable5Shaped, map[string]any{
+				"task_id": p.cfg.TaskID,
+			})
+		}
+	}
+
+	// GetBody lets retryTransport (retry.go) replay this EXACT body -
+	// already read/restored, already Fable-5-shaped - on every retry
+	// attempt after the first (the proxy already buffers the body for the
+	// token ceiling above; this reuses that same buffer for replay,
+	// exactly as the task spec's own step 2 directs, rather than
+	// introducing a second body-buffering mechanism).
+	replayBody := bodyBytes
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(replayBody)), nil
+	}
+
 	model, systemHash := probeRequest(bodyBytes)
 
 	check := p.cfg.Governor.CheckBeforeForward(p.cfg.TaskID, model, bodyBytes)
@@ -589,16 +727,63 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 		// persistCtx convention.
 		p.cfg.Governor.RecordUsage(context.Background(), data.Reservation, p.cfg.EventLedger, p.cfg.TraceID, p.cfg.TaskID,
 			data.Model, u, usd, statusStr, durationMs, data.SystemHash)
+
+		// W4-04 step 6: a NonRetryable outcome (retryTransport made
+		// exactly one attempt, never retried) fires the task-failure
+		// callback synchronously, right here - ModifyResponse runs
+		// exactly once per logical call, so this fires exactly once too.
+		// The upstream's real response (status/body) still flows to the
+		// worker completely unchanged via resp itself - this callback is
+		// purely kahyad's OWN side effect (task -> failed, ledger,
+		// notify), independent of whatever the worker's own HTTP client
+		// does with the response.
+		if data.NonRetryableReason != "" && p.cfg.OnNonRetryableFailure != nil {
+			_ = p.cfg.OnNonRetryableFailure(context.Background(), p.cfg.TaskID, data.NonRetryableReason)
+		}
 	}
 	resp.Body = wrapped
 	return nil
 }
 
-// handleUpstreamError passes upstream/connection failures through as a
-// generic Anthropic-shaped 502 - retry/backoff/error taxonomy is W4-04
-// (out of scope here); this proxy never invents its own retry behavior.
-func handleUpstreamError(w http.ResponseWriter, _ *http.Request, _ error) {
+// handleUpstreamError is httputil.ReverseProxy's ErrorHandler: it fires
+// whenever Transport.RoundTrip (retryTransport, retry.go) returns a
+// non-nil error - which, per that type's own doc comment, happens in
+// exactly one case: every inline retry attempt classified Retryable and
+// the budget (MaxInlineRetries) ran out (ErrRetriesExhausted). Any OTHER
+// RoundTrip-level error (a bug, not a classified outcome) still falls
+// through to the generic 502 - this proxy never invents retry behavior
+// beyond what retryTransport already decided.
+func (p *Proxy) handleUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrRetriesExhausted) {
+		p.onCloudUnreachable(r)
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", MsgCloudUnreachableMarker)
+		return
+	}
 	writeAnthropicError(w, http.StatusBadGateway, "api_error", "Yukari akis baglantisi basarisiz.")
+}
+
+// onCloudUnreachable implements task spec step 3's exhaustion path:
+// ledger proxy.cloud_unreachable, then invoke OnCloudUnreachable exactly
+// once (kahyad wires this to kahyad/internal/task's park-for-retry
+// logic - Machine.Transition to bekliyor-yeniden-deneme, next_retry_at,
+// the outbox enqueue, and the exact Turkish "parked" notification -
+// entirely outside this package, keeping anthproxy store-agnostic per
+// this file's own package doc comment).
+func (p *Proxy) onCloudUnreachable(r *http.Request) {
+	data, _ := r.Context().Value(reqDataCtxKey{}).(*reqData)
+	attempts := 0
+	if data != nil {
+		attempts = data.RetryAttempts
+	}
+	ctx := context.Background()
+	if p.cfg.EventLedger != nil {
+		_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventCloudUnreachable, map[string]any{
+			"task_id": p.cfg.TaskID, "attempts": attempts,
+		})
+	}
+	if p.cfg.OnCloudUnreachable != nil {
+		_ = p.cfg.OnCloudUnreachable(ctx, p.cfg.TaskID)
+	}
 }
 
 // --- Anthropic-shaped error bodies ---

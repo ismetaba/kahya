@@ -286,6 +286,12 @@ type Querier interface {
 	// proxy chokepoint) is GetTaskLane's other caller, consulted on EVERY
 	// forwarded model-call request.
 	SetTaskLane(ctx context.Context, arg SetTaskLaneParams) error
+	// W4-04: writes tasks.next_retry_at when kahyad/internal/task.CloudRetry
+	// parks a task in 'bekliyor-yeniden-deneme' (the status change itself
+	// goes through Machine.Transition/SetTaskStatus, same as every other
+	// transition - this query ONLY ever touches next_retry_at, so a caller
+	// always calls both, never this alone).
+	SetTaskNextRetry(ctx context.Context, arg SetTaskNextRetryParams) error
 	// The ONLY writer of tasks.status is kahyad/internal/task.Machine.Transition
 	// - every status change is preceded by that function's own legal-transition
 	// check and followed by a task.transition (or task.illegal_transition)

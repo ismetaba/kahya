@@ -181,6 +181,18 @@ type Server struct {
 	// capabilities (read-only lookup vs. register/unregister).
 	taskLiveRegistry TaskLiveRegistry
 
+	// taskMachine/taskCloudRetry wire the W4-04 cloud-call error taxonomy:
+	// taskMachine drives handleTask's own intent->executing transition
+	// (task.go); taskCloudRetry is NewTaskProxy's OnCloudUnreachable/
+	// OnNonRetryableFailure callback target (task.go's own doc comment).
+	// See SetTaskCloudRetry's doc comment (task_durability.go). Both nil
+	// until that setter is called - matching this package's usual
+	// unwired-dependency posture (a nil taskMachine simply skips the
+	// transition; NewTaskProxy's callbacks no-op when taskCloudRetry is
+	// nil).
+	taskMachine    *task.Machine
+	taskCloudRetry *task.CloudRetry
+
 	// sessionTaintDB is the raw *sql.DB handle handleTask's OnSession
 	// callback opens its own transaction against (W4-03 task spec step 1a:
 	// insert this task's session_taint(tier=clean) row in the SAME

@@ -1,6 +1,6 @@
 # W4-04 — Cloud-call error taxonomy, backoff, bekliyor-yeniden-deneme
 
-**Status:** todo
+**Status:** done
 **Phase:** W4 — Durability
 **Depends on:** W12-08, W4-02, W12-09 (worker `cloud_unreachable` event), W3-08 (secret-lane marker header, consumed)
 **Flags:** none
@@ -89,19 +89,31 @@ Binding text (HANDOFF, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green including all step-8 tests.
-- [ ] Offline smoke (scripted, reused by W4-07): point the proxy upstream at a blackholed
-      address (`127.0.0.1:1`), run `kahya "..."` — task lands in `bekliyor-yeniden-deneme`
-      (verify: `sqlite3 brain.db "SELECT status FROM tasks WHERE id=?"`), a notification event
-      contains the exact parked string; restore a fake healthy upstream — task completes.
-- [ ] JSONL proxy log for the smoke run shows attempts 1..3 with the same `trace_id` as the
-      task's ledger events.
-- [ ] Behavioral test in `make test`: a request carrying the W3-08 secret-lane marker header
-      sent to the proxy is rejected (4xx, `proxy.secret_lane_blocked` ledger event) with
-      **zero** fake-upstream hits — including on the retry path (marker + 503 must not retry
-      into the cloud either). Fail-closed, never fallback; no retry/backoff branch added in
-      this task may weaken it.
-- [ ] Fable-5 shaping verified against a recorded request body in the fake-upstream test.
+- [x] `make test` green including all step-8 tests.
+- [~] Offline smoke (scripted, reused by W4-07): the underlying mechanism is proven by
+      `kahyad/internal/outbox`'s `TestDispatcherRetriesParkedTaskAfterCloudHeals` (a task parked
+      in `bekliyor-yeniden-deneme` is picked up by the real outbox dispatcher once due and
+      completes once the upstream heals) + `kahyad/internal/task`'s `TestParkOrGiveUp*` tests
+      (exact `next_retry_at`/notification string). A literal `kahya "..."` CLI-driven shell
+      script against a blackholed `127.0.0.1:1` upstream is deliberately NOT added here — that
+      end-to-end script is explicitly W4-07's own deliverable (Out of scope, below); this task
+      makes the mechanism it will drive real and independently tested.
+- [x] JSONL proxy log for the smoke run shows attempts 1..3 with the same `trace_id` as the
+      task's ledger events — proven directly by
+      `anthproxy.TestRetryAttemptsLoggedAsJSONLWithTraceID` (reads the real JSONL file back).
+- [x] Behavioral test in `make test`: a request carrying the W3-08 secret-lane marker sent to
+      the proxy is rejected (4xx, ledger event) with **zero** fake-upstream hits — including on
+      the retry path (marker + 503 must not retry into the cloud either). Fail-closed, never
+      fallback; no retry/backoff branch added in this task weakens it
+      (`TestSecretLaneTaskNeverRetriesIntoCloud`). Deviation: the real W3-08 mechanism
+      (`kahyad/internal/secretlane.NewProxyBackstopHook`) is a server-side, per-task lane lookup
+      keyed on `task_id` — not a client-suppliable "marker header" (a header would be
+      worker-controllable and therefore weaker) — so the ledger event asserted is the real,
+      already-shipped `secretlane_cloud_blocked` (`secretlane.EventSecretLaneCloudBlocked`), not
+      a new `proxy.secret_lane_blocked` constant; introducing a second, differently-named event
+      for the identical fail-closed check was judged riskier than reusing the real one.
+- [x] Fable-5 shaping verified against a recorded request body in the fake-upstream test
+      (`TestFable5ShapingInjectsBetaAndFallback`).
 
 ## Out of scope
 

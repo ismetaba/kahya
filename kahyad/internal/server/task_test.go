@@ -19,6 +19,7 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/task"
 )
 
 // ---- mapTaskOutcome: pure-function unit tests (no real process/timeout
@@ -70,6 +71,23 @@ func TestMapTaskOutcomeErrorWithWorkerMessage(t *testing.T) {
 	payload := m.ssePayload.(map[string]string)
 	if payload["message"] != "ozel hata" {
 		t.Errorf("message = %q, want %q", payload["message"], "ozel hata")
+	}
+}
+
+// TestMapTaskOutcomeCloudUnreachable is the W4-04 addition: a
+// spawn.StatusCloudUnreachable outcome maps to the exact parked Turkish
+// string (task.MsgCloudParked) - the ACTUAL status transition
+// (bekliyor-yeniden-deneme) already happened synchronously via
+// NewTaskProxy's own OnCloudUnreachable callback; this mapping only
+// decides the SSE/free-form-state surface.
+func TestMapTaskOutcomeCloudUnreachable(t *testing.T) {
+	m := mapTaskOutcome(nil, spawn.Outcome{Status: spawn.StatusCloudUnreachable}, "trace1", "task1", 30)
+	if m.finalState != "waiting_retry" || m.ledgerKind != "task_waiting_retry" || m.sseEvent != "error" {
+		t.Fatalf("got %+v", m)
+	}
+	payload := m.ssePayload.(map[string]string)
+	if payload["message"] != task.MsgCloudParked {
+		t.Errorf("message = %q, want the exact parked string %q", payload["message"], task.MsgCloudParked)
 	}
 }
 

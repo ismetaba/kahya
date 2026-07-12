@@ -267,25 +267,36 @@ func (r *Resume) notify(ctx context.Context, traceID, kind, msg, taskID, tool st
 	return r.notifier.Notify(ctx, traceID, kind, msg, payload)
 }
 
-// writeOutboxResumeRow writes one OutboxKindTaskResume row that
-// kahyad/internal/outbox.Dispatcher will later claim and act on by
-// re-spawning the worker with the stored session_id + resume:true (task
-// spec step 7/8). It does NOT touch tasks.attempts - callers that are
-// redispatching a task WITHOUT any status transition (this file's own
-// enqueueResume, below) must bump attempts themselves before calling
-// this; a caller reaching here via a status transition INTO 'executing'
-// (resolve.go's Resolver.Retry) gets its attempts bump for free from
-// Machine.Transition itself and must not double-count it by bumping
-// again here.
+// writeOutboxResumeRow writes one OutboxKindTaskResume row available
+// IMMEDIATELY (availableAt=now) that kahyad/internal/outbox.Dispatcher
+// will claim and act on by re-spawning the worker with the stored
+// session_id + resume:true (task spec step 7/8). It does NOT touch
+// tasks.attempts - callers that are redispatching a task WITHOUT any
+// status transition (this file's own enqueueResume, below) must bump
+// attempts themselves before calling this; a caller reaching here via a
+// status transition INTO 'executing' (resolve.go's Resolver.Retry) gets
+// its attempts bump for free from Machine.Transition itself and must not
+// double-count it by bumping again here.
 func writeOutboxResumeRow(ctx context.Context, outbox OutboxEnqueuer, now func() time.Time, traceID, taskID string) error {
 	ts := FixedNanoRFC3339(now())
+	return writeOutboxResumeRowAt(ctx, outbox, traceID, taskID, ts, ts)
+}
+
+// writeOutboxResumeRowAt is writeOutboxResumeRow generalized to a caller-
+// chosen (createdAt, availableAt) pair - cloudretry.go's park() is the
+// one caller that needs availableAt in the FUTURE (next_retry_at, task
+// spec step 3): the SAME OutboxKindTaskResume row shape and the SAME
+// kahyad/internal/outbox.Dispatcher claim loop handle it with no new
+// mechanism, simply picking it up once available_at has passed (exactly
+// the task spec's own "no new mechanism here" instruction).
+func writeOutboxResumeRowAt(ctx context.Context, outbox OutboxEnqueuer, traceID, taskID, createdAt, availableAt string) error {
 	payload, err := json.Marshal(OutboxTaskResumePayload{TaskID: taskID})
 	if err != nil {
 		return fmt.Errorf("marshal resume payload: %w", err)
 	}
 	if _, err := outbox.InsertOutboxRow(ctx, sqlcgen.InsertOutboxRowParams{
 		TraceID: traceID, Kind: OutboxKindTaskResume, Payload: string(payload),
-		CreatedAt: ts, AvailableAt: sql.NullString{String: ts, Valid: true},
+		CreatedAt: createdAt, AvailableAt: sql.NullString{String: availableAt, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("enqueue outbox row: %w", err)
 	}

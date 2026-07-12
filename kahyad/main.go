@@ -492,6 +492,33 @@ func run() int {
 	srv.SetTaskDurability(taskResolver, st.Queries, taskLive)
 	srv.SetTaskLiveRegistry(taskLive)
 
+	// W4-04: cloud-call error taxonomy - task-side park/give-up/fail-
+	// immediately decision (kahyad/internal/task.CloudRetry), driven by
+	// kahyad/internal/anthproxy's inline retry loop via
+	// server.Server.NewTaskProxy's OnCloudUnreachable/OnNonRetryableFailure
+	// callbacks (task.go's own doc comment). config.validateCloudRetry
+	// already guarantees every cfg.CloudRetryTaskSchedule entry and
+	// cfg.CloudRetryGiveUpAfter parse as valid durations at Load() time, so
+	// the two parse errors below truly cannot fire in production - they
+	// exist only so a future caller of task.NewCloudRetry directly (e.g. a
+	// test) is never silently handed a mis-parsed zero-value schedule.
+	cloudRetrySchedule := make([]time.Duration, 0, len(cfg.CloudRetryTaskSchedule))
+	for _, s := range cfg.CloudRetryTaskSchedule {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			log.Error("cloud_retry_task_schedule_invalid", "entry", s, "err", err.Error())
+			return 1
+		}
+		cloudRetrySchedule = append(cloudRetrySchedule, d)
+	}
+	cloudRetryGiveUpAfter, err := time.ParseDuration(cfg.CloudRetryGiveUpAfter)
+	if err != nil {
+		log.Error("cloud_retry_give_up_after_invalid", "value", cfg.CloudRetryGiveUpAfter, "err", err.Error())
+		return 1
+	}
+	taskCloudRetry := task.NewCloudRetry(st.Queries, st.Queries, taskMachine, st, notifier, cloudRetrySchedule, cloudRetryGiveUpAfter)
+	srv.SetTaskCloudRetry(taskMachine, taskCloudRetry)
+
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
 	// (W12-08). notifier (built above, alongside the egress gate)
 	// logs+ledgers alarms; governorNotifier additionally fans every ALARM-
@@ -632,18 +659,23 @@ func run() int {
 	// SAME taskMachine/taskLive built above. dispatcherSpawnCfg mirrors
 	// POST /v1/task's own spawn.Config fields (WorkerCmd/Socket/LogDir/
 	// MCPBridgePath/CredentialMode); AnthropicBaseURL/APIKey are left unset
-	// here - a genuinely resumed worker that needs to make a NEW model
-	// call would need its own fresh per-dispatch anthproxy.Proxy listener
-	// (the same per-task construction handleTask performs, kahyad/
-	// internal/server/task.go), which is intentionally deferred (a
-	// resumed worker's model-call path is exercised end-to-end by the
-	// W4-07 gate, not this task - see this task's own commit notes).
+	// on this shared base value - each redispatch instead gets its OWN
+	// fresh pair from SetAnthproxyOpener below (W4-04's fix for the gap
+	// this comment used to describe as "intentionally deferred").
 	dispatcherSpawnCfg := spawn.Config{
 		Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
 		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
 	}
 	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, taskLive, cfg.TaskRetryW1MaxAuto)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)
+	// W4-04: a redispatched cloud-lane task needs its OWN fresh Anthropic
+	// forward-proxy listener to make any model call at all - srv.
+	// NewTaskProxy is the EXACT SAME construction handleTask uses at first
+	// spawn (kahyad/internal/server/task.go's own doc comment), so the two
+	// call sites can never drift apart.
+	taskDispatcher.SetAnthproxyOpener(func(_ context.Context, taskID, traceID string) (string, string, func() error, error) {
+		return srv.NewTaskProxy(taskID, traceID)
+	})
 
 	runResumeScan := func(ctx context.Context) {
 		if _, err := taskResume.Scan(ctx); err != nil {

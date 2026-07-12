@@ -29,6 +29,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLINotFoundError,
     HookMatcher,
     ResultMessage,
     TextBlock,
@@ -44,6 +45,43 @@ from .system_prompt import SYSTEM_PROMPT
 # paraphrased - docs/ipc.md §4).
 MSG_ENVELOPE_INVALID = "Görev zarfı geçersiz."
 MSG_MODEL_CALL_FAILED_FMT = "Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace {trace_id}"
+
+# W4-04: exit code this process uses for the cloud_unreachable protocol
+# line below - distinct from 1 (ordinary model-call failure) and 2
+# (envelope invalid) so kahyad/internal/spawn can tell the three apart
+# from the exit code alone, in addition to the stdout protocol line
+# itself (spawn.go's own stdoutLine.Event field is the primary signal;
+# the exit code is belt-and-braces).
+_EXIT_CLOUD_UNREACHABLE = 3
+
+# kahyad/internal/anthproxy.MsgCloudUnreachableMarker's exact value
+# (kahyad/internal/anthproxy/proxy.go) - embedded in the Anthropic-shaped
+# error body kahyad's own forward-proxy returns once its W4-04 inline
+# retry budget is exhausted. This worker has no other way to distinguish
+# "kahyad's own retry budget ran out" from an ordinary model-call failure
+# (it never sees the proxy's internal retry bookkeeping directly - only
+# whatever claude_agent_sdk/the underlying CLI subprocess ends up raising
+# after ITS OWN attempt to reach ANTHROPIC_BASE_URL finally fails), so
+# this is necessarily a string-content check over the raised exception,
+# not a typed one. Kept in English (CLAUDE.md §3: technical/internal
+# identifiers stay English) - never shown to the user directly.
+_CLOUD_UNREACHABLE_MARKER = "kahya_cloud_unreachable"
+
+# Additional best-effort substrings that plausibly indicate a genuine
+# transport/connectivity failure reaching kahyad's own localhost proxy
+# (as opposed to CLINotFoundError - a local install problem - or an
+# ordinary API-level failure the SDK already surfaces as ResultMessage.
+# is_error, handled separately below) - belt-and-braces in case the
+# underlying CLI subprocess never echoes the marker string above
+# verbatim into whatever claude_agent_sdk raises.
+_CLOUD_UNREACHABLE_FALLBACK_MARKERS = (
+    "econnrefused",
+    "econnreset",
+    "connection refused",
+    "connection reset",
+    "socket hang up",
+    "fetch failed",
+)
 
 # Safe placeholder trace_id used ONLY when the real-key leak check
 # (_check_real_key_leak) fires - see MINOR 7 fix in main() below. Never the
@@ -143,6 +181,29 @@ def _fail_envelope_invalid(detail: str) -> int:
     wlog.log("error", "envelope_invalid", detail=detail)
     _print_protocol_line({"type": "error", "message": MSG_ENVELOPE_INVALID})
     return 2
+
+
+def _is_cloud_unreachable(exc: Exception) -> bool:
+    """W4-04: true when exc looks like kahyad's own forward-proxy telling
+    this worker its inline retry budget is exhausted (or, best-effort, any
+    other genuine transport/connectivity failure reaching it) - as opposed
+    to CLINotFoundError (a local install problem, never retried) or an
+    ordinary API-level failure the SDK already surfaces as ResultMessage.
+    is_error (handled by the caller BEFORE this function is ever
+    consulted - see _run_session's ResultMessage.is_error branch, which
+    returns before reaching the except block below).
+
+    See _CLOUD_UNREACHABLE_MARKER's own doc comment for why this is a
+    string-content heuristic, not a typed check: this worker has no
+    direct visibility into kahyad/internal/anthproxy's own retry
+    bookkeeping.
+    """
+    if isinstance(exc, CLINotFoundError):
+        return False
+    text = str(exc).lower()
+    if _CLOUD_UNREACHABLE_MARKER in text:
+        return True
+    return any(marker in text for marker in _CLOUD_UNREACHABLE_FALLBACK_MARKERS)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -330,6 +391,20 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
                         )
                         return 1
     except Exception as e:  # noqa: BLE001 - any SDK/transport failure surfaces as one user-facing error line.
+        # W4-04: kahyad's own forward-proxy exhausted its inline retry
+        # budget (kahyad/internal/anthproxy) - this is NOT an ordinary
+        # model-call failure, so it gets its own protocol line/exit code
+        # instead of the generic Turkish error line: kahyad's task-
+        # durability layer (kahyad/internal/task.CloudRetry) has ALREADY
+        # parked this task in bekliyor-yeniden-deneme synchronously, mid-
+        # call, via the proxy's own OnCloudUnreachable callback - this
+        # line is diagnostic/UX only (the offline-command-finishes-later
+        # acceptance criterion), never the mechanism that actually retries
+        # the task.
+        if _is_cloud_unreachable(e):
+            wlog.log("error", "cloud_unreachable", error=str(e))
+            _print_protocol_line({"event": "cloud_unreachable"})
+            return _EXIT_CLOUD_UNREACHABLE
         wlog.log("error", "sdk_error", error=str(e))
         _print_protocol_line(
             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
@@ -410,6 +485,12 @@ async def _run_reader_session(envelope: Envelope) -> int:
                         )
                         return 1
     except Exception as e:  # noqa: BLE001 - any SDK/transport failure surfaces as one user-facing error line.
+        # W4-04: same cloud_unreachable split as _run_session - see that
+        # function's own comment.
+        if _is_cloud_unreachable(e):
+            wlog.log("error", "reader_cloud_unreachable", error=str(e))
+            _print_protocol_line({"event": "cloud_unreachable"})
+            return _EXIT_CLOUD_UNREACHABLE
         wlog.log("error", "reader_sdk_error", error=str(e))
         _print_protocol_line(
             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}

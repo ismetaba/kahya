@@ -355,6 +355,16 @@ SET attempts = attempts + 1, updated_at = ?
 WHERE id = ?
 RETURNING attempts;
 
+-- name: SetTaskNextRetry :exec
+-- W4-04: writes tasks.next_retry_at when kahyad/internal/task.CloudRetry
+-- parks a task in 'bekliyor-yeniden-deneme' (the status change itself
+-- goes through Machine.Transition/SetTaskStatus, same as every other
+-- transition - this query ONLY ever touches next_retry_at, so a caller
+-- always calls both, never this alone).
+UPDATE tasks
+SET next_retry_at = ?, updated_at = ?
+WHERE id = ?;
+
 -- name: ListExecutingTasks :many
 -- The resume scan's candidate set (kahyad startup + periodic tick):
 -- every task currently recorded as 'executing'. kahyad/internal/task's

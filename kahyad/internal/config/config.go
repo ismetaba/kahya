@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -277,6 +278,30 @@ type Config struct {
 	// dotted string.
 	TaskRetryW1MaxAuto int `yaml:"task_retry_w1_max_auto"`
 
+	// --- W4-04 cloud-call error taxonomy / retry / task parking ---
+
+	// CloudRetryMaxInline is `cloud.retry.max_inline` (task spec, default
+	// 3): the max number of upstream attempts kahyad/internal/anthproxy's
+	// retry transport makes for one logical model call before giving up
+	// inline and parking the task (bekliyor-yeniden-deneme) instead. Flat
+	// key, same convention as TaskRetryW1MaxAuto above.
+	CloudRetryMaxInline int `yaml:"cloud_retry_max_inline"`
+	// CloudRetryTaskSchedule is `cloud.retry.task_schedule` (task spec
+	// default: "1m,5m,15m,60m, then hourly"): each entry is a
+	// time.ParseDuration string; kahyad/internal/task indexes this list by
+	// the task's own attempts count to pick next_retry_at's delay, and
+	// simply keeps re-using the LAST entry once attempts exceeds the list
+	// length - which is exactly "then hourly" when the last configured
+	// entry is itself "60m", as the default is.
+	CloudRetryTaskSchedule []string `yaml:"cloud_retry_task_schedule"`
+	// CloudRetryGiveUpAfter is `cloud.retry.give_up_after` (task spec
+	// default "24h"): a time.ParseDuration string. Once a task has spent
+	// longer than this cumulatively parked in bekliyor-yeniden-deneme
+	// (measured from the task's own created_at), the NEXT retry-exhaustion
+	// gives up instead of parking again - task -> failed + the give-up
+	// Turkish notification string, per task spec step 4.
+	CloudRetryGiveUpAfter string `yaml:"cloud_retry_give_up_after"`
+
 	// TriggerBinPath is the absolute path to the kahya-trigger binary
 	// (kahyad/cmd/kahya-trigger) launchd execs for every declared job —
 	// derived the same way MCPBridgePath/PolicyPath/etc. are (two
@@ -357,6 +382,9 @@ type fileConfig struct {
 	Jobs                    *[]JobConfig `yaml:"jobs"`
 	TriggerBinPath          *string      `yaml:"trigger_bin_path"`
 	TaskRetryW1MaxAuto      *int         `yaml:"task_retry_w1_max_auto"`
+	CloudRetryMaxInline     *int         `yaml:"cloud_retry_max_inline"`
+	CloudRetryTaskSchedule  *[]string    `yaml:"cloud_retry_task_schedule"`
+	CloudRetryGiveUpAfter   *string      `yaml:"cloud_retry_give_up_after"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -394,6 +422,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateJobs(cfg.Jobs); err != nil {
+		return Config{}, err
+	}
+	if err := validateCloudRetry(cfg.CloudRetryMaxInline, cfg.CloudRetryTaskSchedule, cfg.CloudRetryGiveUpAfter); err != nil {
 		return Config{}, err
 	}
 
@@ -471,6 +502,14 @@ func defaults(home string) Config {
 
 		// W4-02 task durability default (task spec, verbatim: "default 3").
 		TaskRetryW1MaxAuto: 3,
+
+		// W4-04 cloud-call error taxonomy defaults (task spec, verbatim):
+		// max_inline=3; task_schedule 1m,5m,15m,60m (then hourly - see the
+		// field's own doc comment for why re-using the last entry IS
+		// "hourly" here); give_up_after=24h.
+		CloudRetryMaxInline:    3,
+		CloudRetryTaskSchedule: []string{"1m", "5m", "15m", "60m"},
+		CloudRetryGiveUpAfter:  "24h",
 	}
 }
 
@@ -743,6 +782,15 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.TaskRetryW1MaxAuto != nil {
 		cfg.TaskRetryW1MaxAuto = *fc.TaskRetryW1MaxAuto
 	}
+	if fc.CloudRetryMaxInline != nil {
+		cfg.CloudRetryMaxInline = *fc.CloudRetryMaxInline
+	}
+	if fc.CloudRetryTaskSchedule != nil {
+		cfg.CloudRetryTaskSchedule = *fc.CloudRetryTaskSchedule
+	}
+	if fc.CloudRetryGiveUpAfter != nil {
+		cfg.CloudRetryGiveUpAfter = *fc.CloudRetryGiveUpAfter
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -876,6 +924,32 @@ func validateJobs(jobs []JobConfig) error {
 		if strings.TrimSpace(j.Handler) == "" {
 			return fmt.Errorf("config: jobs[].handler must not be empty (job %q)", j.Name)
 		}
+	}
+	return nil
+}
+
+// validateCloudRetry fails Load closed (same posture as validateEnv/
+// validateLogLevel/validateCredentialMode/validateJobs) on an invalid
+// W4-04 cloud-retry config: max_inline must be >= 1 (a call that can
+// never even be attempted once is nonsensical), and every task_schedule
+// entry plus give_up_after must be a valid time.ParseDuration string -
+// kahyad/internal/task parses these at schedule-computation time, so a
+// bad value must be caught here, at boot, rather than surfacing as a
+// silent zero-delay retry loop deep inside a running task.
+func validateCloudRetry(maxInline int, taskSchedule []string, giveUpAfter string) error {
+	if maxInline < 1 {
+		return fmt.Errorf("config: cloud_retry_max_inline=%d invalid, must be >= 1", maxInline)
+	}
+	for _, s := range taskSchedule {
+		if _, err := time.ParseDuration(s); err != nil {
+			return fmt.Errorf("config: cloud_retry_task_schedule entry %q invalid: %w", s, err)
+		}
+	}
+	if len(taskSchedule) == 0 {
+		return fmt.Errorf("config: cloud_retry_task_schedule must not be empty")
+	}
+	if _, err := time.ParseDuration(giveUpAfter); err != nil {
+		return fmt.Errorf("config: cloud_retry_give_up_after=%q invalid: %w", giveUpAfter, err)
 	}
 	return nil
 }

@@ -31,6 +31,7 @@ import (
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
+	"kahya/kahyad/internal/task"
 )
 
 // Request body size caps (BLOCKER 3 hardening: an unbounded body reaching
@@ -238,6 +239,67 @@ func rfc3339Now() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
+// NewTaskProxy builds and starts a fresh per-task Anthropic forward-proxy
+// listener for taskID/traceID - the ONE construction both handleTask
+// (first spawn, below) and kahyad/internal/outbox.Dispatcher's
+// AnthproxyOpener (a later cloud-lane REDISPATCH, wired in main.go) share,
+// so the governor/notifier/credential/egress-gate/cost-governor/cloud-
+// retry-callback wiring can never drift between the two call sites - the
+// exact drift that used to leave a resumed cloud-lane task unable to
+// reach the cloud at all (kahyad/internal/outbox's own package doc
+// comment, closed by this task).
+//
+// Returns the base URL to set as the worker's ANTHROPIC_BASE_URL, the
+// per-task local auth token (ANTHROPIC_API_KEY), and a close func the
+// caller must call once done with this listener (mirrors proxy.Close).
+func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, closeFn func() error, err error) {
+	apiKey = spawn.NewAPIKey()
+	var egressGate func(*http.Request) error
+	if s.anthEgressGateFactory != nil {
+		egressGate = s.anthEgressGateFactory(taskID, traceID)
+	}
+	proxy, err := anthproxy.New(anthproxy.ProxyConfig{
+		TaskID:         taskID,
+		TraceID:        traceID,
+		Token:          apiKey,
+		UpstreamURL:    s.cfg.AnthropicUpstreamURL,
+		CredentialMode: s.cfg.CredentialMode,
+		Credential:     s.anthCredential,
+		Governor:       s.anthGovernor,
+		Notifier:       s.anthNotifier,
+		EventLedger:    s.eventLogger,
+		EgressGate:     egressGate,
+		// W4-04: cloud-call error taxonomy / retry / task parking.
+		MaxInlineRetries: s.cfg.CloudRetryMaxInline,
+		JSONLLog:         s.log,
+		PauseBudget: func(ctx context.Context, pausedTaskID string) error {
+			return s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
+				State: "paused_budget", UpdatedAt: rfc3339Now(), ID: pausedTaskID,
+			})
+		},
+		OnCloudUnreachable: func(ctx context.Context, tid string) error {
+			if s.taskCloudRetry == nil {
+				return nil
+			}
+			return s.taskCloudRetry.ParkOrGiveUp(ctx, traceID, tid)
+		},
+		OnNonRetryableFailure: func(ctx context.Context, tid, reasonID string) error {
+			if s.taskCloudRetry == nil {
+				return nil
+			}
+			return s.taskCloudRetry.FailNonRetryable(ctx, traceID, tid, reasonID)
+		},
+	})
+	if err != nil {
+		return "", "", nil, err
+	}
+	baseURL, err = proxy.Start()
+	if err != nil {
+		return "", "", nil, err
+	}
+	return baseURL, apiKey, proxy.Close, nil
+}
+
 // handleTask implements POST /v1/task (W12-07 step 4): validates the
 // prompt, mints a task_id/envelope, inserts the tasks row (state=
 // "running"), ledgers task_spawned, then switches into an SSE response and
@@ -440,47 +502,36 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W12-08: open this task's own ephemeral forward-proxy listener BEFORE
-	// the SSE response starts, so a failure here is still a plain JSON
-	// 500 like every other pre-stream validation failure - never a
-	// mid-stream SSE error event. apiKey is minted once and used both as
-	// the proxy's expected local auth token AND the worker's own
-	// ANTHROPIC_API_KEY (docs/ipc.md: "kahya-task-<hex32>" - the real key
-	// never leaves kahyad).
-	apiKey := spawn.NewAPIKey()
-	var egressGate func(*http.Request) error
-	if s.anthEgressGateFactory != nil {
-		egressGate = s.anthEgressGateFactory(taskID, traceID)
+	// W4-04: this cloud-lane task now genuinely enters the W4-02 status
+	// state machine (intent -> executing) - previously this handler only
+	// ever touched the older, free-form tasks.state field, leaving
+	// tasks.status stuck at 'intent' forever in production (the resume
+	// scan/outbox dispatcher's own candidate queries key off 'executing',
+	// so bekliyor-yeniden-deneme could never actually be reached without
+	// this). Best-effort: a transition failure here does not abort the
+	// request (tasks.state-based SSE reporting below is unaffected either
+	// way) - it is logged and the guarded post-spawn transition further
+	// down simply has nothing to move if this never took hold.
+	if s.taskMachine != nil {
+		if err := s.taskMachine.Transition(dbCtx, traceID, taskID, task.StatusExecuting); err != nil {
+			log.Warn("task_transition_executing_failed", "task_id", taskID, "err", err.Error())
+		}
 	}
-	proxy, err := anthproxy.New(anthproxy.ProxyConfig{
-		TaskID:         taskID,
-		TraceID:        traceID,
-		Token:          apiKey,
-		UpstreamURL:    s.cfg.AnthropicUpstreamURL,
-		CredentialMode: s.cfg.CredentialMode,
-		Credential:     s.anthCredential,
-		Governor:       s.anthGovernor,
-		Notifier:       s.anthNotifier,
-		EventLedger:    s.eventLogger,
-		EgressGate:     egressGate,
-		PauseBudget: func(ctx context.Context, pausedTaskID string) error {
-			return s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
-				State: "paused_budget", UpdatedAt: rfc3339Now(), ID: pausedTaskID,
-			})
-		},
-	})
+
+	// W12-08/W4-04: open this task's own ephemeral forward-proxy listener
+	// BEFORE the SSE response starts, so a failure here is still a plain
+	// JSON 500 like every other pre-stream validation failure - never a
+	// mid-stream SSE error event. NewTaskProxy is the SAME construction
+	// kahyad/internal/outbox.Dispatcher's AnthproxyOpener uses at
+	// REDISPATCH time (wired in main.go) - one shared helper, so the two
+	// call sites can never drift apart.
+	anthropicBaseURL, apiKey, closeProxy, err := s.NewTaskProxy(taskID, traceID)
 	if err != nil {
 		log.Error("anthproxy_new_failed", "task_id", taskID, "err", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, "anthropic proxy init failed")
 		return
 	}
-	anthropicBaseURL, err := proxy.Start()
-	if err != nil {
-		log.Error("anthproxy_start_failed", "task_id", taskID, "err", err.Error())
-		writeJSONError(w, http.StatusInternalServerError, "anthropic proxy start failed")
-		return
-	}
-	defer proxy.Close()
+	defer func() { _ = closeProxy() }()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -575,7 +626,46 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info(m.ledgerKind, "task_id", taskID)
 
+	// W4-04: guarded post-spawn status transition. A cloud-retry callback
+	// (NewTaskProxy's OnCloudUnreachable/OnNonRetryableFailure) may ALREADY
+	// have moved this task's status to bekliyor-yeniden-deneme or failed
+	// SYNCHRONOUSLY, mid-spawn.Run, before this point ever runs - re-
+	// fetching the CURRENT status and only transitioning when it is still
+	// 'executing' avoids attempting an illegal/duplicate transition on top
+	// of whatever the callback already decided (Machine.Transition's own
+	// from==to no-op would make a same-status call harmless anyway, but a
+	// task already parked in bekliyor-yeniden-deneme must NOT also be
+	// forced to 'done'/'failed' here - it is correctly still in flight,
+	// waiting for the outbox dispatcher's own later redelivery).
+	if s.taskMachine != nil {
+		current, gerr := s.taskDurabilityStatus(persistCtx, taskID)
+		if gerr == nil && current == task.StatusExecuting {
+			to := task.StatusDone
+			if runErr != nil || outcome.Status != spawn.StatusOK {
+				to = task.StatusFailed
+			}
+			if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, to); terr != nil {
+				log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", to, "err", terr.Error())
+			}
+		}
+	}
+
 	writeSSE(m.sseEvent, m.ssePayload)
+}
+
+// taskDurabilityStatus reads taskID's CURRENT tasks.status - a tiny
+// helper so the guarded post-spawn transition above never needs its own
+// copy of a GetTaskByID-shaped interface; taskDurabilityStore already has
+// exactly this read (task_durability.go's own TaskDurabilityStore).
+func (s *Server) taskDurabilityStatus(ctx context.Context, taskID string) (string, error) {
+	if s.taskDurabilityStore == nil {
+		return "", fmt.Errorf("task durability store not available")
+	}
+	t, err := s.taskDurabilityStore.GetTaskByID(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	return t.Status, nil
 }
 
 // handleSecretLaneTask answers a lane=="secret" task entirely via
@@ -709,6 +799,18 @@ func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string,
 			finalState: "error", ledgerKind: "task_timeout",
 			sseEvent:   "error",
 			ssePayload: map[string]string{"message": fmt.Sprintf(MsgTaskTimeout, timeoutMin)},
+		}
+	case outcome.Status == spawn.StatusCloudUnreachable:
+		// W4-04: kahyad/internal/task.CloudRetry has ALREADY parked the
+		// task in bekliyor-yeniden-deneme (tasks.status), synchronously,
+		// via NewTaskProxy's own OnCloudUnreachable callback, well before
+		// this mapping ever runs - this branch only decides the free-form
+		// tasks.state/SSE surface, using the SAME exact parked Turkish
+		// string the notification channel already sent.
+		return taskOutcomeMapping{
+			finalState: "waiting_retry", ledgerKind: "task_waiting_retry",
+			sseEvent:   "error",
+			ssePayload: map[string]string{"message": task.MsgCloudParked},
 		}
 	case outcome.Status == spawn.StatusError:
 		msg := outcome.ErrMsg

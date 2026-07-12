@@ -289,6 +289,66 @@ class TestStdoutProtocolAndSession(unittest.TestCase):
             ],
         )
 
+    def test_cloud_unreachable_marker_emits_event_line_and_exit_3(self) -> None:
+        """W4-04: kahyad/internal/anthproxy's own MsgCloudUnreachableMarker
+        text, surfacing as whatever the underlying CLI/SDK ends up raising
+        once its OWN attempt to reach ANTHROPIC_BASE_URL finally fails,
+        must map to {"event":"cloud_unreachable"} + exit 3 - NOT the
+        generic model-call-failed error line."""
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE),
+                base_env(log_dir),
+                client_factory=fake_client_factory(
+                    raise_on_connect=RuntimeError("upstream 503: kahya_cloud_unreachable: retries exhausted")
+                ),
+            )
+
+        self.assertEqual(code, 3)
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(lines, [{"event": "cloud_unreachable"}])
+
+    def test_connection_reset_fallback_marker_also_maps_to_cloud_unreachable(self) -> None:
+        """Belt-and-braces: even without the exact marker string, a
+        plainly connectivity-shaped exception message still counts."""
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE),
+                base_env(log_dir),
+                client_factory=fake_client_factory(raise_on_connect=RuntimeError("Connection reset by peer")),
+            )
+
+        self.assertEqual(code, 3)
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(lines, [{"event": "cloud_unreachable"}])
+
+    def test_cli_not_found_never_misclassified_as_cloud_unreachable(self) -> None:
+        """CLINotFoundError is a local install problem, never a cloud-
+        connectivity one - even if its message happened to contain a
+        fallback marker substring, it must never be misclassified."""
+        from claude_agent_sdk import CLINotFoundError
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE),
+                base_env(log_dir),
+                client_factory=fake_client_factory(
+                    raise_on_connect=CLINotFoundError("Claude Code not found: connection refused by shell")
+                ),
+            )
+
+        self.assertEqual(code, 1)
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(
+            lines,
+            [
+                {
+                    "type": "error",
+                    "message": f"Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace {VALID_ENVELOPE['trace_id']}",
+                }
+            ],
+        )
+
     def test_no_stray_output_beyond_protocol_lines(self) -> None:
         """Every captured stdout line must parse as exactly one JSON
         object - no stray prints, no partial lines."""
