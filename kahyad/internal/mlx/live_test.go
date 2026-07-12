@@ -15,11 +15,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -203,4 +205,87 @@ func TestLiveQwenMemcheckInsufficientFailsClosed(t *testing.T) {
 	if got := sup.State(); got != "down" {
 		t.Errorf("State() = %q, want %q (must never have attempted to spawn)", got, "down")
 	}
+}
+
+// recordingIntentLedger records every intent_classified payload this test
+// logs via router.LogIntentClassified - just enough of router.Ledger's
+// interface to count events and pull out duration_ms for the p95 report
+// below (informational only; task spec: "log, do not gate").
+type recordingIntentLedger struct {
+	durationsMs []int64
+}
+
+func (r *recordingIntentLedger) LogEvent(_ context.Context, _, kind string, payload map[string]any) error {
+	if kind != router.EventIntentClassified {
+		return nil
+	}
+	if d, ok := payload["duration_ms"].(int64); ok {
+		r.durationsMs = append(r.durationsMs, d)
+	}
+	return nil
+}
+
+// TestLiveIntentClassificationTwentyRunsReportsP95 is W4-08's own guarded
+// live check: ≥20 real, warm intent-classification round-trips through
+// router.ClassifyIntent (the SAME combined {secret_lane, category, intent}
+// call TestLiveQwenSpawnHealthClassifyAndIdleUnload above already proves
+// correct) against the real local Qwen3-30B-A3B-4bit server, each one
+// logging intent_classified via router.LogIntentClassified. The p95
+// duration_ms is REPORTED (t.Logf), never asserted against the <300ms-warm
+// target - TestLiveQwenSpawnHealthClassifyAndIdleUnload's own "LIVE
+// FINDING" comment already documents that this target does not hold in
+// practice on real hardware for this model size; this test's job is only
+// to prove the intent_classified event itself fires correctly and to
+// surface a real number, not to gate on it.
+func TestLiveIntentClassificationTwentyRunsReportsP95(t *testing.T) {
+	cmd, modelPath := liveTestPrereqOrSkip(t)
+
+	port := freePort(t)
+	argv := append(append([]string{}, cmd...),
+		"--model", modelPath,
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(port),
+	)
+	sup := New(Config{
+		Cmd: argv, Host: "127.0.0.1", Port: port,
+		StartupGrace: 3 * time.Minute, PollInterval: 500 * time.Millisecond,
+		Log: testLogger(t),
+	})
+	t.Cleanup(sup.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := sup.EnsureRunning(ctx); err != nil {
+		t.Fatalf("EnsureRunning() (real cold spawn) error = %v", err)
+	}
+
+	rawClassifier := secretlane.NewClassifier(secretlane.NewHTTPQwenClassifier(sup.BaseURL(), "mlx-community/Qwen3-30B-A3B-4bit"))
+	ledger := &recordingIntentLedger{}
+
+	const runs = 20
+	prompts := []string{
+		"Kadıköy'deki randevuyu hatırlat",
+		"şu maildeki tarihleri ve tutarları çıkar",
+		"bu görevi alt-ajanlara böl ve paralel çalıştır",
+		"bu kodu üç dosyada birden değiştirmem lazım",
+	}
+	for i := 0; i < runs; i++ {
+		release := sup.Acquire()
+		callCtx, callCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		result, err := router.ClassifyIntent(callCtx, rawClassifier, router.ClassifyIntentInput{Text: prompts[i%len(prompts)]})
+		callCancel()
+		release()
+		if err != nil {
+			t.Fatalf("ClassifyIntent() run %d error = %v", i, err)
+		}
+		router.LogIntentClassified(context.Background(), ledger, "live-intent-trace", result)
+	}
+
+	if got := len(ledger.durationsMs); got < runs {
+		t.Fatalf("intent_classified events logged = %d, want >= %d", got, runs)
+	}
+	sorted := append([]int64(nil), ledger.durationsMs...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p95 := sorted[(len(sorted)*95)/100]
+	t.Logf("live intent classification: %d runs, p95 duration_ms=%d (task spec's <300ms-warm target is informational, not gated - see this test's own doc comment)", len(sorted), p95)
 }

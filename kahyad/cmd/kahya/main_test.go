@@ -447,6 +447,78 @@ func TestReindexReEmbedFlagReachesRequestBody(t *testing.T) {
 	}
 }
 
+// TestAskDerinFlagSendsDeepThinkTrue proves `kahya ask --derin <prompt>`
+// reaches POST /v1/task with deep_think:true (W4-08).
+func TestAskDerinFlagSendsDeepThinkTrue(t *testing.T) {
+	var gotDeepThink bool
+	var gotPrompt string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotDeepThink, _ = body["deep_think"].(bool)
+		gotPrompt, _ = body["prompt"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--derin", "şu", "mimariyi", "değerlendir"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !gotDeepThink {
+		t.Error("server did not see deep_think=true in the request body")
+	}
+	if gotPrompt != "şu mimariyi değerlendir" {
+		t.Errorf("prompt = %q, want %q", gotPrompt, "şu mimariyi değerlendir")
+	}
+}
+
+// TestAskWithoutDerinSendsDeepThinkFalse proves plain `kahya ask <prompt>`
+// (no --derin) sends deep_think:false (the default, backward-compatible
+// value) - the flag opts IN, it is never on by default.
+func TestAskWithoutDerinSendsDeepThinkFalse(t *testing.T) {
+	var gotDeepThink bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotDeepThink, _ = body["deep_think"].(bool)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "merhaba"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if gotDeepThink {
+		t.Error("server saw deep_think=true without --derin, want false")
+	}
+}
+
+// TestAskEmptyPromptRejectedWithoutDialing mirrors
+// TestOneShotEmptyPromptRejectedWithoutDialing for the `ask` subcommand.
+func TestAskEmptyPromptRejectedWithoutDialing(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "nope.sock")
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--derin", "   "}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if got := strings.TrimSpace(stderr.String()); got != MsgEmptyQuestion {
+		t.Errorf("stderr = %q, want exactly %q (proving no dial was attempted)", got, MsgEmptyQuestion)
+	}
+}
+
 func TestFormatLogLineOmitsTraceIDColumnButKeepsExtras(t *testing.T) {
 	line := formatLogLine(map[string]any{
 		"ts": "2026-07-10T09:15:00.5Z", "level": "WARN", "proc": "worker",

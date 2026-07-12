@@ -576,14 +576,25 @@ type sseEvent struct {
 	data  []byte
 }
 
-// StreamTask calls POST /v1/task {"prompt","trace_id":traceID} and reads
-// the text/event-stream response, invoking onDelta with each "delta"
-// event's text as it arrives (in order), and returning once a "result" or
-// "error" event is seen. traceID is minted by the CALLER (main.go), not
-// here - per the task spec, the CLI mints its own trace_id specifically so
-// it can still print it even when this call fails outright.
-func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, onDelta func(string)) (taskResult, error) {
-	body, err := json.Marshal(map[string]string{"prompt": prompt, "trace_id": traceID})
+// streamTaskRequest is POST /v1/task's request body (matches
+// kahyad/internal/server.taskRequest exactly - W4-08 adds deep_think).
+type streamTaskRequest struct {
+	Prompt    string `json:"prompt"`
+	TraceID   string `json:"trace_id"`
+	DeepThink bool   `json:"deep_think,omitempty"`
+}
+
+// StreamTask calls POST /v1/task {"prompt","trace_id":traceID,
+// "deep_think":deepThink} and reads the text/event-stream response,
+// invoking onDelta with each "delta" event's text as it arrives (in
+// order), and returning once a "result" or "error" event is seen. traceID
+// is minted by the CALLER (main.go), not here - per the task spec, the CLI
+// mints its own trace_id specifically so it can still print it even when
+// this call fails outright. deepThink is W4-08's `kahya ask --derin`
+// opt-in (the OTHER opt-in form - the "derin düşün:" Turkish prompt prefix
+// - is detected server-side, so it needs no client-side plumbing at all).
+func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, deepThink bool, onDelta func(string)) (taskResult, error) {
+	body, err := json.Marshal(streamTaskRequest{Prompt: prompt, TraceID: traceID, DeepThink: deepThink})
 	if err != nil {
 		return taskResult{}, err
 	}

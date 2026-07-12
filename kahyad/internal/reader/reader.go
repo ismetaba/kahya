@@ -41,8 +41,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"kahya/kahyad/internal/mlx"
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -266,7 +268,7 @@ func (r *Runner) Run(ctx context.Context, jobType string, rawBytes []byte, trace
 	}
 
 	text := string(rawBytes)
-	verdict := r.classify(ctx, text)
+	verdict := r.classify(ctx, traceID, text)
 
 	var content string
 	var lane string
@@ -302,11 +304,30 @@ func (r *Runner) Run(ctx context.Context, jobType string, rawBytes []byte, trace
 // itself is diagnostic only and intentionally discarded here (Run has
 // nowhere useful to surface it; the resulting Verdict is what drives
 // behavior).
-func (r *Runner) classify(ctx context.Context, text string) secretlane.Verdict {
+func (r *Runner) classify(ctx context.Context, traceID, text string) secretlane.Verdict {
+	start := time.Now()
 	if r.Classifier == nil {
-		return secretlane.Verdict{SecretLane: true, Category: secretlane.CategoryUnknown, Reason: "reader_no_classifier_fail_closed"}
+		v := secretlane.Verdict{SecretLane: true, Category: secretlane.CategoryUnknown, Reason: "reader_no_classifier_fail_closed"}
+		// Source is "deterministic": no model round-trip was even
+		// attempted (r.Classifier itself was never wired) - see
+		// router.SourceForVerdict's own doc comment for why this must
+		// never be reported as "model".
+		router.LogIntentClassified(ctx, r.Ledger, traceID, router.ClassifyIntentResult{
+			Source: router.SourceDeterministic, Duration: time.Since(start),
+		})
+		return v
 	}
 	v, _ := r.Classifier.Classify(ctx, text)
+	// W4-08: this SAME combined call now also returns intent (see
+	// secretlane/classifier.go) - router.SourceForVerdict distinguishes an
+	// actual Qwen round-trip (Reason "qwen"/"qwen_error_fail_closed"/
+	// "qwen_invalid_category_fail_closed") from a deterministic pre-pass
+	// hit or a never-attempted fail-closed reason ("qwen_unavailable_fail_
+	// closed" - c.Qwen==nil inside the classifier, distinct from
+	// r.Classifier itself being nil above).
+	router.LogIntentClassified(ctx, r.Ledger, traceID, router.ClassifyIntentResult{
+		Intent: v.Intent, Source: router.SourceForVerdict(v.Reason), Duration: time.Since(start),
+	})
 	return v
 }
 

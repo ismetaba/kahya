@@ -59,6 +59,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runApprove(client, args[1:], stdin, stdout, stderr)
 	case "task":
 		return runTask(client, args[1:], stdout, stderr)
+	case "ask":
+		return runAsk(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -74,15 +76,38 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	traceID := traceid.New()
-	return execTask(client, traceID, prompt, stdout, stderr)
+	return execTask(client, traceID, prompt, false, stdout, stderr)
+}
+
+// runAsk implements `kahya ask [--derin] <question...>` (W4-08): the SAME
+// one-shot task execution as runOneShot, plus the --derin flag that pins
+// claude-fable-5 ("derin düşün" opt-in) via envelope.deep_think. The OTHER
+// opt-in form - the byte-exact Turkish prompt prefix "derin düşün:" - needs
+// no flag at all; it is detected server-side regardless of which CLI
+// subcommand sent the prompt.
+func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if prompt == "" {
+		fmt.Fprintln(stderr, MsgEmptyQuestion)
+		return 2
+	}
+	traceID := traceid.New()
+	return execTask(client, traceID, prompt, *derin, stdout, stderr)
 }
 
 // execTask runs one task to completion: POST /v1/task, stream delta text
 // to stdout, print the trace footer to stderr, and return the exit code
 // (W12-06 step 2: 0 on result.status=="ok", 1 on error, 2 on any transport
 // failure - dial failure or, until W12-07 lands, /v1/task's current 404).
-func execTask(client *Client, traceID, prompt string, stdout, stderr io.Writer) int {
-	res, err := client.StreamTask(context.Background(), traceID, prompt, func(text string) {
+// deepThink is W4-08's --derin/deep_think opt-in.
+func execTask(client *Client, traceID, prompt string, deepThink bool, stdout, stderr io.Writer) int {
+	res, err := client.StreamTask(context.Background(), traceID, prompt, deepThink, func(text string) {
 		fmt.Fprint(stdout, text)
 	})
 	if err != nil {
@@ -131,7 +156,7 @@ func runREPL(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 			break
 		}
 		if line != "" {
-			execTask(client, traceid.New(), line, stdout, stderr)
+			execTask(client, traceid.New(), line, false, stdout, stderr)
 		}
 		if err != nil {
 			break // EOF right after a final, newline-less line

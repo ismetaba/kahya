@@ -59,18 +59,28 @@ const (
 
 // Ledger event kinds this package (and proxy.go) write — HANDOFF §5 safety
 // #4: every governor/proxy decision is append-only auditable.
+//
+// EventBudgetDowngradeUnavail ("budget_downgrade_unavailable") is RETIRED
+// (W4-08): it used to fire alongside EventBudgetDowngradeOn because the
+// Sonnet->yerel downgrade rung had nowhere to route a Sonnet-class task
+// before kahyad/internal/router's local lane existed. That lane now exists
+// (kahyad/internal/server's POST /v1/task envelope builder consults
+// router.SelectModel + this governor's Downgraded() and routes a
+// Sonnet-class task locally instead) — there is no longer any "downgrade
+// unavailable" case to ledger, so this package no longer emits that event
+// kind at all. The string constant is intentionally not kept around: no
+// production code path can ever produce this event again.
 const (
-	EventModelCall              = "model_call"
-	EventProxyAuthReject        = "proxy_auth_reject"
-	EventTaskPausedBudget       = "task_paused_budget"
-	EventBudgetDowngradeOn      = "budget_downgrade_on"
-	EventBudgetDowngradeUnavail = "budget_downgrade_unavailable"
-	EventSpendAlarm80           = "spend_alarm_80"
-	EventSpendAlarm100          = "spend_alarm_100"
-	EventCacheHitAlarm          = "cache_hit_alarm"
-	EventCacheBusterSuspect     = "cache_buster_suspect"
-	EventKeychainUnavailable    = "keychain_unavailable"
-	EventKeyOverrideIgnored     = "key_override_ignored"
+	EventModelCall           = "model_call"
+	EventProxyAuthReject     = "proxy_auth_reject"
+	EventTaskPausedBudget    = "task_paused_budget"
+	EventBudgetDowngradeOn   = "budget_downgrade_on"
+	EventSpendAlarm80        = "spend_alarm_80"
+	EventSpendAlarm100       = "spend_alarm_100"
+	EventCacheHitAlarm       = "cache_hit_alarm"
+	EventCacheBusterSuspect  = "cache_buster_suspect"
+	EventKeychainUnavailable = "keychain_unavailable"
+	EventKeyOverrideIgnored  = "key_override_ignored"
 )
 
 // spendAlarmRatio80/100 are the fixed alarm crossings (task spec step 3:
@@ -113,11 +123,10 @@ type dailyAgg struct {
 	// *Logged flags dedupe the "once per day" ledger/alarm events; they
 	// live only in memory and reset on daemon restart — see Boot's doc
 	// comment for why that gap is accepted for W1-2.
-	downgradeLogged        bool
-	downgradeUnavailLogged bool
-	alarm80Logged          bool
-	alarm100Logged         bool
-	cacheAlarmLogged       bool
+	downgradeLogged  bool
+	alarm80Logged    bool
+	alarm100Logged   bool
+	cacheAlarmLogged bool
 
 	// lastSystemHash/systemHashChanges implement the cache-buster
 	// detector (step 4): a change from the PREVIOUS call's hash (not
@@ -490,14 +499,22 @@ func (g *Governor) ReleaseReservation(id ReservationID) {
 	g.releaseLocked(id)
 }
 
-// DowngradeModel implements the FIXED Opus->Sonnet->yerel chain (HANDOFF
-// §4 ⚑, verbatim): Opus steps down to Sonnet. Sonnet has nowhere left to
-// go until W3-08 lands the local lane, so it is returned unchanged
-// (changed=false) — callers must NOT invent a Sonnet->Haiku rung (Haiku is
-// a task-class model in the §4 routing table, never a rung in this
-// chain). Any other model (Haiku, Fable, or an unrecognized string) is
-// also returned unchanged — this chain only ever applies to the two
-// models the §4 flag names.
+// DowngradeModel implements the Opus->Sonnet leg of HANDOFF §4 ⚑'s FIXED
+// Opus->Sonnet->yerel chain in isolation: Opus steps down to Sonnet. Sonnet
+// is returned unchanged (changed=false) — callers must NOT invent a
+// Sonnet->Haiku rung (Haiku is a task-class model in the §4 routing table,
+// never a rung in this chain). Any other model (Haiku, Fable, or an
+// unrecognized string) is also returned unchanged — this chain only ever
+// applies to the two models the §4 flag names.
+//
+// NOTE (W4-08): the Sonnet->yerel leg is NOT implemented here — it is
+// implemented generically, on whatever base model a task's intent resolved
+// to, by kahyad/internal/router.SelectModel (which consults this
+// Governor's Downgraded() below, not this method) — see that package's own
+// doc comment for why the local lane is represented as a routing BRANCH
+// decision, never a model string. This method is kept exactly as W12-08
+// left it (a pure Opus->Sonnet mapping) for any caller that only needs
+// that one leg in isolation; production routing does not call it.
 func (g *Governor) DowngradeModel(model string) (result string, changed bool) {
 	if model == "claude-opus-4-8" {
 		return "claude-sonnet-5", true
@@ -507,8 +524,9 @@ func (g *Governor) DowngradeModel(model string) (result string, changed bool) {
 
 // Downgraded reports whether today's spend has crossed
 // Limits.DowngradeAtRatio of the daily budget (default 0.8, i.e. $8 of
-// $10) — W12-07's envelope builder consults this for NEW tasks only; it
-// never affects an already-running task.
+// $10) — kahyad/internal/server's POST /v1/task envelope builder consults
+// this for NEW tasks only (via kahyad/internal/router.SelectModel's
+// RouteInput.Downgraded field); it never affects an already-running task.
 func (g *Governor) Downgraded() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -584,14 +602,7 @@ func (g *Governor) RecordUsage(ctx context.Context, reservation ReservationID, e
 		!agg.downgradeLogged
 	if fireDowngrade {
 		agg.downgradeLogged = true
-		// The "->yerel" rung needs W3-08's local lane; until it lands,
-		// every downgrade-on crossing is ALSO the moment Sonnet-class
-		// tasks discover they have nowhere further to fall (task spec
-		// step 3: "Sonnet-class tasks stay on Sonnet ... ledgers
-		// budget_downgrade_unavailable once per day").
-		agg.downgradeUnavailLogged = true
 	}
-	fireDowngradeUnavail := fireDowngrade
 
 	alarm80 := g.limits.DailyBudgetUSD > 0 &&
 		agg.usd >= g.limits.DailyBudgetUSD*spendAlarmRatio80 && !agg.alarm80Logged
@@ -631,11 +642,6 @@ func (g *Governor) RecordUsage(ctx context.Context, reservation ReservationID, e
 	}
 	if fireDowngrade {
 		g.ledgerEvent(ctx, eventLedger, traceID, EventBudgetDowngradeOn, map[string]any{"day": day})
-	}
-	if fireDowngradeUnavail {
-		g.ledgerEvent(ctx, eventLedger, traceID, EventBudgetDowngradeUnavail, map[string]any{
-			"day": day, "note": "Sonnet->yerel rung needs W3-08; Sonnet-class tasks stay on Sonnet",
-		})
 	}
 	if alarm80 {
 		g.alarmEvent(ctx, eventLedger, traceID, EventSpendAlarm80,

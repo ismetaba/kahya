@@ -127,12 +127,33 @@ type taskTestFixture struct {
 
 func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTestFixture {
 	t.Helper()
+	// W12-08: handleTask now requires an anthproxy Governor to be wired
+	// (same "unwired dependency -> 503" posture as taskStore). Generous
+	// limits so none of these pre-existing W12-07 fixtures ever trip a
+	// budget/ceiling block; passthrough mode needs no Keychain/real key.
+	governor := anthproxy.NewGovernor(anthproxy.Limits{
+		DailyBudgetUSD:         1000,
+		MonthlyBudgetUSD:       10000,
+		TaskTokenCeiling:       500000,
+		DowngradeAtRatio:       0.8,
+		CacheHitAlarmThreshold: 0.5,
+	}, nil, nil)
+	return newTaskTestFixtureWithGovernor(t, workerCmd, timeoutMin, "https://upstream.invalid", governor)
+}
+
+// newTaskTestFixtureWithGovernor is newTaskTestFixture's own general form
+// (W4-08): lets a caller supply its OWN Governor (e.g. one pre-loaded with
+// enough spend to be Downgraded()==true) and its own AnthropicUpstreamURL
+// (e.g. a real httptest.Server, to prove a secret-lane/local-routed task
+// never sends it a single byte).
+func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin int, upstreamURL string, governor *anthproxy.Governor) taskTestFixture {
+	t.Helper()
 	cfg := config.Config{
 		DBPath:               filepath.Join(t.TempDir(), "brain.db"),
 		MemoryDir:            t.TempDir(),
 		Socket:               filepath.Join(shortSocketDir(t), "k.sock"),
 		LogDir:               t.TempDir(),
-		AnthropicUpstreamURL: "https://upstream.invalid",
+		AnthropicUpstreamURL: upstreamURL,
 		DefaultModel:         "claude-sonnet-5",
 		TaskTimeoutMin:       timeoutMin,
 		WorkerCmd:            workerCmd,
@@ -153,17 +174,7 @@ func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTe
 	// session_taint(clean) insert (task spec step 1a), matching production
 	// wiring exactly rather than only the plain UpdateTaskSession fallback.
 	srv.SetSessionTaintDB(st.DB())
-	// W12-08: handleTask now requires an anthproxy Governor to be wired
-	// (same "unwired dependency -> 503" posture as taskStore). Generous
-	// limits so none of these pre-existing W12-07 fixtures ever trip a
-	// budget/ceiling block; passthrough mode needs no Keychain/real key.
-	srv.SetAnthproxy(anthproxy.NewGovernor(anthproxy.Limits{
-		DailyBudgetUSD:         1000,
-		MonthlyBudgetUSD:       10000,
-		TaskTokenCeiling:       500000,
-		DowngradeAtRatio:       0.8,
-		CacheHitAlarmThreshold: 0.5,
-	}, nil, nil), nil, anthproxy.NewPassthroughCredentialSource(), nil)
+	srv.SetAnthproxy(governor, nil, anthproxy.NewPassthroughCredentialSource(), nil)
 	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -216,7 +227,14 @@ func readAllSSE(t *testing.T, body *http.Response) []sseFrame {
 
 func postTask(t *testing.T, client *http.Client, traceID, prompt string) *http.Response {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"prompt": prompt, "trace_id": traceID})
+	return postTaskFull(t, client, traceID, prompt, false)
+}
+
+// postTaskFull is postTask's own general form (W4-08): lets a caller set
+// deep_think (the `kahya ask --derin` opt-in's own wire field).
+func postTaskFull(t *testing.T, client *http.Client, traceID, prompt string, deepThink bool) *http.Response {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"prompt": prompt, "trace_id": traceID, "deep_think": deepThink})
 	req, err := http.NewRequest(http.MethodPost, "http://kahyad/v1/task", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("build request: %v", err)

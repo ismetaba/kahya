@@ -27,6 +27,7 @@ import (
 	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
@@ -67,7 +68,36 @@ const (
 	// itself fails for a reason OTHER than ErrLocalModelUnavailable (which
 	// gets its own exact fail-closed message - see handleSecretLaneTask).
 	MsgSecretLaneModelCallFailed = "Yerel model çağrısı başarısız oldu. Ayrıntı: kahya log --trace %s"
+	// MsgDerinDuringDowngrade is W4-08's spend-warning: prefixed as the
+	// FIRST "delta" SSE event on a "derin düşün" task that is honored
+	// despite an active 80% cost-governor downgrade (HANDOFF §4 cost
+	// governor ⚑: an explicit derin opt-in is never itself downgraded, but
+	// the user should know they are spending through an active downgrade).
+	// Wording is this task's own choice (not byte-exact from any spec) -
+	// English identifiers, Turkish user-facing text per CLAUDE.md.
+	MsgDerinDuringDowngrade = "⚠️ Günlük bütçenin %80'i aşıldı; 'derin düşün' yine de çalıştırılıyor, ek maliyete dikkat edin."
 )
+
+// derinDusunPrefix is W4-08's deterministic, byte-exact Turkish opt-in
+// prompt prefix (task spec: "derin düşün:", matched BYTE-EXACT in Go and
+// STRIPPED from the prompt after detection - never model-detected). A
+// prompt beginning with this prefix sets deep_think=true exactly like the
+// `kahya ask --derin` flag does, and the prefix itself is removed before
+// the (now-bare) prompt is classified/answered - the user never sees their
+// own opt-in marker echoed back.
+const derinDusunPrefix = "derin düşün:"
+
+// detectAndStripDerinPrefix reports whether prompt begins with
+// derinDusunPrefix (strings.HasPrefix - an ordinary byte-for-byte
+// comparison, satisfying "matched BYTE-EXACT in Go") and, if so, returns
+// the remainder with the prefix and any immediately-following whitespace
+// removed.
+func detectAndStripDerinPrefix(prompt string) (stripped string, matched bool) {
+	if !strings.HasPrefix(prompt, derinDusunPrefix) {
+		return prompt, false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(prompt, derinDusunPrefix)), true
+}
 
 // TaskStore is the tasks-table persistence source POST /v1/task needs
 // (W12-07 step 4). *store.Store's own sqlc-generated Queries
@@ -228,6 +258,15 @@ func (s *Server) SetSecretLane(classifier *secretlane.Classifier, answerer secre
 type taskRequest struct {
 	Prompt  string `json:"prompt"`
 	TraceID string `json:"trace_id"`
+	// DeepThink is W4-08's `kahya ask --derin` opt-in: true pins
+	// claude-fable-5 (kahyad/internal/router.SelectModel), UNLESS the
+	// classified lane is secret (which outranks it). Optional/backward-
+	// compatible: absent/false is every pre-W4-08 request body's exact
+	// existing behavior. The OTHER opt-in form - the byte-exact Turkish
+	// prompt prefix "derin düşün:" - is detected server-side in handleTask
+	// itself (never client-side), so it needs no request-body field of its
+	// own.
+	DeepThink bool `json:"deep_think"`
 }
 
 // rfc3339Now is time.Now().UTC() formatted as plain RFC3339 (no
@@ -417,6 +456,26 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// NOT being "fixed" by always-loading Qwen here (see
 	// tasks/w3-policy-tools/W3-08-secret-lane-local.md's "Post-review scope
 	// note").
+	// W4-08: the "derin düşün" opt-in - a byte-exact Turkish prompt prefix,
+	// detected and stripped HERE (deterministically, in Go - never
+	// model-detected), before classification runs on the (now-bare)
+	// prompt. --derin (taskRequest.DeepThink) and the prefix are two
+	// independent ways to set the SAME flag; either (or both) sets it.
+	deepThink := req.DeepThink
+	if stripped, matched := detectAndStripDerinPrefix(req.Prompt); matched {
+		deepThink = true
+		req.Prompt = stripped
+	}
+	// A prompt consisting of ONLY the prefix (e.g. "derin düşün:" or
+	// "derin düşün:   ") strips down to empty - re-check here (the initial
+	// empty-prompt check above ran on the RAW, pre-strip prompt) so this
+	// still surfaces the same clean 400 "prompt must not be empty" instead
+	// of falling through to envelope.Validate()'s generic 500 further down.
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt must not be empty")
+		return
+	}
+
 	lane := spawn.LaneNormal
 	category := ""
 	verdict := secretlane.ClassifyDeterministic(req.Prompt)
@@ -429,6 +488,39 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info("secretlane_classified", "lane", lane, "category", category, "reason", verdict.Reason)
 
+	// W4-08: intent classification runs STRICTLY AFTER the secret-lane
+	// classification above (never before) and, for this ordinary chat
+	// prompt, is itself deterministic (IntentChat) - no CLI-declared task
+	// kind exists yet on this endpoint, so this NEVER takes a live Qwen
+	// dependency merely to answer a plain chat message (the same posture
+	// secretlane.ClassifyDeterministic's own call above already has).
+	// intentResult.Duration/Source still faithfully reflect that (Source
+	// is always "deterministic" here) - the intent_classified event this
+	// logs is what the ledger-ordering acceptance criterion
+	// (intent_classified -> routing_decision -> model_call) requires for
+	// EVERY task, not only ones that ever call the model to get one.
+	intentResult, _ := router.ClassifyIntent(dbCtx, nil, router.ClassifyIntentInput{DeterministicIntent: router.IntentChat})
+	router.LogIntentClassified(dbCtx, s.eventLogger, traceID, intentResult)
+
+	downgraded := s.anthGovernor != nil && s.anthGovernor.Downgraded()
+	routeInput := router.RouteInput{
+		Intent: intentResult.Intent, Lane: lane, DeepThink: deepThink,
+		Downgraded: downgraded, DefaultModel: s.cfg.DefaultModel,
+	}
+	decision := router.SelectModel(routeInput)
+	router.LogRoutingDecision(dbCtx, s.eventLogger, traceID, routeInput, decision)
+
+	// envelopeModel is ALWAYS a valid §9 cloud model, even when decision.
+	// Local is true (schema validity only - mirrors the pre-existing
+	// secret-lane precedent immediately below: envelope.Model is set
+	// unconditionally, but a Local decision NEVER spawns a worker/opens an
+	// Anthropic-proxy listener, so this value is never itself the
+	// enforcement that local content stays local).
+	envelopeModel := decision.Model
+	if decision.Local {
+		envelopeModel = s.cfg.DefaultModel
+	}
+
 	envelope := spawn.Envelope{
 		SchemaVersion:   spawn.SchemaVersion,
 		TaskID:          taskID,
@@ -436,11 +528,13 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		SessionID:       nil,
 		Kind:            "chat",
 		Prompt:          req.Prompt,
-		Model:           s.cfg.DefaultModel,
+		Model:           envelopeModel,
 		MemoryInjection: true,
 		CreatedAt:       now,
 		Lane:            lane,
 		Category:        category,
+		Intent:          intentResult.Intent,
+		DeepThink:       deepThink,
 	}
 	if err := envelope.Validate(); err != nil {
 		// Only reachable via a misconfigured cfg.default_model - prompt/
@@ -498,6 +592,35 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// is the SECOND, independent layer of defense in case that ever
 	// changes.
 	if lane == spawn.LaneSecret {
+		// W4-08: decision (computed above, unconditionally, for every task
+		// including this one) is ALREADY guaranteed Local==true here -
+		// router.SelectModel's own matrix test
+		// (TestSelectModelSecretLanePinsLocalForEveryIntent) proves
+		// Lane==secret pins local for every Intent/DeepThink/Downgraded
+		// combination. This is a defensive, log-only consistency check
+		// ("assert SelectModel would agree" per the task spec) - it changes
+		// no behavior; the actual enforcement is this branch itself, which
+		// never spawns a worker regardless of what decision says.
+		if !decision.Local {
+			log.Error("routing_invariant_violated", "task_id", taskID, "reason", "secret_lane_not_local", "decision_model", decision.Model)
+		}
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx)
+		return
+	}
+
+	if decision.Local {
+		// W4-08: the cost-governor's Sonnet->yerel downgrade rung (HANDOFF
+		// §4 ⚑ cost governor: Opus->Sonnet->yerel at 80% of daily spend).
+		// This task's OWN content classification stayed "normal" (lane, set
+		// above, is never mislabeled secret just because the ROUTE happens
+		// to be local this one time) - only THIS call's routing decision is
+		// local, driven by governor.Downgraded(), never envelope.Model
+		// (kept a valid §9 cloud model above for schema validity only, same
+		// as the secret-lane precedent). Reuses the EXACT SAME local-answer
+		// mechanism (kahyad/internal/secretlane.Answerer via
+		// handleSecretLaneTask) - see kahyad/internal/router's own package
+		// doc comment for why the local lane must never be represented as
+		// an envelope.Model string instead.
 		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx)
 		return
 	}
@@ -552,6 +675,21 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		flusher.Flush()
+	}
+
+	// W4-08: an explicit "derin düşün" opt-in is NOT itself a router
+	// choice subject to downgrade (router.RouteDecision.DerinDuringDowngrade
+	// is only ever true here, on the cloud/claude-fable-5 path - never on
+	// the lane==secret or decision.Local branches above, which already
+	// returned) - it is honored, but the user is warned, in the output
+	// itself, that they are spending through an active 80% downgrade.
+	if decision.DerinDuringDowngrade {
+		if s.eventLogger != nil {
+			if err := s.eventLogger.LogEvent(dbCtx, traceID, "derin_during_downgrade", map[string]any{"task_id": taskID}); err != nil {
+				log.Warn("derin_during_downgrade_ledger_error", "err", err.Error())
+			}
+		}
+		writeSSE("delta", map[string]string{"text": MsgDerinDuringDowngrade + "\n"})
 	}
 
 	timeoutMin := s.cfg.TaskTimeoutMin

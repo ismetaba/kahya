@@ -49,7 +49,9 @@ Single JSON object, written once, then stdin is closed:
   "created_at": "2026-07-10T12:00:00Z",
   "lane": "normal",
   "category": "",
-  "resume": false
+  "resume": false,
+  "intent": "chat",
+  "deep_think": false
 }
 ```
 
@@ -63,12 +65,14 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `session_id` | **Always present**, JSON `null` for a new task (Go: a nil `*string` — `encoding/json` renders this as `null` with no extra code). Reserved for W4-02 session resume; W1-2 never sets it on the way in. |
 | `kind` | Always `"chat"` in W1-2. Other kinds (scheduled/background) are later work. |
 | `prompt` | The user's text, non-blank (rejected at `/v1/task` before a task_id is even minted). Turkish text passes through byte-exact — no transliteration, no normalization. |
-| `model` | Must be one of the HANDOFF §9 cloud set: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` (`spawn.AllowedModels`). W1-2 always uses `cfg.default_model` (static); the full intent router (task-type → model) is W4-08 — the routing **decision** is always Go's, never the prompt's. Set unconditionally even for a `lane:"secret"` task (schema validity) — the ACTUAL enforcement that a secret-lane task never reaches this model is the W3-08 mechanisms `lane`/the proxy backstop describe below, not this field. |
+| `model` | Must be one of the HANDOFF §9 cloud set: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` (`spawn.AllowedModels`). **W4-08:** set by `kahyad/internal/router.SelectModel` (the §4 routing table, as data — see the "W4-08 note" below) rather than the static `cfg.default_model` W1-2 used; the routing **decision** is always Go's, never the prompt's. Set unconditionally even for a `lane:"secret"` task, or a task the router routed to the LOCAL lane (schema validity only — see the W4-08 note for why "local" is never itself a legal value here) — the ACTUAL enforcement that such a task never reaches this model is the mechanisms described below, not this field. |
 | `memory_injection` | Always `true` in W1-2. The `<hafiza>` block itself is rendered by `/v1/memory/search?for_injection=true` (W12-05); the worker's `UserPromptSubmit` hook that actually calls it is W12-09. |
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
 | `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
 | `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
 | `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). |
+| `intent` | **W4-08.** The §4 routing-table intent bucket (`kahyad/internal/router`'s `Intent*` constants: `plan`, `code_multi_file`, `hard_exec`, `subagent_exec`, `fanout`, `extract`, `writeback`, `route`, `classify`, `reader`, `chat`) — omitted via `omitempty` when empty, so every pre-W4-08 envelope/test still validates unchanged. Informational only (logs/CLI/ledger `intent_classified`/`routing_decision` events) — no enum validation in `Envelope.Validate` (the routing DECISION already happened before this envelope was built; the worker never reads this to choose anything, §4: "karar Go kodunda, istemde değil"). An ordinary `/v1/task` chat prompt with no CLI-declared kind is always `"chat"`, decided deterministically (no model call) — see the W4-08 note below for why. |
+| `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `claude-fable-5` whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being `claude-fable-5`. |
 
 ## 3 · Worker environment
 
@@ -211,6 +215,73 @@ a cloud model, without changing anything in §2-§6 above:
   template defaults to an extended "thinking" trace before answering — the
   classifier and local answerer both pass
   `chat_template_kwargs:{"enable_thinking":false}` to get a direct answer.
+
+### W4-08 note — intent router (HANDOFF §4 model-routing table)
+
+`kahyad/internal/router` turns the §4 model-routing table into executable
+Go data plus one pure function, `SelectModel(RouteInput) RouteDecision`,
+that `POST /v1/task`'s handler consults to set `model`/`intent`/
+`deep_think` above — replacing W1-2's static `cfg.default_model` with the
+real table:
+
+- **Table rows** (`plan`/`code_multi_file`/`hard_exec` → `claude-opus-4-8`;
+  `subagent_exec`/`fanout` → `claude-sonnet-5`; `extract`/`writeback` →
+  `claude-haiku-4-5`; `route`/`classify` → the local Qwen classifier itself,
+  never a cloud model; `reader` → lane-dependent, matching W4-03's Okuyucu
+  row unchanged; `chat`/unrecognized → `cfg.default_model`) are `SelectModel`'s
+  own ordinary case, driven by `RouteInput.Intent`.
+- **Ordering invariant, unchanged and reaffirmed:** `RouteInput.Lane` (the
+  W3-08 classification already described above) is checked FIRST, before
+  anything else — `lane=="secret"` PINS the local lane for every intent,
+  outranking `deep_think`/downgrade alike. `POST /v1/task`'s ordinary chat
+  path only ever passes `Intent:"chat"`, decided deterministically (no
+  model call) — the combined Qwen `{secret_lane, category, intent}` call
+  this extends (see the W3-08 note above; the JSON schema now also returns
+  `intent`) is invoked only where W3-08 already invokes Qwen (the W4-03
+  Reader ingest path) or where a caller explicitly asks to classify
+  (`kahyad/internal/router.ClassifyIntent`) — **never** on every ordinary
+  chat message.
+- **`intent_classified` / `routing_decision` ledger events** are emitted
+  for every task (`kahyad/internal/router.LogIntentClassified`/
+  `LogRoutingDecision`), in that order, before the eventual `model_call`
+  event a real cloud call produces — `kahya log --trace <id>` shows all
+  three, in order, under one `trace_id`.
+- **LOCAL LANE IS NOT AN ENVELOPE MODEL.** When `SelectModel` returns
+  `Local:true` (a secret-lane pin, OR the cost-governor's Sonnet→yerel
+  downgrade rung below), `POST /v1/task`'s handler answers the task via the
+  SAME local-answer mechanism the W3-08 note above describes
+  (`kahyad/internal/secretlane.Answerer`, `handleSecretLaneTask`) — it
+  NEVER spawns a worker or opens an Anthropic-proxy listener for that task,
+  and `model` in the envelope/tasks-row stays `cfg.default_model` for
+  schema validity only (never itself the enforcement).
+- **"Derin düşün" opt-in** pins `claude-fable-5` — the ONLY way it is ever
+  selected. Two independent triggers, both setting the SAME `deep_think`
+  flag: `kahya ask --derin` (client-supplied `taskRequest.deep_think`), and
+  the byte-exact Turkish prompt prefix `"derin düşün:"`, detected and
+  stripped **server-side**, in Go (never model-detected), before
+  classification runs on the (now-bare) prompt. `claude-fable-5` still gets
+  its mandatory `betas`/`fallbacks` shaping from the existing W4-04 proxy
+  logic (`kahyad/internal/anthproxy/fable5.go`) — this task only creates
+  the opt-in entry point that selects it, it does not re-implement that
+  shaping.
+- **Cost-governor 80% downgrade rung** (HANDOFF §4 ⚑, fixed chain
+  Opus→Sonnet→yerel): `POST /v1/task`'s handler consults
+  `kahyad/internal/anthproxy.Governor.Downgraded()` and passes it as
+  `RouteInput.Downgraded`; `SelectModel` drops the table's chosen model ONE
+  rung (`claude-opus-4-8`→`claude-sonnet-5`, `claude-sonnet-5`→the local
+  lane) — never touching `claude-haiku-4-5` (no rung is defined for it) or
+  an already-local decision. An explicit `--derin` opt-in is honored EVEN
+  during an active downgrade (it is not itself a router choice to
+  downgrade) — the handler ledgers `derin_during_downgrade` and prefixes
+  the SSE `delta` stream with a Turkish spend warning in that case. The
+  governor's own `budget_downgrade_unavailable` event (W12-08's stopgap for
+  the Sonnet-class case, before this task's local lane existed) is
+  **retired** — it is no longer emitted by any code path.
+- **W4-03 Reader** (`kahyad/internal/reader`) now sources its own
+  non-secret-lane cloud model choice from this SAME table
+  (`router.SelectModel(RouteInput{Intent: router.IntentReader, ...})`)
+  instead of a hand-maintained literal — value unchanged
+  (`claude-haiku-4-5`), a routing-source change only.
 
 ## 4 · Worker stdout protocol (JSONL)
 
@@ -439,9 +510,9 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
 - **Forward-proxy + real `ANTHROPIC_BASE_URL`** — landed in W12-08 (see
   the note above); the model-call `egressGate` hook is now the real
   `kahyad/internal/egress.Gate.Check` allowlist/budget/sensitive-read gate
-  (W3-05), and the
-  "→yerel" downgrade rung stays unavailable (ledgered as
-  `budget_downgrade_unavailable`) until W3-08's local lane lands.
+  (W3-05). The "→yerel" downgrade rung landed in W4-08 (see that note
+  above) — `budget_downgrade_unavailable` is retired, no longer emitted by
+  any code path.
 - **W3-05 egress-security review fixes (post-W3-05, this pass)** —
   tightened the gate/proxy without changing the IPC contract's own wire
   shapes:
@@ -514,14 +585,21 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   *population* remain W4-04; `user_halted` *semantics* remain W6-03 (only
   the enum value + the dispatcher's never-redeliver guard exist so far).
 - **Taint checks in policy decisions** — W4-03.
-- **Intent router / dynamic model routing** — W4-08. W1-2's `model` is
-  always the static `cfg.default_model`.
+- **Intent router / dynamic model routing** — landed in W4-08 (see that
+  note above): `model` is now set by `kahyad/internal/router.SelectModel`,
+  not a static `cfg.default_model`.
 - **Secret-lane classifier wired into memory_write/fs-read/mail-web
-  Reader ingestion** — W4-03/W4-08. W3-08 (see its own note above) exposes
-  the full `secretlane.Classifier` (deterministic + Qwen fallback) and
-  `secretlane.Escalate` (sticky lane widening) for those tasks to call;
-  `POST /v1/task`'s own classification uses the deterministic pre-pass
-  only, per that note's own reasoning.
+  Reader ingestion** — W4-03 wires the W4-03 Reader path (see that
+  package's own doc comment); memory_write/fs-read escalation remains
+  future work. W3-08 (see its own note above) exposes the full
+  `secretlane.Classifier` (deterministic + Qwen fallback, now also
+  returning `intent`, W4-08) and `secretlane.Escalate` (sticky lane
+  widening) for those tasks to call; `POST /v1/task`'s own classification
+  uses the deterministic pre-pass only, per that note's own reasoning.
+- **Subagent/fan-out execution itself** — post-core; W4-08 only encodes
+  the `subagent_exec`/`fanout` table row's model constant
+  (`claude-sonnet-5`) for a future runner to read via
+  `kahyad/internal/router.SelectModel`.
 
 ## 9 · W1-2 gate — how to re-run
 

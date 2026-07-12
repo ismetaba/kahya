@@ -97,7 +97,7 @@ func TestStreamTaskAssemblesDeltasInOrder(t *testing.T) {
 	client := newClient(sock)
 
 	var got strings.Builder
-	res, err := client.StreamTask(context.Background(), "trace123", "soru", func(text string) {
+	res, err := client.StreamTask(context.Background(), "trace123", "soru", false, func(text string) {
 		got.WriteString(text)
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func TestStreamTaskErrorEvent(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	res, err := client.StreamTask(context.Background(), "trace123", "soru", nil)
+	res, err := client.StreamTask(context.Background(), "trace123", "soru", false, nil)
 	if err != nil {
 		t.Fatalf("StreamTask() error = %v", err)
 	}
@@ -139,7 +139,7 @@ func TestStreamTaskDaemonDownIsUnreachable(t *testing.T) {
 	sock := filepath.Join(dir, "no-one-listening.sock") // never bound
 	client := newClient(sock)
 
-	_, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	_, err := client.StreamTask(context.Background(), "trace1", "soru", false, nil)
 	if err == nil {
 		t.Fatal("StreamTask() error = nil, want unreachable error")
 	}
@@ -160,7 +160,7 @@ func TestStreamTask404IsGracefulUnreachable(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	_, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	_, err := client.StreamTask(context.Background(), "trace1", "soru", false, nil)
 	if err == nil {
 		t.Fatal("StreamTask() error = nil, want graceful unreachable error")
 	}
@@ -297,7 +297,7 @@ func TestStreamTaskResultErrorWithMessage(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	res, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	res, err := client.StreamTask(context.Background(), "trace1", "soru", false, nil)
 	if err != nil {
 		t.Fatalf("StreamTask() error = %v", err)
 	}
@@ -319,7 +319,7 @@ func TestStreamTaskResultErrorWithoutMessageUsesFallback(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	res, err := client.StreamTask(context.Background(), "trace1", "soru", nil)
+	res, err := client.StreamTask(context.Background(), "trace1", "soru", false, nil)
 	if err != nil {
 		t.Fatalf("StreamTask() error = %v", err)
 	}
@@ -344,7 +344,7 @@ func TestStreamTaskMidStreamCloseIsStreamIncomplete(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	_, err := client.StreamTask(context.Background(), "trace-mid", "soru", nil)
+	_, err := client.StreamTask(context.Background(), "trace-mid", "soru", false, nil)
 	if err == nil {
 		t.Fatal("StreamTask() error = nil, want stream-incomplete error")
 	}
@@ -370,7 +370,7 @@ func TestStreamTaskZeroByteCloseIsUnreachable(t *testing.T) {
 	sock := startFakeServer(t, handler)
 	client := newClient(sock)
 
-	_, err := client.StreamTask(context.Background(), "trace-empty", "soru", nil)
+	_, err := client.StreamTask(context.Background(), "trace-empty", "soru", false, nil)
 	if err == nil {
 		t.Fatal("StreamTask() error = nil, want unreachable error")
 	}
@@ -397,7 +397,7 @@ func TestReadSSEOversizedLineHasNoCap(t *testing.T) {
 	client := newClient(sock)
 
 	var got strings.Builder
-	res, err := client.StreamTask(context.Background(), "trace-huge", "soru", func(text string) {
+	res, err := client.StreamTask(context.Background(), "trace-huge", "soru", false, func(text string) {
 		got.WriteString(text)
 	})
 	if err != nil {

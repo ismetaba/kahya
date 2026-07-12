@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/mlx"
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -144,6 +145,36 @@ func TestRunNoClassifierWiredFailsClosedToSecretLane(t *testing.T) {
 	}
 	if cloud.calls != 0 {
 		t.Fatalf("cloud.calls = %d, want 0", cloud.calls)
+	}
+}
+
+// TestRunNoClassifierWiredLogsIntentClassifiedSourceDeterministic is a
+// post-review regression test (W4-08): when NO classifier is wired at all
+// (r.Classifier==nil, distinct from a wired classifier whose OWN internal
+// Qwen is nil), the intent_classified event this Run call logs must report
+// source=deterministic - NOT source=model, since no model round-trip was
+// ever attempted (this used to be mislabeled "model").
+func TestRunNoClassifierWiredLogsIntentClassifiedSourceDeterministic(t *testing.T) {
+	local := &fakeLocalModel{response: validMailJSON}
+	cloud := &countingCloudModel{}
+	ledger := &fakeLedger{}
+	r := NewRunner(nil, local, cloud, nil, ledger)
+
+	_, err := r.Run(context.Background(), JobTypeMailSummary, []byte("herhangi bir metin"), testTrace())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	found := false
+	for _, e := range ledger.events {
+		if e.kind == router.EventIntentClassified {
+			found = true
+			if e.payload["source"] != router.SourceDeterministic {
+				t.Errorf("intent_classified payload source = %v, want %q (no classifier wired - no model call was ever attempted)", e.payload["source"], router.SourceDeterministic)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no intent_classified event logged")
 	}
 }
 

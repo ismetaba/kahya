@@ -255,6 +255,54 @@ func TestMarshalRoundTripsModeAndSchema(t *testing.T) {
 	}
 }
 
+// TestMarshalRoundTripsIntentAndDeepThink proves W4-08's two new optional
+// envelope fields marshal correctly and are absent when zero (backward
+// compatible with every pre-W4-08 envelope/test).
+func TestMarshalRoundTripsIntentAndDeepThink(t *testing.T) {
+	e := validEnvelope()
+	e.Intent = "chat"
+	e.DeepThink = true
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(b), `"intent":"chat"`) {
+		t.Errorf("Marshal() = %s, want intent:chat present", b)
+	}
+	if !strings.Contains(string(b), `"deep_think":true`) {
+		t.Errorf("Marshal() = %s, want deep_think:true present", b)
+	}
+}
+
+// TestMarshalOmitsIntentAndDeepThinkWhenZero proves the backward-
+// compatible default: an envelope that never sets these two new fields
+// marshals with neither key present at all.
+func TestMarshalOmitsIntentAndDeepThinkWhenZero(t *testing.T) {
+	b, err := validEnvelope().Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(b), `"intent"`) {
+		t.Errorf("Marshal() = %s, want no intent key when empty", b)
+	}
+	if strings.Contains(string(b), `"deep_think"`) {
+		t.Errorf("Marshal() = %s, want no deep_think key when false", b)
+	}
+}
+
+// TestValidateAcceptsIntentAndDeepThinkUnvalidated proves Validate imposes
+// no enum/shape constraint on Intent (informational only - see the field's
+// own doc comment) and accepts DeepThink regardless of Lane/Model, since
+// the routing DECISION already happened before this envelope was built.
+func TestValidateAcceptsIntentAndDeepThinkUnvalidated(t *testing.T) {
+	e := validEnvelope()
+	e.Intent = "anything_at_all"
+	e.DeepThink = true
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
 func TestNewTaskIDShapeAndUniqueness(t *testing.T) {
 	a := NewTaskID()
 	b := NewTaskID()

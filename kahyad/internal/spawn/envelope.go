@@ -113,6 +113,30 @@ type Envelope struct {
 	// Schema names the registered Reader job type (see Mode's own doc
 	// comment). Empty unless Mode == ModeReader.
 	Schema string `json:"schema,omitempty"`
+
+	// Intent is W4-08's routing-table intent bucket
+	// (kahyad/internal/router's Intent* constants - duplicated here as a
+	// plain string field, never a router.RouteInput/RouteDecision type:
+	// this low-level IPC-contract file must not depend on that
+	// higher-level routing package, mirroring LaneSecret/LaneNormal's own
+	// identical "duplicate rather than import" convention above).
+	// Informational only (logs/CLI/ledger) - the routing DECISION already
+	// happened server-side, before this envelope was built; the worker
+	// never reads this to choose anything (§4: "karar Go kodunda, istemde
+	// değil"). Optional/backward-compatible: omitted from the wire form
+	// when empty, so every pre-W4-08 envelope/test still validates
+	// unchanged.
+	Intent string `json:"intent,omitempty"`
+	// DeepThink is the "derin düşün" opt-in (W4-08): true iff the caller
+	// requested it via the `kahya ask --derin` flag or the byte-exact
+	// Turkish prompt prefix "derin düşün:" (detected and stripped
+	// server-side, kahyad/internal/server's POST /v1/task handler - NEVER
+	// model-detected). When true, kahyad/internal/router.SelectModel pins
+	// Model to claude-fable-5 UNCONDITIONALLY unless Lane=="secret" (which
+	// outranks it) - this field itself carries no enforcement, it is only
+	// the audit trail of why Model ended up being claude-fable-5. Optional/
+	// backward-compatible: omitted when false.
+	DeepThink bool `json:"deep_think,omitempty"`
 }
 
 // ModeReader is Envelope.Mode's one non-empty value (W4-03).

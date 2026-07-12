@@ -1,6 +1,6 @@
 # W4-08 — Intent router: the §4 model-routing table in Go
 
-**Status:** todo
+**Status:** done
 **Phase:** W4 — Durability
 **Depends on:** W12-07 (envelope builder), W3-08 (local Qwen lane + classifier), W4-04 (Fable-5 request shaping, error taxonomy)
 **Flags:** none
@@ -37,14 +37,14 @@ kahyad stops running every task on the single static default model: the §4 rout
 8. Write the remaining tests below; run `make test && make lint`.
 
 ## Acceptance criteria
-- [ ] `make test` green, including the table matrix test covering every §4 row plus default fallback; a test proves `claude-fable-5` is selected **only** when `deep_think` is true.
-- [ ] Test: `kahya ask --derin "<prompt>"` and the byte-exact prompt `derin düşün: şu mimariyi değerlendir` both produce an envelope with `model=claude-fable-5`, and the fake-upstream request body (reusing the W4-04 harness) contains `betas:["server-side-fallback-2026-06-01"]` and `fallbacks:[{"model":"claude-opus-4-8"}]`.
-- [ ] Test: with `Downgraded()` forced true (fixture spend ≥ 80% of `daily_budget_usd`): a plan-intent task routes to `claude-sonnet-5`; a Sonnet-class task routes to the local lane (W3-08 envelope pinning); no `budget_downgrade_unavailable` event is emitted anywhere in the run; `budget_downgrade_on` is ledgered once.
-- [ ] Test: a secret-lane fixture prompt submitted with `--derin` is pinned to the local lane with **zero** requests at the Anthropic proxy for that `trace_id` (lane outranks opt-in and downgrade — fail-closed).
-- [ ] Test: with the classifier stubbed to hang/fail, the task pauses per W3-08's fail-closed path and no bytes reach the proxy (ordering invariant preserved by the router).
-- [ ] Guarded live check (`KAHYA_MLX_TESTS=1`, warm model): ≥20 classification runs log `intent_classified` events; report the p95 `duration_ms` (informational against the <300ms warm target — log, do not gate).
-- [ ] `kahya log --trace <id>` for a routed task shows, in order: `intent_classified` → routing decision → `model_call` with the routed model, all under one `trace_id`.
-- [ ] `docs/ipc.md` updated; W4-03 and W12-09 test suites unregressed; `make lint` green.
+- [x] `make test` green, including the table matrix test covering every §4 row plus default fallback; a test proves `claude-fable-5` is selected **only** when `deep_think` is true.
+- [x] Test: `kahya ask --derin "<prompt>"` and the byte-exact prompt `derin düşün: şu mimariyi değerlendir` both produce an envelope with `model=claude-fable-5`, and the fake-upstream request body (reusing the W4-04 harness) contains `betas:["server-side-fallback-2026-06-01"]` and `fallbacks:[{"model":"claude-opus-4-8"}]`.
+- [x] Test: with `Downgraded()` forced true (fixture spend ≥ 80% of `daily_budget_usd`): a plan-intent task routes to `claude-sonnet-5`; a Sonnet-class task routes to the local lane (W3-08 envelope pinning); no `budget_downgrade_unavailable` event is emitted anywhere in the run; `budget_downgrade_on` is ledgered once.
+- [x] Test: a secret-lane fixture prompt submitted with `--derin` is pinned to the local lane with **zero** requests at the Anthropic proxy for that `trace_id` (lane outranks opt-in and downgrade — fail-closed).
+- [x] Test: with the classifier stubbed to hang/fail, the task pauses per W3-08's fail-closed path and no bytes reach the proxy (ordering invariant preserved by the router).
+- [x] Guarded live check (`KAHYA_MLX_TESTS=1`, warm model): ≥20 classification runs log `intent_classified` events; report the p95 `duration_ms` (informational against the <300ms warm target — log, do not gate).
+- [x] `kahya log --trace <id>` for a routed task shows, in order: `intent_classified` → routing decision → `model_call` with the routed model, all under one `trace_id`.
+- [x] `docs/ipc.md` updated; W4-03 and W12-09 test suites unregressed; `make lint` green.
 
 ## Out of scope
 - Subagent/fan-out execution itself — post-core; this task only encodes the fan-out row's model constant for the future runner to read.

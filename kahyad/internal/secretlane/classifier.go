@@ -44,6 +44,21 @@ const (
 type Verdict struct {
 	SecretLane bool
 	Category   string
+	// Intent is W4-08's extension to this SAME combined classify call: the
+	// §4 routing-table intent bucket (kahyad/internal/router's Intent*
+	// constants - duplicated here as plain string literals in the prompt
+	// below, never imported, for the same "low-level package should not
+	// depend on a higher-level one" reason kahyad/internal/spawn.
+	// LaneSecret/LaneNormal already duplicate THIS package's own Lane
+	// constants). Always empty for a deterministic pre-pass hit
+	// (classifyDeterministic never sets it - that pass only ever decides
+	// secret-lane category, never intent) and for any fail-closed verdict
+	// this package itself synthesizes (qwen_error_fail_closed etc.) - a
+	// caller that needs an intent MUST treat an empty value here as "no
+	// usable intent", never silently substitute a default (see
+	// kahyad/internal/router/intent.go's ClassifyIntent for the caller-side
+	// contract this backs).
+	Intent string
 	// Reason is an internal, English-only diagnostic note of which rule
 	// produced this verdict (e.g. "iban", "tckn", "keyword:tahlil
 	// sonuçları", "qwen", "qwen_error_fail_closed") - logged, never shown
@@ -337,10 +352,21 @@ func (f QwenClassifierFunc) Classify(ctx context.Context, text string) (Verdict,
 // kimlik|none}"). English (this is a model instruction, not a user-facing
 // string - CLAUDE.md's Turkish-user-facing-strings policy does not apply
 // to prompts).
-const classifierSystemPrompt = `You are a strict content classifier running entirely on the user's own machine. Given a piece of text, decide whether it contains Turkish financial (finans), health (sağlık), or identity (kimlik) information that must never leave this machine.
+//
+// W4-08 extends this SAME call to also return "intent" (the §4 routing
+// table's task-type bucket - kahyad/internal/router's Intent* constants,
+// duplicated here as literal strings rather than imported, matching this
+// file's own existing "keep two copies in sync by hand" convention for
+// Category). One combined local round-trip now answers BOTH questions
+// (secret-lane detection AND intent) - never a second model call.
+const classifierSystemPrompt = `You are a strict content classifier running entirely on the user's own machine. Given a piece of text, decide THREE things:
+
+1. Whether it contains Turkish financial (finans), health (sağlık), or identity (kimlik) information that must never leave this machine (secret_lane).
+2. Which of those three categories applies, or "none" (category).
+3. The task-type intent the text is asking for - EXACTLY ONE of: "plan", "code_multi_file", "hard_exec", "subagent_exec", "fanout", "extract", "writeback", "reader", "route", "classify", "chat" (intent). When in doubt, or the text is an ordinary conversational message, answer "chat".
 
 Respond with STRICT JSON ONLY, no other text, exactly this shape:
-{"secret_lane": true|false, "category": "finans"|"saglik"|"kimlik"|"none"}
+{"secret_lane": true|false, "category": "finans"|"saglik"|"kimlik"|"none", "intent": "plan"|"code_multi_file"|"hard_exec"|"subagent_exec"|"fanout"|"extract"|"writeback"|"reader"|"route"|"classify"|"chat"}
 
 category must be "none" when secret_lane is false.`
 
@@ -374,6 +400,13 @@ func NewHTTPQwenClassifier(baseURL, model string) *HTTPQwenClassifier {
 type classifyJSON struct {
 	SecretLane bool   `json:"secret_lane"`
 	Category   string `json:"category"`
+	// Intent is W4-08's addition - absent/malformed is simply an empty
+	// string after json.Unmarshal (no strict enum validation here, unlike
+	// Category's validCategory gate below: an unrecognized/empty intent is
+	// NOT a fail-closed condition - kahyad/internal/router.SelectModel's own
+	// chat/unknown default row already handles it safely, same posture as
+	// this file's own doc comment on Verdict.Intent).
+	Intent string `json:"intent"`
 }
 
 // validCategory reports whether cat is one of the four values Qwen is
@@ -413,7 +446,7 @@ func (c *HTTPQwenClassifier) Classify(ctx context.Context, text string) (Verdict
 	if !parsed.SecretLane {
 		category = CategoryNone
 	}
-	return Verdict{SecretLane: parsed.SecretLane, Category: category, Reason: "qwen"}, nil
+	return Verdict{SecretLane: parsed.SecretLane, Category: category, Intent: parsed.Intent, Reason: "qwen"}, nil
 }
 
 // --- The full classifier ---

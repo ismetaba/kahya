@@ -166,9 +166,13 @@ func TestCheckBeforeForwardAllowsUnderLimits(t *testing.T) {
 	}
 }
 
-// TestDowngradeFlipsAt80Percent proves the 80% downgrade rung (Opus ->
-// Sonnet; Sonnet stays put + budget_downgrade_unavailable, per HANDOFF §4
-// until W3-08 lands the local lane).
+// TestDowngradeFlipsAt80Percent proves the 80% downgrade rung: Downgraded()
+// flips true once today's spend crosses the ratio, budget_downgrade_on is
+// ledgered exactly once per day, and (W4-08) budget_downgrade_unavailable
+// is NEVER ledgered any more - the Sonnet->yerel rung is now handled by
+// kahyad/internal/router.SelectModel + kahyad/internal/server's envelope
+// builder consulting this governor's Downgraded(), so there is no longer
+// any "downgrade unavailable" case for this package to report.
 func TestDowngradeFlipsAt80Percent(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	g := NewGovernor(testLimits(), fixedClock(now), nil)
@@ -188,8 +192,8 @@ func TestDowngradeFlipsAt80Percent(t *testing.T) {
 	if got := ledger.countKind(EventBudgetDowngradeOn); got != 1 {
 		t.Errorf("EventBudgetDowngradeOn ledgered %d times, want exactly 1", got)
 	}
-	if got := ledger.countKind(EventBudgetDowngradeUnavail); got != 1 {
-		t.Errorf("EventBudgetDowngradeUnavail ledgered %d times, want exactly 1 (Sonnet has nowhere to fall until W3-08)", got)
+	if got := ledger.countKind("budget_downgrade_unavailable"); got != 0 {
+		t.Errorf("budget_downgrade_unavailable ledgered %d times, want 0 (retired - the local lane now exists)", got)
 	}
 
 	// A second call the same day must NOT re-ledger either "once per day"

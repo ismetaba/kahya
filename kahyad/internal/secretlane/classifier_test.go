@@ -369,6 +369,43 @@ func TestClassifyQwenHappyPathNotSecretLane(t *testing.T) {
 	}
 }
 
+// TestClassifyQwenIntentFlowsThroughOnHappyPath proves W4-08's combined-
+// call extension: the classifier prompt's own "intent" field, once Qwen
+// answers it, lands on Verdict.Intent unchanged - the SAME round trip that
+// already decided secret_lane/category.
+func TestClassifyQwenIntentFlowsThroughOnHappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"{\"secret_lane\":false,\"category\":\"none\",\"intent\":\"extract\"}"}}]}`))
+	}))
+	defer srv.Close()
+
+	qwen := NewHTTPQwenClassifier(srv.URL, "qwen3-30b-a3b")
+	c := NewClassifier(qwen)
+	v, err := c.Classify(context.Background(), "şu maildeki tarihleri çıkarır mısın")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil", err)
+	}
+	if v.Intent != "extract" {
+		t.Errorf("Intent = %q, want %q", v.Intent, "extract")
+	}
+}
+
+// TestClassifyDeterministicHitNeverSetsIntent proves the deterministic
+// pre-pass (no model consulted) never fabricates an intent value - a
+// caller must fall through to router.ClassifyIntent's own model path (or a
+// deterministic default of its own) to get one.
+func TestClassifyDeterministicHitNeverSetsIntent(t *testing.T) {
+	c := NewClassifier(nil)
+	v, err := c.Classify(context.Background(), "IBAN: TR330006100519786457841326")
+	if err != nil {
+		t.Fatalf("Classify() error = %v, want nil (deterministic hit)", err)
+	}
+	if v.Intent != "" {
+		t.Errorf("Intent = %q, want empty (deterministic pre-pass never classifies intent)", v.Intent)
+	}
+}
+
 func TestClassifyQwenHappyPathSecretLane(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
