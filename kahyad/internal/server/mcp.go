@@ -51,6 +51,18 @@ type EventLogger interface {
 // packages intentionally don't share code across the internal boundary).
 const traceHeader = "X-Kahya-Trace-Id"
 
+// taskHeader is the HTTP header a future bridge MAY propagate a task's
+// task_id through as (kahyad/cmd/kahya-mcp does not send this today - its
+// own package doc comment only names KAHYA_TRACE_ID). policyGateMiddleware
+// below reads it defensively (BLOCKER 1+2 fix): when present, it lets
+// policy.Engine's SessionResolver resolve by the exact task_id primary key
+// instead of only ever falling back to trace_id; when absent (today's
+// actual bridge behavior), TaskID is simply left empty on CheckInput and
+// resolution proceeds via TraceID alone - kahyad/internal/spawn sets the
+// worker's KAHYA_TRACE_ID env to this exact task's own trace_id, so a
+// trace_id-only resolution already finds the right tasks row.
+const taskHeader = "X-Kahya-Task-Id"
+
 // SetEventLogger wires the append-only events ledger used by (a) the
 // /v1/mcp policy gate's policy_decision rows, (b) /v1/memory/search's
 // for_injection=true hafiza_injected rows, and (c) - passed straight
@@ -187,6 +199,18 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 // "one ledger insert per decision" behavior - one engine, two mount
 // points, one ledgering convention.
 //
+// BLOCKER 1+2 fix (post-security-review): this call never sets
+// CheckInput.SessionID at all - /v1/mcp carries no session_id on the wire
+// - which used to mean Engine.Check's old `in.SessionID != ""` guard
+// silently SKIPPED the W4-03 taint check on every single /v1/mcp call,
+// tainted session or not (a fail-open hole a tainted session's
+// memory_write/memory_forget could walk straight through). Check now
+// resolves the session identity SERVER-SIDE from TraceID (and TaskID,
+// when a future bridge sends the X-Kahya-Task-Id header - see taskHeader's
+// doc comment) via its own SessionResolver, so the taint check runs here
+// exactly as it does on POST /policy/check - see policy.CheckInput and
+// policy.SessionResolver's own doc comments for the full mechanism.
+//
 // Consuming the token in-process, right here, rather than requiring a
 // second HTTP round-trip to POST /policy/consume-token, is deliberate:
 // this middleware itself IS the "side-effectful tool"'s enforcement
@@ -218,8 +242,17 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			canonName := policy.Canonicalize(rawName)
 
 			traceID := ""
+			taskID := ""
 			if callReq.Extra != nil && callReq.Extra.Header != nil {
 				traceID = callReq.Extra.Header.Get(traceHeader)
+				// BLOCKER 1+2 fix: propagated when a future bridge sends
+				// it (taskHeader's own doc comment - kahya-mcp does not
+				// today); left "" otherwise, so policy.Engine's
+				// SessionResolver falls back to resolving by traceID
+				// alone, which is already sufficient (kahyad/internal/
+				// spawn sets the worker's KAHYA_TRACE_ID env to this
+				// exact task's own trace_id).
+				taskID = callReq.Extra.Header.Get(taskHeader)
 			}
 			if traceID == "" {
 				traceID = traceid.New()
@@ -278,7 +311,7 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 				argBytes = []byte(callReq.Params.Arguments)
 			}
 			decision, _ := s.policyEngine.Check(ctx, policy.CheckInput{
-				Tool: rawName, TraceID: traceID, ToolInput: argBytes,
+				Tool: rawName, TraceID: traceID, TaskID: taskID, ToolInput: argBytes,
 			})
 			if decision.Result != policy.ResultAllow {
 				return deny(decision.Reason)

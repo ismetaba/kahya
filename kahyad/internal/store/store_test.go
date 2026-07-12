@@ -348,7 +348,7 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 // idx_tool_calls_live_unique from 0008 (task durability BLOCKER 1 fix),
 // and session_taint from 0009 (W4-03)) the next time kahyad boots. The
 // expected latest version is asserted as
-// 8 (0001..0008); bump this literal, deliberately, the next time a new
+// 9 (0001..0009); bump this literal, deliberately, the next time a new
 // migration file is added - this is the one place in the test suite that
 // pins "the latest goose version kahyad ships" as a number, so a
 // forgotten migration file never silently passes this gate.

@@ -222,6 +222,29 @@ type TaintChecker interface {
 	Get(ctx context.Context, sessionID string) (tier string, err error)
 }
 
+// SessionResolver is the W4-03 BLOCKER 1+2 fix's server-side session
+// identity lookup: given a request's trace_id/task_id correlation pair
+// (NEVER a caller-supplied session_id, which is untrusted - see
+// CheckInput.SessionID's own doc comment), it returns the SERVER-
+// PERSISTED session_id kahyad itself recorded onto the tasks row at
+// session_started (W4-02 step 5's persistSessionStarted) - the only
+// session identity Check's taint decision may act on. Implemented by
+// *kahyad/internal/policy.StoreSessionResolver (session_resolver.go, this
+// package) against the tasks table; wired in main.go alongside
+// SetTaintChecker.
+//
+// ResolveSession returns ("", nil) - NOT an error - when neither id
+// resolves to any tasks row, or the matched row has no session_id
+// recorded yet (NULL): "unresolvable" is a normal, expected outcome (e.g.
+// the very first /policy/check call before the worker's session_id has
+// arrived), and Check's own fail-closed contract is what turns that into
+// a DENY, not this interface. A non-nil error means the lookup itself
+// failed (a genuine DB problem) - Check treats that identically to
+// "unresolvable", fail-closed, logging err for diagnostics.
+type SessionResolver interface {
+	ResolveSession(ctx context.Context, traceID, taskID string) (sessionID string, err error)
+}
+
 // Engine is the W3-02 ladder decision engine: one per kahyad process,
 // sharing the single *store.Store the rest of the daemon uses.
 type Engine struct {
@@ -269,6 +292,15 @@ type Engine struct {
 	// production - this is a hook, not a security boundary unto itself; the
 	// boundary is Check's own use of it once wired.
 	taintChecker TaintChecker
+	// sessionResolver is the BLOCKER 1+2 fix's server-side session lookup
+	// (SetSessionResolver). nil (the default) makes Check fall back to
+	// trusting CheckInput.SessionID exactly as this file did before the
+	// fix - every pre-W4-03/pre-fix caller/test that never wires this is
+	// unaffected. main.go MUST wire this alongside taintChecker before
+	// serving any traffic for the fix to actually hold in production - see
+	// SessionResolver's own doc comment for why an unwired resolver is a
+	// documented legacy/test posture, never a production configuration.
+	sessionResolver SessionResolver
 }
 
 // NewEngine constructs an Engine. pol is W3-01's loaded tool registry (the
@@ -308,16 +340,38 @@ func (e *Engine) SetPendingApprovalHook(fn func(PendingApprovalInfo)) {
 }
 
 // SetTaintChecker wires the W4-03 session-tier read Check consults FIRST
-// (before the ladder) whenever a CheckInput carries a non-empty
-// SessionID. Call before any /policy/check traffic starts flowing in
-// production - main.go passes the SAME *kahyad/internal/taint.Tracker
-// instance kahyad/internal/server's OnSession callback and
-// kahyad/internal/reader/actor_seed.go both write session_taint rows
-// through, so a decision here always sees the up-to-date tier. nil (the
-// default, every pre-W4-03 caller/test) means the taint check is skipped
-// entirely - see the Engine.taintChecker field's own doc comment.
+// (before the ladder), for every non-R class, whenever a session identity
+// is available - see SetSessionResolver's doc comment for how that
+// identity is actually determined (server-side, post-BLOCKER-1+2-fix, NOT
+// from CheckInput.SessionID alone). Call before any /policy/check traffic
+// starts flowing in production - main.go passes the SAME
+// *kahyad/internal/taint.Tracker instance kahyad/internal/server's
+// OnSession callback and kahyad/internal/reader/actor_seed.go both write
+// session_taint rows through, so a decision here always sees the
+// up-to-date tier. nil (the default, every pre-W4-03 caller/test) means
+// the taint check is skipped entirely - see the Engine.taintChecker
+// field's own doc comment.
 func (e *Engine) SetTaintChecker(tc TaintChecker) {
 	e.taintChecker = tc
+}
+
+// SetSessionResolver wires the BLOCKER 1+2 fix's server-side session
+// lookup (SessionResolver's own doc comment) that Check's taint-check hook
+// uses to determine which session a request belongs to, INSTEAD of
+// trusting CheckInput.SessionID. Call before any /policy/check or /v1/mcp
+// traffic starts flowing in production, alongside SetTaintChecker -
+// main.go wires both together against the SAME *kahyad/internal/
+// store.Store the rest of the daemon uses (kahyad/internal/policy.
+// NewStoreSessionResolver). nil (the default) is a documented legacy/test
+// posture ONLY: Check falls back to trusting CheckInput.SessionID exactly
+// as it did before this fix, so unit tests that wire a TaintChecker alone
+// (every one that predates this fix) keep passing unchanged - but this
+// must never be left unwired in production, or the worker-supplied
+// session_id becomes trusted again for every /policy/check call, and
+// /v1/mcp (which never sends a session_id at all) never taint-checks
+// anything.
+func (e *Engine) SetSessionResolver(r SessionResolver) {
+	e.sessionResolver = r
 }
 
 // fireUndoExpiryHook calls the registered hook, if any - a small helper so
@@ -347,17 +401,23 @@ func rfc3339(t time.Time) string { return t.Format(time.RFC3339Nano) }
 // bytes (HANDOFF S5 safety #5 WYSIWYE, until W3-06 lands the real
 // normalize+hash pipeline - see approvedBytesHash's doc comment).
 //
-// SessionID (W4-03) is the caller's Agent SDK session_id, when it has
-// one - task.go's handlePolicyCheck threads req.SessionID through here
-// verbatim (the worker's own can_use_tool callback already sends
+// SessionID is the caller-SUPPLIED Agent SDK session_id, when the caller
+// sends one at all - task.go's handlePolicyCheck threads req.SessionID
+// through here verbatim (the worker's own can_use_tool callback sends
 // session_id on every /policy/check POST - see worker/kahya_worker/
-// hooks.py's make_can_use_tool). Empty means "no session concept applies
-// to this call" (e.g. a caller with no worker session at all) - the taint
-// check below is skipped entirely for an empty SessionID, exactly like
-// every other not-yet-wired dependency in this package defaults to a
-// no-op. This is NOT the same as "SessionID present but its row is
-// missing" - THAT resolves to tainted (kahyad/internal/taint.Tracker.Get's
-// own fail-closed contract), and Check enforces it the same way.
+// hooks.py's make_can_use_tool); mcp.go's policyGateMiddleware never sets
+// this field at all (POST /v1/mcp carries no session_id on the wire).
+//
+// BLOCKER 1+2 fix (post-security-review): this field is NO LONGER trusted
+// for the taint decision below. A worker process - or a compromised one -
+// can claim any session_id it likes, so an empty-or-forged SessionID must
+// never be able to flip a tainted session's decision from DENY to ALLOW.
+// Check instead resolves the session SERVER-SIDE, from TraceID/TaskID,
+// via the engine's own SessionResolver (see that type's doc comment) -
+// SessionID is consulted only as a LEGACY fallback when no SessionResolver
+// is wired at all (pre-W4-03 tests; every production wiring sets both a
+// TaintChecker and a SessionResolver together - see SetSessionResolver's
+// doc comment).
 type CheckInput struct {
 	Tool      string
 	Scope     string
@@ -515,24 +575,61 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	// definition: "güvenilmez katman = yalnız R-sınıfı araçlar +
 	// kullanıcıya bildirim" - notifications are kahyad-emitted and need no
 	// tool call at all, so this denial never blocks that tier's own
-	// "+notify" half). Skipped entirely when SessionID is empty (no
-	// session concept for this call) or no TaintChecker is wired
-	// (SetTaintChecker's own doc comment) - every pre-W4-03 caller/test is
-	// therefore unaffected.
-	if e.taintChecker != nil && in.SessionID != "" && class != ClassR {
-		tier, terr := e.taintChecker.Get(ctx, in.SessionID)
-		if terr != nil {
-			// Get itself already fail-closed tier to taint.TierTainted on any
-			// read error (kahyad/internal/taint.Tracker.Get's own doc
-			// comment) - terr is purely diagnostic here.
-			e.ledgerRaw(ctx, in.TraceID, "taint_check_read_error", map[string]any{
-				"event": "taint_check_read_error", "session_id": in.SessionID, "err": terr.Error(),
-			})
-		}
-		if tier == taint.TierTainted {
-			d := Decision{Result: ResultDeny, Reason: ReasonTaintedSession, Rule: RuleTaintedSessionV1, Class: class, Scope: scope}
-			e.ledgerDecision(ctx, in, class, scope, 0, d)
-			return d, nil
+	// "+notify" half). Skipped entirely when no TaintChecker is wired at
+	// all (SetTaintChecker's own doc comment) - every pre-W4-03 caller/
+	// test is therefore unaffected.
+	//
+	// BLOCKER 1+2 fix (post-security-review): WHICH session this is is no
+	// longer taken from the caller-supplied in.SessionID - that value is
+	// untrusted (a worker can send any session_id it likes, empty or
+	// otherwise) and, on the /v1/mcp binding path, is never even sent at
+	// all (mcp.go's policyGateMiddleware built no SessionID onto
+	// CheckInput, so the old `in.SessionID != ""` guard silently skipped
+	// the taint check on EVERY /v1/mcp call, tainted session or not - a
+	// fail-OPEN hole for memory_write/memory_forget). The session identity
+	// is now resolved SERVER-SIDE, from in.TraceID/in.TaskID, via
+	// e.sessionResolver (the tasks table's own session_id, persisted by
+	// kahyad itself at session_started - see SessionResolver's doc
+	// comment) whenever one is wired; an in.SessionID the caller supplied
+	// is consulted only as the documented legacy fallback when NO resolver
+	// is wired at all.
+	if e.taintChecker != nil && class != ClassR {
+		switch {
+		case e.sessionResolver != nil:
+			resolvedSessionID, rerr := e.sessionResolver.ResolveSession(ctx, in.TraceID, in.TaskID)
+			if rerr != nil {
+				e.ledgerRaw(ctx, in.TraceID, "session_resolve_error", map[string]any{
+					"event": "session_resolve_error", "task_id": in.TaskID, "err": rerr.Error(),
+				})
+			}
+			if rerr != nil || resolvedSessionID == "" {
+				// FAIL-CLOSED (HANDOFF §5, verbatim: "kayıt yoksa oturum
+				// güvenilmez sayılır") - no server-persisted session could
+				// be resolved for this trace/task pair at all (never
+				// started, a lookup error, or a genuinely forged/unknown
+				// trace_id+task_id pair), so it is treated exactly like an
+				// explicitly tainted one, for every non-R class.
+				d := Decision{Result: ResultDeny, Reason: ReasonTaintedSession, Rule: RuleTaintedSessionV1, Class: class, Scope: scope}
+				e.ledgerDecision(ctx, in, class, scope, 0, d)
+				return d, nil
+			}
+			if d, denied := e.denyIfTainted(ctx, in, class, scope, resolvedSessionID); denied {
+				return d, nil
+			}
+		case in.SessionID != "":
+			// Legacy/test fallback: no SessionResolver wired at all (every
+			// caller/test that predates this fix - production ALWAYS wires
+			// both together, see SetSessionResolver's doc comment). Trusts
+			// the caller-supplied SessionID exactly as this file did
+			// before the BLOCKER 1+2 fix, so that behavior is unchanged
+			// for any such caller.
+			if d, denied := e.denyIfTainted(ctx, in, class, scope, in.SessionID); denied {
+				return d, nil
+			}
+		default:
+			// No resolver wired AND no caller-supplied SessionID either:
+			// skip entirely - matches every other not-yet-wired
+			// dependency's no-op posture elsewhere in this package.
 		}
 	}
 
@@ -578,6 +675,31 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	}
 
 	return e.needsApproval(ctx, in, class, scope, level, hash, ReasonNeedsApproval)
+}
+
+// denyIfTainted reads sessionID's taint tier via e.taintChecker and, if
+// tainted, produces (and ledgers) the tainted_session DENY decision -
+// shared by Check's two taint-check paths above (server-resolved and
+// legacy-fallback) so both apply the EXACT same read-error-handling and
+// deny-construction logic, never two copies that could silently drift
+// apart. Returns denied=false (Decision zero-valued) when the session is
+// NOT tainted - the caller falls through to the ordinary ladder decision.
+func (e *Engine) denyIfTainted(ctx context.Context, in CheckInput, class ActionClass, scope, sessionID string) (Decision, bool) {
+	tier, terr := e.taintChecker.Get(ctx, sessionID)
+	if terr != nil {
+		// Get itself already fail-closed tier to taint.TierTainted on any
+		// read error (kahyad/internal/taint.Tracker.Get's own doc
+		// comment) - terr is purely diagnostic here.
+		e.ledgerRaw(ctx, in.TraceID, "taint_check_read_error", map[string]any{
+			"event": "taint_check_read_error", "session_id": sessionID, "err": terr.Error(),
+		})
+	}
+	if tier != taint.TierTainted {
+		return Decision{}, false
+	}
+	d := Decision{Result: ResultDeny, Reason: ReasonTaintedSession, Rule: RuleTaintedSessionV1, Class: class, Scope: scope}
+	e.ledgerDecision(ctx, in, class, scope, 0, d)
+	return d, true
 }
 
 // needsApproval mints the server-side pending_approvals row backing a

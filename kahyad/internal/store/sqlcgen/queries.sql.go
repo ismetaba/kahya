@@ -501,6 +501,31 @@ func (q *Queries) GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, e
 	return i, err
 }
 
+const getTaskSessionByTrace = `-- name: GetTaskSessionByTrace :one
+SELECT session_id FROM tasks
+WHERE trace_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`
+
+// W4-03 BLOCKER 1+2 fix: the by-trace_id half of the server-side taint
+// resolver (kahyad/internal/policy.StoreSessionResolver) - a policy
+// decision must resolve WHICH session a request belongs to from the
+// request's own trace_id/task_id correlation, never from a caller-
+// supplied session_id (untrusted; on POST /v1/mcp there is no session_id
+// on the wire at all - see mcp.go's policyGateMiddleware). Mirrors
+// GetTaskBySession's own "not guaranteed unique, most-recently-updated
+// wins" note: a resumed/retried task can share one trace_id across more
+// than one tasks row. NULL session_id (no session_started yet for this
+// task) comes back as a NULL/invalid value, not an error - the resolver
+// itself treats that as "unresolved" (fail-closed), not a query failure.
+func (q *Queries) GetTaskSessionByTrace(ctx context.Context, traceID string) (sql.NullString, error) {
+	row := q.db.QueryRowContext(ctx, getTaskSessionByTrace, traceID)
+	var session_id sql.NullString
+	err := row.Scan(&session_id)
+	return session_id, err
+}
+
 const incrementEgressBudget = `-- name: IncrementEgressBudget :execrows
 UPDATE egress_budget
 SET bytes = bytes + ?

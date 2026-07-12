@@ -465,6 +465,14 @@ func run() int {
 	// through for a freshly Actor-seeded session.
 	taintTracker := taint.New(st.Queries, st)
 	policyEngine.SetTaintChecker(taintTracker)
+	// BLOCKER 1+2 fix (post-security-review): the server-side session
+	// resolver Check's taint-check hook uses to determine WHICH session a
+	// request belongs to, from trace_id/task_id alone - never from the
+	// worker-supplied (untrusted, and on /v1/mcp absent entirely)
+	// session_id on the wire. MUST be wired together with SetTaintChecker
+	// above (SetSessionResolver's own doc comment: an unwired resolver is
+	// a documented legacy/test fallback, never a production posture).
+	policyEngine.SetSessionResolver(policy.NewStoreSessionResolver(st.Queries))
 
 	// W4-02: task durability state machine + receipts + resume scan +
 	// outbox dispatcher (HANDOFF §6 W4 ⚑). taskLive is the live-worker-PID

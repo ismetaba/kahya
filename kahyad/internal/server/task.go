@@ -840,12 +840,21 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	// W4-03: req.SessionID (already part of this endpoint's frozen wire
 	// schema - worker/kahya_worker/hooks.py's make_can_use_tool has sent it
 	// on every /policy/check POST since W12-09) threads straight through
-	// to Engine.Check's own taint-check hook. A nil pointer (no session yet
-	// - e.g. the very first tool call before the worker's init message
-	// carried a session_id) becomes "" - Check treats an empty SessionID as
-	// "skip the taint check", not as a session that fails closed; a real,
-	// non-empty session_id that resolves to no session_taint row at all
-	// (or an explicitly tainted one) is what actually fails closed.
+	// onto CheckInput.SessionID. A nil pointer (no session yet - e.g. the
+	// very first tool call before the worker's init message carried a
+	// session_id) becomes "".
+	//
+	// BLOCKER 1+2 fix (post-security-review): this worker-supplied value
+	// is NOT what Engine.Check's taint-check hook actually decides on in
+	// production - it is untrusted (a worker, or a compromised one, can
+	// send any session_id it likes, including a forged clean one, or none
+	// at all to make an old fail-open guard skip the check entirely).
+	// Check instead resolves the session SERVER-SIDE from TaskID/TraceID
+	// below via its own SessionResolver (main.go wires this alongside
+	// SetTaintChecker) - SessionID here is retained only as CheckInput's
+	// documented legacy fallback for callers/tests with no resolver wired
+	// at all. See policy.CheckInput/policy.SessionResolver's own doc
+	// comments for the full mechanism.
 	sessionID := ""
 	if req.SessionID != nil {
 		sessionID = *req.SessionID

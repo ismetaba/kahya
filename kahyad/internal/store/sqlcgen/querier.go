@@ -101,6 +101,18 @@ type Querier interface {
 	// updated task for the session.
 	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (GetTaskBySessionRow, error)
 	GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, error)
+	// W4-03 BLOCKER 1+2 fix: the by-trace_id half of the server-side taint
+	// resolver (kahyad/internal/policy.StoreSessionResolver) - a policy
+	// decision must resolve WHICH session a request belongs to from the
+	// request's own trace_id/task_id correlation, never from a caller-
+	// supplied session_id (untrusted; on POST /v1/mcp there is no session_id
+	// on the wire at all - see mcp.go's policyGateMiddleware). Mirrors
+	// GetTaskBySession's own "not guaranteed unique, most-recently-updated
+	// wins" note: a resumed/retried task can share one trace_id across more
+	// than one tasks row. NULL session_id (no session_started yet for this
+	// task) comes back as a NULL/invalid value, not an error - the resolver
+	// itself treats that as "unresolved" (fail-closed), not a query failure.
+	GetTaskSessionByTrace(ctx context.Context, traceID string) (sql.NullString, error)
 	// Update-half of an application-level upsert (the same "upsert (update
 	// half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
 	// UpdateEpisodeContent above already use in this file) - the common case

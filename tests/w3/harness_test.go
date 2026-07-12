@@ -685,8 +685,62 @@ type mcpResult struct {
 	Text    string
 }
 
+// seedResolvableSession ensures a tasks row (and a CLEAN session_taint
+// row) exists for (taskID, traceID) before mcpCall below drives a
+// /v1/mcp call against it directly. In real production, POST /v1/task
+// always inserts the tasks row - and the worker's session_started event
+// then persists a clean session_taint row in the SAME transaction (see
+// kahyad/internal/server's persistSessionStarted) - strictly BEFORE any
+// tool call from that task's worker can ever reach /v1/mcp. This package
+// bypasses that whole lifecycle on purpose (it drives fs_write/
+// shell_docker/mail_send directly against /v1/mcp with synthetic ids, to
+// isolate the policy/approval/egress gates under test from a real worker
+// process), so post-W4-03 BLOCKER 1+2 fix - which makes
+// kahyad/internal/policy.Engine.Check resolve the taint-check's session
+// identity SERVER-SIDE from trace_id/task_id, never from the caller - an
+// (taskID, traceID) pair with no seeded row at all is indistinguishable
+// from a genuinely unresolvable one, and Check now fails closed (denies)
+// on exactly that case (HANDOFF §5: "kayıt yoksa oturum güvenilmez
+// sayılır"). Seeding a resolvable, explicitly CLEAN session here is what
+// lets these gate tests keep exercising the ladder/approval/egress
+// decision they actually test, rather than an unconditional taint deny.
+// INSERT OR IGNORE keys off tasks.id (the primary key), so a test that
+// calls mcpCall more than once with the SAME taskID (e.g. a post-
+// promotion re-issue) seeds only once, idempotently.
+func (d *daemon) seedResolvableSession(t *testing.T, taskID, traceID string) {
+	t.Helper()
+	if taskID == "" {
+		return
+	}
+	// A short-lived connection of its own (not d.openDB's t.Cleanup-
+	// registered one) - this helper may run many times per test (once per
+	// mcpCall), and each call's connection is closed immediately below
+	// rather than accumulating until the test ends.
+	db, err := sql.Open("sqlite3", d.dbPath+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("seedResolvableSession: open %s: %v", d.dbPath, err)
+	}
+	defer db.Close()
+	sessionID := "w3gate-session-" + taskID
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO tasks (id, trace_id, session_id, state, lane, updated_at, created_at)
+		 VALUES (?, ?, ?, 'running', 'normal', ?, ?)`,
+		taskID, traceID, sessionID, now, now,
+	); err != nil {
+		t.Fatalf("seedResolvableSession: insert tasks row (id=%s): %v", taskID, err)
+	}
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO session_taint (session_id, tier, updated_at) VALUES (?, 'clean', ?)`,
+		sessionID, now,
+	); err != nil {
+		t.Fatalf("seedResolvableSession: insert session_taint row (session=%s): %v", sessionID, err)
+	}
+}
+
 func (d *daemon) mcpCall(t *testing.T, traceID, taskID, name string, args map[string]any) mcpResult {
 	t.Helper()
+	d.seedResolvableSession(t, taskID, traceID)
 	reqBody := map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{"name": name, "arguments": args},
