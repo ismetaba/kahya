@@ -169,8 +169,10 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if len(cfg.Jobs) != 2 {
-		t.Fatalf("Jobs = %+v, want exactly 2 default entries", cfg.Jobs)
+	// W5-01 added a third default entry (morning-briefing) - see the block
+	// below.
+	if len(cfg.Jobs) != 3 {
+		t.Fatalf("Jobs = %+v, want exactly 3 default entries", cfg.Jobs)
 	}
 
 	byName := make(map[string]JobConfig, len(cfg.Jobs))
@@ -204,6 +206,24 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 	if push.Calendar.Minute == nil || *push.Calendar.Minute != 45 {
 		t.Errorf("memory-push.Calendar.Minute = %v, want 45", push.Calendar.Minute)
+	}
+
+	// W5-01: the 08:30 morning-briefing job.
+	briefing, ok := byName["morning-briefing"]
+	if !ok {
+		t.Fatalf("Jobs missing morning-briefing: %+v", cfg.Jobs)
+	}
+	if briefing.Handler != "morning-briefing" {
+		t.Errorf("morning-briefing.Handler = %q, want %q", briefing.Handler, "morning-briefing")
+	}
+	if briefing.Calendar.Hour == nil || *briefing.Calendar.Hour != 8 {
+		t.Errorf("morning-briefing.Calendar.Hour = %v, want 8", briefing.Calendar.Hour)
+	}
+	if briefing.Calendar.Minute == nil || *briefing.Calendar.Minute != 30 {
+		t.Errorf("morning-briefing.Calendar.Minute = %v, want 30", briefing.Calendar.Minute)
+	}
+	if cfg.BriefingHour != 8 || cfg.BriefingMinute != 30 {
+		t.Errorf("BriefingHour/Minute = %d/%d, want 8/30", cfg.BriefingHour, cfg.BriefingMinute)
 	}
 
 	// validateJobs must still accept the default set (DNS-label names, no

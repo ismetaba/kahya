@@ -227,6 +227,42 @@ func (c *Client) Reindex(ctx context.Context, traceID string, full, reEmbed bool
 	return rr, nil
 }
 
+// jobTriggerResponse mirrors kahyad's POST /jobs/trigger/{name} 202 body
+// (kahyad/internal/server.jobTriggerResponse, W4-01).
+type jobTriggerResponse struct {
+	TraceID string `json:"trace_id"`
+}
+
+// TriggerJob calls POST /jobs/trigger/{name} (W4-01's ONE job-dispatch
+// route - kahyad-trigger, launchd, and `kahya job run <name>` all reach
+// the exact same handler, so a manual trigger can never behave
+// differently than a scheduled one). Returns the freshly-minted trace_id
+// kahyad's response carries, so the caller can point `kahya log --trace
+// <id>` at this exact run.
+func (c *Client) TriggerJob(ctx context.Context, traceID, name string) (string, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/jobs/trigger/"+url.PathEscape(name), traceID, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		if msg := apiError(resp.Body); msg != "" {
+			return "", fmt.Errorf("%s", msg)
+		}
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("job trigger: status %d", resp.StatusCode)}
+	}
+	var jr jobTriggerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("job trigger: decode response: %w", err)}
+	}
+	return jr.TraceID, nil
+}
+
 // policyStateRow mirrors kahyad's GET /policy/state row shape
 // (kahyad/internal/server.policyStateRow, W3-02).
 type policyStateRow struct {

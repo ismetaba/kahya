@@ -25,6 +25,7 @@ import (
 	"kahya/kahyad/internal/anchor"
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/backup"
+	"kahya/kahyad/internal/briefing"
 	"kahya/kahyad/internal/buildinfo"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/egress"
@@ -705,6 +706,51 @@ func run() int {
 	})
 	sched.RegisterHandler("memory-push", func(ctx context.Context) error {
 		return pusher.Run(ctx, scheduler.TraceIDFromContext(ctx))
+	})
+
+	// W5-01: the 08:30 morning briefing (HANDOFF §4 stack ⚑ scheduling /
+	// §5 safety #2: the briefing session is untrusted by design - it can
+	// only ever notify, never execute a W-class tool). Reuses the SAME
+	// secretLaneClassifier/taintTracker/egressGate/tgBot/st instances
+	// every other subsystem shares above - never a second copy of any of
+	// them. srv.NewTaskProxy (the exact same per-task Anthropic forward-
+	// proxy construction handleTask/taskDispatcher both already use) mints
+	// a fresh listener for each briefing run's own worker call, so the
+	// briefing model call passes through the identical W12-08 cost-
+	// governor/egress-gate/cache-hit machinery every other task's call
+	// does.
+	briefingOrchestrator := &briefing.Orchestrator{
+		Cfg: briefing.Config{
+			GHRepos:       cfg.BriefingGHRepos,
+			FileGlobs:     cfg.BriefingFileGlobs,
+			CalendarNames: cfg.BriefingCalendarNames,
+		},
+		Classifier: secretLaneClassifier,
+		Globs:      briefing.PolicyGlobMatcher{Globs: pol.SecretLaneGlobs},
+		GH: briefing.GHCollector{
+			Runner: briefing.ExecGHRunner{HTTPSProxy: fmt.Sprintf("http://127.0.0.1:%d", cfg.EgressPort)},
+			Repos:  cfg.BriefingGHRepos,
+		},
+		Calendar:  briefing.ExecCalendarRunner{},
+		Files:     briefing.FileGlobCollector{Globs: cfg.BriefingFileGlobs},
+		FileState: briefing.FileScanState{Path: filepath.Join(cfg.DataDir, "briefing_file_scan_state.txt")},
+		Taint:     taintTracker,
+		Spawner: briefing.ProcessSpawner{
+			Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
+			MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
+			ProxyOpener: func(taskID, traceID string) (string, string, func() error, error) {
+				return srv.NewTaskProxy(taskID, traceID)
+			},
+		},
+		Delivery:  tgBot,
+		TaskStore: st.Queries,
+		Ledger:    st,
+		Dedupe:    briefing.StoreDedupeChecker{Store: st.Queries},
+		Log:       log,
+	}
+	sched.RegisterHandler("morning-briefing", func(ctx context.Context) error {
+		_, err := briefingOrchestrator.Run(ctx, scheduler.TraceIDFromContext(ctx))
+		return err
 	})
 
 	sched.LoadJobs(cfg.Jobs)

@@ -114,6 +114,33 @@ func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePending
 	return result.RowsAffected()
 }
 
+const countEventsByKindAndDate = `-- name: CountEventsByKindAndDate :one
+SELECT count(*) FROM events WHERE kind = ? AND date(created_at) = ?
+`
+
+type CountEventsByKindAndDateParams struct {
+	Kind      string `json:"kind"`
+	CreatedAt string `json:"created_at"`
+}
+
+// W5-01's once-per-day idempotency check: counts events of kind on the
+// UTC calendar date dateStr ("YYYY-MM-DD" - SQLite's date() truncates
+// created_at to exactly this, and every created_at this codebase writes
+// is already UTC RFC3339/RFC3339Nano, so no timezone conversion is
+// needed). kahyad/internal/briefing.Orchestrator.Run consults this
+// BEFORE ever classifying a single collector item or spawning a worker
+// for a scheduled OR manual run: a non-zero count for kind=
+// "briefing.delivered" means today's briefing already went out, so this
+// run logs briefing.skipped_duplicate and sends nothing - a missed-run-
+// fired-on-wake plus the regular 08:30 run can therefore never deliver
+// two notifications the same date.
+func (q *Queries) CountEventsByKindAndDate(ctx context.Context, arg CountEventsByKindAndDateParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countEventsByKindAndDate, arg.Kind, arg.CreatedAt)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countToolCallAttempts = `-- name: CountToolCallAttempts :one
 SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?
 `
@@ -994,6 +1021,36 @@ type InsertSessionTaintCleanParams struct {
 // RaiseSessionTaint below.
 func (q *Queries) InsertSessionTaintClean(ctx context.Context, arg InsertSessionTaintCleanParams) error {
 	_, err := q.db.ExecContext(ctx, insertSessionTaintClean, arg.SessionID, arg.UpdatedAt)
+	return err
+}
+
+const insertSessionTaintTainted = `-- name: InsertSessionTaintTainted :exec
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'tainted', ?, ?)
+`
+
+type InsertSessionTaintTaintedParams struct {
+	SessionID string         `json:"session_id"`
+	Reason    sql.NullString `json:"reason"`
+	UpdatedAt string         `json:"updated_at"`
+}
+
+// W5-01's THIRD birth-place for a session_taint row (kahyad/internal/
+// taint's own package doc comment names exactly two before this: the
+// OnSession InsertClean for a user-initiated task, and actor_seed.Spawn's
+// InsertClean for a freshly-seeded Actor). This one is for a session that
+// is UNTRUSTED BY DESIGN AT CREATION (the morning-briefing worker session
+// - HANDOFF S5 safety #2: the briefing is untrusted by design)
+// - never a session that started clean and later had content-sourced
+// taint Raised onto it. A plain INSERT, mirroring InsertSessionTaintClean
+// exactly except for the literal tier: a session_id that already has ANY
+// row makes this fail on the PRIMARY KEY constraint -
+// kahyad/internal/taint.Tracker.InsertUntrusted surfaces that as an error
+// (a caller minting a brand-new session_id that collides with an existing
+// row has a bug worth surfacing), rather than silently reusing
+// RaiseSessionTaint's upsert semantics.
+func (q *Queries) InsertSessionTaintTainted(ctx context.Context, arg InsertSessionTaintTaintedParams) error {
+	_, err := q.db.ExecContext(ctx, insertSessionTaintTainted, arg.SessionID, arg.Reason, arg.UpdatedAt)
 	return err
 }
 

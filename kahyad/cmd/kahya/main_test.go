@@ -519,6 +519,79 @@ func TestAskEmptyPromptRejectedWithoutDialing(t *testing.T) {
 	}
 }
 
+// TestJobRunTriggersNamedJobAndPrintsTraceID is W5-01's own CLI-manual-
+// trigger acceptance criterion: `kahya job run <name>` POSTs to
+// /jobs/trigger/{name} and prints the Turkish success line with the
+// trace_id kahyad minted.
+func TestJobRunTriggersNamedJobAndPrintsTraceID(t *testing.T) {
+	var gotPath string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"trace_id": "trace-from-server"})
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"job", "run", "morning-briefing"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if gotPath != "/jobs/trigger/morning-briefing" {
+		t.Errorf("path = %q, want /jobs/trigger/morning-briefing", gotPath)
+	}
+	want := fmt.Sprintf(MsgJobTriggered, "morning-briefing", "trace-from-server")
+	if !strings.Contains(stdout.String(), want) {
+		t.Errorf("stdout = %q, want it to contain %q", stdout.String(), want)
+	}
+}
+
+// TestJobUsageOnMissingArgs proves a malformed `kahya job` invocation
+// prints the usage line and exits 2 without ever dialing kahyad.
+func TestJobUsageOnMissingArgs(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "nope.sock")
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"job"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if got := strings.TrimSpace(stderr.String()); got != MsgJobUsage {
+		t.Errorf("stderr = %q, want exactly %q", got, MsgJobUsage)
+	}
+}
+
+// TestJobRunUnknownJobPropagatesServerError proves a 404
+// unknown-job response from kahyad surfaces as a non-zero exit with the
+// server's own error message, never a silent success.
+func TestJobRunUnknownJobPropagatesServerError(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{"error": "unknown job: nope"})
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"job", "run", "nope"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatal("exit code = 0, want non-zero for an unknown job")
+	}
+	if !strings.Contains(stderr.String(), "unknown job") {
+		t.Errorf("stderr = %q, want it to contain the server's error message", stderr.String())
+	}
+}
+
 func TestFormatLogLineOmitsTraceIDColumnButKeepsExtras(t *testing.T) {
 	line := formatLogLine(map[string]any{
 		"ts": "2026-07-10T09:15:00.5Z", "level": "WARN", "proc": "worker",

@@ -367,6 +367,37 @@ type Config struct {
 	// cadence). Same CI-speed-gate override rationale as
 	// ResumeScanIntervalSeconds above.
 	OutboxDispatchIntervalSeconds int `yaml:"outbox_dispatch_interval_seconds"`
+
+	// --- W5-01 morning briefing ---
+
+	// BriefingHour/BriefingMinute are cfg.briefing.hour/cfg.briefing.minute
+	// (task spec, default 08:30): the wall-clock time the "morning-briefing"
+	// cfg.Jobs entry's own CalendarSpec is built from at defaults()-time
+	// (below) - kept as their OWN fields, rather than requiring an operator
+	// to hand-edit the jobs: list's Calendar block directly, so
+	// `kahya-briefing-hour: 7` alone is enough to reschedule (`kahyad
+	// -sync-jobs` still needs a re-run to push the new StartCalendarInterval
+	// to launchd - this field only changes what THAT sync would install).
+	BriefingHour   int `yaml:"briefing_hour"`
+	BriefingMinute int `yaml:"briefing_minute"`
+	// BriefingGHRepos is cfg.briefing.gh_repos: the "owner/repo" list
+	// kahyad/internal/briefing's gh collector runs `gh pr list`/`gh run
+	// list` against (task spec: "seed with the user's active repos, e.g.
+	// gold-token"). Default empty - an operator opts in explicitly; an
+	// empty list makes the gh section of the briefing simply produce zero
+	// items, never an error.
+	BriefingGHRepos []string `yaml:"briefing_gh_repos"`
+	// BriefingFileGlobs is cfg.briefing.file_globs: the doublestar globs
+	// (same syntax as policy.yaml's own glob fields) kahyad/internal/
+	// briefing's file collector mtime-diffs since the last run. Default
+	// empty - no glob, no items, never an error.
+	BriefingFileGlobs []string `yaml:"briefing_file_globs"`
+	// BriefingCalendarNames is cfg.briefing.calendar_names: which named
+	// macOS Calendar.app calendars kahyad/internal/briefing's calendar
+	// collector reads today's events from. Default empty means "every
+	// calendar the Automation grant can see" - kahyad/internal/briefing's
+	// own JXA snippet treats an empty list as "no name filter".
+	BriefingCalendarNames []string `yaml:"briefing_calendar_names"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -451,6 +482,11 @@ type fileConfig struct {
 	AnchorLocalFallbackPath       *string      `yaml:"anchor_local_fallback_path"`
 	ResumeScanIntervalSeconds     *int         `yaml:"resume_scan_interval_seconds"`
 	OutboxDispatchIntervalSeconds *int         `yaml:"outbox_dispatch_interval_seconds"`
+	BriefingHour                  *int         `yaml:"briefing_hour"`
+	BriefingMinute                *int         `yaml:"briefing_minute"`
+	BriefingGHRepos               *[]string    `yaml:"briefing_gh_repos"`
+	BriefingFileGlobs             *[]string    `yaml:"briefing_file_globs"`
+	BriefingCalendarNames         *[]string    `yaml:"briefing_calendar_names"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -704,6 +740,13 @@ func defaults(home, env string) Config {
 		Jobs: []JobConfig{
 			{Name: "backup-nightly", Handler: "backup-nightly", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(30)}},
 			{Name: "memory-push", Handler: "memory-push", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(45)}},
+			// W5-01 morning briefing (HANDOFF §4 stack ⚑ scheduling: 08:30
+			// briefing via launchd StartCalendarInterval). Hour/Minute are
+			// the SAME defaultBriefingHour/Minute constants BriefingHour/
+			// BriefingMinute below default to, kept in sync by construction
+			// (both literals, never one field reading another in this same
+			// composite literal).
+			{Name: "morning-briefing", Handler: "morning-briefing", Calendar: CalendarSpec{Hour: intPtr(defaultBriefingHour), Minute: intPtr(defaultBriefingMinute)}},
 		},
 
 		// W4-05 ledger external anchor defaults (task spec, verbatim:
@@ -715,8 +758,26 @@ func defaults(home, env string) Config {
 		// cadence - see each field's own doc comment).
 		ResumeScanIntervalSeconds:     defaultResumeScanIntervalSeconds,
 		OutboxDispatchIntervalSeconds: defaultOutboxDispatchIntervalSeconds,
+
+		// W5-01 morning briefing defaults (task spec: hour/minute 08:30;
+		// gh repo list/file globs/calendar names default empty - an
+		// operator opts each source in explicitly via config.yaml; an
+		// empty list degrades that section to zero collected items, never
+		// an error - see each field's own doc comment).
+		BriefingHour:   defaultBriefingHour,
+		BriefingMinute: defaultBriefingMinute,
 	}
 }
+
+// defaultBriefingHour/defaultBriefingMinute are the W5-01 morning-briefing
+// job's wall-clock default (HANDOFF §6 W5, verbatim "08:30 brifingi") -
+// named constants so the "morning-briefing" cfg.Jobs entry above and
+// Config.BriefingHour/BriefingMinute's own defaults can never drift apart
+// (both read this exact pair, never a separately hand-typed literal).
+const (
+	defaultBriefingHour   = 8
+	defaultBriefingMinute = 30
+)
 
 // intPtr returns a pointer to v — CalendarSpec's fields are all *int (nil
 // means launchd's own StartCalendarInterval "every" semantics), so
@@ -1022,6 +1083,21 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.OutboxDispatchIntervalSeconds != nil {
 		cfg.OutboxDispatchIntervalSeconds = *fc.OutboxDispatchIntervalSeconds
+	}
+	if fc.BriefingHour != nil {
+		cfg.BriefingHour = *fc.BriefingHour
+	}
+	if fc.BriefingMinute != nil {
+		cfg.BriefingMinute = *fc.BriefingMinute
+	}
+	if fc.BriefingGHRepos != nil {
+		cfg.BriefingGHRepos = *fc.BriefingGHRepos
+	}
+	if fc.BriefingFileGlobs != nil {
+		cfg.BriefingFileGlobs = expandHomeEach(*fc.BriefingFileGlobs, home)
+	}
+	if fc.BriefingCalendarNames != nil {
+		cfg.BriefingCalendarNames = *fc.BriefingCalendarNames
 	}
 }
 

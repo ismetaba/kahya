@@ -194,4 +194,16 @@ const (
 	// when anchor.remote is configured, with the remote's own anchors.log
 	// too) - no tampering detected. Exit 0.
 	MsgLedgerVerifyOK = "Defter doğrulandı: kurcalama tespit edilmedi."
+
+	// ---- W5-01: kahya job run <name> (extends the W4-01 kahya-trigger
+	// mechanism with a subcommand on the main CLI) ----
+
+	// MsgJobUsage is printed when `kahya job` is given anything other than
+	// the recognized "run <name>" subcommand. Exit 2.
+	MsgJobUsage = "kullanım: kahya job run <ad>"
+
+	// MsgJobTriggered is `kahya job run <name>`'s success line: %s = the
+	// job name, %s = the trace_id this run was assigned (so the user can
+	// follow up with `kahya log --trace <id>`).
+	MsgJobTriggered = "İş tetiklendi: %s (iz: %s)"
 )

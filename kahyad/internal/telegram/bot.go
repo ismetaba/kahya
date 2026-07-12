@@ -361,6 +361,21 @@ func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.Reply
 	return msg
 }
 
+// SendNotification sends an ordinary, non-approval, non-alarm text
+// message through the SAME egress-gated send path every other Telegram-
+// bound message from this bot uses (send, above) - W5-01's morning
+// briefing is the first caller (kahyad/internal/briefing.Delivery), and
+// the first genuinely proactive (not approval-card, not cost-alarm) use
+// of this bot. Returns true iff the send actually reached Telegram
+// (Enabled() && the egress gate allowed it && the underlying Sender.Send
+// call itself succeeded) so a caller can ledger delivery precisely rather
+// than assuming success - send's own best-effort local-fallback notify
+// still fires on a blocked/failed send exactly as it does for every other
+// caller of send.
+func (b *Bot) SendNotification(ctx context.Context, traceID, text string) bool {
+	return b.send(ctx, traceID, text, nil) != nil
+}
+
 func (b *Bot) fallbackLocal(ctx context.Context, traceID, kind, message string) {
 	if b.local == nil {
 		return

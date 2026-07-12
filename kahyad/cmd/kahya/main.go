@@ -63,6 +63,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runLedger(client, args[1:], stdout, stderr)
 	case "ask":
 		return runAsk(client, args[1:], stdout, stderr)
+	case "job":
+		return runJob(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -202,6 +204,29 @@ func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgReindexSummary+"\n", rr.FilesIndexed, rr.Chunks, rr.DurationMs)
+	return 0
+}
+
+// runJob implements `kahya job run <name>` (W5-01: extends the W4-01
+// kahya-trigger mechanism with a subcommand on the main CLI). This POSTs
+// to the EXACT SAME /jobs/trigger/{name} route kahya-trigger and a
+// launchd-scheduled run both already use (kahyad/internal/server/jobs.go's
+// own doc comment: "kahyad's ONE dispatch route") - a manual `kahya job
+// run morning-briefing` can therefore never behave differently than the
+// 08:30 scheduled run.
+func runJob(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "run" || strings.TrimSpace(args[1]) == "" {
+		fmt.Fprintln(stderr, MsgJobUsage)
+		return 2
+	}
+	name := args[1]
+
+	traceID, err := client.TriggerJob(context.Background(), traceid.New(), name)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgJobTriggered+"\n", name, traceID)
 	return 0
 }
 

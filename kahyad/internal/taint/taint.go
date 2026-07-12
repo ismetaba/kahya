@@ -85,6 +85,7 @@ type Store interface {
 	GetSessionTaint(ctx context.Context, sessionID string) (sqlcgen.SessionTaint, error)
 	InsertSessionTaintClean(ctx context.Context, arg sqlcgen.InsertSessionTaintCleanParams) error
 	RaiseSessionTaint(ctx context.Context, arg sqlcgen.RaiseSessionTaintParams) error
+	InsertSessionTaintTainted(ctx context.Context, arg sqlcgen.InsertSessionTaintTaintedParams) error
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -192,6 +193,44 @@ func (t *Tracker) ledgerRaw(ctx context.Context, traceID, kind string, payload m
 		return
 	}
 	_ = t.ledger.LogEvent(ctx, traceID, kind, payload)
+}
+
+// InsertUntrusted inserts a brand-new session_taint row at tier=tainted
+// for sessionID - the THIRD birth-place for a session_taint row (see this
+// package's doc comment for the other two: OnSession's InsertClean for a
+// user-initiated task, and actor_seed.Spawn's InsertClean for a freshly-
+// seeded Actor). This one is for a session that is UNTRUSTED BY DESIGN AT
+// CREATION - W5-01's morning-briefing worker session is the first caller
+// (HANDOFF §5 safety #2: "Sabah brifingi tasarım gereği güvenilmezdir")
+// - never a session that started clean and later had content-sourced
+// taint Raised onto it. Callers reach for this (rather than Raise, which
+// upserts and is meant for widening an EXISTING session's tier) precisely
+// because the fail-closed default already denies W-tools for a session
+// with no row at all - InsertUntrusted exists so that default is made
+// EXPLICIT and auditable (a real row, a real reason, a real timestamp)
+// rather than relying silently on "no row found".
+//
+// A plain INSERT, mirroring InsertClean: if sessionID already has ANY row
+// (clean or tainted), the PRIMARY KEY conflict is surfaced as an error -
+// a caller minting a brand-new session_id that collides with an existing
+// row has a bug worth surfacing, not something to paper over via Raise's
+// upsert semantics.
+func (t *Tracker) InsertUntrusted(ctx context.Context, traceID, sessionID, reason string) error {
+	err := t.store.InsertSessionTaintTainted(ctx, sqlcgen.InsertSessionTaintTaintedParams{
+		SessionID: sessionID,
+		Reason:    sql.NullString{String: reason, Valid: reason != ""},
+		UpdatedAt: t.nowRFC3339(),
+	})
+	if err == nil {
+		return nil
+	}
+	if isUniqueConstraintViolation(err) {
+		t.ledgerRaw(ctx, traceID, EventLowerAttempt, map[string]any{
+			"event": EventLowerAttempt, "session_id": sessionID, "attempted_tier": TierTainted,
+		})
+		return fmt.Errorf("%w: session_id=%s", ErrLowerAttempt, sessionID)
+	}
+	return fmt.Errorf("taint: insert session_taint tainted(%s): %w", sessionID, err)
 }
 
 // isUniqueConstraintViolation reports whether err is a SQLite unique (or

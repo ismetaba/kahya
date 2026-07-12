@@ -564,6 +564,24 @@ ON CONFLICT (session_id) DO UPDATE SET
     reason = excluded.reason,
     updated_at = excluded.updated_at;
 
+-- name: InsertSessionTaintTainted :exec
+-- W5-01's THIRD birth-place for a session_taint row (kahyad/internal/
+-- taint's own package doc comment names exactly two before this: the
+-- OnSession InsertClean for a user-initiated task, and actor_seed.Spawn's
+-- InsertClean for a freshly-seeded Actor). This one is for a session that
+-- is UNTRUSTED BY DESIGN AT CREATION (the morning-briefing worker session
+-- - HANDOFF S5 safety #2: the briefing is untrusted by design)
+-- - never a session that started clean and later had content-sourced
+-- taint Raised onto it. A plain INSERT, mirroring InsertSessionTaintClean
+-- exactly except for the literal tier: a session_id that already has ANY
+-- row makes this fail on the PRIMARY KEY constraint -
+-- kahyad/internal/taint.Tracker.InsertUntrusted surfaces that as an error
+-- (a caller minting a brand-new session_id that collides with an existing
+-- row has a bug worth surfacing), rather than silently reusing
+-- RaiseSessionTaint's upsert semantics.
+INSERT INTO session_taint (session_id, tier, reason, updated_at)
+VALUES (?, 'tainted', ?, ?);
+
 -- W4-05 (ledger external anchor + tamper detection) queries below. See
 -- migrations/0010_ledger_anchor.sql for the schema.
 --
@@ -643,3 +661,17 @@ ORDER BY event_id ASC;
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
 ORDER BY id ASC;
+
+-- name: CountEventsByKindAndDate :one
+-- W5-01's once-per-day idempotency check: counts events of kind on the
+-- UTC calendar date dateStr ("YYYY-MM-DD" - SQLite's date() truncates
+-- created_at to exactly this, and every created_at this codebase writes
+-- is already UTC RFC3339/RFC3339Nano, so no timezone conversion is
+-- needed). kahyad/internal/briefing.Orchestrator.Run consults this
+-- BEFORE ever classifying a single collector item or spawning a worker
+-- for a scheduled OR manual run: a non-zero count for kind=
+-- "briefing.delivered" means today's briefing already went out, so this
+-- run logs briefing.skipped_duplicate and sends nothing - a missed-run-
+-- fired-on-wake plus the regular 08:30 run can therefore never deliver
+-- two notifications the same date.
+SELECT count(*) FROM events WHERE kind = ? AND date(created_at) = ?;

@@ -26,6 +26,9 @@ func (erroringStore) InsertSessionTaintClean(context.Context, sqlcgen.InsertSess
 func (erroringStore) RaiseSessionTaint(context.Context, sqlcgen.RaiseSessionTaintParams) error {
 	return errors.New("unused")
 }
+func (erroringStore) InsertSessionTaintTainted(context.Context, sqlcgen.InsertSessionTaintTaintedParams) error {
+	return errors.New("unused")
+}
 
 // testStore builds a Tracker against a real temp-file brain.db - the same
 // rationale kahyad/internal/task/machine_test.go's testStore gives for
@@ -241,5 +244,79 @@ func TestGetOnReadErrorFailsClosedToTainted(t *testing.T) {
 	}
 	if tier != TierTainted {
 		t.Fatalf("tier = %q, want %q", tier, TierTainted)
+	}
+}
+
+// TestInsertUntrustedThenGetReturnsTainted is W5-01's own regression test
+// for the THIRD session_taint birth-place (InsertUntrusted's own doc
+// comment): a session minted untrusted-by-design at creation (the
+// morning-briefing worker session) reads back as TierTainted, with a real
+// row (not merely the fail-closed missing-row default) - checked via
+// countEventsOfKind below, since this row's presence is what makes the
+// tier "explicit and auditable" rather than incidental.
+func TestInsertUntrustedThenGetReturnsTainted(t *testing.T) {
+	st := testStore(t)
+	tr := New(st.Queries, st)
+	ctx := context.Background()
+
+	if err := tr.InsertUntrusted(ctx, "trace-1", "session-briefing", "briefing:untrusted_by_design"); err != nil {
+		t.Fatalf("InsertUntrusted: %v", err)
+	}
+	tier, err := tr.Get(ctx, "session-briefing")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if tier != TierTainted {
+		t.Fatalf("tier = %q, want %q", tier, TierTainted)
+	}
+}
+
+// TestInsertUntrustedTwiceFailsAsLowerAttempt mirrors
+// TestInsertCleanTwiceFailsAsLowerAttempt: InsertUntrusted is a plain
+// INSERT, never an upsert - a second call against the SAME session_id
+// (even though both would-be tiers are 'tainted') is rejected exactly like
+// any other birth-place collision, ledgered under EventLowerAttempt (the
+// existing ledger vocabulary this package already has for "a caller tried
+// to create a row where one already exists").
+func TestInsertUntrustedTwiceFailsAsLowerAttempt(t *testing.T) {
+	st := testStore(t)
+	tr := New(st.Queries, st)
+	ctx := context.Background()
+
+	if err := tr.InsertUntrusted(ctx, "trace-1", "session-briefing-2", "reason"); err != nil {
+		t.Fatalf("first InsertUntrusted: %v", err)
+	}
+	err := tr.InsertUntrusted(ctx, "trace-1", "session-briefing-2", "reason")
+	if !errors.Is(err, ErrLowerAttempt) {
+		t.Fatalf("second InsertUntrusted: err = %v, want ErrLowerAttempt", err)
+	}
+	if n := countEventsOfKind(t, st, EventLowerAttempt); n != 1 {
+		t.Fatalf("taint.lower_attempt events = %d, want 1", n)
+	}
+}
+
+// TestInsertUntrustedOverExistingCleanRowFails proves InsertUntrusted
+// cannot be used to retroactively taint an already-clean row either - it
+// is strictly a BIRTH path (a fresh session_id with no row yet), never a
+// transition, mirroring InsertClean's own "any existing row, any tier, is
+// a rejected collision" contract.
+func TestInsertUntrustedOverExistingCleanRowFails(t *testing.T) {
+	st := testStore(t)
+	tr := New(st.Queries, st)
+	ctx := context.Background()
+
+	if err := tr.InsertClean(ctx, "trace-1", "session-already-clean"); err != nil {
+		t.Fatalf("InsertClean: %v", err)
+	}
+	err := tr.InsertUntrusted(ctx, "trace-2", "session-already-clean", "reason")
+	if !errors.Is(err, ErrLowerAttempt) {
+		t.Fatalf("InsertUntrusted over clean row: err = %v, want ErrLowerAttempt", err)
+	}
+	tier, gerr := tr.Get(ctx, "session-already-clean")
+	if gerr != nil {
+		t.Fatalf("Get: %v", gerr)
+	}
+	if tier != TierClean {
+		t.Fatalf("tier after failed InsertUntrusted = %q, want %q (still clean)", tier, TierClean)
 	}
 }
