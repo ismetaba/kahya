@@ -8,6 +8,15 @@ import (
 	"database/sql"
 )
 
+type AnchorLog struct {
+	ID         int64          `json:"id"`
+	EventID    int64          `json:"event_id"`
+	DigestHex  string         `json:"digest_hex"`
+	AnchoredAt string         `json:"anchored_at"`
+	RemoteRef  sql.NullString `json:"remote_ref"`
+	Status     string         `json:"status"`
+}
+
 type ApprovalToken struct {
 	TokenHash         string         `json:"token_hash"`
 	TaskID            string         `json:"task_id"`
@@ -107,6 +116,12 @@ type Fact struct {
 	ExtractorVer  sql.NullString `json:"extractor_ver"`
 	UpdatedAt     string         `json:"updated_at"`
 	CreatedAt     string         `json:"created_at"`
+}
+
+type LedgerDigestState struct {
+	ID          int64  `json:"id"`
+	LastEventID int64  `json:"last_event_id"`
+	Digest      []byte `json:"digest"`
 }
 
 type MergeLedger struct {

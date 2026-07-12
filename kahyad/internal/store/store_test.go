@@ -346,11 +346,11 @@ func TestHealthReportsSchemaVersion(t *testing.T) {
 // tasks.lane/tasks.secret_category from 0006 (W3-08), and
 // tasks.status/tool_calls/outbox lease columns from 0007 (W4-02),
 // idx_tool_calls_live_unique from 0008 (task durability BLOCKER 1 fix),
-// and session_taint from 0009 (W4-03)) the next time kahyad boots. The
-// expected latest version is asserted as
-// 9 (0001..0009); bump this literal, deliberately, the next time a new
-// migration file is added - this is the one place in the test suite that
-// pins "the latest goose version kahyad ships" as a number, so a
+// session_taint from 0009 (W4-03), and ledger_digest_state/anchor_log from
+// 0010 (W4-05)) the next time kahyad boots. The expected latest version is
+// asserted as 10 (0001..0010); bump this literal, deliberately, the next
+// time a new migration file is added - this is the one place in the test
+// suite that pins "the latest goose version kahyad ships" as a number, so a
 // forgotten migration file never silently passes this gate.
 func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	cfg := testCfg(t)
@@ -389,7 +389,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 9 // 0001-0009; bump alongside each new migration file
+	const latestVersion = 10 // 0001-0010; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}
@@ -402,7 +402,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 
 	got = tableNames(t, s.DB())
-	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget", "tool_calls"} {
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget", "tool_calls", "session_taint", "ledger_digest_state", "anchor_log"} {
 		if !got[name] {
 			t.Errorf("table %q missing after v1->latest upgrade; tables = %v", name, got)
 		}

@@ -59,6 +59,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runApprove(client, args[1:], stdin, stdout, stderr)
 	case "task":
 		return runTask(client, args[1:], stdout, stderr)
+	case "ledger":
+		return runLedger(client, args[1:], stdout, stderr)
 	case "ask":
 		return runAsk(client, args[1:], stdout, stderr)
 	default:
@@ -457,6 +459,35 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 	} else {
 		fmt.Fprintf(stdout, MsgTaskResolvedRetry+"\n", id)
 	}
+	return 0
+}
+
+// runLedger implements `kahya ledger verify` (W4-05) - currently the only
+// `kahya ledger` subcommand.
+func runLedger(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || args[0] != "verify" {
+		fmt.Fprintln(stderr, MsgLedgerUsage)
+		return 2
+	}
+	return runLedgerVerify(client, stdout, stderr)
+}
+
+// runLedgerVerify implements `kahya ledger verify` (W4-05 task spec step
+// 6): POST /v1/ledger/verify, then either print the success line (exit 0)
+// or the exact Turkish AlarmMismatch string kahyad returned (exit 1) - a
+// mismatch's message is already fully formed server-side, never re-wrapped
+// or re-translated here.
+func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
+	result, err := client.LedgerVerify(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if !result.OK {
+		fmt.Fprintln(stderr, result.Message)
+		return 1
+	}
+	fmt.Fprintln(stdout, MsgLedgerVerifyOK)
 	return 0
 }
 

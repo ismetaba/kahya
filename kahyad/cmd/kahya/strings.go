@@ -182,4 +182,16 @@ const (
 	// lines.
 	MsgTaskResolvedRetry = "Görev yeniden kuyruğa alındı: %s"
 	MsgTaskResolvedAbort = "Görev durduruldu (failed): %s"
+
+	// ---- W4-05: kahya ledger verify ----
+
+	// MsgLedgerUsage is printed when `kahya ledger` is given anything other
+	// than the recognized "verify" subcommand. Exit 2.
+	MsgLedgerUsage = "kullanım: kahya ledger verify"
+
+	// MsgLedgerVerifyOK is `kahya ledger verify`'s success line: the
+	// from-genesis recompute agreed with every anchored checkpoint (and,
+	// when anchor.remote is configured, with the remote's own anchors.log
+	// too) - no tampering detected. Exit 0.
+	MsgLedgerVerifyOK = "Defter doğrulandı: kurcalama tespit edilmedi."
 )

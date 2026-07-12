@@ -34,6 +34,9 @@ sql:
       # 0009 (W4-03) is a plain CREATE TABLE (session_taint) - same
       # reasoning.
       - "kahyad/migrations/0009_session_taint.sql"
+      # 0010 (W4-05) is two plain CREATE TABLEs (ledger_digest_state,
+      # anchor_log) - same reasoning.
+      - "kahyad/migrations/0010_ledger_anchor.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

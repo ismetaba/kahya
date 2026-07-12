@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"kahya/kahyad/internal/anchor"
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/backup"
 	"kahya/kahyad/internal/buildinfo"
@@ -740,6 +741,44 @@ func run() int {
 	if err := sched.RegisterTick("outbox_dispatch", "@every 5s", runOutboxDispatch); err != nil {
 		log.Error("outbox_dispatch_tick_register_failed", "err", err.Error())
 	}
+
+	// W4-05: the ledger external anchor (HANDOFF §5 safety #4 flag). Both
+	// Pusher and Verifier are ALWAYS constructed - the ONLY gate on any
+	// real git/SSH activity is cfg.AnchorRemote being non-empty
+	// (anchor.Pusher.Run's own doc comment), mirroring how the W4-06
+	// TimeMachine setup above gates its own real side effects so dev/test
+	// never touches a real remote. anchorRepoDir is the task spec's own
+	// fixed local working tree (~/Library/Application Support/Kahya/
+	// anchor-repo). anchor.NewPusher/NewVerifier each read the real
+	// kahya.anchor Keychain deploy key internally - this package never
+	// touches that identity directly, per HANDOFF §5 safety #4's
+	// Keychain-isolation rule (kahyad/internal/anchor's own import-guard
+	// test enforces it permanently). governorNotifier
+	// (not the bare `notifier`) is reused here so a stale-pending/mismatch
+	// alarm reaches Telegram exactly like every other alarm-class event
+	// does.
+	anchorRepoDir := filepath.Join(cfg.DataDir, "anchor-repo")
+	anchorGitRunner := anchor.NewExecGitRunner()
+	anchorPusher := anchor.NewPusher(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir, cfg.AnchorLocalFallbackPath, cfg.AnchorIntervalHours)
+	anchorPusher.SetJSONLLogger(log)
+	anchorVerifier := anchor.NewVerifier(st.Queries, st, governorNotifier, anchorGitRunner, cfg.AnchorRemote, anchorRepoDir)
+	anchorVerifier.SetJSONLLogger(log)
+	srv.SetLedgerVerifier(anchorVerifier)
+
+	// Startup anchor push (task spec step 3: "once at startup ... plus
+	// once at graceful shutdown" - the shutdown half runs further down,
+	// right before the embed/qwen supervisors stop).
+	if err := anchorPusher.Run(context.Background(), bootTraceID); err != nil {
+		log.Error("anchor_push_startup_failed", "err", err.Error())
+	}
+	if err := sched.RegisterTick("anchor_push", fmt.Sprintf("@every %dh", cfg.AnchorIntervalHours), func(ctx context.Context) {
+		if err := anchorPusher.Run(ctx, scheduler.TraceIDFromContext(ctx)); err != nil {
+			log.Error("anchor_push_tick_failed", "err", err.Error())
+		}
+	}); err != nil {
+		log.Error("anchor_push_tick_register_failed", "err", err.Error())
+	}
+
 	sched.StartTicks()
 	defer sched.StopTicks()
 
@@ -834,6 +873,15 @@ func run() int {
 	reindexDone.Wait()
 	undoSweepDone.Wait()
 	telegramDone.Wait()
+
+	// W4-05: one last anchor push at graceful shutdown (task spec step 3's
+	// other half - see the startup call above). Deliberately AFTER every
+	// other goroutine above has been joined (so it observes the ledger's
+	// truly final state for this process) but BEFORE the deferred
+	// st.Close() runs (brain.db is still open here).
+	if err := anchorPusher.Run(context.Background(), traceid.New()); err != nil {
+		log.Error("anchor_push_shutdown_failed", "err", err.Error())
+	}
 
 	// Stop kills the embed service's entire process GROUP (SIGKILL) and
 	// suppresses its restart-with-backoff loop - launchd holds only

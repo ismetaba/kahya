@@ -58,6 +58,18 @@ func TestNewTelegramConfiguredCorrectly(t *testing.T) {
 	}
 }
 
+// TestNewAnchorConfiguredCorrectly asserts NewAnchor points at the
+// W0-04-provisioned kahya.anchor/kahya item - a SEPARATE Keychain item from
+// both New()'s kahya.anthropic and NewTelegram()'s kahya.telegram (HANDOFF
+// §5 safety #4 ⚑: the anchor deploy key must be its own identity). Hermetic
+// - no dependency on the item actually existing on this machine.
+func TestNewAnchorConfiguredCorrectly(t *testing.T) {
+	k := NewAnchor()
+	if k.service != "kahya.anchor" || k.account != "kahya" {
+		t.Fatalf("NewAnchor() service/account = %q/%q, want kahya.anchor/kahya", k.service, k.account)
+	}
+}
+
 // TestKeychainReadFailureNotCached proves an error is never cached: two
 // consecutive reads of a missing item both return an error rather than the
 // second call somehow succeeding with a cached blank value.

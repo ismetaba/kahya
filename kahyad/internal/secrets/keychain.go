@@ -30,6 +30,16 @@ const (
 // Telegram bot's BotFather token).
 const telegramService = "kahya.telegram"
 
+// anchorService is W0-04's third provisioned item (the same "-T $(which
+// kahyad)" comment above names it): the SEPARATE-identity deploy key for
+// W4-05's append-only external anchor repo (HANDOFF §5 safety #4 ⚑: "Bu
+// kimlik Keychain'de ayrı öğedir, yalnız çapa-yazma kod yolunda okunur" -
+// "this identity is a SEPARATE Keychain item, read only by the
+// anchor-write code path"). kahyad/internal/anchor's own deploy-key
+// accessor is the ONLY caller of NewAnchor in this codebase - that
+// package's own import-guard test enforces that permanently.
+const anchorService = "kahya.anchor"
+
 // Keychain reads and caches the Anthropic API key from the macOS Keychain.
 // Safe for concurrent use.
 type Keychain struct {
@@ -60,6 +70,18 @@ func New() *Keychain {
 // that as "bot disabled", never a boot failure.
 func NewTelegram() *Keychain {
 	return &Keychain{service: telegramService, account: defaultAccount}
+}
+
+// NewAnchor constructs a Keychain reader for the production `kahya.anchor`
+// item (account `kahya`, same W0-04 provisioning command/ACL convention as
+// New's `kahya.anthropic`/NewTelegram's `kahya.telegram`) - the W4-05
+// append-only anchor repo's deploy key. Do not call this from anywhere
+// other than kahyad/internal/anchor: that package's own
+// anchor_import_guard_test.go is the permanent enforcement of the
+// Keychain-isolation rule this constructor exists to satisfy (HANDOFF §5
+// safety #4 ⚑) - this comment is advisory, the test is the actual guard.
+func NewAnchor() *Keychain {
+	return &Keychain{service: anchorService, account: defaultAccount}
 }
 
 // Read returns the cached Anthropic API key, invoking

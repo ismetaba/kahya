@@ -563,3 +563,83 @@ ON CONFLICT (session_id) DO UPDATE SET
     tier = 'tainted',
     reason = excluded.reason,
     updated_at = excluded.updated_at;
+
+-- W4-05 (ledger external anchor + tamper detection) queries below. See
+-- migrations/0010_ledger_anchor.sql for the schema.
+--
+-- ledger_digest_state queries: kahyad/internal/store.InsertEventWithDigest
+-- (the ONE choke point that appends a row to events - see its own doc
+-- comment for why it is the only caller of GetLedgerDigestState/
+-- AdvanceLedgerDigestState) is the only writer; kahyad/internal/anchor's
+-- push.go (to learn what to anchor next) and verify.go (as a bonus
+-- cross-check against its own from-genesis recompute) are read-only
+-- callers.
+
+-- name: GetLedgerDigestState :one
+SELECT id, last_event_id, digest FROM ledger_digest_state WHERE id = 1;
+
+-- name: AdvanceLedgerDigestState :exec
+-- Called ONLY from inside InsertEventWithDigest's own transaction,
+-- immediately after that same transaction's InsertEvent - both writes
+-- commit or roll back together, so the digest can never fall out of sync
+-- with the ledger it claims to cover (task spec's own "never an event
+-- without its digest step, never a digest step without its event").
+UPDATE ledger_digest_state
+SET last_event_id = ?, digest = ?
+WHERE id = 1;
+
+-- anchor_log queries: kahyad/internal/anchor/push.go is the only writer
+-- (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+
+-- name: InsertAnchorLog :one
+-- status is always 'pending' at insert time (task spec step 3: "insert
+-- anchor_log row pending" BEFORE the git push is even attempted) - the
+-- caller passes the literal string, never a variable, so this file has
+-- exactly one place that ever creates a 'pending' row.
+INSERT INTO anchor_log (event_id, digest_hex, anchored_at, remote_ref, status)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status;
+
+-- name: MarkAnchorPushed :exec
+-- The ONLY statement that ever flips a row from 'pending' to 'pushed' -
+-- called once the git push has actually landed on the remote (task spec
+-- step 3: "On success mark pushed").
+UPDATE anchor_log
+SET status = 'pushed', remote_ref = ?
+WHERE id = ?;
+
+-- name: GetLatestAnchorLog :one
+-- The most recent anchor_log row of ANY status - push.go's
+-- claimPendingRow uses this to decide whether there is already an
+-- in-flight 'pending' row to retry (offline case, task spec step 5) before
+-- ever considering a new one.
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+ORDER BY id DESC
+LIMIT 1;
+
+-- name: ListPendingAnchorLogs :many
+-- Every not-yet-pushed anchor_log row, oldest first - push.go's
+-- stale-pending alarm (task spec step 5: "if the oldest pending is older
+-- than 2 x interval_hours, alarm") reads index [0].
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+WHERE status = 'pending'
+ORDER BY id ASC;
+
+-- name: ListAnchorLogs :many
+-- Every anchor_log row ordered by the ledger position it anchors -
+-- verify.go's own recompute-from-event-1 pass uses this as its ordered
+-- checkpoint list (task spec step 6: "at each anchor_log/remote anchor
+-- line, compare").
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+ORDER BY event_id ASC;
+
+-- name: ListAllEvents :many
+-- Every ledger event ever appended, oldest first - verify.go's own
+-- full-recompute pass (task spec step 6: "recompute the digest from event
+-- 1 upward"; "Full recompute is fine at MVP scale ... do not optimize").
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+ORDER BY id ASC;

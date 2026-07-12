@@ -21,6 +21,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/ledgerdigest"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/migrations"
 )
@@ -223,7 +224,8 @@ func (s *Store) Health(ctx context.Context) (ok bool, schemaVersion int64, err e
 // gate/write/forget/injection ledgering, and any future caller) shares one
 // marshaling/timestamp convention instead of hand-building the JSON string
 // itself - mirroring how kahyad/internal/indexer.Indexer.Reindex already
-// marshals its own ledger payload inline. ts and created_at both use the
+// marshals its own ledger payload inline (via the SAME InsertEventWithDigest
+// choke point - see its own doc comment). ts and created_at both use the
 // current UTC time in RFC3339Nano, matching every other ledger writer in
 // this codebase.
 func (s *Store) LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error {
@@ -231,18 +233,75 @@ func (s *Store) LogEvent(ctx context.Context, traceID, kind string, payload map[
 	if err != nil {
 		return fmt.Errorf("store: marshal event payload (kind=%s): %w", kind, err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = s.Queries.InsertEvent(ctx, sqlcgen.InsertEventParams{
-		TraceID:   traceID,
-		Ts:        now,
-		Kind:      kind,
-		Payload:   string(b),
-		CreatedAt: now,
-	})
-	if err != nil {
-		return fmt.Errorf("store: insert event (kind=%s): %w", kind, err)
+	if _, err := InsertEventWithDigest(ctx, s.db, traceID, kind, b, time.Now()); err != nil {
+		return err
 	}
 	return nil
+}
+
+// InsertEventWithDigest is THE single choke point (W4-05) that appends a
+// row to the append-only events ledger: it inserts the row AND advances
+// ledger_digest_state's running digest (kahyad/internal/ledgerdigest.Next -
+// digest = SHA256(prev_digest || uint64_be(event_id) || event_payload_bytes),
+// genesis prev_digest seeded as 32 zero bytes by migrations/
+// 0010_ledger_anchor.sql) in the SAME SQLite transaction. Either both writes
+// commit, or neither does - there is never an event without its digest
+// step, and never a digest step without its event (task spec step 1's own
+// correctness requirement). payload must be the EXACT bytes that get
+// stored in the events.payload column (this function does not re-marshal
+// it), since the digest must cover the ledger's actual on-disk bytes, not
+// whatever in-memory value produced them.
+//
+// This is the ONLY function in this codebase that may execute
+// "INSERT INTO events" - Store.LogEvent above (every ordinary ledger
+// writer in this codebase - policy, tasks, egress, telegram, scheduler,
+// backup, mcp/*, etc. - goes through LogEvent, never sqlcgen.InsertEvent
+// directly) and kahyad/internal/indexer.Indexer's own reindex-summary
+// ledger write (the ONE place in this codebase that used to call
+// sqlcgen.Queries.InsertEvent directly, bypassing LogEvent, because it
+// already held its own *sql.DB handle) both call this function instead.
+// Grepping this repo for `InsertEvent(` or `INSERT INTO events` should
+// never turn up a third call site outside this function and its own
+// generated sqlcgen implementation.
+func InsertEventWithDigest(ctx context.Context, db *sql.DB, traceID, kind string, payload []byte, now time.Time) (sqlcgen.Event, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return sqlcgen.Event{}, fmt.Errorf("store: begin ledger tx (kind=%s): %w", kind, err)
+	}
+
+	ts := now.UTC().Format(time.RFC3339Nano)
+	txq := sqlcgen.New(tx)
+	ev, err := txq.InsertEvent(ctx, sqlcgen.InsertEventParams{
+		TraceID:   traceID,
+		Ts:        ts,
+		Kind:      kind,
+		Payload:   string(payload),
+		CreatedAt: ts,
+	})
+	if err != nil {
+		_ = tx.Rollback()
+		return sqlcgen.Event{}, fmt.Errorf("store: insert event (kind=%s): %w", kind, err)
+	}
+
+	state, err := txq.GetLedgerDigestState(ctx)
+	if err != nil {
+		_ = tx.Rollback()
+		return sqlcgen.Event{}, fmt.Errorf("store: read ledger_digest_state (event=%d): %w", ev.ID, err)
+	}
+
+	next := ledgerdigest.Next(state.Digest, ev.ID, []byte(ev.Payload))
+	if err := txq.AdvanceLedgerDigestState(ctx, sqlcgen.AdvanceLedgerDigestStateParams{
+		LastEventID: ev.ID,
+		Digest:      next[:],
+	}); err != nil {
+		_ = tx.Rollback()
+		return sqlcgen.Event{}, fmt.Errorf("store: advance ledger_digest_state (event=%d): %w", ev.ID, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return sqlcgen.Event{}, fmt.Errorf("store: commit ledger tx (kind=%s, event=%d): %w", kind, ev.ID, err)
+	}
+	return ev, nil
 }
 
 // Close checkpoints the WAL into the main database file (TRUNCATE mode, so

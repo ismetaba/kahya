@@ -24,6 +24,7 @@ import (
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -223,7 +224,14 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 	// cancelled shutdown never prevents recording what this run actually
 	// did. brain.db is still open at this point regardless: main.go always
 	// waits for Reindex to return before closing it (BLOCKER 2).
-	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	//
+	// W4-05: this is the ONE other place in the codebase (besides
+	// store.Store.LogEvent) that appends a row to the events ledger, so it
+	// goes through the SAME store.InsertEventWithDigest choke point rather
+	// than calling sqlcgen.Queries.InsertEvent directly - otherwise a
+	// reindex's own ledger row would advance events.id without ever
+	// advancing ledger_digest_state alongside it, making every later
+	// anchor/verify digest silently wrong from that point on.
 	payload, err := json.Marshal(res)
 	if err != nil {
 		// json.Marshal on a plain struct of ints/int64s cannot actually
@@ -231,13 +239,7 @@ func (idx *Indexer) Reindex(ctx context.Context, traceID string, full bool) (Res
 		// this path.
 		payload = []byte("{}")
 	}
-	if _, err := idx.q.InsertEvent(context.Background(), sqlcgen.InsertEventParams{
-		TraceID:   resolvedTraceID,
-		Ts:        nowStr,
-		Kind:      "reindex",
-		Payload:   string(payload),
-		CreatedAt: nowStr,
-	}); err != nil {
+	if _, err := store.InsertEventWithDigest(context.Background(), idx.db, resolvedTraceID, "reindex", payload, time.Now()); err != nil {
 		// The ledger write failing does not undo the reindex itself
 		// (markdown->SQLite sync already committed per-file); log and move
 		// on rather than discarding a successful reindex's result.

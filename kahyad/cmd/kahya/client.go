@@ -524,6 +524,45 @@ func (c *Client) TaskResolve(ctx context.Context, traceID, taskID, action string
 	return nil
 }
 
+// ledgerVerifyResult mirrors kahyad's POST /v1/ledger/verify JSON body
+// (kahyad/internal/server.ledgerVerifyResponse, W4-05). Message (only set
+// when OK is false) is already the exact Turkish AlarmMismatch string -
+// `kahya ledger verify` prints it verbatim, never re-wrapped.
+type ledgerVerifyResult struct {
+	OK              bool   `json:"ok"`
+	MismatchEventID int64  `json:"mismatch_event_id,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+// LedgerVerify calls POST /v1/ledger/verify (`kahya ledger verify`, W4-05):
+// recomputes the ledger digest from event 1 forward and compares it
+// against every anchored checkpoint (kahyad itself performs the recompute
+// and any resulting anchor.mismatch ledgering - kahya is brain.db's only
+// writer).
+func (c *Client) LedgerVerify(ctx context.Context, traceID string) (ledgerVerifyResult, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/ledger/verify", traceID, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return ledgerVerifyResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return ledgerVerifyResult{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return ledgerVerifyResult{}, fmt.Errorf("%s", msg)
+		}
+		return ledgerVerifyResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("ledger/verify: status %d", resp.StatusCode)}
+	}
+	var lr ledgerVerifyResult
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return ledgerVerifyResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("ledger/verify: decode response: %w", err)}
+	}
+	return lr, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

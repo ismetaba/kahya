@@ -10,6 +10,27 @@ import (
 	"database/sql"
 )
 
+const advanceLedgerDigestState = `-- name: AdvanceLedgerDigestState :exec
+UPDATE ledger_digest_state
+SET last_event_id = ?, digest = ?
+WHERE id = 1
+`
+
+type AdvanceLedgerDigestStateParams struct {
+	LastEventID int64  `json:"last_event_id"`
+	Digest      []byte `json:"digest"`
+}
+
+// Called ONLY from inside InsertEventWithDigest's own transaction,
+// immediately after that same transaction's InsertEvent - both writes
+// commit or roll back together, so the digest can never fall out of sync
+// with the ledger it claims to cover (task spec's own "never an event
+// without its digest step, never a digest step without its event").
+func (q *Queries) AdvanceLedgerDigestState(ctx context.Context, arg AdvanceLedgerDigestStateParams) error {
+	_, err := q.db.ExecContext(ctx, advanceLedgerDigestState, arg.LastEventID, arg.Digest)
+	return err
+}
+
 const claimOutboxRow = `-- name: ClaimOutboxRow :execrows
 UPDATE outbox
 SET lease_until = ?, attempts = attempts + 1
@@ -258,6 +279,53 @@ func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeB
 		&i.Meta,
 		&i.CreatedAt,
 	)
+	return i, err
+}
+
+const getLatestAnchorLog = `-- name: GetLatestAnchorLog :one
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+ORDER BY id DESC
+LIMIT 1
+`
+
+// The most recent anchor_log row of ANY status - push.go's
+// claimPendingRow uses this to decide whether there is already an
+// in-flight 'pending' row to retry (offline case, task spec step 5) before
+// ever considering a new one.
+func (q *Queries) GetLatestAnchorLog(ctx context.Context) (AnchorLog, error) {
+	row := q.db.QueryRowContext(ctx, getLatestAnchorLog)
+	var i AnchorLog
+	err := row.Scan(
+		&i.ID,
+		&i.EventID,
+		&i.DigestHex,
+		&i.AnchoredAt,
+		&i.RemoteRef,
+		&i.Status,
+	)
+	return i, err
+}
+
+const getLedgerDigestState = `-- name: GetLedgerDigestState :one
+
+SELECT id, last_event_id, digest FROM ledger_digest_state WHERE id = 1
+`
+
+// W4-05 (ledger external anchor + tamper detection) queries below. See
+// migrations/0010_ledger_anchor.sql for the schema.
+//
+// ledger_digest_state queries: kahyad/internal/store.InsertEventWithDigest
+// (the ONE choke point that appends a row to events - see its own doc
+// comment for why it is the only caller of GetLedgerDigestState/
+// AdvanceLedgerDigestState) is the only writer; kahyad/internal/anchor's
+// push.go (to learn what to anchor next) and verify.go (as a bonus
+// cross-check against its own from-genesis recompute) are read-only
+// callers.
+func (q *Queries) GetLedgerDigestState(ctx context.Context) (LedgerDigestState, error) {
+	row := q.db.QueryRowContext(ctx, getLedgerDigestState)
+	var i LedgerDigestState
+	err := row.Scan(&i.ID, &i.LastEventID, &i.Digest)
 	return i, err
 }
 
@@ -571,6 +639,47 @@ func (q *Queries) IncrementTaskAttempts(ctx context.Context, arg IncrementTaskAt
 	var attempts int64
 	err := row.Scan(&attempts)
 	return attempts, err
+}
+
+const insertAnchorLog = `-- name: InsertAnchorLog :one
+
+INSERT INTO anchor_log (event_id, digest_hex, anchored_at, remote_ref, status)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status
+`
+
+type InsertAnchorLogParams struct {
+	EventID    int64          `json:"event_id"`
+	DigestHex  string         `json:"digest_hex"`
+	AnchoredAt string         `json:"anchored_at"`
+	RemoteRef  sql.NullString `json:"remote_ref"`
+	Status     string         `json:"status"`
+}
+
+// anchor_log queries: kahyad/internal/anchor/push.go is the only writer
+// (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+// status is always 'pending' at insert time (task spec step 3: "insert
+// anchor_log row pending" BEFORE the git push is even attempted) - the
+// caller passes the literal string, never a variable, so this file has
+// exactly one place that ever creates a 'pending' row.
+func (q *Queries) InsertAnchorLog(ctx context.Context, arg InsertAnchorLogParams) (AnchorLog, error) {
+	row := q.db.QueryRowContext(ctx, insertAnchorLog,
+		arg.EventID,
+		arg.DigestHex,
+		arg.AnchoredAt,
+		arg.RemoteRef,
+		arg.Status,
+	)
+	var i AnchorLog
+	err := row.Scan(
+		&i.ID,
+		&i.EventID,
+		&i.DigestHex,
+		&i.AnchoredAt,
+		&i.RemoteRef,
+		&i.Status,
+	)
+	return i, err
 }
 
 const insertApprovalToken = `-- name: InsertApprovalToken :exec
@@ -1073,6 +1182,85 @@ func (q *Queries) ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiv
 	return items, nil
 }
 
+const listAllEvents = `-- name: ListAllEvents :many
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+ORDER BY id ASC
+`
+
+// Every ledger event ever appended, oldest first - verify.go's own
+// full-recompute pass (task spec step 6: "recompute the digest from event
+// 1 upward"; "Full recompute is fine at MVP scale ... do not optimize").
+func (q *Queries) ListAllEvents(ctx context.Context) ([]Event, error) {
+	rows, err := q.db.QueryContext(ctx, listAllEvents)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.Ts,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAnchorLogs = `-- name: ListAnchorLogs :many
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+ORDER BY event_id ASC
+`
+
+// Every anchor_log row ordered by the ledger position it anchors -
+// verify.go's own recompute-from-event-1 pass uses this as its ordered
+// checkpoint list (task spec step 6: "at each anchor_log/remote anchor
+// line, compare").
+func (q *Queries) ListAnchorLogs(ctx context.Context) ([]AnchorLog, error) {
+	rows, err := q.db.QueryContext(ctx, listAnchorLogs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AnchorLog{}
+	for rows.Next() {
+		var i AnchorLog
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventID,
+			&i.DigestHex,
+			&i.AnchoredAt,
+			&i.RemoteRef,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutonomyState = `-- name: ListAutonomyState :many
 SELECT tool, class, scope, level, consecutive_approvals, updated_at
 FROM autonomy_state
@@ -1360,6 +1548,46 @@ func (q *Queries) ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 	return items, nil
 }
 
+const listPendingAnchorLogs = `-- name: ListPendingAnchorLogs :many
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+FROM anchor_log
+WHERE status = 'pending'
+ORDER BY id ASC
+`
+
+// Every not-yet-pushed anchor_log row, oldest first - push.go's
+// stale-pending alarm (task spec step 5: "if the oldest pending is older
+// than 2 x interval_hours, alarm") reads index [0].
+func (q *Queries) ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingAnchorLogs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AnchorLog{}
+	for rows.Next() {
+		var i AnchorLog
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventID,
+			&i.DigestHex,
+			&i.AnchoredAt,
+			&i.RemoteRef,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReceiptlessToolCalls = `-- name: ListReceiptlessToolCalls :many
 SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
 FROM tool_calls
@@ -1500,6 +1728,25 @@ func (q *Queries) ListUnconsumedPendingApprovals(ctx context.Context) ([]Pending
 		return nil, err
 	}
 	return items, nil
+}
+
+const markAnchorPushed = `-- name: MarkAnchorPushed :exec
+UPDATE anchor_log
+SET status = 'pushed', remote_ref = ?
+WHERE id = ?
+`
+
+type MarkAnchorPushedParams struct {
+	RemoteRef sql.NullString `json:"remote_ref"`
+	ID        int64          `json:"id"`
+}
+
+// The ONLY statement that ever flips a row from 'pending' to 'pushed' -
+// called once the git push has actually landed on the remote (task spec
+// step 3: "On success mark pushed").
+func (q *Queries) MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error {
+	_, err := q.db.ExecContext(ctx, markAnchorPushed, arg.RemoteRef, arg.ID)
+	return err
 }
 
 const markEpisodeDeleted = `-- name: MarkEpisodeDeleted :exec

@@ -124,6 +124,18 @@ func TestLoadDefaults(t *testing.T) {
 	if want := filepath.Join(home, "Kahya", "backups"); cfg.BackupDir != want {
 		t.Errorf("BackupDir = %q, want %q", cfg.BackupDir, want)
 	}
+	// W4-05: anchor.remote/anchor.local_fallback_path unconfigured by
+	// default (genuinely user-dependent); anchor.interval_hours defaults
+	// to 6 (task spec, verbatim).
+	if cfg.AnchorRemote != "" {
+		t.Errorf("AnchorRemote = %q, want empty by default", cfg.AnchorRemote)
+	}
+	if cfg.AnchorIntervalHours != 6 {
+		t.Errorf("AnchorIntervalHours = %d, want 6", cfg.AnchorIntervalHours)
+	}
+	if cfg.AnchorLocalFallbackPath != "" {
+		t.Errorf("AnchorLocalFallbackPath = %q, want empty by default", cfg.AnchorLocalFallbackPath)
+	}
 }
 
 // TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush proves W4-06's own
@@ -305,6 +317,85 @@ func TestLoadFileOverridesTaskRetryW1MaxAuto(t *testing.T) {
 	}
 	if cfg.TaskRetryW1MaxAuto != 5 {
 		t.Errorf("TaskRetryW1MaxAuto = %d, want 5", cfg.TaskRetryW1MaxAuto)
+	}
+}
+
+// TestLoadFileOverridesAnchorKeys proves anchor_remote/anchor_interval_hours/
+// anchor_local_fallback_path are real, independently-overridable
+// config.yaml keys (W4-05) - and that anchor_local_fallback_path is
+// tilde-expanded like every other configured path.
+func TestLoadFileOverridesAnchorKeys(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "anchor_remote: git@example.invalid:kahya/anchor.git\n" +
+		"anchor_interval_hours: 4\n" +
+		"anchor_local_fallback_path: ~/anchor-fallback.log\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AnchorRemote != "git@example.invalid:kahya/anchor.git" {
+		t.Errorf("AnchorRemote = %q, want git@example.invalid:kahya/anchor.git", cfg.AnchorRemote)
+	}
+	if cfg.AnchorIntervalHours != 4 {
+		t.Errorf("AnchorIntervalHours = %d, want 4", cfg.AnchorIntervalHours)
+	}
+	if want := filepath.Join(home, "anchor-fallback.log"); cfg.AnchorLocalFallbackPath != want {
+		t.Errorf("AnchorLocalFallbackPath = %q, want %q", cfg.AnchorLocalFallbackPath, want)
+	}
+}
+
+// TestLoadEnvOverridesAnchorKeys proves the same three keys are also
+// overridable via env vars, taking precedence over a config.yaml value.
+func TestLoadEnvOverridesAnchorKeys(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ANCHOR_REMOTE", "git@example.invalid:kahya/anchor-env.git")
+	t.Setenv("KAHYA_ANCHOR_INTERVAL_HOURS", "12")
+	t.Setenv("KAHYA_ANCHOR_LOCAL_FALLBACK_PATH", "~/anchor-fallback-env.log")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AnchorRemote != "git@example.invalid:kahya/anchor-env.git" {
+		t.Errorf("AnchorRemote = %q, want the env override", cfg.AnchorRemote)
+	}
+	if cfg.AnchorIntervalHours != 12 {
+		t.Errorf("AnchorIntervalHours = %d, want 12", cfg.AnchorIntervalHours)
+	}
+	if want := filepath.Join(home, "anchor-fallback-env.log"); cfg.AnchorLocalFallbackPath != want {
+		t.Errorf("AnchorLocalFallbackPath = %q, want %q", cfg.AnchorLocalFallbackPath, want)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidAnchorIntervalHours proves
+// anchor_interval_hours < 1 fails Load outright (same fail-closed posture
+// as every other validate* check in this package).
+func TestLoadFailsClosedOnInvalidAnchorIntervalHours(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("anchor_interval_hours: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want an error for anchor_interval_hours=0")
 	}
 }
 

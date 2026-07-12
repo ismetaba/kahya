@@ -10,6 +10,12 @@ import (
 )
 
 type Querier interface {
+	// Called ONLY from inside InsertEventWithDigest's own transaction,
+	// immediately after that same transaction's InsertEvent - both writes
+	// commit or roll back together, so the digest can never fall out of sync
+	// with the ledger it claims to cover (task spec's own "never an event
+	// without its digest step, never a digest step without its event").
+	AdvanceLedgerDigestState(ctx context.Context, arg AdvanceLedgerDigestStateParams) error
 	// The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
 	// ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"
 	// pattern elsewhere in this file): only the FIRST dispatcher to run this
@@ -63,6 +69,22 @@ type Querier interface {
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
 	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (Episode, error)
+	// The most recent anchor_log row of ANY status - push.go's
+	// claimPendingRow uses this to decide whether there is already an
+	// in-flight 'pending' row to retry (offline case, task spec step 5) before
+	// ever considering a new one.
+	GetLatestAnchorLog(ctx context.Context) (AnchorLog, error)
+	// W4-05 (ledger external anchor + tamper detection) queries below. See
+	// migrations/0010_ledger_anchor.sql for the schema.
+	//
+	// ledger_digest_state queries: kahyad/internal/store.InsertEventWithDigest
+	// (the ONE choke point that appends a row to events - see its own doc
+	// comment for why it is the only caller of GetLedgerDigestState/
+	// AdvanceLedgerDigestState) is the only writer; kahyad/internal/anchor's
+	// push.go (to learn what to anchor next) and verify.go (as a bonus
+	// cross-check against its own from-genesis recompute) are read-only
+	// callers.
+	GetLedgerDigestState(ctx context.Context) (LedgerDigestState, error)
 	// Idempotent-open lookup (post-security-review amendment): Engine.Check's
 	// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
 	// reuse an already-OPEN window for the same (task_id, tool, trace_id)
@@ -123,6 +145,13 @@ type Querier interface {
 	// resume scan's within-cap W1 receipt-less retry path (which re-dispatches
 	// without any status change, since the task never leaves 'executing').
 	IncrementTaskAttempts(ctx context.Context, arg IncrementTaskAttemptsParams) (int64, error)
+	// anchor_log queries: kahyad/internal/anchor/push.go is the only writer
+	// (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+	// status is always 'pending' at insert time (task spec step 3: "insert
+	// anchor_log row pending" BEFORE the git push is even attempted) - the
+	// caller passes the literal string, never a variable, so this file has
+	// exactly one place that ever creates a 'pending' row.
+	InsertAnchorLog(ctx context.Context, arg InsertAnchorLogParams) (AnchorLog, error)
 	// consumed_at starts NULL (a literal, not a param - see
 	// ConsumeApprovalToken below for the only statement that ever sets it).
 	// class/scope persist the token's REAL bound identity (post-security-
@@ -194,6 +223,15 @@ type Querier interface {
 	InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error)
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
+	// Every ledger event ever appended, oldest first - verify.go's own
+	// full-recompute pass (task spec step 6: "recompute the digest from event
+	// 1 upward"; "Full recompute is fine at MVP scale ... do not optimize").
+	ListAllEvents(ctx context.Context) ([]Event, error)
+	// Every anchor_log row ordered by the ledger position it anchors -
+	// verify.go's own recompute-from-event-1 pass uses this as its ordered
+	// checkpoint list (task spec step 6: "at each anchor_log/remote anchor
+	// line, compare").
+	ListAnchorLogs(ctx context.Context) ([]AnchorLog, error)
 	ListAutonomyState(ctx context.Context) ([]AutonomyState, error)
 	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
 	// Candidate rows for one dispatcher claim pass: not yet delivered,
@@ -220,6 +258,10 @@ type Querier interface {
 	// it).
 	ListExecutingTasks(ctx context.Context) ([]Task, error)
 	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
+	// Every not-yet-pushed anchor_log row, oldest first - push.go's
+	// stale-pending alarm (task spec step 5: "if the oldest pending is older
+	// than 2 x interval_hours, alarm") reads index [0].
+	ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error)
 	// Every tool_calls row for task_id still stuck at 'intent'/'executing' -
 	// i.e. a side-effectful call whose kahyad-side execution was interrupted
 	// (worker died, kahyad crashed) before a receipt (or a failure) was ever
@@ -237,6 +279,10 @@ type Querier interface {
 	// trailing-zero-trimmed fractional seconds do NOT always sort
 	// lexicographically in timestamp order).
 	ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error)
+	// The ONLY statement that ever flips a row from 'pending' to 'pushed' -
+	// called once the git push has actually landed on the remote (task spec
+	// step 3: "On success mark pushed").
+	MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
 	// Terminal success: the re-spawned worker exited 0 (task spec step 7).
 	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error

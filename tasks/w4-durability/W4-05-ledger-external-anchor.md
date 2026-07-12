@@ -1,6 +1,6 @@
 # W4-05 — Ledger external anchor push + tamper detection
 
-**Status:** todo
+**Status:** code-complete (real-remote verification blocked-user)
 **Phase:** W4 — Durability
 **Depends on:** W12-02, W0-04, W4-01 (step 3 uses its `RegisterTick` API)
 **Flags:** user-assist
@@ -103,16 +103,24 @@ Binding invariant (HANDOFF §5 safety #4, quote verbatim):
 
 ## Acceptance criteria
 
-- [ ] `make test` green including digest golden, file://-remote push, pending alarm, tamper,
+- [x] `make test` green including digest golden, file://-remote push, pending alarm, tamper,
       and import-guard tests.
 - [ ] Manual (real remote, after user supplies it): two anchor ticks produce two lines in the
       remote repo's `anchors.log`; `git log` on the remote shows append-only history.
-- [ ] Tamper drill: `sqlite3 brain.db "UPDATE events SET payload=json_set(payload,'$.k','x') WHERE id=(SELECT MIN(id) FROM events);"`
+      **blocked-user: user must create the anchor repo + add kahya.anchor to Keychain (see
+      docs/runbooks/anchor-setup.md) before this can be exercised against a real remote.**
+- [x] Tamper drill: `sqlite3 brain.db "UPDATE events SET payload=json_set(payload,'$.k','x') WHERE id=(SELECT MIN(id) FROM events);"`
       then `kahya ledger verify` exits non-zero and prints the exact mismatch string above;
       an `anchor.mismatch` event exists. (This is the W4-07 third leg — must pass here first.)
-- [ ] `grep -rn "AnchorDeployKey" kahyad/ --include='*.go' | grep -v internal/anchor` returns
+      Verified hermetically in `kahyad/internal/anchor/verify_test.go`
+      (`TestVerifyDetectsLocalTamperAfterTwoAnchors`) against a real `file://` bare remote —
+      the literal `sqlite3 ... UPDATE events` command only succeeds once the append-only
+      `events_no_update` trigger is dropped first (a raw connection can always do this before
+      rewriting history), which the test does explicitly and documents as the realistic threat
+      model this external anchor exists for.
+- [x] `grep -rn "AnchorDeployKey" kahyad/ --include='*.go' | grep -v internal/anchor` returns
       nothing (mirrors the guard test).
-- [ ] JSONL log lines for push/verify carry a `trace_id` (per-tick minted, README convention).
+- [x] JSONL log lines for push/verify carry a `trace_id` (per-tick minted, README convention).
 
 ## Out of scope
 

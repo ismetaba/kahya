@@ -325,6 +325,31 @@ type Config struct {
 	// ~/Kahya/backups/brain-YYYYMMDD.db") — kahyad/internal/backup.
 	// Snapshotter's nightly VACUUM INTO target directory.
 	BackupDir string `yaml:"backup_dir"`
+
+	// --- W4-05 ledger external anchor ---
+
+	// AnchorRemote is `anchor.remote` (task spec, HANDOFF §5 safety #4 ⚑):
+	// the append-only deploy-key git remote kahyad/internal/anchor.Pusher
+	// pushes the running-digest anchor to. Default "" (unconfigured) makes
+	// every anchor push a complete no-op (kahyad/internal/anchor.Pusher.
+	// Run's own doc comment) - this is the ONLY gate main.go needs so
+	// dev/test never pushes to a real remote, mirroring how W4-06 gates
+	// its own real side effects. Genuinely user-dependent (the user must
+	// create the private repo + provision the kahya.anchor Keychain item -
+	// docs/runbooks/anchor-setup.md), so there is no sensible non-empty
+	// default.
+	AnchorRemote string `yaml:"anchor_remote"`
+	// AnchorIntervalHours is `anchor.interval_hours` (task spec default 6):
+	// the cadence kahyad/internal/scheduler.RegisterTick fires
+	// kahyad/internal/anchor.Pusher.Run on. Also the stale-pending alarm's
+	// own unit (task spec step 5: "older than 2 x interval_hours").
+	AnchorIntervalHours int `yaml:"anchor_interval_hours"`
+	// AnchorLocalFallbackPath is `anchor.local_fallback_path` (task spec
+	// step 5, optional): when set, every anchor line is ALSO appended
+	// there with O_APPEND - the different-uid, kernel-enforced
+	// append-only file the docs/runbooks/anchor-setup.md offline-fallback
+	// block describes (`chflags sappnd`). Default "" (disabled).
+	AnchorLocalFallbackPath string `yaml:"anchor_local_fallback_path"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -404,6 +429,9 @@ type fileConfig struct {
 	CloudRetryGiveUpAfter   *string      `yaml:"cloud_retry_give_up_after"`
 	KahyaDir                *string      `yaml:"kahya_dir"`
 	BackupDir               *string      `yaml:"backup_dir"`
+	AnchorRemote            *string      `yaml:"anchor_remote"`
+	AnchorIntervalHours     *int         `yaml:"anchor_interval_hours"`
+	AnchorLocalFallbackPath *string      `yaml:"anchor_local_fallback_path"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -444,6 +472,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateCloudRetry(cfg.CloudRetryMaxInline, cfg.CloudRetryTaskSchedule, cfg.CloudRetryGiveUpAfter); err != nil {
+		return Config{}, err
+	}
+	if err := validateAnchorIntervalHours(cfg.AnchorIntervalHours); err != nil {
 		return Config{}, err
 	}
 
@@ -542,6 +573,11 @@ func defaults(home string) Config {
 			{Name: "backup-nightly", Handler: "backup-nightly", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(30)}},
 			{Name: "memory-push", Handler: "memory-push", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(45)}},
 		},
+
+		// W4-05 ledger external anchor defaults (task spec, verbatim:
+		// interval_hours default 6). AnchorRemote/AnchorLocalFallbackPath
+		// default empty - see their own doc comments.
+		AnchorIntervalHours: 6,
 	}
 }
 
@@ -835,6 +871,15 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.BackupDir != nil {
 		cfg.BackupDir = expandHome(*fc.BackupDir, home)
 	}
+	if fc.AnchorRemote != nil {
+		cfg.AnchorRemote = *fc.AnchorRemote
+	}
+	if fc.AnchorIntervalHours != nil {
+		cfg.AnchorIntervalHours = *fc.AnchorIntervalHours
+	}
+	if fc.AnchorLocalFallbackPath != nil {
+		cfg.AnchorLocalFallbackPath = expandHome(*fc.AnchorLocalFallbackPath, home)
+	}
 }
 
 func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
@@ -907,6 +952,17 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 		if s, err := strconv.Atoi(v); err == nil {
 			cfg.QwenIdleTTLSeconds = s
 		}
+	}
+	if v := os.Getenv("KAHYA_ANCHOR_REMOTE"); v != "" {
+		cfg.AnchorRemote = v
+	}
+	if v := os.Getenv("KAHYA_ANCHOR_INTERVAL_HOURS"); v != "" {
+		if h, err := strconv.Atoi(v); err == nil {
+			cfg.AnchorIntervalHours = h
+		}
+	}
+	if v := os.Getenv("KAHYA_ANCHOR_LOCAL_FALLBACK_PATH"); v != "" {
+		cfg.AnchorLocalFallbackPath = expandHome(v, home)
 	}
 }
 
@@ -994,6 +1050,18 @@ func validateCloudRetry(maxInline int, taskSchedule []string, giveUpAfter string
 	}
 	if _, err := time.ParseDuration(giveUpAfter); err != nil {
 		return fmt.Errorf("config: cloud_retry_give_up_after=%q invalid: %w", giveUpAfter, err)
+	}
+	return nil
+}
+
+// validateAnchorIntervalHours fails Load closed (same posture as every
+// other validate* function above) on anchor_interval_hours < 1 - the W4-05
+// stale-pending alarm's own "2 x interval_hours" threshold (kahyad/
+// internal/anchor.Pusher.checkStalePending) would be meaningless (or
+// divide-by-zero-adjacent) for a non-positive interval.
+func validateAnchorIntervalHours(hours int) error {
+	if hours < 1 {
+		return fmt.Errorf("config: anchor_interval_hours=%d invalid, must be >= 1", hours)
 	}
 	return nil
 }
