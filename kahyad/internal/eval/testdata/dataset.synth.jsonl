@@ -1,0 +1,13 @@
+{"id":"synth-01","query":"evlerimizden en yakını hangisi","lang":"tr","answerable":true,"expected":[{"file":"notes/ev.md","substring":"ev"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-02","query":"doğum günüm ne zaman","lang":"tr","answerable":true,"expected":[{"file":"notes/kisisel.md","substring":"14 Mart"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-03","query":"kız kardeşimin adı nedir","lang":"tr","answerable":true,"expected":[{"file":"people/aile.md","substring":"Elif"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-04","query":"en sevdiğim kahve nedir","lang":"tr","answerable":true,"expected":[{"file":"notes/tercihler.md","substring":"filtre kahve"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-05","query":"arabamın plakası kaç","lang":"tr","answerable":true,"expected":[{"file":"notes/arac.md","substring":"34"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-06","query":"projemin adı ne","lang":"tr","answerable":true,"expected":[{"file":"work/proje.md","substring":"Kâhya"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-07","query":"toplantı saati kaçta","lang":"tr","answerable":true,"expected":[{"file":"work/takvim.md","substring":"15:00"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-08","query":"favorite restoran in Kadıköy","lang":"mixed","answerable":true,"expected":[{"file":"notes/mekanlar.md","substring":"Çiya"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-09","query":"my doktor randevusu date","lang":"mixed","answerable":true,"expected":[{"file":"notes/saglik.md","substring":"20 Nisan"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-10","query":"wifi şifresi at the ofis","lang":"mixed","answerable":true,"expected":[{"file":"work/ofis.md","substring":"parola"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-11","query":"köpeğimin adı ne","lang":"tr","answerable":true,"expected":[{"file":"people/evcil.md","substring":"Boncuk"}],"label_source":"ritual","added_at":"2026-07-12"}
+{"id":"synth-12","query":"Mars gezegenine ne zaman taşınıyorum","lang":"tr","answerable":false,"expected":[{"file":"","substring":"Mars taşınma tarihi"}],"label_source":"manual","added_at":"2026-07-12"}
+{"id":"synth-13","query":"hangi kripto parayı ne zaman satmalıyım","lang":"tr","answerable":false,"expected":[{"file":"","substring":"kesin satış tavsiyesi"}],"label_source":"manual","added_at":"2026-07-12"}

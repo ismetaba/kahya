@@ -20,6 +20,25 @@ import (
 // batchSize is the fixed backfill batch (W12-11 step 3: "batch 32").
 const batchSize = 32
 
+// EventReEmbedRefused is ledgered when a re_embed activation is refused by
+// the W78-01 retrieval eval gate (gate point b: switching the active
+// model_ver requires a green eval recorded for the candidate index state).
+const EventReEmbedRefused = "embed.re_embed_refused"
+
+// reEmbedGate is the W78-01 gate a full re_embed (which activates the active
+// model_ver by re-embedding every chunk and purging stale-version vectors)
+// must pass first. kahyad wires kahyad/internal/eval.EvalGate (via a small
+// main.go adapter that supplies the current dataset_sha256/fusion_sha256) as
+// the production implementation. nil = ungated (the low-level mechanism
+// path used by embed's own tests and any non-activating full=false backfill);
+// production ALWAYS wires it, so a real model_ver switch is fail-closed.
+type reEmbedGate interface {
+	// AllowReEmbedActivation reports whether re-embedding+activating modelVer
+	// is allowed, plus a byte-exact Turkish refusal reason and an English
+	// log-only detail. Fail-closed: any gate error REFUSES.
+	AllowReEmbedActivation(ctx context.Context, modelVer string) (allowed bool, reason, detail string)
+}
+
 // Result is Backfill's return value and the exact shape of the
 // event=embed_backfill ledger payload (W12-11 step 3:
 // "{chunks, model_ver, duration_ms}").
@@ -50,6 +69,16 @@ type Backfiller struct {
 	activeModelVer string
 	log            *logx.Logger
 	events         eventLogger
+	// gate is the optional W78-01 re_embed activation gate (SetReEmbedGate).
+	gate reEmbedGate
+}
+
+// SetReEmbedGate wires the W78-01 gate a full re_embed must pass before it
+// re-embeds+activates the active model_ver (gate point b). Call before
+// Backfill is ever invoked with full=true; a nil gate (the default) leaves
+// re_embed ungated for the low-level mechanism/test path.
+func (b *Backfiller) SetReEmbedGate(gate reEmbedGate) {
+	b.gate = gate
 }
 
 // NewBackfiller constructs a Backfiller. db is kahyad's single brain.db
@@ -72,6 +101,29 @@ func NewBackfiller(db *sql.DB, client batchEmbedder, activeModelVer string, log 
 func (b *Backfiller) Backfill(ctx context.Context, traceID string, full bool) (Result, error) {
 	start := time.Now()
 	log := b.log.With(traceID)
+
+	// W78-01 gate point b: a full re_embed re-embeds every chunk under the
+	// active model_ver and then purges every stale-version vector - that is
+	// the model_ver ACTIVATION. It may proceed only when the retrieval eval
+	// gate is green for the candidate (this model_ver's) index state. On
+	// refusal we touch NO vectors at all: ledger the refusal and return an
+	// error, leaving the existing index exactly as it was (fail-closed).
+	if full && b.gate != nil {
+		allowed, reason, detail := b.gate.AllowReEmbedActivation(ctx, b.activeModelVer)
+		if !allowed {
+			log.Error("embed_re_embed_activation_refused", "model_ver", b.activeModelVer, "reason", detail)
+			if b.events != nil {
+				if lerr := b.events.LogEvent(ctx, traceID, EventReEmbedRefused, map[string]any{
+					"model_ver": b.activeModelVer,
+					"reason":    detail,
+					"reason_tr": reason,
+				}); lerr != nil {
+					log.Warn("embed_re_embed_refused_ledger_error", "err", lerr.Error())
+				}
+			}
+			return Result{}, fmt.Errorf("embed: re_embed activation refused (model_ver=%s): %s", b.activeModelVer, reason)
+		}
+	}
 
 	ids, texts, err := b.selectTargets(ctx, full)
 	if err != nil {

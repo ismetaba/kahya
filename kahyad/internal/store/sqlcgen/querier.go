@@ -467,6 +467,11 @@ type Querier interface {
 	// most one such row per task at any moment, but the scan itself is
 	// defensive about that.
 	ListReceiptlessToolCalls(ctx context.Context, taskID string) ([]ToolCall, error)
+	// W78-01 `kahya eval export-ritual`: every ANSWERED (label IS NOT NULL)
+	// ritual label joined to its fact, newest label first - the draft source
+	// the CLI prints to stdout for MANUAL curation into the private ~/Kahya
+	// retrieval dataset. Read-only; adds no columns, so no migration is needed.
+	ListRitualLabeledFactsForEval(ctx context.Context) ([]ListRitualLabeledFactsForEvalRow, error)
 	// `kahya task show <id>`'s tool_calls listing, oldest attempt first.
 	ListToolCallsByTask(ctx context.Context, taskID string) ([]ToolCall, error)
 	// W3-06 `kahya approvals`: every not-yet-consumed row, oldest first.

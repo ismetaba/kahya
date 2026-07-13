@@ -592,14 +592,81 @@ func runRemembered(client *Client, args []string, stdout, stderr io.Writer) int 
 	return 0
 }
 
-// runEval implements `kahya eval` (W5-05) - currently just the one "mini"
-// subcommand; any other/missing argument prints usage and exits 2.
+// runEval implements `kahya eval` (W5-05 "mini"; W78-01 "retrieval" +
+// "export-ritual"); any other/missing argument prints usage and exits 2.
 func runEval(client *Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) != 1 || args[0] != "mini" {
+	if len(args) != 1 {
 		fmt.Fprintln(stderr, MsgEvalUsage)
 		return 2
 	}
-	return runEvalMini(client, stdout, stderr)
+	switch args[0] {
+	case "mini":
+		return runEvalMini(client, stdout, stderr)
+	case "retrieval":
+		return runEvalRetrieval(client, stdout, stderr)
+	case "export-ritual":
+		return runEvalExportRitual(client, stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgEvalUsage)
+		return 2
+	}
+}
+
+// runEvalRetrieval implements `kahya eval retrieval` (W78-01): POSTs
+// /v1/eval/retrieval (kahyad runs the full retrieval-QA eval against its own
+// memory_search and ledgers the eval.retrieval.result event - this CLI
+// process never opens brain.db itself), prints a Turkish per-item table and a
+// precision summary. Exit code is NON-ZERO when precision < 0.80 (the §5
+// pre-change gate's green threshold, çekimserlik dahil) or on any transport/
+// server error.
+func runEvalRetrieval(client *Client, stdout, stderr io.Writer) int {
+	result, err := client.EvalRetrievalRun(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	for _, it := range result.Items {
+		switch {
+		case it.Correct:
+			fmt.Fprintf(stdout, MsgEvalRetrievalCorrect+"\n", it.ID)
+		case it.Abstained:
+			fmt.Fprintf(stdout, MsgEvalRetrievalAbstained+"\n", it.ID)
+		default:
+			fmt.Fprintf(stdout, MsgEvalRetrievalWrong+"\n", it.ID)
+		}
+	}
+	fmt.Fprintf(stdout, MsgEvalRetrievalSummary+"\n", result.Precision*100, result.Correct, result.Total)
+
+	if result.Precision < 0.80 {
+		fmt.Fprintln(stdout, MsgEvalRetrievalBelowThreshold)
+		return 1
+	}
+	fmt.Fprintln(stdout, MsgEvalRetrievalGreen)
+	return 0
+}
+
+// runEvalExportRitual implements `kahya eval export-ritual` (W78-01): POSTs
+// /v1/eval/export-ritual and prints the drafted candidate JSONL lines to
+// stdout, one per line, for MANUAL curation into the private ~/Kahya dataset.
+// It NEVER writes a file. A header/footer go to stderr so the stdout stream
+// stays pure JSONL (pipeable straight into an editor/`>> dataset.jsonl` by
+// the user, never by kahya).
+func runEvalExportRitual(client *Client, stdout, stderr io.Writer) int {
+	result, err := client.EvalExportRitual(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if len(result.Lines) == 0 {
+		fmt.Fprintln(stderr, MsgEvalExportRitualEmpty)
+		return 0
+	}
+	fmt.Fprintf(stderr, MsgEvalExportRitualHeader+"\n", len(result.Lines))
+	for _, line := range result.Lines {
+		fmt.Fprintln(stdout, line)
+	}
+	return 0
 }
 
 // runEvalMini implements `kahya eval mini`: POSTs /v1/eval/mini/run (kahyad

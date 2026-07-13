@@ -1,6 +1,6 @@
 # W78-01 — Retrieval QA eval set + pre-change gate
 
-**Status:** todo
+**Status:** done (runner/scorer/gate code + hermetic tests + all 3 gate wirings); the real ~50-item `~/Kahya/eval/retrieval/dataset.jsonl` (needs the user's real memory + W5-03 ritual labels) and the live `make eval-retrieval` ≥80% drill are user-assist runtime, deferred exactly like the W5-05/W6 live drills.
 **Phase:** W7–8 — Hardening + eval
 **Depends on:** W5-05, W12-11
 **Flags:** none
@@ -63,15 +63,18 @@ precision = correct / total ≥ 0.80.
 
 ## Acceptance criteria
 
-- [ ] `wc -l ~/Kahya/eval/retrieval/dataset.jsonl` ≥ 45; `jq -s '[.[]|select(.answerable==false)]|length' ~/Kahya/eval/retrieval/dataset.jsonl` ≥ 5; ≥10 items with `lang=="mixed"`; the dataset is committed to the `~/Kahya` repo, and the code repo contains only the synthetic `testdata/` fixture dataset (no real-memory content).
-- [ ] `make eval-retrieval` exits 0 and prints `precision` ≥ 0.80 (çekimserlik dahil, semantics above) against the seeded live corpus.
-- [ ] `sqlite3 ~/Library/Application\ Support/Kahya/brain.db "SELECT type FROM events WHERE type='eval.retrieval.result' ORDER BY id DESC LIMIT 1"` returns a row after a run; payload contains `precision`, `dataset_sha256`, `model_ver`, `fusion_sha256`, `trace_id`.
-- [ ] Gate test in `make test`: with no green eval event, a stale (>24h) green event, or a mismatched `dataset_sha256`/`fusion_sha256`, the consolidation auto-commit path returns the Turkish refusal string above and a ledger event; with a fresh matching green event it proceeds (fixture).
-- [ ] Gate test in `make test`: `model_ver` switch refused without a green eval run recorded for the candidate index state.
-- [ ] Gate test in `make test`: activating a changed fusion config whose `fusion_sha256` has no green eval result is refused (fixture).
-- [ ] The eval executes inside kahyad via `POST /eval/retrieval` over the UDS; a test (or build-level assertion) proves the `kahya eval ...` subcommands contain no direct sqlite access to brain.db.
-- [ ] Runner test proves eval queries traverse the same function as `<hafiza>` injection search (e.g. both call one exported `Search()`; asserted by test, not by comment).
-- [ ] `make test` and `make lint` green.
+- [~] `wc -l ~/Kahya/eval/retrieval/dataset.jsonl` ≥ 45 … : USER-ASSIST RUNTIME — the real ≥45-item dataset is derived from the user's real memory + W5-03 ritual labels and lives in the private `~/Kahya` repo, so it cannot be authored here. The code repo ships only the synthetic `kahyad/internal/eval/testdata/dataset.synth.jsonl` fixture (13 items, ≥2 unanswerable, ≥3 mixed-lang, byte-exact Turkish, no real-memory content) — verified by `TestLoadRetrievalDatasetSynth`. `kahya eval export-ritual` drafts real items from ritual labels for the user to curate.
+- [~] `make eval-retrieval` exits 0 and prints `precision` ≥ 0.80 against the seeded live corpus: USER-ASSIST RUNTIME (needs the user's live corpus + daemon). `make eval-retrieval` target added; the runner/scorer LOGIC (precision incl. abstention) is proven hermetically by the eval-package tests (a green synthetic run scores 1.0; a poisoned unanswerable item drops precision — `TestRetrievalRunnerUnanswerableFalsePositiveDropsPrecision`).
+- [x] The eval ledgers an `eval.retrieval.result` event (kind, not `type`) after a run; payload contains `precision`, `total`, `correct`, `dataset_sha256`, `model_ver`, `fusion_sha256`, `trace_id` — `TestRetrievalRunnerGreenRunLedgersResult`.
+- [x] Gate test in `make test`: with no green eval event, a stale (>24h) event, a red event, or a mismatched `dataset_sha256`/`model_ver`/`fusion_sha256`, the auto-commit gate returns the byte-exact Turkish refusal `"retrieval eval kapısı yeşil değil — önce 'kahya eval retrieval' çalıştır"` + a ledger event; a fresh matching green event proceeds. Gate-check error / nil reader / preflight error all fail closed. (`TestGateRefuses*`, `TestRunAutoCommit*` incl. `PreflightIdentityUsedByGate`/`PreflightErrorFailsClosed`.)
+- [x] Gate test in `make test`: `model_ver` re-embed activation refused without a green candidate run (`TestReEmbedGateRefusesWithoutGreenCandidate`; wired in `embed.Backfiller.Backfill` before any vector write).
+- [x] Gate test in `make test`: activating a changed fusion config whose `fusion_sha256` has no green result is refused (`TestFusionActivationGateRefusesUnknownFusionSHA`; `search.Searcher.ActivateFusionConfig` is the guarded seam — the boot-literal fusion config has no other runtime activation point, documented).
+- [x] The eval runs inside kahyad via `POST /v1/eval/retrieval` over the UDS; `kahyad/cmd/kahya/import_guard_test.go` proves the CLI package imports no `database/sql`/`mattn/go-sqlite3`/store/sqlcgen.
+- [x] Runner test proves eval queries traverse the same function as `<hafiza>` injection search — `var _ RetrievalSearcher = (*search.Searcher)(nil)` + `retrieval_samepath_test.go` assert both go through the one concrete `*search.Searcher.Search` (compile-level, not a comment).
+- [x] `make test` and `make lint` green (97 python + full Go incl. `kahyad/internal/eval`; sqlcgen regen committed).
+
+### Note on abstention scoring (design decision, resolved during review)
+The task assumed retrieval applies "an injection threshold"; it does not — the live `<hafiza>` chunk path filters by tier eligibility then injects the top-K (`memory.RenderKept`, no numeric floor), and the fused `search.Hit.Score` is min-max normalized per query (the nearest vector neighbour is always ~1.0). A floor on that normalized score therefore can never detect abstention in the production hybrid config. So the eval scores abstention **faithfully to what actually gets injected**: the injected set is the tier-eligible top-K (no floor), and an item is correct iff its expected evidence appears (answerable) / does NOT appear (unanswerable, whose `expected` names the corpus-absent answer to guard against). A relevance-calibrated absolute-score floor for the hybrid path is future reranker work (§8, "only if eval precision falls short").
 
 ## Out of scope
 

@@ -29,10 +29,13 @@ type EventLogger interface {
 // package-local shape (never kahyad/internal/store/sqlcgen.Event directly)
 // so this package's own tests can inject a trivial in-memory fake with no
 // brain.db dependency at all (mirrors kahyad/internal/consolidation's
-// identical EventRow).
+// identical EventRow). CreatedAt is the RFC3339 ledger timestamp - the mini
+// runner ignores it, but W78-01's EvalGate needs it to enforce the "no
+// older than 24h" freshness window (gate.go).
 type EventRow struct {
-	ID      int64
-	Payload string
+	ID        int64
+	Payload   string
+	CreatedAt string
 }
 
 // EventReader is the append-only ledger's read seam this package needs.
@@ -56,7 +59,7 @@ func (r StoreEventReader) ListEventsByKind(ctx context.Context, kind string) ([]
 	}
 	out := make([]EventRow, len(rows))
 	for i, row := range rows {
-		out[i] = EventRow{ID: row.ID, Payload: row.Payload}
+		out[i] = EventRow{ID: row.ID, Payload: row.Payload, CreatedAt: row.CreatedAt}
 	}
 	return out, nil
 }

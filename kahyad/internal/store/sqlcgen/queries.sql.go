@@ -2715,6 +2715,57 @@ func (q *Queries) ListReceiptlessToolCalls(ctx context.Context, taskID string) (
 	return items, nil
 }
 
+const listRitualLabeledFactsForEval = `-- name: ListRitualLabeledFactsForEval :many
+SELECT el.fact_id, el.label, el.question_text, f.subject, f.predicate, f.object
+FROM eval_labels el
+JOIN facts f ON f.id = el.fact_id
+WHERE el.label IS NOT NULL
+ORDER BY el.answered_at DESC, el.id DESC
+`
+
+type ListRitualLabeledFactsForEvalRow struct {
+	FactID       int64          `json:"fact_id"`
+	Label        sql.NullString `json:"label"`
+	QuestionText string         `json:"question_text"`
+	Subject      string         `json:"subject"`
+	Predicate    string         `json:"predicate"`
+	Object       string         `json:"object"`
+}
+
+// W78-01 `kahya eval export-ritual`: every ANSWERED (label IS NOT NULL)
+// ritual label joined to its fact, newest label first - the draft source
+// the CLI prints to stdout for MANUAL curation into the private ~/Kahya
+// retrieval dataset. Read-only; adds no columns, so no migration is needed.
+func (q *Queries) ListRitualLabeledFactsForEval(ctx context.Context) ([]ListRitualLabeledFactsForEvalRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRitualLabeledFactsForEval)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRitualLabeledFactsForEvalRow{}
+	for rows.Next() {
+		var i ListRitualLabeledFactsForEvalRow
+		if err := rows.Scan(
+			&i.FactID,
+			&i.Label,
+			&i.QuestionText,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listToolCallsByTask = `-- name: ListToolCallsByTask :many
 SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
 FROM tool_calls

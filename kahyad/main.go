@@ -299,6 +299,25 @@ func run() int {
 	searcher.SetEmbedder(embedClient, cfg.ActiveEmbedModelVer)
 	srv.SetSearcher(searcher)
 
+	// W78-01: the retrieval-eval pre-change gate (§5-Memory-#5). It reads
+	// eval.retrieval.result events from the SAME ledger every other gate does
+	// and is shared by all three gated points below (consolidation
+	// auto-commit, re_embed activation, and the fusion-activation seam). The
+	// current index state it matches a green result against is (dataset_sha256
+	// of the retrieval dataset file, cfg.ActiveEmbedModelVer, and the active
+	// fusion config's FusionConfigSHA256). The dataset file lives in the
+	// PRIVATE ~/Kahya repo and may be absent on a fresh install - an empty
+	// dataset_sha256 then never matches a recorded green event, keeping every
+	// gate fail-closed until the real dataset + a green run exist.
+	fusionSHA := searcher.FusionConfigSHA256()
+	retrievalDatasetSHA := ""
+	if ds, dsErr := eval.LoadRetrievalDataset(cfg.EvalRetrievalDatasetPath); dsErr != nil {
+		log.Warn("eval_retrieval_dataset_unavailable", "path", cfg.EvalRetrievalDatasetPath, "err", dsErr.Error())
+	} else {
+		retrievalDatasetSHA = ds.SHA256
+	}
+	evalGate := eval.EvalGate{Reader: eval.StoreEventReader{Q: st.Queries}}
+
 	// /v1/reindex (W12-04 step 5; W12-11 steps 3/5 add the vector
 	// backfill/re_embed pass). idx is shared between this route and the
 	// boot-time incremental reindex kicked off just below, so its internal
@@ -312,6 +331,16 @@ func run() int {
 	// lockstep with chunks - see kahyad/internal/embed's package doc.
 	idx := indexer.New(st.DB(), cfg.MemoryDir, log)
 	backfiller := embed.NewBackfiller(st.DB(), embedClient, cfg.ActiveEmbedModelVer, log, st)
+	// W78-01 gate point b: a full re_embed (which activates the active
+	// model_ver) must pass the retrieval eval gate first - fail-closed via
+	// the ReEmbedGateAdapter, which reloads the dataset each check so the
+	// dataset_sha256 always reflects the file on disk at activation time.
+	backfiller.SetReEmbedGate(eval.ReEmbedGateAdapter{
+		Gate:         evalGate,
+		DatasetPath:  cfg.EvalRetrievalDatasetPath,
+		FusionSHA256: fusionSHA,
+		MaxAge:       consolidation.DefaultEvalGateMaxAge,
+	})
 	reindexBackfiller := embed.NewReindexBackfiller(idx, backfiller, log)
 	srv.SetReindexer(reindexBackfiller)
 
@@ -880,6 +909,12 @@ func run() int {
 			MemoryDir:       cfg.MemoryDir,
 			SecretLaneGlobs: pol.SecretLaneGlobs,
 			AutoCommit:      cfg.ConsolidationAutoCommit,
+			// W78-01 gate point a: the current index state the auto-commit
+			// gate matches a green eval.retrieval.result against.
+			EvalDatasetSHA256: retrievalDatasetSHA,
+			EvalModelVer:      cfg.ActiveEmbedModelVer,
+			EvalFusionSHA256:  fusionSHA,
+			EvalGateMaxAge:    consolidation.DefaultEvalGateMaxAge,
 		},
 		Git: backup.NewExecGitRunner(),
 		Cloud: consolidation.CloudSession{Spawner: consolidation.ProcessSpawner{
@@ -897,6 +932,7 @@ func run() int {
 		Reindexer:   reindexBackfiller,
 		Pusher:      pusher,
 		HotWindow:   consolidation.StoreFactWriter{Q: st.Queries, Engine: factEngine},
+		Gate:        evalGate,
 		Log:         log,
 	}
 	sched.RegisterHandler("nightly-consolidation", func(ctx context.Context) error {
@@ -928,6 +964,39 @@ func run() int {
 		EventReader: eval.StoreEventReader{Q: st.Queries},
 	}
 	srv.SetEvalMiniRunner(evalRunner)
+
+	// W78-01: `kahya eval retrieval` (/v1/eval/retrieval) - the full ~50-item
+	// retrieval-QA eval, and `kahya eval export-ritual` (/v1/eval/export-ritual)
+	// - the ritual-label draft source. The retrieval runner takes the SAME
+	// *search.Searcher value /v1/memory/search and <hafiza> injection call,
+	// directly (no adapter - eval.RetrievalSearcher is satisfied by
+	// *search.Searcher.Search), so the eval scores exactly the injection code
+	// path. It records the same fusion_sha256/model_ver the gates above match.
+	retrievalRunner := &eval.RetrievalRunner{
+		DatasetPath:  cfg.EvalRetrievalDatasetPath,
+		ModelVer:     cfg.ActiveEmbedModelVer,
+		FusionSHA256: fusionSHA,
+		Searcher:     searcher,
+		EventLogger:  st,
+	}
+	ritualExporter := &eval.RitualExporter{Reader: eval.StoreRitualLabelReader{Q: st.Queries}}
+	srv.SetEvalRetrievalRunner(retrievalRunner, ritualExporter)
+
+	// W78-01 deliverable: the nightly consolidation runs the retrieval eval as
+	// its FIRST step, so the auto-commit gate self-produces the fresh green
+	// result it requires (instead of depending on an out-of-band manual `kahya
+	// eval retrieval`). The preflight returns the EXACT identity the run just
+	// ledgered - dataset_sha256 reloaded from the current file (so a dataset
+	// edit after boot is honored without a restart), model_ver/fusion_sha256
+	// the boot-stable values a runtime change can't move - which the gate then
+	// matches. A run error is fail-closed (auto-commit refused).
+	consolidator.EvalPreflight = func(ctx context.Context, traceID string) (string, string, string, error) {
+		out, err := retrievalRunner.Run(ctx, traceID)
+		if err != nil {
+			return "", "", "", err
+		}
+		return out.DatasetSHA256, out.ModelVer, out.FusionSHA256, nil
+	}
 
 	// W5-03: the Sunday 18:00 weekly truth ritual - `kahya job run
 	// truth-ritual` (manual trigger) and the launchd-scheduled run both

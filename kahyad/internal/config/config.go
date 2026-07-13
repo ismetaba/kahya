@@ -98,6 +98,15 @@ type Config struct {
 	// config.yaml's eval_mini_baseline_path key or KAHYA_EVAL_MINI_BASELINE_PATH.
 	EvalMiniBaselinePath string `yaml:"eval_mini_baseline_path"`
 
+	// EvalRetrievalDatasetPath is the absolute path to the W78-01 full
+	// retrieval-QA dataset (~50 items) `kahya eval retrieval` runs against
+	// memory_search. The REAL dataset lives in the PRIVATE ~/Kahya memory
+	// repo (it is derived from the user's real memory + W5-03 ritual labels,
+	// so it must never be committed to this code repo). Defaults to
+	// "<KahyaDir>/eval/retrieval/dataset.jsonl". Override via config.yaml's
+	// eval_retrieval_dataset_path key or KAHYA_EVAL_RETRIEVAL_DATASET_PATH.
+	EvalRetrievalDatasetPath string `yaml:"eval_retrieval_dataset_path"`
+
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
 	// passes through (HANDOFF S5 safety #1). Default 3128 (the
@@ -553,6 +562,7 @@ type fileConfig struct {
 	MCPBridgePath                 *string      `yaml:"mcp_bridge_path"`
 	PolicyPath                    *string      `yaml:"policy_path"`
 	EvalMiniBaselinePath          *string      `yaml:"eval_mini_baseline_path"`
+	EvalRetrievalDatasetPath      *string      `yaml:"eval_retrieval_dataset_path"`
 	EgressPort                    *int         `yaml:"egress_port"`
 	DockerImageTag                *string      `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string      `yaml:"docker_image_digest_path"`
@@ -817,28 +827,29 @@ func defaults(home, env string) Config {
 	dataDir := filepath.Join(home, "Library", "Application Support", dataDirName)
 	kahyaDir := filepath.Join(home, kahyaDirName)
 	return Config{
-		DataDir:                 dataDir,
-		Socket:                  filepath.Join(dataDir, socketFileName(env)),
-		LogDir:                  filepath.Join(dataDir, "logs"),
-		DBPath:                  filepath.Join(dataDir, "brain.db"),
-		MemoryDir:               filepath.Join(kahyaDir, "memory"),
-		AnthropicUpstreamURL:    "https://api.anthropic.com",
-		EmbedPort:               8092,
-		DefaultModel:            "claude-sonnet-5",
-		TaskTimeoutMin:          30,
-		ActiveEmbedModelVer:     "qwen3-embedding-0.6b:512:v1",
-		LogLevel:                "info",
-		UndoWindowSeconds:       300,
-		Env:                     env,
-		WorkerCmd:               defaultWorkerCmd(),
-		EmbedCmd:                defaultEmbedCmd(),
-		MCPBridgePath:           defaultMCPBridgePath(),
-		PolicyPath:              defaultPolicyPath(),
-		EvalMiniBaselinePath:    defaultEvalMiniBaselinePath(),
-		EgressPort:              3128,
-		DockerImageTag:          "kahya-sandbox:0.1.0",
-		DockerImageDigestPath:   defaultDockerImageDigestPath(),
-		EgressSidecarDigestPath: defaultEgressSidecarDigestPath(),
+		DataDir:                  dataDir,
+		Socket:                   filepath.Join(dataDir, socketFileName(env)),
+		LogDir:                   filepath.Join(dataDir, "logs"),
+		DBPath:                   filepath.Join(dataDir, "brain.db"),
+		MemoryDir:                filepath.Join(kahyaDir, "memory"),
+		EvalRetrievalDatasetPath: filepath.Join(kahyaDir, "eval", "retrieval", "dataset.jsonl"),
+		AnthropicUpstreamURL:     "https://api.anthropic.com",
+		EmbedPort:                8092,
+		DefaultModel:             "claude-sonnet-5",
+		TaskTimeoutMin:           30,
+		ActiveEmbedModelVer:      "qwen3-embedding-0.6b:512:v1",
+		LogLevel:                 "info",
+		UndoWindowSeconds:        300,
+		Env:                      env,
+		WorkerCmd:                defaultWorkerCmd(),
+		EmbedCmd:                 defaultEmbedCmd(),
+		MCPBridgePath:            defaultMCPBridgePath(),
+		PolicyPath:               defaultPolicyPath(),
+		EvalMiniBaselinePath:     defaultEvalMiniBaselinePath(),
+		EgressPort:               3128,
+		DockerImageTag:           "kahya-sandbox:0.1.0",
+		DockerImageDigestPath:    defaultDockerImageDigestPath(),
+		EgressSidecarDigestPath:  defaultEgressSidecarDigestPath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -1221,6 +1232,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.EvalMiniBaselinePath != nil {
 		cfg.EvalMiniBaselinePath = expandHome(*fc.EvalMiniBaselinePath, home)
 	}
+	if fc.EvalRetrievalDatasetPath != nil {
+		cfg.EvalRetrievalDatasetPath = expandHome(*fc.EvalRetrievalDatasetPath, home)
+	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort
 	}
@@ -1397,6 +1411,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_EVAL_MINI_BASELINE_PATH"); v != "" {
 		cfg.EvalMiniBaselinePath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_EVAL_RETRIEVAL_DATASET_PATH"); v != "" {
+		cfg.EvalRetrievalDatasetPath = expandHome(v, home)
 	}
 	if v := os.Getenv("KAHYA_EGRESS_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {

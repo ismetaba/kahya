@@ -1058,3 +1058,14 @@ SELECT count(*) FROM eval_labels WHERE trace_id = ? AND answered_at IS NULL;
 SELECT fact_id, MAX(asked_at) AS last_asked_at
 FROM eval_labels
 GROUP BY fact_id;
+
+-- name: ListRitualLabeledFactsForEval :many
+-- W78-01 `kahya eval export-ritual`: every ANSWERED (label IS NOT NULL)
+-- ritual label joined to its fact, newest label first - the draft source
+-- the CLI prints to stdout for MANUAL curation into the private ~/Kahya
+-- retrieval dataset. Read-only; adds no columns, so no migration is needed.
+SELECT el.fact_id, el.label, el.question_text, f.subject, f.predicate, f.object
+FROM eval_labels el
+JOIN facts f ON f.id = el.fact_id
+WHERE el.label IS NOT NULL
+ORDER BY el.answered_at DESC, el.id DESC;

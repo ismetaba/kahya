@@ -266,6 +266,13 @@ type Server struct {
 	// dependency" convention as consolidation/factEngine above.
 	evalMini EvalMiniRunner
 
+	// evalRetrieval wires POST /v1/eval/retrieval and evalRitualExporter
+	// wires POST /v1/eval/export-ritual (W78-01, evalretrieval.go's own doc
+	// comment); nil until SetEvalRetrievalRunner is called - same "unwired
+	// dependency" convention as evalMini above.
+	evalRetrieval      EvalRetrievalRunner
+	evalRitualExporter EvalRitualExporter
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -393,6 +400,8 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/consolidation/approve", s.handleConsolidationApprove)
 	mux.HandleFunc("/v1/consolidation/reject", s.handleConsolidationReject)
 	mux.HandleFunc("/v1/eval/mini/run", s.handleEvalMiniRun)
+	mux.HandleFunc("/v1/eval/retrieval", s.handleEvalRetrievalRun)
+	mux.HandleFunc("/v1/eval/export-ritual", s.handleEvalExportRitual)
 	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
 	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)

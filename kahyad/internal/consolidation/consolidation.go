@@ -2,8 +2,11 @@
 // (HANDOFF §6 W5 ⚑, §5 memory #4): a nightly (03:00) run that merges/
 // organizes ~/Kahya/memory/*.md and git-commits the result under strict
 // commit discipline - suggestion mode (diff + `kahya consolidation
-// approve`) for the first 2 weeks, auto-commit only once the W7 mini-eval
-// is green (W78-01's eval.mini.pass ledger event).
+// approve`) for the first 2 weeks, auto-commit only once the W78-01
+// retrieval eval gate is green: a fresh (<=24h) eval.retrieval.result event
+// with precision >= 0.80 whose dataset_sha256/model_ver/fusion_sha256 match
+// the current index+dataset (RetrievalGate/autoCommitAllowed; the nightly run
+// produces that result itself via EvalPreflight).
 //
 // Package layout:
 //   - consolidation.go (this file): the orchestrator, Run/Approve/Reject/
@@ -37,21 +40,28 @@ import (
 	"kahya/kahyad/internal/mlx"
 )
 
-// EventEvalMiniPass is the ledger event kind W78-01's mini-eval writes on
-// a green run - the auto-commit guard's own lookback target.
-const EventEvalMiniPass = "eval.mini.pass"
-
 // EventAutoCommitRefused is ledgered whenever consolidation.auto_commit is
-// configured true but the runtime guard refuses it (no qualifying
-// eval.mini.pass event in the last EvalMiniPassLookbackDays) - task spec
+// configured true but the runtime guard refuses it (the W78-01 retrieval
+// eval gate is not green for the current index state) - task spec
 // acceptance criterion: "kahyad logs an error and stays in suggestion
-// mode".
+// mode". The payload carries the byte-exact Turkish refusal reason.
 const EventAutoCommitRefused = "consolidation.auto_commit_refused"
 
-// EvalMiniPassLookbackDays bounds how recent an eval.mini.pass event must
-// be for consolidation.auto_commit:true to actually take effect (task
-// spec: "exists in the last 30 days").
-const EvalMiniPassLookbackDays = 30
+// evalGateRefusalReasonTR is the byte-exact Turkish refusal ledgered when
+// the auto-commit gate cannot even be consulted (no gate wired - a fail-
+// closed wiring bug). It MUST stay byte-identical to
+// kahyad/internal/eval.GateRefusalReason; the gate itself returns that same
+// string on every ordinary (no/stale/red/mismatched) refusal, so this
+// literal is only reached on the nil-gate path. This package deliberately
+// does not import kahyad/internal/eval (it already refers to that package's
+// event kinds by string, never by import), so the string is duplicated here
+// with this note rather than referenced.
+const evalGateRefusalReasonTR = "retrieval eval kapısı yeşil değil — önce 'kahya eval retrieval' çalıştır"
+
+// DefaultEvalGateMaxAge is the freshness window a green eval.retrieval.result
+// must fall within for auto-commit to proceed (task spec: "no older than
+// 24h") - used when Config.EvalGateMaxAge is unset.
+const DefaultEvalGateMaxAge = 24 * time.Hour
 
 // ErrNoPending is returned by Approve/Reject/Show when no consolidation
 // suggestion is currently outstanding.
@@ -83,6 +93,20 @@ type Pusher interface {
 	Run(ctx context.Context, traceID string) error
 }
 
+// RetrievalGate is the W78-01 pre-change gate the auto-commit decision now
+// consults (replacing the old eval.mini.pass 30-day lookback): auto-commit
+// proceeds only when a green eval.retrieval.result exists within maxAge whose
+// dataset_sha256/model_ver/fusion_sha256 all match the current index state.
+// kahyad/internal/eval.EvalGate satisfies this directly (its
+// CheckRetrievalGate method) - this package keeps its own narrow, primitive-
+// typed interface so it never imports kahyad/internal/eval.
+type RetrievalGate interface {
+	// CheckRetrievalGate returns whether the change is allowed, a byte-exact
+	// Turkish refusal reason (empty when allowed), and an English log-only
+	// detail. It is fail-closed: any ledger-read error REFUSES.
+	CheckRetrievalGate(ctx context.Context, maxAge time.Duration, datasetSHA, modelVer, fusionSHA string) (allowed bool, reason, detail string)
+}
+
 // Config is Consolidator's run-time configuration.
 type Config struct {
 	// KahyaDir is the ~/Kahya git-repo root (cfg.KahyaDir).
@@ -94,10 +118,25 @@ type Config struct {
 	// `~`-expanded (kahyad/internal/policy.Policy.SecretLaneGlobs).
 	SecretLaneGlobs []string
 	// AutoCommit is cfg.ConsolidationAutoCommit - the OPERATOR'S intent
-	// only; autoCommitAllowed still requires a recent eval.mini.pass event
-	// before this ever actually merges directly (task spec acceptance
-	// criterion).
+	// only; autoCommitAllowed still requires a green W78-01 retrieval eval
+	// (via Consolidator.Gate) before this ever actually merges directly (task
+	// spec acceptance criterion).
 	AutoCommit bool
+
+	// EvalDatasetSHA256/EvalModelVer/EvalFusionSHA256 are the CURRENT index
+	// state the auto-commit gate matches a green eval.retrieval.result
+	// against (W78-01 gate point a). main.go injects them at boot from the
+	// retrieval dataset file, cfg.ActiveEmbedModelVer, and
+	// search.Searcher.FusionConfigSHA256() respectively. An empty
+	// EvalDatasetSHA256 (the dataset file is absent - common on a fresh
+	// install where the private ~/Kahya dataset does not exist yet) can never
+	// match a recorded green event, so auto-commit stays fail-closed in
+	// suggestion mode until a real dataset + green run exist.
+	EvalDatasetSHA256 string
+	EvalModelVer      string
+	EvalFusionSHA256  string
+	// EvalGateMaxAge is the freshness window (DefaultEvalGateMaxAge when unset).
+	EvalGateMaxAge time.Duration
 	// WorktreeParentDir is where temporary consolidation worktrees are
 	// created (os.MkdirTemp's dir argument) - defaults to os.TempDir()
 	// when empty. Tests set this to a t.TempDir() so nothing ever touches
@@ -132,6 +171,23 @@ type Consolidator struct {
 	EventReader EventReader
 	Reindexer   Reindexer
 	Pusher      Pusher
+
+	// Gate is the W78-01 retrieval-eval pre-change gate autoCommitAllowed
+	// consults (gate point a). nil = fail-closed: auto-commit is refused and
+	// the run stays in suggestion mode. main.go wires kahyad/internal/eval.
+	// EvalGate here.
+	Gate RetrievalGate
+
+	// EvalPreflight, when set, RUNS the retrieval eval as the first step of the
+	// auto-commit decision (W78-01 deliverable: "the nightly pipeline runs the
+	// eval as its first step") and returns the EXACT (dataset_sha256, model_ver,
+	// fusion_sha256) identity it recorded, which autoCommitAllowed then requires
+	// the gate to match - so a nightly run self-produces the fresh green result
+	// it needs (and the identity always reflects the dataset file on disk right
+	// now, never a boot-time snapshot). An error is fail-closed (auto-commit
+	// refused). nil = fall back to Cfg.Eval* (the boot-time identity; used by
+	// tests and by any caller that runs the eval out of band).
+	EvalPreflight func(ctx context.Context, traceID string) (datasetSHA, modelVer, fusionSHA string, err error)
 
 	// HotWindow is optional (nil = hot-window promotion is skipped this
 	// run, logged, never fatal to the markdown consolidation itself).
@@ -356,8 +412,8 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 
 	// Step 8/auto-mode switch (task spec step 7): suggestion mode is the
 	// default; auto mode merges directly, but ONLY when the runtime guard
-	// (auto_commit config AND a recent eval.mini.pass ledger event) allows
-	// it.
+	// (auto_commit config AND a fresh green eval.retrieval.result matching the
+	// current index+dataset) allows it.
 	if c.autoCommitAllowed(ctx, traceID) {
 		return c.finalize(ctx, traceID, traceID, branch)
 	}
@@ -524,42 +580,58 @@ func removeWorktreeForBranchIfAny(ctx context.Context, git backup.GitRunner, rep
 }
 
 // autoCommitAllowed implements the auto-commit runtime guard (task spec
-// acceptance criterion): cfg.AutoCommit is the operator's own intent, but
-// it is honored ONLY when an eval.mini.pass ledger event exists within
-// the last EvalMiniPassLookbackDays - absent that, an error is logged
-// (JSONL + a consolidation.auto_commit_refused ledger event) and this run
-// stays in suggestion mode, EVERY time, never just once.
+// acceptance criterion / W78-01 gate point a): cfg.AutoCommit is the
+// operator's own intent, but it is honored ONLY when the W78-01 retrieval
+// eval gate is green for the current index state (a green eval.retrieval.result
+// within EvalGateMaxAge whose dataset_sha256/model_ver/fusion_sha256 match).
+// Absent that, an error is logged (JSONL + a consolidation.auto_commit_refused
+// ledger event carrying the byte-exact Turkish refusal) and this run stays in
+// suggestion mode, EVERY time, never just once. Fail-closed: a nil gate
+// refuses.
 func (c *Consolidator) autoCommitAllowed(ctx context.Context, traceID string) bool {
 	if !c.Cfg.AutoCommit {
 		return false
 	}
-	if c.EventReader == nil {
-		c.refuseAutoCommit(ctx, traceID, "no event reader wired")
+	if c.Gate == nil {
+		c.refuseAutoCommit(ctx, traceID, "no retrieval eval gate wired", evalGateRefusalReasonTR)
 		return false
 	}
-	rows, err := c.EventReader.ListEventsByKind(ctx, EventEvalMiniPass)
-	if err != nil {
-		c.refuseAutoCommit(ctx, traceID, "list eval.mini.pass events: "+err.Error())
+
+	// Run the retrieval eval FIRST (when wired) so the gate consults a fresh
+	// result reflecting the current index+dataset, and gate against the EXACT
+	// identity that run recorded. Without a preflight, fall back to the
+	// boot-time Cfg identity (tests / out-of-band eval).
+	datasetSHA, modelVer, fusionSHA := c.Cfg.EvalDatasetSHA256, c.Cfg.EvalModelVer, c.Cfg.EvalFusionSHA256
+	if c.EvalPreflight != nil {
+		ds, mv, fs, err := c.EvalPreflight(ctx, traceID)
+		if err != nil {
+			c.refuseAutoCommit(ctx, traceID, "retrieval eval preflight failed: "+err.Error(), evalGateRefusalReasonTR)
+			return false
+		}
+		datasetSHA, modelVer, fusionSHA = ds, mv, fs
+	}
+
+	maxAge := c.Cfg.EvalGateMaxAge
+	if maxAge <= 0 {
+		maxAge = DefaultEvalGateMaxAge
+	}
+	allowed, reason, detail := c.Gate.CheckRetrievalGate(ctx, maxAge, datasetSHA, modelVer, fusionSHA)
+	if !allowed {
+		c.refuseAutoCommit(ctx, traceID, detail, reason)
 		return false
 	}
-	cutoff := c.now().AddDate(0, 0, -EvalMiniPassLookbackDays)
-	for _, row := range rows {
-		createdAt, perr := time.Parse(time.RFC3339, row.CreatedAt)
-		if perr != nil {
-			continue
-		}
-		if !createdAt.Before(cutoff) {
-			return true
-		}
-	}
-	c.refuseAutoCommit(ctx, traceID, "no eval.mini.pass event in the last "+fmt.Sprint(EvalMiniPassLookbackDays)+" days")
-	return false
+	return true
 }
 
-func (c *Consolidator) refuseAutoCommit(ctx context.Context, traceID, reason string) {
-	c.logError("consolidation_auto_commit_refused", "trace_id", traceID, "reason", reason)
+// refuseAutoCommit logs (JSONL, English detail) and ledgers the refusal with
+// the byte-exact Turkish reason surfaced to the user/audit.
+func (c *Consolidator) refuseAutoCommit(ctx context.Context, traceID, detail, turkishReason string) {
+	c.logError("consolidation_auto_commit_refused", "trace_id", traceID, "reason", detail)
 	if c.EventLogger != nil {
-		_ = c.EventLogger.LogEvent(ctx, traceID, EventAutoCommitRefused, map[string]any{"reason": reason})
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventAutoCommitRefused, map[string]any{
+			"reason":    detail,
+			"reason_tr": turkishReason,
+		})
 	}
 }
 

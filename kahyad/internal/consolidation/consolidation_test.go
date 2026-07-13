@@ -2,6 +2,7 @@ package consolidation
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -532,9 +533,159 @@ func TestRunSupersedesStalePendingAndRegeneratesAgainstCurrentMain(t *testing.T)
 	}
 }
 
-// --- (g) auto-commit guard ---
+// --- (g) auto-commit guard (W78-01 retrieval eval gate) ---
 
-func TestRunAutoCommitRefusedWithoutEvalMiniPass(t *testing.T) {
+// fakeRetrievalGate is a hermetic stand-in for kahyad/internal/eval.EvalGate:
+// it records the (dataset,model,fusion,maxAge) it was asked about and returns
+// a fixed allow/refuse verdict. A refusal returns the byte-exact Turkish
+// reason, exactly as the real gate does.
+type fakeRetrievalGate struct {
+	allow      bool
+	gotMaxAge  time.Duration
+	gotDataset string
+	gotModel   string
+	gotFusion  string
+}
+
+func (g *fakeRetrievalGate) CheckRetrievalGate(ctx context.Context, maxAge time.Duration, datasetSHA, modelVer, fusionSHA string) (bool, string, string) {
+	g.gotMaxAge, g.gotDataset, g.gotModel, g.gotFusion = maxAge, datasetSHA, modelVer, fusionSHA
+	if g.allow {
+		return true, "", ""
+	}
+	return false, evalGateRefusalReasonTR, "gate red (test)"
+}
+
+func TestRunAutoCommitRefusedWhenGateRed(t *testing.T) {
+	repo := initKahyaRepo(t)
+	cloud := SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
+		out := map[string]string{}
+		for k, v := range files {
+			out[k] = v + "\nchanged\n"
+		}
+		return out, nil
+	})
+	logger := &fakeEventStore{}
+	gate := &fakeRetrievalGate{allow: false}
+	c := &Consolidator{
+		Cfg: Config{
+			KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(),
+			Now: fixedNow(t), AutoCommit: true,
+			EvalDatasetSHA256: "d1", EvalModelVer: "m1", EvalFusionSHA256: "f1",
+		},
+		Git:         backup.NewExecGitRunner(),
+		Cloud:       cloud,
+		EventLogger: logger,
+		EventReader: logger,
+		Gate:        gate,
+	}
+	if err := c.Run(context.Background(), "trace-1"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// A red gate must keep auto_commit:true in suggestion mode.
+	pending, err := FindPending(context.Background(), logger)
+	if err != nil || pending == nil {
+		t.Fatalf("FindPending() = (%+v, %v), want a pending suggestion (auto-commit must have been refused)", pending, err)
+	}
+	// The gate was consulted with the current index state + 24h window.
+	if gate.gotDataset != "d1" || gate.gotModel != "m1" || gate.gotFusion != "f1" {
+		t.Fatalf("gate consulted with (%q,%q,%q), want (d1,m1,f1)", gate.gotDataset, gate.gotModel, gate.gotFusion)
+	}
+	if gate.gotMaxAge != DefaultEvalGateMaxAge {
+		t.Fatalf("gate maxAge = %v, want %v", gate.gotMaxAge, DefaultEvalGateMaxAge)
+	}
+	// The refusal is ledgered with the byte-exact Turkish reason.
+	refusedRows, err := logger.ListEventsByKind(context.Background(), EventAutoCommitRefused)
+	if err != nil || len(refusedRows) == 0 {
+		t.Fatalf("ListEventsByKind(auto_commit_refused) = (%+v, %v), want at least one row", refusedRows, err)
+	}
+	var payload struct {
+		ReasonTR string `json:"reason_tr"`
+	}
+	if err := json.Unmarshal([]byte(refusedRows[0].Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ReasonTR != evalGateRefusalReasonTR {
+		t.Fatalf("refusal reason_tr = %q, want byte-exact %q", payload.ReasonTR, evalGateRefusalReasonTR)
+	}
+}
+
+// changingCloud is the standard cloud stub the auto-commit tests use (appends
+// a line so the run has a diff to commit).
+func changingCloud() SessionFunc {
+	return SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
+		out := map[string]string{}
+		for k, v := range files {
+			out[k] = v + "\nchanged\n"
+		}
+		return out, nil
+	})
+}
+
+// TestRunAutoCommitPreflightIdentityUsedByGate proves the W78-01 "nightly runs
+// the eval first" wiring: when EvalPreflight is set, the gate is consulted with
+// the identity the preflight RETURNS (the fresh run's dataset/model/fusion),
+// not the boot-time Cfg.Eval* snapshot - so a dataset edited after boot is
+// honored.
+func TestRunAutoCommitPreflightIdentityUsedByGate(t *testing.T) {
+	repo := initKahyaRepo(t)
+	logger := &fakeEventStore{}
+	gate := &fakeRetrievalGate{allow: false}
+	preflightCalls := 0
+	c := &Consolidator{
+		Cfg: Config{
+			KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(),
+			Now: fixedNow(t), AutoCommit: true,
+			EvalDatasetSHA256: "BOOT", EvalModelVer: "BOOT", EvalFusionSHA256: "BOOT",
+		},
+		Git: backup.NewExecGitRunner(), Cloud: changingCloud(),
+		EventLogger: logger, EventReader: logger, Gate: gate,
+		EvalPreflight: func(ctx context.Context, traceID string) (string, string, string, error) {
+			preflightCalls++
+			return "FRESH_DS", "FRESH_MV", "FRESH_FS", nil
+		},
+	}
+	if err := c.Run(context.Background(), "trace-1"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if preflightCalls != 1 {
+		t.Fatalf("EvalPreflight called %d times, want exactly 1 (the eval runs first)", preflightCalls)
+	}
+	if gate.gotDataset != "FRESH_DS" || gate.gotModel != "FRESH_MV" || gate.gotFusion != "FRESH_FS" {
+		t.Fatalf("gate consulted with (%q,%q,%q), want the preflight identity (FRESH_*), not the boot Cfg", gate.gotDataset, gate.gotModel, gate.gotFusion)
+	}
+}
+
+// TestRunAutoCommitPreflightErrorFailsClosed proves a failed retrieval-eval
+// preflight refuses auto-commit (suggestion mode) and never consults the gate.
+func TestRunAutoCommitPreflightErrorFailsClosed(t *testing.T) {
+	repo := initKahyaRepo(t)
+	logger := &fakeEventStore{}
+	gate := &fakeRetrievalGate{allow: true} // would allow, but must never be reached
+	c := &Consolidator{
+		Cfg: Config{
+			KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(),
+			Now: fixedNow(t), AutoCommit: true,
+		},
+		Git: backup.NewExecGitRunner(), Cloud: changingCloud(),
+		EventLogger: logger, EventReader: logger, Gate: gate,
+		EvalPreflight: func(ctx context.Context, traceID string) (string, string, string, error) {
+			return "", "", "", context.DeadlineExceeded
+		},
+	}
+	if err := c.Run(context.Background(), "trace-1"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if gate.gotDataset != "" {
+		t.Fatalf("gate was consulted (dataset=%q) despite a preflight error - must fail closed before the gate", gate.gotDataset)
+	}
+	pending, err := FindPending(context.Background(), logger)
+	if err != nil || pending == nil {
+		t.Fatalf("FindPending() = (%+v, %v), want a pending suggestion (preflight error must fail closed)", pending, err)
+	}
+}
+
+func TestRunAutoCommitRefusedWhenGateNilFailClosed(t *testing.T) {
 	repo := initKahyaRepo(t)
 	cloud := SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
 		out := map[string]string{}
@@ -545,6 +696,7 @@ func TestRunAutoCommitRefusedWithoutEvalMiniPass(t *testing.T) {
 	})
 	logger := &fakeEventStore{}
 	c := &Consolidator{
+		// AutoCommit true but NO gate wired: fail-closed, stays in suggestion mode.
 		Cfg:         Config{KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(), Now: fixedNow(t), AutoCommit: true},
 		Git:         backup.NewExecGitRunner(),
 		Cloud:       cloud,
@@ -554,21 +706,13 @@ func TestRunAutoCommitRefusedWithoutEvalMiniPass(t *testing.T) {
 	if err := c.Run(context.Background(), "trace-1"); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-
-	// Without an eval.mini.pass event, auto_commit:true must NOT merge -
-	// the run stays in suggestion mode.
 	pending, err := FindPending(context.Background(), logger)
 	if err != nil || pending == nil {
-		t.Fatalf("FindPending() = (%+v, %v), want a pending suggestion (auto-commit must have been refused)", pending, err)
-	}
-
-	refusedRows, err := logger.ListEventsByKind(context.Background(), EventAutoCommitRefused)
-	if err != nil || len(refusedRows) == 0 {
-		t.Fatalf("ListEventsByKind(auto_commit_refused) = (%+v, %v), want at least one row", refusedRows, err)
+		t.Fatalf("FindPending() = (%+v, %v), want a pending suggestion (nil gate must fail closed)", pending, err)
 	}
 }
 
-func TestRunAutoCommitProceedsWithRecentEvalMiniPass(t *testing.T) {
+func TestRunAutoCommitProceedsWhenGateGreen(t *testing.T) {
 	repo := initKahyaRepo(t)
 	cloud := SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
 		out := map[string]string{}
@@ -578,9 +722,6 @@ func TestRunAutoCommitProceedsWithRecentEvalMiniPass(t *testing.T) {
 		return out, nil
 	})
 	logger := &fakeEventStore{}
-	if err := logger.LogEvent(context.Background(), "eval-trace", EventEvalMiniPass, map[string]any{"ok": true}); err != nil {
-		t.Fatal(err)
-	}
 	reindexer := &fakeReindexer{}
 	c := &Consolidator{
 		Cfg:         Config{KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(), Now: fixedNow(t), AutoCommit: true},
@@ -589,6 +730,7 @@ func TestRunAutoCommitProceedsWithRecentEvalMiniPass(t *testing.T) {
 		EventLogger: logger,
 		EventReader: logger,
 		Reindexer:   reindexer,
+		Gate:        &fakeRetrievalGate{allow: true},
 	}
 	if err := c.Run(context.Background(), "trace-1"); err != nil {
 		t.Fatalf("Run() error = %v", err)

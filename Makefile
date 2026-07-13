@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 sandbox-image docker-up hammerspoon-install
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval sandbox-image docker-up hammerspoon-install
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -264,3 +264,14 @@ accept-w12: build
 # OVERRIDE's dev-only escape hatch stand in for all three).
 accept-w4: build
 	bash scripts/accept_w4.sh
+# eval-retrieval: the W78-01 LIVE retrieval-QA drill (§5-Memory-#5 pre-change
+# gate). Like accept-w4/accept-w12 it runs against a REAL already-running
+# kahyad (launchd `make install-agent` or `make run-daemon` in another
+# terminal) and the real ~/Kahya seed corpus + private retrieval dataset - it
+# is NOT part of hermetic `make test` (which fully proves the runner/scorer/
+# gate LOGIC with the synthetic testdata fixture instead). `kahya eval
+# retrieval` triggers the in-daemon run over the UDS, ledgers one
+# eval.retrieval.result event, prints a Turkish precision table, and exits
+# non-zero when precision < 0.80 (çekimserlik dahil).
+eval-retrieval: build
+	./bin/kahya eval retrieval

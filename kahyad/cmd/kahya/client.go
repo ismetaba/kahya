@@ -972,6 +972,92 @@ func (c *Client) EvalMiniRun(ctx context.Context, traceID string) (evalMiniRunRe
 	return rr, nil
 }
 
+// evalRetrievalItemResult mirrors kahyad's POST /v1/eval/retrieval JSON
+// body's "items" row shape (kahyad/internal/server.evalRetrievalItemResult,
+// W78-01).
+type evalRetrievalItemResult struct {
+	ID         string `json:"id"`
+	Answerable bool   `json:"answerable"`
+	Correct    bool   `json:"correct"`
+	Abstained  bool   `json:"abstained"`
+}
+
+// evalRetrievalRunResult mirrors kahyad's POST /v1/eval/retrieval JSON body
+// (kahyad/internal/server.evalRetrievalRunResponse, W78-01).
+type evalRetrievalRunResult struct {
+	Precision     float64                   `json:"precision"`
+	Total         int                       `json:"total"`
+	Correct       int                       `json:"correct"`
+	ModelVer      string                    `json:"model_ver"`
+	FusionSHA256  string                    `json:"fusion_sha256"`
+	DatasetSHA256 string                    `json:"dataset_sha256"`
+	Items         []evalRetrievalItemResult `json:"items"`
+	Error         string                    `json:"error,omitempty"`
+}
+
+// EvalRetrievalRun calls POST /v1/eval/retrieval (`kahya eval retrieval`):
+// kahyad runs the W78-01 full retrieval-QA eval against its own memory_search
+// searcher and ledgers exactly one eval.retrieval.result event - this CLI
+// process never opens brain.db itself, only ever this one UDS round-trip.
+func (c *Client) EvalRetrievalRun(ctx context.Context, traceID string) (evalRetrievalRunResult, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/eval/retrieval", traceID, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return evalRetrievalRunResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return evalRetrievalRunResult{}, err
+	}
+	defer resp.Body.Close()
+
+	var rr evalRetrievalRunResult
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return evalRetrievalRunResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/retrieval: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if rr.Error != "" {
+			return evalRetrievalRunResult{}, fmt.Errorf("%s", rr.Error)
+		}
+		return evalRetrievalRunResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/retrieval: status %d", resp.StatusCode)}
+	}
+	return rr, nil
+}
+
+// evalExportRitualResult mirrors kahyad's POST /v1/eval/export-ritual JSON
+// body (kahyad/internal/server.evalExportRitualResponse, W78-01).
+type evalExportRitualResult struct {
+	Lines []string `json:"lines"`
+	Error string   `json:"error,omitempty"`
+}
+
+// EvalExportRitual calls POST /v1/eval/export-ritual (`kahya eval
+// export-ritual`): kahyad drafts candidate dataset JSONL lines from the
+// W5-03 ritual's human labels and returns them for the CLI to print to
+// stdout for MANUAL curation (kahyad never writes any file).
+func (c *Client) EvalExportRitual(ctx context.Context, traceID string) (evalExportRitualResult, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/eval/export-ritual", traceID, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return evalExportRitualResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return evalExportRitualResult{}, err
+	}
+	defer resp.Body.Close()
+
+	var rr evalExportRitualResult
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return evalExportRitualResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/export-ritual: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if rr.Error != "" {
+			return evalExportRitualResult{}, fmt.Errorf("%s", rr.Error)
+		}
+		return evalExportRitualResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/export-ritual: status %d", resp.StatusCode)}
+	}
+	return rr, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

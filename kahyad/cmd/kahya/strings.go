@@ -298,8 +298,9 @@ const (
 	// ---- W5-05: kahya eval mini ----
 
 	// MsgEvalUsage is printed when `kahya eval` is given anything other
-	// than exactly "mini". Exit 2.
-	MsgEvalUsage = "kullanım: kahya eval mini"
+	// than a recognized subcommand ("mini"/"retrieval"/"export-ritual").
+	// Exit 2.
+	MsgEvalUsage = "kullanım: kahya eval mini | kahya eval retrieval | kahya eval export-ritual"
 
 	// MsgEvalMiniPass/MsgEvalMiniFail prefix each baseline question's own
 	// result line (`kahya eval mini`'s per-question report): %s = the
@@ -320,6 +321,38 @@ const (
 	// MsgEvalMiniFirstRun is printed instead of a regression verdict when
 	// no prior eval.mini.run event exists yet (nothing to compare against).
 	MsgEvalMiniFirstRun = "İlk çalıştırma - karşılaştırılacak önceki sonuç yok."
+
+	// ---- W78-01: kahya eval retrieval / kahya eval export-ritual ----
+
+	// MsgEvalRetrievalCorrect/Abstained/Wrong prefix each retrieval item's
+	// own result line (`kahya eval retrieval`'s per-item report): %s = the
+	// item id. "Abstained" is a correct outcome only for unanswerable items,
+	// but the daemon has already folded that into "correct"; a line printed
+	// with the abstained prefix here is one that was scored WRONG precisely
+	// because it abstained on an answerable item (an answerable item that
+	// found its evidence prints with the correct prefix instead).
+	MsgEvalRetrievalCorrect   = "  DOĞRU      %s"
+	MsgEvalRetrievalAbstained = "  ÇEKİMSER   %s"
+	MsgEvalRetrievalWrong     = "  YANLIŞ     %s"
+
+	// MsgEvalRetrievalSummary is `kahya eval retrieval`'s summary line:
+	// %.1f = precision as a percentage, first %d = correct count, second
+	// %d = total item count.
+	MsgEvalRetrievalSummary = "Özet: precision %%%.1f (%d/%d doğru, çekimserlik dahil)."
+
+	// MsgEvalRetrievalGreen/BelowThreshold report the §5 pre-change gate
+	// verdict: >=%80 opens the gate, <%80 keeps it closed.
+	MsgEvalRetrievalGreen          = "Kapı yeşil: retrieval eval geçti (>=%80)."
+	MsgEvalRetrievalBelowThreshold = "Kapı kırmızı: retrieval eval precision %80'in altında."
+
+	// MsgEvalExportRitualHeader is printed to STDERR before the drafted JSONL
+	// lines (%d = line count) - a hint that stdout is raw, hand-curatable
+	// JSONL, never a file kahya wrote itself.
+	MsgEvalExportRitualHeader = "%d aday satırı (elle düzenleyip ~/Kahya/eval/retrieval/dataset.jsonl içine ekleyin):"
+
+	// MsgEvalExportRitualEmpty is printed to STDERR when no ritual-labeled
+	// facts exist yet (nothing to draft).
+	MsgEvalExportRitualEmpty = "Ritüel etiketli olgu yok - önce haftalık doğru/yanlış ritüelini çalıştırın."
 
 	// ---- W6-01: kahya approvals list|show|decide, kahya debug emit-approval ----
 

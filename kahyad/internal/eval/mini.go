@@ -14,16 +14,15 @@
 // event iff the pass count drops OR any question that passed in that
 // prior run now fails.
 //
-// This package writes ONLY the "eval.mini.run" ledger event (EventMiniRun
-// below) - pass count + trace_id + the full per-question breakdown, for
-// this run's own regression check and any later manual audit. It MUST
-// NEVER write "eval.mini.pass": that event belongs to W78-01's full
-// ~50-question eval and is the ONE thing kahyad/internal/consolidation's
-// own autoCommitAllowed guard looks for before it will ever let nightly
-// consolidation auto-merge without a suggestion-mode review (see
-// consolidation.EventEvalMiniPass's doc comment) - writing it here would
-// wrongly unlock auto-commit from this package's much smaller, unlabeled
-// sanity check.
+// This package's mini runner writes ONLY the "eval.mini.run" ledger event
+// (EventMiniRun below) - pass count + trace_id + the full per-question
+// breakdown, for this run's own regression check and any later manual audit.
+// It is a lightweight regression tripwire, NOT the §5-Memory-#5 pre-change
+// gate: the auto-commit / model_ver / fusion gates all key off W78-01's full
+// retrieval eval (EventRetrievalResult = "eval.retrieval.result", written by
+// retrieval.go's RetrievalRunner and checked by gate.go's EvalGate), never
+// off this smaller, unlabeled sanity baseline. The mini runner deliberately
+// writes neither "eval.mini.pass" nor "eval.retrieval.result".
 package eval
 
 import (
