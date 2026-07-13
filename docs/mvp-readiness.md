@@ -73,7 +73,7 @@ işaretiyle **raporlar** ama çıkış kodunu **belirlemez** (§9 sözleşmedir)
 
 | Hedef | Değer | `readiness` alanı |
 | --- | --- | --- |
-| komutların ≥%60'ı açıklama-turu olmadan tamamlanır (açıklama-turu oranı ≤%40) | `northstar.clarification_turn_rate` (bugün veri-yok: hiçbir açıklama-turu event türü yazılmıyor — W78-04'te boşluk olarak kayıtlı) | `northstar.clarification_ok` |
+| komutların ≥%60'ı açıklama-turu olmadan tamamlanır (açıklama-turu oranı ≤%40) | `northstar.clarification_turn_rate` (W78-07'den beri canlı: kahyad, worker'ın açıklama-turu sinyali üzerine `kind="clarification_turn"` event yazar — boş/yeni bir ledger'da hâlâ veri-yok) | `northstar.clarification_ok` |
 | palet-aç→ilk-token p50 <1.5s | `northstar.palette_first_token_p50_ms` | `northstar.palette_ok` |
 
 ---

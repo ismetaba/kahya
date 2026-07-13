@@ -12,9 +12,12 @@
 // and kahyad/internal/remembered/remembered.go):
 //   - commands/day        = count(kind='task_spawned') grouped by UTC day
 //   - clarification rate   = distinct task_spawned traces that ALSO have a
-//     clarification-turn event / distinct task_spawned traces. NO such event
-//     kind is emitted anywhere in the codebase today (grep-confirmed), so
-//     this metric renders veri-yok (nil) - recorded as a gap, never faked.
+//     clarification-turn event / distinct task_spawned traces. Since W78-07
+//     kahyad emits kind="clarification_turn" (server/task.go's
+//     logClarificationTurn, driven by the worker's açıklama-turu stdout
+//     signal) - so this metric now computes a real rate; it renders
+//     veri-yok (nil) only when the ledger carries no clarification-turn
+//     event at all (a brand-new/empty db), never as a permanent gap.
 //   - palette->first-token p50 = MEDIAN of (first_token.ts - palette_open.ts)
 //     per trace_id that carries both (earliest first_token if several).
 //   - remembered moments   = count(kind='remembered_moment') in the window.
@@ -60,13 +63,14 @@ const (
 	kindModelCall = "model_call"
 )
 
-// clarificationKinds are the event kinds that WOULD mark an "açıklama-turu"
-// (a turn where the assistant asked the user a question before acting,
-// HANDOFF §6 ⚑). None of these is emitted anywhere in the codebase today, so
-// ClarificationTurnRate stays veri-yok (nil) until an upstream task starts
-// writing one of them - at which point the ratio computes automatically with
-// no change here. This is the W78-04 "record it as a gap, do NOT invent a
-// writer" contract.
+// clarificationKinds are the event kinds that mark an "açıklama-turu" (a
+// turn where the assistant asked the user a question before acting, HANDOFF
+// §6 ⚑). As of W78-07 kahyad emits "clarification_turn" (server/task.go's
+// logClarificationTurn); the other two are accepted as forward-compatible
+// aliases so a future emitter/import path need not touch this reader. Any of
+// them present makes ClarificationTurnRate compute a real ratio; none
+// present (an empty/brand-new ledger) still renders veri-yok (nil), the same
+// safe fallback as before the emitter existed.
 var clarificationKinds = []string{"clarification", "clarification_turn", "acikla"}
 
 // DayCount is one calendar day's command count (commands/day).
@@ -228,12 +232,13 @@ func (r *Reader) commandsPerDay(ctx context.Context, since, until string) ([]Day
 // clarificationTurnRate = distinct task_spawned traces that ALSO carry a
 // clarification-turn event / distinct task_spawned traces. Returns nil
 // (veri-yok) when there are no commands in the window OR when no
-// clarification-turn event exists anywhere in the ledger (the kind is not yet
-// emitted - the current, grep-confirmed state).
+// clarification-turn event exists anywhere in the ledger (an empty/brand-new
+// db - since W78-07 the kind IS emitted, so this is no longer the steady
+// state).
 func (r *Reader) clarificationTurnRate(ctx context.Context, since, until string) (*float64, error) {
-	// Fast-out: if the clarification kind is emitted nowhere in the ledger at
-	// all, the metric is not measurable -> veri-yok. This distinguishes
-	// "feature not implemented" from "implemented, zero this window".
+	// Fast-out: if no clarification-turn event exists anywhere in the ledger,
+	// the metric is not measurable -> veri-yok. This distinguishes an
+	// empty/brand-new db from "measurable, zero clarifications this window".
 	anyClar, err := r.anyClarificationEvent(ctx)
 	if err != nil {
 		return nil, err

@@ -22,7 +22,7 @@ from unittest import mock
 
 import _pathfix  # noqa: F401
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
 import kahya_worker.__main__ as worker_main
 
@@ -368,6 +368,90 @@ class TestStdoutProtocolAndSession(unittest.TestCase):
                 continue
             obj = json.loads(line)  # raises if not valid standalone JSON
             self.assertIn("type", obj)
+
+
+def _ok_result(session_id: str = "sess-clar") -> ResultMessage:
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=session_id,
+    )
+
+
+class TestClarificationTurnUnit(unittest.TestCase):
+    """W78-07: the pure açıklama-turu decision (HANDOFF §6 ⚑) -
+    _is_clarification_turn(assistant_text, any_tool_use)."""
+
+    def test_question_without_tool_use_is_clarification(self) -> None:
+        self.assertTrue(worker_main._is_clarification_turn("Hangi hesaptan ödeyeyim?", False))
+
+    def test_trailing_whitespace_after_question_mark_still_counts(self) -> None:
+        self.assertTrue(worker_main._is_clarification_turn("Onaylıyor musun?\n\n", False))
+
+    def test_statement_without_question_mark_is_not_clarification(self) -> None:
+        self.assertFalse(worker_main._is_clarification_turn("Fatura ödendi.", False))
+
+    def test_question_but_tool_was_used_is_not_clarification(self) -> None:
+        # It asked something, but it also ACTED this turn - not "eylemden önce".
+        self.assertFalse(worker_main._is_clarification_turn("Devam edeyim mi?", True))
+
+    def test_empty_answer_is_not_clarification(self) -> None:
+        self.assertFalse(worker_main._is_clarification_turn("", False))
+
+
+class TestClarificationTurnStream(unittest.TestCase):
+    """W78-07: end-to-end through _run_session's stdout protocol - the
+    worker SIGNALS the turn via a {"event":"clarification_turn"} line
+    (kahyad, the sole brain.db writer, is what actually ledgers it)."""
+
+    def _run(self, messages: list) -> list[dict]:
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=messages)
+            )
+        self.assertEqual(code, 0)
+        return [json.loads(l) for l in out.splitlines() if l.strip()]
+
+    def test_question_only_turn_emits_clarification_event_before_result(self) -> None:
+        messages = [
+            AssistantMessage(
+                content=[TextBlock(text="Hangi hesaptan ödeme yapayım?")],
+                model="claude-sonnet-5", session_id="sess-clar",
+            ),
+            _ok_result(),
+        ]
+        lines = self._run(messages)
+        self.assertIn({"event": "clarification_turn"}, lines)
+        # It must precede the terminal result line, and there is exactly one.
+        clar_idx = lines.index({"event": "clarification_turn"})
+        result_idx = lines.index({"type": "result", "status": "ok"})
+        self.assertLess(clar_idx, result_idx)
+        self.assertEqual(sum(1 for l in lines if l.get("event") == "clarification_turn"), 1)
+
+    def test_turn_with_tool_use_emits_no_clarification_event(self) -> None:
+        # Asked a question AND acted (a tool call) this turn -> not açıklama-turu.
+        messages = [
+            AssistantMessage(
+                content=[
+                    ToolUseBlock(id="tu1", name="mcp__kahya_memory__memory_search", input={"q": "x"}),
+                    TextBlock(text="Bunu mu demek istedin?"),
+                ],
+                model="claude-sonnet-5", session_id="sess-clar",
+            ),
+            _ok_result(),
+        ]
+        lines = self._run(messages)
+        self.assertNotIn({"event": "clarification_turn"}, lines)
+
+    def test_non_question_answer_emits_no_clarification_event(self) -> None:
+        messages = [
+            AssistantMessage(
+                content=[TextBlock(text="Fatura ödendi.")],
+                model="claude-sonnet-5", session_id="sess-clar",
+            ),
+            _ok_result(),
+        ]
+        lines = self._run(messages)
+        self.assertNotIn({"event": "clarification_turn"}, lines)
 
 
 class TestBuildOptions(unittest.TestCase):

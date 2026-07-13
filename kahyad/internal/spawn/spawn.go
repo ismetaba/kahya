@@ -69,6 +69,18 @@ const (
 // stdoutLine.Type).
 const cloudUnreachableEvent = "cloud_unreachable"
 
+// clarificationTurnEvent is the exact "event" field value
+// worker/kahya_worker/__main__.py's W78-07 açıklama-turu line carries
+// (its _CLARIFICATION_TURN_EVENT) - the SAME separate-top-level-key
+// convention as cloudUnreachableEvent above. UNLIKE cloud_unreachable,
+// this is NOT a terminal outcome: it is a mid-stream signal that the
+// worker asked the user a clarifying question before acting (HANDOFF §6
+// ⚑), relayed to the caller via Callbacks.OnClarification so kahyad - the
+// sole brain.db writer - can ledger kind="clarification_turn" for the
+// north-star metric; the turn still ends with its ordinary result/error
+// line.
+const clarificationTurnEvent = "clarification_turn"
+
 // Config bundles everything Run needs to launch and instrument one worker
 // process for one task (HANDOFF §4 IPC ⚑, frozen in docs/ipc.md).
 type Config struct {
@@ -147,6 +159,16 @@ type Callbacks struct {
 	// stdout line, with that line's session_id, so the caller can persist
 	// it onto the task row immediately - not just after Run returns.
 	OnSession func(sessionID string)
+	// OnClarification is called (at most once per task in practice - the
+	// worker emits the line at most once, right before its terminal
+	// result) when a {"event":"clarification_turn"} stdout line arrives
+	// (worker/kahya_worker/__main__.py, W78-07): the worker asked the user
+	// a clarifying question before acting (HANDOFF §6 ⚑). Unlike the
+	// cloud_unreachable event line, this is NOT terminal - it never sets
+	// Outcome.Status; the stream still ends with its ordinary result/error
+	// line. The caller (kahyad/internal/server) uses this to ledger
+	// kind="clarification_turn" for the W78-04 north-star metric. Optional.
+	OnClarification func()
 	// OnStderr is called once per stderr line. The worker's stderr is
 	// diagnostics only (HANDOFF §4 IPC ⚑ / W12-07 step 3: "treats stderr
 	// as diagnostics, logged at warn") - callers must never surface these
@@ -282,6 +304,16 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 			if sl.Event == cloudUnreachableEvent {
 				outcome.Status = StatusCloudUnreachable
 				sawTerminal = true
+				return
+			}
+			if sl.Event == clarificationTurnEvent {
+				// Non-terminal signal (never touches outcome/sawTerminal):
+				// the worker asked a clarifying question this turn. Relay
+				// it and keep parsing - the terminal result/error line
+				// still follows.
+				if cb.OnClarification != nil {
+					cb.OnClarification()
+				}
 				return
 			}
 			switch sl.Type {

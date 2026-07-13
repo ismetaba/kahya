@@ -364,6 +364,19 @@ with `event: error`, message
 `"Görev zaman aşımına uğradı (%d dk)."` (minutes substituted in);
 `tasks.state` → `error`; ledger `task_timeout`.
 
+**`event`-keyed lines (not `type`-keyed):** a few worker lines carry a
+top-level `"event"` key **instead of** `"type"` — kahyad matches these on
+`spawn.stdoutLine.Event`, never conflated with the `type` switch above.
+`{"event":"cloud_unreachable"}` (W4-04) is terminal (see §3). Since **W78-07**,
+`{"event":"clarification_turn"}` is a **non-terminal** line the worker emits
+at most once, immediately before its terminal `"result"`, when the assistant
+asked the user a clarifying question **before acting** (HANDOFF §6 ⚑
+*açıklama-turu*). It is **not** relayed to the SSE stream and never changes
+`tasks.state`; kahyad — the sole `brain.db` writer — turns it into one
+`events` row `kind="clarification_turn"` (carrying the task's `trace_id`) that
+the W78-04 north-star metric counts. The worker only ever *signals* the turn;
+it never writes the ledger itself.
+
 ## 5 · `POST /v1/task` (HTTP-over-UDS, `~/Library/Application Support/Kahya/kahyad.sock`)
 
 Request body (matches `kahyad/cmd/kahya/client.go`'s `StreamTask`, W12-06):

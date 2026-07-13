@@ -340,6 +340,39 @@ func TestRunReportsCloudUnreachableEventLine(t *testing.T) {
 	}
 }
 
+// TestRunReportsClarificationTurnEventLine covers the W78-07
+// {"event":"clarification_turn"} protocol line: it must fire
+// OnClarification exactly once and, UNLIKE cloud_unreachable, must be
+// NON-terminal - the following {"type":"result","status":"ok"} line still
+// decides Outcome.Status (the açıklama-turu signal never becomes the
+// task's own outcome).
+func TestRunReportsClarificationTurnEventLine(t *testing.T) {
+	env := testEnvelope(t)
+	cfg := testConfig("-c")
+	cfg.Cmd = []string{"python3", "-c",
+		`import sys; sys.stdin.buffer.read(); ` +
+			`print('{"type":"delta","text":"Hangi hesap?"}'); ` +
+			`print('{"event":"clarification_turn"}'); ` +
+			`print('{"type":"result","status":"ok"}')`,
+	}
+
+	var clarifications int
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	outcome, err := Run(ctx, cfg, env, Callbacks{
+		OnClarification: func() { clarifications++ },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if clarifications != 1 {
+		t.Errorf("OnClarification fired %d times, want 1", clarifications)
+	}
+	if outcome.Status != StatusOK {
+		t.Errorf("outcome.Status = %q, want %q (clarification is non-terminal)", outcome.Status, StatusOK)
+	}
+}
+
 // TestRunPersistsSessionID covers the {"type":"session","session_id":...}
 // line: OnSession must fire with the reported id, and it must also surface
 // on the final Outcome.

@@ -965,6 +965,15 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 				log.Warn("task_session_update_failed", "task_id", taskID, "err", err.Error())
 			}
 		},
+		OnClarification: func() {
+			// W78-07: the worker signalled an açıklama-turu (it asked the
+			// user a clarifying question before acting). kahyad - the sole
+			// brain.db writer (HANDOFF §5 #4) - is what actually ledgers
+			// it, stamping THIS task's own trace_id onto the row; the
+			// worker never writes the ledger itself. persistCtx (not
+			// dbCtx) so a disconnected/timed-out client can't drop the row.
+			s.logClarificationTurn(persistCtx, traceID, taskID)
+		},
 		OnStderr: func(line string) {
 			log.Warn("worker_stderr", "task_id", taskID, "line", line)
 		},
@@ -1137,6 +1146,32 @@ func (s *Server) logFirstToken(ctx context.Context, traceID, taskID string) {
 		"task_id": taskID,
 	}); err != nil {
 		s.log.With(traceID).Warn("first_token_ledger_error", "err", err.Error())
+	}
+}
+
+// logClarificationTurn implements W78-07: ledger a kind="clarification_turn"
+// event under traceID/taskID when the worker signalled an açıklama-turu -
+// the assistant asked the user a question before acting (HANDOFF §6 ⚑,
+// "asistanın eylemden önce kullanıcıya soru sorduğu tur"). This is the
+// EMISSION side of the W78-04 north-star metric ("açıklama-turu oranı"):
+// the metrics reader (kahyad/internal/metrics.clarificationKinds) already
+// counts DISTINCT task_spawned traces that ALSO carry one of these rows /
+// total task_spawned traces - it just had no writer until now, so the rate
+// rendered veri-yok. No sync.Once guard here (unlike logFirstToken's
+// OnDelta call site, which can fire per delta): spawn.Callbacks.
+// OnClarification fires at most once per task (the worker emits its
+// {"event":"clarification_turn"} line at most once, right before the
+// terminal result), and the metric counts DISTINCT traces regardless, so a
+// hypothetical duplicate would not double-count anyway. Best-effort: a
+// ledger failure here must never abort task completion.
+func (s *Server) logClarificationTurn(ctx context.Context, traceID, taskID string) {
+	if s.eventLogger == nil {
+		return
+	}
+	if err := s.eventLogger.LogEvent(ctx, traceID, "clarification_turn", map[string]any{
+		"task_id": taskID,
+	}); err != nil {
+		s.log.With(traceID).Warn("clarification_turn_ledger_error", "err", err.Error())
 	}
 }
 

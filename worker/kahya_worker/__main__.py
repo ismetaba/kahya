@@ -33,7 +33,9 @@ from claude_agent_sdk import (
     CLINotFoundError,
     HookMatcher,
     ResultMessage,
+    ServerToolUseBlock,
     TextBlock,
+    ToolUseBlock,
 )
 
 from . import logging as wlog
@@ -69,6 +71,17 @@ MSG_STT_FAILED_FMT = "Ses işlenemedi. Ayrıntı: kahya log --trace {trace_id}"
 # itself (spawn.go's own stdoutLine.Event field is the primary signal;
 # the exit code is belt-and-braces).
 _EXIT_CLOUD_UNREACHABLE = 3
+
+# W78-07: the exact "event" field value this worker's açıklama-turu
+# (clarification-turn) protocol line carries - a SEPARATE top-level JSON
+# key from every other stdout line's "type", exactly like the
+# cloud_unreachable line below (kahyad/internal/spawn parses BOTH off
+# stdoutLine.Event, never conflated with "type"). kahyad - the SOLE
+# brain.db writer (HANDOFF §5 #4) - turns this signal into the
+# events-table kind="clarification_turn" row the W78-04 north-star metric
+# ("açıklama-turu oranı", HANDOFF §6 ⚑) counts; the worker only ever
+# SIGNALS the turn, it never writes the ledger itself.
+_CLARIFICATION_TURN_EVENT = "clarification_turn"
 
 # kahyad/internal/anthproxy.MsgCloudUnreachableMarker's exact value
 # (kahyad/internal/anthproxy/proxy.go) - embedded in the Anthropic-shaped
@@ -235,6 +248,37 @@ def _is_cloud_unreachable(exc: Exception) -> bool:
     return any(marker in text for marker in _CLOUD_UNREACHABLE_FALLBACK_MARKERS)
 
 
+def _is_clarification_turn(assistant_text: str, any_tool_use: bool) -> bool:
+    """W78-07: true when this turn is an *açıklama-turu* - HANDOFF §6 ⚑'s
+    exact definition: "asistanın eylemden önce kullanıcıya soru sorduğu
+    tur" (the turn in which the assistant asks the user a question BEFORE
+    acting). Decided here in the worker because this is the one place that
+    observes BOTH halves of the stream at once: whether any tool
+    (ToolUseBlock / ServerToolUseBlock) was used at all this turn, and the
+    assistant's own answer text.
+
+    Two conditions, both required:
+      - `any_tool_use` is False - the assistant took no action this turn
+        (used no tool). A turn that acted is, by definition, not one that
+        stopped to ask "before acting".
+      - the assistant's answer, trimmed of trailing whitespace, ends with
+        a question mark ("?", the same U+003F codepoint Turkish uses) -
+        the deterministic, model-free proxy for "asked the user a
+        question". A rhetorical/quoted trailing "?" is an accepted
+        false-positive of this heuristic; the metric is a directional
+        proxy (HANDOFF §6), not a semantic judge, and a heuristic kept in
+        Go/Python beats a second model call on every ordinary answer.
+
+    The metric counts DISTINCT clarified traces, so this being a
+    best-effort proxy (rather than exact) only ever shifts the rate by
+    whole commands, never fractionally - exactly what the north-star
+    "komutların ≥%60'ı açıklama-turu olmadan tamamlanır" target measures.
+    """
+    if any_tool_use:
+        return False
+    return assistant_text.rstrip().endswith("?")
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = sys.stdin.buffer.read()
 
@@ -391,6 +435,17 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
     outcome onto exactly one terminal protocol line + exit code."""
     options = _build_options(envelope, socket_path, mcp_bridge)
 
+    # W78-07: accumulated across this whole turn so _is_clarification_turn
+    # (below, just before the terminal "result" line) can decide whether
+    # the assistant asked the user a question BEFORE acting. any_tool_use
+    # flips True on the FIRST ToolUseBlock/ServerToolUseBlock seen (the
+    # assistant acted this turn - never a clarification turn thereafter);
+    # answer_text collects every assistant TextBlock, in arrival order, so
+    # its final trailing "?" (the model-free question proxy) is checked
+    # against the turn's complete answer, not just its last fragment.
+    any_tool_use = False
+    answer_text: list[str] = []
+
     try:
         async with ClaudeSDKClient(options=options) as client:
             await client.query(envelope.prompt)
@@ -418,7 +473,13 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
+                            answer_text.append(block.text)
                             _print_protocol_line({"type": "delta", "text": block.text})
+                        elif isinstance(block, (ToolUseBlock, ServerToolUseBlock)):
+                            # The assistant acted this turn (used a tool) -
+                            # this can no longer be an "eylemden önce ...
+                            # soru sorduğu tur" (§6). Latched, never reset.
+                            any_tool_use = True
                 elif isinstance(message, ResultMessage):
                     if message.is_error:
                         wlog.log("error", "model_call_failed", result=str(message.result))
@@ -446,6 +507,16 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
         )
         return 1
+
+    # W78-07: signal an açıklama-turu (clarification turn) BEFORE the
+    # terminal result line, so kahyad - the sole brain.db writer - can
+    # ledger kind="clarification_turn" for this trace. Emitted only on the
+    # success path (a turn that errored/timed out never reaches here); the
+    # worker only signals, kahyad decides what to persist and stamps its
+    # own trace_id onto the row (the worker never writes the ledger).
+    if _is_clarification_turn("".join(answer_text), any_tool_use):
+        wlog.log("info", "clarification_turn", task_id=envelope.task_id)
+        _print_protocol_line({"event": _CLARIFICATION_TURN_EVENT})
 
     wlog.log("info", "task_done", task_id=envelope.task_id)
     _print_protocol_line({"type": "result", "status": "ok"})

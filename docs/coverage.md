@@ -82,7 +82,7 @@
 | W6: PTT loop 100% local; `⌥⎋` no-continue/no-retry across daemon restart; palette→first-token timestamps in events | W6-04 | covered |
 | W7–8: retrieval precision ≥80% incl. abstention; red-team 0 bypass (dev profile); §5 invariant tests in CI; restore drill once | W78-01, W78-02, W78-03, W78-05 | covered |
 | Backup ⚑ block (git remote + nightly push; `VACUUM INTO` + integrity_check, 7 copies, TM exclusions; Keychain-loss runbook) | W4-06 (+W0-01 remote) | covered |
-| Metric definitions ⚑ + north star (komut/gün, açıklama-turu, p50, hatırladı anı) | W78-04 (reads), W5-03 (remembered-moment emission), W78-06 (gates) | covered |
+| Metric definitions ⚑ + north star (komut/gün, açıklama-turu, p50, hatırladı anı) | W78-04 (reads), W5-03 (remembered-moment emission), W78-07 (clarification-turn emission), W78-06 (gates) | covered |
 | "hatırladı anı" emission: user marks remembered moments, tied to weekly ritual | W5-03 (`🌟 Hatırladı` button on Telegram task/ritual messages + `kahya remembered --trace <id>` → idempotent `remembered_moment` events rows), W78-04 (counts) | covered |
 
 ## §7 Day-1 items
