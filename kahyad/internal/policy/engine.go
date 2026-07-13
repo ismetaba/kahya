@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"kahya/kahyad/internal/canon"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
 )
@@ -952,38 +953,96 @@ type FeedbackResult struct {
 // pending approval exists, it may never itself carry the approval).
 var ErrW3RequiresLocalSurface = errors.New("policy: W3 approval must carry surface=local")
 
-// Approve implements POST /policy/feedback's approve outcome: look up the
+// w3TypedOnayla is the ONE literal word a W3 approval's typed confirmation
+// must equal, byte-exact, after NFC normalization (HANDOFF S5 safety #5 /
+// W6-01's own core invariant, verbatim: not "evet", not "y", not "Onayla",
+// not "onayla" with a stray leading/trailing space, not a homoglyph/bidi
+// variant that merely LOOKS like this word).
+const w3TypedOnayla = "onayla"
+
+// ErrW3RequiresTypedOnayla is returned by Approve when a pending W3
+// approval's typed confirmation text is not byte-exactly w3TypedOnayla
+// after NFC normalization (see isTypedOnayla below). Checked AFTER the
+// surface=="local" check but, like it, BEFORE consumePendingApproval: a
+// wrong-typed attempt must not burn the one-time pending_approval_id, so
+// the SAME id remains retriable with the correct word (mirrors
+// ErrW3RequiresLocalSurface's own pre-consume placement/rationale).
+var ErrW3RequiresTypedOnayla = errors.New("policy: W3 approval requires the typed confirmation word \"onayla\"")
+
+// isTypedOnayla reports whether typed, NFC-normalized, is byte-for-byte
+// equal to w3TypedOnayla. NFC (kahyad/internal/canon.Normalize's NFC
+// field) is used deliberately rather than Canonical (which additionally
+// STRIPS bidi/zero-width/other invisible control code points) - this is
+// the STRICTER of the two comparisons: an invisible code point smuggled
+// into the typed text (e.g. a trailing zero-width space) must still fail
+// this check, not silently canonicalize away into a match. A confusable/
+// homoglyph rune (e.g. Cyrillic "a" in place of Latin "a") is never
+// mapped onto its ASCII look-alike by NFC either, so it also fails this
+// comparison outright, exactly as required.
+func isTypedOnayla(typed string) bool {
+	return canon.Normalize(typed).NFC == w3TypedOnayla
+}
+
+// Approve implements POST /policy/feedback's (and W6-01's POST
+// /approvals/{id}/decision's) approve outcome: look up the
 // pending_approvals row by id (BLOCKER 1 - never trust anything decoded
 // from the id itself), enforce the W3 surface=local hard rule against the
-// ROW's real class, atomically single-use-consume the row (BLOCKER 2 -
-// missing/expired/already-consumed all reject with no token minted), mint
-// a one-time token bound to the row's task_id+approved_bytes_hash, open a
-// W1 undo window (a manually-approved W1 write earns the same 5-minute
-// safety net an auto-allowed one gets), bump consecutive_approvals, and -
-// exactly at the 20th consecutive approval - ledger promotion_suggested
-// (the level itself never changes here; only `kahya autonomy promote`
-// changes it, per HANDOFF S4).
-func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface string) (FeedbackResult, error) {
+// ROW's real class, enforce the W6-01 W3 typed-byte-exact-"onayla" rule
+// (isTypedOnayla - ignored entirely for a non-W3 class, which passes
+// whatever typed happens to be, even ""), atomically single-use-consume
+// the row (BLOCKER 2 - missing/expired/already-consumed all reject with
+// no token minted), mint a one-time token bound to the row's
+// task_id+approved_bytes_hash, open a W1 undo window (a manually-approved
+// W1 write earns the same 5-minute safety net an auto-allowed one gets),
+// bump consecutive_approvals, and - exactly at the 20th consecutive
+// approval - ledger promotion_suggested (the level itself never changes
+// here; only `kahya autonomy promote` changes it, per HANDOFF S4).
+//
+// surface is NEVER read from an HTTP request body by either of this
+// engine's two callers (kahyad/internal/server's handlePolicyFeedback and
+// handleApprovalsDecision) without the caller itself having independently
+// derived it from the CHANNEL the request arrived on (UDS => "local");
+// the Telegram bot (kahyad/internal/telegram) is the one caller that ever
+// passes anything else, and it passes its own hardcoded "telegram"
+// literal, never anything read off the wire either. That is what makes
+// the HANDOFF S5 safety #5 local-surface guarantee unforgeable: there is
+// no code path from an inbound request's OWN claimed surface straight
+// into this parameter.
+func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface, typed string) (FeedbackResult, error) {
 	pa, err := e.getValidPendingApproval(ctx, pendingApprovalID)
 	if err != nil {
 		return FeedbackResult{}, err
 	}
 	class := ActionClass(pa.Class)
 
-	// Checked BEFORE consuming: a W3 pending approval rejected here (wrong
-	// surface) must remain usable for a LATER local approval, not be
-	// burned by the failed attempt.
-	//
-	// Ledger kind is EXACTLY "w3_nonlocal_approval_rejected" (this task's
-	// own spec, verbatim) - Go-side, arrives before W3-07 (Telegram) even
-	// exists, so Telegram can never be wired to approve a W3 action later:
-	// this check runs regardless of which surface ever calls
-	// POST /policy/feedback.
-	if class == ClassW3 && surface != "local" {
-		e.ledgerRaw(ctx, pa.TraceID, "w3_nonlocal_approval_rejected", map[string]any{
-			"event": "w3_nonlocal_approval_rejected", "tool": pa.Tool, "class": class, "scope": pa.Scope, "surface": surface,
-		})
-		return FeedbackResult{}, ErrW3RequiresLocalSurface
+	if class == ClassW3 {
+		// Checked BEFORE consuming: a W3 pending approval rejected here
+		// (wrong surface, or wrong/missing typed confirmation) must remain
+		// usable for a LATER, correct local approval, not be burned by the
+		// failed attempt.
+		//
+		// Ledger kind is EXACTLY "w3_nonlocal_approval_rejected" (this
+		// task's own spec, verbatim) - Go-side, arrives before W3-07
+		// (Telegram) even exists, so Telegram can never be wired to
+		// approve a W3 action later: this check runs regardless of which
+		// surface ever calls POST /policy/feedback or POST
+		// /approvals/{id}/decision.
+		if surface != "local" {
+			e.ledgerRaw(ctx, pa.TraceID, "w3_nonlocal_approval_rejected", map[string]any{
+				"event": "w3_nonlocal_approval_rejected", "tool": pa.Tool, "class": class, "scope": pa.Scope, "surface": surface,
+			})
+			return FeedbackResult{}, ErrW3RequiresLocalSurface
+		}
+		// W6-01: the byte-exact typed-"onayla" gate, enforced HERE
+		// (server-side, authoritative) rather than trusted from any
+		// client-side prompt - a CLI/Hammerspoon-side comparison is UX
+		// only; this is what actually decides.
+		if !isTypedOnayla(typed) {
+			e.ledgerRaw(ctx, pa.TraceID, "w3_invalid_typed_onayla", map[string]any{
+				"event": "w3_invalid_typed_onayla", "tool": pa.Tool, "class": class, "scope": pa.Scope,
+			})
+			return FeedbackResult{}, ErrW3RequiresTypedOnayla
+		}
 	}
 
 	if err := e.consumePendingApproval(ctx, pendingApprovalID); err != nil {
@@ -1165,4 +1224,38 @@ func (e *Engine) GetPendingApprovalDetail(ctx context.Context, id string) (Pendi
 		ToolInput: pa.ToolInput, MintedAt: mintedAt,
 		TraceID: pa.TraceID, TaskID: pa.TaskID,
 	}, nil
+}
+
+// debugEmitApprovalTaskIDPrefix names every pending_approvals row
+// DebugEmitPendingApproval mints, so it is trivially distinguishable from
+// a real tool-triggered one in the ledger/DB.
+const debugEmitApprovalTaskIDPrefix = "debug-emit-approval-"
+
+// DebugEmitPendingApproval mints a synthetic pending_approvals row for
+// class (W2 or W3 only), with no real tool call behind it -
+// `kahya debug emit-approval --class W2|W3`'s server-side call (W6-01).
+// Its ONLY caller, kahyad/internal/server's handleDebugEmitApproval,
+// refuses to reach this at all unless cfg.Env==config.EnvDev - this
+// method itself performs no such check (this package must not import
+// kahyad/internal/config; the env gate lives entirely at the HTTP layer,
+// matching devstub.go's identical "gate at the one call site, not deep in
+// the engine" posture). Exists purely so a developer/reviewer can
+// exercise the Hammerspoon approval-card flow (hs.notify -> Görüntüle ->
+// hs.dialog) end to end without a real W2/W3 tool call to trigger one:
+// the synthetic tool_input renders via renderPendingApproval's generic
+// raw-bytes fallback (kahyad/internal/server/approvals.go) - fine for
+// this purpose, since the point is to exercise the CARD/DECISION
+// plumbing, not to review a real diff. Fires the SAME pendingApprovalHook
+// every real NEEDS_APPROVAL decision does (mintPendingApproval's own doc
+// comment), so both the Telegram and Hammerspoon hooks pop exactly as
+// they would for a real one.
+func (e *Engine) DebugEmitPendingApproval(ctx context.Context, traceID string, class ActionClass) (string, error) {
+	if class != ClassW2 && class != ClassW3 {
+		return "", fmt.Errorf("policy: DebugEmitPendingApproval: class must be W2 or W3, got %q", class)
+	}
+	tool := "debug_emit_" + strings.ToLower(string(class))
+	toolInput := []byte(fmt.Sprintf(`{"debug_emit_approval":true,"class":%q}`, class))
+	hash := approvedBytesHash(toolInput)
+	taskID := debugEmitApprovalTaskIDPrefix + traceID
+	return e.mintPendingApproval(ctx, taskID, traceID, tool, class, defaultScope, hash, toolInput)
 }

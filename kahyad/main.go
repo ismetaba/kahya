@@ -53,6 +53,7 @@ import (
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/telegram"
 	"kahya/kahyad/internal/traceid"
+	"kahya/kahyad/internal/ui"
 	mcpfs "kahya/mcp/fs"
 	mcposascript "kahya/mcp/osascript"
 	mcpshell "kahya/mcp/shell"
@@ -364,13 +365,24 @@ func run() int {
 	// are egress too).
 	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID, APIURL: cfg.TelegramAPIURL}
 	tgBot := telegram.New(tgCfg, buildTelegramTokenSource(cfg, log), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
+
+	// W6-01: the Hammerspoon CLI exec bridge - kahyad's LOCAL approval-card
+	// and background/scheduled-task-notification surface (HANDOFF §4 IPC
+	// ⚑: "yerelde Hammerspoon hs.notify ... arka-plan görev sonuçları aynı
+	// kanaldan trace_id ile döner"). localDelivery fans a
+	// SendNotification call out to BOTH tgBot (remote) and hsCli (local) -
+	// see kahyad/internal/ui.FanOutDelivery's own doc comment.
+	hsCli := ui.New(cfg.HsCliPath, log)
+	localDelivery := ui.FanOutDelivery{Primary: tgBot, Local: hsCli}
+
 	policyEngine.SetPendingApprovalHook(func(info policy.PendingApprovalInfo) {
 		// Fired synchronously from inside Check/Approve's own request path
 		// (kahyad/internal/policy.Engine.pendingApprovalHook's doc
-		// comment) - the actual Telegram send happens in its own
-		// goroutine so a slow/blocked send can never delay a policy
-		// decision.
+		// comment) - the actual Telegram/Hammerspoon sends each happen in
+		// their own goroutine so a slow/blocked send can never delay a
+		// policy decision.
 		go tgBot.OnPendingApproval(context.Background(), info)
+		go hsCli.ShowApproval(context.Background(), info.TraceID, info.ID)
 	})
 	log.Info("telegram_bot_wired", "enabled", tgBot.Enabled())
 
@@ -782,7 +794,8 @@ func run() int {
 				return srv.NewTaskProxy(taskID, traceID)
 			},
 		},
-		Delivery:  tgBot,
+		// W6-01: fans out to both Telegram (remote) and Hammerspoon (local) - see localDelivery's own doc comment above.
+		Delivery:  localDelivery,
 		TaskStore: st.Queries,
 		Ledger:    st,
 		Dedupe:    briefing.StoreDedupeChecker{Store: st.Queries},
@@ -818,8 +831,9 @@ func run() int {
 				return srv.NewTaskProxy(taskID, traceID)
 			},
 		}},
-		Local:       consolidation.LocalSession{Sup: qwenSup, Model: cfg.QwenModelName},
-		Notifier:    tgBot,
+		Local: consolidation.LocalSession{Sup: qwenSup, Model: cfg.QwenModelName},
+		// W6-01: fans out to both Telegram (remote) and Hammerspoon (local) - see localDelivery's own doc comment above.
+		Notifier:    localDelivery,
 		EventLogger: st,
 		EventReader: consolidation.StoreEventReader{Q: st.Queries},
 		Reindexer:   reindexBackfiller,

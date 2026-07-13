@@ -34,7 +34,7 @@ func TestApproveW3NonLocalSurfaceRejected(t *testing.T) {
 		t.Fatalf("Check(mail_send/W3) = %+v, want NEEDS_APPROVAL with a pending id", d)
 	}
 
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "telegram"); err != ErrW3RequiresLocalSurface {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "telegram", ""); err != ErrW3RequiresLocalSurface {
 		t.Fatalf("Approve(surface=telegram) on a W3 payload: err = %v, want ErrW3RequiresLocalSurface", err)
 	}
 	if n := countEvents(t, st, "w3_nonlocal_approval_rejected"); n != 1 {
@@ -46,7 +46,7 @@ func TestApproveW3NonLocalSurfaceRejected(t *testing.T) {
 
 	// The SAME id must still be approvable from the local surface - the
 	// rejected remote attempt did not consume it.
-	res, err := e.Approve(ctx, d.PendingApprovalID, "local")
+	res, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla")
 	if err != nil {
 		t.Fatalf("Approve(surface=local) after a rejected remote attempt: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestApproveW3LocalSurfaceSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "local"); err != nil {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla"); err != nil {
 		t.Fatalf("Approve(surface=local): %v", err)
 	}
 	if n := countEvents(t, st, "w3_nonlocal_approval_rejected"); n != 0 {
@@ -104,7 +104,7 @@ func TestApproveTelegramSurfaceLabeledRemote(t *testing.T) {
 	if d.Result != ResultNeedsApproval {
 		t.Fatalf("Check = %+v, want NEEDS_APPROVAL", d)
 	}
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "telegram"); err != nil {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "telegram", ""); err != nil {
 		t.Fatalf("Approve(surface=telegram): %v", err)
 	}
 
@@ -133,7 +133,7 @@ func TestApproveLocalSurfaceNotLabeledRemote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "local"); err != nil {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla"); err != nil {
 		t.Fatalf("Approve(surface=local): %v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestListPendingApprovals(t *testing.T) {
 		t.Fatalf("ListPendingApprovals ToolInput = %q, want %q", got.ToolInput, toolInput)
 	}
 
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "local"); err != nil {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla"); err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
 	list, err = e.ListPendingApprovals(ctx)
@@ -213,7 +213,7 @@ func TestGetPendingApprovalDetailDoesNotConsume(t *testing.T) {
 		}
 	}
 
-	if _, err := e.Approve(ctx, d.PendingApprovalID, "local"); err != nil {
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla"); err != nil {
 		t.Fatalf("Approve after two detail lookups: %v", err)
 	}
 }

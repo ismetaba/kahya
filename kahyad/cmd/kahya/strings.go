@@ -303,4 +303,43 @@ const (
 	// MsgEvalMiniFirstRun is printed instead of a regression verdict when
 	// no prior eval.mini.run event exists yet (nothing to compare against).
 	MsgEvalMiniFirstRun = "İlk çalıştırma - karşılaştırılacak önceki sonuç yok."
+
+	// ---- W6-01: kahya approvals list|show|decide, kahya debug emit-approval ----
+
+	// MsgApprovalsUsage is printed when `kahya approvals` is given an
+	// unrecognized subcommand (anything other than "list"/"show"/"decide",
+	// or no args at all - which is still valid, the bare pre-W6-01 list
+	// form). Exit 2.
+	MsgApprovalsUsage = "kullanım: kahya approvals [list|show <id> [--json]|decide <id> (--approve --typed <metin> | --reject)]"
+
+	// MsgApprovalsShowUsage is printed when `kahya approvals show` is
+	// given anything other than exactly one positional argument (the
+	// pending approval id). Exit 2.
+	MsgApprovalsShowUsage = "kullanım: kahya approvals show <id> [--json]"
+
+	// MsgApprovalsDecideUsage is printed when `kahya approvals decide` is
+	// given anything other than exactly one positional argument plus
+	// exactly one of --approve/--reject (both or neither is a usage
+	// error) - the non-interactive counterpart to `kahya approve <id>`'s
+	// own stdin prompt, driven by Hammerspoon's approval cards
+	// (hammerspoon/kahya.lua). Exit 2.
+	MsgApprovalsDecideUsage = "kullanım: kahya approvals decide <id> (--approve --typed <metin> | --reject)"
+
+	// MsgDebugUsage is printed when `kahya debug` is given anything other
+	// than a recognized subcommand ("emit-approval"). Exit 2.
+	MsgDebugUsage = "kullanım: kahya debug emit-approval --class W2|W3"
+
+	// MsgDebugEmitApprovalUsage is printed when `kahya debug emit-approval`
+	// is given anything other than exactly --class W2|W3. Exit 2.
+	MsgDebugEmitApprovalUsage = "kullanım: kahya debug emit-approval --class W2|W3"
+
+	// MsgDebugEmitApprovalRefusedLocal is the CLI-side (client-side, UX-
+	// only - kahyad enforces the authoritative check server-side, see
+	// kahyad/internal/server.MsgDebugEmitApprovalRefused) refusal printed
+	// when KAHYA_ENV is not "dev". Exit 1.
+	MsgDebugEmitApprovalRefusedLocal = "kahya debug emit-approval yalnızca KAHYA_ENV=dev altında kullanılabilir."
+
+	// MsgDebugEmitApprovalCreated is `kahya debug emit-approval`'s success
+	// line (%s = the freshly minted pending_approval_id).
+	MsgDebugEmitApprovalCreated = "Sahte onay oluşturuldu: %s (kahya approvals list ile görün)"
 )

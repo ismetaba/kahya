@@ -150,10 +150,14 @@ func TestPolicyFeedback_W3RefusesNonLocalSurface(t *testing.T) {
 
 	var approved policyFeedbackResponse
 	postJSON(t, f.client, "/policy/feedback", map[string]any{
-		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local",
+		// W6-01: a W3 approve now additionally requires the byte-exact
+		// typed confirmation "onayla" (kahyad/internal/policy.Engine.
+		// Approve's own doc comment) - surface=local alone is no longer
+		// sufficient.
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
 	}, &approved)
 	if !approved.OK || approved.Token == "" {
-		t.Fatalf("approve(surface=local) = %+v, want ok with a token", approved)
+		t.Fatalf("approve(surface=local, typed=onayla) = %+v, want ok with a token", approved)
 	}
 }
 

@@ -260,7 +260,12 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	var suffix, toast string
 	switch action {
 	case cbActionApprove:
-		_, feedbackErr = b.engine.Approve(context.Background(), id, "telegram")
+		// typed="" - Telegram never sends a W3 approval button at all (W3
+		// is notify-only, see OnPendingApproval's own switch above), so this
+		// call only ever reaches the engine's typed-onayla check for a
+		// forged callback on a W3 id - which the surface!="local" check
+		// above it rejects first regardless of typed's value.
+		_, feedbackErr = b.engine.Approve(context.Background(), id, "telegram", "")
 		suffix, toast = suffixApproved, toastApproved
 	case cbActionDeny:
 		feedbackErr = b.engine.Deny(context.Background(), id)

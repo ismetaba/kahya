@@ -359,6 +359,12 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/policy/consume-token", s.handlePolicyConsumeToken)
 	mux.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
 	mux.HandleFunc("/policy/approvals", s.handlePolicyApprovals)
+	// W6-01: the Hammerspoon-facing approval routes (hammerspoon/kahya.lua,
+	// kahyad/cmd/kahya's `kahya approvals show|decide`) — see
+	// approvals_decision.go's own package doc comment.
+	mux.HandleFunc("GET /approvals/pending", s.handleApprovalsPending)
+	mux.HandleFunc("POST /approvals/{id}/decision", s.handleApprovalsDecision)
+	mux.HandleFunc("POST /debug/emit-approval", s.handleDebugEmitApproval)
 	mux.HandleFunc("/policy/state", s.handlePolicyState)
 	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
 	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)

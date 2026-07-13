@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"kahya/kahyad/internal/anthproxy"
@@ -267,6 +268,18 @@ type taskRequest struct {
 	// itself (never client-side), so it needs no request-body field of its
 	// own.
 	DeepThink bool `json:"deep_think"`
+	// PaletteOpenedAt is W6-01's `kahya ask --palette-opened-at
+	// <unix-seconds-float>` flag / hammerspoon/kahya.lua's
+	// hs.timer.secondsSinceEpoch(), captured at hotkey press (BEFORE the
+	// palette's own hs.chooser even opens). When present, handleTask
+	// ledgers a kind="palette_open" event carrying this exact value in its
+	// payload, under this task's own trace_id (logPaletteOpen) - the
+	// north-star "palet-aç→ilk-token" metric's start timestamp (HANDOFF §6
+	// metric definitions ⚑; the metric QUERY itself is W78-04, this task
+	// only records the two timestamps). Optional/backward-compatible:
+	// absent (nil) is every pre-W6-01 request body's exact existing
+	// behavior - no palette_open event is ever written for it.
+	PaletteOpenedAt *float64 `json:"palette_opened_at,omitempty"`
 }
 
 // rfc3339Now is time.Now().UTC() formatted as plain RFC3339 (no
@@ -407,6 +420,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	taskID := spawn.NewTaskID()
 	now := rfc3339Now()
+
+	// W6-01: record palette_open as early as possible - before
+	// classification, envelope construction, or any worker/proxy exists
+	// for this task - so its own timestamp reflects the ACTUAL hotkey-press
+	// moment (req.PaletteOpenedAt) rather than anything this handler itself
+	// does. Applies uniformly to every lane (cloud AND secret) since both
+	// paths share this one call site.
+	if req.PaletteOpenedAt != nil {
+		s.logPaletteOpen(dbCtx, traceID, taskID, *req.PaletteOpenedAt)
+	}
 
 	// W3-08: classify BEFORE the envelope/task row are ever constructed -
 	// the ordering invariant's strongest possible form: there is no
@@ -722,6 +745,15 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		defer s.taskLiveRegistry.Unregister(taskID)
 	}
 
+	// W6-01: first_token fires at most ONCE per task, on the FIRST OnDelta
+	// callback below (the W12-08 forward-proxy path - see logFirstToken's
+	// own doc comment) - a sync.Once rather than a plain bool guard since
+	// nothing in this package promises OnDelta is invoked from only one
+	// goroutine (spawn.Run's own contract does not make that guarantee
+	// explicit), and firing this twice would be a spurious extra ledger
+	// row, not a security issue, but is still avoided.
+	var firstTokenOnce sync.Once
+
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
 		OnStart: func(pid int) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
@@ -730,6 +762,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		OnDelta: func(text string) {
+			firstTokenOnce.Do(func() { s.logFirstToken(persistCtx, traceID, taskID) })
 			writeSSE("delta", map[string]string{"text": text})
 		},
 		OnSession: func(sessionID string) {
@@ -851,6 +884,56 @@ func (s *Server) taskDurabilityStatus(ctx context.Context, taskID string) (strin
 	return t.Status, nil
 }
 
+// logPaletteOpen implements W6-01: ledger a kind="palette_open" event
+// under traceID/taskID, carrying paletteOpenedAt (the RAW unix-seconds
+// float the client sent, e.g. hammerspoon/kahya.lua's
+// hs.timer.secondsSinceEpoch() captured at hotkey press) in its payload -
+// the north-star "palet-aç→ilk-token" metric's start timestamp (HANDOFF §6
+// metric definitions ⚑). This event's own events.ts column is left at
+// LogEvent's ordinary "now" (the moment this line of Go code runs, i.e.
+// very early in handleTask) rather than being backdated to
+// paletteOpenedAt itself - the payload is where the ACTUAL captured
+// timestamp lives (for W78-04's later metric query to read); the ts
+// column stays on this codebase's one universal "ledger rows are stamped
+// with wall-clock write time" convention, which is also what keeps
+// first_token.ts >= palette_open.ts trivially true by construction (both
+// are logged in strict program order within this same request). Best-
+// effort: a ledger failure here must never abort task dispatch.
+func (s *Server) logPaletteOpen(ctx context.Context, traceID, taskID string, paletteOpenedAt float64) {
+	if s.eventLogger == nil {
+		return
+	}
+	if err := s.eventLogger.LogEvent(ctx, traceID, "palette_open", map[string]any{
+		"task_id": taskID, "palette_opened_at": paletteOpenedAt,
+	}); err != nil {
+		s.log.With(traceID).Warn("palette_open_ledger_error", "err", err.Error())
+	}
+}
+
+// logFirstToken implements W6-01: ledger a kind="first_token" event under
+// traceID/taskID at the FIRST point kahyad relays this task's streamed
+// model output - handleTask's own OnDelta callback (the W12-08 forward
+// proxy path: every cloud AND stub-model task's deltas flow through
+// spawn.Run's stdout-relay, which itself only ever carries bytes the
+// worker received via that per-task proxy listener) and
+// finishSecretLaneTask's own answer relay (the W3-08 secret-lane LOCAL
+// path) both call this exactly once per task - see each call site's own
+// doc comment for why calling this more than once per task would still be
+// harmless (an append-only ledger tolerates it) but is avoided anyway
+// (sync.Once at the OnDelta call site; finishSecretLaneTask's own success
+// branch runs at most once by construction). Best-effort: a ledger
+// failure here must never abort delta relay.
+func (s *Server) logFirstToken(ctx context.Context, traceID, taskID string) {
+	if s.eventLogger == nil {
+		return
+	}
+	if err := s.eventLogger.LogEvent(ctx, traceID, "first_token", map[string]any{
+		"task_id": taskID,
+	}); err != nil {
+		s.log.With(traceID).Warn("first_token_ledger_error", "err", err.Error())
+	}
+}
+
 // handleSecretLaneTask answers a lane=="secret" task entirely via
 // s.secretLaneAnswerer (kahyad/internal/secretlane.Answerer, the local
 // Qwen3-30B-A3B server) - see handleTask's own call-site comment for why
@@ -938,6 +1021,16 @@ func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logg
 		}
 	}
 	log.Info("task_done", "task_id", taskID, "processed_locally", true)
+
+	// W6-01: first_token's OTHER relay point (see logFirstToken's own doc
+	// comment) - the W3-08 secret-lane LOCAL path. mlx_lm.server's
+	// non-streaming response arrives as one complete string, so this is
+	// the first (and only) point kahyad relays this task's model output at
+	// all; called unconditionally, exactly once, on this success branch
+	// (finishSecretLaneTask itself runs at most once per task - no
+	// sync.Once needed here, unlike the cloud/stub OnDelta call site,
+	// which can fire multiple times per task).
+	s.logFirstToken(persistCtx, traceID, taskID)
 
 	writeSSE("delta", map[string]string{"text": answer})
 	// processed_locally: true is the task spec's own CLI-badge field

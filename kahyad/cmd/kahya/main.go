@@ -56,7 +56,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "undo":
 		return runUndo(client, args[1:], stdout, stderr)
 	case "approvals":
-		return runApprovals(client, stdout, stderr)
+		return runApprovals(client, args[1:], stdout, stderr)
+	case "debug":
+		return runDebug(client, args[1:], stdout, stderr)
 	case "approve":
 		return runApprove(client, args[1:], stdin, stdout, stderr)
 	case "task":
@@ -92,19 +94,24 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	traceID := traceid.New()
-	return execTask(client, traceID, prompt, false, stdout, stderr)
+	return execTask(client, traceID, prompt, false, nil, stdout, stderr)
 }
 
-// runAsk implements `kahya ask [--derin] <question...>` (W4-08): the SAME
-// one-shot task execution as runOneShot, plus the --derin flag that pins
-// claude-fable-5 ("derin düşün" opt-in) via envelope.deep_think. The OTHER
-// opt-in form - the byte-exact Turkish prompt prefix "derin düşün:" - needs
-// no flag at all; it is detected server-side regardless of which CLI
-// subcommand sent the prompt.
+// runAsk implements `kahya ask [--derin] [--palette-opened-at <unix-
+// seconds-float>] <question...>` (W4-08 + W6-01): the SAME one-shot task
+// execution as runOneShot, plus the --derin flag that pins claude-fable-5
+// ("derin düşün" opt-in) via envelope.deep_think, plus --palette-opened-at
+// (W6-01: hammerspoon/kahya.lua's own call into this subcommand, carrying
+// hs.timer.secondsSinceEpoch() captured at hotkey press - never something
+// a human types themselves). The OTHER --derin opt-in form - the
+// byte-exact Turkish prompt prefix "derin düşün:" - needs no flag at all;
+// it is detected server-side regardless of which CLI subcommand sent the
+// prompt.
 func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
+	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -114,16 +121,37 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	traceID := traceid.New()
-	return execTask(client, traceID, prompt, *derin, stdout, stderr)
+	var palette *float64
+	if isFlagPassed(fs, "palette-opened-at") {
+		palette = paletteOpenedAt
+	}
+	return execTask(client, traceID, prompt, *derin, palette, stdout, stderr)
+}
+
+// isFlagPassed reports whether name was EXPLICITLY set on fs's command
+// line (as opposed to merely holding its zero-value default) -
+// --palette-opened-at 0 (an explicit, if unusual, timestamp of the Unix
+// epoch) must still be forwarded as non-nil, which a bare
+// `*paletteOpenedAt != 0` check would incorrectly treat as "flag absent".
+func isFlagPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 // execTask runs one task to completion: POST /v1/task, stream delta text
 // to stdout, print the trace footer to stderr, and return the exit code
 // (W12-06 step 2: 0 on result.status=="ok", 1 on error, 2 on any transport
 // failure - dial failure or, until W12-07 lands, /v1/task's current 404).
-// deepThink is W4-08's --derin/deep_think opt-in.
-func execTask(client *Client, traceID, prompt string, deepThink bool, stdout, stderr io.Writer) int {
-	res, err := client.StreamTask(context.Background(), traceID, prompt, deepThink, func(text string) {
+// deepThink is W4-08's --derin/deep_think opt-in; paletteOpenedAt is
+// W6-01's `kahya ask --palette-opened-at` opt-in (nil for every other
+// caller - runOneShot, the REPL).
+func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, stdout, stderr io.Writer) int {
+	res, err := client.StreamTaskFull(context.Background(), traceID, prompt, deepThink, paletteOpenedAt, func(text string) {
 		fmt.Fprint(stdout, text)
 	})
 	if err != nil {
@@ -172,7 +200,7 @@ func runREPL(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 			break
 		}
 		if line != "" {
-			execTask(client, traceid.New(), line, false, stdout, stderr)
+			execTask(client, traceid.New(), line, false, nil, stdout, stderr)
 		}
 		if err != nil {
 			break // EOF right after a final, newline-less line
@@ -619,12 +647,35 @@ func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// runApprovals implements `kahya approvals` (W3-06): GET /policy/approvals,
+// runApprovals implements `kahya approvals [list|show <id> [--json]|decide
+// <id> (--approve --typed <s> | --reject)]` (W3-06 + W6-01). No args (or
+// "list") is the pre-existing bare-list form: GET /policy/approvals,
 // printed one line per pending approval (id, tool, class, summary, age) -
 // kahyad/internal/approval.FormatApprovalsList is the SAME formatter the
-// task spec calls for, shared with (a future) W3-07 Telegram listing
-// rather than a second hand-rolled Printf here.
-func runApprovals(client *Client, stdout, stderr io.Writer) int {
+// task spec calls for, shared with the W3-07 Telegram listing rather than
+// a second hand-rolled Printf here. "show"/"decide" are W6-01's
+// NON-INTERACTIVE additions (hammerspoon/kahya.lua's approval cards drive
+// these - see runApprovalsShow/runApprovalsDecide's own doc comments);
+// `kahya approve <id>`'s own interactive stdin-prompt flow is unchanged
+// and unaffected by either.
+func runApprovals(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		return runApprovalsList(client, stdout, stderr)
+	}
+	switch args[0] {
+	case "list":
+		return runApprovalsList(client, stdout, stderr)
+	case "show":
+		return runApprovalsShow(client, args[1:], stdout, stderr)
+	case "decide":
+		return runApprovalsDecide(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgApprovalsUsage)
+		return 2
+	}
+}
+
+func runApprovalsList(client *Client, stdout, stderr io.Writer) int {
 	rows, err := client.ListApprovals(context.Background(), traceid.New())
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
@@ -642,6 +693,138 @@ func runApprovals(client *Client, stdout, stderr io.Writer) int {
 		}
 	}
 	fmt.Fprint(stdout, approval.FormatApprovalsList(items))
+	return 0
+}
+
+// runApprovalsShow implements `kahya approvals show <id> [--json]`
+// (W6-01): GET /policy/approvals?id=<id>'s byte-exact rendered diff,
+// printed WITHOUT any decision prompt - a non-interactive counterpart to
+// `kahya approve <id>`'s own diff-then-prompt flow. hammerspoon/kahya.lua's
+// kahyaShowApproval(id) shells out to `kahya approvals show <id> --json`
+// to fetch the diff it displays in its own hs.dialog surface.
+func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("approvals show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	asJSON := fs.Bool("json", false, "makine-okur JSON çıktısı")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		fmt.Fprintln(stderr, MsgApprovalsShowUsage)
+		return 2
+	}
+	id := strings.TrimSpace(rest[0])
+
+	detail, err := client.GetApproval(context.Background(), traceid.New(), id)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	if *asJSON {
+		if err := json.NewEncoder(stdout).Encode(map[string]string{
+			"id": detail.ID, "tool": detail.Tool, "class": detail.Class,
+			"scope": detail.Scope, "rendered": detail.Rendered,
+		}); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		return 0
+	}
+	fmt.Fprintln(stdout, detail.Rendered)
+	return 0
+}
+
+// runApprovalsDecide implements `kahya approvals decide <id> (--approve
+// --typed <s> | --reject)` (W6-01): the non-interactive counterpart to
+// `kahya approve <id>`'s own stdin-prompt flow - hammerspoon/kahya.lua's
+// approval cards (hs.dialog.blockAlert/textPrompt) already collected the
+// human's decision/typed text themselves, so this subcommand takes it as
+// flags instead of reading stdin. Calls POST /approvals/{id}/decision
+// (kahyad/cmd/kahya's own client.ApprovalDecision) - NOT POST
+// /policy/feedback - so no surface field is ever sent on the wire at all;
+// kahyad stamps surface="local" itself, purely from the UDS channel. typed
+// is forwarded verbatim for kahyad's AUTHORITATIVE server-side W3
+// byte-exact "onayla" check; this subcommand performs no client-side
+// comparison of its own.
+func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("approvals decide", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	approveFlag := fs.Bool("approve", false, "onayla")
+	rejectFlag := fs.Bool("reject", false, "reddet")
+	typed := fs.String("typed", "", "W3 için yazılı onay metni")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" || *approveFlag == *rejectFlag {
+		fmt.Fprintln(stderr, MsgApprovalsDecideUsage)
+		return 2
+	}
+	id := strings.TrimSpace(rest[0])
+	traceID := traceid.New()
+
+	if *rejectFlag {
+		if _, err := client.ApprovalDecision(context.Background(), traceID, id, false, ""); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		fmt.Fprintln(stdout, MsgApprovalDenied)
+		return 1
+	}
+
+	if _, err := client.ApprovalDecision(context.Background(), traceID, id, true, *typed); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, MsgApprovalApproved)
+	return 0
+}
+
+// runDebug implements `kahya debug emit-approval --class W2|W3` (W6-01).
+func runDebug(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgDebugUsage)
+		return 2
+	}
+	switch args[0] {
+	case "emit-approval":
+		return runDebugEmitApproval(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgDebugUsage)
+		return 2
+	}
+}
+
+// runDebugEmitApproval implements `kahya debug emit-approval --class
+// W2|W3` (W6-01): mints a synthetic pending approval purely so a
+// developer/reviewer can exercise the Hammerspoon approval-card flow end
+// to end. Refuses locally (client-side UX only) unless KAHYA_ENV=dev is
+// set in THIS process's own environment; kahyad itself refuses (403)
+// independently and authoritatively regardless of what this check does
+// (kahyad/internal/server.MsgDebugEmitApprovalRefused).
+func runDebugEmitApproval(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("debug emit-approval", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	class := fs.String("class", "", "W2 veya W3")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *class != "W2" && *class != "W3" {
+		fmt.Fprintln(stderr, MsgDebugEmitApprovalUsage)
+		return 2
+	}
+	if os.Getenv("KAHYA_ENV") != "dev" {
+		fmt.Fprintln(stderr, MsgDebugEmitApprovalRefusedLocal)
+		return 1
+	}
+
+	id, err := client.DebugEmitApproval(context.Background(), traceid.New(), *class)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgDebugEmitApprovalCreated+"\n", id)
 	return 0
 }
 
@@ -672,8 +855,22 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 
 	r := bufio.NewReader(stdin)
 	var decision approval.Decision
+	// typed carries the RAW text read for a W3 prompt, forwarded to
+	// kahyad below as PolicyFeedback's own typed argument - the engine's
+	// server-side byte-exact "onayla" check (kahyad/internal/policy.
+	// Engine.Approve) is the AUTHORITATIVE one; this CLI's own
+	// approval.PromptLiteral comparison is UX only (an immediate local
+	// rejection without a round trip for the common "evet"/"y" mistakes).
+	var typed string
 	if detail.Class == "W3" {
-		decision, err = approval.PromptLiteral(r, stdout, PromptW3Literal, "onayla")
+		typed, err = approval.ReadTrimmedLine(r, stdout, PromptW3Literal)
+		if err == nil {
+			if typed == "onayla" {
+				decision = approval.DecisionApprove
+			} else {
+				decision = approval.DecisionDeny
+			}
+		}
 	} else {
 		decision, err = approval.PromptYesNo(r, stdout, PromptW1W2YesNo, "e", "evet")
 	}
@@ -683,7 +880,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 	}
 
 	if decision != approval.DecisionApprove {
-		if _, err := client.PolicyFeedback(context.Background(), traceID, "deny", id, ""); err != nil {
+		if _, err := client.PolicyFeedback(context.Background(), traceID, "deny", id, "", ""); err != nil {
 			fmt.Fprintln(stderr, err.Error())
 			return 2
 		}
@@ -691,7 +888,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 		return 1
 	}
 
-	if _, err := client.PolicyFeedback(context.Background(), traceID, "approve", id, "local"); err != nil {
+	if _, err := client.PolicyFeedback(context.Background(), traceID, "approve", id, "local", typed); err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return 2
 	}

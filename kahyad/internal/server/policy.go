@@ -89,8 +89,25 @@ type policyFeedbackRequest struct {
 	PendingApprovalID string `json:"pending_approval_id,omitempty"`
 	// Surface must be "local" for a W3-class pending approval (HANDOFF §5
 	// safety #5: Telegram may notify, never approve, a W3 action) -
-	// enforced in kahyad/internal/policy.Engine.Approve, not here.
+	// enforced in kahyad/internal/policy.Engine.Approve, not here. This is
+	// this route's pre-existing (pre-W6-01) wire shape, kept unchanged for
+	// the CLI's own `kahya approve <id>` caller (kahyad/cmd/kahya's
+	// runApprove, which sends the literal "local" for its own approve
+	// calls, exactly as it always has) - W6-01's NEW POST
+	// /approvals/{id}/decision route (kahyad/internal/server/
+	// approvals_decision.go) is the one that structurally cannot forge
+	// this field at all (no Surface field on that route's own request
+	// struct); this pre-existing route is not rewired to match, per this
+	// task's own scope.
 	Surface string `json:"surface,omitempty"`
+	// Typed is W6-01's addition: the exact text a human typed into a W3
+	// approval's confirmation prompt, forwarded here so
+	// kahyad/internal/policy.Engine.Approve can verify it server-side
+	// (byte-exact "onayla" after NFC normalization) - the authoritative
+	// check; kahyad/cmd/kahya's own client-side comparison before ever
+	// sending this is UX only. Ignored entirely for a non-W3 pending
+	// approval.
+	Typed   string `json:"typed,omitempty"`
 	TraceID string `json:"trace_id,omitempty"` // required for kind="undo"
 }
 
@@ -116,7 +133,7 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Kind {
 	case "approve":
-		result, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, req.Surface)
+		result, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, req.Surface, req.Typed)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: err.Error()})
 			return

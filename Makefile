@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 sandbox-image docker-up
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 sandbox-image docker-up hammerspoon-install
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -222,6 +222,23 @@ install-agent: build
 uninstall-agent:
 	-launchctl bootout gui/$$(id -u)/com.kahya.kahyad
 	rm -f "$(LAUNCH_AGENTS_DIR)/$(PLIST_NAME)"
+# hammerspoon-install (W6-01): copies hammerspoon/kahya.lua ->
+# ~/.hammerspoon/kahya.lua, substituting the @KAHYA_BIN@ placeholder with
+# the ABSOLUTE path of the built `kahya` CLI ($(abspath bin/kahya) -
+# hs.task cannot PATH-resolve a bare command name, Hammerspoon's GUI launch
+# environment has no shell PATH at all), then appends `require("kahya")`
+# to ~/.hammerspoon/init.lua if not already present (creating init.lua
+# first if it doesn't exist yet). Depends on `build` so bin/kahya actually
+# exists before its path is baked into the installed Lua file.
+hammerspoon-install: build
+	mkdir -p "$(HOME)/.hammerspoon"
+	sed -e 's#@KAHYA_BIN@#$(abspath bin/kahya)#g' \
+		hammerspoon/kahya.lua > "$(HOME)/.hammerspoon/kahya.lua"
+	touch "$(HOME)/.hammerspoon/init.lua"
+	grep -qxF 'require("kahya")' "$(HOME)/.hammerspoon/init.lua" || \
+		echo 'require("kahya")' >> "$(HOME)/.hammerspoon/init.lua"
+	@echo "installed: $(HOME)/.hammerspoon/kahya.lua (kahya bin: $(abspath bin/kahya))"
+	@echo "reload Hammerspoon's config (menu bar icon -> Reload Config) to pick it up"
 # accept-w12: the W1-2 LIVE acceptance gate (W12-10). Unlike `test`'s
 # hermetic e2e gate (mock Anthropic server, throwaway fixture corpus), this
 # runs against a REAL already-running kahyad (launchd `make install-agent`

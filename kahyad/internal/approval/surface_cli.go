@@ -45,22 +45,39 @@ func PromptYesNo(r *bufio.Reader, w io.Writer, prompt string, yesWords ...string
 	return DecisionDeny, nil
 }
 
-// PromptLiteral writes prompt to w, reads one line from r, and reports
-// DecisionApprove iff the response is EXACTLY literal, byte-for-byte and
-// CASE-SENSITIVE, after stripping only the trailing line-framing bytes a
-// terminal/pipe always adds ("\n", then one "\r") — never any OTHER
-// whitespace (HANDOFF §5 safety #5 / this task's spec: W3 accepts nothing
-// but the literally typed word "onayla" — not "evet", not "y", not
-// "Onayla", and not " onayla"/"onayla " with stray whitespace either).
-// Fail-closed identically to PromptYesNo on a broken input stream.
-func PromptLiteral(r *bufio.Reader, w io.Writer, prompt, literal string) (Decision, error) {
+// ReadTrimmedLine writes prompt to w, reads one line from r, and returns
+// it with only the trailing line-framing bytes a terminal/pipe always
+// adds stripped ("\n", then one "\r") — never any OTHER whitespace. This
+// is PromptLiteral's own reading mechanics, factored out so a caller that
+// ALSO needs the raw typed text itself (not just an approve/deny
+// Decision) can get it — W6-01's `kahya approve <id>` W3 gate forwards
+// this exact text to kahyad/internal/policy.Engine.Approve's own
+// server-side byte-exact "onayla" check (the authoritative verification;
+// this package's own comparison, via PromptLiteral below, is CLI-side UX
+// only). Fail-closed identically to PromptYesNo/PromptLiteral on a broken
+// input stream: an error with no bytes at all read returns ("", err).
+func ReadTrimmedLine(r *bufio.Reader, w io.Writer, prompt string) (string, error) {
 	fmt.Fprint(w, prompt)
 	line, err := r.ReadString('\n')
 	if err != nil && line == "" {
-		return DecisionDeny, err
+		return "", err
 	}
 	line = strings.TrimSuffix(line, "\n")
 	line = strings.TrimSuffix(line, "\r")
+	return line, nil
+}
+
+// PromptLiteral reports DecisionApprove iff the response ReadTrimmedLine
+// collects is EXACTLY literal, byte-for-byte and CASE-SENSITIVE (HANDOFF
+// §5 safety #5 / this task's spec: W3 accepts nothing but the literally
+// typed word "onayla" — not "evet", not "y", not "Onayla", and not
+// " onayla"/"onayla " with stray whitespace either). Fail-closed
+// identically to PromptYesNo on a broken input stream.
+func PromptLiteral(r *bufio.Reader, w io.Writer, prompt, literal string) (Decision, error) {
+	line, err := ReadTrimmedLine(r, w, prompt)
+	if err != nil {
+		return DecisionDeny, err
+	}
 	if line == literal {
 		return DecisionApprove, nil
 	}

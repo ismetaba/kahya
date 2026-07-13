@@ -433,6 +433,26 @@ type Config struct {
 	RitualWeeklyWeekday int `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour    int `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute  int `yaml:"ritual_weekly_minute"`
+
+	// --- W6-01 Hammerspoon palette + local approval cards ---
+
+	// HsCliPath is config key `ui.hs_cli` (task spec, verbatim key name;
+	// flattened to this codebase's usual lower_snake_case single-namespace
+	// convention as ui_hs_cli - matching TaskRetryW1MaxAuto's own doc
+	// comment on why a dotted-looking spec key becomes one flat field
+	// here): the absolute path to the Hammerspoon `hs` CLI
+	// (kahyad/internal/ui.HSCli execs this) kahyad shells out to for (a)
+	// every freshly minted pending_approvals row's approval card
+	// (kahyad/internal/policy.Engine's SetPendingApprovalHook, wired in
+	// main.go) and (b) the generic background/scheduled-task notification
+	// path (kahyad/internal/ui.HSCli.SendNotification). Default
+	// "/opt/homebrew/bin/hs" (Apple Silicon Homebrew prefix, matching
+	// hammerspoon/kahya.lua's hs.ipc.cliInstall("/opt/homebrew") call -
+	// see kahyad/internal/ui.DefaultHsCliPath, which duplicates this exact
+	// literal by hand, mirroring kahyad/internal/anthproxy's
+	// CredentialMode constants' identical "keep two packages' literals in
+	// sync by hand rather than take a cross-package import" precedent).
+	HsCliPath string `yaml:"ui_hs_cli"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -527,6 +547,7 @@ type fileConfig struct {
 	RitualWeeklyWeekday           *int         `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int         `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute            *int         `yaml:"ritual_weekly_minute"`
+	HsCliPath                     *string      `yaml:"ui_hs_cli"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -869,6 +890,9 @@ func defaults(home, env string) Config {
 		RitualWeeklyWeekday: defaultRitualWeekday,
 		RitualWeeklyHour:    defaultRitualWeeklyHour,
 		RitualWeeklyMinute:  defaultRitualWeeklyMinute,
+
+		// W6-01 Hammerspoon palette default (task spec, verbatim).
+		HsCliPath: defaultHsCliPath,
 	}
 }
 
@@ -894,6 +918,15 @@ const (
 	defaultRitualWeeklyHour   = 18
 	defaultRitualWeeklyMinute = 0
 )
+
+// defaultHsCliPath is config key ui.hs_cli's own default (W6-01, task
+// spec verbatim) - kept as a literal, rather than importing
+// kahyad/internal/ui just for its DefaultHsCliPath constant, matching
+// this codebase's existing precedent of small, independently-owned
+// literals kept in sync by hand across packages rather than one taking a
+// dependency on the other purely for a constant (see Config.HsCliPath's
+// own doc comment).
+const defaultHsCliPath = "/opt/homebrew/bin/hs"
 
 // intPtr returns a pointer to v — CalendarSpec's fields are all *int (nil
 // means launchd's own StartCalendarInterval "every" semantics), so
@@ -1240,6 +1273,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.RitualWeeklyHour != nil {
 		cfg.RitualWeeklyHour = *fc.RitualWeeklyHour
 	}
+	if fc.HsCliPath != nil {
+		cfg.HsCliPath = expandHome(*fc.HsCliPath, home)
+	}
 	if fc.RitualWeeklyMinute != nil {
 		cfg.RitualWeeklyMinute = *fc.RitualWeeklyMinute
 	}
@@ -1329,6 +1365,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_ANCHOR_LOCAL_FALLBACK_PATH"); v != "" {
 		cfg.AnchorLocalFallbackPath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_UI_HS_CLI"); v != "" {
+		cfg.HsCliPath = expandHome(v, home)
 	}
 }
 

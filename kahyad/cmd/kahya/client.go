@@ -444,14 +444,19 @@ func (c *Client) GetApproval(ctx context.Context, traceID, id string) (approvalD
 }
 
 // PolicyFeedback calls POST /policy/feedback {kind, pending_approval_id,
-// surface} (`kahya approve <id>`'s own approve/deny outcome, W3-02/W3-06).
-// surface is always "local" for an approve issued from this CLI (HANDOFF
-// §5 safety #5: the CLI IS the local surface at W3-W5) - callers pass ""
-// for kind="deny", which ignores surface entirely. Returns the minted
-// token on a successful approve ("" for deny).
-func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingApprovalID, surface string) (string, error) {
+// surface, typed} (`kahya approve <id>`'s own approve/deny outcome,
+// W3-02/W3-06/W6-01). surface is always "local" for an approve issued
+// from this CLI (HANDOFF §5 safety #5: the CLI IS the local surface at
+// W3-W5) - callers pass "" for kind="deny", which ignores surface
+// entirely. typed is W6-01's addition: the exact text the human typed for
+// a W3 approval's confirmation prompt, forwarded so kahyad can verify it
+// server-side (byte-exact "onayla" after NFC normalization) - the
+// authoritative check; ignored server-side for a non-W3 approval, so
+// callers may always pass "" for W1/W2/deny. Returns the minted token on
+// a successful approve ("" for deny).
+func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingApprovalID, surface, typed string) (string, error) {
 	body, err := json.Marshal(map[string]string{
-		"kind": kind, "pending_approval_id": pendingApprovalID, "surface": surface, "trace_id": traceID,
+		"kind": kind, "pending_approval_id": pendingApprovalID, "surface": surface, "typed": typed, "trace_id": traceID,
 	})
 	if err != nil {
 		return "", err
@@ -480,6 +485,80 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/feedback: status %d", resp.StatusCode)}
 	}
 	return fr.Token, nil
+}
+
+// ApprovalDecision calls POST /approvals/{id}/decision {approve, typed}
+// (W6-01) - the non-interactive counterpart to PolicyFeedback used by
+// `kahya approvals decide` and (indirectly, via that subcommand)
+// hammerspoon/kahya.lua's approval cards. No surface field is ever sent -
+// kahyad itself stamps surface="local" from the UDS channel (see
+// kahyad/internal/server's handleApprovalsDecision doc comment); there is
+// no wire field on this route for a caller to forge one through. Returns
+// the minted token on a successful approve ("" on reject).
+func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, approve bool, typed string) (string, error) {
+	body, err := json.Marshal(map[string]any{"approve": approve, "typed": typed})
+	if err != nil {
+		return "", err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/approvals/"+url.PathEscape(id)+"/decision", traceID, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var fr struct {
+		OK    bool   `json:"ok"`
+		Token string `json:"token,omitempty"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&fr); err != nil {
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("approvals/decision: decode response: %w", err)}
+	}
+	if !fr.OK {
+		if fr.Error != "" {
+			return "", fmt.Errorf("%s", fr.Error)
+		}
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("approvals/decision: status %d", resp.StatusCode)}
+	}
+	return fr.Token, nil
+}
+
+// DebugEmitApproval calls POST /debug/emit-approval {class} (W6-01):
+// `kahya debug emit-approval --class W2|W3`'s own server-side call.
+// kahyad itself refuses (403) unless it is running under KAHYA_ENV=dev,
+// regardless of what this CLI's own client-side env check already did.
+// Returns the freshly minted pending_approval_id.
+func (c *Client) DebugEmitApproval(ctx context.Context, traceID, class string) (string, error) {
+	body, err := json.Marshal(map[string]string{"class": class})
+	if err != nil {
+		return "", err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/debug/emit-approval", traceID, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var dr struct {
+		ID    string `json:"id,omitempty"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("debug/emit-approval: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if dr.Error != "" {
+			return "", fmt.Errorf("%s", dr.Error)
+		}
+		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("debug/emit-approval: status %d", resp.StatusCode)}
+	}
+	return dr.ID, nil
 }
 
 // taskStatusToolCall mirrors kahyad's GET /v1/task/status response's
@@ -899,11 +978,13 @@ type sseEvent struct {
 }
 
 // streamTaskRequest is POST /v1/task's request body (matches
-// kahyad/internal/server.taskRequest exactly - W4-08 adds deep_think).
+// kahyad/internal/server.taskRequest exactly - W4-08 adds deep_think;
+// W6-01 adds palette_opened_at).
 type streamTaskRequest struct {
-	Prompt    string `json:"prompt"`
-	TraceID   string `json:"trace_id"`
-	DeepThink bool   `json:"deep_think,omitempty"`
+	Prompt          string   `json:"prompt"`
+	TraceID         string   `json:"trace_id"`
+	DeepThink       bool     `json:"deep_think,omitempty"`
+	PaletteOpenedAt *float64 `json:"palette_opened_at,omitempty"`
 }
 
 // StreamTask calls POST /v1/task {"prompt","trace_id":traceID,
@@ -915,8 +996,21 @@ type streamTaskRequest struct {
 // this call fails outright. deepThink is W4-08's `kahya ask --derin`
 // opt-in (the OTHER opt-in form - the "derin düşün:" Turkish prompt prefix
 // - is detected server-side, so it needs no client-side plumbing at all).
+// This is StreamTaskFull's own paletteOpenedAt=nil shorthand - every
+// pre-W6-01 caller (runOneShot, the REPL, `kahya ask` without
+// --palette-opened-at) keeps using this exact signature unchanged.
 func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, deepThink bool, onDelta func(string)) (taskResult, error) {
-	body, err := json.Marshal(streamTaskRequest{Prompt: prompt, TraceID: traceID, DeepThink: deepThink})
+	return c.StreamTaskFull(ctx, traceID, prompt, deepThink, nil, onDelta)
+}
+
+// StreamTaskFull is StreamTask's own general form (W6-01): paletteOpenedAt,
+// when non-nil, is `kahya ask --palette-opened-at <unix-seconds-float>`'s
+// own value (hammerspoon/kahya.lua's hs.timer.secondsSinceEpoch(),
+// captured at hotkey press) - forwarded verbatim onto the wire so kahyad
+// can ledger a palette_open event under this task's own trace_id (see
+// kahyad/internal/server's logPaletteOpen doc comment).
+func (c *Client) StreamTaskFull(ctx context.Context, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, onDelta func(string)) (taskResult, error) {
+	body, err := json.Marshal(streamTaskRequest{Prompt: prompt, TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt})
 	if err != nil {
 		return taskResult{}, err
 	}

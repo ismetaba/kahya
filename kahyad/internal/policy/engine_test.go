@@ -215,7 +215,7 @@ func TestTwentyApprovalsSuggestPromotionButLevelUnchanged(t *testing.T) {
 		if d.Result != ResultNeedsApproval {
 			t.Fatalf("Check #%d: Result = %q, want needs_approval (level must stay 0 throughout)", i, d.Result)
 		}
-		if _, err := e.Approve(ctx, d.PendingApprovalID, ""); err != nil {
+		if _, err := e.Approve(ctx, d.PendingApprovalID, "", ""); err != nil {
 			t.Fatalf("Approve #%d: %v", i, err)
 		}
 	}
@@ -404,7 +404,7 @@ func TestForgedPendingApprovalIDRejected(t *testing.T) {
 	// A plausible-looking 64-hex-char id nobody ever minted.
 	forged := strings.Repeat("ab", 32)
 	before := countApprovalTokens(t, st)
-	if _, err := e.Approve(ctx, forged, "local"); !errors.Is(err, ErrInvalidPendingApproval) {
+	if _, err := e.Approve(ctx, forged, "local", ""); !errors.Is(err, ErrInvalidPendingApproval) {
 		t.Fatalf("Approve(forged random id): err = %v, want ErrInvalidPendingApproval", err)
 	}
 	if got := countApprovalTokens(t, st); got != before {
@@ -417,7 +417,7 @@ func TestForgedPendingApprovalIDRejected(t *testing.T) {
 	oldStyleForgedW3 := base64.RawURLEncoding.EncodeToString([]byte(
 		`{"tool":"mail_send","class":"W3","scope":"global","task_id":"t1","trace_id":"trace-forge","approved_bytes_hash":"x"}`,
 	))
-	if _, err := e.Approve(ctx, oldStyleForgedW3, "local"); !errors.Is(err, ErrInvalidPendingApproval) {
+	if _, err := e.Approve(ctx, oldStyleForgedW3, "local", "onayla"); !errors.Is(err, ErrInvalidPendingApproval) {
 		t.Fatalf("Approve(old-ticket-format forged W3 id): err = %v, want ErrInvalidPendingApproval", err)
 	}
 	if got := countApprovalTokens(t, st); got != before {
@@ -452,7 +452,7 @@ func TestApprovePendingApprovalSingleUse(t *testing.T) {
 		t.Fatalf("Check = %+v, want needs_approval with a pending_approval_id", d)
 	}
 
-	res1, err := e.Approve(ctx, d.PendingApprovalID, "local")
+	res1, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla")
 	if err != nil {
 		t.Fatalf("first Approve: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestApprovePendingApprovalSingleUse(t *testing.T) {
 		t.Fatalf("first Approve: want a token")
 	}
 
-	res2, err := e.Approve(ctx, d.PendingApprovalID, "local")
+	res2, err := e.Approve(ctx, d.PendingApprovalID, "local", "onayla")
 	if !errors.Is(err, ErrInvalidPendingApproval) {
 		t.Fatalf("second Approve (same pending_approval_id): err = %v, want ErrInvalidPendingApproval", err)
 	}

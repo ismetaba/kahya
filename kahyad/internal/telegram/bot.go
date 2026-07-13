@@ -110,7 +110,13 @@ type LocalNotifier interface {
 // HTTP hop. *kahyad/internal/policy.Engine already has exactly this method
 // shape.
 type FeedbackEngine interface {
-	Approve(ctx context.Context, pendingApprovalID, surface string) (policy.FeedbackResult, error)
+	// Approve's typed parameter is W6-01's byte-exact W3 "onayla" gate -
+	// this bot's own Approve call site (approvals.go's handleCallback)
+	// always passes "" (Telegram never presents a W3 approval button at
+	// all; see OnPendingApproval's own doc comment), so it is never
+	// actually exercised through this call path, but the method shape must
+	// still match kahyad/internal/policy.Engine.Approve's real signature.
+	Approve(ctx context.Context, pendingApprovalID, surface, typed string) (policy.FeedbackResult, error)
 	Deny(ctx context.Context, pendingApprovalID string) error
 }
 

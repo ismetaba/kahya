@@ -307,7 +307,7 @@ func TestForgedW3CallbackRejectedAtEngine(t *testing.T) {
 
 	// The SAME id must still be approvable from the LOCAL surface - the
 	// rejected forged Telegram attempt must not have consumed it.
-	if _, err := fix.Engine.Approve(context.Background(), d.PendingApprovalID, "local"); err != nil {
+	if _, err := fix.Engine.Approve(context.Background(), d.PendingApprovalID, "local", "onayla"); err != nil {
 		t.Fatalf("Approve(surface=local) after a rejected forged Telegram attempt: %v", err)
 	}
 }

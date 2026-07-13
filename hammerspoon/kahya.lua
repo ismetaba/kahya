@@ -1,0 +1,300 @@
+-- kahya.lua — Kâhya's Hammerspoon surface (W6-01, HANDOFF §4 UI + IPC).
+--
+-- This file provides three things:
+--   1. The ⌥Space command palette (hs.chooser, free-text): capture the
+--      hotkey-press timestamp, run `kahya ask --palette-opened-at <t> --
+--      <text>`, show the answer via hs.notify.
+--   2. The LOCAL approval-card surface (HANDOFF §5 safety #5 ⚑: "W3 yazılı
+--      'onayla' YALNIZ yerel yüzeyden kabul edilir" — from W6 on, THIS is
+--      that local surface): kahyaShowApproval(id), invoked by kahyad's own
+--      pending-approval hook (kahyad/internal/ui.HSCli.ShowApproval) via
+--      `hs -c 'kahyaShowApproval("<id>")'`.
+--   3. The generic background/scheduled-task notification path:
+--      kahyaNotify(payloadB64), invoked by kahyad/internal/ui.HSCli.Notify
+--      / SendNotification via `hs -c 'kahyaNotify("<base64 json>")'`.
+--
+-- IMPORTANT — this file is a RENDERING + INPUT surface ONLY. Every binding
+-- security decision (hash verification, NFC normalization, bidi/zero-
+-- width/homoglyph stripping, one-time approval tokens, the byte-exact
+-- "onayla" check) lives in kahyad itself (kahyad/internal/policy.Engine,
+-- kahyad/internal/canon, kahyad/internal/approval — W3-02/W3-06/W6-01).
+-- This file only ever DISPLAYS what `kahya approvals show <id> --json`
+-- returns and forwards the human's decision to `kahya approvals decide`;
+-- it never computes, caches, or second-guesses any approval verdict
+-- itself.
+--
+-- Installed by `make hammerspoon-install` (repo Makefile), which copies
+-- this file to ~/.hammerspoon/kahya.lua, substituting @KAHYA_BIN@ with the
+-- absolute path of the built `kahya` CLI (bin/kahya), and appends
+-- `require("kahya")` to ~/.hammerspoon/init.lua if not already present.
+--
+-- Requires (docs/tcc-w6-checklist.md, do this BEFORE relying on any of
+-- the below): Hammerspoon granted Accessibility (hs.hotkey/hs.chooser),
+-- Hammerspoon's own Notifications set to "Alerts" style in System
+-- Settings (banner style auto-dismisses and hides the action button the
+-- approval card depends on).
+
+-- hs.task cannot resolve a bare command name via $PATH (Hammerspoon's GUI
+-- launch environment has no shell PATH at all) — every hs.task.new call
+-- below MUST use this absolute path, never a bare "kahya".
+local kahyaBin = "@KAHYA_BIN@"
+
+-- ---------------------------------------------------------------------
+-- Small shared helpers
+-- ---------------------------------------------------------------------
+
+-- runKahya execs `kahyaBin <args...>`, calling onDone(exitCode, stdOut,
+-- stdErr) when it finishes. Every CLI invocation in this file goes
+-- through this one helper so argv construction/logging stays in one
+-- place.
+local function runKahya(args, onDone)
+  local task = hs.task.new(kahyaBin, function(exitCode, stdOut, stdErr)
+    if onDone then
+      onDone(exitCode, stdOut or "", stdErr or "")
+    end
+  end, args)
+  task:start()
+  return task
+end
+
+-- firstLines returns the first n lines of s, joined back with "\n" — the
+-- palette's own completion notification only ever previews the answer;
+-- the FULL text is always still reachable via `kahya log --trace <id>`.
+local function firstLines(s, n)
+  if not s or s == "" then
+    return s
+  end
+  local lines = {}
+  for line in string.gmatch(s, "([^\n]*)\n?") do
+    table.insert(lines, line)
+    if #lines >= n then
+      break
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+-- ---------------------------------------------------------------------
+-- 1. ⌥Space command palette
+-- ---------------------------------------------------------------------
+
+-- kahyaChooser is built once at module load. hs.chooser has no built-in
+-- "free text" mode — pressing Enter always selects an existing ROW, it
+-- never hands back arbitrary unselected query text on its own. The
+-- standard Hammerspoon idiom for a free-text command palette (used here)
+-- is to keep exactly ONE synthetic choice that always mirrors whatever
+-- the user has typed so far (queryChangedCallback below rewrites it on
+-- every keystroke) — Enter therefore always selects THAT row, and its
+-- own .query field is read back in the completion callback.
+local kahyaPaletteOpenedAt = nil
+
+local function submitPaletteQuery(query)
+  if not query or query == "" then
+    return
+  end
+  if not kahyaPaletteOpenedAt then
+    -- Should not happen (set at hotkey press, just below) — refuse to
+    -- guess a timestamp rather than sending a wrong one.
+    kahyaPaletteOpenedAt = hs.timer.secondsSinceEpoch()
+  end
+  -- %.6f: an explicit, always-decimal (never scientific-notation)
+  -- formatting of the captured epoch-seconds float — kahyad's
+  -- `--palette-opened-at` flag parses this with Go's strconv.ParseFloat,
+  -- which accepts ordinary decimal notation but must never receive
+  -- "1.79e+09"-style scientific notation from a large tostring() default.
+  local paletteOpenedAtStr = string.format("%.6f", kahyaPaletteOpenedAt)
+  kahyaPaletteOpenedAt = nil
+
+  -- "--" terminates flag parsing (Go's flag package convention) so a
+  -- query that itself starts with "-" is never misread as a flag.
+  runKahya({ "ask", "--palette-opened-at", paletteOpenedAtStr, "--", query }, function(exitCode, stdOut, stdErr)
+    local text = stdOut
+    if exitCode ~= 0 and stdErr ~= "" then
+      text = stdErr
+    end
+    hs.notify.new({
+      title = "Kâhya",
+      informativeText = firstLines(text, 5),
+      autoWithdraw = true,
+    }):send()
+  end)
+end
+
+local kahyaChooser = hs.chooser.new(function(choice)
+  if choice and choice.query and choice.query ~= "" then
+    submitPaletteQuery(choice.query)
+  end
+end)
+kahyaChooser:placeholderText("Kâhya'ya yaz…")
+kahyaChooser:choices({})
+kahyaChooser:queryChangedCallback(function(query)
+  if query and query ~= "" then
+    -- The one-and-only row: its own .query field (NOT hs.chooser's
+    -- unrelated .text/.subText, which are display-only) is what the
+    -- completion callback above reads back — text/subText are still set
+    -- to something readable so the row itself looks sensible in the UI.
+    kahyaChooser:choices({ { text = query, subText = "Kâhya'ya gönder", query = query } })
+  else
+    kahyaChooser:choices({})
+  end
+end)
+
+hs.hotkey.bind({ "alt" }, "space", function()
+  -- Captured HERE, at hotkey press — before the chooser UI even opens —
+  -- so the north-star "palet-aç→ilk-token" metric's start timestamp is
+  -- the actual moment the user asked for the palette, not the moment
+  -- they finished typing.
+  kahyaPaletteOpenedAt = hs.timer.secondsSinceEpoch()
+  kahyaChooser:show()
+end)
+
+-- ---------------------------------------------------------------------
+-- 2. Local approval-card surface
+-- ---------------------------------------------------------------------
+
+-- sendApprovalDecision calls `kahya approvals decide <id> --approve
+-- --typed <text> | --reject` — the CLI's own client talks to kahyad's
+-- POST /approvals/{id}/decision, which stamps surface="local" itself
+-- (channel-derived, never read from this Lua file or the CLI's own
+-- request body) and, for a W3 approval, verifies `typed` byte-exact
+-- against "onayla" server-side. This function never decides anything on
+-- its own; it only relays the human's already-made choice.
+local function sendApprovalDecision(id, approve, typed)
+  local args = { "approvals", "decide", id }
+  if approve then
+    table.insert(args, "--approve")
+    table.insert(args, "--typed")
+    table.insert(args, typed or "")
+  else
+    table.insert(args, "--reject")
+  end
+  runKahya(args, function(exitCode, stdOut, stdErr)
+    if exitCode ~= 0 then
+      -- FAIL-CLOSED DELIVERY: nothing auto-approves just because this
+      -- exec failed. The pending approval (if the decision never landed)
+      -- stays discoverable via `kahya approvals list`; this notice is
+      -- purely informational.
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = "Onay kararı iletilemedi: " .. id,
+        autoWithdraw = true,
+      }):send()
+    end
+  end)
+end
+
+-- openApprovalDialog pops the class-specific decision dialog for detail
+-- (kahyad's own byte-exact W3-06 diff, already rendered server-side —
+-- this file never re-renders or re-verifies it, only displays it
+-- verbatim).
+local function openApprovalDialog(detail)
+  local id = detail.id
+  local class = detail.class
+  local rendered = detail.rendered or ""
+
+  if class == "W3" then
+    -- HANDOFF §5 safety #5 ⚑: W3 accepts nothing but the literally typed
+    -- word "onayla" — this dialog's instructive text says so verbatim;
+    -- the ACTUAL verification of what was typed happens server-side
+    -- (kahyad/internal/policy.Engine.Approve), never here.
+    local button, typed = hs.dialog.textPrompt(
+      "Bu eylem geri alınamaz (W3): " .. detail.tool,
+      rendered .. "\n\nOnaylamak için \"onayla\" yazın:",
+      "",
+      "Onayla",
+      "Reddet"
+    )
+    sendApprovalDecision(id, button == "Onayla", typed)
+  else
+    local button = hs.dialog.blockAlert(
+      string.format("Onay gerekiyor (%s): %s", class, detail.tool),
+      rendered,
+      "Onayla",
+      "Reddet"
+    )
+    sendApprovalDecision(id, button == "Onayla", nil)
+  end
+end
+
+-- kahyaShowApproval(id) is kahyad's own pending-approval hook's entry
+-- point (kahyad/internal/ui.HSCli.ShowApproval execs
+-- `hs -c 'kahyaShowApproval("<id>")'` for EVERY freshly minted pending
+-- approval — W1/W2/W3 alike, since this IS the local surface). It fetches
+-- the byte-exact diff via `kahya approvals show <id> --json`, pops an
+-- hs.notify card, and wires its own action button to openApprovalDialog.
+function kahyaShowApproval(id)
+  runKahya({ "approvals", "show", id, "--json" }, function(exitCode, stdOut, stdErr)
+    if exitCode ~= 0 or stdOut == "" then
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = "Onay bilgisi alınamadı: " .. id,
+        autoWithdraw = true,
+      }):send()
+      return
+    end
+    local ok, detail = pcall(hs.json.decode, stdOut)
+    if not ok or not detail or not detail.id then
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = "Onay verisi çözümlenemedi: " .. id,
+        autoWithdraw = true,
+      }):send()
+      return
+    end
+
+    local notification = hs.notify.new(function(note)
+      if note:activationType() == hs.notify.activationTypes.actionButtonClicked then
+        openApprovalDialog(detail)
+      end
+    end, {
+      title = "Kâhya — onay bekliyor",
+      informativeText = string.format("%s (%s)", detail.tool or "", detail.class or ""),
+      hasActionButton = true,
+      actionButtonTitle = "Görüntüle",
+      autoWithdraw = false,
+    })
+    notification:send()
+  end)
+end
+
+-- ---------------------------------------------------------------------
+-- 3. Generic local notification path (background/scheduled task results)
+-- ---------------------------------------------------------------------
+
+-- kahyaNotify(payloadB64) is kahyad's own generic notification entry
+-- point (kahyad/internal/ui.HSCli.Notify/SendNotification execs
+-- `hs -c 'kahyaNotify("<base64 json>")'`; the JSON is base64-encoded so
+-- kahyad never has to Lua-escape arbitrary Turkish/notification text
+-- itself — see that Go function's own doc comment). payload is
+-- {title, message, trace_id}; the FULL result always stays reachable via
+-- `kahya log --trace <id>` regardless of whether this notification is
+-- ever seen.
+function kahyaNotify(payloadB64)
+  local raw = hs.base64.decode(payloadB64)
+  if not raw or raw == "" then
+    return
+  end
+  local ok, payload = pcall(hs.json.decode, raw)
+  if not ok or not payload then
+    return
+  end
+  local traceLine = ""
+  if payload.trace_id and payload.trace_id ~= "" then
+    traceLine = "\n\niz: " .. payload.trace_id
+  end
+  hs.notify.new({
+    title = payload.title or "Kâhya",
+    informativeText = firstLines(payload.message or "", 5) .. traceLine,
+    autoWithdraw = true,
+  }):send()
+end
+
+-- ---------------------------------------------------------------------
+-- CLI install (so `hs -c '...'` from kahyad's own exec bridge works)
+-- ---------------------------------------------------------------------
+
+-- Apple Silicon Homebrew prefix, matching config key ui.hs_cli's own
+-- default (/opt/homebrew/bin/hs — kahyad/internal/ui.DefaultHsCliPath).
+-- The parameterless hs.ipc.cliInstall() installs under /usr/local
+-- instead, which would not match that default on an Apple Silicon Mac.
+hs.ipc.cliInstall("/opt/homebrew")
