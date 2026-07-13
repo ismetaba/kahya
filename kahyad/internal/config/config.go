@@ -573,6 +573,17 @@ func Load() (Config, error) {
 
 	applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
 
+	// Sync the config-field-driven schedules into cfg.Jobs. The
+	// "truth-ritual" and "morning-briefing" job entries are seeded in
+	// defaults() from the default constants; an operator override of
+	// ritual_weekly_* / briefing_hour/minute (config.yaml or env) must
+	// actually MOVE the scheduled launchd job, not merely sit in the
+	// otherwise-unused Config field (W5-03 review). Done before validateJobs
+	// so the reconciled CalendarSpec is validated. A user who replaced the
+	// whole jobs: list keeps whatever they wrote for any OTHER entry; these
+	// two named entries, if present, track their dedicated config keys.
+	reconcileConfigDrivenJobCalendars(&cfg)
+
 	if err := validateEnv(cfg.Env); err != nil {
 		return Config{}, err
 	}
@@ -630,6 +641,30 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// reconcileConfigDrivenJobCalendars rewrites the CalendarSpec of the
+// "truth-ritual" and "morning-briefing" cfg.Jobs entries (if present) from
+// their dedicated config keys (ritual_weekly_weekday/hour/minute,
+// briefing_hour/minute), so an override of those keys actually moves the
+// scheduled job. Idempotent when the keys are at their defaults (the entry's
+// calendar already equals them). Other job entries are untouched.
+func reconcileConfigDrivenJobCalendars(cfg *Config) {
+	for i := range cfg.Jobs {
+		switch cfg.Jobs[i].Name {
+		case "truth-ritual":
+			cfg.Jobs[i].Calendar = CalendarSpec{
+				Weekday: intPtr(cfg.RitualWeeklyWeekday),
+				Hour:    intPtr(cfg.RitualWeeklyHour),
+				Minute:  intPtr(cfg.RitualWeeklyMinute),
+			}
+		case "morning-briefing":
+			cfg.Jobs[i].Calendar = CalendarSpec{
+				Hour:   intPtr(cfg.BriefingHour),
+				Minute: intPtr(cfg.BriefingMinute),
+			}
+		}
+	}
 }
 
 // socketFileName is the control-socket's own filename for env ("dev" gets

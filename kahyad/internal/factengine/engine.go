@@ -52,6 +52,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mattn/go-sqlite3"
+
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
@@ -502,6 +504,17 @@ func (e *Engine) WriteFact(ctx context.Context, traceID string, c Candidate) (in
 // deduped (SQL's own NULL != NULL semantics already make the dedupe
 // SELECT below match nothing for a NULL session_id, which is the safe
 // default: fewer things to conflate, not fewer evidence rows).
+// isUniqueViolation reports whether err is a SQLite UNIQUE/PK constraint
+// violation (the shape mattn/go-sqlite3 surfaces) - mirrors
+// kahyad/internal/task.isUniqueConstraintViolation one package over.
+func isUniqueViolation(err error) bool {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code == sqlite3.ErrConstraint
+	}
+	return false
+}
+
 func (e *Engine) addEvidence(ctx context.Context, factID, episodeID int64, sessionID string, polarity int64, weight float64) error {
 	sessCol := nullString(sessionID)
 	if sessionID != "" {
@@ -519,6 +532,16 @@ func (e *Engine) addEvidence(ctx context.Context, factID, episodeID int64, sessi
 		FactID: factID, EpisodeID: nullInt64(episodeID), SessionID: sessCol,
 		Polarity: polarity, Weight: weight, CreatedAt: e.nowRFC3339(),
 	})
+	// The SELECT above is only an early-out; idx_evidence_one_per_session_
+	// polarity (migrations/0014) is the real guarantee. Two concurrent taps
+	// of the same ritual button (telegram callbacks are NOT serialized) can
+	// both pass that SELECT, but only one INSERT wins - the loser hits the
+	// unique index and is treated as the same-session repeat it is
+	// ("ayni-oturum tekrari tek kanit"), not an error. NULL-session rows are
+	// outside the partial index and never take this path.
+	if err != nil && sessionID != "" && isUniqueViolation(err) {
+		return nil
+	}
 	return err
 }
 
