@@ -52,7 +52,7 @@ func insertTaskWithEnvelope(t *testing.T, st *store.Store, id, sessionID string)
 		sid = sql.NullString{String: sessionID, Valid: true}
 	}
 	row, err := st.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
-		ID: id, TraceID: "trace-" + id, SessionID: sid, State: "running", TaintTier: "untrusted",
+		ID: id, TraceID: "trace-" + id, SessionID: sid, State: "running",
 		Model:     sql.NullString{String: "claude-sonnet-5", Valid: true},
 		Envelope:  sql.NullString{String: string(envJSON), Valid: true},
 		UpdatedAt: now, CreatedAt: now, Lane: "normal",

@@ -50,7 +50,7 @@ func insertDurabilityTestTask(t *testing.T, st *store.Store, id string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	if _, err := st.Queries.InsertTask(context.Background(), sqlcgen.InsertTaskParams{
 		ID: id, TraceID: "trace-" + id, SessionID: sql.NullString{String: "sess-1", Valid: true},
-		State: "running", TaintTier: "untrusted", UpdatedAt: now, CreatedAt: now, Lane: "normal",
+		State: "running", UpdatedAt: now, CreatedAt: now, Lane: "normal",
 	}); err != nil {
 		t.Fatalf("InsertTask: %v", err)
 	}

@@ -728,7 +728,6 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		TraceID:        traceID,
 		SessionID:      sql.NullString{},
 		State:          "running",
-		TaintTier:      "untrusted",
 		Model:          sql.NullString{String: envelope.Model, Valid: true},
 		Envelope:       sql.NullString{String: string(envelopeJSON), Valid: true},
 		UpdatedAt:      now,

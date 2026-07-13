@@ -191,7 +191,6 @@ type Task struct {
 	TraceID        string         `json:"trace_id"`
 	SessionID      sql.NullString `json:"session_id"`
 	State          string         `json:"state"`
-	TaintTier      string         `json:"taint_tier"`
 	Model          sql.NullString `json:"model"`
 	Envelope       sql.NullString `json:"envelope"`
 	UpdatedAt      string         `json:"updated_at"`

@@ -43,7 +43,6 @@ func seedTask(t *testing.T, st *store.Store, taskID, traceID, sessionID string) 
 		TraceID:   traceID,
 		SessionID: sql.NullString{String: sessionID, Valid: sessionID != ""},
 		State:     "running",
-		TaintTier: "untrusted",
 		UpdatedAt: "2026-01-01T00:00:00Z",
 		CreatedAt: "2026-01-01T00:00:00Z",
 		Lane:      "normal",

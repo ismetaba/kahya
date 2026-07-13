@@ -820,7 +820,7 @@ func (q *Queries) GetSessionTaint(ctx context.Context, sessionID string) (Sessio
 
 const getTaskByID = `-- name: GetTaskByID :one
 
-SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
 FROM tasks
 WHERE id = ?
 `
@@ -841,7 +841,6 @@ func (q *Queries) GetTaskByID(ctx context.Context, id string) (Task, error) {
 		&i.TraceID,
 		&i.SessionID,
 		&i.State,
-		&i.TaintTier,
 		&i.Model,
 		&i.Envelope,
 		&i.UpdatedAt,
@@ -858,7 +857,7 @@ func (q *Queries) GetTaskByID(ctx context.Context, id string) (Task, error) {
 }
 
 const getTaskBySession = `-- name: GetTaskBySession :one
-SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at
 FROM tasks
 WHERE session_id = ?
 ORDER BY updated_at DESC
@@ -870,7 +869,6 @@ type GetTaskBySessionRow struct {
 	TraceID   string         `json:"trace_id"`
 	SessionID sql.NullString `json:"session_id"`
 	State     string         `json:"state"`
-	TaintTier string         `json:"taint_tier"`
 	Model     sql.NullString `json:"model"`
 	Envelope  sql.NullString `json:"envelope"`
 	UpdatedAt string         `json:"updated_at"`
@@ -888,7 +886,6 @@ func (q *Queries) GetTaskBySession(ctx context.Context, sessionID sql.NullString
 		&i.TraceID,
 		&i.SessionID,
 		&i.State,
-		&i.TaintTier,
 		&i.Model,
 		&i.Envelope,
 		&i.UpdatedAt,
@@ -1675,9 +1672,9 @@ func (q *Queries) InsertSessionTaintTainted(ctx context.Context, arg InsertSessi
 }
 
 const insertTask = `-- name: InsertTask :one
-INSERT INTO tasks (id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+INSERT INTO tasks (id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
 `
 
 type InsertTaskParams struct {
@@ -1685,7 +1682,6 @@ type InsertTaskParams struct {
 	TraceID        string         `json:"trace_id"`
 	SessionID      sql.NullString `json:"session_id"`
 	State          string         `json:"state"`
-	TaintTier      string         `json:"taint_tier"`
 	Model          sql.NullString `json:"model"`
 	Envelope       sql.NullString `json:"envelope"`
 	UpdatedAt      string         `json:"updated_at"`
@@ -1714,7 +1710,6 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		arg.TraceID,
 		arg.SessionID,
 		arg.State,
-		arg.TaintTier,
 		arg.Model,
 		arg.Envelope,
 		arg.UpdatedAt,
@@ -1728,7 +1723,6 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		&i.TraceID,
 		&i.SessionID,
 		&i.State,
-		&i.TaintTier,
 		&i.Model,
 		&i.Envelope,
 		&i.UpdatedAt,
@@ -2431,7 +2425,7 @@ func (q *Queries) ListEvidenceByFact(ctx context.Context, factID int64) ([]ListE
 }
 
 const listExecutingTasks = `-- name: ListExecutingTasks :many
-SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
 FROM tasks
 WHERE status = 'executing'
   AND status != 'user_halted'
@@ -2469,7 +2463,6 @@ func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
 			&i.TraceID,
 			&i.SessionID,
 			&i.State,
-			&i.TaintTier,
 			&i.Model,
 			&i.Envelope,
 			&i.UpdatedAt,
@@ -2534,7 +2527,7 @@ func (q *Queries) ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedA
 }
 
 const listNonTerminalTasks = `-- name: ListNonTerminalTasks :many
-SELECT id, trace_id, session_id, state, taint_tier, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
 FROM tasks
 WHERE status NOT IN ('done', 'failed', 'user_halted')
 ORDER BY updated_at ASC
@@ -2562,7 +2555,6 @@ func (q *Queries) ListNonTerminalTasks(ctx context.Context) ([]Task, error) {
 			&i.TraceID,
 			&i.SessionID,
 			&i.State,
-			&i.TaintTier,
 			&i.Model,
 			&i.Envelope,
 			&i.UpdatedAt,

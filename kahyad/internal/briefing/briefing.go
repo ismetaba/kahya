@@ -351,7 +351,6 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 			TraceID:   traceID,
 			SessionID: sql.NullString{String: sessionID, Valid: true},
 			State:     "running",
-			TaintTier: "untrusted",
 			Model:     sql.NullString{String: ModelName, Valid: true},
 			UpdatedAt: nowStr,
 			CreatedAt: nowStr,

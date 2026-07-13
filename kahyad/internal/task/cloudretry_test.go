@@ -162,7 +162,7 @@ func TestParkOrGiveUpGivesUpPastGiveUpAfter(t *testing.T) {
 	st2 := st
 	ctx := context.Background()
 	if _, err := st2.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
-		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running", TaintTier: "untrusted",
+		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running",
 		UpdatedAt: created.Format(time.RFC3339), CreatedAt: created.Format(time.RFC3339), Lane: "normal",
 	}); err != nil {
 		t.Fatalf("InsertTask: %v", err)
@@ -206,7 +206,7 @@ func TestParkOrGiveUpStillParksJustBeforeGiveUpAfter(t *testing.T) {
 	created := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
 	ctx := context.Background()
 	if _, err := st.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
-		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running", TaintTier: "untrusted",
+		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running",
 		UpdatedAt: created.Format(time.RFC3339), CreatedAt: created.Format(time.RFC3339), Lane: "normal",
 	}); err != nil {
 		t.Fatalf("InsertTask: %v", err)

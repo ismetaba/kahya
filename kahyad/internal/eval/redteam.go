@@ -623,7 +623,6 @@ func seedTaskRow(ctx context.Context, st *store.Store, taskID, traceID, sessionI
 		TraceID:   traceID,
 		SessionID: sql.NullString{String: sessionID, Valid: sessionID != ""},
 		State:     "running",
-		TaintTier: "untrusted",
 		UpdatedAt: "2026-01-01T00:00:00Z",
 		CreatedAt: "2026-01-01T00:00:00Z",
 		Lane:      "normal",

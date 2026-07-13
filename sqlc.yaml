@@ -59,6 +59,10 @@ sql:
       # GetApprovalToken/RevokeApprovalTokensByTask reference, so it MUST be
       # here for sqlc to generate against.
       - "kahyad/migrations/0016_token_revoked_at.sql"
+      # 0017 (W4-03 follow-up) DROPs tasks.taint_tier - a column InsertTask and
+      # several task SELECTs reference, so it MUST be here for sqlc to see the
+      # column is gone and regenerate the Task model without it.
+      - "kahyad/migrations/0017_drop_task_taint_tier.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

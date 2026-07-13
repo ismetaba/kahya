@@ -66,7 +66,7 @@ func TestPersistSessionStartedRejectsAlreadyTaintedSessionID(t *testing.T) {
 	// Insert a bare tasks row directly (bypassing the HTTP path) so
 	// persistSessionStarted has a real task_id to update.
 	if _, err := f.store.DB().ExecContext(ctx,
-		`INSERT INTO tasks (id, trace_id, state, taint_tier, updated_at, created_at, lane) VALUES (?, ?, 'running', 'untrusted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'normal')`,
+		`INSERT INTO tasks (id, trace_id, state, updated_at, created_at, lane) VALUES (?, ?, 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'normal')`,
 		"task-collide", "trace-collide"); err != nil {
 		t.Fatalf("insert bare task row: %v", err)
 	}

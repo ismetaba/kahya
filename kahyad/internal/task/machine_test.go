@@ -40,7 +40,7 @@ func insertTask(t *testing.T, st *store.Store, id string) sqlcgen.Task {
 	now := time.Now().UTC().Format(time.RFC3339)
 	row, err := st.Queries.InsertTask(context.Background(), sqlcgen.InsertTaskParams{
 		ID: id, TraceID: "trace-" + id, SessionID: sql.NullString{},
-		State: "running", TaintTier: "untrusted", UpdatedAt: now, CreatedAt: now,
+		State: "running", UpdatedAt: now, CreatedAt: now,
 		Lane: "normal",
 	})
 	if err != nil {

@@ -107,12 +107,6 @@ func newActorSessionID() string {
 // decision, never chosen here); episodeID identifies the originating
 // Reader job (Result.EpisodeID) for the actor.seeded ledger event's
 // derived_from field. traceID correlates every write this call performs.
-//
-// tasks.taint_tier (a Day-1, pre-W4-03 column - migrations/0001) is set
-// to "clean" here purely as an informational mirror; it is NOT the real
-// enforcement mechanism (session_taint is - see that table's own
-// migration doc comment) and nothing in this codebase currently reads it
-// back.
 func Spawn(ctx context.Context, db ActorDB, ledger Ledger, validated any, model, episodeID, traceID string) (ActorResult, error) {
 	prompt, err := RenderPrompt(validated)
 	if err != nil {
@@ -134,7 +128,6 @@ func Spawn(ctx context.Context, db ActorDB, ledger Ledger, validated any, model,
 		TraceID:   traceID,
 		SessionID: sql.NullString{String: sessionID, Valid: true},
 		State:     "running",
-		TaintTier: "clean",
 		Model:     sql.NullString{String: model, Valid: model != ""},
 		UpdatedAt: now,
 		CreatedAt: now,
