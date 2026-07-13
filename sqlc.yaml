@@ -55,6 +55,10 @@ sql:
       # worker_pgid/halted_at, outbox.task_id/canceled_at) - same
       # reasoning as 0006/0011/0012 above.
       - "kahyad/migrations/0015_halt_semantics.sql"
+      # 0016 (W6-03 review fix) adds approval_tokens.revoked_at - a column
+      # GetApprovalToken/RevokeApprovalTokensByTask reference, so it MUST be
+      # here for sqlc to generate against.
+      - "kahyad/migrations/0016_token_revoked_at.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

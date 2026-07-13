@@ -276,7 +276,7 @@ func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactBy
 }
 
 const getApprovalToken = `-- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at
 FROM approval_tokens
 WHERE token_hash = ?
 `
@@ -295,6 +295,7 @@ func (q *Queries) GetApprovalToken(ctx context.Context, tokenHash string) (Appro
 		&i.MintedAt,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }
@@ -3130,12 +3131,13 @@ func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) error 
 
 const revokeApprovalTokensByTask = `-- name: RevokeApprovalTokensByTask :execrows
 UPDATE approval_tokens
-SET consumed_at = ?
+SET consumed_at = ?, revoked_at = ?
 WHERE task_id = ? AND consumed_at IS NULL
 `
 
 type RevokeApprovalTokensByTaskParams struct {
 	ConsumedAt sql.NullString `json:"consumed_at"`
+	RevokedAt  sql.NullString `json:"revoked_at"`
 	TaskID     string         `json:"task_id"`
 }
 
@@ -3155,7 +3157,7 @@ type RevokeApprovalTokensByTaskParams struct {
 // kahyad/internal/halt's own doc comment for why this bypasses
 // Engine.ConsumeToken's demotion machinery entirely).
 func (q *Queries) RevokeApprovalTokensByTask(ctx context.Context, arg RevokeApprovalTokensByTaskParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, revokeApprovalTokensByTask, arg.ConsumedAt, arg.TaskID)
+	result, err := q.db.ExecContext(ctx, revokeApprovalTokensByTask, arg.ConsumedAt, arg.RevokedAt, arg.TaskID)
 	if err != nil {
 		return 0, err
 	}

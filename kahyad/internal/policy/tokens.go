@@ -153,6 +153,17 @@ func (e *Engine) failFromHash(ctx context.Context, in ConsumeInput, hash, reason
 		"event": "token_verify_failed", "tool": in.Tool, "task_id": in.TaskID, "reason": reason,
 	})
 	if row, err := e.store.GetApprovalToken(ctx, hash); err == nil {
+		// A token BURNED BY A USER HALT (revoked_at set - only the halt
+		// executor's RevokeApprovalTokensByTask sets it) must DENY but NEVER
+		// demote the autonomy ladder: the user chose to stop, they did not
+		// misuse a token (W6-03 review fix). Every OTHER affected==0 outcome
+		// (a genuine replay, a fabricated hash) still demotes as before.
+		if row.RevokedAt.Valid {
+			e.ledgerRaw(ctx, in.TraceID, "token_halt_revoked", map[string]any{
+				"event": "token_halt_revoked", "tool": row.Tool, "task_id": in.TaskID,
+			})
+			return ErrTokenInvalid
+		}
 		e.demote(ctx, row.Tool, ActionClass(row.Class), row.Scope, in.TraceID, "token_verify_failed:"+reason)
 	}
 	return ErrTokenInvalid

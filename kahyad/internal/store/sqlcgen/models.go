@@ -28,6 +28,7 @@ type ApprovalToken struct {
 	MintedAt          string         `json:"minted_at"`
 	ExpiresAt         string         `json:"expires_at"`
 	ConsumedAt        sql.NullString `json:"consumed_at"`
+	RevokedAt         sql.NullString `json:"revoked_at"`
 }
 
 type AutonomyState struct {

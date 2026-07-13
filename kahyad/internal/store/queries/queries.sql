@@ -190,7 +190,7 @@ INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, 
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
 
 -- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at
 FROM approval_tokens
 WHERE token_hash = ?;
 
@@ -322,7 +322,7 @@ ORDER BY minted_at ASC;
 -- kahyad/internal/halt's own doc comment for why this bypasses
 -- Engine.ConsumeToken's demotion machinery entirely).
 UPDATE approval_tokens
-SET consumed_at = ?
+SET consumed_at = ?, revoked_at = ?
 WHERE task_id = ? AND consumed_at IS NULL;
 
 -- W3-05 (egress proxy) queries below: egress_budget persists each host's

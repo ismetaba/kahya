@@ -56,14 +56,23 @@ func (e *Engine) InvalidateApprovalsForTask(ctx context.Context, traceID, taskID
 	now := rfc3339(e.nowUTC())
 	invalidated := 0
 	for _, row := range rows {
-		if _, err := e.store.ConsumePendingApproval(ctx, sqlcgen.ConsumePendingApprovalParams{
+		affected, err := e.store.ConsumePendingApproval(ctx, sqlcgen.ConsumePendingApprovalParams{
 			ConsumedAt: sql.NullString{String: now, Valid: true}, ID: row.ID,
-		}); err != nil {
+		})
+		if err != nil {
 			// Best-effort: log via the ledger and move on to the next row -
 			// halt must never partial-abort over one row's DB hiccup.
 			e.ledgerRaw(ctx, traceID, "approval_invalidate_failed", map[string]any{
 				"event": "approval_invalidate_failed", "pending_approval_id": row.ID, "task_id": taskID, "err": err.Error(),
 			})
+			continue
+		}
+		if affected == 0 {
+			// Lost a race to a CONCURRENT halt of the same task (double-press
+			// ⌥⎋, or two POST /halt): the winner already consumed this row via
+			// the atomic "WHERE consumed_at IS NULL" guard. Don't double-count,
+			// double-ledger approval.invalidated, or re-fire the Telegram-edit
+			// hook (W6-03 review MINOR).
 			continue
 		}
 		invalidated++
@@ -88,7 +97,13 @@ func (e *Engine) InvalidateApprovalsForTask(ctx context.Context, traceID, taskID
 	// carry no human-facing surface of their own to invalidate - unlike
 	// pending_approvals, there is no card/dialog to edit).
 	if _, err := e.store.RevokeApprovalTokensByTask(ctx, sqlcgen.RevokeApprovalTokensByTaskParams{
-		ConsumedAt: sql.NullString{String: now, Valid: true}, TaskID: taskID,
+		// consumed_at burns the token (so ConsumeToken's single-use guard
+		// denies it); revoked_at ADDITIONALLY marks it halt-revoked so
+		// failFromHash skips the autonomy-ladder demotion (W6-03 review fix:
+		// a user halt is not a tool misusing a token).
+		ConsumedAt: sql.NullString{String: now, Valid: true},
+		RevokedAt:  sql.NullString{String: now, Valid: true},
+		TaskID:     taskID,
 	}); err != nil {
 		e.ledgerRaw(ctx, traceID, "approval_token_revoke_failed", map[string]any{
 			"event": "approval_token_revoke_failed", "task_id": taskID, "err": err.Error(),
