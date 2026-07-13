@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam sandbox-image docker-up hammerspoon-install
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam sandbox-image docker-up hammerspoon-install invariants
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -168,6 +168,19 @@ lint:
 		echo "$$matches"; \
 		exit 1; \
 	fi
+# invariants (W78-03): the §5-invariant selector. tests/invariants/cmd/
+# runinvariants parses docs/coverage.md's authoritative "## §5 invariant ->
+# test map (W78-03)" section and (a) HONESTY-CHECKS every cited pkg/
+# TestName - hermetic AND local-integration - against the real repo,
+# aborting if any citation no longer resolves (a renamed/deleted cited test
+# turns this red); then (b) runs exactly the ci-hermetic cited tests,
+# grouped by package. The local-integration citations (Docker/MLX/real-bin
+# gates) are existence-checked here but executed only by the full local
+# `make test` (and W78-06 `make readiness`), so `make invariants` stays
+# green on a CI box with no Docker/MLX/Keychain. The same honesty check
+# also runs inside `make test` as tests/invariants.TestCoverageMapAllTestsExist.
+invariants:
+	go run -tags $(GOTAGS) ./tests/invariants/cmd/runinvariants
 generate:   # activated by W12-02 when sqlc.yaml lands
 	if [ -f sqlc.yaml ]; then go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate; else echo "sqlc.yaml not yet present (W12-02)"; fi
 # sandbox-image: builds the W3-04 shell sandbox image and pins its digest

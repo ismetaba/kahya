@@ -1,0 +1,89 @@
+# Kâhya CI — runs the CI-hermetic build, lint, §5-invariant selector, and
+# the full test suite on every push and pull request.
+#
+# Hermeticity (HANDOFF §5 / W78-03): CI has NO Docker, NO MLX runtime, NO
+# Keychain, NO real Anthropic credential, and NO real user memory (the real
+# dataset lives in ~/Kahya, per W78-01 — it is never checked out here).
+#   * `make test` gates its container tests behind `docker info` (unset
+#     KAHYA_DOCKER_TESTS), so mcp/shell's Docker tests SKIP cleanly and the
+#     suite stays green without a Docker daemon.
+#   * The red-team and retrieval evals run in their HERMETIC form only —
+#     kahyad/internal/eval's TestRedteamAllScenariosBlocked and the
+#     retrieval runner/gate tests use synthetic fixtures + record-replay,
+#     no network and no secrets. The LIVE `make eval-redteam` /
+#     `make eval-retrieval` targets need a running daemon and are NOT run
+#     here (they are dev-machine / W78-06 `make readiness` only).
+#   * local-integration invariant tests (real in-container curl bypass,
+#     real MLX load) are existence-checked by `make invariants` but not
+#     executed in CI.
+# No secrets are configured for this workflow; anything needing a real
+# Keychain/API key is stubbed or skipped by the tests themselves.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    # macOS-only product: kahyad + the W4/W6/W12 acceptance gates (which
+    # `make test` force-spawns a real bin/kahyad for) depend on macOS paths
+    # and tools (/usr/bin/security, say, osascript). Running on Linux would
+    # execute those gates against a platform the product never targets. The
+    # hermetic gates still need NO Keychain/Docker/MLX/network here: the
+    # acceptance harnesses use KAHYA_ANTHROPIC_KEY_OVERRIDE under a dev profile
+    # + a mock upstream, Docker tests skip behind `docker info`, and MLX/live
+    # evals are dev-machine-only.
+    runs-on: macos-latest
+    env:
+      # Belt-and-suspenders: never let a test think Docker is available.
+      KAHYA_DOCKER_TESTS: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned Go toolchain — go-version-file reads the exact version from
+      # go.mod, so CI tracks the repo's pin (never "latest").
+      - name: Set up Go (pinned via go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The worker venv is pinned to claude-agent-sdk==0.2.111 via
+      # worker/requirements.lock; `make venv` (a prerequisite of `make
+      # test`) installs it. Pre-warm here so a resolver failure surfaces as
+      # its own step.
+      - name: Install worker deps (pinned lock)
+        run: make venv
+
+      - name: Build (kahyad, kahya, kahya-mcp, kahya-trigger)
+        run: make build
+
+      - name: Lint (gofmt, go vet, sqlc-diff, single-egress-gate)
+        run: make lint
+
+      # §5 invariant selector: parses docs/coverage.md, honesty-checks every
+      # cited pkg/TestName, and runs the CI-hermetic invariant tests. Fails
+      # if the coverage map cites a test that no longer exists.
+      - name: Invariants (§5 coverage map + honesty check)
+        run: make invariants
+
+      # Full suite. Docker is absent, so mcp/shell container tests skip and
+      # the acceptance/e2e gates run their hermetic (mock/fixture) form. The
+      # hermetic red-team + retrieval evals run inside this step.
+      - name: Test (CI-hermetic full suite; Docker tests skip)
+        run: make test

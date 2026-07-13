@@ -1,6 +1,6 @@
 # W78-03 — §5 invariant CI tests + coverage map
 
-**Status:** todo
+**Status:** done — `docs/coverage.md` invariant→test map (all 16 §5 invariants, ≥1 ci-hermetic test each), 2 gap-fill tests + a self-verifying coverage-map honesty check, `make invariants`, and `.github/workflows/ci.yml` (macOS runner). The CI workflow is committed but its live GitHub-Actions run is user-assist (needs the repo pushed to a remote + Actions enabled).
 **Phase:** W7–8 — Hardening + eval
 **Depends on:** W3-10, W4-07, W5-05
 **Flags:** none
@@ -71,11 +71,11 @@ re-implement enforcement.
 
 ## Acceptance criteria
 
-- [ ] `docs/coverage.md` exists and lists the enforcement-plane preamble (#0), all six safety invariants, all five memory invariants, and all four product principles — each with ≥1 named **CI-hermetic** test and owning task (local-integration variants listed additionally where they exist).
-- [ ] `make invariants` runs the tagged tests, all green, and fails if `docs/coverage.md` cites a nonexistent test (verified by temporarily renaming a test in a scratch run).
-- [ ] CI workflow file present and its `make test` + `make lint` + eval steps pass with record-replay fixtures and no network access.
-- [ ] Spot-check tests exist and pass for: egress hard-block after sensitive read (#1); taint missing-record⇒untrusted (#2); fs deny-glob on `~/.zshrc` (#6); WYSIWYE executed≠approved reject (#5); agent_derived quarantine from injection (memory #1); W3 Telegram-reject/CLI-accept (product principle); `POST /policy/check` error/timeout ⇒ DENY fail-closed (§4 IPC ⚑); secret-lane under simulated memory pressure or model-load failure ⇒ FAIL-CLOSED with **zero requests observed at the cloud forward-proxy** (§4 memory-pressure ⚑ — never falls back to cloud); side-effectful MCP tool without a valid kahyad one-time approval token refuses even when `can_use_tool` is bypassed (preamble #0).
-- [ ] `make test` and `make lint` green.
+- [x] `docs/coverage.md` has an authoritative `## §5 invariant → test map (W78-03)` section listing preamble #0, all six safety invariants, all five memory invariants, and all four product principles — each with ≥1 named CI-hermetic `pkg/TestName` test + owning task + class (ci-hermetic / local-integration), verified by `tests/invariants/TestCoverageMapEveryInvariantHasCIHermetic` (required-set + class coverage, single-sourced via `invariants.RequiredInvariants`/`ClassCoverageErrors`).
+- [x] `make invariants` (a) honesty-checks every cited `pkg/TestName` exists, (b) enforces class coverage, (c) runs the CI-hermetic tests AND — via `go test -json` — verifies each cited test actually **ran+passed** (a mis-classified/build-tag-gated citation now fails rather than passing vacuously), and fails on a nonexistent citation. Mutation-verified: renaming a citation → red; pointing a ci-hermetic row at an `acceptance`-tagged test → red; both recover on restore.
+- [x] `.github/workflows/ci.yml` present (**macos-latest** — the only supported platform; Docker/MLX/Keychain absent so container tests skip, acceptance gates use the dev-profile key override + mock upstream, evals run hermetic), running `make build`/`make lint`/`make invariants`/`make test`. Its live GitHub-Actions run is user-assist (needs the repo pushed + Actions enabled); `make test`/`make lint`/`make invariants` are green locally.
+- [x] Spot-check tests present + passing (cited in the map): egress sensitive-read hard-block (#1); taint missing⇒untrusted (#2); fs `~/.zshrc` deny-glob (#6); WYSIWYE executed≠approved reject (#5); agent_derived injection quarantine (memory #1); W3 Telegram-notice-only + CLI-onayla (product A); `Engine.Check` timeout/error ⇒ DENY fail-closed (§4 IPC — new gap-fill `TestCheckContextTimeoutDeniesFailClosed`); secret-lane / local-model-unavailable ⇒ fail-closed with zero forward-proxy requests (`reader.TestNoCloudFallback*NeverHitsProxy`); MCP tool without a valid one-time token refuses even if `can_use_tool` bypassed (`mcp/fs.TestHandleWriteNeedsApprovalFailsWithoutToken` + `policy` token tests); memory-never-lowers-permission (new gap-fill `TestMemoryContentCannotLowerAPermission`).
+- [x] `make test` and `make lint` green.
 
 ## Out of scope
 
