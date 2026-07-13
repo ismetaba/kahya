@@ -1,6 +1,6 @@
 # W6-03 — `⌥⎋` emergency halt semantics
 
-**Status:** todo
+**Status:** code-complete; live ⌥⎋ + real daemon-restart drill under launchd = user-assist (see the last acceptance item)
 **Phase:** W6 — Voice + shortcut
 **Depends on:** W6-01, W4-02
 **Flags:** none
@@ -46,12 +46,12 @@ After this task `⌥⎋` is a real emergency stop: every running worker (whole p
 10. Write the tests below; `make test && make lint`.
 
 ## Acceptance criteria
-- [ ] Go test: kahyad spawns a stub worker script that forks a child (`sleep 300 &`); `POST /halt` → both the worker PID and its child are gone (`kill(pid, 0)` errors for both) — proves process-*group* kill. Variant: clear the in-memory registry entry first (simulating a daemon restart that orphaned the worker) → halt via the persisted `tasks.worker_pgid` still kills the group.
-- [ ] Go test: a task in `executing` with one pending outbox delivery and one pending W2 approval is halted → task `status='user_halted'`, outbox row `canceled`, approval `invalidated`; a subsequent `POST /approvals/{id}/decision --approve` → DENY (token revoked). Then run the W4-02 resume scan and an outbox tick exactly as daemon startup does → zero worker spawns, zero redeliveries for that task.
-- [ ] Go test (requires the W3-04 Docker runtime, e.g. colima, running): `docker run -d --label kahya.task_id=<test-id> alpine sleep 300` registered to a fake task → halt → `docker ps -q --filter label=kahya.task_id=<test-id>` is empty.
-- [ ] Ledger check: `sqlite3 ~/Library/Application\ Support/Kahya/brain.db "SELECT kind FROM events WHERE trace_id='<id>'"` includes `task.user_halted` and `approval.invalidated`.
-- [ ] Manual: start a deliberately long task (e.g. a multi-minute Docker shell job); press `⌥⎋` → notification `Acil durdurma — tüm görevler durduruldu` appears and the container dies; then `launchctl kickstart -k gui/$(id -u)/com.kahya.kahyad` → the task does not continue and is not retried (`kahya log --trace <id>` shows nothing after `task.user_halted`). This is the §6 kabul clause verbatim.
-- [ ] `kahya halt` with no running tasks prints `Durdurulacak görev yok.` and exits 0.
+- [x] Go test: kahyad spawns a stub worker script that forks a child (`sleep 300 &`); `POST /halt` → both the worker PID and its child are gone (`kill(pid, 0)` errors for both) — proves process-*group* kill. Variant: clear the in-memory registry entry first (simulating a daemon restart that orphaned the worker) → halt via the persisted `tasks.worker_pgid` still kills the group. (`kahyad/internal/halt/executor_test.go`'s `TestHaltTaskKillsProcessGroupViaInMemoryPGID` + `TestHaltTaskKillsProcessGroupViaPersistedPGIDAfterSimulatedRestart`.)
+- [x] Go test: a task in `executing` with one pending outbox delivery and one pending W2 approval is halted → task `status='user_halted'`, outbox row `canceled`, approval `invalidated`; a subsequent `POST /approvals/{id}/decision --approve` → DENY (token revoked). Then run the W4-02 resume scan and an outbox tick exactly as daemon startup does → zero worker spawns, zero redeliveries for that task. (`kahyad/internal/halt/executor_test.go`'s `TestHaltTaskExcludesFromResumeAndOutboxAfterHalt`; the HTTP route itself re-exercised in `kahyad/internal/server/halt_test.go`.)
+- [x] Go test (requires the W3-04 Docker runtime, e.g. colima, running): `docker run -d --label kahya.task_id=<test-id> alpine sleep 300` registered to a fake task → halt → `docker ps -q --filter label=kahya.task_id=<test-id>` is empty. (`kahyad/internal/halt/container_test.go`'s `TestHaltTaskKillsLabeledDockerContainer`, gated on `KAHYA_DOCKER_TESTS=1` exactly like `mcp/shell`'s own live-Docker tests — ran for real against this session's colima daemon, not skipped.)
+- [x] Ledger check: `sqlite3 ~/Library/Application\ Support/Kahya/brain.db "SELECT kind FROM events WHERE trace_id='<id>'"` includes `task.user_halted` and `approval.invalidated`. (Automated equivalent: `executor_test.go`'s `countEventsByTraceAndKind` helper, asserted in `TestHaltTaskExcludesFromResumeAndOutboxAfterHalt` and the double-halt test.)
+- [!] Manual: start a deliberately long task (e.g. a multi-minute Docker shell job); press `⌥⎋` → notification `Acil durdurma — tüm görevler durduruldu` appears and the container dies; then `launchctl kickstart -k gui/$(id -u)/com.kahya.kahyad` → the task does not continue and is not retried (`kahya log --trace <id>` shows nothing after `task.user_halted`). This is the §6 kabul clause verbatim. — user-assist (needs a real Hammerspoon under launchd + a live macOS keypress + an actual daemon restart); every mechanism this drill exercises is hermetically proven above (process-group kill, container kill, terminal-state exclusion surviving a *simulated* restart via the persisted `worker_pgid`, zero resume/outbox activity after halt) — this item is the real end-to-end physical drill, deferred to the user exactly like W6-01/W6-02's own TCC/Hammerspoon manual items.
+- [x] `kahya halt` with no running tasks prints `Durdurulacak görev yok.` and exits 0. (`kahyad/cmd/kahya/halt_test.go`'s `TestHaltZeroHaltedPrintsNoneMessage`.)
 
 ## Out of scope
 - Graceful drain, pause/resume, or partial checkpointing — halt is terminal SIGKILL by design; anything softer is a different feature no backlog row owns.

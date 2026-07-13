@@ -314,22 +314,64 @@ func (b *Bot) markResolved(id, suffix string) {
 // resolution ... so a stale phone screen can't mislead." Egress-checked
 // like every other outbound byte this package sends.
 func (b *Bot) editCard(card *cardState, suffix string) {
+	b.editCardText(context.Background(), card, card.Text+suffix)
+}
+
+// editCardText is editCard's shared core (factored out for W6-03's
+// OnApprovalInvalidated below, which REPLACES a card's text outright
+// rather than appending a suffix to the original diff - the diff content
+// is no longer relevant once the whole task has been halted). Egress-
+// checked like every other outbound byte this package sends.
+func (b *Bot) editCardText(ctx context.Context, card *cardState, newText string) {
 	if !b.Enabled() {
 		return
 	}
-	newText := card.Text + suffix
 	// MINOR D fix: SessionID is now set (== card.TraceID, the same value
 	// TraceID carries) so a sensitive-read session's Telegram edits are
 	// actually subject to the sensitive-read egress rule, matching
 	// anthproxy_hook.go's per-task-trace-id-is-the-session-key convention
 	// - previously SessionID was always empty here, so that rule could
 	// never apply to this package's sends at all.
-	dec, err := b.egress.Check(context.Background(), egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(newText)), egress.SessionInfo{SessionID: card.TraceID, TraceID: card.TraceID})
+	dec, err := b.egress.Check(ctx, egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(newText)), egress.SessionInfo{SessionID: card.TraceID, TraceID: card.TraceID})
 	if err != nil || !dec.Allow {
 		return
 	}
 	stored := tele.StoredMessage{MessageID: strconv.Itoa(card.MessageID), ChatID: card.ChatID}
 	_, _ = b.sender.Edit(stored, newText)
+}
+
+// msgApprovalInvalidatedHalt is W6-03's byte-exact Telegram card-edit text
+// for a pending approval an emergency halt invalidated (HANDOFF §6 W6
+// flag; CLAUDE.md language policy - Turkish, byte-exact, never paraphrased).
+const msgApprovalInvalidatedHalt = "⛔ Onay geçersiz — görev kullanıcı tarafından durduruldu."
+
+// OnApprovalInvalidated is kahyad/internal/policy.Engine's
+// SetInvalidatedHook callback (W6-03): if this bot ever sent a W1/W2
+// approval card for info.ID (sendApprovalCard above), REPLACE its text
+// with the byte-exact halt message and mark it resolved - a stale tap on
+// the original Onayla/Reddet buttons afterward gets "Zaten işlendi."
+// (handleCallback's own already-resolved short-circuit), never a second
+// decision reaching the engine (which would fail-closed there too, since
+// the underlying pending_approvals row/token are already
+// consumed/revoked - this is purely the user-visible surface catching up).
+// A no-op if this bot never sent a card for info.ID at all (no entry in
+// b.cards - e.g. a W3 notify-only message, which carries no keyboard and
+// nothing to "un-approve", or the bot was not configured at mint time) or
+// is not Enabled().
+func (b *Bot) OnApprovalInvalidated(ctx context.Context, info policy.PendingApprovalInfo) {
+	if !b.Enabled() {
+		return
+	}
+	b.mu.Lock()
+	card, ok := b.cards[info.ID]
+	if ok {
+		card.resolved = true
+	}
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	b.editCardText(ctx, card, msgApprovalInvalidatedHalt)
 }
 
 // respond answers cb with a short "toast" callback response (Onaylandı /

@@ -1,7 +1,7 @@
--- kahya.lua — Kâhya's Hammerspoon surface (W6-01/W6-02, HANDOFF §4 UI +
--- IPC + stack STT).
+-- kahya.lua — Kâhya's Hammerspoon surface (W6-01/W6-02/W6-03, HANDOFF §4
+-- UI + IPC + stack STT).
 --
--- This file provides four things:
+-- This file provides five things:
 --   1. The ⌥Space command palette (hs.chooser, free-text): capture the
 --      hotkey-press timestamp, run `kahya ask --palette-opened-at <t> --
 --      <text>`, show the answer via hs.notify.
@@ -19,6 +19,11 @@
 --   3. The generic background/scheduled-task notification path:
 --      kahyaNotify(payloadB64), invoked by kahyad/internal/ui.HSCli.Notify
 --      / SendNotification via `hs -c 'kahyaNotify("<base64 json>")'`.
+--   4. ⌥⎋ EMERGENCY HALT (W6-03, HANDOFF §6 W6 ⚑): `kahyaBin halt` (no
+--      --task = every non-terminal task) -> hs.notify "Acil durdurma —
+--      tüm görevler durduruldu". Works even while the palette/an approval
+--      dialog is open — deliberately W6-01 did NOT bind ⌥⎋, so this task
+--      is the first to claim it.
 --
 -- IMPORTANT — this file is a RENDERING + INPUT surface ONLY. Every binding
 -- security decision (hash verification, NFC normalization, bidi/zero-
@@ -419,6 +424,47 @@ function kahyaNotify(payloadB64)
     autoWithdraw = true,
   }):send()
 end
+
+-- ---------------------------------------------------------------------
+-- 4. ⌥⎋ emergency halt (W6-03)
+-- ---------------------------------------------------------------------
+
+-- ⌥⎋ -> `kahyaBin halt` (no --task: halts EVERY non-terminal task) ->
+-- notify "Acil durdurma — tüm görevler durduruldu" (task spec step 7,
+-- byte-exact). Every actual halt decision — process-group SIGKILL, docker
+-- kill, the terminal user_halted transition, outbox cancel, approval
+-- invalidation + token revocation — happens server-side in kahyad
+-- (kahyad/internal/halt.Executor); this binding only fires the CLI call
+-- and shows the notification, exactly like every other binding in this
+-- file.
+--
+-- Works while the palette (kahyaChooser) or an approval dialog
+-- (hs.dialog.textPrompt/blockAlert in openApprovalDialog) is open:
+-- hs.hotkey.bind registers a system-level event tap that Hammerspoon's
+-- own run loop still services even while an NSAlert/NSTextField modal
+-- session is pumping it — the same reason ⌥Space itself already works
+-- regardless of which app is frontmost. No special-casing is needed here;
+-- this is an ordinary hs.hotkey.bind exactly like the ⌥Space one above.
+hs.hotkey.bind({ "alt" }, "escape", function()
+  runKahya({ "halt" }, function(exitCode, stdOut, stdErr)
+    hs.notify.new({
+      title = "Kâhya",
+      informativeText = "Acil durdurma — tüm görevler durduruldu",
+      autoWithdraw = true,
+    }):send()
+    if exitCode ~= 0 then
+      -- kahyaBin halt itself only ever exits 0 (task spec: "exit 0 both
+      -- ways") - a non-zero exit here means the CLI could not even reach
+      -- kahyad (dial failure), which the user should still know about
+      -- alongside the notification above.
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = "Durdurma komutu kahyad'a ulaşamadı: " .. (stdErr ~= "" and stdErr or stdOut),
+        autoWithdraw = true,
+      }):send()
+    end
+  end)
+end)
 
 -- ---------------------------------------------------------------------
 -- CLI install (so `hs -c '...'` from kahyad's own exec bridge works)

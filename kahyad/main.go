@@ -33,6 +33,7 @@ import (
 	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/eval"
 	"kahya/kahyad/internal/factengine"
+	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/mlx"
@@ -403,6 +404,14 @@ func run() int {
 		go tgBot.OnPendingApproval(context.Background(), info)
 		go hsCli.ShowApproval(context.Background(), info.TraceID, info.ID)
 	})
+	// W6-03: the emergency-halt executor's own approval-invalidation step
+	// (kahyad/internal/policy.Engine.InvalidateApprovalsForTask) fires this
+	// once per pending_approvals row it consumes, so a card this SAME
+	// tgBot already sent gets edited to the halt message - see
+	// kahyad/internal/telegram.Bot.OnApprovalInvalidated's own doc comment.
+	policyEngine.SetInvalidatedHook(func(info policy.PendingApprovalInfo) {
+		go tgBot.OnApprovalInvalidated(context.Background(), info)
+	})
 	log.Info("telegram_bot_wired", "enabled", tgBot.Enabled())
 
 	// BLOCKER B/C: the shared, daemon-lifetime forward-proxy (egress.Proxy,
@@ -565,6 +574,16 @@ func run() int {
 	taskLive := task.NewLiveRegistry()
 	srv.SetTaskDurability(taskResolver, st.Queries, taskLive)
 	srv.SetTaskLiveRegistry(taskLive)
+
+	// W6-03: the emergency-halt (⌥⎋) executor (HANDOFF §6 W6 ⚑) - shares
+	// taskMachine/taskLive/st with the resume scan/outbox dispatcher below
+	// and policyEngine/shellRunner built earlier. shellRunner (the W3-04
+	// Docker shell tool) satisfies kahyad/internal/halt.ContainerKiller
+	// directly via KillLabeled; policyEngine satisfies ApprovalInvalidator
+	// directly via InvalidateApprovalsForTask.
+	haltExecutor := halt.NewExecutor(st.Queries, taskMachine, taskLive, policyEngine, shellRunner, st)
+	haltExecutor.SetJSONLLogger(log)
+	srv.SetHaltExecutor(haltExecutor)
 
 	// W4-07 acceptance gate: the dev-only w2_slow_stub MCP tool
 	// (kahyad/internal/server/devstub.go) is the ONLY thing that drives the

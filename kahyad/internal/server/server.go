@@ -194,6 +194,11 @@ type Server struct {
 	taskMachine    *task.Machine
 	taskCloudRetry *task.CloudRetry
 
+	// haltExecutor wires POST /halt (W6-03) - see halt.go's SetHaltExecutor
+	// doc comment. nil until that setter is called - the route answers 503
+	// the same "unwired dependency" way SetSearcher/SetReindexer do.
+	haltExecutor HaltExecutor
+
 	// devStubReceipts wires the W4-07 acceptance-gate-only w2_slow_stub MCP
 	// tool (devstub.go) - see SetDevStub's own doc comment. nil (the
 	// default, and ALWAYS nil in production - main.go only calls SetDevStub
@@ -382,6 +387,9 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
 	mux.HandleFunc("/v1/entity/split", s.handleEntitySplit)
 	mux.HandleFunc("/v1/remembered", s.handleRemembered)
+	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
+	// ⌥⎋ binding both call this (halt.go's own doc comment).
+	mux.HandleFunc("POST /halt", s.handleHalt)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

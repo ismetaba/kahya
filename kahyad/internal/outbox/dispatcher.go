@@ -93,6 +93,13 @@ type Store interface {
 	// worker, so a long-running task's row is never re-claimed purely
 	// because its original lease (computed once at claim time) elapsed.
 	RenewOutboxLease(ctx context.Context, arg sqlcgen.RenewOutboxLeaseParams) error
+	// SetTaskWorkerPGID persists a redispatched worker's process-group id
+	// (W6-03) - see resume.go's own SetTaskWorkerPGID doc comment
+	// (kahyad/internal/task's mirror of the same interface method); this
+	// package's own processResume call site below is the SECOND of the
+	// two places a fresh worker pid needs recording (the first is
+	// kahyad/internal/server's handleTask, the first-spawn path).
+	SetTaskWorkerPGID(ctx context.Context, arg sqlcgen.SetTaskWorkerPGIDParams) error
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -382,6 +389,19 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		OnStart: func(pid int) {
 			if d.live != nil {
 				d.live.Register(t.ID, pid)
+			}
+			// W6-03: persist the redispatched worker's process-group id
+			// ALONGSIDE the in-memory registry above - see
+			// kahyad/internal/server's handleTask OnStart callback (the
+			// first-spawn path's mirror of this same write) for why. Best-
+			// effort: a write failure here is logged, never fatal to the
+			// redispatch itself.
+			if err := d.store.SetTaskWorkerPGID(ctx, sqlcgen.SetTaskWorkerPGIDParams{
+				WorkerPgid: sql.NullInt64{Int64: int64(pid), Valid: true}, UpdatedAt: d.nowRFC3339(), ID: t.ID,
+			}); err != nil {
+				d.ledgerRaw(ctx, t.TraceID, "outbox.worker_pgid_persist_failed", map[string]any{
+					"event": "outbox.worker_pgid_persist_failed", "task_id": t.ID, "err": err.Error(),
+				})
 			}
 		},
 		OnSession: func(sessionID string) {

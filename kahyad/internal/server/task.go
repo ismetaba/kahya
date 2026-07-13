@@ -110,6 +110,12 @@ type TaskStore interface {
 	InsertTask(ctx context.Context, arg sqlcgen.InsertTaskParams) (sqlcgen.Task, error)
 	UpdateTaskState(ctx context.Context, arg sqlcgen.UpdateTaskStateParams) error
 	UpdateTaskSession(ctx context.Context, arg sqlcgen.UpdateTaskSessionParams) error
+	// SetTaskWorkerPGID persists the spawned worker's process-group id
+	// (W6-03) - see that query's own doc comment in queries.sql for why
+	// this exists ALONGSIDE the in-memory taskLiveRegistry: a worker
+	// orphaned by a daemon crash/restart is still killable via this
+	// column, since macOS has no PDEATHSIG.
+	SetTaskWorkerPGID(ctx context.Context, arg sqlcgen.SetTaskWorkerPGIDParams) error
 }
 
 // SetTaskStore wires POST /v1/task's tasks-table persistence. Call before
@@ -864,6 +870,21 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
 			if s.taskLiveRegistry != nil {
 				s.taskLiveRegistry.Register(taskID, pid)
+			}
+			// W6-03: persist the worker's process-group id (spawn.Run always
+			// starts it as its own new group leader via Setpgid, so pid ==
+			// pgid) ALONGSIDE the in-memory registry above, so the halt
+			// executor can still kill this worker's group even after a
+			// daemon crash/restart emptied that in-memory registry (macOS
+			// has no PDEATHSIG - migrations/0015_halt_semantics.sql's own
+			// doc comment). Best-effort: a write failure here is logged,
+			// never fatal to the task itself.
+			if s.taskStore != nil {
+				if err := s.taskStore.SetTaskWorkerPGID(persistCtx, sqlcgen.SetTaskWorkerPGIDParams{
+					WorkerPgid: sql.NullInt64{Int64: int64(pid), Valid: true}, UpdatedAt: rfc3339Now(), ID: taskID,
+				}); err != nil {
+					log.Warn("task_worker_pgid_persist_failed", "task_id", taskID, "err", err.Error())
+				}
 			}
 		},
 		OnDelta: func(text string) {

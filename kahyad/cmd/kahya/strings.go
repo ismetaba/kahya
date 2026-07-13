@@ -189,6 +189,17 @@ const (
 	MsgTaskResolvedRetry = "Görev yeniden kuyruğa alındı: %s"
 	MsgTaskResolvedAbort = "Görev durduruldu (failed): %s"
 
+	// ---- W6-03: kahya halt [--task <id>] ----
+
+	// MsgHaltStoppedFmt is `kahya halt`'s success line when n>=1 tasks were
+	// freshly halted (%d = n). Byte-exact per this task's spec.
+	MsgHaltStoppedFmt = "⛔ %d görev durduruldu (user_halted)."
+	// MsgHaltNone is printed instead when n==0 - no running tasks to halt
+	// at all (or, for `--task <id>`, that task was already
+	// terminal/does not exist). Exit 0 either way (this task's spec:
+	// "pressing ⌥⎋ with nothing running is not an error").
+	MsgHaltNone = "Durdurulacak görev yok."
+
 	// ---- W4-05: kahya ledger verify ----
 
 	// MsgLedgerUsage is printed when `kahya ledger` is given anything other

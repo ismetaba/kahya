@@ -679,6 +679,53 @@ func (c *Client) LedgerVerify(ctx context.Context, traceID string) (ledgerVerify
 	return lr, nil
 }
 
+// haltResponse mirrors kahyad's POST /halt JSON body
+// (kahyad/internal/server.haltResponse, W6-03).
+type haltResponse struct {
+	Halted int    `json:"halted"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Halt calls POST /halt (`kahya halt [--task <id>]`, W6-03): taskID=""
+// sends `{"all":true}` (halt every non-terminal task); a non-empty taskID
+// sends `{"task_id":"<id>"}` (halt exactly that one task). Returns how
+// many tasks were freshly halted - 0 is a documented no-op success (no
+// running tasks, or the named task was already terminal/does not exist),
+// never an error.
+func (c *Client) Halt(ctx context.Context, traceID, taskID string) (int, error) {
+	var body []byte
+	var err error
+	if taskID == "" {
+		body, err = json.Marshal(map[string]bool{"all": true})
+	} else {
+		body, err = json.Marshal(map[string]string{"task_id": taskID})
+	}
+	if err != nil {
+		return 0, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/halt", traceID, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return 0, fmt.Errorf("%s", msg)
+		}
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("halt: status %d", resp.StatusCode)}
+	}
+	var hr haltResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
+		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("halt: decode response: %w", err)}
+	}
+	return hr.Halted, nil
+}
+
 // consolidationShowResponse mirrors kahyad's GET /v1/consolidation JSON
 // body (kahyad/internal/server.consolidationShowResponse, W5-02).
 type consolidationShowResponse struct {

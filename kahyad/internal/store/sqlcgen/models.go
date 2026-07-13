@@ -160,6 +160,8 @@ type Outbox struct {
 	AvailableAt  sql.NullString `json:"available_at"`
 	LeaseUntil   sql.NullString `json:"lease_until"`
 	Attempts     int64          `json:"attempts"`
+	TaskID       sql.NullString `json:"task_id"`
+	CanceledAt   sql.NullString `json:"canceled_at"`
 }
 
 type PendingApproval struct {
@@ -198,6 +200,8 @@ type Task struct {
 	Status         string         `json:"status"`
 	NextRetryAt    sql.NullString `json:"next_retry_at"`
 	Attempts       int64          `json:"attempts"`
+	WorkerPgid     sql.NullInt64  `json:"worker_pgid"`
+	HaltedAt       sql.NullString `json:"halted_at"`
 }
 
 type ToolCall struct {

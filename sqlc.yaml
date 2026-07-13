@@ -47,6 +47,14 @@ sql:
       # CREATE INDEX statements (including one partial UNIQUE index) - same
       # reasoning.
       - "kahyad/migrations/0013_eval_labels.sql"
+      # 0014 (evidence one-per-session-polarity) is a plain CREATE UNIQUE
+      # INDEX with no new columns/tables any query needs - intentionally
+      # NOT added here (nothing for sqlc to generate against).
+      #
+      # 0015 (W6-03) is four plain ALTER TABLE statements (tasks.
+      # worker_pgid/halted_at, outbox.task_id/canceled_at) - same
+      # reasoning as 0006/0011/0012 above.
+      - "kahyad/migrations/0015_halt_semantics.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

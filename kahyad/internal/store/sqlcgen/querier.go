@@ -16,6 +16,13 @@ type Querier interface {
 	// with the ledger it claims to cover (task spec's own "never an event
 	// without its digest step, never a digest step without its event").
 	AdvanceLedgerDigestState(ctx context.Context, arg AdvanceLedgerDigestStateParams) error
+	// W6-03 halt executor step 3.4: cancel every UNDELIVERED outbox row for
+	// taskID (dispatched_at IS NULL - a row already marked delivered is left
+	// untouched, matching this codebase's "never rewrite settled history"
+	// posture elsewhere). Idempotent (AND canceled_at IS NULL): a second halt
+	// call against an already-halted task affects 0 rows here, never
+	// re-stamps canceled_at with a later timestamp.
+	CancelOutboxRowsByTask(ctx context.Context, arg CancelOutboxRowsByTaskParams) (int64, error)
 	// The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
 	// ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"
 	// pattern elsewhere in this file): only the FIRST dispatcher to run this
@@ -260,7 +267,13 @@ type Querier interface {
 	// kahyad/internal/outbox/dispatcher.go for the only caller.
 	// available_at defaults to "now" (immediately dispatchable); lease_until
 	// starts NULL (never claimed) and attempts starts 0 - both only ever
-	// change via ClaimOutboxRow below.
+	// change via ClaimOutboxRow below. task_id (W6-03, migrations/
+	// 0015_halt_semantics.sql) back-links this row to the task it would
+	// redeliver - NULL for any future outbox kind that is not task-scoped
+	// (none exist yet; kahyad/internal/task.writeOutboxResumeRowAt is the only
+	// caller today and always supplies one). canceled_at starts NULL, exactly
+	// like dispatched_at - only the W6-03 halt executor's CancelOutboxRowsByTask
+	// ever sets it.
 	InsertOutboxRow(ctx context.Context, arg InsertOutboxRowParams) (Outbox, error)
 	// Post-security-review amendment: pending_approvals queries below back the
 	// server-issued, single-use pending_approval_id (see
@@ -310,11 +323,13 @@ type Querier interface {
 	// S4 flag - so there is no window where a task row exists with an
 	// unclassified lane). The RETURNING clause lists every physical column
 	// (including status/next_retry_at/attempts, W4-02's 0007_task_durability
-	// ALTER TABLEs - left OUT of the INSERT column/VALUES list itself, so
+	// ALTER TABLEs, and worker_pgid/halted_at, W6-03's 0015_halt_semantics
+	// ALTER TABLEs - all left OUT of the INSERT column/VALUES list itself, so
 	// every existing caller keeps inserting a row that takes their DEFAULTs
-	// unchanged: status='intent', attempts=0, next_retry_at=NULL) so sqlc
-	// reuses the existing Task model type here rather than generating a
-	// second, differently-ordered InsertTaskRow type.
+	// unchanged: status='intent', attempts=0, next_retry_at=NULL,
+	// worker_pgid=NULL, halted_at=NULL) so sqlc reuses the existing Task
+	// model type here rather than generating a second, differently-ordered
+	// InsertTaskRow type.
 	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	// Step 1 of the intent -> executing -> {receipt, failed} lifecycle
 	// (kahyad/internal/task.Receipts.Execute): one row per side-effectful
@@ -364,6 +379,23 @@ type Querier interface {
 	// so two concurrent dispatchers racing on the SAME candidate list each
 	// only ever win the atomic UPDATE for rows the other hasn't already
 	// claimed first.
+	//
+	// W6-03 (HANDOFF S6 W6 flag, verbatim): "gorev terminal user_halted
+	// durumuna yazilir (session-resume ve outbox retry'dan kalici haric)".
+	// TWO independent, deliberately redundant guards enforce this at the
+	// claim query itself (task spec step 5: "must filter status !=
+	// 'user_halted' explicitly, even though it is terminal"):
+	//   1. o.canceled_at IS NULL - the halt executor's own
+	//      CancelOutboxRowsByTask marks every one of the task's undelivered
+	//      rows canceled AT HALT TIME (task spec step 3.4).
+	//   2. the LEFT JOIN below re-checks the OWNING TASK's CURRENT status on
+	//      every claim pass, straight from tasks.status - so even a row that
+	//      somehow went uncancelled (a bug, a race, a future caller of
+	//      InsertOutboxRow that forgets task_id) is STILL never claimed for a
+	//      task that is (or has since become) user_halted. t.id IS NULL
+	//      covers a row whose task_id is NULL (no task to exclude it - see
+	//      InsertOutboxRow's own doc comment) exactly as before this guard
+	//      existed.
 	ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsParams) ([]Outbox, error)
 	// Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
 	// so Split can restore exactly this set back onto the losing entity.
@@ -395,12 +427,33 @@ type Querier interface {
 	// own LiveRegistry then filters this down to the ones with NO live worker
 	// PID - a live task is simply skipped (the daemon itself is still running
 	// it).
+	//
+	// W6-03 defense-in-depth (HANDOFF S6 W6 flag, verbatim): "gorev terminal
+	// user_halted durumuna yazilir (session-resume ve outbox retry'dan kalici
+	// haric)". status = 'executing' above ALREADY excludes 'user_halted' (the
+	// two are mutually exclusive column values - a halted task can never also
+	// read 'executing'), so the explicit "AND status != 'user_halted'" below
+	// is redundant by construction today; it is kept anyway, verbatim, as a
+	// second, independent guard directly at this query - the W6-03 task spec's
+	// own instruction ("defense in depth even though it is terminal") for the
+	// exact scenario this comment quotes: even a future change to this WHERE
+	// clause that loosens 'executing' can never accidentally resume a halted
+	// task without ALSO having to delete this line first.
 	ListExecutingTasks(ctx context.Context) ([]Task, error)
 	// Per-fact most-recent asked_at, across every ritual run ever run - the
 	// sampler's "never/longest-ago probed" priority tier (select.go): a
 	// fact_id absent from this result set has never been asked and sorts
 	// first, ahead of every fact that has.
 	ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedAtAllFactsRow, error)
+	// W6-03 `POST /halt {"all":true}`'s own candidate set (task spec step 4:
+	// "{all:true} iterates every task in a non-terminal running state"): every
+	// task NOT already in one of the three terminal statuses (done, failed,
+	// user_halted - kahyad/internal/task.allowedTransitions' own zero-outbound-
+	// edges states). Halting an already-terminal task is instead the
+	// idempotent no-op HaltTask itself decides on a direct GetTaskByID lookup
+	// (task spec step 8) - this query is only ever consulted for the {all:true}
+	// fan-out, never for a single --task <id> halt.
+	ListNonTerminalTasks(ctx context.Context) ([]Task, error)
 	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 	// Every not-yet-pushed anchor_log row, oldest first - push.go's
 	// stale-pending alarm (task spec step 5: "if the oldest pending is older
@@ -423,6 +476,11 @@ type Querier interface {
 	// trailing-zero-trimmed fractional seconds do NOT always sort
 	// lexicographically in timestamp order).
 	ListUnconsumedPendingApprovals(ctx context.Context) ([]PendingApproval, error)
+	// W6-03 Engine.InvalidateApprovalsForTask's own candidate set: every
+	// not-yet-consumed pending_approvals row for taskID, oldest first - the
+	// SAME "not-yet-consumed" definition ListUnconsumedPendingApprovals above
+	// uses, scoped to one task instead of every task in the system.
+	ListUnconsumedPendingApprovalsByTask(ctx context.Context, taskID string) ([]PendingApproval, error)
 	// Active episodes not yet hot-window-cooled, created at or before cutoff
 	// (RFC3339 UTC string compare - every created_at this codebase writes is
 	// already normalized to that format, so a plain string comparison sorts
@@ -483,6 +541,27 @@ type Querier interface {
 	// (kahyad/internal/factengine/retract.go) always inserts a negative
 	// evidence row in the SAME logical operation, never this alone.
 	RetractFact(ctx context.Context, arg RetractFactParams) error
+	// W6-03 halt executor step 3.5 ("invalidate pending approvals ... and
+	// REVOKE their one-time tokens"): burns every not-yet-consumed
+	// approval_tokens row for taskID via the SAME "UPDATE ... WHERE
+	// consumed_at IS NULL" single-use pattern ConsumeApprovalToken above uses
+	// - a token an autonomy-ladder auto-allow (W1) or a prior human Approve
+	// (W2) already minted BEFORE the halt, but that the corresponding
+	// side-effectful MCP tool has not yet presented to ConsumeToken, is
+	// exactly the "a diff approved before the halt must not authorize
+	// anything after it" case (HANDOFF S5 one-time approval tokens) - a stale
+	// CLI decide, Hammerspoon card button, or Telegram inline button pressed
+	// AFTER this UPDATE all hit ConsumeToken's identical "0 rows affected ->
+	// ErrTokenInvalid" fail-closed path, never a demotion (this is the user
+	// choosing to stop, not a tool misusing a token - see
+	// kahyad/internal/halt's own doc comment for why this bypasses
+	// Engine.ConsumeToken's demotion machinery entirely).
+	RevokeApprovalTokensByTask(ctx context.Context, arg RevokeApprovalTokensByTaskParams) (int64, error)
+	// W6-03: stamped by the halt executor in the SAME step that transitions
+	// tasks.status to 'user_halted' (kahyad/internal/task.Machine.Transition,
+	// a separate call - this query ONLY ever touches halted_at, exactly like
+	// SetTaskNextRetry above only ever touches next_retry_at).
+	SetTaskHaltedAt(ctx context.Context, arg SetTaskHaltedAtParams) error
 	// W3-08 (secret-lane routing) queries below: lane/secret_category are
 	// STICKY (kahyad/internal/secretlane.Escalate enforces "only ever widens,
 	// never downgrades" in Go, not SQL - see 0006_secret_lane.sql's own doc
@@ -510,6 +589,16 @@ type Querier interface {
 	// and Machine.Transition treats that as a lost race, never silently
 	// overwriting whatever the winner just wrote (no more last-write-wins).
 	SetTaskStatus(ctx context.Context, arg SetTaskStatusParams) (int64, error)
+	// W6-03: persists the spawned worker's process-group id onto its task row
+	// (kahyad/internal/spawn.Callbacks.OnStart fires this at BOTH the first
+	// spawn, kahyad/internal/server's handleTask, AND every outbox-driven
+	// redispatch, kahyad/internal/outbox.Dispatcher.processResume) -
+	// ALONGSIDE the existing in-memory kahyad/internal/task.LiveRegistry, so
+	// the W6-03 halt executor can still find and kill this worker's process
+	// GROUP even after a daemon crash/restart emptied that in-memory registry
+	// (macOS has no PDEATHSIG - see migrations/0015_halt_semantics.sql's own
+	// doc comment).
+	SetTaskWorkerPGID(ctx context.Context, arg SetTaskWorkerPGIDParams) error
 	SetUndoWindowState(ctx context.Context, arg SetUndoWindowStateParams) error
 	// Update-half of an application-level upsert (kahyad/internal/policy
 	// calls this first; a 0-rows-affected result means no row exists yet, so

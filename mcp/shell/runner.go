@@ -510,7 +510,7 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 
 	containerName := containerNameFor(taskID)
 	spec := dockerRunSpec{
-		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID,
+		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
 		Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
 	}
 	if in.NeedsNetwork {
@@ -596,6 +596,34 @@ func (r *Runner) KillAllLabeled(ctx context.Context) error {
 	return firstErr
 }
 
+// KillLabeled kills every container carrying the EXACT
+// `kahya.task_id=<taskID>` label value (unlike KillAllLabeled's blanket
+// "the label key is present, any value" filter) — the W6-03 emergency-halt
+// executor's own per-task container-kill step (HANDOFF §6 W6 flag: "ilgili
+// Docker konteynerleri öldürülür"). Best-effort and NEVER returns an error:
+// halt is best-effort-complete (this task's own spec step 3: "continue past
+// individual failures - halt must be best-effort-complete, never
+// partial-abort") and must never be blocked by Docker being unreachable
+// (r.Health nil-checked defensively; a "docker ps" call that itself errors
+// or exits non-zero, e.g. the daemon is not running, is treated identically
+// to "no containers to kill" - task spec step 3.2's own "skip silently if
+// Docker is not running"). A container that has already exited by the time
+// its own `docker kill` runs is likewise ignored — best-effort, not a
+// signal to stop killing the rest of the list.
+func (r *Runner) KillLabeled(ctx context.Context, taskID string) error {
+	if r.Health != nil && !r.Health.Healthy(ctx) {
+		return nil
+	}
+	res, err := r.Exec.Run(ctx, "docker", []string{"ps", "-q", "--filter", "label=kahya.task_id=" + taskID}, nil)
+	if err != nil || res.ExitCode != 0 {
+		return nil
+	}
+	for _, id := range strings.Fields(string(res.Stdout)) {
+		_, _ = r.Exec.Run(ctx, "docker", []string{"kill", id}, nil)
+	}
+	return nil
+}
+
 // resolveEnv looks up allowlist's names through r.EnvLookup, silently
 // skipping any name absent from the host environment — RunInput.
 // EnvAllowlist supplies NAMES only; VALUES always come from the host,
@@ -641,8 +669,16 @@ type dockerRunSpec struct {
 	ImageTag      string
 	ContainerName string
 	TaskID        string
-	Workdir       string // host-side canonical path (CanonicalPath.Op)
-	EnvPairs      map[string]string
+	// TraceID carries the `kahya.trace_id` container label (W6-03) -
+	// SEPARATE from TaskID's own `kahya.task_id` label (already present
+	// since W3-04): the halt executor's container-kill step filters
+	// containers by kahya.task_id alone, but kahya.trace_id is what a
+	// JSONL/ledger grep against a specific trace can correlate straight
+	// back to the container that ran for it, without a second join
+	// through the tasks table.
+	TraceID  string
+	Workdir  string // host-side canonical path (CanonicalPath.Op)
+	EnvPairs map[string]string
 	// Network overrides the default "none" — Run sets this to
 	// EgressNetworkName for a needs_network:true invocation (W3-05),
 	// after EgressEnsurer.Ensure has already set the network/sidecar up.
@@ -666,8 +702,12 @@ type dockerRunSpec struct {
 // `-v <workdir>:/work:rw` as the ONLY bind mount, `--user 1000:1000`,
 // `--pids-limit 256`, `--memory 2g`, `--cap-drop ALL`, `--security-opt
 // no-new-privileges`, `--label kahya.task_id=<id>` (spec step 7: "label
-// every container"), `--rm` (auto-remove on exit so sandbox containers
-// never accumulate — HANDOFF gives no container-retention requirement).
+// every container") + `--label kahya.trace_id=<tid>` (W6-03: the halt
+// executor's own container-kill step filters on the task_id label; the
+// trace_id label is a second, independent correlation key so a JSONL/
+// ledger grep against one trace finds the container directly), `--rm`
+// (auto-remove on exit so sandbox containers never accumulate — HANDOFF
+// gives no container-retention requirement).
 // The Docker socket is never mounted (this task's own gotcha, HANDOFF §5
 // safety #6 context). The container's own command is a bare `/bin/sh`,
 // fed the script over STDIN (`-i`) — never as a command-line argument —
@@ -693,6 +733,7 @@ func buildDockerRunArgs(spec dockerRunSpec) []string {
 		"--workdir", containerWorkdir,
 		"--name", spec.ContainerName,
 		"--label", "kahya.task_id=" + spec.TaskID,
+		"--label", "kahya.trace_id=" + spec.TraceID,
 	}
 	args = appendSortedEnvPairs(args, spec.ProxyEnvPairs)
 	args = appendSortedEnvPairs(args, spec.EnvPairs)

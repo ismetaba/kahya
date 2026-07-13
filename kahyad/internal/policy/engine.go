@@ -188,6 +188,13 @@ type Store interface {
 	// is filtered in Go (ListPendingApprovals below), not SQL - see that
 	// query's own doc comment in queries.sql.
 	ListUnconsumedPendingApprovals(ctx context.Context) ([]sqlcgen.PendingApproval, error)
+	// ListUnconsumedPendingApprovalsByTask/RevokeApprovalTokensByTask back
+	// the W6-03 halt executor's InvalidateApprovalsForTask (halt.go, this
+	// package): every not-yet-consumed pending_approvals row for one task,
+	// and the single UPDATE that burns every not-yet-consumed
+	// approval_tokens row for that same task.
+	ListUnconsumedPendingApprovalsByTask(ctx context.Context, taskID string) ([]sqlcgen.PendingApproval, error)
+	RevokeApprovalTokensByTask(ctx context.Context, arg sqlcgen.RevokeApprovalTokensByTaskParams) (int64, error)
 
 	InsertUndoWindow(ctx context.Context, arg sqlcgen.InsertUndoWindowParams) (sqlcgen.UndoWindow, error)
 	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error)
@@ -284,6 +291,19 @@ type Engine struct {
 	// any actual network send) so a slow hook can never delay a policy
 	// decision.
 	pendingApprovalHook func(PendingApprovalInfo)
+	// invalidatedHook is the W6-03 halt executor's own subscription seam
+	// (SetInvalidatedHook) - the exact same "owning surface subscribes via
+	// a nil-by-default hook" pattern pendingApprovalHook above already
+	// established, mirrored for the OPPOSITE event: called once per
+	// pending_approvals row InvalidateApprovalsForTask (halt.go, this
+	// package) invalidates, AFTER the row is already durably consumed, so
+	// the Telegram bot can edit that approval's card to the halt message
+	// (kahyad/internal/telegram.Bot.OnApprovalInvalidated) without this
+	// package needing to know Telegram exists. nil by default. Called
+	// SYNCHRONOUSLY from InvalidateApprovalsForTask, which runs inside the
+	// halt executor's own request path - same "fire a goroutine for any
+	// real network send" caller obligation as pendingApprovalHook.
+	invalidatedHook func(PendingApprovalInfo)
 	// taintChecker is W4-03's session-tier read (SetTaintChecker). nil (the
 	// default) means the taint check is skipped entirely - matching every
 	// other not-yet-wired dependency's "unwired means no-op" posture in
@@ -338,6 +358,16 @@ func (e *Engine) SetUndoExpiryHook(fn func(traceID, taskID, tool string)) {
 // caller/test is unaffected.
 func (e *Engine) SetPendingApprovalHook(fn func(PendingApprovalInfo)) {
 	e.pendingApprovalHook = fn
+}
+
+// SetInvalidatedHook registers fn to be called once per pending_approvals
+// row the W6-03 halt executor invalidates (see invalidatedHook's own doc
+// comment on the Engine struct). Call before any /halt traffic starts
+// flowing; nil (the default) means no hook runs - InvalidateApprovalsForTask
+// itself still invalidates the DB rows and revokes tokens either way, this
+// only controls whether an approval surface (Telegram) is told about it.
+func (e *Engine) SetInvalidatedHook(fn func(PendingApprovalInfo)) {
+	e.invalidatedHook = fn
 }
 
 // SetTaintChecker wires the W4-03 session-tier read Check consults FIRST

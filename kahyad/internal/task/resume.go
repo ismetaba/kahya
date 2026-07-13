@@ -297,6 +297,11 @@ func writeOutboxResumeRowAt(ctx context.Context, outbox OutboxEnqueuer, traceID,
 	if _, err := outbox.InsertOutboxRow(ctx, sqlcgen.InsertOutboxRowParams{
 		TraceID: traceID, Kind: OutboxKindTaskResume, Payload: string(payload),
 		CreatedAt: createdAt, AvailableAt: sql.NullString{String: availableAt, Valid: true},
+		// W6-03: back-links this row to taskID so the outbox claim query's
+		// own defense-in-depth join (ListDueOutboxRows) and the halt
+		// executor's CancelOutboxRowsByTask can both find it directly - see
+		// migrations/0015_halt_semantics.sql's own doc comment.
+		TaskID: sql.NullString{String: taskID, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("enqueue outbox row: %w", err)
 	}

@@ -80,6 +80,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRemembered(client, args[1:], stdout, stderr)
 	case "eval":
 		return runEval(client, args[1:], stdout, stderr)
+	case "halt":
+		return runHalt(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -1058,6 +1060,32 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 	} else {
 		fmt.Fprintf(stdout, MsgTaskResolvedRetry+"\n", id)
 	}
+	return 0
+}
+
+// runHalt implements `kahya halt [--task <id>]` (W6-03): no --task halts
+// EVERY non-terminal task; --task <id> halts exactly that one. Exit 0
+// either way, per the task spec's own "pressing ⌥⎋ with nothing running
+// is not an error" instruction - a --task <id> that does not exist, or is
+// already terminal, is likewise 0 halted, never an error.
+func runHalt(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("halt", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	taskID := fs.String("task", "", "yalnız bu görevi durdur (boş = tüm aktif görevler)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	n, err := client.Halt(context.Background(), traceid.New(), strings.TrimSpace(*taskID))
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 1
+	}
+	if n == 0 {
+		fmt.Fprintln(stdout, MsgHaltNone)
+		return 0
+	}
+	fmt.Fprintf(stdout, MsgHaltStoppedFmt+"\n", n)
 	return 0
 }
 
