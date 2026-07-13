@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any
 
 from claude_agent_sdk import (
@@ -36,6 +37,7 @@ from claude_agent_sdk import (
 )
 
 from . import logging as wlog
+from . import stt
 from .envelope import Envelope, EnvelopeError, parse_envelope
 from .hooks import make_can_use_tool, make_user_prompt_submit_hook
 from .system_prompt import SYSTEM_PROMPT
@@ -45,6 +47,20 @@ from .system_prompt import SYSTEM_PROMPT
 # paraphrased - docs/ipc.md §4).
 MSG_ENVELOPE_INVALID = "Görev zarfı geçersiz."
 MSG_MODEL_CALL_FAILED_FMT = "Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace {trace_id}"
+
+# W6-02: the byte-exact Turkish error for an empty/whitespace-only
+# transcript (tasks/w6-voice/W6-02-ptt-whisper.md step 3) - an empty
+# transcript is NEVER submitted to the task loop as a prompt; this is the
+# terminal stdout protocol message the CLI/hammerspoon surface instead.
+MSG_EMPTY_TRANSCRIPT = "Ses anlaşılamadı — lütfen tekrar deneyin"
+
+# W6-02: a generic fallback for an mode="stt" failure that is neither
+# stt.SttModelMissingError nor an empty transcript (e.g. the wav path does
+# not exist, or mlx_whisper itself raises something else entirely) - kept
+# distinct from MSG_MODEL_CALL_FAILED_FMT's wording (that message is about
+# a MODEL call, this is about local audio transcription) but follows the
+# same "point at kahya log --trace" convention.
+MSG_STT_FAILED_FMT = "Ses işlenemedi. Ayrıntı: kahya log --trace {trace_id}"
 
 # W4-04: exit code this process uses for the cloud_unreachable protocol
 # line below - distinct from 1 (ordinary model-call failure) and 2
@@ -158,14 +174,27 @@ def _check_real_key_leak() -> str | None:
     return None
 
 
-def _check_credential_env(credential_mode: str) -> str | None:
+def _check_credential_env(credential_mode: str, mode: str) -> str | None:
     """Returns a description of the first violated startup env
     invariant (step 6), or None if they all hold. ANTHROPIC_BASE_URL must
     always be set - the worker only ever talks to kahyad's own per-task
     forward-proxy listener, never a real upstream directly, in EITHER
     mode. In "keychain" mode, ANTHROPIC_API_KEY must additionally match
     the per-task token shape exactly (see the module's OWNER AUTH
-    DECISION comment for why "passthrough" mode does not enforce this)."""
+    DECISION comment for why "passthrough" mode does not enforce this).
+
+    W6-02: mode=="stt" sessions (envelope.Mode == spawn.ModeSTT, Go side)
+    never construct a ClaudeAgentOptions/ClaudeSDKClient at all - they only
+    call kahya_worker.stt.transcribe() as a local library function
+    (_run_stt_only below) - so neither check applies to them; kahyad's own
+    stt-phase caller (kahyad/internal/server) deliberately does not even
+    open a per-task Anthropic forward-proxy listener for this mode, and
+    passes ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY empty. This is what makes
+    "100% local" structural rather than incidental for the voice-capture
+    phase: there is no reachable network endpoint for this process to hit
+    even if something tried."""
+    if mode == "stt":
+        return None
     if not os.environ.get("ANTHROPIC_BASE_URL", "").strip():
         return "ANTHROPIC_BASE_URL is not set"
     if credential_mode == _CREDENTIAL_MODE_KEYCHAIN:
@@ -246,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     wlog.configure(os.environ.get("KAHYA_LOG_DIR", "."), os.environ.get("KAHYA_TRACE_ID", envelope.trace_id))
 
     credential_mode = os.environ.get("KAHYA_CREDENTIAL_MODE") or _CREDENTIAL_MODE_KEYCHAIN
-    env_err = _check_credential_env(credential_mode)
+    env_err = _check_credential_env(credential_mode, envelope.mode)
     if env_err is not None:
         wlog.log("error", "worker_env_invalid", detail=env_err, credential_mode=credential_mode)
         return 2
@@ -275,6 +304,13 @@ def main(argv: list[str] | None = None) -> int:
     # the built-in set outright).
     if envelope.mode == "reader":
         return asyncio.run(_run_reader_session(envelope))
+
+    # W6-02: mode="stt" runs the toolless, CLOUD-LESS local transcription
+    # path instead of any agent session at all - no asyncio.run needed,
+    # mlx_whisper.transcribe (kahya_worker.stt.transcribe) is a plain
+    # blocking library call (see _run_stt_only's own doc comment).
+    if envelope.mode == "stt":
+        return _run_stt_only(envelope)
 
     return asyncio.run(_run_session(envelope, socket_path, mcp_bridge))
 
@@ -498,6 +534,115 @@ async def _run_reader_session(envelope: Envelope) -> int:
         return 1
 
     wlog.log("info", "reader_task_done", task_id=envelope.task_id, schema=envelope.schema)
+    _print_protocol_line({"type": "result", "status": "ok"})
+    return 0
+
+
+# --- W6-02: STT mode (toolless, CLOUD-LESS - envelope.mode == "stt").
+# Transcribes envelope.input_audio_path with kahya_worker.stt.transcribe
+# (a plain, local library call - HANDOFF §4 ⚑ "mlx-whisper ... worker
+# içinde kütüphane") and reports the transcript back over the SAME
+# stdout protocol every other mode already uses ("delta" + terminal
+# "result"/"error") - no ClaudeAgentOptions/ClaudeSDKClient/MCP server is
+# ever constructed here, so this function never reaches the network,
+# structurally, regardless of what ANTHROPIC_BASE_URL happens to be set
+# to (kahyad's own caller deliberately leaves it blank for this mode -
+# see kahyad/internal/server's stt.go doc comment). ---
+
+
+def _tmp_dir() -> str:
+    """Returns KAHYA_TMP_DIR (kahyad/internal/spawn.BuildEnv sets this
+    from cfg.TmpDir - kahyad's own ``~/Library/Application Support/Kahya/
+    tmp/``, created 0700 at kahyad startup), or "" if unset.
+    ``_maybe_delete_audio`` treats an unset/blank value as "never delete
+    anything" - fail CLOSED towards NOT deleting, never towards deleting
+    something it should not."""
+    return os.environ.get("KAHYA_TMP_DIR", "")
+
+
+def _maybe_delete_audio(path: str) -> None:
+    """Deletes `path` IFF it resolves to a file directly inside kahyad's
+    own KAHYA_TMP_DIR (tasks/w6-voice/W6-02-ptt-whisper.md step 3: "delete
+    the file iff it is under ~/Library/Application Support/Kahya/tmp/ -
+    never delete a repo fixture or any path outside that tmp dir").
+    Resolves BOTH paths (os.path.realpath) before comparing, so a symlink
+    cannot be used to point outside the tmp dir while looking like it is
+    inside it; the check is "PARENT directory equals the resolved tmp
+    dir" (os.path.dirname), never a prefix/startswith string comparison -
+    a bare startswith(tmp_dir) would also match an unrelated sibling
+    directory that merely shares that prefix (e.g. ".../tmp-evil").
+    Best-effort and never raises: a failed delete is logged (warn), never
+    allowed to crash an otherwise-successful transcription or change this
+    function's own return value."""
+    tmp_dir = _tmp_dir()
+    if not path or not tmp_dir:
+        return
+    try:
+        real_path = os.path.realpath(path)
+        real_tmp_dir = os.path.realpath(tmp_dir)
+        if os.path.dirname(real_path) != real_tmp_dir:
+            wlog.log("warn", "stt_delete_skipped_outside_tmp", path=path, tmp_dir=tmp_dir)
+            return
+        os.remove(real_path)
+        wlog.log("info", "stt_temp_deleted", path=path)
+    except OSError as e:
+        wlog.log("warn", "stt_delete_failed", path=path, error=str(e))
+
+
+def _run_stt_only(envelope: Envelope) -> int:
+    """Runs mode="stt" (W6-02, task spec step 3): transcribes
+    envelope.input_audio_path entirely locally, emits the ``stt.completed``/
+    ``stt.empty`` JSONL event, deletes the temp wav (``_maybe_delete_audio``,
+    unconditionally - the recording is consumed whether or not usable text
+    came out of it), and reports the outcome via the ordinary stdout
+    protocol: a successful non-blank transcript as one "delta" line
+    followed by a terminal "result" line (kahyad/internal/server's own
+    caller joins "delta" text exactly like kahyad/internal/reader.
+    WorkerCloudModel already does for reader mode - no protocol change was
+    needed for this task at all); a missing model, an empty/whitespace-only
+    transcript, or any other transcription failure as a terminal "error"
+    line whose message is kahyad's caller uses VERBATIM as the user-facing
+    Turkish text - never wrapped, translated, or paraphrased between here
+    and the CLI.
+    """
+    path = envelope.input_audio_path or ""
+    started = time.monotonic()
+    try:
+        transcript = stt.transcribe(path)
+    except stt.SttModelMissingError:
+        # Fail-closed (HANDOFF §4/§5): never attempt a network download in
+        # response - stt.resolve_model's own doc comment is the actual
+        # enforcement; this is just the reporting side of it.
+        wlog.log("error", "stt_model_missing", path=path)
+        _maybe_delete_audio(path)
+        _print_protocol_line({"type": "error", "message": stt.MSG_MODEL_MISSING})
+        return 1
+    except Exception as e:  # noqa: BLE001 - any other transcription failure (bad/missing wav, mlx_whisper internal error, ...) still surfaces as ONE clean Turkish line, never a raw traceback.
+        wlog.log("error", "stt_failed", path=path, error=str(e))
+        _maybe_delete_audio(path)
+        _print_protocol_line({"type": "error", "message": MSG_STT_FAILED_FMT.format(trace_id=envelope.trace_id)})
+        return 1
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+
+    if not transcript.strip():
+        # Never submit an empty prompt to the task loop (task spec step 3).
+        wlog.log("info", "stt.empty", task_id=envelope.task_id, duration_ms=duration_ms)
+        _maybe_delete_audio(path)
+        _print_protocol_line({"type": "error", "message": MSG_EMPTY_TRANSCRIPT})
+        return 1
+
+    wlog.log(
+        "info", "stt.completed", task_id=envelope.task_id,
+        chars=len(transcript), duration_ms=duration_ms,
+    )
+    _maybe_delete_audio(path)
+    # The transcript, used verbatim as the eventual user prompt - relayed
+    # as an ordinary "delta" line (kahyad/internal/server's caller joins
+    # every "delta" it sees into the final transcript string, exactly like
+    # kahyad/internal/reader.WorkerCloudModel already does for its own
+    # "reader" mode - no bespoke protocol field needed for this task).
+    _print_protocol_line({"type": "delta", "text": transcript})
     _print_protocol_line({"type": "result", "status": "ok"})
     return 0
 

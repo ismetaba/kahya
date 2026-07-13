@@ -137,10 +137,31 @@ type Envelope struct {
 	// the audit trail of why Model ended up being claude-fable-5. Optional/
 	// backward-compatible: omitted when false.
 	DeepThink bool `json:"deep_think,omitempty"`
+
+	// InputAudioPath is W6-02's push-to-talk field: the absolute path to a
+	// mono 16kHz wav to transcribe locally (worker/kahya_worker/stt.py,
+	// `language="tr"` fixed - HANDOFF §4 stack row) before anything else
+	// happens for this task. NEVER itself the ordering-invariant
+	// enforcement: kahyad/internal/server's own stt-phase caller
+	// (transcribeAudioLocally, stt.go) spawns a SEPARATE, always-local
+	// Mode==ModeSTT envelope FIRST and only builds the REAL "chat" envelope
+	// (which never carries this field) from the resulting transcript, once
+	// classification has already run on it exactly like any typed prompt -
+	// see that file's own doc comment for the full ordering argument. Set
+	// ONLY on a Mode==ModeSTT envelope; empty/omitted on every other kind
+	// (including the real chat envelope built from the transcript).
+	InputAudioPath string `json:"input_audio_path,omitempty"`
 }
 
-// ModeReader is Envelope.Mode's one non-empty value (W4-03).
+// ModeReader is Envelope.Mode's W4-03 non-empty value: a toolless,
+// cloud-Haiku Reader session (worker/kahya_worker/__main__.py's
+// _run_reader_session).
 const ModeReader = "reader"
+
+// ModeSTT is Envelope.Mode's W6-02 non-empty value: a toolless, CLOUD-LESS
+// local transcription session (worker/kahya_worker/__main__.py's
+// _run_stt_only) - requires InputAudioPath non-blank (Validate below).
+const ModeSTT = "stt"
 
 // NewTaskID mints a task_id shaped "t_<hex32>" (16 random bytes, hex
 // encoded - the same entropy/encoding convention as
@@ -203,11 +224,14 @@ func (e Envelope) Validate() error {
 	if e.Resume && (e.SessionID == nil || strings.TrimSpace(*e.SessionID) == "") {
 		return fmt.Errorf("spawn: resume = true requires a non-empty session_id")
 	}
-	if e.Mode != "" && e.Mode != ModeReader {
-		return fmt.Errorf("spawn: mode = %q, want %q or empty", e.Mode, ModeReader)
+	if e.Mode != "" && e.Mode != ModeReader && e.Mode != ModeSTT {
+		return fmt.Errorf("spawn: mode = %q, want %q, %q, or empty", e.Mode, ModeReader, ModeSTT)
 	}
 	if e.Mode == ModeReader && strings.TrimSpace(e.Schema) == "" {
 		return fmt.Errorf("spawn: mode = %q requires a non-empty schema", ModeReader)
+	}
+	if e.Mode == ModeSTT && strings.TrimSpace(e.InputAudioPath) == "" {
+		return fmt.Errorf("spawn: mode = %q requires a non-empty input_audio_path", ModeSTT)
 	}
 	return nil
 }

@@ -606,5 +606,116 @@ class TestReaderMode(unittest.TestCase):
         self.assertEqual(lines[-1]["type"], "error")
 
 
+class TestSttMode(unittest.TestCase):
+    """W6-02: mode="stt" transcribes envelope.input_audio_path via
+    kahya_worker.stt.transcribe (mocked at the module boundary here,
+    exactly like ClaudeSDKClient is for every other mode - the real
+    mlx-whisper/model-required path is worker/tests/test_stt.py's own
+    job), never constructs a ClaudeAgentOptions/ClaudeSDKClient at all,
+    and never requires ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY to be set."""
+
+    def _stt_envelope(self, audio_path: str) -> dict:
+        return {
+            **VALID_ENVELOPE,
+            "mode": "stt",
+            "input_audio_path": audio_path,
+            "memory_injection": False,
+        }
+
+    def test_successful_transcript_streams_delta_then_result(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir, tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = os.path.join(tmp_dir, "ptt-1.wav")
+            with open(audio_path, "w", encoding="utf-8") as f:
+                f.write("fake wav bytes")
+
+            env = base_env(log_dir, KAHYA_TMP_DIR=tmp_dir)
+            # W6-02: mode="stt" never needs a reachable Anthropic proxy -
+            # prove the credential-env assertion really is skipped for it
+            # by deliberately leaving these blank, exactly as kahyad's own
+            # caller (kahyad/internal/server.transcribeAudioLocally) does.
+            env["ANTHROPIC_BASE_URL"] = ""
+            env["ANTHROPIC_API_KEY"] = ""
+
+            with mock.patch.object(worker_main.stt, "transcribe", return_value="yarın toplantım var") as fake_transcribe:
+                code, out = run_main_with(self._stt_envelope(audio_path), env)
+
+            fake_transcribe.assert_called_once_with(audio_path)
+            lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+            self.assertEqual(code, 0)
+            self.assertEqual(lines, [
+                {"type": "delta", "text": "yarın toplantım var"},
+                {"type": "result", "status": "ok"},
+            ])
+            # Temp wav under KAHYA_TMP_DIR is deleted after transcription.
+            self.assertFalse(os.path.exists(audio_path))
+
+            jsonl = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+            completed = next(l for l in jsonl if l.get("event") == "stt.completed")
+            self.assertEqual(completed["trace_id"], VALID_ENVELOPE["trace_id"])
+            self.assertEqual(completed["chars"], len("yarın toplantım var"))
+            self.assertIsInstance(completed["duration_ms"], int)
+
+    def test_empty_transcript_fails_closed_never_reaches_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir, tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = os.path.join(tmp_dir, "ptt-2.wav")
+            open(audio_path, "w").close()
+            env = base_env(log_dir, KAHYA_TMP_DIR=tmp_dir)
+
+            with mock.patch.object(worker_main.stt, "transcribe", return_value="   "):
+                code, out = run_main_with(self._stt_envelope(audio_path), env)
+
+            lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+            self.assertEqual(code, 1)
+            self.assertEqual(lines, [{"type": "error", "message": worker_main.MSG_EMPTY_TRANSCRIPT}])
+            self.assertFalse(os.path.exists(audio_path))
+
+            jsonl = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+            self.assertTrue(any(l.get("event") == "stt.empty" for l in jsonl))
+
+    def test_missing_model_reports_fixed_turkish_error_never_downloads(self) -> None:
+        from kahya_worker.stt import MSG_MODEL_MISSING, SttModelMissingError
+
+        with tempfile.TemporaryDirectory() as log_dir, tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = os.path.join(tmp_dir, "ptt-3.wav")
+            open(audio_path, "w").close()
+            env = base_env(log_dir, KAHYA_TMP_DIR=tmp_dir)
+
+            with mock.patch.object(
+                worker_main.stt, "transcribe", side_effect=SttModelMissingError(MSG_MODEL_MISSING)
+            ):
+                code, out = run_main_with(self._stt_envelope(audio_path), env)
+
+            lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+            self.assertEqual(code, 1)
+            self.assertEqual(lines, [{"type": "error", "message": MSG_MODEL_MISSING}])
+
+    def test_delete_safety_never_deletes_outside_tmp_dir(self) -> None:
+        # A path OUTSIDE KAHYA_TMP_DIR (e.g. a repo fixture) must survive
+        # even though transcription "succeeded" - _maybe_delete_audio's own
+        # parent-directory check, not a prefix/startswith comparison.
+        with tempfile.TemporaryDirectory() as log_dir, tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            audio_path = os.path.join(outside_dir, "tr_toplanti.wav")
+            with open(audio_path, "w", encoding="utf-8") as f:
+                f.write("fixture, never delete")
+
+            env = base_env(log_dir, KAHYA_TMP_DIR=tmp_dir)
+            with mock.patch.object(worker_main.stt, "transcribe", return_value="toplantı"):
+                code, _out = run_main_with(self._stt_envelope(audio_path), env)
+
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.exists(audio_path))
+
+    def test_credential_env_check_skipped_for_stt_mode(self) -> None:
+        self.assertIsNone(worker_main._check_credential_env("keychain", "stt"))
+        self.assertIsNone(worker_main._check_credential_env("passthrough", "stt"))
+
+    def test_credential_env_check_still_enforced_for_chat_mode(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                worker_main._check_credential_env("keychain", ""),
+                "ANTHROPIC_BASE_URL is not set",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

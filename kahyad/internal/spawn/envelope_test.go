@@ -239,6 +239,72 @@ func TestValidateAcceptsEmptyModeUnchanged(t *testing.T) {
 	}
 }
 
+// --- W6-02: mode=stt / input_audio_path ---
+
+func TestValidateAcceptsModeSTTWithInputAudioPath(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeSTT
+	e.InputAudioPath = "/Users/x/Library/Application Support/Kahya/tmp/ptt-1.wav"
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestValidateRejectsModeSTTWithoutInputAudioPath(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeSTT
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for mode=stt with no input_audio_path")
+	}
+}
+
+func TestValidateRejectsModeSTTWithBlankInputAudioPath(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeSTT
+	e.InputAudioPath = "   "
+	if err := e.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want error for mode=stt with whitespace-only input_audio_path")
+	}
+}
+
+func TestValidateAcceptsInputAudioPathIgnoredByOrdinaryMode(t *testing.T) {
+	// Set but Mode is still "" (ordinary chat) - accepted; only mode=="stt"
+	// ever reads this field (kahya_worker.__main__'s own dispatch), so an
+	// ordinary chat envelope carrying it is not itself an error.
+	e := validEnvelope()
+	e.InputAudioPath = "/tmp/x.wav"
+	if err := e.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestMarshalRoundTripsInputAudioPath(t *testing.T) {
+	e := validEnvelope()
+	e.Mode = ModeSTT
+	e.InputAudioPath = "/tmp/ptt-1.wav"
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(b), `"mode":"stt"`) {
+		t.Errorf("Marshal() = %s, want mode:stt present", b)
+	}
+	if !strings.Contains(string(b), `"input_audio_path":"/tmp/ptt-1.wav"`) {
+		t.Errorf("Marshal() = %s, want input_audio_path present", b)
+	}
+}
+
+func TestMarshalOmitsInputAudioPathWhenEmpty(t *testing.T) {
+	e := validEnvelope()
+	b, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(b), "input_audio_path") {
+		t.Errorf("Marshal() = %s, want no input_audio_path key when empty", b)
+	}
+}
+
 func TestMarshalRoundTripsModeAndSchema(t *testing.T) {
 	e := validEnvelope()
 	e.Mode = ModeReader

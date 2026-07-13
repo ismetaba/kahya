@@ -18,6 +18,12 @@ const (
 	// Exit code 2.
 	MsgEmptyQuestion = "Soru boş olamaz."
 
+	// MsgAudioAndTextMutuallyExclusive is printed when `kahya ask --audio
+	// <path>` is combined with trailing typed question text (W6-02) -
+	// rejected locally, before any dial, since the audio IS the prompt in
+	// this form.
+	MsgAudioAndTextMutuallyExclusive = "--audio ile yazılı soru metni birlikte kullanılamaz."
+
 	// MsgREPLBanner is the first line the REPL prints on startup.
 	MsgREPLBanner = "Kâhya hazır. Çıkmak için: /çık"
 

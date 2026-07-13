@@ -92,8 +92,26 @@ class Envelope:
     # session's single JSON object response into - this worker does
     # nothing with schema beyond echoing it into its own JSONL logs, since
     # schema ENFORCEMENT is entirely Go-side, after this process exits.
+    #
+    # mode="stt" (W6-02) is a THIRD value: a toolless, MCP-less, CLOUD-LESS
+    # session that does nothing but call kahya_worker.stt.transcribe() on
+    # input_audio_path and report the resulting transcript back as an
+    # ordinary "delta" stdout-protocol line (kahya_worker.__main__.
+    # _run_stt_only) - no ClaudeAgentOptions/ClaudeSDKClient is ever
+    # constructed for this mode, so it never reaches the network at all
+    # (kahyad/internal/server's own stt-phase doc comment: this is what
+    # lets the ordinary secret-lane classification, which runs on the
+    # RESULTING transcript text exactly like any typed prompt, complete
+    # strictly BEFORE any cloud-touching worker is ever spawned for this
+    # task - no separate/bypass routing decision exists for voice input).
     mode: str = ""
     schema: str | None = None
+    # input_audio_path (W6-02): the absolute path to a mono 16kHz wav this
+    # session should transcribe. Required (non-blank) when mode=="stt";
+    # ignored by every other mode (a "chat"/"reader" envelope with this set
+    # is not itself an error - see parse_envelope - but only mode="stt"
+    # ever reads it, kahya_worker.__main__.main's own dispatch).
+    input_audio_path: str | None = None
 
 
 def parse_envelope(raw: bytes) -> Envelope:
@@ -163,20 +181,27 @@ def parse_envelope(raw: bytes) -> Envelope:
     if resume and (session_id is None or not session_id.strip()):
         raise EnvelopeError("resume = true requires a non-empty session_id")
 
-    # mode/schema (W4-03): optional on the wire, like resume - absent means
-    # mode="" (an ordinary Actor/chat session), mirroring
+    # mode/schema (W4-03, W6-02): optional on the wire, like resume - absent
+    # means mode="" (an ordinary Actor/chat session), mirroring
     # kahyad/internal/spawn.Envelope.Validate's own rules exactly: mode must
-    # be "" or "reader"; mode="reader" requires a non-blank schema.
+    # be "", "reader", or "stt"; mode="reader" requires a non-blank schema;
+    # mode="stt" requires a non-blank input_audio_path.
     mode = obj.get("mode", "")
     if not isinstance(mode, str):
         raise EnvelopeError("mode must be a string")
-    if mode not in ("", "reader"):
-        raise EnvelopeError(f'mode = {mode!r}, want "reader" or empty')
+    if mode not in ("", "reader", "stt"):
+        raise EnvelopeError(f'mode = {mode!r}, want "reader", "stt", or empty')
     schema = obj.get("schema")
     if schema is not None and not isinstance(schema, str):
         raise EnvelopeError("schema must be a string or null")
     if mode == "reader" and not (schema and schema.strip()):
         raise EnvelopeError('mode = "reader" requires a non-blank schema')
+
+    input_audio_path = obj.get("input_audio_path")
+    if input_audio_path is not None and not isinstance(input_audio_path, str):
+        raise EnvelopeError("input_audio_path must be a string or null")
+    if mode == "stt" and not (input_audio_path and input_audio_path.strip()):
+        raise EnvelopeError('mode = "stt" requires a non-blank input_audio_path')
 
     return Envelope(
         schema_version=schema_version,
@@ -191,4 +216,5 @@ def parse_envelope(raw: bytes) -> Envelope:
         resume=resume,
         mode=mode,
         schema=schema,
+        input_audio_path=input_audio_path,
     )

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -280,6 +281,17 @@ type taskRequest struct {
 	// absent (nil) is every pre-W6-01 request body's exact existing
 	// behavior - no palette_open event is ever written for it.
 	PaletteOpenedAt *float64 `json:"palette_opened_at,omitempty"`
+	// InputAudioPath is W6-02's `kahya ask --audio <path>` field: an
+	// absolute path to a mono 16kHz wav. When present, handleTask
+	// transcribes it ENTIRELY LOCALLY (transcribeAudioLocally, stt.go)
+	// BEFORE the ordinary blank-prompt check/classification/envelope
+	// construction below, and overwrites req.Prompt with the resulting
+	// transcript - see handleTask's own doc comment on why this is what
+	// keeps a spoken command routing exactly like the identical typed one
+	// (no separate/bypass classification path for voice input). Optional/
+	// backward-compatible: absent is every pre-W6-02 request body's exact
+	// existing behavior.
+	InputAudioPath string `json:"input_audio_path,omitempty"`
 }
 
 // rfc3339Now is time.Now().UTC() formatted as plain RFC3339 (no
@@ -385,16 +397,92 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, status, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(req.Prompt) == "" {
-		writeJSONError(w, http.StatusBadRequest, "prompt must not be empty")
-		return
-	}
 
 	traceID := req.TraceID
 	if traceID == "" {
 		traceID = traceIDFromContext(r)
 	}
 	log := s.log.With(traceID)
+
+	// W6-02 ORDERING INVARIANT (HANDOFF §4 ⚑ / this task's own "no voice
+	// bypass" requirement): when input_audio_path is present, transcribe
+	// it ENTIRELY LOCALLY - transcribeAudioLocally (stt.go) spawns the
+	// worker in envelope.Mode==spawn.ModeSTT, which never constructs a
+	// ClaudeAgentOptions/ClaudeSDKClient/MCP server and never opens an
+	// Anthropic-proxy listener, so this call cannot reach the network
+	// however it is implemented on the worker side - BEFORE the ordinary
+	// blank-prompt check, secretlane.ClassifyDeterministic, intent
+	// routing, envelope construction, or either the lane==secret/
+	// decision.Local/cloud branch further below ever runs. req.Prompt is
+	// then overwritten with the resulting transcript, so every line of
+	// code from the blank-prompt check onward is the EXACT SAME,
+	// unmodified path an ordinary typed prompt already goes through -
+	// there is no separate, audio-specific routing decision anywhere past
+	// this block. A spoken finance-flavored command therefore reaches
+	// secretlane.ClassifyDeterministic on the identical transcript text a
+	// typed version of the same command would have produced, and is
+	// classified/routed identically.
+	// writeSSE/flusher, once non-nil, are THE one SSE stream this response
+	// ever opens for this request - populated either here (the
+	// input_audio_path branch, when present) or by the ordinary open-SSE
+	// block further below, never both: that later block (and
+	// handleSecretLaneTask's own copy, which now takes writeSSE as a
+	// parameter instead of always opening its own) only builds its own
+	// flusher/writeSSE when these are still nil, so a single HTTP response
+	// never gets a second, superfluous WriteHeader call.
+	var writeSSE func(event string, payload any)
+	var flusher http.Flusher
+
+	if strings.TrimSpace(req.InputAudioPath) != "" {
+		if !filepath.IsAbs(req.InputAudioPath) {
+			writeJSONError(w, http.StatusBadRequest, "input_audio_path must be an absolute path")
+			return
+		}
+
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			log.Error("task_streaming_unsupported")
+			writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
+			return
+		}
+		flusher = fl
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		writeSSE = func(event string, payload any) {
+			b, err := json.Marshal(payload)
+			if err != nil {
+				log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+				return
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+			flusher.Flush()
+		}
+
+		transcript, sttErr := s.transcribeAudioLocally(r.Context(), log, traceID, req.InputAudioPath)
+		if sttErr != nil {
+			// sttErr's Error() text is ALREADY the exact Turkish user-facing
+			// string the worker itself decided (stt.py's MSG_MODEL_MISSING /
+			// kahya_worker.__main__'s MSG_EMPTY_TRANSCRIPT, or a generic
+			// fallback) - see transcribeAudioLocally's own doc comment. No
+			// task row was ever created for this failed STT phase; nothing
+			// further to persist.
+			log.Error("stt_transcription_failed", "err", sttErr.Error())
+			writeSSE("error", map[string]string{"message": sttErr.Error()})
+			return
+		}
+		// Falls through to the ordinary text-prompt flow below with
+		// req.Prompt now the transcript, verbatim, reusing this SAME
+		// already-open SSE stream (writeSSE/flusher above) - never a
+		// second one.
+		req.Prompt = transcript
+	}
+
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt must not be empty")
+		return
+	}
 
 	// dbCtx (the request's own context) is used for the writes that happen
 	// BEFORE the worker is spawned, while the client is still known to be
@@ -627,7 +715,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		if !decision.Local {
 			log.Error("routing_invariant_violated", "task_id", taskID, "reason", "secret_lane_not_local", "decision_model", decision.Model)
 		}
-		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx)
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx, writeSSE)
 		return
 	}
 
@@ -644,7 +732,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		// handleSecretLaneTask) - see kahyad/internal/router's own package
 		// doc comment for why the local lane must never be represented as
 		// an envelope.Model string instead.
-		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx)
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx, writeSSE)
 		return
 	}
 
@@ -674,30 +762,47 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	anthropicBaseURL, apiKey, closeProxy, err := s.NewTaskProxy(taskID, traceID)
 	if err != nil {
 		log.Error("anthproxy_new_failed", "task_id", taskID, "err", err.Error())
+		if writeSSE != nil {
+			// The input_audio_path phase already opened this response as
+			// SSE (200 + text/event-stream) - a plain JSON error body at
+			// this point would be malformed against that already-sent
+			// Content-Type, so report the SAME failure as a terminal SSE
+			// "error" event instead of writeJSONError's plain-JSON path.
+			writeSSE("error", map[string]string{"message": fmt.Sprintf(MsgTaskUnexpectedExit, traceID)})
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, "anthropic proxy init failed")
 		return
 	}
 	defer func() { _ = closeProxy() }()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		log.Error("task_streaming_unsupported")
-		writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	writeSSE := func(event string, payload any) {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+	// writeSSE/flusher are only still nil here when the input_audio_path
+	// phase above never ran (an ordinary typed-prompt request) - that
+	// phase already opened this exact SSE stream on ITS OWN "flusher, ok"
+	// check succeeding, so re-checking/re-opening here would be a
+	// superfluous second WriteHeader on the very same response.
+	if writeSSE == nil {
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			log.Error("task_streaming_unsupported")
+			writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
 			return
 		}
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		flusher = fl
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
+
+		writeSSE = func(event string, payload any) {
+			b, err := json.Marshal(payload)
+			if err != nil {
+				log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+				return
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+			flusher.Flush()
+		}
 	}
 
 	// W4-08: an explicit "derin düşün" opt-in is NOT itself a router
@@ -944,26 +1049,36 @@ func (s *Server) logFirstToken(ctx context.Context, traceID, taskID string) {
 // non-streamed, since mlx_lm.server's non-streaming response already
 // arrives as one complete string) then a terminal "result" or "error"
 // event.
-func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt string, dbCtx, persistCtx context.Context) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		log.Error("task_streaming_unsupported")
-		writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	writeSSE := func(event string, payload any) {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+// preOpened, when non-nil (W6-02: the input_audio_path phase already
+// opened this exact response as SSE before classification ever ran - see
+// handleTask's own doc comment), is reused AS-IS instead of opening a
+// second SSE stream on the same response (which would be a superfluous,
+// harmless-but-noisy second WriteHeader call). nil (every pre-W6-02
+// caller) is this function's own original behavior: open its own SSE
+// stream exactly as before.
+func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt string, dbCtx, persistCtx context.Context, preOpened func(event string, payload any)) {
+	writeSSE := preOpened
+	if writeSSE == nil {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			log.Error("task_streaming_unsupported")
+			writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
 			return
 		}
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
+
+		writeSSE = func(event string, payload any) {
+			b, err := json.Marshal(payload)
+			if err != nil {
+				log.Error("task_sse_marshal_failed", "event", event, "err", err.Error())
+				return
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+			flusher.Flush()
+		}
 	}
 
 	timeoutMin := s.cfg.TaskTimeoutMin

@@ -194,6 +194,52 @@ class TestParseEnvelope(unittest.TestCase):
         with self.assertRaises(EnvelopeError):
             parse_envelope(encode(d))
 
+    # --- W6-02: stt mode/input_audio_path ---
+
+    def test_input_audio_path_defaults_to_none(self) -> None:
+        env = parse_envelope(encode(valid_envelope_dict()))
+        self.assertIsNone(env.input_audio_path)
+
+    def test_accepts_mode_stt_with_input_audio_path(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "stt"
+        d["input_audio_path"] = "/Users/x/Library/Application Support/Kahya/tmp/ptt-1.wav"
+        env = parse_envelope(encode(d))
+        self.assertEqual(env.mode, "stt")
+        self.assertEqual(
+            env.input_audio_path, "/Users/x/Library/Application Support/Kahya/tmp/ptt-1.wav"
+        )
+
+    def test_rejects_mode_stt_without_input_audio_path(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "stt"
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_mode_stt_with_blank_input_audio_path(self) -> None:
+        d = valid_envelope_dict()
+        d["mode"] = "stt"
+        d["input_audio_path"] = "   "
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_rejects_non_string_input_audio_path(self) -> None:
+        d = valid_envelope_dict()
+        d["input_audio_path"] = 7
+        with self.assertRaises(EnvelopeError):
+            parse_envelope(encode(d))
+
+    def test_input_audio_path_ignored_by_ordinary_chat_mode(self) -> None:
+        # Set but mode is still "" (ordinary chat) - accepted; only
+        # mode="stt" ever reads this field (kahya_worker.__main__'s own
+        # dispatch), so an ordinary chat envelope carrying it is not
+        # itself an error.
+        d = valid_envelope_dict()
+        d["input_audio_path"] = "/tmp/x.wav"
+        env = parse_envelope(encode(d))
+        self.assertEqual(env.mode, "")
+        self.assertEqual(env.input_audio_path, "/tmp/x.wav")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,9 +1,16 @@
--- kahya.lua — Kâhya's Hammerspoon surface (W6-01, HANDOFF §4 UI + IPC).
+-- kahya.lua — Kâhya's Hammerspoon surface (W6-01/W6-02, HANDOFF §4 UI +
+-- IPC + stack STT).
 --
--- This file provides three things:
+-- This file provides four things:
 --   1. The ⌥Space command palette (hs.chooser, free-text): capture the
 --      hotkey-press timestamp, run `kahya ask --palette-opened-at <t> --
 --      <text>`, show the answer via hs.notify.
+--   1b. ⌥Space HOLD-TO-TALK (W6-02): the SAME ⌥Space binding, extended
+--      with pressedfn/releasedfn - a 300ms hold starts a local ffmpeg
+--      capture instead of the text palette; release runs `kahya ask
+--      --audio <wav>`, transcribed entirely on-device by mlx-whisper
+--      inside the Python worker (never in this file, never in kahyad -
+--      HANDOFF §4 ⚑ "mlx-whisper ... worker içinde kütüphane").
 --   2. The LOCAL approval-card surface (HANDOFF §5 safety #5 ⚑: "W3 yazılı
 --      'onayla' YALNIZ yerel yüzeyden kabul edilir" — from W6 on, THIS is
 --      that local surface): kahyaShowApproval(id), invoked by kahyad's own
@@ -29,8 +36,11 @@
 -- `require("kahya")` to ~/.hammerspoon/init.lua if not already present.
 --
 -- Requires (docs/tcc-w6-checklist.md, do this BEFORE relying on any of
--- the below): Hammerspoon granted Accessibility (hs.hotkey/hs.chooser),
--- Hammerspoon's own Notifications set to "Alerts" style in System
+-- the below): Hammerspoon granted Accessibility (hs.hotkey/hs.chooser) +
+-- Microphone/Input Monitoring (HANDOFF §7 TCC table: "Hammerspoon |
+-- Accessibility (+ PTT için Mikrofon / Input Monitoring)" - the ffmpeg
+-- child process captures under whichever process actually owns the mic
+-- grant), Hammerspoon's own Notifications set to "Alerts" style in System
 -- Settings (banner style auto-dismisses and hides the action button the
 -- approval card depends on).
 
@@ -38,6 +48,33 @@
 -- launch environment has no shell PATH at all) — every hs.task.new call
 -- below MUST use this absolute path, never a bare "kahya".
 local kahyaBin = "@KAHYA_BIN@"
+
+-- W6-02 push-to-talk constants (task spec step 1/5) — hs.task also cannot
+-- resolve these via $PATH, so both are absolute paths, kept as local
+-- constants right next to kahyaBin per the task spec's own instruction.
+--
+-- micDevice: the avfoundation input device index for ffmpeg's `-i`
+-- argument (":<index>", audio-only — no video device). Discover it once
+-- with `ffmpeg -f avfoundation -list_devices true -i ""` and hardcode the
+-- result here; ":0" is the common default (the Mac's built-in mic is
+-- usually the first audio device) but is NOT guaranteed on every machine
+-- — verify with the list-devices command above before relying on it.
+local micDevice = ":0"
+-- ffmpegBin: Homebrew's Apple-Silicon prefix (matches kahyaBin's own
+-- @KAHYA_BIN@ substitution convention — an absolute path, since hs.task
+-- cannot resolve a bare "ffmpeg" any more than it can a bare "kahya").
+local ffmpegBin = "/opt/homebrew/bin/ffmpeg"
+-- kahyaTmpDir: kahyad's own W6-02 temp-audio directory (config.Config.
+-- TmpDir(), created 0700 at kahyad startup) — hammerspoon writes the
+-- ffmpeg capture here; kahya_worker's own delete-safety check
+-- (kahya_worker.__main__._maybe_delete_audio) only ever deletes a file
+-- whose PARENT directory is exactly this one.
+local kahyaTmpDir = os.getenv("HOME") .. "/Library/Application Support/Kahya/tmp"
+
+-- pttHoldThreshold: how long ⌥Space must be held (task spec step 5: "if
+-- the key is released earlier, open the text palette") before push-to-
+-- talk capture starts instead of the W6-01 text palette.
+local pttHoldThreshold = 0.3
 
 -- ---------------------------------------------------------------------
 -- Small shared helpers
@@ -139,13 +176,107 @@ kahyaChooser:queryChangedCallback(function(query)
   end
 end)
 
+-- ---------------------------------------------------------------------
+-- 1b. ⌥Space hold-to-talk (W6-02): press starts a 300ms timer; released
+-- before it fires -> the W6-01 text palette above; still held at 300ms ->
+-- start an ffmpeg capture, show "🎙️ Dinliyorum…"; release while
+-- recording -> terminate ffmpeg (finalizes the wav on SIGTERM) and run
+-- `kahyaBin ask --audio <wav> --palette-opened-at <pressTimestamp>`.
+-- ---------------------------------------------------------------------
+
+local pttTimer = nil
+local pttTask = nil
+local pttWavPath = nil
+-- pttRecording: true only once the hold threshold has actually fired and
+-- an ffmpeg capture is (or was) running - distinguishes "released early,
+-- show the palette" from "released after recording started, submit the
+-- audio" in the releasedfn below.
+local pttRecording = false
+
+-- pttStartRecording is pttTimer's own 300ms callback (task spec step 5):
+-- still held at this point (releasedfn would already have stopped the
+-- timer otherwise) - start the ffmpeg capture and show the listening
+-- notification.
+local function pttStartRecording()
+  pttRecording = true
+  -- Millisecond epoch (not whole seconds): two holds started within the
+  -- same second must never collide on the same wav filename.
+  local epochMs = string.format("%d", math.floor(hs.timer.secondsSinceEpoch() * 1000))
+  pttWavPath = kahyaTmpDir .. "/ptt-" .. epochMs .. ".wav"
+
+  pttTask = hs.task.new(ffmpegBin, nil, {
+    "-hide_banner",
+    "-f", "avfoundation",
+    "-i", micDevice,
+    "-ac", "1",
+    "-ar", "16000",
+    "-sample_fmt", "s16",
+    "-y", pttWavPath,
+  })
+  pttTask:start()
+
+  hs.notify.new({
+    title = "Kâhya",
+    informativeText = "🎙️ Dinliyorum… (bırakınca gönderilir)",
+    autoWithdraw = true,
+  }):send()
+end
+
+-- pttSubmitRecording is releasedfn's own "was actually recording" branch:
+-- terminate the ffmpeg capture (SIGTERM finalizes the wav) and send it to
+-- `kahya ask --audio` exactly the way submitPaletteQuery sends typed text,
+-- reusing the SAME hs.notify completion surface.
+local function pttSubmitRecording()
+  local wavPath = pttWavPath
+  local pressTimestamp = kahyaPaletteOpenedAt or hs.timer.secondsSinceEpoch()
+  pttWavPath = nil
+  pttRecording = false
+
+  if pttTask then
+    pttTask:terminate()
+    pttTask = nil
+  end
+  local paletteOpenedAtStr = string.format("%.6f", pressTimestamp)
+  kahyaPaletteOpenedAt = nil
+
+  runKahya({ "ask", "--audio", wavPath, "--palette-opened-at", paletteOpenedAtStr }, function(exitCode, stdOut, stdErr)
+    local text = stdOut
+    if exitCode ~= 0 and stdErr ~= "" then
+      text = stdErr
+    end
+    hs.notify.new({
+      title = "Kâhya",
+      informativeText = firstLines(text, 5),
+      autoWithdraw = true,
+    }):send()
+  end)
+end
+
+-- No repeatfn argument: Hammerspoon does not re-invoke pressedfn for the
+-- OS's own key-repeat events unless a repeatfn is supplied, so holding
+-- ⌥Space down never re-arms pttTimer or restarts a capture already in
+-- progress.
 hs.hotkey.bind({ "alt" }, "space", function()
-  -- Captured HERE, at hotkey press — before the chooser UI even opens —
-  -- so the north-star "palet-aç→ilk-token" metric's start timestamp is
-  -- the actual moment the user asked for the palette, not the moment
-  -- they finished typing.
+  -- pressed - captured HERE, before either the chooser UI or ffmpeg
+  -- capture even starts, so the north-star "palet-aç→ilk-token" metric's
+  -- start timestamp is the actual moment the user asked for the palette/
+  -- began speaking, not the moment they finished typing/talking.
   kahyaPaletteOpenedAt = hs.timer.secondsSinceEpoch()
-  kahyaChooser:show()
+  pttRecording = false
+  pttTimer = hs.timer.doAfter(pttHoldThreshold, pttStartRecording)
+end, function()
+  -- released
+  if pttTimer then
+    pttTimer:stop()
+    pttTimer = nil
+  end
+  if pttRecording then
+    pttSubmitRecording()
+  else
+    -- Released before the 300ms threshold fired - the W6-01 text palette
+    -- (kahyaPaletteOpenedAt, captured above at press, is reused as-is).
+    kahyaChooser:show()
+  end
 end)
 
 -- ---------------------------------------------------------------------

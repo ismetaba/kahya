@@ -979,12 +979,20 @@ type sseEvent struct {
 
 // streamTaskRequest is POST /v1/task's request body (matches
 // kahyad/internal/server.taskRequest exactly - W4-08 adds deep_think;
-// W6-01 adds palette_opened_at).
+// W6-01 adds palette_opened_at; W6-02 adds input_audio_path).
 type streamTaskRequest struct {
 	Prompt          string   `json:"prompt"`
 	TraceID         string   `json:"trace_id"`
 	DeepThink       bool     `json:"deep_think,omitempty"`
 	PaletteOpenedAt *float64 `json:"palette_opened_at,omitempty"`
+	// InputAudioPath is `kahya ask --audio <path>`'s own field (W6-02):
+	// an absolute, canonicalized path to a mono 16kHz wav. When set,
+	// kahyad transcribes it ENTIRELY LOCALLY before doing anything else
+	// with this task (kahyad/internal/server's own stt.go doc comment) -
+	// Prompt is typically empty on the wire in this case (StreamTaskAudio
+	// never sets it); the resulting transcript becomes the task's prompt
+	// server-side.
+	InputAudioPath string `json:"input_audio_path,omitempty"`
 }
 
 // StreamTask calls POST /v1/task {"prompt","trace_id":traceID,
@@ -1010,7 +1018,28 @@ func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, deepThi
 // can ledger a palette_open event under this task's own trace_id (see
 // kahyad/internal/server's logPaletteOpen doc comment).
 func (c *Client) StreamTaskFull(ctx context.Context, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, onDelta func(string)) (taskResult, error) {
-	body, err := json.Marshal(streamTaskRequest{Prompt: prompt, TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt})
+	return c.streamTask(ctx, traceID, streamTaskRequest{
+		Prompt: prompt, TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt,
+	}, onDelta)
+}
+
+// StreamTaskAudio is StreamTaskFull's own W6-02 sibling: `kahya ask
+// --audio <path>` sends input_audio_path instead of a typed prompt -
+// kahyad transcribes it locally before this task otherwise proceeds
+// exactly like StreamTaskFull's own request (same deep_think/
+// palette_opened_at wiring, same SSE contract/result mapping).
+func (c *Client) StreamTaskAudio(ctx context.Context, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, onDelta func(string)) (taskResult, error) {
+	return c.streamTask(ctx, traceID, streamTaskRequest{
+		TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt, InputAudioPath: audioPath,
+	}, onDelta)
+}
+
+// streamTask is StreamTaskFull/StreamTaskAudio's shared core: marshal
+// reqBody, POST /v1/task, and read the resulting SSE stream to a terminal
+// taskResult - the one place this mapping is implemented, so the two
+// public entry points can never drift apart.
+func (c *Client) streamTask(ctx context.Context, traceID string, reqBody streamTaskRequest, onDelta func(string)) (taskResult, error) {
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return taskResult{}, err
 	}

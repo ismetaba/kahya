@@ -73,6 +73,9 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). |
 | `intent` | **W4-08.** The §4 routing-table intent bucket (`kahyad/internal/router`'s `Intent*` constants: `plan`, `code_multi_file`, `hard_exec`, `subagent_exec`, `fanout`, `extract`, `writeback`, `route`, `classify`, `reader`, `chat`) — omitted via `omitempty` when empty, so every pre-W4-08 envelope/test still validates unchanged. Informational only (logs/CLI/ledger `intent_classified`/`routing_decision` events) — no enum validation in `Envelope.Validate` (the routing DECISION already happened before this envelope was built; the worker never reads this to choose anything, §4: "karar Go kodunda, istemde değil"). An ordinary `/v1/task` chat prompt with no CLI-declared kind is always `"chat"`, decided deterministically (no model call) — see the W4-08 note below for why. |
 | `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `claude-fable-5` whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being `claude-fable-5`. |
+| `mode` | **W4-03/W6-02.** `""` (ordinary Actor/chat, every pre-W4-03 envelope) \| `"reader"` (toolless cloud-Haiku Reader, `spawn.ModeReader` — requires `schema` non-blank) \| `"stt"` (toolless, CLOUD-LESS local transcription, `spawn.ModeSTT` — requires `input_audio_path` non-blank). See the "W6-02 note" below for the `"stt"` case. |
+| `schema` | **W4-03.** Non-blank only when `mode=="reader"` — names the registered Go-side struct (`kahyad/internal/reader.JobTypeMailSummary`/`JobTypeWebpageExtract`) the caller parses that session's single JSON response into. |
+| `input_audio_path` | **W6-02.** Absolute path to a mono 16kHz wav. Non-blank only when `mode=="stt"` (`Envelope.Validate` enforces this) — see the "W6-02 note" below. |
 
 ## 3 · Worker environment
 
@@ -90,6 +93,7 @@ container), kahyad sets exactly eight variables (`spawn.BuildEnv`):
 | `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
+| `KAHYA_TMP_DIR` | Since W6-02: `config.Config.TmpDir()` (`<data_dir>/tmp`, e.g. `~/Library/Application Support/Kahya/tmp` — created 0700 at kahyad startup). `mode=="stt"` sessions read this to decide whether `input_audio_path` is safe to delete after transcription (`kahya_worker.__main__._maybe_delete_audio`): a file is deleted **iff** its resolved parent directory equals this exact value — never a repo fixture, never any other path. Empty/unset is a fail-CLOSED no-op (never delete). |
 
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 
@@ -283,6 +287,56 @@ real table:
   instead of a hand-maintained literal — value unchanged
   (`claude-haiku-4-5`), a routing-source change only.
 
+### W6-02 note — push-to-talk / local STT phase (HANDOFF §4 ⚑ "mlx-whisper ... worker içinde kütüphane" + ordering invariant)
+
+`kahya ask --audio <path>` (hammerspoon/kahya.lua's hold-to-talk release
+handler) sends `POST /v1/task` with `input_audio_path` set and `prompt`
+typically empty. `kahyad/internal/server.handleTask`'s own ordering
+invariant for this case, enforced structurally (not by convention):
+
+1. **Before** the ordinary blank-prompt check, `secretlane.
+   ClassifyDeterministic`, intent routing, or envelope construction for
+   the real task EVER run, `transcribeAudioLocally`
+   (`kahyad/internal/server/stt.go`) spawns the worker in a SEPARATE,
+   throwaway `mode="stt"` envelope (`spawn.ModeSTT`, `input_audio_path`
+   set, `prompt` a fixed placeholder never read by the worker). This
+   worker invocation never constructs a `ClaudeAgentOptions`/
+   `ClaudeSDKClient`/MCP server at all (`kahya_worker.__main__.
+   _run_stt_only`) and kahyad never opens a per-task Anthropic
+   forward-proxy listener for it (`AnthropicBaseURL`/`APIKey` left
+   blank) — it is CLOUD-LESS by construction, not merely by policy.
+2. The worker resolves the model (`kahya_worker.stt.resolve_model`,
+   `huggingface_hub.snapshot_download(..., local_files_only=True)` —
+   fail-closed: a cache miss raises immediately, NEVER downloads) and
+   transcribes (`mlx_whisper.transcribe(path, path_or_hf_repo=model_dir,
+   language="tr")` — `language="tr"` is a FIXED LITERAL in
+   `worker/kahya_worker/stt.py`, never a parameter/config/envelope
+   field), then reports the transcript back over the SAME stdout
+   protocol every other mode uses: one `{"type":"delta","text":
+   "<transcript>"}` line + a terminal `{"type":"result","status":"ok"}`
+   line (or a terminal `{"type":"error","message":"<Turkish>"}` line on
+   any failure — a missing model, an empty/whitespace-only transcript,
+   or any other transcription error). `kahyad/internal/spawn.Run`'s
+   existing "delta"/"result"/"error" parsing needed NO changes for this
+   — the same mechanism `kahyad/internal/reader.WorkerCloudModel`
+   already uses to collect its own "reader"-mode worker's output.
+3. Only once that call returns a non-blank transcript does `handleTask`
+   set `req.Prompt` to it and fall through into the **exact same,
+   unmodified** code every typed prompt already goes through:
+   `secretlane.ClassifyDeterministic`, intent routing, envelope
+   construction, the `lane=="secret"`/`decision.Local`/cloud branches.
+   There is no separate, audio-specific routing decision anywhere past
+   this point — a spoken finance-flavored command is classified and
+   routed identically to the same typed command.
+
+The worker also emits JSONL events to `worker.jsonl` (`kahya log --trace
+<id>` surfaces these): `stt.completed` (`{"chars":<n>,"duration_ms":<n>}`)
+on success, `stt.empty` on an empty/whitespace-only transcript (task then
+fails with the byte-exact Turkish `"Ses anlaşılamadı — lütfen tekrar
+deneyin"`), and deletes `input_audio_path` afterward in every case (see
+`KAHYA_TMP_DIR`'s own row above) — the recording is consumed whether or
+not usable text came out of it.
+
 ## 4 · Worker stdout protocol (JSONL)
 
 One JSON object per line. Every line has a `"type"` field; kahyad ignores
@@ -321,7 +375,11 @@ Request body (matches `kahyad/cmd/kahya/client.go`'s `StreamTask`, W12-06):
 `trace_id` is optional in the body — if absent, kahyad falls back to the
 `X-Kahya-Trace-Id` request header, or mints a fresh one if that is also
 absent. An empty/whitespace-only `prompt` is rejected locally with `400`
-before a task is minted at all.
+before a task is minted at all — UNLESS `input_audio_path` is set (W6-02:
+`kahya ask --audio <path>`), in which case that check runs against the
+transcript kahyad produces locally first (see the "W6-02 note" below);
+`input_audio_path` itself must be an absolute path or the request is
+rejected with `400` before anything else happens.
 
 **Body size cap:** the request body is capped at 8 MiB
 (`http.MaxBytesReader`, `kahyad/internal/server.taskBodyMaxBytes`) before

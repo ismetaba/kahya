@@ -201,6 +201,25 @@ func run() int {
 		"pid", os.Getpid(),
 	)
 
+	// W6-02: <data_dir>/tmp (e.g. ~/Library/Application Support/Kahya/tmp),
+	// 0700 - hammerspoon/kahya.lua's ffmpeg push-to-talk capture writes
+	// ptt-<epoch>.wav there; the worker's own mode="stt" delete-safety
+	// check (kahya_worker.__main__._maybe_delete_audio, via KAHYA_TMP_DIR -
+	// kahyad/internal/spawn.BuildEnv) only ever deletes a file whose parent
+	// directory is exactly this one. Best-effort: a failure here is logged,
+	// never fatal to boot - every OTHER capability (health, log tailing,
+	// ordinary typed-prompt tasks) must not go down over this directory
+	// alone failing to create.
+	if err := os.MkdirAll(cfg.TmpDir(), 0o700); err != nil {
+		log.Error("tmp_dir_create_failed", "path", cfg.TmpDir(), "err", err.Error())
+	} else if err := os.Chmod(cfg.TmpDir(), 0o700); err != nil {
+		// MkdirAll leaves an EXISTING directory's mode untouched (matching
+		// kahyad/internal/logx.New's own identical enforce-0700-on-every-
+		// boot precedent for LogDir) - explicit Chmod so a pre-existing,
+		// more-permissive tmp dir is tightened back down on every restart.
+		log.Error("tmp_dir_chmod_failed", "path", cfg.TmpDir(), "err", err.Error())
+	}
+
 	// W3-01: load + strictly validate policy.yaml BEFORE the UDS listener
 	// (bound further below, inside srv.Run's Prepare) can accept a single
 	// /policy/check or /v1/mcp request. Any error here — a missing file, an
@@ -894,6 +913,7 @@ func run() int {
 	dispatcherSpawnCfg := spawn.Config{
 		Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
 		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
+		TmpDir: cfg.TmpDir(),
 	}
 	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, taskLive, cfg.TaskRetryW1MaxAuto)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)

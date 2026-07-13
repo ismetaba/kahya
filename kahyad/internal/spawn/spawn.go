@@ -107,6 +107,15 @@ type Config struct {
 	// kahyad/internal/anthproxy is running in (see docs/ipc.md's W12-08
 	// note and kahya_worker.__main__'s own OWNER AUTH DECISION comment).
 	CredentialMode string
+	// TmpDir is KAHYA_TMP_DIR (W6-02): config.Config.TmpDir() -
+	// `<data_dir>/tmp`, created 0700 at kahyad startup. The worker's
+	// mode="stt" delete-safety check (kahya_worker.__main__.
+	// _maybe_delete_audio) only ever deletes envelope.input_audio_path
+	// when its PARENT directory resolves to exactly this one - never a
+	// repo fixture, never any other path. Empty is a documented no-op:
+	// _maybe_delete_audio treats an unset KAHYA_TMP_DIR as "never delete
+	// anything" (fail CLOSED towards not deleting).
+	TmpDir string
 }
 
 // Outcome is Run's terminal result. See StatusOK/StatusError/StatusTimeout
@@ -528,6 +537,7 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"ANTHROPIC_API_KEY=" + cfg.APIKey,
 		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
 		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
+		"KAHYA_TMP_DIR=" + cfg.TmpDir,
 		// The claude-agent-sdk worker spawns the bundled `claude` CLI, which
 		// otherwise opens its OWN outbound HTTPS to telemetry / auto-update /
 		// error-reporting / feature-flag hosts, independent of

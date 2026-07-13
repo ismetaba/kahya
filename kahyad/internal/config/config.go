@@ -455,6 +455,23 @@ type Config struct {
 	HsCliPath string `yaml:"ui_hs_cli"`
 }
 
+// TmpDir is W6-02's push-to-talk temp-audio directory: `<data_dir>/tmp`
+// (e.g. `~/Library/Application Support/Kahya/tmp`) - kahyad creates this
+// 0700 at startup (main.go) and hammerspoon/kahya.lua's ffmpeg capture
+// writes `ptt-<epoch>.wav` there; the worker's own delete-safety check
+// (kahya_worker.__main__._maybe_delete_audio, via the KAHYA_TMP_DIR env
+// var kahyad/internal/spawn.BuildEnv sets from this) only ever deletes a
+// file whose PARENT directory is exactly this one - never a repo fixture,
+// never any other path. Deliberately a METHOD, not its own configurable
+// field: it always tracks cfg.DataDir (prod vs the W7-8 KAHYA_ENV=dev
+// profile vs a test's own overridden DataDir) exactly the way LogDir/
+// DBPath already do when not explicitly overridden - see Load's own
+// "every data_dir-derived field" comment - with no separate config.yaml
+// key or env override needed for it.
+func (c Config) TmpDir() string {
+	return filepath.Join(c.DataDir, "tmp")
+}
+
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
 // DNS-label chars only (kahyad/internal/scheduler renders it into a
 // "com.kahya.job.<name>" launchd Label and a "job-<name>.log" filename —

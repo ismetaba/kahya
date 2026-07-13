@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -516,6 +517,110 @@ func TestAskEmptyPromptRejectedWithoutDialing(t *testing.T) {
 	}
 	if got := strings.TrimSpace(stderr.String()); got != MsgEmptyQuestion {
 		t.Errorf("stderr = %q, want exactly %q (proving no dial was attempted)", got, MsgEmptyQuestion)
+	}
+}
+
+// TestAskAudioFlagSendsInputAudioPathNotPrompt is W6-02: `kahya ask
+// --audio <path>` sends input_audio_path (absolute/canonicalized) on the
+// wire and leaves prompt empty - kahyad transcribes locally and fills the
+// prompt server-side.
+func TestAskAudioFlagSendsInputAudioPathNotPrompt(t *testing.T) {
+	var gotAudioPath string
+	var gotPrompt string
+	var promptPresent bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotAudioPath, _ = body["input_audio_path"].(string)
+		gotPrompt, promptPresent = body["prompt"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	fixturePath := filepath.Join(t.TempDir(), "ptt-1.wav")
+	if err := os.WriteFile(fixturePath, []byte("fake wav"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	// canonicalizeAudioPath also resolves symlinks (e.g. macOS's /var ->
+	// /private/var) - resolve the SAME way here so this assertion does not
+	// depend on t.TempDir()'s own path happening to contain no symlinks.
+	wantPath, err := filepath.EvalSymlinks(fixturePath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--audio", fixturePath}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if gotAudioPath != wantPath {
+		t.Errorf("input_audio_path = %q, want %q", gotAudioPath, wantPath)
+	}
+	if promptPresent && gotPrompt != "" {
+		t.Errorf("prompt = %q, want empty when --audio is used", gotPrompt)
+	}
+}
+
+// TestAskAudioFlagCanonicalizesRelativePath proves a relative --audio
+// argument reaches kahyad as an absolute path (task spec: "absolute/
+// canonicalized").
+func TestAskAudioFlagCanonicalizesRelativePath(t *testing.T) {
+	var gotAudioPath string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotAudioPath, _ = body["input_audio_path"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	dir := t.TempDir()
+	fixtureName := "ptt-2.wav"
+	if err := os.WriteFile(filepath.Join(dir, fixtureName), []byte("fake wav"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--audio", fixtureName}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !filepath.IsAbs(gotAudioPath) {
+		t.Errorf("input_audio_path = %q, want an absolute path", gotAudioPath)
+	}
+	if filepath.Base(gotAudioPath) != fixtureName {
+		t.Errorf("input_audio_path = %q, want basename %q", gotAudioPath, fixtureName)
+	}
+}
+
+// TestAskAudioAndTextRejectedWithoutDialing proves --audio combined with
+// trailing typed text is rejected locally, before any dial.
+func TestAskAudioAndTextRejectedWithoutDialing(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "nope.sock")
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--audio", "/tmp/x.wav", "ayrıca", "bunu", "da", "sor"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if got := strings.TrimSpace(stderr.String()); got != MsgAudioAndTextMutuallyExclusive {
+		t.Errorf("stderr = %q, want exactly %q (proving no dial was attempted)", got, MsgAudioAndTextMutuallyExclusive)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,26 +99,25 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 }
 
 // runAsk implements `kahya ask [--derin] [--palette-opened-at <unix-
-// seconds-float>] <question...>` (W4-08 + W6-01): the SAME one-shot task
-// execution as runOneShot, plus the --derin flag that pins claude-fable-5
-// ("derin düşün" opt-in) via envelope.deep_think, plus --palette-opened-at
-// (W6-01: hammerspoon/kahya.lua's own call into this subcommand, carrying
-// hs.timer.secondsSinceEpoch() captured at hotkey press - never something
-// a human types themselves). The OTHER --derin opt-in form - the
-// byte-exact Turkish prompt prefix "derin düşün:" - needs no flag at all;
-// it is detected server-side regardless of which CLI subcommand sent the
-// prompt.
+// seconds-float>] [--audio <path>] <question...>` (W4-08 + W6-01 + W6-02):
+// the SAME one-shot task execution as runOneShot, plus the --derin flag
+// that pins claude-fable-5 ("derin düşün" opt-in) via envelope.deep_think,
+// plus --palette-opened-at (W6-01: hammerspoon/kahya.lua's own call into
+// this subcommand, carrying hs.timer.secondsSinceEpoch() captured at
+// hotkey press - never something a human types themselves), plus --audio
+// <path> (W6-02: hammerspoon/kahya.lua's hold-to-talk release handler -
+// sends input_audio_path instead of typed question text; kahyad
+// transcribes it entirely locally before the task otherwise proceeds
+// identically). The OTHER --derin opt-in form - the byte-exact Turkish
+// prompt prefix "derin düşün:" - needs no flag at all; it is detected
+// server-side regardless of which CLI subcommand sent the prompt.
 func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
 	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
+	audio := fs.String("audio", "", "ses dosyası yolu (wav) - transkript kahyad tarafından yerelde çıkarılır (hammerspoon/kahya.lua basılı-tut kullanır)")
 	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if prompt == "" {
-		fmt.Fprintln(stderr, MsgEmptyQuestion)
 		return 2
 	}
 	traceID := traceid.New()
@@ -125,7 +125,45 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	if isFlagPassed(fs, "palette-opened-at") {
 		palette = paletteOpenedAt
 	}
+
+	if strings.TrimSpace(*audio) != "" {
+		if len(fs.Args()) > 0 {
+			fmt.Fprintln(stderr, MsgAudioAndTextMutuallyExclusive)
+			return 2
+		}
+		audioPath, err := canonicalizeAudioPath(*audio)
+		if err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		return execTaskAudio(client, traceID, audioPath, *derin, palette, stdout, stderr)
+	}
+
+	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if prompt == "" {
+		fmt.Fprintln(stderr, MsgEmptyQuestion)
+		return 2
+	}
 	return execTask(client, traceID, prompt, *derin, palette, stdout, stderr)
+}
+
+// canonicalizeAudioPath resolves path to an absolute, symlink-free form
+// (W6-02 task spec: "kahya ask --audio <path>" flag ... absolute/
+// canonicalized"). EvalSymlinks is best-effort: a path that does not
+// exist (should not happen - hammerspoon/kahya.lua only invokes this
+// after ffmpeg has already finalized the wav on SIGTERM) falls back to
+// the plain absolute form rather than erroring, so a race with a
+// not-yet-flushed filesystem write never turns into a confusing CLI
+// failure purely from this cosmetic canonicalization step.
+func canonicalizeAudioPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("ses dosyası yolu çözümlenemedi: %w", err)
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real, nil
+	}
+	return abs, nil
 }
 
 // isFlagPassed reports whether name was EXPLICITLY set on fs's command
@@ -162,6 +200,33 @@ func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpe
 	if res.Status == "ok" && res.ProcessedLocally {
 		// W3-08 CLI badge: printed on its own line, after the streamed
 		// answer text, before the trace footer.
+		fmt.Fprintln(stdout, MsgLocallyProcessed)
+	}
+	printTraceFooter(stderr, traceID)
+	if res.Status == "ok" {
+		return 0
+	}
+	if res.ErrMsg != "" {
+		fmt.Fprintln(stderr, res.ErrMsg)
+	}
+	return 1
+}
+
+// execTaskAudio is execTask's own W6-02 sibling: `kahya ask --audio
+// <path>` sends audioPath as input_audio_path instead of typed prompt
+// text - kahyad transcribes it entirely locally before the task otherwise
+// proceeds identically (same result mapping/exit codes/CLI badge as
+// execTask).
+func execTaskAudio(client *Client, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, stdout, stderr io.Writer) int {
+	res, err := client.StreamTaskAudio(context.Background(), traceID, audioPath, deepThink, paletteOpenedAt, func(text string) {
+		fmt.Fprint(stdout, text)
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		printTraceFooter(stderr, traceID)
+		return 2
+	}
+	if res.Status == "ok" && res.ProcessedLocally {
 		fmt.Fprintln(stdout, MsgLocallyProcessed)
 	}
 	printTraceFooter(stderr, traceID)
