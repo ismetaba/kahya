@@ -36,6 +36,7 @@ import (
 	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/metrics"
 	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/mlxsup"
 	"kahya/kahyad/internal/notify"
@@ -997,6 +998,20 @@ func run() int {
 	}
 	ritualExporter := &eval.RitualExporter{Reader: eval.StoreRitualLabelReader{Q: st.Queries}}
 	srv.SetEvalRetrievalRunner(retrievalRunner, ritualExporter)
+
+	// W78-04: GET /metrics (`kahya metrics`) - read-only reporting over the
+	// events ledger. A SEPARATE, DEDICATED brain.db handle opened with PRAGMA
+	// query_only=ON (a second read-only *sql.DB to the same WAL file is safe
+	// alongside st's read/write handle) so a metrics query can NEVER write to
+	// the ledger - kahyad stays brain.db's sole writer (HANDOFF §5 #4). If
+	// this handle fails to open, metrics reporting is simply unavailable (the
+	// route answers 503); it must never block the daemon from serving.
+	if metricsDB, mErr := metrics.OpenReadOnly(cfg.DBPath); mErr != nil {
+		log.Warn("metrics_reader_unavailable", "err", mErr.Error())
+	} else {
+		defer metricsDB.Close()
+		srv.SetMetricsReader(metrics.New(metricsDB))
+	}
 
 	// W78-01 deliverable: the nightly consolidation runs the retrieval eval as
 	// its FIRST step, so the auto-commit gate self-produces the fresh green

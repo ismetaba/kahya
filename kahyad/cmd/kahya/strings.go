@@ -426,4 +426,49 @@ const (
 	// MsgDebugEmitApprovalCreated is `kahya debug emit-approval`'s success
 	// line (%s = the freshly minted pending_approval_id).
 	MsgDebugEmitApprovalCreated = "Sahte onay oluşturuldu: %s (kahya approvals list ile görün)"
+
+	// ---- W78-04: kahya metrics [--since <duration|date>] [--json] ----
+
+	// MsgMetricsVeriYok is the byte-exact placeholder printed for any metric
+	// whose underlying event type is not yet emitted (or has no data in the
+	// window) - the veri-yok state. Used in the default table wherever a
+	// nullable metric came back nil.
+	MsgMetricsVeriYok = "— (veri yok)"
+
+	// MsgMetricsHeader is the summary table's first line (%s / %s = the
+	// window's since/until UTC dates).
+	MsgMetricsHeader = "Metrikler (%s → %s)"
+
+	// MsgMetricsCommandsPerDay is the commands/day row: %s = the average
+	// commands/day over the window rendered by the caller, %s = the ✓/✗
+	// north-star verdict against the ≥10/gün target.
+	MsgMetricsCommandsPerDay = "komut/gün: %s  (hedef ≥10/gün) %s"
+
+	// MsgMetricsCommandsTotal is the window's total command count line.
+	MsgMetricsCommandsTotal = "  toplam komut: %d"
+
+	// MsgMetricsClarification is the clarification-turn rate row: %s = the
+	// rate as a percentage or the veri-yok placeholder, %s = the ✓/✗ verdict
+	// against the ≤%40 target.
+	MsgMetricsClarification = "açıklama-turu oranı: %s  (hedef ≤%%40) %s"
+
+	// MsgMetricsPaletteP50 is the palette→first-token p50 row: %s = the p50 in
+	// milliseconds or veri-yok, %s = the ✓/✗ verdict against the <1.5s target.
+	MsgMetricsPaletteP50 = "palet→ilk-token p50: %s  (hedef <1.5s) %s"
+
+	// MsgMetricsRemembered is the remembered-moment count row.
+	MsgMetricsRemembered = "hatırladı anı: %d"
+
+	// MsgMetricsCacheHit is the cache-hit rate row: %s = the rate as a
+	// percentage or veri-yok.
+	MsgMetricsCacheHit = "cache-hit oranı: %s"
+
+	// MsgMetricsDailySpend is the daily-spend row: %s = the window total in
+	// USD.
+	MsgMetricsDailySpend = "günlük harcama (toplam): %s"
+
+	// MsgMetricsNorthStarOK / MsgMetricsNorthStarMiss are the ✓/✗ north-star
+	// verdict markers substituted into the rows above.
+	MsgMetricsNorthStarOK   = "✓"
+	MsgMetricsNorthStarMiss = "✗"
 )

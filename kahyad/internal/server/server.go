@@ -273,6 +273,12 @@ type Server struct {
 	evalRetrieval      EvalRetrievalRunner
 	evalRitualExporter EvalRitualExporter
 
+	// metricsReader wires GET /metrics (W78-04, metrics.go's own doc
+	// comment); nil until SetMetricsReader is called - same "unwired
+	// dependency" convention as evalRetrieval above. Read-only reporting over
+	// the events ledger on a dedicated query_only connection (main.go).
+	metricsReader MetricsReader
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -408,6 +414,9 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
 	mux.HandleFunc("/v1/entity/split", s.handleEntitySplit)
 	mux.HandleFunc("/v1/remembered", s.handleRemembered)
+	// W78-04: read-only metrics reporting over the events ledger (`kahya
+	// metrics`) - see metrics.go's own doc comment.
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
 	// ⌥⎋ binding both call this (halt.go's own doc comment).
 	mux.HandleFunc("POST /halt", s.handleHalt)

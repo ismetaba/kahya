@@ -80,6 +80,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRemembered(client, args[1:], stdout, stderr)
 	case "eval":
 		return runEval(client, args[1:], stdout, stderr)
+	case "metrics":
+		return runMetrics(client, args[1:], stdout, stderr)
 	case "halt":
 		return runHalt(client, args[1:], stdout, stderr)
 	default:
@@ -706,6 +708,113 @@ func runEvalMini(client *Client, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, MsgEvalMiniNoRegression)
 	return 0
+}
+
+// runMetrics implements `kahya metrics [--since <duration|date>] [--json]`
+// (W78-04): a THIN client of GET /metrics. Default output is a Turkish summary
+// table annotated with the MVP north-star targets (commands/day ≥10,
+// clarification-turn rate ≤%40, palette→first-token p50 <1.5s); --json
+// re-encodes the decoded aggregate (keys mirror the daemon's metrics.Metrics)
+// for tooling. --since defaults to the
+// last 14 days ("hafta 2" window). A daemon that is unreachable yields a
+// Turkish error on stderr and a non-zero exit, with NO direct-db fallback.
+func runMetrics(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("metrics", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	since := fs.String("since", "14d", "pencere: süre (14d, 36h) veya tarih (2026-07-01)")
+	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	result, err := client.Metrics(context.Background(), traceid.New(), strings.TrimSpace(*since))
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(result); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		return 0
+	}
+
+	renderMetricsTable(result, stdout)
+	return 0
+}
+
+// renderMetricsTable prints the default Turkish metrics summary with each
+// north-star metric annotated by its target and a ✓/✗ verdict.
+func renderMetricsTable(m metricsResult, stdout io.Writer) {
+	fmt.Fprintf(stdout, MsgMetricsHeader+"\n", metricsDayLabel(m.Since), metricsDayLabel(m.Until))
+
+	// commands/day: north-star target is >=10/day, evaluated against the
+	// window's average (total commands / number of days in the window).
+	avg := metricsAvgPerDay(m)
+	fmt.Fprintf(stdout, MsgMetricsCommandsPerDay+"\n",
+		fmt.Sprintf("%.1f", avg), northStarMark(avg >= 10))
+	fmt.Fprintf(stdout, MsgMetricsCommandsTotal+"\n", m.CommandsTotal)
+
+	// clarification-turn rate: veri-yok today (no such event kind emitted).
+	// Target <=40%; the verdict only shows when data exists.
+	if m.ClarificationTurnRate == nil {
+		fmt.Fprintf(stdout, MsgMetricsClarification+"\n", MsgMetricsVeriYok, "")
+	} else {
+		pct := *m.ClarificationTurnRate * 100
+		fmt.Fprintf(stdout, MsgMetricsClarification+"\n",
+			fmt.Sprintf("%%%.1f", pct), northStarMark(pct <= 40))
+	}
+
+	// palette->first-token p50: target <1500ms.
+	if m.PaletteToFirstTokenP50Ms == nil {
+		fmt.Fprintf(stdout, MsgMetricsPaletteP50+"\n", MsgMetricsVeriYok, "")
+	} else {
+		fmt.Fprintf(stdout, MsgMetricsPaletteP50+"\n",
+			fmt.Sprintf("%d ms", *m.PaletteToFirstTokenP50Ms), northStarMark(*m.PaletteToFirstTokenP50Ms < 1500))
+	}
+
+	fmt.Fprintf(stdout, MsgMetricsRemembered+"\n", m.RememberedMoments)
+
+	if m.CacheHitRate == nil {
+		fmt.Fprintf(stdout, MsgMetricsCacheHit+"\n", MsgMetricsVeriYok)
+	} else {
+		fmt.Fprintf(stdout, MsgMetricsCacheHit+"\n", fmt.Sprintf("%%%.1f", *m.CacheHitRate*100))
+	}
+
+	fmt.Fprintf(stdout, MsgMetricsDailySpend+"\n", fmt.Sprintf("$%.2f", m.DailySpendTotalUSD))
+}
+
+// metricsAvgPerDay is total commands / number of days spanned by the window
+// (at least 1), the basis for the >=10/gün north-star check.
+func metricsAvgPerDay(m metricsResult) float64 {
+	days := 1.0
+	if !m.Since.IsZero() && !m.Until.IsZero() {
+		span := m.Until.Sub(m.Since).Hours() / 24
+		if span > 1 {
+			days = span
+		}
+	}
+	return float64(m.CommandsTotal) / days
+}
+
+// metricsDayLabel renders a window bound as a bare UTC date for the header.
+func metricsDayLabel(t time.Time) string {
+	if t.IsZero() {
+		return "?"
+	}
+	return t.UTC().Format("2006-01-02")
+}
+
+// northStarMark maps a target-met boolean to the ✓/✗ marker.
+func northStarMark(ok bool) string {
+	if ok {
+		return MsgMetricsNorthStarOK
+	}
+	return MsgMetricsNorthStarMiss
 }
 
 // runAutonomy implements `kahya autonomy` (list ladder state) and

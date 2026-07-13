@@ -1108,6 +1108,71 @@ func (c *Client) EvalExportRitual(ctx context.Context, traceID string) (evalExpo
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it
 // need not match queryTraceID, the trace being looked up).
+// metricsDayCount / metricsDaySpend / metricsResult mirror
+// kahyad/internal/metrics.{DayCount,DaySpend,Metrics} (W78-04) exactly, so the
+// CLI stays a THIN client: it decodes the daemon's aggregate JSON and renders
+// it, never touching brain.db. Nullable metrics decode to nil pointers, which
+// the renderer prints as "— (veri yok)".
+type metricsDayCount struct {
+	Day   string `json:"day"`
+	Count int    `json:"count"`
+}
+
+type metricsDaySpend struct {
+	Day string  `json:"day"`
+	USD float64 `json:"usd"`
+}
+
+type metricsResult struct {
+	Since                    time.Time         `json:"since"`
+	Until                    time.Time         `json:"until"`
+	CommandsPerDay           []metricsDayCount `json:"commands_per_day"`
+	CommandsTotal            int               `json:"commands_total"`
+	ClarificationTurnRate    *float64          `json:"clarification_turn_rate"`
+	PaletteToFirstTokenP50Ms *int64            `json:"palette_to_first_token_p50_ms"`
+	RememberedMoments        int               `json:"remembered_moments"`
+	CacheHitRate             *float64          `json:"cache_hit_rate"`
+	DailySpendUSD            []metricsDaySpend `json:"daily_spend_usd"`
+	DailySpendTotalUSD       float64           `json:"daily_spend_total_usd"`
+}
+
+// Metrics calls GET /metrics?since=<since> (`kahya metrics`). since is passed
+// through verbatim (a duration like "14d"/"36h" or a date "2026-07-01"); the
+// daemon parses and defaults it. A dial failure or non-2xx status is funneled
+// through unreachableError so the CLI renders the one Turkish daemon-error
+// line and exits non-zero - it NEVER falls back to opening brain.db.
+func (c *Client) Metrics(ctx context.Context, traceID, since string) (metricsResult, error) {
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	path := "/metrics"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, traceID, nil)
+	if err != nil {
+		return metricsResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return metricsResult{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return metricsResult{}, fmt.Errorf("%s", msg)
+		}
+		return metricsResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("metrics: status %d", resp.StatusCode)}
+	}
+	var mr metricsResult
+	if err := json.NewDecoder(resp.Body).Decode(&mr); err != nil {
+		return metricsResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("metrics: decode response: %w", err)}
+	}
+	return mr, nil
+}
+
 func (c *Client) Log(ctx context.Context, traceID, queryTraceID string) ([]map[string]any, error) {
 	q := url.Values{"trace_id": {queryTraceID}}
 	req, err := c.newRequest(ctx, http.MethodGet, "/v1/log?"+q.Encode(), traceID, nil)

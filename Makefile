@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam sandbox-image docker-up hammerspoon-install invariants
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -303,3 +303,14 @@ eval-retrieval: build
 # Prerequisite: run scripts/kahya-dev-env.sh once to provision the dev profile.
 eval-redteam: build
 	KAHYA_ENV=dev ./bin/kahya eval redteam
+
+# metrics: the W78-04 MVP north-star + supporting metrics readout (`kahya
+# metrics`). Prints a Turkish summary table over the last 14 days ("hafta 2"
+# window) - commands/day, açıklama-turu oranı, palet->ilk-token p50, hatırladı
+# anı, cache-hit oranı, günlük harcama - each annotated with its north-star
+# target. Read-only reporting over the events ledger via the running kahyad's
+# UDS GET /metrics (needs a running daemon). Override the window with
+# `make metrics SINCE=36h` or a date.
+SINCE ?= 14d
+metrics: build
+	./bin/kahya metrics --since $(SINCE)

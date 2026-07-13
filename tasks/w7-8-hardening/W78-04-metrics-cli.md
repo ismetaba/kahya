@@ -1,6 +1,6 @@
 # W78-04 — Metrics CLI over the events table
 
-**Status:** todo
+**Status:** done — `kahya metrics [--since] [--json]` (thin UDS client), `GET /metrics` served by kahyad on a dedicated `query_only` connection, six metrics over the `events` table with north-star ✓/✗ annotations. Clarification-turn rate renders "— (veri yok)" (no upstream emits that event yet — recorded as a gap, no writer invented). Fully hermetic; nothing runtime-blocked.
 **Phase:** W7–8 — Hardening + eval
 **Depends on:** W12-06, W12-02, W12-08, W5-03, W6-04 (the last three own the event emissions this reads)
 **Flags:** none
