@@ -90,6 +90,14 @@ type Config struct {
 	// committed repo-root policy.yaml).
 	PolicyPath string `yaml:"policy_path"`
 
+	// EvalMiniBaselinePath is the absolute path to eval/mini-baseline.jsonl
+	// (W5-05): the ~20-question retrieval mini-baseline `kahya eval mini`
+	// runs against memory_search. Defaults to "<repo>/eval/mini-baseline.jsonl",
+	// derived the same way PolicyPath/MCPBridgePath/WorkerCmd/EmbedCmd are -
+	// two directories up from the running kahyad executable. Override via
+	// config.yaml's eval_mini_baseline_path key or KAHYA_EVAL_MINI_BASELINE_PATH.
+	EvalMiniBaselinePath string `yaml:"eval_mini_baseline_path"`
+
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
 	// passes through (HANDOFF S5 safety #1). Default 3128 (the
@@ -476,6 +484,7 @@ type fileConfig struct {
 	EmbedCmd                      *[]string    `yaml:"embed_cmd"`
 	MCPBridgePath                 *string      `yaml:"mcp_bridge_path"`
 	PolicyPath                    *string      `yaml:"policy_path"`
+	EvalMiniBaselinePath          *string      `yaml:"eval_mini_baseline_path"`
 	EgressPort                    *int         `yaml:"egress_port"`
 	DockerImageTag                *string      `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string      `yaml:"docker_image_digest_path"`
@@ -751,6 +760,7 @@ func defaults(home, env string) Config {
 		EmbedCmd:                defaultEmbedCmd(),
 		MCPBridgePath:           defaultMCPBridgePath(),
 		PolicyPath:              defaultPolicyPath(),
+		EvalMiniBaselinePath:    defaultEvalMiniBaselinePath(),
 		EgressPort:              3128,
 		DockerImageTag:          "kahya-sandbox:0.1.0",
 		DockerImageDigestPath:   defaultDockerImageDigestPath(),
@@ -1000,6 +1010,19 @@ func defaultPolicyPath() string {
 	return filepath.Join(repoRoot, "policy.yaml")
 }
 
+// defaultEvalMiniBaselinePath resolves the default "<repo>/eval/
+// mini-baseline.jsonl" path, using the exact same repo-root derivation as
+// defaultPolicyPath (see defaultWorkerCmd's doc comment) - the mini-eval
+// baseline lives at the repo root's eval/ directory, committed alongside
+// every other top-level project file.
+func defaultEvalMiniBaselinePath() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "eval", "mini-baseline.jsonl")
+}
+
 // defaultDockerImageDigestPath resolves the default "<repo>/docker/
 // sandbox/IMAGE_DIGEST" path, using the exact same repo-root derivation as
 // defaultWorkerCmd/defaultEmbedCmd/defaultMCPBridgePath/defaultPolicyPath
@@ -1090,6 +1113,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.PolicyPath != nil {
 		cfg.PolicyPath = expandHome(*fc.PolicyPath, home)
+	}
+	if fc.EvalMiniBaselinePath != nil {
+		cfg.EvalMiniBaselinePath = expandHome(*fc.EvalMiniBaselinePath, home)
 	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort
@@ -1246,6 +1272,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 	if v := os.Getenv("KAHYA_POLICY_PATH"); v != "" {
 		cfg.PolicyPath = expandHome(v, home)
+	}
+	if v := os.Getenv("KAHYA_EVAL_MINI_BASELINE_PATH"); v != "" {
+		cfg.EvalMiniBaselinePath = expandHome(v, home)
 	}
 	if v := os.Getenv("KAHYA_EGRESS_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {

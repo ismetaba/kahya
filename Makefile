@@ -70,6 +70,33 @@ test: venv build
 		echo "W4-07 acceptance gate FAILED (tests/acceptance/w4)" >&2; \
 		exit 1; \
 	fi
+	@# W5-05 acceptance gate: the four hermetic gate tests (single-
+	@# notification briefing, consolidation diff->author=kahyad commit,
+	@# tainted-DENY/clean-ALLOW, mini-eval regression detection) MUST
+	@# actually run, not silently no-op - same anti-vacuous-green guard
+	@# shape as W4-07's above, scoped to the four packages the W5-05 gate
+	@# lives in (kahyad/internal/eval is a brand-new package as of W5-05;
+	@# the other three already had test files, but this still catches a
+	@# future accidental //go:build tag or an emptied directory on any of
+	@# them).
+	@echo "running W5-05 acceptance gate (briefing/consolidation/policy/eval gate tests)..."
+	@W5_OUT=$$(go test -tags $(GOTAGS) ./kahyad/internal/briefing/... ./kahyad/internal/consolidation/... ./kahyad/internal/policy/... ./kahyad/internal/eval/... -v 2>&1); \
+	W5_STATUS=$$?; \
+	echo "$$W5_OUT" | grep -E '^(--- (PASS|FAIL)|ok|FAIL)'; \
+	if echo "$$W5_OUT" | grep -q '\[no test files\]' || echo "$$W5_OUT" | grep -q 'no packages to test'; then \
+		echo ""; \
+		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: one of kahyad/internal/{briefing,consolidation,policy,eval} reported '[no test files]' -- the W5-05 acceptance gate did NOT actually run for that package (tasks/README.md gate rule: a test package that plain go test silently skips is a forbidden vacuously-green result)." >&2; \
+		exit 1; \
+	fi; \
+	if ! echo "$$W5_OUT" | grep -q 'TestW5GateSingleNotificationTraceIDThenDuplicateSkipped' || ! echo "$$W5_OUT" | grep -q 'TestW5GateConsolidationProducesDiffThenApproveCommitsAsKahyaAndReindexes' || ! echo "$$W5_OUT" | grep -q 'TestSameToolSameTargetDeniedTaintedAllowedClean' || ! echo "$$W5_OUT" | grep -q 'TestRunnerRunDetectsInjectedRegression'; then \
+		echo ""; \
+		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: one or more of the four named W5-05 gate tests did not appear in the test output at all (renamed/deleted?) -- tasks/README.md gate rule." >&2; \
+		exit 1; \
+	fi; \
+	if [ $$W5_STATUS -ne 0 ]; then \
+		echo "W5-05 acceptance gate FAILED" >&2; \
+		exit 1; \
+	fi
 	@if docker info >/dev/null 2>&1; then \
 		echo "docker daemon detected -- exporting KAHYA_DOCKER_TESTS=1 (mcp/shell's container tests must PASS, never skip, from here on)"; \
 		KAHYA_DOCKER_TESTS=1 go test -tags $(TEST_TAGS) ./...; \

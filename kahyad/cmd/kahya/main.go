@@ -75,6 +75,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runEntity(client, args[1:], stdout, stderr)
 	case "remembered":
 		return runRemembered(client, args[1:], stdout, stderr)
+	case "eval":
+		return runEval(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -490,6 +492,53 @@ func runRemembered(client *Client, args []string, stdout, stderr io.Writer) int 
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgRememberedSaved)
+	return 0
+}
+
+// runEval implements `kahya eval` (W5-05) - currently just the one "mini"
+// subcommand; any other/missing argument prints usage and exits 2.
+func runEval(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || args[0] != "mini" {
+		fmt.Fprintln(stderr, MsgEvalUsage)
+		return 2
+	}
+	return runEvalMini(client, stdout, stderr)
+}
+
+// runEvalMini implements `kahya eval mini`: POSTs /v1/eval/mini/run (kahyad
+// runs the baseline against its own memory_search and ledgers the
+// eval.mini.run event - this CLI process never opens brain.db itself),
+// prints a GEÇTİ/KALDI line per question, a pass-count summary, and the
+// regression verdict against the immediately preceding run. Exit code is
+// NON-ZERO iff the server reports a regression (task spec: "regression = a
+// previously-passing question now failing, or pass-count dropping") - a
+// clean daemon-unreachable/server error also exits nonzero, same as every
+// other subcommand.
+func runEvalMini(client *Client, stdout, stderr io.Writer) int {
+	result, err := client.EvalMiniRun(context.Background(), traceid.New())
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	for _, r := range result.Results {
+		if r.Pass {
+			fmt.Fprintf(stdout, MsgEvalMiniPass+"\n", r.Q)
+		} else {
+			fmt.Fprintf(stdout, MsgEvalMiniFail+"\n", r.Q)
+		}
+	}
+	fmt.Fprintf(stdout, MsgEvalMiniSummary+"\n", result.PassCount, result.Total)
+
+	if !result.PreviousFound {
+		fmt.Fprintln(stdout, MsgEvalMiniFirstRun)
+		return 0
+	}
+	if result.Regressed {
+		fmt.Fprintf(stdout, MsgEvalMiniRegression+"\n", strings.Join(result.Reasons, "\n"))
+		return 1
+	}
+	fmt.Fprintln(stdout, MsgEvalMiniNoRegression)
 	return 0
 }
 

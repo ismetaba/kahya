@@ -31,6 +31,7 @@ import (
 	"kahya/kahyad/internal/consolidation"
 	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/embed"
+	"kahya/kahyad/internal/eval"
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
@@ -830,6 +831,31 @@ func run() int {
 		return consolidator.Run(ctx, scheduler.TraceIDFromContext(ctx))
 	})
 	srv.SetConsolidation(consolidator)
+
+	// W5-05: `kahya eval mini` (/v1/eval/mini/run) - the ~20-question
+	// retrieval mini-baseline. Searcher is adapted from the SAME searcher
+	// value /v1/memory/search itself calls (three lines, converting
+	// search.Hit -> eval.Hit - kahyad/internal/eval deliberately has no
+	// compile-time dependency on kahyad/internal/search, see eval/
+	// runner.go's own doc comment); EventLogger/EventReader are the SAME
+	// events-ledger seam consolidation's own Consolidator uses above.
+	evalRunner := &eval.Runner{
+		BaselinePath: cfg.EvalMiniBaselinePath,
+		Searcher: eval.SearcherFunc(func(ctx context.Context, traceID, query string, k int) ([]eval.Hit, error) {
+			hits, err := searcher.Search(ctx, traceID, query, k)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]eval.Hit, len(hits))
+			for i, h := range hits {
+				out[i] = eval.Hit{Path: h.Path, Text: h.Text}
+			}
+			return out, nil
+		}),
+		EventLogger: st,
+		EventReader: eval.StoreEventReader{Q: st.Queries},
+	}
+	srv.SetEvalMiniRunner(evalRunner)
 
 	// W5-03: the Sunday 18:00 weekly truth ritual - `kahya job run
 	// truth-ritual` (manual trigger) and the launchd-scheduled run both

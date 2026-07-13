@@ -796,6 +796,56 @@ func (c *Client) MarkRemembered(ctx context.Context, traceID, targetTraceID stri
 	return rr.Duplicate, nil
 }
 
+// evalMiniQuestionResult mirrors kahyad's POST /v1/eval/mini/run JSON
+// body's "results" row shape (kahyad/internal/server.evalMiniQuestionResult,
+// W5-05).
+type evalMiniQuestionResult struct {
+	Q         string `json:"q"`
+	Pass      bool   `json:"pass"`
+	Abstained bool   `json:"abstained,omitempty"`
+	Err       string `json:"err,omitempty"`
+}
+
+// evalMiniRunResult mirrors kahyad's POST /v1/eval/mini/run JSON body
+// (kahyad/internal/server.evalMiniRunResponse, W5-05).
+type evalMiniRunResult struct {
+	Total         int                      `json:"total"`
+	PassCount     int                      `json:"pass_count"`
+	Results       []evalMiniQuestionResult `json:"results"`
+	PreviousFound bool                     `json:"previous_found"`
+	Regressed     bool                     `json:"regressed"`
+	Reasons       []string                 `json:"reasons,omitempty"`
+	Error         string                   `json:"error,omitempty"`
+}
+
+// EvalMiniRun calls POST /v1/eval/mini/run (`kahya eval mini`): kahyad runs
+// the W5-05 retrieval mini-baseline against its own memory_search searcher
+// and ledgers exactly one eval.mini.run event - this CLI process never
+// opens brain.db itself, only ever this one UDS round-trip.
+func (c *Client) EvalMiniRun(ctx context.Context, traceID string) (evalMiniRunResult, error) {
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/eval/mini/run", traceID, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return evalMiniRunResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return evalMiniRunResult{}, err
+	}
+	defer resp.Body.Close()
+
+	var rr evalMiniRunResult
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return evalMiniRunResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/mini/run: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if rr.Error != "" {
+			return evalMiniRunResult{}, fmt.Errorf("%s", rr.Error)
+		}
+		return evalMiniRunResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("eval/mini/run: status %d", resp.StatusCode)}
+	}
+	return rr, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

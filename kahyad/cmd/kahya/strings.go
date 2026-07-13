@@ -277,4 +277,30 @@ const (
 	// Telegram "🌟 Hatırladı" button's own success toast,
 	// kahyad/internal/telegram's toastRememberedSaved).
 	MsgRememberedSaved = "🌟 Hatırladı anı kaydedildi."
+
+	// ---- W5-05: kahya eval mini ----
+
+	// MsgEvalUsage is printed when `kahya eval` is given anything other
+	// than exactly "mini". Exit 2.
+	MsgEvalUsage = "kullanım: kahya eval mini"
+
+	// MsgEvalMiniPass/MsgEvalMiniFail prefix each baseline question's own
+	// result line (`kahya eval mini`'s per-question report): %s = the
+	// question text.
+	MsgEvalMiniPass = "  GEÇTİ  %s"
+	MsgEvalMiniFail = "  KALDI  %s"
+
+	// MsgEvalMiniSummary is `kahya eval mini`'s summary line: first %d =
+	// pass count, second %d = total question count.
+	MsgEvalMiniSummary = "Özet: %d/%d soru geçti."
+
+	// MsgEvalMiniNoRegression/MsgEvalMiniRegression report the regression
+	// verdict against the immediately preceding eval.mini.run event.
+	// MsgEvalMiniRegression's %s is the newline-joined list of reasons.
+	MsgEvalMiniNoRegression = "Önceki çalıştırmaya göre gerileme yok."
+	MsgEvalMiniRegression   = "GERİLEME TESPİT EDİLDİ:\n%s"
+
+	// MsgEvalMiniFirstRun is printed instead of a regression verdict when
+	// no prior eval.mini.run event exists yet (nothing to compare against).
+	MsgEvalMiniFirstRun = "İlk çalıştırma - karşılaştırılacak önceki sonuç yok."
 )

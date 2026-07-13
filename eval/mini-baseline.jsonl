@@ -1,0 +1,22 @@
+{"q": "evlerimizden", "expect_substring": "ev", "k": 5}
+{"q": "iOS ev tasarım uygulaması hangi proje?", "expect_substring": "Maketto", "k": 5}
+{"q": "Maketto hangi framework kullanıyor?", "expect_substring": "RoomPlan", "k": 5}
+{"q": "kullanıcının makinesi hangi Mac modeli?", "expect_substring": "M5 Max", "k": 5}
+{"q": "kaç GB birleşik bellek var?", "expect_substring": "128 GB", "k": 5}
+{"q": "Kâhya mimarisinde kaç süreç var?", "expect_substring": "Go daemon", "k": 5}
+{"q": "Kâhya UI için hangi araçlar kullanılıyor MVP'de?", "expect_substring": "Hammerspoon", "k": 5}
+{"q": "gold-token misyonu gram başına yüzde kaç altın?", "expect_substring": "4 yetki alanı", "k": 5}
+{"q": "gold-token backend hangi dilde yazılıyor?", "expect_substring": "Go 1.22", "k": 5}
+{"q": "gold-token gerçek kod konumu nedir?", "expect_substring": "Project 1/gold-token", "k": 5}
+{"q": "saga trace_id bug'ı nasıl çözüldü?", "expect_substring": "correlation_id", "k": 5}
+{"q": "Wan 2.2 S2V hangi çözünürlükte önerilir?", "expect_substring": "448×448", "k": 5}
+{"q": "S2V için fp8 dosyaları neden kullanılamıyor?", "expect_substring": "CRASHES on MPS", "k": 5}
+{"q": "FLUX LoRA eğitimi neden bulut GPU'da yapılıyor?", "expect_substring": "FLUX LoRA", "k": 5}
+{"q": "ai-video stack hangi model kullanıyor?", "expect_substring": "LTX", "k": 5}
+{"q": "ComfyUI hangi node paketi import edilemiyor?", "expect_substring": "kornia", "k": 5}
+{"q": "browser-agent-llm uzantısında sansürsüz model hangisi?", "expect_substring": "qwen3-30b", "k": 5}
+{"q": "aria2c ile HF indirmesi kaç MB/s'e çıkıyor?", "expect_substring": "aria2c", "k": 5}
+{"q": "Draw Things'te en kaliteli video modeli hangisi?", "expect_substring": "Wan 2.2", "k": 5}
+{"q": "agent-test-env artefaktları hangi klasörde saklanıyor?", "expect_substring": "agent-test-studio", "k": 5}
+{"q": "claude-cli sağlayıcısında hangi model tercih ediliyor?", "expect_substring": "opus", "k": 5}
+{"q": "Kâhya backlog kaç görevlik?", "expect_substring": "50 görevlik", "k": 5}

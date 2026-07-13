@@ -1,6 +1,6 @@
 # W5-05 — W5 acceptance gate
 
-**Status:** todo
+**Status:** blocked-user (code-complete: all four gate tests + `kahya eval mini` + `scripts/w5_gate.sh` implemented, `make test`/`make lint` green; the REAL end-to-end drill run and drill item 4's Telegram ritual answer are user-assist runtime — see "Gate run" note below)
 **Phase:** W5 — Proactivity + consolidation
 **Depends on:** W5-01, W5-02, W5-03, W5-04
 **Flags:** user-assist 🧍 (the gate drill is human-run; drill item 4 needs the user to answer at least one ritual question on Telegram)
@@ -47,12 +47,46 @@ The W5 weekly gate is verified end-to-end and encoded as permanent tests: single
 
 ## Acceptance criteria
 
-- [ ] `make test` green, including the four new gate tests.
-- [ ] `scripts/w5_gate.sh` run once for real prints PASS for all four gate items (mirrors §6 W5 acceptance byte-for-byte in intent: tek bildirim + `trace_id`; diff commit; tainted-DENY/clean-ALLOW; mini-baseline no regression).
-- [ ] `kahya eval mini` exits 0 post-consolidation and `sqlite3 ... "SELECT count(*) FROM events WHERE type='eval.mini.run'"` ≥ 2 (before + after runs recorded).
-- [ ] `eval/mini-baseline.jsonl` contains ≥20 lines and line 1 is the `evlerimizden`→`ev` morphology probe, byte-exact.
-- [ ] Taint gate test proves the **same** tool+target pair is DENIED from the briefing session and ALLOWED (to approval) from a clean session — not two different actions.
-- [ ] `kahya log --trace <briefing-trace-id>` output saved by the drill script shows kahyad and worker JSONL lines sharing the id.
+- [x] `make test` green, including the four new gate tests (`TestW5GateSingleNotificationTraceIDThenDuplicateSkipped`, `TestW5GateConsolidationProducesDiffThenApproveCommitsAsKahyaAndReindexes`, `TestSameToolSameTargetDeniedTaintedAllowedClean`, `TestRunnerRunDetectsInjectedRegression`) — plus a dedicated Makefile guard (mirroring W4-07's) that fails the build if any of the four is missing from the test run or its package reports `[no test files]`.
+- [ ] `scripts/w5_gate.sh` run once for real prints PASS for all four gate items — **user-assist**: this environment has no Calendar Automation TCC grant (the morning-briefing job's `collect_calendar.go` osascript call hangs — a real, live-drill-discovered W5-01 bug, flagged separately, not fixed here per this task's own scope rule) and no live Anthropic credential (HANDOFF W0-04, pre-existing blocker) or Telegram token, so the drill's model/Telegram-dependent halves come back ERTELENDİ (deferred) rather than GEÇTİ (pass) on THIS machine. See "Gate run" note below for the actual run's full output. The script itself is code-complete and was validated live against a real running kahyad (health check, job dispatch, `/policy/check`, `kahya eval mini`, ledger/sqlite reads all exercised for real; two real bugs in the script's own bash/python plumbing were found and fixed this way before freezing it — see the note).
+- [x] `kahya eval mini` exits 0 on a non-regressing run and `sqlite3 ... "SELECT count(*) FROM events WHERE kind='eval.mini.run'"` grows by 1 per run (hermetically proven in `kahyad/internal/eval/mini_test.go`'s `TestRunnerRunFirstRunNeverRegressesAndLedgersEvent`/`TestRunnerRunDetectsInjectedRegression`, AND reproduced live in this environment: two consecutive `kahya eval mini` runs against a real daemon took the event count from 0→1→2 with exit 0 both times, no regression on an unchanged corpus). Note: the acceptance criterion's own text says `events.type`; the actual column is `events.kind` (`type` does not exist in the schema) — the query above uses the real column name. The full "post a REAL cloud-backed consolidation" loop is part of the live drill (still user-assist, see above).
+- [x] `eval/mini-baseline.jsonl` contains ≥20 lines (22) and line 1 is the `evlerimizden`→`ev` morphology probe, byte-exact (enforced by `TestMiniBaselineFileShape`). Authored and verified against the actually-seeded `~/Kahya/memory` corpus using the real `search.Searcher`/`indexer.Indexer` code (FTS-only, no embedder) before freezing.
+- [x] Taint gate test proves the **same** tool+target pair is DENIED from the briefing session and ALLOWED (to approval) from a clean session — not two different actions (`kahyad/internal/policy/taint_gate_test.go`, both tests construct the ToolInput bytes ONCE and pass that identical value to both `Check` calls).
+- [ ] `kahya log --trace <briefing-trace-id>` output saved by the drill script shows kahyad and worker JSONL lines sharing the id — **user-assist** (needs a real briefing delivery, see above); the identical invariant is hermetically proven by `TestRunEmitsCollectorWorkerAndDeliveryJSONLLinesUnderOneTraceID` (jsonl_test.go) and composed into `TestW5GateSingleNotificationTraceIDThenDuplicateSkipped` (gate_test.go).
+
+## Gate run
+
+**2026-07-13, this session (blocked-user environment: no Calendar TCC grant, no live Anthropic credential, no Telegram token).**
+
+`make test` (full suite, including the W4-07 and W5-05 Makefile guards) and `make lint`: **green**.
+
+`scripts/w5_gate.sh` run once for real against a throwaway `KAHYA_ENV=dev` kahyad (fresh temp HOME/DB, real binaries, real seeded corpus, no mocks):
+
+```
+GEÇTİ      sağlık
+KALDI      brifing-tek-bildirim -- 60s içinde iş tamamlanmadı (collect_calendar.go'nun
+           osascript çağrısı askıda kaldı - Takvim Otomasyonu izni hiç karar verilmemiş)
+ERTELENDİ  brifing-trace_id / brifing-tekrar-atlandı (yukarıdaki hataya bağlı)
+ERTELENDİ  taint-tainted-deny (brifing işi tamamlanmadığı için taint satırı commit
+           edilmedi) / taint-clean-allow (gerçek bir 'clean' oturum yok)
+GEÇTİ      mini-baseline-önce (eval.mini.run olayı yazıldı, 1/22 soru geçti - bu
+           ortamdaki 2 dosyalık W12-10 fixture korpusu üzerinde, gerçek ~/Kahya
+           içeriği değil)
+ERTELENDİ  konsolidasyon-diff / -onay-commit / -reindex / mini-baseline-sonra
+           (nightly-consolidation'ın cloud-lane oturumu canlı kimlik bilgisi
+           olmadan başarısız oldu)
+ERTELENDİ  ritüel-yanıt (90s içinde Telegram yanıtı gelmedi - Telegram bu ortamda
+           yapılandırılmamış)
+=== ÖZET: 1 KALDI, 9 ERTELENDİ ===
+```
+
+The one real FAIL (`brifing-tek-bildirim`) is a genuine, previously-unknown W5-01 bug found by this drill, not a W5-05 defect: `collect_calendar.go`'s `ExecCalendarRunner.Run` invokes `osascript` with the CALLER's context (no deadline), so on a machine where Calendar Automation permission was never decided, the call can hang indefinitely, wedging the whole morning-briefing job before it ever reaches `Taint.InsertUntrusted`/`TaskStore.InsertTask`. Flagged as a follow-up (spawn_task `task_d175a382`, "Bound collect_calendar.go's osascript call with its own timeout") — per this task's own scope rule, fixed under W5-01, not here.
+
+Two real bugs in `scripts/w5_gate.sh` itself were found and fixed during this same live run, before freezing the script:
+1. `python3 -` reads its own program text from stdin, so `cmd | python3 - <<'EOF' ... EOF` silently starves the inner script's `sys.stdin` of the piped data (the interpreter already consumed fd 0 reading the heredoc-supplied program). Two call sites (`wait_for_job_done`'s event filter, and the briefing task_id extraction) used exactly this broken pattern; fixed by having each python3 heredoc read the JSONL log FILE directly by path (passed as `sys.argv`) instead of piping another process's output into it.
+2. The script originally polled kahyad.jsonl for package-specific event names (`consolidation.pending`, `briefing_skipped_duplicate`, etc.) that are ONLY ever ledgered (brain.db `events` table), never echoed to JSONL — so the wait would never find them. Fixed by polling the scheduler's own universal `job_completed`/`job_failed` JSONL line (kahyad/internal/scheduler.Scheduler.Trigger logs this for every job, always) as the "is it done" signal, then reading the specific ledger event kind from `events` via `sqlite3` for the "what happened" verdict.
+
+Drill item 4 (truth-ritual Telegram answer) needs the user; per protocol this stays `blocked-user` rather than a fabricated answer. Re-run `scripts/w5_gate.sh` once a Calendar Automation grant, a live Anthropic credential, and a Telegram bot token are all wired (`make install-agent` / `make run-daemon`) to turn every ERTELENDİ line above into a real GEÇTİ/KALDI.
 
 ## Out of scope
 

@@ -245,6 +245,11 @@ type Server struct {
 	// dependency" convention as factEngine above.
 	remembered RememberedMarker
 
+	// evalMini wires POST /v1/eval/mini/run (W5-05, evalmini.go's own doc
+	// comment); nil until SetEvalMiniRunner is called - same "unwired
+	// dependency" convention as consolidation/factEngine above.
+	evalMini EvalMiniRunner
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -365,6 +370,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/consolidation", s.handleConsolidationShow)
 	mux.HandleFunc("/v1/consolidation/approve", s.handleConsolidationApprove)
 	mux.HandleFunc("/v1/consolidation/reject", s.handleConsolidationReject)
+	mux.HandleFunc("/v1/eval/mini/run", s.handleEvalMiniRun)
 	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
 	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
