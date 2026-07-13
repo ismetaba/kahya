@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill readiness readiness-complete
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -335,3 +335,33 @@ metrics: build
 # daemon ('make install-agent' or 'make run-daemon') -- user-assist runtime.
 restore-drill: build
 	KAHYA_ENV=restore ./scripts/restore-drill.sh
+
+# readiness (W78-06): the dogfood-readiness START gate - the single command
+# that says "the MVP may enter real daily use". It runs the FULL local
+# verification first (`make test lint invariants` - all *-acceptance gate tests
+# and the local-integration invariant tests), THEN `kahya readiness
+# --phase=start`, which reads the RECORDED evidence rows over the running
+# kahyad UDS (latest eval.retrieval.result >=0.80, eval.redteam.result
+# bypasses=0, restore.drill.result ok) and exits non-zero if any build gate is
+# red or its evidence row is missing. LIVE-DRILL target: the `kahya readiness`
+# step needs a RUNNING kahyad ('make install-agent' or 'make run-daemon' in
+# another terminal) with those evidence rows already recorded (they are
+# produced by `make eval-retrieval`, `make eval-redteam`, `make restore-drill`
+# - all user-assist runtime drills). The gate LOGIC (build green/red/missing,
+# usage red-then-green, incident parsing) is proven hermetically in
+# kahyad/internal/readiness + server + cmd/kahya tests under `make test`, which
+# needs no daemon.
+readiness: build test lint invariants
+	./bin/kahya readiness --phase=start
+# readiness-complete (W78-06): the MVP-DONE gate. Same full local verification,
+# then `kahya readiness --phase=complete`, which additionally requires the §9
+# usage gates over the real dogfood window (>=10 commands/day sustained, >=5
+# remembered-moments/week, a >=14-day window - all from the W78-04 metrics
+# aggregates - PLUS zero data-loss incidents parsed from docs/dogfood.md). It
+# is EXPECTED RED until a real 2-week dogfood window exists; it goes green only
+# after the window is filled in docs/dogfood.md and the metrics window is real.
+# North-star targets (clarification-turn rate <=40%, palette->first-token p50
+# <1.5s) are REPORTED but do NOT gate the exit code (§9 is the contract). Same
+# running-daemon requirement as `readiness` above.
+readiness-complete: build test lint invariants
+	./bin/kahya readiness --phase=complete

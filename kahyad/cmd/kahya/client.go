@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/readiness"
 )
 
 const (
@@ -1171,6 +1172,46 @@ func (c *Client) Metrics(ctx context.Context, traceID, since string) (metricsRes
 		return metricsResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("metrics: decode response: %w", err)}
 	}
 	return mr, nil
+}
+
+// Readiness calls GET /readiness?since=<since> (`kahya readiness`, W78-06). It
+// decodes the daemon's readiness.Report (build gates + the daemon-derivable §9
+// usage gates + the reported north star) - the CLI folds in the file-derived
+// data-loss gate itself. The readiness package it decodes into imports NO
+// database/sql / sqlite driver (its metrics view is a plain struct), so this
+// stays a THIN client: a dial failure or non-2xx is funneled through
+// unreachableError so the CLI prints the one Turkish daemon-error line and
+// exits non-zero - it NEVER falls back to opening brain.db.
+func (c *Client) Readiness(ctx context.Context, traceID, since string) (readiness.Report, error) {
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	path := "/readiness"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, traceID, nil)
+	if err != nil {
+		return readiness.Report{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return readiness.Report{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return readiness.Report{}, fmt.Errorf("%s", msg)
+		}
+		return readiness.Report{}, &unreachableError{sock: c.sock, err: fmt.Errorf("readiness: status %d", resp.StatusCode)}
+	}
+	var rep readiness.Report
+	if err := json.NewDecoder(resp.Body).Decode(&rep); err != nil {
+		return readiness.Report{}, &unreachableError{sock: c.sock, err: fmt.Errorf("readiness: decode response: %w", err)}
+	}
+	return rep, nil
 }
 
 func (c *Client) Log(ctx context.Context, traceID, queryTraceID string) ([]map[string]any, error) {

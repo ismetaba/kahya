@@ -42,6 +42,7 @@ import (
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/outbox"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/readiness"
 	"kahya/kahyad/internal/remembered"
 	"kahya/kahyad/internal/ritual"
 	"kahya/kahyad/internal/scheduler"
@@ -51,6 +52,7 @@ import (
 	"kahya/kahyad/internal/server"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/telegram"
@@ -1010,7 +1012,16 @@ func run() int {
 		log.Warn("metrics_reader_unavailable", "err", mErr.Error())
 	} else {
 		defer metricsDB.Close()
-		srv.SetMetricsReader(metrics.New(metricsDB))
+		metricsReader := metrics.New(metricsDB)
+		srv.SetMetricsReader(metricsReader)
+		// W78-06: GET /readiness (`kahya readiness`) - the dogfood-readiness
+		// readout. It reuses the SAME read-only metrics.Reader for the §9
+		// usage gates and reads the recorded build-gate evidence rows via
+		// st.Queries.ListEventsByKind (the evidence rows live in the events
+		// ledger; the read is over the store's own handle, SELECT-only). No
+		// new writer and no second connection - kahyad stays brain.db's sole
+		// writer (HANDOFF §5 #4).
+		srv.SetReadinessReader(readinessEvidenceReader{q: st.Queries}, metricsReader)
 	}
 
 	// W78-01 deliverable: the nightly consolidation runs the retrieval eval as
@@ -1349,6 +1360,32 @@ func loadAnthproxyBootEvents(ctx context.Context, st *store.Store) ([]anthproxy.
 		events = append(events, anthproxy.BootEvent{Ts: ts, Record: rec})
 	}
 	return events, nil
+}
+
+// readinessEvidenceReader adapts the store's ListEventsByKind to
+// server.ReadinessEvidenceReader (W78-06): it reads the recorded build-gate
+// evidence rows (eval.retrieval.result / eval.redteam.result /
+// restore.drill.result) and projects each store row onto the narrow
+// readiness.EventRow the readiness package consumes - keeping
+// kahyad/internal/readiness free of any store/sqlcgen dependency, exactly as
+// eval.StoreEventReader does for its own EventRow. This is a SELECT-only read
+// over the store handle; it never writes.
+type readinessEvidenceReader struct {
+	q interface {
+		ListEventsByKind(ctx context.Context, kind string) ([]sqlcgen.Event, error)
+	}
+}
+
+func (r readinessEvidenceReader) ListEventsByKind(ctx context.Context, kind string) ([]readiness.EventRow, error) {
+	rows, err := r.q.ListEventsByKind(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]readiness.EventRow, len(rows))
+	for i, row := range rows {
+		out[i] = readiness.EventRow{ID: row.ID, Payload: row.Payload, CreatedAt: row.CreatedAt}
+	}
+	return out, nil
 }
 
 // buildCredentialSource selects the anthproxy.CredentialSource matching

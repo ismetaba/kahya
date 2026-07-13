@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/approval"
+	"kahya/kahyad/internal/readiness"
 	"kahya/kahyad/internal/traceid"
 )
 
@@ -82,6 +83,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runEval(client, args[1:], stdout, stderr)
 	case "metrics":
 		return runMetrics(client, args[1:], stdout, stderr)
+	case "readiness":
+		return runReadiness(client, args[1:], stdout, stderr)
 	case "halt":
 		return runHalt(client, args[1:], stdout, stderr)
 	default:
@@ -815,6 +818,183 @@ func northStarMark(ok bool) string {
 		return MsgMetricsNorthStarOK
 	}
 	return MsgMetricsNorthStarMiss
+}
+
+// runReadiness implements `kahya readiness [--phase=start|complete] [--since
+// <window>] [--json] [--dogfood <path>]` (W78-06): a THIN client of GET
+// /readiness. It prints a Turkish build/usage/north-star pass-fail table and
+// exits non-zero when a GATING gate is red. Two phases:
+//   - start (default): requires ALL build gates green (recorded retrieval /
+//     red-team / restore-drill evidence). Exits non-zero if any build gate is
+//     red or its evidence row is missing.
+//   - complete: additionally requires all §9 usage gates green - the daemon-
+//     derived commands/day, remembered/week, 14-day window, PLUS the file-
+//     derived zero-data-loss gate (this CLI parses docs/dogfood.md's structured
+//     incident column). North-star targets are REPORTED but never gate the exit
+//     code (§9 is the contract). It is EXPECTED red until a real 2-week window
+//     exists.
+//
+// A daemon that is unreachable yields a Turkish error on stderr and exit 2,
+// with NO direct-db fallback.
+func runReadiness(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("readiness", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	phase := fs.String("phase", "start", "start | complete")
+	since := fs.String("since", "14d", "pencere: süre (14d, 36h) veya tarih (2026-07-01)")
+	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
+	dogfood := fs.String("dogfood", "docs/dogfood.md", "dogfood takip dosyası (--phase=complete)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	p := strings.TrimSpace(*phase)
+	if p != "start" && p != "complete" {
+		fmt.Fprintln(stderr, MsgReadinessUsage)
+		return 2
+	}
+
+	rep, err := client.Readiness(context.Background(), traceid.New(), strings.TrimSpace(*since))
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	// Fold in the file-derived data-loss usage gate for --phase=complete: the
+	// daemon leaves it nil (incidents live in docs/dogfood.md, which the daemon
+	// has no view of), so the CLI parses the file here. A missing/unreadable
+	// file is FAIL-CLOSED: the gate goes red (a data-loss incident could not be
+	// ruled out).
+	if p == "complete" {
+		incidents, perr := readiness.ParseDogfoodIncidents(*dogfood)
+		if perr != nil {
+			no := false
+			rep.UsageGates.DataLossOK = &no
+			rep.UsageGates.DataLossReason = fmt.Sprintf(MsgReadinessDogfoodMissing, *dogfood)
+		} else {
+			ok := readiness.DataLossOK(incidents)
+			rep.UsageGates.DataLossOK = &ok
+		}
+	}
+
+	pass := readinessPass(rep, p)
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		if pass {
+			return 0
+		}
+		return 1
+	}
+
+	renderReadiness(rep, p, pass, stdout)
+	if pass {
+		return 0
+	}
+	return 1
+}
+
+// readinessPass is the exit-code predicate: start needs all build gates green;
+// complete additionally needs every §9 usage gate green (data-loss included).
+// North-star targets never enter this decision.
+func readinessPass(rep readiness.Report, phase string) bool {
+	if !rep.BuildGates.AllGreen() {
+		return false
+	}
+	if phase == "start" {
+		return true
+	}
+	ug := rep.UsageGates
+	dataLossGreen := ug.DataLossOK != nil && *ug.DataLossOK
+	return ug.CommandsPerDayOK && ug.RememberedOK && ug.WindowOK && dataLossGreen
+}
+
+// renderReadiness prints the Turkish build/usage/north-star table. Build gates
+// print in every phase; usage + north star print only for --phase=complete
+// (they are meaningless before a dogfood window exists).
+func renderReadiness(rep readiness.Report, phase string, pass bool, stdout io.Writer) {
+	fmt.Fprintln(stdout, MsgReadinessBuildHeader)
+	printReadinessBuildRow(stdout, MsgReadinessLabelRetrieval, rep.BuildGates.Retrieval)
+	printReadinessBuildRow(stdout, MsgReadinessLabelRedteam, rep.BuildGates.Redteam)
+	printReadinessBuildRow(stdout, MsgReadinessLabelRestore, rep.BuildGates.RestoreDrill)
+
+	if phase == "complete" {
+		ug := rep.UsageGates
+		fmt.Fprintln(stdout, MsgReadinessUsageHeader)
+		fmt.Fprintf(stdout, MsgReadinessRow+"\n", MsgReadinessLabelCommands,
+			readinessVerdict(ug.CommandsPerDayOK), fmt.Sprintf("ort %.1f/gün", ug.CommandsPerDay))
+		fmt.Fprintf(stdout, MsgReadinessRow+"\n", MsgReadinessLabelRemembered,
+			readinessVerdict(ug.RememberedOK), fmt.Sprintf("%.1f/hafta", ug.RememberedPerWk))
+		fmt.Fprintf(stdout, MsgReadinessRow+"\n", MsgReadinessLabelWindow,
+			readinessVerdict(ug.WindowOK), fmt.Sprintf("%d gün", ug.WindowDays))
+		dataLossGreen := ug.DataLossOK != nil && *ug.DataLossOK
+		fmt.Fprintf(stdout, MsgReadinessRow+"\n", MsgReadinessLabelDataLoss,
+			readinessVerdict(dataLossGreen), ug.DataLossReason)
+
+		fmt.Fprintln(stdout, MsgReadinessNorthStarHeader)
+		printReadinessNorthStarRow(stdout, MsgReadinessLabelClarification,
+			readinessClarificationValue(rep.NorthStar), readinessNSMark(rep.NorthStar.ClarificationOK))
+		printReadinessNorthStarRow(stdout, MsgReadinessLabelPalette,
+			readinessPaletteValue(rep.NorthStar), readinessNSMark(rep.NorthStar.PaletteOK))
+	}
+
+	switch {
+	case phase == "start" && pass:
+		fmt.Fprintln(stdout, MsgReadinessStartGreen)
+	case phase == "start":
+		fmt.Fprintln(stdout, MsgReadinessStartRed)
+	case pass:
+		fmt.Fprintln(stdout, MsgReadinessCompleteGreen)
+	default:
+		fmt.Fprintln(stdout, MsgReadinessCompleteRed)
+	}
+}
+
+// printReadinessBuildRow prints one build-gate row; the detail column shows the
+// Turkish reason when red (empty when green).
+func printReadinessBuildRow(w io.Writer, label string, g readiness.BuildGate) {
+	fmt.Fprintf(w, MsgReadinessRow+"\n", label, readinessVerdict(g.Green), g.Reason)
+}
+
+func printReadinessNorthStarRow(w io.Writer, label, value, mark string) {
+	fmt.Fprintf(w, MsgReadinessNSRow+"\n", label, value, mark)
+}
+
+// readinessVerdict maps a gate's green boolean to GEÇTİ/KALDI.
+func readinessVerdict(green bool) string {
+	if green {
+		return MsgReadinessPass
+	}
+	return MsgReadinessFail
+}
+
+// readinessNSMark maps a north-star *OK verdict to ✓/✗, or empty when veri-yok
+// (nil) - a reported-only target never shows a misleading mark.
+func readinessNSMark(ok *bool) string {
+	if ok == nil {
+		return ""
+	}
+	if *ok {
+		return MsgMetricsNorthStarOK
+	}
+	return MsgMetricsNorthStarMiss
+}
+
+func readinessClarificationValue(ns readiness.NorthStar) string {
+	if ns.ClarificationTurnRate == nil {
+		return MsgReadinessVeriYok
+	}
+	return fmt.Sprintf("%%%.1f", *ns.ClarificationTurnRate*100)
+}
+
+func readinessPaletteValue(ns readiness.NorthStar) string {
+	if ns.PaletteFirstTokenP50Ms == nil {
+		return MsgReadinessVeriYok
+	}
+	return fmt.Sprintf("%d ms", *ns.PaletteFirstTokenP50Ms)
 }
 
 // runAutonomy implements `kahya autonomy` (list ladder state) and

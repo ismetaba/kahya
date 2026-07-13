@@ -1,6 +1,6 @@
 # W78-06 — Dogfood readiness gate + tracking doc
 
-**Status:** todo
+**Status:** done — `kahya readiness [--phase=start|complete]` over `GET /readiness` (reads the recorded eval/redteam/restore evidence + W78-04 metrics, fail-closed on missing/stale/future-dated rows), `docs/mvp-readiness.md` (every §6 gate + §9 criterion → evidence), `docs/dogfood.md` (2-week tracker + the v1-blocked rule byte-exact), `make readiness`/`make readiness-complete`. Firing the real 2-week dogfood window (so `--phase=complete` can go green) is the user's real-usage period — user-assist runtime.
 **Phase:** W7–8 — Hardening + eval
 **Depends on:** W78-01, W78-02, W78-03, W78-04, W78-05, and every phase gate: W12-10, W12-11, W3-10, W4-07, W5-05, W6-04
 **Flags:** none

@@ -279,6 +279,15 @@ type Server struct {
 	// the events ledger on a dedicated query_only connection (main.go).
 	metricsReader MetricsReader
 
+	// readinessEvidence / readinessMetrics wire GET /readiness (W78-06,
+	// readiness.go's own doc comment); nil until SetReadinessReader is called.
+	// readinessEvidence reads the recorded build-gate evidence rows;
+	// readinessMetrics is the SAME read-only metrics.Reader wired for /metrics
+	// (reused for the usage gates). Both read-only over the query_only
+	// connection - kahyad stays brain.db's sole writer.
+	readinessEvidence ReadinessEvidenceReader
+	readinessMetrics  MetricsReader
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -421,6 +430,10 @@ func (s *Server) Prepare() error {
 	// W78-04: read-only metrics reporting over the events ledger (`kahya
 	// metrics`) - see metrics.go's own doc comment.
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	// W78-06: read-only dogfood-readiness readout over the recorded evidence
+	// rows + the metrics aggregates (`kahya readiness`) - see readiness.go's
+	// own doc comment.
+	mux.HandleFunc("GET /readiness", s.handleReadiness)
 	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
 	// ⌥⎋ binding both call this (halt.go's own doc comment).
 	mux.HandleFunc("POST /halt", s.handleHalt)

@@ -471,4 +471,54 @@ const (
 	// verdict markers substituted into the rows above.
 	MsgMetricsNorthStarOK   = "✓"
 	MsgMetricsNorthStarMiss = "✗"
+
+	// --- W78-06 `kahya readiness` (dogfood-readiness gate) ---
+
+	// MsgReadinessUsage is printed when `kahya readiness` gets an unknown
+	// --phase. Exit code 2.
+	MsgReadinessUsage = "kullanım: kahya readiness [--phase=start|complete] [--since <pencere>] [--json] [--dogfood <yol>]"
+
+	// MsgReadinessBuildHeader / UsageHeader / NorthStarHeader label the three
+	// sections of the readiness table.
+	MsgReadinessBuildHeader     = "İnşa kapıları (dogfood'a başlamak için):"
+	MsgReadinessUsageHeader     = "Kullanım kapıları (§9 MVP-tamamlandı):"
+	MsgReadinessNorthStarHeader = "Kuzey-yıldızı (raporlanır, kapı değil):"
+
+	// MsgReadinessPass / MsgReadinessFail are the per-gate verdicts.
+	MsgReadinessPass = "GEÇTİ"
+	MsgReadinessFail = "KALDI"
+
+	// MsgReadinessRow is one gate row: %-40s label, %s verdict, %s detail.
+	MsgReadinessRow = "  %-40s %s  %s"
+	// MsgReadinessNSRow is one north-star row: %-40s label, %s value, %s ✓/✗.
+	MsgReadinessNSRow = "  %-40s %s  %s"
+
+	// Gate labels.
+	MsgReadinessLabelRetrieval     = "retrieval eval (precision ≥0.80)"
+	MsgReadinessLabelRedteam       = "kırmızı-takım (0 atlatma)"
+	MsgReadinessLabelRestore       = "geri-yükleme tatbikatı (ok)"
+	MsgReadinessLabelCommands      = "komut/gün (≥10, sürdürülebilir)"
+	MsgReadinessLabelRemembered    = "hatırladı/hafta (≥5)"
+	MsgReadinessLabelWindow        = "14-günlük kesintisiz pencere"
+	MsgReadinessLabelDataLoss      = "sıfır veri-kaybı olayı"
+	MsgReadinessLabelClarification = "açıklama-turu oranı (≤%40)"
+	MsgReadinessLabelPalette       = "palet→ilk-token p50 (<1.5s)"
+
+	// MsgReadinessVeriYok is the veri-yok placeholder for a north-star metric
+	// with no data yet.
+	MsgReadinessVeriYok = "— (veri yok)"
+
+	// MsgReadinessStartGreen / StartRed are the `--phase=start` verdict lines.
+	MsgReadinessStartGreen = "Tüm inşa kapıları yeşil — dogfood penceresi açılabilir."
+	MsgReadinessStartRed   = "Bir veya daha fazla inşa kapısı kırmızı/eksik — dogfood başlayamaz."
+
+	// MsgReadinessCompleteGreen / CompleteRed are the `--phase=complete`
+	// verdict lines.
+	MsgReadinessCompleteGreen = "MVP tamamlandı: 2 haftalık dogfood tüm §9 kapılarını geçti."
+	MsgReadinessCompleteRed   = "Bir veya daha fazla §9 kapısı kırmızı — MVP henüz tamamlanmadı."
+
+	// MsgReadinessDogfoodMissing is the data-loss gate's detail when
+	// docs/dogfood.md cannot be read (fail-closed: the gate goes red). %s = the
+	// path tried.
+	MsgReadinessDogfoodMissing = "docs/dogfood.md okunamadı (%s) — veri-kaybı kapısı doğrulanamıyor"
 )
