@@ -755,6 +755,47 @@ func (c *Client) SplitEntities(ctx context.Context, traceID string, mergeLedgerI
 	})
 }
 
+// rememberedResponse mirrors kahyad's POST /v1/remembered JSON body
+// (kahyad/internal/server.rememberedResponse, W5-03).
+type rememberedResponse struct {
+	OK        bool   `json:"ok"`
+	Duplicate bool   `json:"duplicate,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// MarkRemembered calls POST /v1/remembered {trace_id, channel} (`kahya
+// remembered --trace <id>`, channel="local" - the CLI IS the local
+// surface, HANDOFF §5 safety #5's "local"/"remote" split). Returns
+// duplicate=true when targetTraceID was already marked (still not an
+// error - re-marking is idempotent by design, W5-03 task spec).
+func (c *Client) MarkRemembered(ctx context.Context, traceID, targetTraceID string) (duplicate bool, err error) {
+	body, err := json.Marshal(map[string]string{"trace_id": targetTraceID, "channel": "local"})
+	if err != nil {
+		return false, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/remembered", traceID, bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	var rr rememberedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return false, &unreachableError{sock: c.sock, err: fmt.Errorf("remembered: decode response: %w", err)}
+	}
+	if !rr.OK {
+		if rr.Error != "" {
+			return false, fmt.Errorf("%s", rr.Error)
+		}
+		return false, &unreachableError{sock: c.sock, err: fmt.Errorf("remembered: status %d", resp.StatusCode)}
+	}
+	return rr.Duplicate, nil
+}
+
 // Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
 // "lines" array (kahyad/internal/server.logLineResponse). traceID is the
 // X-Kahya-Trace-Id this request itself carries (a freshly minted one - it

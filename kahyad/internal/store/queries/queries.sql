@@ -869,3 +869,73 @@ RETURNING id, op, src_entity_id, dst_entity_id, evidence, actor, created_at;
 SELECT id, op, src_entity_id, dst_entity_id, evidence, actor, created_at
 FROM merge_ledger
 WHERE id = ?;
+
+-- W5-03 (truth-ritual) queries below: the eval_labels durable label store
+-- plus the two small facts/episodes reads kahyad/internal/ritual's sampler
+-- needs beyond what factengine/W5-04 already added above. See that
+-- package for the only callers.
+
+-- name: ListActiveFacts :many
+-- The ritual sampler's whole candidate pool - every ACTIVE fact,
+-- unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
+-- exclusion/priority policy entirely in Go, never in SQL, so the policy
+-- stays readable/testable as plain code, not buried in a query).
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE status = 'active'
+ORDER BY id ASC;
+
+-- name: GetEpisodeByID :one
+-- The sampler's fail-closed secret-lane classification read: resolves one
+-- evidence row's episode_id to its source_path, matched against
+-- policy.yaml's secret_lane_globs - the SAME path-glob mechanism
+-- kahyad/internal/consolidation's PartitionByLane already uses for memory
+-- files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
+-- dosya yollari icin").
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at
+FROM episodes
+WHERE id = ?;
+
+-- name: InsertEvalLabel :one
+-- One row per fact ASKED about in a single ritual run (W5-03 task spec
+-- step 4) - label/answered_at start NULL, filled in by
+-- UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
+-- the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+INSERT INTO eval_labels (fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at)
+VALUES (?, ?, NULL, ?, NULL, ?, ?, ?)
+RETURNING id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at;
+
+-- name: GetEvalLabel :one
+SELECT id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at
+FROM eval_labels
+WHERE id = ?;
+
+-- name: UpdateEvalLabelAnswer :exec
+-- Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
+-- the same question edit the label, they do not append evidence rows") -
+-- called again on a later, possibly-different-button tap for the SAME
+-- question; this never creates a second eval_labels row for one asked
+-- fact.
+UPDATE eval_labels
+SET label = ?, answered_at = ?
+WHERE id = ?;
+
+-- name: ListEvalLabelsByTrace :many
+-- Every eval_labels row one ritual run minted, oldest first - the "all
+-- rows share one trace_id" acceptance criterion's own read path.
+SELECT id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at
+FROM eval_labels
+WHERE trace_id = ?
+ORDER BY id ASC;
+
+-- name: CountUnansweredEvalLabelsByTrace :one
+SELECT count(*) FROM eval_labels WHERE trace_id = ? AND answered_at IS NULL;
+
+-- name: ListLastAskedAtAllFacts :many
+-- Per-fact most-recent asked_at, across every ritual run ever run - the
+-- sampler's "never/longest-ago probed" priority tier (select.go): a
+-- fact_id absent from this result set has never been asked and sorts
+-- first, ahead of every fact that has.
+SELECT fact_id, MAX(asked_at) AS last_asked_at
+FROM eval_labels
+GROUP BY fact_id;

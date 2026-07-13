@@ -211,6 +211,22 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	if cb == nil {
 		return nil
 	}
+	// W5-03: the "Hatirladi" button and the ritual Dogru/Yanlis/Emin
+	// degilim buttons use their OWN, independent callback_data encodings
+	// (remembered.go/ritual.go, this package) - dispatched BEFORE
+	// decodeCallbackData below, which only ever understands the W3-07
+	// approve/deny action bytes and would otherwise reject every other
+	// action byte as "unknown". Both still run behind the SAME
+	// allowlistMiddleware every other callback in this package does -
+	// registerHandlers wires it once, ahead of every Handle call.
+	if len(cb.Data) > 0 {
+		switch cb.Data[0] {
+		case cbActionRemembered:
+			return b.handleRememberedCallback(cb)
+		case cbActionRitualTrue, cbActionRitualFalse, cbActionRitualUnsure:
+			return b.handleRitualCallback(cb)
+		}
+	}
 	action, id, err := decodeCallbackData(cb.Data)
 	if err != nil {
 		// No card was ever looked up yet (the id itself failed to decode)

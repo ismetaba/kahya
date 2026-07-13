@@ -68,6 +68,7 @@ type Querier interface {
 	// every row ever inserted for this exact triple (every seq), regardless
 	// of its current status.
 	CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error)
+	CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID string) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
 	// WriteFact's upsert lookup: an existing ACTIVE fact for this exact
 	// (subject, predicate, object) gets a new evidence row instead of a
@@ -91,6 +92,13 @@ type Querier interface {
 	// kahyad/internal/egress/budget.go for the only caller.
 	GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error)
 	GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
+	// The sampler's fail-closed secret-lane classification read: resolves one
+	// evidence row's episode_id to its source_path, matched against
+	// policy.yaml's secret_lane_globs - the SAME path-glob mechanism
+	// kahyad/internal/consolidation's PartitionByLane already uses for memory
+	// files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
+	// dosya yollari icin").
+	GetEpisodeByID(ctx context.Context, id int64) (Episode, error)
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (GetEpisodeByPathRow, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
 	// filter by source, which is fine for callers that only ever use one
@@ -98,6 +106,7 @@ type Querier interface {
 	// source='memory_file' specifically (task spec step 3), so it gets its own
 	// query rather than overloading GetEpisodeByPath's signature.
 	GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeBySourceAndPathParams) (GetEpisodeBySourceAndPathRow, error)
+	GetEvalLabel(ctx context.Context, id int64) (EvalLabel, error)
 	// The per-(fact_id, session_id, polarity) dedupe check (HANDOFF S5
 	// memory #3): sql.ErrNoRows means this session has not yet evidenced
 	// this fact at this polarity, so a NEW evidence row is due; a hit means
@@ -215,6 +224,11 @@ type Querier interface {
 	InsertEntity(ctx context.Context, arg InsertEntityParams) (InsertEntityRow, error)
 	InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error)
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
+	// One row per fact ASKED about in a single ritual run (W5-03 task spec
+	// step 4) - label/answered_at start NULL, filled in by
+	// UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
+	// the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+	InsertEvalLabel(ctx context.Context, arg InsertEvalLabelParams) (EvalLabel, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
 	// Later tasks add more queries to this file as they need them; sqlc
 	// regenerates the whole package from the union of every *.sql file here.
@@ -311,6 +325,15 @@ type Querier interface {
 	// only ever matches an attempt that reached 'receipt'.
 	InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error)
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
+	// W5-03 (truth-ritual) queries below: the eval_labels durable label store
+	// plus the two small facts/episodes reads kahyad/internal/ritual's sampler
+	// needs beyond what factengine/W5-04 already added above. See that
+	// package for the only callers.
+	// The ritual sampler's whole candidate pool - every ACTIVE fact,
+	// unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
+	// exclusion/priority policy entirely in Go, never in SQL, so the policy
+	// stays readable/testable as plain code, not buried in a query).
+	ListActiveFacts(ctx context.Context) ([]Fact, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
 	// Every ledger event ever appended, oldest first - verify.go's own
 	// full-recompute pass (task spec step 6: "recompute the digest from event
@@ -350,6 +373,9 @@ type Querier interface {
 	// one or more existing ids means a NEW entity must be created provisional
 	// (HANDOFF S5 memory #2: name similarity alone never auto-merges).
 	ListEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error)
+	// Every eval_labels row one ritual run minted, oldest first - the "all
+	// rows share one trace_id" acceptance criterion's own read path.
+	ListEvalLabelsByTrace(ctx context.Context, traceID string) ([]EvalLabel, error)
 	// W12-08 (anthproxy cost governor): boot-time rebuild reads every
 	// historical event of one kind (e.g. 'model_call') and replays it into
 	// the in-memory governor totals - kahyad/internal/anthproxy stays
@@ -370,6 +396,11 @@ type Querier interface {
 	// PID - a live task is simply skipped (the daemon itself is still running
 	// it).
 	ListExecutingTasks(ctx context.Context) ([]Task, error)
+	// Per-fact most-recent asked_at, across every ritual run ever run - the
+	// sampler's "never/longest-ago probed" priority tier (select.go): a
+	// fact_id absent from this result set has never been asked and sorts
+	// first, ahead of every fact that has.
+	ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedAtAllFactsRow, error)
 	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 	// Every not-yet-pushed anchor_log row, oldest first - push.go's
 	// stale-pending alarm (task spec step 5: "if the oldest pending is older
@@ -500,6 +531,12 @@ type Querier interface {
 	// new/changed content: same id, fresh hash/tier, status forced back to
 	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
 	UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error
+	// Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
+	// the same question edit the label, they do not append evidence rows") -
+	// called again on a later, possibly-different-button tap for the SAME
+	// question; this never creates a second eval_labels row for one asked
+	// fact.
+	UpdateEvalLabelAnswer(ctx context.Context, arg UpdateEvalLabelAnswerParams) error
 	// The engine recomputes confidence from the fact's own evidence rows
 	// (sum of weights, deduped by (session_id, polarity), clamped to the
 	// highest positive tier cap represented - never a noisy-OR ratchet) and

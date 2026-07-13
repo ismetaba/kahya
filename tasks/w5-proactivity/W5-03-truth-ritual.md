@@ -1,6 +1,6 @@
 # W5-03 — Weekly truth ritual
 
-**Status:** todo
+**Status:** done
 **Phase:** W5 — Proactivity + consolidation
 **Depends on:** W3-07, W12-02, W12-06 (CLI surface for `kahya remembered`)
 **Flags:** none
@@ -59,18 +59,18 @@ A weekly Telegram ritual exists: kahyad picks ~10 stored facts, asks the user "b
 
 ## Acceptance criteria
 
-- [ ] `kahya job run truth-ritual` on a seeded facts table sends ≤10 Telegram questions; `sqlite3 ... "SELECT count(*) FROM eval_labels WHERE answered_at IS NULL"` matches the number sent; all rows share one `trace_id` visible via `kahya log --trace <id>`.
-- [ ] Test in `make test`: answering `❌ Yanlış` inserts a negative-polarity evidence row and lowers log-odds confidence; a fact driven below 0.3 no longer appears in `memory_search` injection-eligible results.
-- [ ] Test in `make test`: answering `✅ Doğru` on a quarantined `agent_derived` fact makes it injection-eligible; the ledger event carries the `remote` label.
-- [ ] Test in `make test`: a secret-lane-tagged fact and a fact with no classification record are never selected by the sampler (fail-closed exclusion).
-- [ ] Test in `make test`: tapping the same button twice yields exactly one evidence row for that fact+ritual run.
-- [ ] Test in `make test`: an update from a chat_id outside the allowlist is dropped silently and ledgered (reuses/extends the W3-07 test path).
-- [ ] Test in `make test`: a callback for a question expired >72h changes nothing (label still `answered_at IS NULL`, zero evidence rows, confidence unchanged) and a `ritual.expired_answer` event is ledgered.
-- [ ] Test in `make test`: ritual question sends exit only via the W3-05 egress gate (assert against the egress-proxy request log; a ritual run with the gate stubbed to DENY sends nothing and ledgers the denial).
-- [ ] Test in `make test`: `kahya remembered --trace <id>` on a completed task's trace inserts exactly one events row `kind='remembered_moment'` with that `trace_id`; running it a second time adds no row; an unknown `trace_id` yields a Turkish error, non-zero exit, and zero rows.
-- [ ] Test in `make test`: tapping `🌟 Hatırladı` on a Telegram task-result message writes the same `remembered_moment` row with the `remote` channel label; a double-tap yields exactly one row; a tap from a chat_id outside the allowlist is dropped silently and ledgered (W3-07 path).
-- [ ] Test in `make test`: a fixture week containing 5 marked moments counts as 5 via the query W78-04 uses (`SELECT count(*) FROM events WHERE kind='remembered_moment' AND ts >= <week-start>`) — the §9 "haftada ≥5 \"hatırladı\" anı" gate is measurable.
-- [ ] `launchctl print gui/$(id -u)/<label>` shows the weekly job loaded.
+- [x] `kahya job run truth-ritual` on a seeded facts table sends ≤10 Telegram questions; `sqlite3 ... "SELECT count(*) FROM eval_labels WHERE answered_at IS NULL"` matches the number sent; all rows share one `trace_id` visible via `kahya log --trace <id>`. (`kahyad/internal/ritual/ritual_test.go`'s `TestRunSendsUpToTenAndSharesOneTraceID`)
+- [x] Test in `make test`: answering `❌ Yanlış` inserts a negative-polarity evidence row and lowers log-odds confidence; a fact driven below 0.3 no longer appears in `memory_search` injection-eligible results. (`TestAnswerYanlisLowersConfidenceAndExitsInjection`)
+- [x] Test in `make test`: answering `✅ Doğru` on a quarantined `agent_derived` fact makes it injection-eligible; the ledger event carries the `remote` label. (`TestAnswerDogruOnQuarantinedAgentDerivedLiftsInjectionEligibility`)
+- [x] Test in `make test`: a secret-lane-tagged fact and a fact with no classification record are never selected by the sampler (fail-closed exclusion). (`kahyad/internal/ritual/select_test.go`'s `TestSelectExcludesSecretLaneFact` / `TestSelectExcludesFactWithNoClassificationRecord` / `TestSelectExcludesFactWithNoEvidenceAtAll`)
+- [x] Test in `make test`: tapping the same button twice yields exactly one evidence row for that fact+ritual run. (`TestAnswerDoubleTapSameButtonYieldsOneEvidenceRow`)
+- [x] Test in `make test`: an update from a chat_id outside the allowlist is dropped silently and ledgered (reuses/extends the W3-07 test path). (`kahyad/internal/telegram/ritual_test.go`'s `TestRitualCallbackDroppedOutsideAllowlist`, `remembered_test.go`'s `TestHatirladiButtonDroppedOutsideAllowlist`)
+- [x] Test in `make test`: a callback for a question expired >72h changes nothing (label still `answered_at IS NULL`, zero evidence rows, confidence unchanged) and a `ritual.expired_answer` event is ledgered. (`TestAnswerExpiredChangesNothing`)
+- [x] Test in `make test`: ritual question sends exit only via the W3-05 egress gate (assert against the egress-proxy request log; a ritual run with the gate stubbed to DENY sends nothing and ledgers the denial). (`kahyad/internal/telegram/ritual_test.go`'s `TestSendRitualQuestionEgressBlockedSendsNothing`; `kahyad/internal/ritual/ritual_test.go`'s `TestRunGateDeniedSendsNothingButStillLedgersAsked`)
+- [x] Test in `make test`: `kahya remembered --trace <id>` on a completed task's trace inserts exactly one events row `kind='remembered_moment'` with that `trace_id`; running it a second time adds no row; an unknown `trace_id` yields a Turkish error, non-zero exit, and zero rows. (`kahyad/internal/remembered/remembered_test.go`'s `TestMarkKnownTraceInsertsExactlyOneRowThenIdempotent` / `TestMarkUnknownTraceFailsClosed`; `kahyad/cmd/kahya/remembered_cli_test.go`)
+- [x] Test in `make test`: tapping `🌟 Hatırladı` on a Telegram task-result message writes the same `remembered_moment` row with the `remote` channel label; a double-tap yields exactly one row; a tap from a chat_id outside the allowlist is dropped silently and ledgered (W3-07 path). (`kahyad/internal/telegram/remembered_test.go`'s `TestHatirladiButtonMarksRemoteChannel` / `TestHatirladiButtonDuplicateTapAnswersDuplicateToast` / `TestSendTaskResultAttachesHatirladiButton` / `TestHatirladiButtonDroppedOutsideAllowlist`, backed by `kahyad/internal/remembered`'s own real-DB idempotency test)
+- [x] Test in `make test`: a fixture week containing 5 marked moments counts as 5 via the query W78-04 uses (`SELECT count(*) FROM events WHERE kind='remembered_moment' AND ts >= <week-start>`) — the §9 "haftada ≥5 \"hatırladı\" anı" gate is measurable. (`kahyad/internal/remembered/remembered_test.go`'s `TestFiveMarkedMomentsPerWeekCountQuery`)
+- [ ] `launchctl print gui/$(id -u)/<label>` shows the weekly job loaded. (runtime-only note — requires a real launchd install via `make install-agent`/`kahyad -sync-jobs`; the "truth-ritual" cfg.Jobs default entry and its plist rendering are otherwise covered by the existing hermetic scheduler tests, same as every other declared job)
 
 ## Out of scope
 

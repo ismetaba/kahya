@@ -43,6 +43,10 @@ sql:
       # 0012 (W5-04) is three plain ALTER TABLE statements (entities.
       # provisional, facts.confirmed_at, evidence.weight) - same reasoning.
       - "kahyad/migrations/0012_factengine.sql"
+      # 0013 (W5-03) is a plain CREATE TABLE (eval_labels) plus two plain
+      # CREATE INDEX statements (including one partial UNIQUE index) - same
+      # reasoning.
+      - "kahyad/migrations/0013_eval_labels.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

@@ -84,6 +84,18 @@ type Episode struct {
 	CooledAt   sql.NullString `json:"cooled_at"`
 }
 
+type EvalLabel struct {
+	ID           int64          `json:"id"`
+	FactID       int64          `json:"fact_id"`
+	QuestionText string         `json:"question_text"`
+	Label        sql.NullString `json:"label"`
+	AskedAt      string         `json:"asked_at"`
+	AnsweredAt   sql.NullString `json:"answered_at"`
+	Channel      sql.NullString `json:"channel"`
+	TraceID      string         `json:"trace_id"`
+	CreatedAt    string         `json:"created_at"`
+}
+
 type Event struct {
 	ID        int64  `json:"id"`
 	TraceID   string `json:"trace_id"`

@@ -170,9 +170,10 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 
 	// W5-01 added a third default entry (morning-briefing); W5-02 added a
-	// fourth (nightly-consolidation) - see the blocks below.
-	if len(cfg.Jobs) != 4 {
-		t.Fatalf("Jobs = %+v, want exactly 4 default entries", cfg.Jobs)
+	// fourth (nightly-consolidation); W5-03 added a fifth (truth-ritual) -
+	// see the blocks below.
+	if len(cfg.Jobs) != 5 {
+		t.Fatalf("Jobs = %+v, want exactly 5 default entries", cfg.Jobs)
 	}
 
 	byName := make(map[string]JobConfig, len(cfg.Jobs))
@@ -242,6 +243,27 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 	if cfg.ConsolidationAutoCommit {
 		t.Errorf("ConsolidationAutoCommit = true, want false (suggestion mode is the default)")
+	}
+
+	// W5-03: the Sunday 18:00 truth-ritual job.
+	ritual, ok := byName["truth-ritual"]
+	if !ok {
+		t.Fatalf("Jobs missing truth-ritual: %+v", cfg.Jobs)
+	}
+	if ritual.Handler != "truth-ritual" {
+		t.Errorf("truth-ritual.Handler = %q, want %q", ritual.Handler, "truth-ritual")
+	}
+	if ritual.Calendar.Weekday == nil || *ritual.Calendar.Weekday != 0 {
+		t.Errorf("truth-ritual.Calendar.Weekday = %v, want 0 (Sunday)", ritual.Calendar.Weekday)
+	}
+	if ritual.Calendar.Hour == nil || *ritual.Calendar.Hour != 18 {
+		t.Errorf("truth-ritual.Calendar.Hour = %v, want 18", ritual.Calendar.Hour)
+	}
+	if ritual.Calendar.Minute == nil || *ritual.Calendar.Minute != 0 {
+		t.Errorf("truth-ritual.Calendar.Minute = %v, want 0", ritual.Calendar.Minute)
+	}
+	if cfg.RitualWeeklyWeekday != 0 || cfg.RitualWeeklyHour != 18 || cfg.RitualWeeklyMinute != 0 {
+		t.Errorf("RitualWeekly Weekday/Hour/Minute = %d/%d/%d, want 0/18/0", cfg.RitualWeeklyWeekday, cfg.RitualWeeklyHour, cfg.RitualWeeklyMinute)
 	}
 
 	// validateJobs must still accept the default set (DNS-label names, no

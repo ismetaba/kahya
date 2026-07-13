@@ -183,6 +183,17 @@ func (q *Queries) CountToolCallAttempts(ctx context.Context, arg CountToolCallAt
 	return count, err
 }
 
+const countUnansweredEvalLabelsByTrace = `-- name: CountUnansweredEvalLabelsByTrace :one
+SELECT count(*) FROM eval_labels WHERE trace_id = ? AND answered_at IS NULL
+`
+
+func (q *Queries) CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUnansweredEvalLabelsByTrace, traceID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
 DELETE FROM chunks WHERE episode_id = ?
 `
@@ -344,6 +355,37 @@ func (q *Queries) GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
 	return i, err
 }
 
+const getEpisodeByID = `-- name: GetEpisodeByID :one
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at
+FROM episodes
+WHERE id = ?
+`
+
+// The sampler's fail-closed secret-lane classification read: resolves one
+// evidence row's episode_id to its source_path, matched against
+// policy.yaml's secret_lane_globs - the SAME path-glob mechanism
+// kahyad/internal/consolidation's PartitionByLane already uses for memory
+// files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
+// dosya yollari icin").
+func (q *Queries) GetEpisodeByID(ctx context.Context, id int64) (Episode, error) {
+	row := q.db.QueryRowContext(ctx, getEpisodeByID, id)
+	var i Episode
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.SourcePath,
+		&i.SourceHash,
+		&i.SourceTier,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.Meta,
+		&i.CreatedAt,
+		&i.CooledAt,
+	)
+	return i, err
+}
+
 const getEpisodeByPath = `-- name: GetEpisodeByPath :one
 SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
 FROM episodes
@@ -426,6 +468,29 @@ func (q *Queries) GetEpisodeBySourceAndPath(ctx context.Context, arg GetEpisodeB
 		&i.EndedAt,
 		&i.Status,
 		&i.Meta,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getEvalLabel = `-- name: GetEvalLabel :one
+SELECT id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at
+FROM eval_labels
+WHERE id = ?
+`
+
+func (q *Queries) GetEvalLabel(ctx context.Context, id int64) (EvalLabel, error) {
+	row := q.db.QueryRowContext(ctx, getEvalLabel, id)
+	var i EvalLabel
+	err := row.Scan(
+		&i.ID,
+		&i.FactID,
+		&i.QuestionText,
+		&i.Label,
+		&i.AskedAt,
+		&i.AnsweredAt,
+		&i.Channel,
+		&i.TraceID,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -1177,6 +1242,49 @@ func (q *Queries) InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (I
 	return i, err
 }
 
+const insertEvalLabel = `-- name: InsertEvalLabel :one
+INSERT INTO eval_labels (fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at)
+VALUES (?, ?, NULL, ?, NULL, ?, ?, ?)
+RETURNING id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at
+`
+
+type InsertEvalLabelParams struct {
+	FactID       int64          `json:"fact_id"`
+	QuestionText string         `json:"question_text"`
+	AskedAt      string         `json:"asked_at"`
+	Channel      sql.NullString `json:"channel"`
+	TraceID      string         `json:"trace_id"`
+	CreatedAt    string         `json:"created_at"`
+}
+
+// One row per fact ASKED about in a single ritual run (W5-03 task spec
+// step 4) - label/answered_at start NULL, filled in by
+// UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
+// the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+func (q *Queries) InsertEvalLabel(ctx context.Context, arg InsertEvalLabelParams) (EvalLabel, error) {
+	row := q.db.QueryRowContext(ctx, insertEvalLabel,
+		arg.FactID,
+		arg.QuestionText,
+		arg.AskedAt,
+		arg.Channel,
+		arg.TraceID,
+		arg.CreatedAt,
+	)
+	var i EvalLabel
+	err := row.Scan(
+		&i.ID,
+		&i.FactID,
+		&i.QuestionText,
+		&i.Label,
+		&i.AskedAt,
+		&i.AnsweredAt,
+		&i.Channel,
+		&i.TraceID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertEvent = `-- name: InsertEvent :one
 
 INSERT INTO events (trace_id, ts, kind, payload, created_at)
@@ -1680,6 +1788,62 @@ func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowPara
 	return i, err
 }
 
+const listActiveFacts = `-- name: ListActiveFacts :many
+
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+FROM facts
+WHERE status = 'active'
+ORDER BY id ASC
+`
+
+// W5-03 (truth-ritual) queries below: the eval_labels durable label store
+// plus the two small facts/episodes reads kahyad/internal/ritual's sampler
+// needs beyond what factengine/W5-04 already added above. See that
+// package for the only callers.
+// The ritual sampler's whole candidate pool - every ACTIVE fact,
+// unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
+// exclusion/priority policy entirely in Go, never in SQL, so the policy
+// stays readable/testable as plain code, not buried in a query).
+func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveFacts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Fact{}
+	for rows.Next() {
+		var i Fact
+		if err := rows.Scan(
+			&i.ID,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+			&i.SourceTier,
+			&i.Evidentiality,
+			&i.Confidence,
+			&i.Importance,
+			&i.ValidFrom,
+			&i.ValidTo,
+			&i.Status,
+			&i.Evidence,
+			&i.ExtractorVer,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.ConfirmedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listActiveMemoryFileEpisodes = `-- name: ListActiveMemoryFileEpisodes :many
 SELECT id, source_path FROM episodes
 WHERE source = 'memory_file' AND status = 'active'
@@ -2027,6 +2191,48 @@ func (q *Queries) ListEntityIDsByAlias(ctx context.Context, alias string) ([]int
 	return items, nil
 }
 
+const listEvalLabelsByTrace = `-- name: ListEvalLabelsByTrace :many
+SELECT id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at
+FROM eval_labels
+WHERE trace_id = ?
+ORDER BY id ASC
+`
+
+// Every eval_labels row one ritual run minted, oldest first - the "all
+// rows share one trace_id" acceptance criterion's own read path.
+func (q *Queries) ListEvalLabelsByTrace(ctx context.Context, traceID string) ([]EvalLabel, error) {
+	rows, err := q.db.QueryContext(ctx, listEvalLabelsByTrace, traceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []EvalLabel{}
+	for rows.Next() {
+		var i EvalLabel
+		if err := rows.Scan(
+			&i.ID,
+			&i.FactID,
+			&i.QuestionText,
+			&i.Label,
+			&i.AskedAt,
+			&i.AnsweredAt,
+			&i.Channel,
+			&i.TraceID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsByKind = `-- name: ListEventsByKind :many
 SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
@@ -2197,6 +2403,44 @@ func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
 			&i.NextRetryAt,
 			&i.Attempts,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLastAskedAtAllFacts = `-- name: ListLastAskedAtAllFacts :many
+SELECT fact_id, MAX(asked_at) AS last_asked_at
+FROM eval_labels
+GROUP BY fact_id
+`
+
+type ListLastAskedAtAllFactsRow struct {
+	FactID      int64       `json:"fact_id"`
+	LastAskedAt interface{} `json:"last_asked_at"`
+}
+
+// Per-fact most-recent asked_at, across every ritual run ever run - the
+// sampler's "never/longest-ago probed" priority tier (select.go): a
+// fact_id absent from this result set has never been asked and sorts
+// first, ahead of every fact that has.
+func (q *Queries) ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedAtAllFactsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listLastAskedAtAllFacts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLastAskedAtAllFactsRow{}
+	for rows.Next() {
+		var i ListLastAskedAtAllFactsRow
+		if err := rows.Scan(&i.FactID, &i.LastAskedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -2906,6 +3150,28 @@ func (q *Queries) UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeCon
 		arg.Status,
 		arg.ID,
 	)
+	return err
+}
+
+const updateEvalLabelAnswer = `-- name: UpdateEvalLabelAnswer :exec
+UPDATE eval_labels
+SET label = ?, answered_at = ?
+WHERE id = ?
+`
+
+type UpdateEvalLabelAnswerParams struct {
+	Label      sql.NullString `json:"label"`
+	AnsweredAt sql.NullString `json:"answered_at"`
+	ID         int64          `json:"id"`
+}
+
+// Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
+// the same question edit the label, they do not append evidence rows") -
+// called again on a later, possibly-different-button tap for the SAME
+// question; this never creates a second eval_labels row for one asked
+// fact.
+func (q *Queries) UpdateEvalLabelAnswer(ctx context.Context, arg UpdateEvalLabelAnswerParams) error {
+	_, err := q.db.ExecContext(ctx, updateEvalLabelAnswer, arg.Label, arg.AnsweredAt, arg.ID)
 	return err
 }
 

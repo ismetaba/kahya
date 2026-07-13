@@ -168,6 +168,15 @@ type Bot struct {
 	home            string
 	secretLaneGlobs []string
 
+	// remembered/ritual are W5-03's late-wired dependencies (like
+	// FeedbackEngine, these drive an actual decision from a callback tap) -
+	// SetRememberedMarker/SetRitualAnswerer, both nil until wired. A nil
+	// value degrades its callback to a graceful "unavailable" toast rather
+	// than a panic, matching this package's usual unwired-dependency
+	// posture elsewhere.
+	remembered RememberedMarker
+	ritual     RitualAnswerer
+
 	mu    sync.Mutex
 	cards map[string]*cardState
 }

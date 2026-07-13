@@ -411,6 +411,20 @@ type Config struct {
 	// never bypasses that runtime guard, it only expresses the operator's
 	// intent once the guard would actually pass.
 	ConsolidationAutoCommit bool `yaml:"consolidation_auto_commit"`
+
+	// --- W5-03 weekly truth ritual ---
+
+	// RitualWeeklyWeekday/Hour/Minute are cfg.ritual.weekly_at's three
+	// components (task spec, default Sunday 18:00 - HANDOFF §6 W5 flag)
+	// the "truth-ritual" cfg.Jobs entry's own CalendarSpec is built from
+	// at defaults()-time (below), mirroring BriefingHour/Minute's identical
+	// "flat, overridable-without-hand-editing-the-jobs-block" rationale
+	// (`kahyad -sync-jobs` still needs a re-run for a changed value to
+	// reach launchd's own StartCalendarInterval). Weekday follows
+	// launchd's own convention (0 = Sunday, matching CalendarSpec.Weekday).
+	RitualWeeklyWeekday int `yaml:"ritual_weekly_weekday"`
+	RitualWeeklyHour    int `yaml:"ritual_weekly_hour"`
+	RitualWeeklyMinute  int `yaml:"ritual_weekly_minute"`
 }
 
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
@@ -501,6 +515,9 @@ type fileConfig struct {
 	BriefingFileGlobs             *[]string    `yaml:"briefing_file_globs"`
 	BriefingCalendarNames         *[]string    `yaml:"briefing_calendar_names"`
 	ConsolidationAutoCommit       *bool        `yaml:"consolidation_auto_commit"`
+	RitualWeeklyWeekday           *int         `yaml:"ritual_weekly_weekday"`
+	RitualWeeklyHour              *int         `yaml:"ritual_weekly_hour"`
+	RitualWeeklyMinute            *int         `yaml:"ritual_weekly_minute"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -766,6 +783,14 @@ func defaults(home, env string) Config {
 			// wall-clock-scheduling rule backup-nightly/memory-push/
 			// morning-briefing above already follow).
 			{Name: "nightly-consolidation", Handler: "nightly-consolidation", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(0)}},
+			// W5-03 weekly truth ritual (HANDOFF §6 W5 ⚑: "haftalik
+			// dogru/yanlis rituelinin hafif surumu"). Weekday follows
+			// launchd's own StartCalendarInterval convention (0 = Sunday);
+			// Hour/Minute are the SAME defaultRitualWeeklyHour/Minute
+			// constants RitualWeeklyHour/RitualWeeklyMinute below default
+			// to, kept in sync by construction (both literals, matching
+			// morning-briefing's own comment above).
+			{Name: "truth-ritual", Handler: "truth-ritual", Calendar: CalendarSpec{Weekday: intPtr(defaultRitualWeekday), Hour: intPtr(defaultRitualWeeklyHour), Minute: intPtr(defaultRitualWeeklyMinute)}},
 		},
 
 		// W4-05 ledger external anchor defaults (task spec, verbatim:
@@ -793,6 +818,12 @@ func defaults(home, env string) Config {
 		// so an operator must opt in explicitly even once that gate would
 		// pass.
 		ConsolidationAutoCommit: false,
+
+		// W5-03 weekly truth ritual defaults (task spec: Sunday 18:00 -
+		// HANDOFF §6 W5 flag).
+		RitualWeeklyWeekday: defaultRitualWeekday,
+		RitualWeeklyHour:    defaultRitualWeeklyHour,
+		RitualWeeklyMinute:  defaultRitualWeeklyMinute,
 	}
 }
 
@@ -804,6 +835,19 @@ func defaults(home, env string) Config {
 const (
 	defaultBriefingHour   = 8
 	defaultBriefingMinute = 30
+)
+
+// defaultRitualWeekday/Hour/Minute are the W5-03 weekly-truth-ritual job's
+// wall-clock default (HANDOFF §6 W5, verbatim "haftalik dogru/yanlis
+// rituelinin hafif surumu": Sunday 18:00) - named constants so the
+// "truth-ritual" cfg.Jobs entry above and Config.RitualWeeklyWeekday/
+// Hour/Minute's own defaults can never drift apart, mirroring
+// defaultBriefingHour/Minute's identical rationale. Weekday follows
+// launchd's own StartCalendarInterval convention (0 = Sunday).
+const (
+	defaultRitualWeekday      = 0
+	defaultRitualWeeklyHour   = 18
+	defaultRitualWeeklyMinute = 0
 )
 
 // intPtr returns a pointer to v — CalendarSpec's fields are all *int (nil
@@ -1128,6 +1172,15 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.ConsolidationAutoCommit != nil {
 		cfg.ConsolidationAutoCommit = *fc.ConsolidationAutoCommit
+	}
+	if fc.RitualWeeklyWeekday != nil {
+		cfg.RitualWeeklyWeekday = *fc.RitualWeeklyWeekday
+	}
+	if fc.RitualWeeklyHour != nil {
+		cfg.RitualWeeklyHour = *fc.RitualWeeklyHour
+	}
+	if fc.RitualWeeklyMinute != nil {
+		cfg.RitualWeeklyMinute = *fc.RitualWeeklyMinute
 	}
 }
 

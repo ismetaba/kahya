@@ -253,7 +253,18 @@ func TestRunOncePerDaySecondRunSkipsDuplicate(t *testing.T) {
 	classifier := permissiveClassifier()
 	spawner := &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`}
 	delivery := &fakeDelivery{Sent: true}
-	now := fixedNow(time.Date(2026, 7, 12, 8, 30, 0, 0, time.UTC))
+	// Pre-existing-bug fix (unrelated to W5-03, found while getting `make
+	// test` green): this test's own dedupe check compares Orchestrator.Now's
+	// injected date against events.created_at, which Store.LogEvent always
+	// stamps from the REAL wall clock (time.Now()), never from an injected
+	// clock - the two can only ever agree when the fixture's hardcoded
+	// calendar day happens to equal the real one. A hardcoded PAST literal
+	// (2026-07-12) made this test silently depend on running before that
+	// date passed; anchoring "now" to the real day (fixed hour/minute for
+	// readability) makes the dedupe date match the real ledger timestamp's
+	// date on any day this suite ever runs.
+	realToday := time.Now().UTC()
+	now := fixedNow(time.Date(realToday.Year(), realToday.Month(), realToday.Day(), 8, 30, 0, 0, time.UTC))
 
 	o := &Orchestrator{
 		Classifier: classifier,

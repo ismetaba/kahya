@@ -240,6 +240,11 @@ type Server struct {
 	// convention as consolidation above.
 	factEngine FactEngineRunner
 
+	// remembered wires POST /v1/remembered (W5-03, remembered.go's own doc
+	// comment); nil until SetRememberedMarker is called - same "unwired
+	// dependency" convention as factEngine above.
+	remembered RememberedMarker
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's
@@ -364,6 +369,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
 	mux.HandleFunc("/v1/entity/split", s.handleEntitySplit)
+	mux.HandleFunc("/v1/remembered", s.handleRemembered)
 
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),

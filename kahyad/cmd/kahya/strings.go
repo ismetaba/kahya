@@ -261,4 +261,20 @@ const (
 	// MsgEntitySplit is `kahya entity split`'s success line: %d = the new
 	// split merge_ledger row's id.
 	MsgEntitySplit = "Varlıklar ayrıldı (birleştirme defteri kaydı: %d)."
+
+	// ---- W5-03: kahya remembered --trace <id> ----
+
+	// MsgRememberedUsage is printed when `kahya remembered` is given
+	// anything other than exactly the --trace flag. Exit 2.
+	MsgRememberedUsage = "kullanım: kahya remembered --trace <id>"
+
+	// MsgRememberedTraceRequired is printed when `kahya remembered` is run
+	// without --trace. Exit 2.
+	MsgRememberedTraceRequired = "remembered komutu için --trace gerekli."
+
+	// MsgRememberedSaved is `kahya remembered --trace <id>`'s success
+	// line - byte-exact per the W5-03 task spec (identical to the
+	// Telegram "🌟 Hatırladı" button's own success toast,
+	// kahyad/internal/telegram's toastRememberedSaved).
+	MsgRememberedSaved = "🌟 Hatırladı anı kaydedildi."
 )

@@ -73,6 +73,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runFact(client, args[1:], stdout, stderr)
 	case "entity":
 		return runEntity(client, args[1:], stdout, stderr)
+	case "remembered":
+		return runRemembered(client, args[1:], stdout, stderr)
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
@@ -460,6 +462,34 @@ func runEntitySplit(client *Client, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgEntitySplit+"\n", id)
+	return 0
+}
+
+// runRemembered implements `kahya remembered --trace <id>` (W5-03): the
+// CLI half of the "hatırladı anı" marking flow (the Telegram "🌟
+// Hatırladı" button is the other half, kahyad/internal/telegram). POSTs
+// /v1/remembered with channel="local" - success (fresh mark OR an
+// idempotent re-mark alike) prints the byte-exact Turkish success line;
+// an unknown trace_id prints the server's own Turkish error message
+// verbatim and exits nonzero.
+func runRemembered(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("remembered", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	trace := fs.String("trace", "", "hatırladı anı olarak işaretlenecek trace_id")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	*trace = strings.TrimSpace(*trace)
+	if *trace == "" {
+		fmt.Fprintln(stderr, MsgRememberedTraceRequired)
+		return 2
+	}
+
+	if _, err := client.MarkRemembered(context.Background(), traceid.New(), *trace); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+	fmt.Fprintln(stdout, MsgRememberedSaved)
 	return 0
 }
 

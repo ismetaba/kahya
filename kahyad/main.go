@@ -39,6 +39,8 @@ import (
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/outbox"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/remembered"
+	"kahya/kahyad/internal/ritual"
 	"kahya/kahyad/internal/scheduler"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secretlane"
@@ -489,6 +491,31 @@ func run() int {
 	factEngine := factengine.New(st.Queries, taintTracker, st)
 	srv.SetFactEngine(factEngine)
 
+	// W5-03: the "hatirladi ani" (remembered-moment) marking flow's single
+	// write path - shared by POST /v1/remembered (`kahya remembered
+	// --trace <id>`, channel=local) and the Telegram "🌟 Hatırladı" button
+	// (channel=remote, called in-process below), never a second
+	// implementation. st.Queries satisfies remembered.Store (the
+	// trace-exists read), st itself satisfies remembered.Ledger (the
+	// idempotent write, gated by migrations/0013's own partial unique
+	// index).
+	rememberedMarker := remembered.New(st.Queries, st, log)
+	srv.SetRememberedMarker(rememberedMarker)
+	tgBot.SetRememberedMarker(rememberedMarker)
+
+	// W5-03: the weekly truth ritual (HANDOFF §6 W5 ⚑). The sampler
+	// (select.go's fail-closed secret-lane exclusion policy) shares the
+	// SAME pol.SecretLaneGlobs/cfg.MemoryDir every other secret-lane-aware
+	// subsystem above uses (briefing/consolidation); the engine shares
+	// factEngine/taintTracker/st (the run's own clean evidence-write
+	// session, registered once per run) and delivers through tgBot -
+	// SetRitualAnswerer wires the SAME tgBot's ritual-answer buttons back
+	// into this exact Engine, so a Telegram tap and `kahya job run
+	// truth-ritual` drive the identical code path.
+	ritualSampler := ritual.NewSampler(st.Queries, cfg.MemoryDir, pol.SecretLaneGlobs, nil)
+	ritualEngine := ritual.New(ritualSampler, st.Queries, factEngine, taintTracker, st, tgBot)
+	tgBot.SetRitualAnswerer(ritualEngine)
+
 	// W4-02: task durability state machine + receipts + resume scan +
 	// outbox dispatcher (HANDOFF §6 W4 ⚑). taskLive is the live-worker-PID
 	// registry shared by the resume scan's LiveChecker, the outbox
@@ -803,6 +830,15 @@ func run() int {
 		return consolidator.Run(ctx, scheduler.TraceIDFromContext(ctx))
 	})
 	srv.SetConsolidation(consolidator)
+
+	// W5-03: the Sunday 18:00 weekly truth ritual - `kahya job run
+	// truth-ritual` (manual trigger) and the launchd-scheduled run both
+	// reach this SAME handler via scheduler.Trigger's one dispatch route
+	// (jobs.go's own doc comment), exactly like every other job here.
+	sched.RegisterHandler("truth-ritual", func(ctx context.Context) error {
+		_, err := ritualEngine.Run(ctx, scheduler.TraceIDFromContext(ctx))
+		return err
+	})
 
 	sched.LoadJobs(cfg.Jobs)
 	srv.SetScheduler(sched)
