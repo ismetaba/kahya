@@ -253,26 +253,23 @@ func TestRunOncePerDaySecondRunSkipsDuplicate(t *testing.T) {
 	classifier := permissiveClassifier()
 	spawner := &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`}
 	delivery := &fakeDelivery{Sent: true}
-	// Pre-existing-bug fix (unrelated to W5-03, found while getting `make
-	// test` green): this test's own dedupe check compares Orchestrator.Now's
-	// injected date against events.created_at, which Store.LogEvent always
-	// stamps from the REAL wall clock (time.Now()), never from an injected
-	// clock - the two can only ever agree when the fixture's hardcoded
-	// calendar day happens to equal the real one. A hardcoded PAST literal
-	// (2026-07-12) made this test silently depend on running before that
-	// date passed; anchoring "now" to the real day (fixed hour/minute for
-	// readability) makes the dedupe date match the real ledger timestamp's
-	// date on any day this suite ever runs.
-	realToday := time.Now().UTC()
-	now := fixedNow(time.Date(realToday.Year(), realToday.Month(), realToday.Day(), 8, 30, 0, 0, time.UTC))
-
+	// The once-per-day dedupe compares Orchestrator.Now's date against
+	// events.created_at, which Store.LogEvent always stamps from the REAL
+	// wall clock (time.Now()), never an injected one. An injected fixed date
+	// only agrees with the real ledger timestamp's date until the real UTC
+	// day rolls over - which, in a long-running suite, it does (this test
+	// flaked on exactly that boundary). Production uses time.Now for BOTH the
+	// dedupe date and the event timestamp, so they always agree within a run;
+	// the test uses time.Now too, reading it fresh per Run (never capturing a
+	// date up front), so the only unreachable window is a real midnight
+	// falling between the two back-to-back Run calls microseconds apart.
 	o := &Orchestrator{
 		Classifier: classifier,
 		Spawner:    spawner,
 		Delivery:   delivery,
 		Ledger:     ledger,
 		Dedupe:     dedupe,
-		Now:        now,
+		Now:        time.Now,
 	}
 
 	first, err := o.Run(context.Background(), "trace-once-1")

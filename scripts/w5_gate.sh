@@ -359,26 +359,26 @@ else
 		else
 			pass "konsolidasyon-diff (kahya consolidation show bir diff gösteriyor)"
 		fi
-		# reindex.completed/consolidation.approved, kahya consolidation
+		# reindex/consolidation.approved, kahya consolidation
 		# approve'un KENDİ (CLI'de taze basılan) trace_id'si altında
 		# ledgerlanır - nightly-consolidation'ın $TRACE3'ü değil - bu yüzden
 		# trace_id eşleştirmek yerine approve'dan ÖNCE/SONRA toplam
-		# reindex.completed sayısını karşılaştırıyoruz (artış = approve'un
+		# reindex sayısını karşılaştırıyoruz (artış = approve'un
 		# tetiklediği yeni bir reindex).
-		REINDEX_BEFORE="$(sqlite3 "$DB_PATH" "SELECT count(*) FROM events WHERE kind='reindex.completed';" 2>/dev/null || echo 0)"
+		REINDEX_BEFORE="$(sqlite3 "$DB_PATH" "SELECT count(*) FROM events WHERE kind='reindex';" 2>/dev/null || echo 0)"
 		APPROVE_OUT="$(printf 'onayla\n' | "$KAHYA_BIN" consolidation approve 2>&1)"
 		APPROVE_STATUS=$?
 		LAST_AUTHOR="$(git -C "$KAHYA_MEMORY_REPO" log -1 --format='%an' 2>&1 || true)"
-		REINDEX_AFTER="$(sqlite3 "$DB_PATH" "SELECT count(*) FROM events WHERE kind='reindex.completed';" 2>/dev/null || echo 0)"
+		REINDEX_AFTER="$(sqlite3 "$DB_PATH" "SELECT count(*) FROM events WHERE kind='reindex';" 2>/dev/null || echo 0)"
 		if [ $APPROVE_STATUS -eq 0 ] && [ "$LAST_AUTHOR" = "kahyad" ]; then
 			pass "konsolidasyon-onay-commit (git -C $KAHYA_MEMORY_REPO log -1 --format=%an == kahyad)"
 		else
 			fail "konsolidasyon-onay-commit" "approve çıkışı=$APPROVE_STATUS, son commit yazarı=$LAST_AUTHOR ($APPROVE_OUT)"
 		fi
 		if [ "${REINDEX_AFTER:-0}" -gt "${REINDEX_BEFORE:-0}" ]; then
-			pass "konsolidasyon-reindex (reindex.completed sayısı arttı: $REINDEX_BEFORE -> $REINDEX_AFTER)"
+			pass "konsolidasyon-reindex (reindex sayısı arttı: $REINDEX_BEFORE -> $REINDEX_AFTER)"
 		else
-			fail "konsolidasyon-reindex" "approve sonrası yeni bir reindex.completed olayı görülmedi ($REINDEX_BEFORE -> $REINDEX_AFTER)"
+			fail "konsolidasyon-reindex" "approve sonrası yeni bir reindex olayı görülmedi ($REINDEX_BEFORE -> $REINDEX_AFTER)"
 		fi
 
 		AFTER_OUT="$("$KAHYA_BIN" eval mini 2>&1)"
