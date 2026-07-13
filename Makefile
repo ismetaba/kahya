@@ -57,17 +57,22 @@ test: venv build
 	@# guard would never run (a dropped `acceptance` build tag while some
 	@# other suite is red would be invisible). Fast (~17s) and it is the phase
 	@# gate, so running it up front is the right order.
-	@echo "running W4-07 acceptance gate (tests/acceptance/w4, CI-speed A/B/C)..."
+	@echo "running W4-07 + W6-04 acceptance gates (tests/acceptance/w4 + tests/acceptance/w6, CI-speed)..."
 	@ACCEPT_OUT=$$(go test -tags $(GOTAGS),acceptance ./tests/acceptance/... -v 2>&1); \
 	STATUS=$$?; \
 	echo "$$ACCEPT_OUT"; \
 	if echo "$$ACCEPT_OUT" | grep -q '\[no test files\]' || echo "$$ACCEPT_OUT" | grep -q 'no packages to test'; then \
 		echo ""; \
-		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: tests/acceptance/w4 reported '[no test files]' -- the W4-07 acceptance gate did NOT actually run (a build-tag-gated test package that plain go test silently skips is a forbidden vacuously-green result, tasks/README.md gate rule). Check that -tags includes 'acceptance' and that tests/acceptance/w4/*_test.go all carry the //go:build acceptance constraint." >&2; \
+		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: tests/acceptance/w4 or tests/acceptance/w6 reported '[no test files]' -- an acceptance gate did NOT actually run (a build-tag-gated test package that plain go test silently skips is a forbidden vacuously-green result, tasks/README.md gate rule). Check that -tags includes 'acceptance' and that tests/acceptance/{w4,w6}/*_test.go all carry the //go:build acceptance constraint." >&2; \
+		exit 1; \
+	fi; \
+	if ! echo "$$ACCEPT_OUT" | grep -q 'TestW6Gate1VoiceLoopFullyLocal' || ! echo "$$ACCEPT_OUT" | grep -q 'TestW6Gate2HaltSurvivesDaemonRestart' || ! echo "$$ACCEPT_OUT" | grep -q 'TestW6Gate3PaletteAndFirstTokenLoggedToEvents'; then \
+		echo ""; \
+		echo "ANTI-VACUOUS-GREEN GUARD TRIPPED: one or more of the three named W6-04 gate tests (TestW6Gate1VoiceLoopFullyLocal / TestW6Gate2HaltSurvivesDaemonRestart / TestW6Gate3PaletteAndFirstTokenLoggedToEvents) did not appear in the acceptance test output at all (renamed/deleted/build-tag dropped?) -- tasks/README.md gate rule." >&2; \
 		exit 1; \
 	fi; \
 	if [ $$STATUS -ne 0 ]; then \
-		echo "W4-07 acceptance gate FAILED (tests/acceptance/w4)" >&2; \
+		echo "W4-07/W6-04 acceptance gate FAILED (tests/acceptance/w4 + w6)" >&2; \
 		exit 1; \
 	fi
 	@# W5-05 acceptance gate: the four hermetic gate tests (single-
