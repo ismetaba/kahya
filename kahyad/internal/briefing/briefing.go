@@ -74,6 +74,13 @@ const (
 // strings; never shown to the user).
 const briefingUntrustedReason = "briefing:untrusted_by_design"
 
+// calendarCollectBudget bounds the osascript calendar collector so an
+// undecided Calendar Automation TCC grant (osascript blocks forever waiting
+// on a permission dialog that can never appear under launchd) can never
+// wedge the whole nightly briefing. Generous - a real calendar read is
+// sub-second; this is purely a hang backstop.
+const calendarCollectBudget = 20 * time.Second
+
 // Config is this package's own run-time configuration - a narrower,
 // already-`~`-expanded projection of config.Config's own
 // BriefingGHRepos/BriefingFileGlobs/BriefingCalendarNames fields (main.go
@@ -174,6 +181,10 @@ type Orchestrator struct {
 	// Now overrides time.Now (tests only) - both the once-per-day dedupe
 	// key and every timestamp this run writes are derived from this.
 	Now func() time.Time
+
+	// CalendarBudget overrides calendarCollectBudget (tests only, so a
+	// hanging-calendar-runner test need not wait the full production budget).
+	CalendarBudget time.Duration
 }
 
 func (o *Orchestrator) now() time.Time {
@@ -181,6 +192,13 @@ func (o *Orchestrator) now() time.Time {
 		return o.Now()
 	}
 	return time.Now()
+}
+
+func (o *Orchestrator) calendarBudget() time.Duration {
+	if o.CalendarBudget > 0 {
+		return o.CalendarBudget
+	}
+	return calendarCollectBudget
 }
 
 // newBriefingSessionID mints a fresh, random session_id for one briefing
@@ -255,9 +273,25 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	items = append(items, ghRunItems(runs)...)
 
 	if o.Calendar != nil {
-		events, err := CollectCalendar(ctx, o.Calendar, o.Cfg.CalendarNames)
+		// Bound the calendar collector independently of the run ctx: the
+		// scheduler invokes the briefing with context.Background() (no
+		// deadline), and osascript BLOCKS indefinitely when the Calendar
+		// Automation TCC grant is still undecided (the permission dialog
+		// cannot appear under launchd) - without this timeout a single
+		// undecided grant wedges the entire nightly briefing forever. A
+		// timeout is treated identically to a missing grant (surfaced as the
+		// "Takvim erisimi yok" line), since a blocked-on-the-TCC-dialog hang
+		// IS effectively "no access".
+		calCtx, cancel := context.WithTimeout(ctx, o.calendarBudget())
+		events, err := CollectCalendar(calCtx, o.Calendar, o.Cfg.CalendarNames)
+		// calCtx.Err() (not errors.Is on the returned error): a
+		// CommandContext-killed osascript surfaces as "signal: killed", which
+		// does NOT wrap context.DeadlineExceeded - the deadline is only
+		// observable on the context itself.
+		timedOut := calCtx.Err() == context.DeadlineExceeded
+		cancel()
 		switch {
-		case errors.Is(err, ErrCalendarNoAccess):
+		case errors.Is(err, ErrCalendarNoAccess) || timedOut:
 			calendarNoAccess = true
 			o.ledgerRaw(ctx, traceID, EventCalendarUnavailable, nil)
 		case err != nil:

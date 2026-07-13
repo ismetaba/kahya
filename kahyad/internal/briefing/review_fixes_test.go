@@ -36,6 +36,53 @@ func (hangingClassifier) Classify(ctx context.Context, _ string) (secretlane.Ver
 	return secretlane.Verdict{}, ctx.Err()
 }
 
+// hangingCalendarRunner blocks until its ctx is cancelled - modelling
+// osascript stuck on an undecided Calendar Automation TCC dialog under
+// launchd.
+type hangingCalendarRunner struct{}
+
+func (hangingCalendarRunner) Run(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestHangingCalendarDoesNotWedgeBriefing is the regression test for the
+// W5-05-review-flagged W5-01 bug: the osascript calendar collector had no
+// timeout of its own and the scheduler passes context.Background(), so an
+// undecided TCC grant hung the whole nightly briefing forever. The
+// calendarCollectBudget now bounds it and a timeout degrades to the
+// "Takvim erisimi yok" no-access path - the briefing still delivers.
+func TestHangingCalendarDoesNotWedgeBriefing(t *testing.T) {
+	delivery := &fakeDelivery{Sent: true}
+	o := &Orchestrator{
+		Classifier:     permissiveClassifier(),
+		Calendar:       hangingCalendarRunner{},
+		Cfg:            Config{CalendarNames: []string{"Home"}},
+		Spawner:        &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:       delivery,
+		Now:            time.Now,
+		CalendarBudget: 200 * time.Millisecond, // fast, not the 20s production budget
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = o.Run(context.Background(), "trace-cal-hang")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("briefing wedged on a hanging calendar collector - the budget timeout did not fire")
+	}
+
+	if len(delivery.Calls) != 1 {
+		t.Fatalf("delivery calls = %d, want 1 (briefing must still deliver despite the hung calendar)", len(delivery.Calls))
+	}
+	if !strings.Contains(delivery.Calls[0], "Takvim erişimi yok") {
+		t.Errorf("delivered text lacks the no-access line after a calendar timeout: %q", delivery.Calls[0])
+	}
+}
+
 // TestDeliveryRedactionFailsClosedOnClassifierError is the regression test
 // for the W5-01 review BLOCKER: the step-6 defense-in-depth redaction pass
 // discarded the classifier error, so a secret line was delivered VERBATIM
