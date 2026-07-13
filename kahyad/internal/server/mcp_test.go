@@ -18,6 +18,7 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/taint"
 	"kahya/mcp/memory"
 )
 
@@ -324,6 +325,71 @@ func TestMCPGateAllowsMemorySearchThroughHTTP(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("policy_decision event count = %d, want 1 (allow decisions are ledgered too)", count)
+	}
+}
+
+// TestMCPGateTaintCheckSkippedNoSessionOnThisPath pins the documented,
+// accepted defense-in-depth limitation on policyGateMiddleware (see its own
+// doc comment in mcp.go): the /v1/mcp route threads NO session_id into
+// Engine.Check, so the W4-03 taint gate never fires here - a memory_write
+// (W1) call is governed purely by the autonomy ladder, even when a taint
+// tracker IS wired and the session it would key on is tainted. The taint
+// invariant (HANDOFF §5 safety #2) binds on the ORDINARY can_use_tool ->
+// POST /policy/check path instead (engine_w403_test.go / handlePolicyCheck),
+// which carries the worker's own session_id; a worker-supplied session_id on
+// THIS route would be forgeable by the very compromised worker this
+// middleware defends against, so it is deliberately not threaded. If a
+// future change starts enforcing taint here (e.g. via an unforgeable
+// per-task binding), this test flips and must be updated deliberately.
+func TestMCPGateTaintCheckSkippedNoSessionOnThisPath(t *testing.T) {
+	f := newMCPTestFixture(t)
+
+	// Arm the engine's taint checker with a genuinely tainted session. The
+	// tracker also fail-closes any UNKNOWN session to tainted (taint.Get),
+	// so if the middleware passed ANY session_id at all, a non-R call would
+	// be denied with rule=tainted_session. No in-flight request exists at
+	// this point, so wiring the checker post-Serve is safe (make test runs
+	// without -race, and the field is read only during a request).
+	tr := taint.New(f.store.Queries, f.store)
+	if err := tr.Raise(context.Background(), "trace-taint-arm", "session-tainted", "untrusted_output:web_fetch"); err != nil {
+		t.Fatalf("Raise: %v", err)
+	}
+	f.srv.policyEngine.SetTaintChecker(tr)
+
+	// Promote memory_write (W1) to L2 so the LADDER auto-allows it: the only
+	// thing that could still deny is a taint check, which must not run here.
+	seedAutonomyState(t, f.store, "memory_write", "W1", "global", 2)
+
+	// The bridge sends no session_id; the JSON-RPC params carry only the
+	// tool's declared arguments (no schema on this route has a session_id).
+	resp := postMCP(t, f.client, `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_write","arguments":{"content":"tainted-path yazi","file":"inbox/taint-bypass.md"}}}`)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var parsed jsonrpcToolCallResult
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("decode: %v\nbody=%s", err, body)
+	}
+	if parsed.Result.IsError {
+		t.Fatalf("memory_write over /v1/mcp was denied (%+v); want ALLOW - the taint check must not fire on this no-session path", parsed.Result.Content)
+	}
+
+	// The W1 write actually executed (ladder allow), proving the decision was
+	// the ladder's, not a taint DENY.
+	if _, err := os.Stat(filepath.Join(f.memoryDir, "inbox", "taint-bypass.md")); err != nil {
+		t.Fatalf("memory_write file not created despite ALLOW (err=%v)", err)
+	}
+
+	// And no decision on this path was ever a tainted_session DENY.
+	var taintDenies int
+	if err := f.store.DB().QueryRow(
+		`SELECT count(*) FROM events WHERE kind='policy_decision' AND json_extract(payload,'$.rule') = ?`,
+		policy.RuleTaintedSessionV1,
+	).Scan(&taintDenies); err != nil {
+		t.Fatalf("count tainted_session decisions: %v", err)
+	}
+	if taintDenies != 0 {
+		t.Fatalf("tainted_session policy_decision rows = %d, want 0 (taint must not be enforced on /v1/mcp)", taintDenies)
 	}
 }
 

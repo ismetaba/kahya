@@ -236,6 +236,62 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 // /v1/mcp directly (bypassing kahya-mcp's bridge and can_use_tool
 // entirely) is STILL denied here. can_use_tool (W12-09) is a separate,
 // non-binding, worker-side early-reject layer.
+//
+// KNOWN, ACCEPTED DEFENSE-IN-DEPTH LIMITATION (W4-03 session taint):
+// this middleware does NOT thread a SessionID into Engine.Check, so the
+// W4-03 taint gate (Engine.Check's "tainted session => only R-class"
+// hook, keyed on CheckInput.SessionID) is SKIPPED on the /v1/mcp route -
+// Check treats an empty SessionID as "no session concept applies" and
+// falls straight through to the ladder. This is deliberate, not an
+// oversight, and specifically NOT "just not wired yet": there is no
+// non-forgeable session_id available on this route to thread.
+//   - No tool mounted here carries a session_id argument in its schema
+//     (memory_search/write/forget - mcp/memory; fs_* - mcp/fs; shell_* -
+//     mcp/shell; applescript/jxa/shortcuts - mcp/osascript), and the only
+//     per-request identity kahya-mcp's bridge propagates is the trace_id
+//     header (X-Kahya-Trace-Id), sourced from the worker's own
+//     KAHYA_TRACE_ID env - i.e. worker-supplied.
+//   - The adversary this middleware exists to stop is a COMPROMISED
+//     worker (RCE-level, not a merely prompt-injected model) crafting
+//     arbitrary POSTs to the shared control socket. ANY session identity
+//     that adversary supplies - a tool arg, or a header the bridge/worker
+//     sets - is attacker-chosen: it would omit it (taint skipped) or name
+//     a known-clean session (taint passes). A worker-supplied session_id
+//     here therefore buys no security against this adversary; wiring one
+//     would be security theater that reads as protection it does not give.
+//   - Taint fundamentally defends against a prompt-injected MODEL, whose
+//     tool calls flow through the ORDINARY path (can_use_tool -> POST
+//     /policy/check -> handlePolicyCheck), which DOES pass the worker's own
+//     session_id into this same Engine.Check taint hook - that is where the
+//     HANDOFF §5 safety #2 invariant binds. This middleware backstops a
+//     strictly stronger adversary, for whom taint keyed on a forgeable
+//     session adds nothing, but for whom the controls kahyad evaluates
+//     authoritatively (from the tool name + its own autonomy_state + the
+//     call's args, never from any worker-supplied session/trace value) DO
+//     still bind: class W3 never auto-allows and always needs written LOCAL
+//     approval (Check -> needs_approval -> deny() here), so mail_send etc.
+//     stays unreachable taint or no taint; the autonomy ladder still gates
+//     every W1/W2 call by kahyad-side state, so only user-promoted tools
+//     auto-allow; fs_*/shell_*/osascript_* run their OWN deny-glob/
+//     digest-pin/egress/arg-validator chain (the fsOwnedTools/shellOwnedTools/
+//     osascriptOwnedTools bypass above) regardless - and share this EXACT
+//     same no-session_id limitation via enginePolicyClient (fs.go), for the
+//     same reason; deny-all still fails closed at boot; every decision is
+//     ledgered; an auto-allowed W1 still opens a 5-minute undo window.
+//   - The residual risk taint would otherwise cover on this path is thus
+//     narrow: an RCE-compromised worker, whose session is tainted, using
+//     this bypass (not the ordinary path) to invoke a W1/W2 tool the user
+//     ALREADY promoted to auto-allow - which is still ledgered and (for W1)
+//     undoable.
+//   - A SOUND fix needs an UNFORGEABLE binding between the incoming /v1/mcp
+//     request and a specific session: a dedicated authenticated per-task
+//     channel, or a kahyad-minted per-task secret this middleware MANDATES
+//     (deny on absence) and resolves server-side to that task's captured
+//     session_id. All workers share one control socket today with no
+//     per-connection identity, so that is a larger, separate change, tracked
+//     in tasks/w4-durability/W4-03-taint-reader-actor.md's "Deviations".
+//     TestMCPGateTaintCheckSkippedNoSessionOnThisPath (mcp_test.go) pins
+//     this documented behavior.
 func (s *Server) policyGateMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
