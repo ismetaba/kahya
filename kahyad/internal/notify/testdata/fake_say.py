@@ -49,6 +49,14 @@ def main():
     _append(argv_log, "ARGV " + " ".join(argv))
 
     if len(argv) >= 2 and argv[0] == "-v" and argv[1] == "?":
+        # $FAKE_SAY_VOICES_HANG_MS (if set) makes the voice-list query BLOCK
+        # that long before answering - the hermetic stand-in for a wedged
+        # Speech Synthesis Manager that never returns, so a test can prove
+        # kahyad/internal/notify.Speaker.voiceAvailable's own timeout fires
+        # (W6-05 review BLOCKER 2: degrade-never-block).
+        hang_ms = os.environ.get("FAKE_SAY_VOICES_HANG_MS")
+        if hang_ms:
+            time.sleep(float(hang_ms) / 1000.0)
         # Real `say -v '?'` never reads stdin either - mirror that exactly.
         sys.stdout.write(os.environ.get("FAKE_SAY_VOICES", ""))
         sys.stdout.flush()

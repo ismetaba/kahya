@@ -367,6 +367,45 @@ func TestSpeakDegradesOnFailedExecNeverPanics(t *testing.T) {
 	}
 }
 
+// TestVoiceCheckDoesNotHangOnWedgedSay is the W6-05 review BLOCKER 2
+// regression: a wedged Speech Synthesis Manager could make `say -v '?'` hang
+// forever, and voiceAvailable runs on the task's OWN synchronous goroutine -
+// so an unbounded probe would wedge the whole task, not degrade it. The
+// probe is now context-bounded by voiceCheckTimeout: on timeout the voice is
+// treated as missing (the exact missing-voice degrade), and Speak returns
+// promptly instead of blocking for the fixture's full hang.
+func TestVoiceCheckDoesNotHangOnWedgedSay(t *testing.T) {
+	orig := voiceCheckTimeout
+	voiceCheckTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { voiceCheckTimeout = orig })
+
+	dir := t.TempDir()
+	setFakeSayEnv(t, dir, yeldaVoiceList)
+	// The voice query blocks far LONGER than both voiceCheckTimeout and this
+	// test's own 3s wall-clock bound - only the timeout firing can explain
+	// Speak returning quickly.
+	t.Setenv("FAKE_SAY_VOICES_HANG_MS", "30000")
+	notifier := &recordingNotifier{}
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin, Voice: "Yelda"}, testLog(t), &recordingLedger{}, notifier)
+
+	done := make(chan struct{})
+	go func() {
+		s.Speak(context.Background(), SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Speak() hung on a wedged `say -v ?` - voiceCheckTimeout did not bound the probe")
+	}
+
+	// A timed-out probe is the missing-voice degrade: exactly one
+	// voice-missing notification, and nothing was ever actually spoken.
+	if notifier.count() != 1 || notifier.notifyCalls[0].kind != EventVoiceMissing {
+		t.Errorf("want exactly 1 %q notification on probe timeout, got %d calls", EventVoiceMissing, notifier.count())
+	}
+}
+
 // TestKillTaskSpeechNoopWhenNoUtteranceActive proves KillTaskSpeech is a
 // harmless no-op when Speaker has nothing in flight for taskID.
 func TestKillTaskSpeechNoopWhenNoUtteranceActive(t *testing.T) {

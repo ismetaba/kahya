@@ -53,6 +53,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"kahya/kahyad/internal/logx"
 )
@@ -77,6 +78,12 @@ const (
 	DefaultSayBin   = "/usr/bin/say"
 	DefaultMaxChars = 280
 )
+
+// voiceCheckTimeout bounds the one-time `say -v '?'` voice-availability probe
+// (W6-05 review: degrade-never-block - see voiceAvailable). A var, not a
+// const, so TestVoiceCheckDoesNotHangOnWedgedSay can lower it to keep that
+// regression fast; production never reassigns it.
+var voiceCheckTimeout = 5 * time.Second
 
 // Event kinds this file ledgers/JSONL-logs - grepped by `kahya log
 // --trace <id>` and this package's own tests.
@@ -305,7 +312,15 @@ func (s *Speaker) Speak(ctx context.Context, req SpeakRequest) {
 // separate "have we already notified" bookkeeping.
 func (s *Speaker) voiceAvailable(ctx context.Context, traceID string) bool {
 	s.voiceCheckOnce.Do(func() {
-		out, err := exec.Command(s.sayBin, "-v", "?").Output()
+		// Bound the voice-availability probe (DEGRADE-NEVER-BLOCK, W6-05
+		// review): a wedged Speech Synthesis Manager could make `say -v '?'`
+		// hang forever, and Speak runs synchronously on the task's own
+		// goroutine - so an unbounded probe would wedge the task, not degrade
+		// it. On timeout the voice is treated as unavailable (silent + the
+		// one-time notification), exactly the missing-voice degrade.
+		cctx, cancel := context.WithTimeout(context.Background(), voiceCheckTimeout)
+		defer cancel()
+		out, err := exec.CommandContext(cctx, s.sayBin, "-v", "?").Output()
 		s.voiceInstalled = err == nil && strings.Contains(strings.ToLower(string(out)), strings.ToLower(s.voice))
 		if !s.voiceInstalled {
 			if s.notifier != nil {
@@ -340,6 +355,30 @@ func (s *Speaker) KillTaskSpeech(_ context.Context, taskID string) error {
 		pid = s.activePID
 	}
 	s.activeMu.Unlock()
+	return killSpeechPID(pid)
+}
+
+// KillAllSpeech kills whatever utterance is CURRENTLY speaking, regardless of
+// which task it belongs to (W6-05 review fix): ⌥⎋ is halt-ALL, which iterates
+// only NON-terminal tasks - but a cloud-lane task transitions to 'done'
+// BEFORE it speaks its result, so the task speaking when the user hits ⌥⎋ is
+// often terminal and NOT in that list at all. "Stop everything now" must
+// silence it anyway. The Speaker serializes utterances, so there is at most
+// one to kill.
+func (s *Speaker) KillAllSpeech(_ context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.activeMu.Lock()
+	pid := s.activePID
+	s.activeMu.Unlock()
+	return killSpeechPID(pid)
+}
+
+// killSpeechPID SIGKILLs the process GROUP of a currently-speaking `say`
+// child (Speaker starts each with Setpgid), tolerating an already-exited one
+// (ESRCH). pid==0 means nothing is speaking - a no-op.
+func killSpeechPID(pid int) error {
 	if pid == 0 {
 		return nil
 	}

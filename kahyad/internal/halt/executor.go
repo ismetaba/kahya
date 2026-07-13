@@ -127,6 +127,11 @@ var _ ContainerKiller = (*mcpshell.Runner)(nil)
 // KillTaskSpeech is this package's only way to reach it.
 type SpeechKiller interface {
 	KillTaskSpeech(ctx context.Context, taskID string) error
+	// KillAllSpeech kills whatever utterance is currently speaking, for ANY
+	// task - HaltAll (⌥⎋) needs it because the speaking task is often already
+	// terminal (a cloud-lane task goes 'done' before it speaks its result) and
+	// so absent from ListNonTerminalTasks entirely.
+	KillAllSpeech(ctx context.Context) error
 }
 
 // Ledger is the append-only events sink HaltTask writes to (HANDOFF §5
@@ -228,19 +233,16 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 	// finds its halt too.
 	traceID := t.TraceID
 
-	if isTerminalStatus(t.Status) {
-		x.logJSONL(traceID, "halt.noop_already_terminal", taskID, t.Status)
-		return false, nil
-	}
-
-	// Step 1: SIGKILL the worker's process GROUP (task spec step 3.1).
-	x.killProcessGroup(traceID, t)
-
-	// Step 1b: kill this task's in-flight `say` child, if any (W6-05) -
-	// see SpeechKiller's own doc comment for why this is a SEPARATE step
-	// from killProcessGroup above (Speaker's child carries no
-	// tasks.worker_pgid of its own). nil (no Speaker wired at all) is a
-	// documented degrade - the step is simply skipped.
+	// Kill this task's in-flight `say` child FIRST, BEFORE the terminal-status
+	// short-circuit (W6-05 review BLOCKER): a cloud-lane task transitions to
+	// 'done' BEFORE it speaks its result (kahyad/internal/server/task.go), so
+	// by the time the user hits ⌥⎋ the task is already terminal but the `say`
+	// child is still audibly speaking. Every OTHER halt step (process group,
+	// containers, status transition, outbox, approvals) genuinely has nothing
+	// to do for a terminal task and short-circuits below - the speech does
+	// not. nil (no Speaker wired) is a documented degrade. This never sets
+	// haltedNow: silencing a done task's lingering speech is not a fresh halt
+	// of the task itself.
 	if x.speech != nil {
 		if err := x.speech.KillTaskSpeech(ctx, taskID); err != nil {
 			x.logJSONLErr(traceID, "halt.speech_kill_failed", taskID, err)
@@ -248,6 +250,14 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 			x.logJSONL(traceID, "halt.speech_killed", taskID, "")
 		}
 	}
+
+	if isTerminalStatus(t.Status) {
+		x.logJSONL(traceID, "halt.noop_already_terminal", taskID, t.Status)
+		return false, nil
+	}
+
+	// Step 1: SIGKILL the worker's process GROUP (task spec step 3.1).
+	x.killProcessGroup(traceID, t)
 
 	// Step 2: docker kill every kahya.task_id=<taskID>-labeled container
 	// (task spec step 3.2) - skipped silently when no ContainerKiller is
@@ -318,6 +328,16 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 // call's own HaltTask (which would then correctly report haltedNow=false
 // for it, not an error).
 func (x *Executor) HaltAll(ctx context.Context) (int, error) {
+	// ⌥⎋ = "stop everything now": silence any in-flight speech up front,
+	// regardless of which (possibly-already-terminal) task owns it - the
+	// per-task loop below only ever visits NON-terminal tasks, so a done task
+	// still speaking its result would otherwise keep talking after the halt
+	// (W6-05 review BLOCKER).
+	if x.speech != nil {
+		if err := x.speech.KillAllSpeech(ctx); err != nil {
+			x.logJSONLErr("", "halt.speech_kill_all_failed", "", err)
+		}
+	}
 	tasks, err := x.store.ListNonTerminalTasks(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("halt: list non-terminal tasks: %w", err)
