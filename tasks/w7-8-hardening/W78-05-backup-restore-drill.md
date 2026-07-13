@@ -1,6 +1,6 @@
 # W78-05 — Backup restore drill + runbook
 
-**Status:** todo
+**Status:** done (hermetic `drill_test.go` proves the full build→backup→restore→reindex-no-op→identical-`<hafiza>`→ledger-survives cycle with a narrowness proof; `restore-runbook.md`, `restore-drill.sh`, `make restore-drill`, and the `restore.drill.result` UDS endpoint). The live `make restore-drill` on the real `~/Kahya` + prod daemon (and its prod-ledger row) is user-assist runtime.
 **Phase:** W7–8 — Hardening + eval
 **Depends on:** W4-06, W12-10, W78-02 (reuses its `KAHYA_ENV` profile path-resolution)
 **Flags:** none

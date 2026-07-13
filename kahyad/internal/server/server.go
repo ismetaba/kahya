@@ -409,6 +409,10 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/eval/retrieval", s.handleEvalRetrievalRun)
 	mux.HandleFunc("/v1/eval/export-ritual", s.handleEvalExportRitual)
 	mux.HandleFunc("/v1/eval/redteam", s.handleEvalRedteamRecord)
+	// W78-05: the ONE production touchpoint of the backup restore drill -
+	// records the counts/hashes-only restore.drill.result summary row (see
+	// restoredrill.go's own package doc comment).
+	mux.HandleFunc("/v1/restore/drill-result", s.handleRestoreDrillResult)
 	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
 	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
@@ -827,11 +831,16 @@ type reindexRequest struct {
 // carried in the ledger event payload), but that key is deliberately left
 // out of the HTTP response to match the spec's schema exactly.
 type reindexResponse struct {
-	FilesIndexed   int   `json:"files_indexed"`
-	FilesUnchanged int   `json:"files_unchanged"`
-	FilesRemoved   int   `json:"files_removed"`
-	Chunks         int   `json:"chunks"`
-	DurationMs     int64 `json:"duration_ms"`
+	FilesIndexed   int `json:"files_indexed"`
+	FilesUnchanged int `json:"files_unchanged"`
+	FilesRemoved   int `json:"files_removed"`
+	// FilesErrored surfaces indexer.Result.FilesErrored (skipped symlinks /
+	// unreadable files) so a caller - e.g. the W78-05 restore drill's
+	// no-op assertion - can tell a clean incremental pass from one that
+	// silently skipped a file.
+	FilesErrored int   `json:"files_errored"`
+	Chunks       int   `json:"chunks"`
+	DurationMs   int64 `json:"duration_ms"`
 }
 
 // handleReindex triggers a corpus reindex (W12-04 step 5). A second,
@@ -869,6 +878,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		FilesIndexed:   res.FilesIndexed,
 		FilesUnchanged: res.FilesUnchanged,
 		FilesRemoved:   res.FilesRemoved,
+		FilesErrored:   res.FilesErrored,
 		Chunks:         res.Chunks,
 		DurationMs:     res.DurationMs,
 	}

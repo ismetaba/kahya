@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -314,3 +314,24 @@ eval-redteam: build
 SINCE ?= 14d
 metrics: build
 	./bin/kahya metrics --since $(SINCE)
+
+# restore-drill: the W78-05 LIVE backup restore drill (HANDOFF §6 W7-8
+# acceptance ⚑). Runs scripts/restore-drill.sh, which -- against the REAL
+# ~/Kahya + a running PRODUCTION kahyad -- triggers a fresh W4-06 backup,
+# clones ~/Kahya at that same point, restores the backup onto an ISOLATED
+# KAHYA_ENV=restore scratch profile (~/Kahya-restore + ~/Library/Application
+# Support/Kahya-restore, own socket), boots a scratch kahyad, asserts
+# integrity_check=ok + user_version + an incremental no-op reindex, proves the
+# scratch <hafiza> injection is byte-identical to the production reference
+# (after trace_id/timestamp normalization only), and asserts the restored
+# events/episodes counts survived the VACUUM copy. On success it records the
+# counts/hashes-only restore.drill.result row on PRODUCTION kahyad over its UDS
+# (the sole brain.db writer) -- the script never opens the prod brain.db for
+# writing, and a fail-closed guard refuses any scratch target that resolves to
+# a production path. NOT part of hermetic `make test`: the equivalence + ledger
+# survival is ALSO proven hermetically with fixtures under `make test`
+# (kahyad/internal/restore.TestRestoreDrillEquivalenceAndLedgerSurvival), which
+# needs no daemon, no network, and no production paths. Needs a running prod
+# daemon ('make install-agent' or 'make run-daemon') -- user-assist runtime.
+restore-drill: build
+	KAHYA_ENV=restore ./scripts/restore-drill.sh

@@ -762,11 +762,12 @@ func postReindex(t *testing.T, client *http.Client, body string) *http.Response 
 
 // TestReindexEndpointReturnsSummary guards W12-04 step 5's happy path: a
 // valid request reaches the wired Reindexer and its Result round-trips as
-// the exact five-key JSON schema the task spec fixes.
+// the fixed six-key JSON schema (files_errored added in W78-05 so the restore
+// drill's no-op assertion can see a skipped file).
 func TestReindexEndpointReturnsSummary(t *testing.T) {
 	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
 	fr := &fakeReindexer{res: indexer.Result{
-		FilesIndexed: 3, FilesUnchanged: 11, FilesRemoved: 1, FilesErrored: 0, Chunks: 9, DurationMs: 42,
+		FilesIndexed: 3, FilesUnchanged: 11, FilesRemoved: 1, FilesErrored: 2, Chunks: 9, DurationMs: 42,
 	}}
 	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
 	srv.SetReindexer(fr)
@@ -790,6 +791,7 @@ func TestReindexEndpointReturnsSummary(t *testing.T) {
 		"files_indexed":   3,
 		"files_unchanged": 11,
 		"files_removed":   1,
+		"files_errored":   2,
 		"chunks":          9,
 		"duration_ms":     42,
 	}
@@ -798,11 +800,8 @@ func TestReindexEndpointReturnsSummary(t *testing.T) {
 			t.Errorf("body[%q] = %v, want %v", k, body[k], v)
 		}
 	}
-	if _, ok := body["files_errored"]; ok {
-		t.Errorf("body contains files_errored = %v, want it absent (not part of the fixed 5-key schema)", body["files_errored"])
-	}
-	if len(body) != 5 {
-		t.Errorf("body has %d keys (%v), want exactly 5", len(body), body)
+	if len(body) != 6 {
+		t.Errorf("body has %d keys (%v), want exactly 6", len(body), body)
 	}
 
 	if !fr.lastFull || fr.lastTID != "tid-reindex-1" {
