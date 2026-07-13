@@ -65,6 +65,18 @@ def resolve_model() -> str:
     """
     override = os.environ.get("KAHYA_WHISPER_MODEL_DIR", "").strip()
     if override:
+        # The override MUST be validated as an existing, non-empty local
+        # directory before it is trusted (fail-closed, W6-02 review BLOCKER):
+        # mlx_whisper.transcribe(path_or_hf_repo=...) does NOT pass
+        # local_files_only, so if the override is a path that does not exist
+        # on disk, mlx_whisper treats it as a HUB REPO ID and downloads it -
+        # exactly the task-time network fetch this whole module exists to
+        # prevent (and kahyad's spawn.BuildEnv does not set HF_HUB_OFFLINE, so
+        # nothing else stops it). A missing/empty override fails closed to
+        # MSG_MODEL_MISSING, identically to a cache miss on the production
+        # path below.
+        if not os.path.isdir(override) or not os.listdir(override):
+            raise SttModelMissingError(MSG_MODEL_MISSING)
         return override
     try:
         return snapshot_download(MODEL_REPO, local_files_only=True)

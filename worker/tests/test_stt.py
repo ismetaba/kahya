@@ -129,10 +129,37 @@ class TestResolveModelFailsClosed(unittest.TestCase):
     def test_kahya_whisper_model_dir_override_skips_snapshot_download(self) -> None:
         from kahya_worker import stt
 
-        with mock.patch.dict(os.environ, {"KAHYA_WHISPER_MODEL_DIR": "/some/prebuilt/dir"}, clear=True):
+        # A VALID (existing, non-empty) override dir is returned verbatim, no
+        # snapshot_download call.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                f.write("{}")
+            with mock.patch.dict(os.environ, {"KAHYA_WHISPER_MODEL_DIR": d}, clear=True):
+                with mock.patch.object(stt, "snapshot_download") as fake_download:
+                    self.assertEqual(stt.resolve_model(), d)
+                    fake_download.assert_not_called()
+
+    def test_kahya_whisper_model_dir_override_missing_fails_closed(self) -> None:
+        """W6-02 review BLOCKER regression: a KAHYA_WHISPER_MODEL_DIR override
+        pointing at a nonexistent (or empty) directory must FAIL CLOSED, never
+        be handed to mlx_whisper (which would treat it as a hub repo id and
+        download it)."""
+        from kahya_worker import stt
+
+        bogus = os.path.join(tempfile.gettempdir(), "kahya-nonexistent-whisper-dir-xyz")
+        self.assertFalse(os.path.exists(bogus))
+        with mock.patch.dict(os.environ, {"KAHYA_WHISPER_MODEL_DIR": bogus}, clear=True):
             with mock.patch.object(stt, "snapshot_download") as fake_download:
-                self.assertEqual(stt.resolve_model(), "/some/prebuilt/dir")
+                with self.assertRaises(stt.SttModelMissingError) as ctx:
+                    stt.resolve_model()
+                self.assertEqual(str(ctx.exception), stt.MSG_MODEL_MISSING)
                 fake_download.assert_not_called()
+
+        # And an EXISTING but EMPTY override dir also fails closed.
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(os.environ, {"KAHYA_WHISPER_MODEL_DIR": empty}, clear=True):
+                with self.assertRaises(stt.SttModelMissingError):
+                    stt.resolve_model()
 
 
 if __name__ == "__main__":
