@@ -504,6 +504,62 @@ func TestAskWithoutDerinSendsDeepThinkFalse(t *testing.T) {
 	}
 }
 
+// TestAskSpeakFlagSendsSpeakTrue proves `kahya ask --speak <prompt>`
+// reaches POST /v1/task with speak:true (W6-05).
+func TestAskSpeakFlagSendsSpeakTrue(t *testing.T) {
+	var gotSpeak bool
+	var gotPrompt string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotSpeak, _ = body["speak"].(bool)
+		gotPrompt, _ = body["prompt"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--speak", "bugün", "hava", "nasıl"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if !gotSpeak {
+		t.Error("server did not see speak=true in the request body")
+	}
+	if gotPrompt != "bugün hava nasıl" {
+		t.Errorf("prompt = %q, want %q", gotPrompt, "bugün hava nasıl")
+	}
+}
+
+// TestAskWithoutSpeakSendsSpeakFalse proves plain `kahya ask <prompt>`
+// (no --speak) sends speak:false (the default, backward-compatible value)
+// - the flag opts IN, it is never on by default.
+func TestAskWithoutSpeakSendsSpeakFalse(t *testing.T) {
+	var gotSpeak bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotSpeak, _ = body["speak"].(bool)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	})
+	sock := startFakeServer(t, handler)
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "merhaba"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr.String())
+	}
+	if gotSpeak {
+		t.Error("server saw speak=true without --speak, want false")
+	}
+}
+
 // TestAskEmptyPromptRejectedWithoutDialing mirrors
 // TestOneShotEmptyPromptRejectedWithoutDialing for the `ask` subcommand.
 func TestAskEmptyPromptRejectedWithoutDialing(t *testing.T) {

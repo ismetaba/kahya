@@ -153,6 +153,57 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AnchorLocalFallbackPath != "" {
 		t.Errorf("AnchorLocalFallbackPath = %q, want empty by default", cfg.AnchorLocalFallbackPath)
 	}
+	// W6-05: TTS defaults (task spec, verbatim) - off by default, Yelda
+	// voice, real /usr/bin/say, 280-char cap, secret-lane not spoken.
+	if cfg.TTSEnabled {
+		t.Error("TTSEnabled = true, want false by default")
+	}
+	if cfg.TTSVoice != "Yelda" {
+		t.Errorf("TTSVoice = %q, want Yelda", cfg.TTSVoice)
+	}
+	if cfg.TTSSayBin != "/usr/bin/say" {
+		t.Errorf("TTSSayBin = %q, want /usr/bin/say", cfg.TTSSayBin)
+	}
+	if cfg.TTSMaxChars != 280 {
+		t.Errorf("TTSMaxChars = %d, want 280", cfg.TTSMaxChars)
+	}
+	if cfg.TTSSpeakSecretLane {
+		t.Error("TTSSpeakSecretLane = true, want false by default")
+	}
+}
+
+// TestLoadFileOverridesTTSKeys proves every cfg.tts.* key (W6-05) is
+// overridable via config.yaml, mirroring TestLoadFileOverridesAnchorKeys'
+// identical shape one section up.
+func TestLoadFileOverridesTTSKeys(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, "tts_enabled: true\n"+
+		"tts_voice: Zeynep\n"+
+		"tts_say_bin: ~/bin/fake-say\n"+
+		"tts_max_chars: 120\n"+
+		"tts_speak_secret_lane: true\n")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.TTSEnabled {
+		t.Error("TTSEnabled = false, want true (file override)")
+	}
+	if cfg.TTSVoice != "Zeynep" {
+		t.Errorf("TTSVoice = %q, want Zeynep", cfg.TTSVoice)
+	}
+	if want := filepath.Join(home, "bin", "fake-say"); cfg.TTSSayBin != want {
+		t.Errorf("TTSSayBin = %q, want %q (tilde-expanded)", cfg.TTSSayBin, want)
+	}
+	if cfg.TTSMaxChars != 120 {
+		t.Errorf("TTSMaxChars = %d, want 120", cfg.TTSMaxChars)
+	}
+	if !cfg.TTSSpeakSecretLane {
+		t.Error("TTSSpeakSecretLane = false, want true (file override)")
+	}
 }
 
 // TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush proves W4-06's own

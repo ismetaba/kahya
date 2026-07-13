@@ -116,6 +116,19 @@ type ContainerKiller interface {
 
 var _ ContainerKiller = (*mcpshell.Runner)(nil)
 
+// SpeechKiller is the narrow W6-05 speech-kill surface Executor needs -
+// *kahyad/internal/notify.Speaker satisfies this directly via
+// KillTaskSpeech. May be nil (no Speaker wired at all - every pre-W6-05
+// test/caller): the speech-kill step is then simply skipped, mirroring
+// ContainerKiller's identical "may be nil" degrade above. A `say` child
+// Speaker starts is a task-scoped process this package would otherwise
+// never know about at all (Speaker owns/starts it directly, never via
+// spawn.Run, so it carries no tasks.worker_pgid column of its own) -
+// KillTaskSpeech is this package's only way to reach it.
+type SpeechKiller interface {
+	KillTaskSpeech(ctx context.Context, taskID string) error
+}
+
 // Ledger is the append-only events sink HaltTask writes to (HANDOFF §5
 // safety #4). *store.Store already has exactly this method shape.
 type Ledger interface {
@@ -130,6 +143,7 @@ type Executor struct {
 	live      LiveRegistry        // may be nil
 	approvals ApprovalInvalidator // may be nil
 	docker    ContainerKiller     // may be nil
+	speech    SpeechKiller        // may be nil - see SetSpeechKiller
 	ledger    Ledger              // may be nil
 	// jsonl is the OPTIONAL JSONL sink every halt step additionally logs
 	// to, alongside the DB ledger row (mirrors kahyad/internal/task.
@@ -154,6 +168,11 @@ func NewExecutor(store Store, machine Machine, live LiveRegistry, approvals Appr
 // SetJSONLLogger wires jsonl as the additional JSONL sink every halt step
 // logs to (see the jsonl field's own doc comment). Safe to leave unset.
 func (x *Executor) SetJSONLLogger(l *logx.Logger) { x.jsonl = l }
+
+// SetSpeechKiller wires x (W6-05) - see the SpeechKiller type's own doc
+// comment. Safe to leave unset (the speech-kill step is then simply
+// skipped).
+func (x *Executor) SetSpeechKiller(s SpeechKiller) { x.speech = s }
 
 // SetClock overrides Executor's clock (tests only).
 func (x *Executor) SetClock(now func() time.Time) { x.now = now }
@@ -216,6 +235,19 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 
 	// Step 1: SIGKILL the worker's process GROUP (task spec step 3.1).
 	x.killProcessGroup(traceID, t)
+
+	// Step 1b: kill this task's in-flight `say` child, if any (W6-05) -
+	// see SpeechKiller's own doc comment for why this is a SEPARATE step
+	// from killProcessGroup above (Speaker's child carries no
+	// tasks.worker_pgid of its own). nil (no Speaker wired at all) is a
+	// documented degrade - the step is simply skipped.
+	if x.speech != nil {
+		if err := x.speech.KillTaskSpeech(ctx, taskID); err != nil {
+			x.logJSONLErr(traceID, "halt.speech_kill_failed", taskID, err)
+		} else {
+			x.logJSONL(traceID, "halt.speech_killed", taskID, "")
+		}
+	}
 
 	// Step 2: docker kill every kahya.task_id=<taskID>-labeled container
 	// (task spec step 3.2) - skipped silently when no ContainerKiller is

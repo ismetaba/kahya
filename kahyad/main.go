@@ -395,6 +395,23 @@ func run() int {
 	hsCli := ui.New(cfg.HsCliPath, log)
 	localDelivery := ui.FanOutDelivery{Primary: tgBot, Local: hsCli}
 
+	// W6-05: the local-only TTS Speaker (HANDOFF §4 stack TTS row ⚑: `say
+	// -v Yelda`). Wired into hsCli (the LOCAL half of localDelivery above)
+	// ONLY - never into tgBot/localDelivery.Primary - so a Telegram/remote
+	// delivery structurally cannot reach it (kahyad/internal/ui.HSCli.
+	// SendNotification's own doc comment); srv.SetSpeaker (below, once srv
+	// exists) additionally wires the interactive `kahya ask`/`--speak`
+	// completion path (kahyad/internal/server/task.go's own maybeSpeak).
+	// notifier is the SAME shared Notifier every other alarm/notification
+	// call in this function already uses - the voice-missing notification
+	// is exactly one more JSONL+ledger sink call, nothing Speaker-specific.
+	speaker := notify.NewSpeaker(notify.SpeakerConfig{
+		Enabled: cfg.TTSEnabled, Voice: cfg.TTSVoice, SayBin: cfg.TTSSayBin,
+		MaxChars: cfg.TTSMaxChars, SpeakSecretLane: cfg.TTSSpeakSecretLane,
+	}, log, st, notifier)
+	hsCli.Speaker = speaker
+	srv.SetSpeaker(speaker)
+
 	policyEngine.SetPendingApprovalHook(func(info policy.PendingApprovalInfo) {
 		// Fired synchronously from inside Check/Approve's own request path
 		// (kahyad/internal/policy.Engine.pendingApprovalHook's doc
@@ -583,6 +600,9 @@ func run() int {
 	// directly via InvalidateApprovalsForTask.
 	haltExecutor := halt.NewExecutor(st.Queries, taskMachine, taskLive, policyEngine, shellRunner, st)
 	haltExecutor.SetJSONLLogger(log)
+	// W6-05: ⌥⎋ also kills this task's in-flight `say` child, if any - see
+	// halt.SpeechKiller's own doc comment.
+	haltExecutor.SetSpeechKiller(speaker)
 	srv.SetHaltExecutor(haltExecutor)
 
 	// W4-07 acceptance gate: the dev-only w2_slow_stub MCP tool

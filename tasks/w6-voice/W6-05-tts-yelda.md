@@ -1,6 +1,6 @@
 # W6-05 — TTS: spoken answers via `say -v Yelda`
 
-**Status:** todo
+**Status:** code-complete; live "spoken aloud" run under launchd = user-assist (see the last acceptance item)
 **Phase:** W6 — Voice + shortcut
 **Depends on:** W6-01 (local notification path), W0-03 (Yelda voice verified/flagged)
 **Flags:** none
@@ -37,14 +37,14 @@ Kâhya can speak. Behind a config toggle (default **off**), locally delivered an
 7. Write the tests below; run `make test && make lint`.
 
 ## Acceptance criteria
-- [ ] `make test` green, including: with `tts.enabled=true` and the fake `say`, a locally delivered task result triggers exactly one invocation with args containing `-v Yelda` and stdin = the notification text truncated to `tts.max_chars` (rune-safe); with `tts.enabled=false`, zero invocations; `kahya ask --speak` voices that task only.
-- [ ] Test: a secret-lane-labeled result with default config is not spoken and a `tts.skipped_secret_lane` event is ledgered; with `tts.speak_secret_lane=true` it is spoken.
-- [ ] Test: two results delivered near-simultaneously are spoken serially (fake `say` sleeps; assert no overlapping invocations).
-- [ ] Test: fake `say -v '?'` output without Yelda ⇒ no speech, exactly one `tts.voice_missing` notification/ledger event across repeated deliveries, and the tasks still complete (degrade, never block).
-- [ ] Test: a Telegram-delivered (remote) result never reaches the Speaker.
-- [ ] Test: halting a task (W6-03 path) kills its in-flight `say` child (fake `say` with a long sleep; assert the pid is gone).
-- [ ] Manual, under launchd-started kahyad: `kahya ask --speak "bugün hava nasıl olacak demiştim?"` → the answer is spoken aloud in the Yelda voice; `kahya log --trace <id>` shows a `tts.spoken` line with the task's `trace_id`.
-- [ ] `make lint` green.
+- [x] `make test` green, including: with `tts.enabled=true` and the fake `say`, a locally delivered task result triggers exactly one invocation with args containing `-v Yelda` and stdin = the notification text truncated to `tts.max_chars` (rune-safe); with `tts.enabled=false`, zero invocations; `kahya ask --speak` voices that task only. (`kahyad/internal/notify/tts_test.go`'s `TestSpeakEnabledInvokesSayWithVoiceAndTruncatedStdin`/`TestSpeakDisabledZeroInvocations`/`TestSpeakForceOverridesDisabledConfig`; CLI-level plumbing in `kahyad/cmd/kahya/main_test.go`'s `TestAskSpeakFlagSendsSpeakTrue`/`TestAskWithoutSpeakSendsSpeakFalse`.)
+- [x] Test: a secret-lane-labeled result with default config is not spoken and a `tts.skipped_secret_lane` event is ledgered; with `tts.speak_secret_lane=true` it is spoken. (`tts_test.go`'s `TestSpeakSecretLaneSkippedByDefaultAndLedgered`/`TestSpeakSecretLaneSpokenWhenConfigured`.)
+- [x] Test: two results delivered near-simultaneously are spoken serially (fake `say` sleeps; assert no overlapping invocations). (`tts_test.go`'s `TestSpeakSerializesConcurrentUtterances`, parses fake-say START/END timestamps and asserts the two intervals are disjoint.)
+- [x] Test: fake `say -v '?'` output without Yelda ⇒ no speech, exactly one `tts.voice_missing` notification/ledger event across repeated deliveries, and the tasks still complete (degrade, never block). (`tts_test.go`'s `TestSpeakDegradesOnMissingVoiceExactlyOnceAcrossRepeatedCalls`; failed-exec degrade in `TestSpeakDegradesOnFailedExecNeverPanics`.)
+- [x] Test: a Telegram-delivered (remote) result never reaches the Speaker. (`kahyad/internal/ui/hscli_test.go`'s `TestFanOutDeliverySpeaksOnlyFromLocalNeverFromRemote`: `FanOutDelivery{Primary: <Telegram-shaped fake>, Local: <HSCli+Speaker>}` — the remote side still receives its own notification, but exactly one `say` invocation happens overall, and it can only have come from `Local`; `kahyad/internal/telegram.Bot.SendNotification` has no Speaker field/import at all, so this holds structurally, not just at runtime.)
+- [x] Test: halting a task (W6-03 path) kills its in-flight `say` child (fake `say` with a long sleep; assert the pid is gone). (`kahyad/internal/halt/speech_test.go`'s `TestHaltTaskKillsInFlightSpeech` — the real `halt.Executor.HaltTask` wired to a real `notify.Speaker` via the new `SetSpeechKiller`, exactly as main.go wires them in production; notify-package-local half in `tts_test.go`'s `TestKillTaskSpeechKillsInFlightUtterance`.)
+- [!] Manual, under launchd-started kahyad: `kahya ask --speak "bugün hava nasıl olacak demiştim?"` → the answer is spoken aloud in the Yelda voice; `kahya log --trace <id>` shows a `tts.spoken` line with the task's `trace_id`. — user-assist (needs a live macOS audio device + the real Yelda voice under a launchd-started daemon); every mechanism this drill exercises is hermetically proven above (say invoked with `-v Yelda`, stdin = the exact text, `tts.spoken` ledgered with `trace_id`) — deferred to the user exactly like W6-01/W6-02/W6-03's own manual/TCC items.
+- [x] `make lint` green.
 
 ## Out of scope
 - Piper/XTTS, streaming/low-latency TTS, wake-word — deferred per HANDOFF §8.

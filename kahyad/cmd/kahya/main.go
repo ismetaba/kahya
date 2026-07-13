@@ -97,7 +97,7 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	traceID := traceid.New()
-	return execTask(client, traceID, prompt, false, nil, stdout, stderr)
+	return execTask(client, traceID, prompt, false, nil, false, stdout, stderr)
 }
 
 // runAsk implements `kahya ask [--derin] [--palette-opened-at <unix-
@@ -119,6 +119,7 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
 	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
 	audio := fs.String("audio", "", "ses dosyası yolu (wav) - transkript kahyad tarafından yerelde çıkarılır (hammerspoon/kahya.lua basılı-tut kullanır)")
+	speak := fs.Bool("speak", false, "cevabı sesli oku (say -v Yelda) - tts.enabled kapalı olsa bile, sadece bu görev için (W6-05)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -138,7 +139,7 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, err.Error())
 			return 2
 		}
-		return execTaskAudio(client, traceID, audioPath, *derin, palette, stdout, stderr)
+		return execTaskAudio(client, traceID, audioPath, *derin, palette, *speak, stdout, stderr)
 	}
 
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -146,7 +147,7 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, MsgEmptyQuestion)
 		return 2
 	}
-	return execTask(client, traceID, prompt, *derin, palette, stdout, stderr)
+	return execTask(client, traceID, prompt, *derin, palette, *speak, stdout, stderr)
 }
 
 // canonicalizeAudioPath resolves path to an absolute, symlink-free form
@@ -189,9 +190,10 @@ func isFlagPassed(fs *flag.FlagSet, name string) bool {
 // failure - dial failure or, until W12-07 lands, /v1/task's current 404).
 // deepThink is W4-08's --derin/deep_think opt-in; paletteOpenedAt is
 // W6-01's `kahya ask --palette-opened-at` opt-in (nil for every other
-// caller - runOneShot, the REPL).
-func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, stdout, stderr io.Writer) int {
-	res, err := client.StreamTaskFull(context.Background(), traceID, prompt, deepThink, paletteOpenedAt, func(text string) {
+// caller - runOneShot, the REPL); speak is W6-05's `kahya ask --speak`
+// one-shot TTS override (false for every other caller).
+func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, speak bool, stdout, stderr io.Writer) int {
+	res, err := client.StreamTaskFull(context.Background(), traceID, prompt, deepThink, paletteOpenedAt, speak, func(text string) {
 		fmt.Fprint(stdout, text)
 	})
 	if err != nil {
@@ -218,9 +220,9 @@ func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpe
 // <path>` sends audioPath as input_audio_path instead of typed prompt
 // text - kahyad transcribes it entirely locally before the task otherwise
 // proceeds identically (same result mapping/exit codes/CLI badge as
-// execTask).
-func execTaskAudio(client *Client, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, stdout, stderr io.Writer) int {
-	res, err := client.StreamTaskAudio(context.Background(), traceID, audioPath, deepThink, paletteOpenedAt, func(text string) {
+// execTask); speak is W6-05's `kahya ask --speak` one-shot TTS override.
+func execTaskAudio(client *Client, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, speak bool, stdout, stderr io.Writer) int {
+	res, err := client.StreamTaskAudio(context.Background(), traceID, audioPath, deepThink, paletteOpenedAt, speak, func(text string) {
 		fmt.Fprint(stdout, text)
 	})
 	if err != nil {
@@ -267,7 +269,7 @@ func runREPL(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 			break
 		}
 		if line != "" {
-			execTask(client, traceid.New(), line, false, nil, stdout, stderr)
+			execTask(client, traceid.New(), line, false, nil, false, stdout, stderr)
 		}
 		if err != nil {
 			break // EOF right after a final, newline-less line

@@ -257,6 +257,49 @@ func (s *Server) SetSecretLane(classifier *secretlane.Classifier, answerer secre
 	s.markSensitiveRead = markSensitiveRead
 }
 
+// SpeakerService is W6-05's local-only TTS speak call - *kahyad/internal/
+// notify.Speaker satisfies this directly. See Server.speaker's own doc
+// comment.
+type SpeakerService interface {
+	Speak(ctx context.Context, req notify.SpeakRequest)
+}
+
+// SetSpeaker wires s.speaker (W6-05) - see that field's own doc comment.
+// Call before Prepare(); safe to leave unset (Speak is then simply never
+// attempted from this package).
+func (s *Server) SetSpeaker(speaker SpeakerService) {
+	s.speaker = speaker
+}
+
+// maybeSpeak is W6-05's own call site: invoked exactly once per task,
+// AFTER that task's own terminal "result" SSE event has already been
+// written (never before - never for an "error" result either: this
+// package's own SCOPE DECISION, this task voices a task's ANSWER, not an
+// error diagnostic), from BOTH the cloud/local-decision success branch
+// (handleTask, below) and the secret-lane success branch
+// (finishSecretLaneTask). speakOverride is `kahya ask --speak`'s own
+// per-request Force (kahyad/cmd/kahya's own --speak flag, threaded through
+// taskRequest.Speak below) - it bypasses cfg.tts.enabled but NEVER the
+// secret-lane gate (notify.Speaker.Speak's own doc comment). Best-effort/
+// degrade-never-block by construction: Speak itself never returns
+// anything this caller could act on.
+//
+// SCOPE DECISION: kahyad/internal/ui.HSCli's OWN, separate, Speaker wiring
+// (that package's SendNotification doc comment) is what background/
+// scheduled-task notifications (W5-01 briefing, W5-02 consolidation) speak
+// through - those code paths carry no per-task Lane/Force of their own
+// (they never go through POST /v1/task's classification at all), so this
+// call site exists specifically for the interactive `kahya ask` path,
+// where a real, request-scoped Lane/Force pair already exists.
+func (s *Server) maybeSpeak(ctx context.Context, traceID, taskID, lane string, speakOverride bool, text string) {
+	if s.speaker == nil {
+		return
+	}
+	s.speaker.Speak(ctx, notify.SpeakRequest{
+		TraceID: traceID, TaskID: taskID, Lane: lane, Force: speakOverride, Text: text,
+	})
+}
+
 // taskRequest is POST /v1/task's request body - the exact shape
 // kahyad/cmd/kahya/client.go already POSTs (W12-06 contract): {"prompt",
 // "trace_id"}. trace_id follows the same optional-override pattern as
@@ -298,6 +341,18 @@ type taskRequest struct {
 	// backward-compatible: absent is every pre-W6-02 request body's exact
 	// existing behavior.
 	InputAudioPath string `json:"input_audio_path,omitempty"`
+	// Speak is W6-05's `kahya ask --speak` one-shot override: true voices
+	// THIS task's own result (via maybeSpeak, below) even when
+	// cfg.tts.enabled is false - still local-only (kahyad/cmd/kahya never
+	// sends this over the Telegram/remote path, which has no equivalent
+	// flag at all), and never bypasses the secret-lane gate (see
+	// notify.Speaker.Speak's own doc comment). Optional/backward-
+	// compatible: absent/false is every pre-W6-05 request body's exact
+	// existing behavior - plumbed through exactly like PaletteOpenedAt
+	// above (a request-scoped field, not a persisted tasks-table column:
+	// `kahya ask --speak` only ever affects THIS one task's own in-memory
+	// completion, nothing durable needs to remember it past that).
+	Speak bool `json:"speak,omitempty"`
 }
 
 // rfc3339Now is time.Now().UTC() formatted as plain RFC3339 (no
@@ -721,7 +776,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		if !decision.Local {
 			log.Error("routing_invariant_violated", "task_id", taskID, "reason", "secret_lane_not_local", "decision_model", decision.Model)
 		}
-		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx, writeSSE)
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, lane, req.Speak, dbCtx, persistCtx, writeSSE)
 		return
 	}
 
@@ -738,7 +793,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		// handleSecretLaneTask) - see kahyad/internal/router's own package
 		// doc comment for why the local lane must never be represented as
 		// an envelope.Model string instead.
-		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, dbCtx, persistCtx, writeSSE)
+		s.handleSecretLaneTask(w, log, taskID, traceID, req.Prompt, lane, req.Speak, dbCtx, persistCtx, writeSSE)
 		return
 	}
 
@@ -865,6 +920,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// row, not a security issue, but is still avoided.
 	var firstTokenOnce sync.Once
 
+	// W6-05: accumulates every OnDelta chunk verbatim, in arrival order,
+	// so maybeSpeak (below, success branch only) has this task's own full
+	// answer text to speak - kahya ask's own SSE stream is this path's
+	// "visual notification" (there is no separate hs.notify banner for an
+	// interactive ask), so nothing else in this function ever holds the
+	// complete answer as one string otherwise. Negligible cost even when
+	// tts is disabled/no --speak override: builder.String() is simply
+	// never read in that case (maybeSpeak/Speak themselves no-op).
+	var answerText strings.Builder
+
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
 		OnStart: func(pid int) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
@@ -889,6 +954,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		},
 		OnDelta: func(text string) {
 			firstTokenOnce.Do(func() { s.logFirstToken(persistCtx, traceID, taskID) })
+			answerText.WriteString(text)
 			writeSSE("delta", map[string]string{"text": text})
 		},
 		OnSession: func(sessionID string) {
@@ -993,6 +1059,20 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSSE(m.sseEvent, m.ssePayload)
+
+	// W6-05: speak this task's own answer, AFTER its terminal SSE event
+	// above - success ("result") only, mirroring finishSecretLaneTask's
+	// identical scope decision (this task voices a task's ANSWER, never
+	// an error diagnostic). This block is only ever reached for a
+	// genuinely cloud-routed task (both lane=="secret" and decision.Local
+	// return earlier, via handleSecretLaneTask, above) - lane here is
+	// therefore always the W3-08 CONTENT classification's own "normal",
+	// passed through for symmetry with that other call site rather than
+	// hardcoded, so this call site needs no separate secret-lane
+	// reasoning of its own.
+	if m.sseEvent == "result" {
+		s.maybeSpeak(persistCtx, traceID, taskID, lane, req.Speak, answerText.String())
+	}
 }
 
 // taskDurabilityStatus reads taskID's CURRENT tasks.status - a tiny
@@ -1077,7 +1157,7 @@ func (s *Server) logFirstToken(ctx context.Context, traceID, taskID string) {
 // harmless-but-noisy second WriteHeader call). nil (every pre-W6-02
 // caller) is this function's own original behavior: open its own SSE
 // stream exactly as before.
-func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt string, dbCtx, persistCtx context.Context, preOpened func(event string, payload any)) {
+func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt, lane string, speakOverride bool, dbCtx, persistCtx context.Context, preOpened func(event string, payload any)) {
 	writeSSE := preOpened
 	if writeSSE == nil {
 		flusher, ok := w.(http.Flusher)
@@ -1107,12 +1187,12 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 	defer cancel()
 
 	if s.secretLaneAnswerer == nil {
-		s.finishSecretLaneTask(persistCtx, log, taskID, traceID, writeSSE, "", fmt.Errorf("secretlane: no local answerer wired"))
+		s.finishSecretLaneTask(persistCtx, log, taskID, traceID, lane, speakOverride, writeSSE, "", fmt.Errorf("secretlane: no local answerer wired"))
 		return
 	}
 
 	answer, err := s.secretLaneAnswerer.Answer(taskCtx, prompt)
-	s.finishSecretLaneTask(persistCtx, log, taskID, traceID, writeSSE, answer, err)
+	s.finishSecretLaneTask(persistCtx, log, taskID, traceID, lane, speakOverride, writeSSE, answer, err)
 }
 
 // finishSecretLaneTask persists the terminal task state/ledger row and
@@ -1121,7 +1201,7 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 // task spec's crown invariant) is distinguished from every other local
 // answer failure so the user sees the EXACT documented Turkish string
 // rather than a generic one.
-func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logger, taskID, traceID string, writeSSE func(string, any), answer string, err error) {
+func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logger, taskID, traceID, lane string, speakOverride bool, writeSSE func(string, any), answer string, err error) {
 	if err != nil {
 		msg := fmt.Sprintf(MsgSecretLaneModelCallFailed, traceID)
 		if errors.Is(err, mlx.ErrLocalModelUnavailable) {
@@ -1176,6 +1256,11 @@ func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logg
 	writeSSE("result", map[string]any{
 		"status": "ok", "task_id": taskID, "session_id": "", "processed_locally": true,
 	})
+
+	// W6-05: speak this task's own answer, AFTER its terminal SSE "result"
+	// event above - see maybeSpeak's own doc comment (SCOPE DECISION: this
+	// is the interactive `kahya ask` path's own call site).
+	s.maybeSpeak(persistCtx, traceID, taskID, lane, speakOverride, answer)
 }
 
 // taskOutcomeMapping is spawn.Run's terminal outcome translated into the

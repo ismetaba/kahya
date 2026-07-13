@@ -453,6 +453,37 @@ type Config struct {
 	// CredentialMode constants' identical "keep two packages' literals in
 	// sync by hand rather than take a cross-package import" precedent).
 	HsCliPath string `yaml:"ui_hs_cli"`
+
+	// --- W6-05 TTS (`say -v Yelda`) ---
+
+	// TTSEnabled is cfg.tts.enabled (default false, HANDOFF §4 stack TTS
+	// row): behind this toggle, every LOCALLY delivered task result/
+	// notification (kahyad/internal/notify.Speaker, wired into
+	// kahyad/internal/ui.HSCli.SendNotification and kahyad/internal/
+	// server's own interactive `kahya ask` completion) is additionally
+	// voiced via `say -v TTSVoice`, AFTER the visual notification has
+	// already been dispatched. `kahya ask --speak` speaks that ONE task's
+	// result regardless of this toggle (Speaker.SpeakRequest.Force) -
+	// never on the Telegram/remote channel either way (see
+	// kahyad/internal/notify/tts.go's own package doc comment).
+	TTSEnabled bool `yaml:"tts_enabled"`
+	// TTSVoice is cfg.tts.voice (default "Yelda" - HANDOFF §4 ⚑).
+	TTSVoice string `yaml:"tts_voice"`
+	// TTSSayBin is cfg.tts.say_bin (default "/usr/bin/say"); tests point
+	// this at a fake script (testdata/fake_say.py) so `make test` never
+	// shells out to the real binary or produces real audio.
+	TTSSayBin string `yaml:"tts_say_bin"`
+	// TTSMaxChars is cfg.tts.max_chars (default 280): an utterance's text
+	// is truncated to this many RUNES (never bytes - Turkish text) before
+	// being spoken - the notification summary, not full outputs (task
+	// spec).
+	TTSMaxChars int `yaml:"tts_max_chars"`
+	// TTSSpeakSecretLane is cfg.tts.speak_secret_lane (default false):
+	// shoulder-surfing-conservative default - a secret-lane-labeled
+	// (W3-08) result is not spoken unless this is explicitly true. Does
+	// NOT touch the §5 lane routing itself (the bytes stay local either
+	// way) - purely whether they are ALSO read aloud.
+	TTSSpeakSecretLane bool `yaml:"tts_speak_secret_lane"`
 }
 
 // TmpDir is W6-02's push-to-talk temp-audio directory: `<data_dir>/tmp`
@@ -565,6 +596,11 @@ type fileConfig struct {
 	RitualWeeklyHour              *int         `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute            *int         `yaml:"ritual_weekly_minute"`
 	HsCliPath                     *string      `yaml:"ui_hs_cli"`
+	TTSEnabled                    *bool        `yaml:"tts_enabled"`
+	TTSVoice                      *string      `yaml:"tts_voice"`
+	TTSSayBin                     *string      `yaml:"tts_say_bin"`
+	TTSMaxChars                   *int         `yaml:"tts_max_chars"`
+	TTSSpeakSecretLane            *bool        `yaml:"tts_speak_secret_lane"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -910,6 +946,15 @@ func defaults(home, env string) Config {
 
 		// W6-01 Hammerspoon palette default (task spec, verbatim).
 		HsCliPath: defaultHsCliPath,
+
+		// W6-05 TTS defaults (task spec, verbatim: enabled=false,
+		// voice=Yelda, say_bin=/usr/bin/say, max_chars=280,
+		// speak_secret_lane=false).
+		TTSEnabled:         false,
+		TTSVoice:           defaultTTSVoice,
+		TTSSayBin:          defaultTTSSayBin,
+		TTSMaxChars:        defaultTTSMaxChars,
+		TTSSpeakSecretLane: false,
 	}
 }
 
@@ -944,6 +989,15 @@ const (
 // dependency on the other purely for a constant (see Config.HsCliPath's
 // own doc comment).
 const defaultHsCliPath = "/opt/homebrew/bin/hs"
+
+// defaultTTSVoice/defaultTTSSayBin/defaultTTSMaxChars are cfg.tts.voice/
+// say_bin/max_chars's own defaults (W6-05, task spec verbatim: "Yelda",
+// "/usr/bin/say", 280).
+const (
+	defaultTTSVoice    = "Yelda"
+	defaultTTSSayBin   = "/usr/bin/say"
+	defaultTTSMaxChars = 280
+)
 
 // intPtr returns a pointer to v — CalendarSpec's fields are all *int (nil
 // means launchd's own StartCalendarInterval "every" semantics), so
@@ -1295,6 +1349,21 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.RitualWeeklyMinute != nil {
 		cfg.RitualWeeklyMinute = *fc.RitualWeeklyMinute
+	}
+	if fc.TTSEnabled != nil {
+		cfg.TTSEnabled = *fc.TTSEnabled
+	}
+	if fc.TTSVoice != nil {
+		cfg.TTSVoice = *fc.TTSVoice
+	}
+	if fc.TTSSayBin != nil {
+		cfg.TTSSayBin = expandHome(*fc.TTSSayBin, home)
+	}
+	if fc.TTSMaxChars != nil {
+		cfg.TTSMaxChars = *fc.TTSMaxChars
+	}
+	if fc.TTSSpeakSecretLane != nil {
+		cfg.TTSSpeakSecretLane = *fc.TTSSpeakSecretLane
 	}
 }
 

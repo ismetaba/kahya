@@ -34,6 +34,7 @@ import (
 	"strings"
 
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/notify"
 )
 
 // DefaultHsCliPath is config key ui.hs_cli's own default (Apple Silicon
@@ -70,8 +71,25 @@ type HSCli struct {
 	// Log is optional (nil skips the warning line, matching this
 	// codebase's usual "unwired dependency" posture).
 	Log *logx.Logger
+	// Speaker is W6-05's TTS speak call - *kahyad/internal/notify.Speaker
+	// satisfies this directly. nil (the default, every pre-W6-05 caller/
+	// test) means SendNotification never attempts to speak at all - same
+	// "unwired dependency" posture as Log. See SendNotification's own doc
+	// comment for exactly when/how this is called - THIS is the one and
+	// only place in this package Speak is ever reached, which is what
+	// makes "a Telegram/remote delivery never reaches the Speaker"
+	// structurally true: kahyad/internal/telegram.Bot's own
+	// SendNotification has no equivalent field at all.
+	Speaker Speaker
 	// run defaults to execRun; tests substitute a fake via NewForTest.
 	run runFunc
+}
+
+// Speaker is the narrow W6-05 TTS surface HSCli's SendNotification calls
+// AFTER dispatching the visual hs.notify banner - *kahyad/internal/
+// notify.Speaker satisfies this directly.
+type Speaker interface {
+	Speak(ctx context.Context, req notify.SpeakRequest)
 }
 
 // New constructs an HSCli. path empty defaults to DefaultHsCliPath.
@@ -153,7 +171,28 @@ func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool
 	if err != nil {
 		return false
 	}
-	return h.Notify(ctx, traceID, payload) == nil
+	ok := h.Notify(ctx, traceID, payload) == nil
+
+	// W6-05: speak the SAME full text, AFTER the visual notification
+	// above has already been dispatched - regardless of whether that
+	// hs.notify exec itself succeeded (this package's own "never loses
+	// the underlying event just because ONE delivery surface failed" doc
+	// comment: a failed VISUAL banner must not also silently swallow a
+	// configured, LOCAL-only spoken one). h.Speaker is nil for every
+	// pre-W6-05 caller/test - Speak is then simply never attempted. This
+	// generic background/scheduled-task delivery path carries no per-call
+	// secret-lane label or --speak override of its own (unlike
+	// kahyad/internal/server's interactive `kahya ask` completion, which
+	// calls Speak directly with its own classified Lane/Force - see that
+	// package's own maybeSpeak) - cfg.tts.enabled (baked into the Speaker
+	// at construction) is the ONLY gate a background job's own
+	// notification speech goes through here; Lane is always
+	// notify.LaneNormal and Force is always false.
+	if h.Speaker != nil {
+		h.Speaker.Speak(ctx, notify.SpeakRequest{TraceID: traceID, Text: text, Lane: notify.LaneNormal})
+	}
+
+	return ok
 }
 
 // exec runs args via h.run, warning (never failing the caller) on error -

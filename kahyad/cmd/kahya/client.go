@@ -1040,6 +1040,12 @@ type streamTaskRequest struct {
 	// never sets it); the resulting transcript becomes the task's prompt
 	// server-side.
 	InputAudioPath string `json:"input_audio_path,omitempty"`
+	// Speak is `kahya ask --speak`'s own field (W6-05): true voices this
+	// ONE task's result even when kahyad's cfg.tts.enabled is false - see
+	// kahyad/internal/server.taskRequest.Speak's own doc comment.
+	// Optional/backward-compatible: absent/false is every pre-W6-05
+	// request body's exact existing behavior.
+	Speak bool `json:"speak,omitempty"`
 }
 
 // StreamTask calls POST /v1/task {"prompt","trace_id":traceID,
@@ -1055,18 +1061,20 @@ type streamTaskRequest struct {
 // pre-W6-01 caller (runOneShot, the REPL, `kahya ask` without
 // --palette-opened-at) keeps using this exact signature unchanged.
 func (c *Client) StreamTask(ctx context.Context, traceID, prompt string, deepThink bool, onDelta func(string)) (taskResult, error) {
-	return c.StreamTaskFull(ctx, traceID, prompt, deepThink, nil, onDelta)
+	return c.StreamTaskFull(ctx, traceID, prompt, deepThink, nil, false, onDelta)
 }
 
-// StreamTaskFull is StreamTask's own general form (W6-01): paletteOpenedAt,
-// when non-nil, is `kahya ask --palette-opened-at <unix-seconds-float>`'s
-// own value (hammerspoon/kahya.lua's hs.timer.secondsSinceEpoch(),
-// captured at hotkey press) - forwarded verbatim onto the wire so kahyad
-// can ledger a palette_open event under this task's own trace_id (see
-// kahyad/internal/server's logPaletteOpen doc comment).
-func (c *Client) StreamTaskFull(ctx context.Context, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, onDelta func(string)) (taskResult, error) {
+// StreamTaskFull is StreamTask's own general form (W6-01/W6-05):
+// paletteOpenedAt, when non-nil, is `kahya ask --palette-opened-at
+// <unix-seconds-float>`'s own value (hammerspoon/kahya.lua's
+// hs.timer.secondsSinceEpoch(), captured at hotkey press) - forwarded
+// verbatim onto the wire so kahyad can ledger a palette_open event under
+// this task's own trace_id (see kahyad/internal/server's logPaletteOpen
+// doc comment). speak is `kahya ask --speak`'s own one-shot TTS override
+// (W6-05).
+func (c *Client) StreamTaskFull(ctx context.Context, traceID, prompt string, deepThink bool, paletteOpenedAt *float64, speak bool, onDelta func(string)) (taskResult, error) {
 	return c.streamTask(ctx, traceID, streamTaskRequest{
-		Prompt: prompt, TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt,
+		Prompt: prompt, TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt, Speak: speak,
 	}, onDelta)
 }
 
@@ -1074,10 +1082,10 @@ func (c *Client) StreamTaskFull(ctx context.Context, traceID, prompt string, dee
 // --audio <path>` sends input_audio_path instead of a typed prompt -
 // kahyad transcribes it locally before this task otherwise proceeds
 // exactly like StreamTaskFull's own request (same deep_think/
-// palette_opened_at wiring, same SSE contract/result mapping).
-func (c *Client) StreamTaskAudio(ctx context.Context, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, onDelta func(string)) (taskResult, error) {
+// palette_opened_at/speak wiring, same SSE contract/result mapping).
+func (c *Client) StreamTaskAudio(ctx context.Context, traceID, audioPath string, deepThink bool, paletteOpenedAt *float64, speak bool, onDelta func(string)) (taskResult, error) {
 	return c.streamTask(ctx, traceID, streamTaskRequest{
-		TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt, InputAudioPath: audioPath,
+		TraceID: traceID, DeepThink: deepThink, PaletteOpenedAt: paletteOpenedAt, Speak: speak, InputAudioPath: audioPath,
 	}, onDelta)
 }
 

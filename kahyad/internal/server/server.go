@@ -166,6 +166,17 @@ type Server struct {
 	secretLaneAnswerer   secretlane.Answerer
 	markSensitiveRead    func(ctx context.Context, sessionKey, traceID string) error
 
+	// speaker wires W6-05's local-only TTS: handleTask/finishSecretLaneTask
+	// (task.go) call speaker.Speak exactly once, AFTER a task's own
+	// terminal SSE "result" event has already been written, for a
+	// SUCCESSFULLY completed task only - see SetSpeaker's doc comment. nil
+	// (the default) means a task's result is never spoken from THIS call
+	// site at all (kahyad/internal/ui.HSCli's OWN, separate, Speaker wiring
+	// still covers background/scheduled-task notifications regardless -
+	// see that package's SendNotification doc comment) - same "unwired
+	// dependency" posture as every other optional Server field.
+	speaker SpeakerService
+
 	// taskResolver/taskDurabilityStore/taskLive wire GET /v1/task/status
 	// and POST /v1/task/resolve (W4-02) - see task_durability.go's
 	// SetTaskDurability doc comment. nil until that setter is called - both
