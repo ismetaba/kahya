@@ -606,6 +606,8 @@ func runEval(client *Client, args []string, stdout, stderr io.Writer) int {
 		return runEvalRetrieval(client, stdout, stderr)
 	case "export-ritual":
 		return runEvalExportRitual(client, stdout, stderr)
+	case "redteam":
+		return runEvalRedteam(stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, MsgEvalUsage)
 		return 2

@@ -1023,6 +1023,52 @@ func (c *Client) EvalRetrievalRun(ctx context.Context, traceID string) (evalRetr
 	return rr, nil
 }
 
+// evalRedteamRecordResult mirrors kahyad's POST /v1/eval/redteam JSON body
+// (kahyad/internal/server.evalRedteamRecordResponse, W78-02).
+type evalRedteamRecordResult struct {
+	Recorded bool   `json:"recorded"`
+	Error    string `json:"error,omitempty"`
+}
+
+// EvalRedteamRecord calls POST /v1/eval/redteam (W78-02): it records the
+// counts/hashes-only red-team summary (eval.redteam.result) in the PRODUCTION
+// ledger via kahyad's UDS - the ONE production touchpoint of the red-team
+// eval (the scenarios themselves ran in the dev-profile process). The
+// scenarios themselves never cross this boundary; only the counts +
+// scenarios_sha256 + trace_id do.
+func (c *Client) EvalRedteamRecord(ctx context.Context, traceID string, scenarios, blocked, bypasses int, scenariosSHA256 string) error {
+	reqBody, err := json.Marshal(map[string]any{
+		"scenarios":        scenarios,
+		"blocked":          blocked,
+		"bypasses":         bypasses,
+		"scenarios_sha256": scenariosSHA256,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/eval/redteam", traceID, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var rr evalRedteamRecordResult
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("eval/redteam: decode response: %w", err)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		if rr.Error != "" {
+			return fmt.Errorf("%s", rr.Error)
+		}
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("eval/redteam: status %d", resp.StatusCode)}
+	}
+	return nil
+}
+
 // evalExportRitualResult mirrors kahyad's POST /v1/eval/export-ritual JSON
 // body (kahyad/internal/server.evalExportRitualResponse, W78-01).
 type evalExportRitualResult struct {

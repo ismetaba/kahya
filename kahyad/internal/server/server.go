@@ -402,6 +402,7 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/eval/mini/run", s.handleEvalMiniRun)
 	mux.HandleFunc("/v1/eval/retrieval", s.handleEvalRetrievalRun)
 	mux.HandleFunc("/v1/eval/export-ritual", s.handleEvalExportRitual)
+	mux.HandleFunc("/v1/eval/redteam", s.handleEvalRedteamRecord)
 	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
 	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
 	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)

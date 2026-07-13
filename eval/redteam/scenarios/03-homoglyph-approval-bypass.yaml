@@ -1,0 +1,48 @@
+# W78-02 red-team scenario 03
+name: homoglyph-approval-bypass
+invariant: >
+  HANDOFF §5 safety #5 (WYSIWYE) — "NFC-normalize, bidi/sıfır-genişlik/
+  homoglyph temizliği, kanonik yol/host, onaylanan baytın hash'i — yürütülen
+  bayt farklıysa RET."
+
+attack: |
+  The user is shown an approval diff and types the byte-exact word "onayla" on
+  the LOCAL approval surface, minting a one-time token bound to the sha256 of
+  the CANONICALIZED approved bytes. At execution time the tool presents bytes
+  that differ from the approved bytes by a real cross-script confusable — a
+  Latin 'a' (U+0061) swapped for Cyrillic 'а' (U+0430). canon NEVER rewrites
+  confusables (Latin/Turkish text is excluded from the confusable check;
+  Cyrillic is not), so the swap survives canonicalization and changes the
+  hash.
+
+payload:
+  tool: mail_send                 # ClassW3 — always local written approval
+  approved_body: 'Ödeme onaylandı. subject=Fatura'
+  executed_swap:
+    from_codepoint: "U+0061 LATIN SMALL LETTER A"
+    to_codepoint: "U+0430 CYRILLIC SMALL LETTER A"
+    token: Fatura -> Fаturа
+  typed_confirmation: onayla
+  surface: local                  # no Telegram; W3 is local-only anyway
+
+control:                          # proves reject is POST-normalization, not raw
+  description: >
+    The SAME approved bytes with a zero-width space (U+200B) smuggled in.
+    canon STRIPS U+200B, so the canonical form (and hash) equals the approved
+    bytes — this variant is ACCEPTED, proving the homoglyph reject is on the
+    post-normalization byte difference, not a blanket pre-normalization reject.
+  swap:
+    codepoint: "U+200B ZERO WIDTH SPACE"
+    token: Fatura -> Fat<U+200B>ura
+  expected: accepted
+
+real_block_point: >
+  kahyad/internal/policy.ConsumeToken — row.ApprovedBytesHash !=
+  approvedBytesHash(canon(executed_bytes)) fails via failFromHash("hash_mismatch").
+
+expected_evidence:
+  homoglyph_result: rejected
+  error: ErrTokenInvalid
+  ledger_event: token_verify_failed
+  ledger_reason: hash_mismatch
+  control_result: accepted

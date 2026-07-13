@@ -300,7 +300,41 @@ const (
 	// MsgEvalUsage is printed when `kahya eval` is given anything other
 	// than a recognized subcommand ("mini"/"retrieval"/"export-ritual").
 	// Exit 2.
-	MsgEvalUsage = "kullanım: kahya eval mini | kahya eval retrieval | kahya eval export-ritual"
+	MsgEvalUsage = "kullanım: kahya eval mini | kahya eval retrieval | kahya eval export-ritual | kahya eval redteam"
+
+	// ---- W78-02: kahya eval redteam ----
+
+	// MsgEvalRedteamRequiresDev is printed (STDERR) and the command exits
+	// nonzero when `kahya eval redteam` is run without KAHYA_ENV=dev - the
+	// red-team eval runs ONLY in the isolated dev profile, never against
+	// production data.
+	MsgEvalRedteamRequiresDev = "kahya eval redteam yalnız KAHYA_ENV=dev profilinde çalışır (ayrı brain.db + deny-all egress). KAHYA_ENV=dev ayarlanmadı; iptal edildi."
+
+	// MsgEvalRedteamBlocked/MsgEvalRedteamBypass prefix each scenario's own
+	// result line: %s = the scenario name.
+	MsgEvalRedteamBlocked = "  BLOKE     %s"
+	MsgEvalRedteamBypass  = "  ATLATILDI %s"
+
+	// MsgEvalRedteamSummary is the summary line: first %d = blocked count,
+	// second %d = total scenario count, third %d = bypass count.
+	MsgEvalRedteamSummary = "Özet: %d/%d senaryo bloke edildi (%d başarılı atlatma)."
+
+	// MsgEvalRedteamGreen/Red report the gate verdict: 0 bypasses opens the
+	// gate, any bypass keeps it closed.
+	MsgEvalRedteamGreen = "Kapı yeşil: kırmızı-takım setinde 0 başarılı atlatma."
+	MsgEvalRedteamRed   = "Kapı kırmızı: kırmızı-takım setinde başarılı atlatma var."
+
+	// MsgEvalRedteamRunError is printed (STDERR) when the harness itself
+	// could not run (e.g. the dev profile could not be resolved/opened):
+	// %s = the underlying error.
+	MsgEvalRedteamRunError = "kırmızı-takım koşusu başarısız: %s"
+
+	// MsgEvalRedteamSummaryRecorded/NotRecorded report whether the
+	// counts/hashes-only summary row was written to the PRODUCTION ledger.
+	// NotRecorded's %s is the reason (a live prod daemon is user-assist; a
+	// failure here never changes the scenario-based exit code).
+	MsgEvalRedteamSummaryRecorded    = "Özet satırı üretim defterine yazıldı (eval.redteam.result)."
+	MsgEvalRedteamSummaryNotRecorded = "Özet satırı üretim defterine yazılamadı (üretim kahyad çalışıyor olmalı): %s"
 
 	// MsgEvalMiniPass/MsgEvalMiniFail prefix each baseline question's own
 	// result line (`kahya eval mini`'s per-question report): %s = the

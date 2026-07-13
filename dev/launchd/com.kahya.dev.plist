@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  W78-02 dev-profile launchd agent. DISTINCT from the production agent
+  (com.kahya.kahyad, kahyad/launchd/com.kahya.kahyad.plist) in every
+  colliding dimension so a dev/red-team daemon and the production daemon can
+  run side by side without ever sharing a file:
+
+    * Label:  com.kahya.dev            (prod: com.kahya.kahyad)
+    * Socket: ~/Library/Application Support/Kahya-dev/kahyad-dev.sock
+              (prod: ~/Library/Application Support/Kahya/kahyad.sock)
+    * Data:   ~/Library/Application Support/Kahya-dev/  (prod: .../Kahya/)
+    * Memory: ~/Kahya-dev/            (prod: ~/Kahya/)
+    * Policy: policy.dev.yaml, deny-all egress (prod: policy.yaml)
+
+  All of that separation follows automatically from KAHYA_ENV=dev (the
+  generic profile resolution in kahyad/internal/config), so this plist only
+  has to set that one env var plus KAHYA_POLICY_PATH. RunAtLoad is FALSE and
+  KeepAlive is FALSE on purpose: the dev profile is loaded on demand for a
+  red-team drill, not kept alive like production. scripts/kahya-dev-env.sh
+  substitutes the __KAHYA_*__ placeholders and provisions the dev profile;
+  it NEVER touches the prod label/socket/data.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.kahya.dev</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__KAHYA_REPO_ROOT__/bin/kahyad</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KAHYA_ENV</key>
+		<string>dev</string>
+		<key>KAHYA_POLICY_PATH</key>
+		<string>__KAHYA_REPO_ROOT__/policy.dev.yaml</string>
+	</dict>
+	<key>KeepAlive</key>
+	<false/>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>__KAHYA_DEV_LOG_DIR__/launchd-kahyad-dev.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__KAHYA_DEV_LOG_DIR__/launchd-kahyad-dev.err.log</string>
+</dict>
+</plist>

@@ -901,14 +901,20 @@ func TestLoadRejectsNonASCIIPath(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidEnv(t *testing.T) {
-	clearEnv(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("KAHYA_ENV", "staging")
+	// W78-02 D1 generalized KAHYA_ENV from a fixed prod/dev enum to any
+	// well-formed profile name (^[a-z0-9-]+$), so an ordinary name like
+	// "staging" is now VALID (it resolves to its own Kahya-staging tree).
+	// Only a MALFORMED name - one that could traverse directories or smuggle
+	// a bad path component into "Kahya-<name>" - must still fail Load closed.
+	for _, bad := range []string{"../etc", "dev/../..", "Staging", "prod dev", ".."} {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("KAHYA_ENV", bad)
 
-	_, err := Load()
-	if err == nil {
-		t.Fatal("Load() error = nil, want rejection of invalid KAHYA_ENV")
+		if _, err := Load(); err == nil {
+			t.Fatalf("Load(KAHYA_ENV=%q) error = nil, want rejection of a malformed KAHYA_ENV", bad)
+		}
 	}
 }
 

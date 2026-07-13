@@ -202,6 +202,22 @@ func run() int {
 		"pid", os.Getpid(),
 	)
 
+	// Fail-LOUD on a non-prod profile: KAHYA_ENV=<name> resolution is generic
+	// (W78-02: any well-formed name gets its own isolated ~/Library/Application
+	// Support/Kahya-<name>/ tree, so W78-05's restore profile works too), which
+	// means a typo'd KAHYA_ENV no longer refuses to boot - it silently runs
+	// against a fresh empty profile. Emit a prominent WARN so a fat-fingered
+	// value (or a stray export leaking into the prod launchd job, which must
+	// never carry KAHYA_ENV) is visible in the logs rather than looking like
+	// "lost all memory".
+	if cfg.Env != config.EnvProd {
+		log.Warn("non_prod_profile_active",
+			"env", cfg.Env,
+			"data_dir", cfg.DataDir,
+			"hint", "this is an isolated profile; the production daemon must NOT set KAHYA_ENV",
+		)
+	}
+
 	// W6-02: <data_dir>/tmp (e.g. ~/Library/Application Support/Kahya/tmp),
 	// 0700 - hammerspoon/kahya.lua's ffmpeg push-to-talk capture writes
 	// ptt-<epoch>.wav there; the worker's own mode="stt" delete-safety

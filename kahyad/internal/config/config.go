@@ -650,7 +650,7 @@ func Load() (Config, error) {
 	// separate brain.db/memory the dev process cannot confuse with prod) -
 	// NOT a separate config file; a dev daemon reading the same config.yaml
 	// as prod but writing its data under Kahya-dev is exactly the intended
-	// separation (and refuseDevProfileOpeningProdDB below still guarantees
+	// separation (and refuseNonProdProfileOpeningProdDB below still guarantees
 	// the DB path itself is never the prod one). At this point in the
 	// pipeline data_dir has not yet been touched by the file or env layers,
 	// so there is exactly one unambiguous place to look.
@@ -729,7 +729,7 @@ func Load() (Config, error) {
 	// database. Checked LAST, against the fully-resolved cfg.DBPath, so
 	// every override layer (file, env, the data_dir-derived fallback just
 	// above) has already had its say.
-	if err := refuseDevProfileOpeningProdDB(cfg, home); err != nil {
+	if err := refuseNonProdProfileOpeningProdDB(cfg, home); err != nil {
 		return Config{}, err
 	}
 
@@ -760,32 +760,84 @@ func reconcileConfigDrivenJobCalendars(cfg *Config) {
 	}
 }
 
-// socketFileName is the control-socket's own filename for env ("dev" gets
-// its own kahyad-dev.sock, never plain kahyad.sock - HANDOFF §6 W7-8 ⚑
-// dev-profile: a separate launchd label/socket per profile so a dev and a
-// prod kahyad could in principle run side by side without colliding).
+// socketFileName is the control-socket's own filename for env. Production
+// ("prod", the default) keeps the plain kahyad.sock; ANY other (non-prod)
+// profile name gets its own "kahyad-<name>.sock" (e.g. dev -> kahyad-dev.sock,
+// redteam -> kahyad-redteam.sock) - HANDOFF §6 W7-8 ⚑ dev-profile: a
+// separate launchd label/socket per profile so a dev/red-team and a prod
+// kahyad could in principle run side by side without colliding. Generic on
+// purpose (W78-02 D1): W78-05's `restore` scratch profile reuses this exact
+// resolution. The PROD filename (kahyad.sock) stays byte-identical to what
+// it always was.
 func socketFileName(env string) string {
-	if env == EnvDev {
-		return "kahyad-dev.sock"
+	if env == EnvProd {
+		return "kahyad.sock"
 	}
-	return "kahyad.sock"
+	return "kahyad-" + env + ".sock"
 }
 
-// refuseDevProfileOpeningProdDB implements the W4-07 HARD CONSTRAINT: fail
-// Load closed when cfg.Env==dev but the fully-resolved cfg.DBPath is
-// nonetheless the real production database path (defaults(home, EnvProd)'s
-// own db_path) - see Load's own call-site comment for why this is checked
-// last, against the final resolved value, not merely against whichever
-// layer happened to set it.
-func refuseDevProfileOpeningProdDB(cfg Config, home string) error {
-	if cfg.Env != EnvDev {
+// refuseNonProdProfileOpeningProdDB implements the W4-07 HARD CONSTRAINT
+// (generalized in W78-02 D1 from dev-only to ANY non-prod profile): fail
+// Load closed when cfg.Env is a non-prod profile (dev, redteam, restore, ...)
+// but the fully-resolved cfg.DBPath is nonetheless the real production
+// database path (defaults(home, EnvProd)'s own db_path) - see Load's own
+// call-site comment for why this is checked last, against the final resolved
+// value, not merely against whichever layer happened to set it. A prod Env
+// is (correctly) allowed to open the prod db; only a profile that has NO
+// business touching prod data is refused.
+func refuseNonProdProfileOpeningProdDB(cfg Config, home string) error {
+	if cfg.Env == EnvProd {
 		return nil
 	}
 	prodDBPath := defaults(home, EnvProd).DBPath
 	if cfg.DBPath == prodDBPath {
-		return fmt.Errorf("config: KAHYA_ENV=dev refuses to open the production brain.db (%s) - dev profile must use a separate db_path/KAHYA_DATA_DIR/KAHYA_DB_PATH", prodDBPath)
+		return fmt.Errorf("config: KAHYA_ENV=%s refuses to open the production brain.db (%s) - a non-prod profile must use a separate db_path/KAHYA_DATA_DIR/KAHYA_DB_PATH", cfg.Env, prodDBPath)
 	}
 	return nil
+}
+
+// ProdDBPath returns the production brain.db path for the current user's
+// home directory - the exact path a KAHYA_ENV=prod (or unset) Load resolves
+// to. Exported for the W78-02 red-team harness's fail-closed guard (it must
+// prove, at runtime, that the profile db it is about to open is NOT this
+// prod path) and its "never opens the prod brain.db" regression test. Uses
+// os.UserHomeDir, exactly like Load; a home-resolution failure surfaces as
+// an error rather than a silently-wrong path.
+func ProdDBPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("config: resolve home dir: %w", err)
+	}
+	return defaults(home, EnvProd).DBPath, nil
+}
+
+// ProdSocketPath returns the production kahyad control-socket path for the
+// current user's home directory (the exact socket a KAHYA_ENV=prod Load
+// resolves to, kahyad.sock). Exported for `kahya eval redteam` (W78-02 D5):
+// the red-team CLI itself runs under KAHYA_ENV=dev, but the post-run
+// eval.redteam.result SUMMARY row must be written by the PRODUCTION kahyad
+// over ITS socket (the only production touchpoint), so the CLI dials this
+// path for that one write regardless of the dev profile it otherwise uses.
+func ProdSocketPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("config: resolve home dir: %w", err)
+	}
+	return defaults(home, EnvProd).Socket, nil
+}
+
+// DefaultRedteamScenariosDir resolves "<repo>/eval/redteam/scenarios", using
+// the exact same repo-root derivation as defaultPolicyPath (two directories
+// up from the running executable). The committed red-team scenario set lives
+// there; `kahya eval redteam` hashes it into the summary row's
+// scenarios_sha256 so a run is tied to the exact attack definitions it
+// exercised.
+func DefaultRedteamScenariosDir() string {
+	repoRoot := "."
+	if exe, err := os.Executable(); err == nil {
+		repoRoot = filepath.Dir(filepath.Dir(exe))
+	}
+	return filepath.Join(repoRoot, "eval", "redteam", "scenarios")
 }
 
 // defaultTickIntervalSeconds mirrors main.go's own pre-W4-07 hardcoded
@@ -811,18 +863,25 @@ func validateTickIntervals(resumeScanSeconds, outboxDispatchSeconds int) error {
 	return nil
 }
 
-// defaults returns Config's built-in defaults for env ("prod" or "dev" -
-// Load always passes a value validateEnv would accept; defaults itself
-// does not re-validate it). W4-07: env=="dev" derives an entirely separate
-// profile - data_dir/memory_dir/kahya_dir/backup_dir/socket all move to
-// their own "-dev"-suffixed paths (~/Library/Application Support/
-// Kahya-dev, ~/Kahya-dev, kahyad-dev.sock) - so a dev-profile kahyad never
-// shares a single file on disk with a production one, by construction,
-// before any override layer even runs.
+// defaults returns Config's built-in defaults for env ("prod", "dev", or
+// any other validateEnv-accepted profile name - Load always passes a value
+// validateEnv would accept; defaults itself does not re-validate it).
+// W4-07/W78-02 D1: any non-"prod" env derives an entirely separate profile -
+// data_dir/memory_dir/kahya_dir/backup_dir/socket all move to their own
+// "-<name>"-suffixed paths (e.g. ~/Library/Application Support/Kahya-dev,
+// ~/Kahya-dev, kahyad-dev.sock; ~/Library/Application Support/Kahya-redteam,
+// kahyad-redteam.sock) - so a non-prod-profile kahyad never shares a single
+// file on disk with a production one, by construction, before any override
+// layer even runs. env=="prod" (or the empty string Load normalizes to it)
+// keeps the exact production paths, byte-identical to what they always were.
 func defaults(home, env string) Config {
 	dataDirName, kahyaDirName := "Kahya", "Kahya"
-	if env == EnvDev {
-		dataDirName, kahyaDirName = "Kahya-dev", "Kahya-dev"
+	if env != EnvProd {
+		// Any non-prod profile (dev, redteam, restore, ...) gets an entirely
+		// separate "Kahya-<name>" data/memory tree (W78-02 D1 - generic on
+		// purpose so W78-05's restore scratch profile reuses it). PROD
+		// ("Kahya") is untouched, byte-identical to what it always was.
+		dataDirName, kahyaDirName = "Kahya-"+env, "Kahya-"+env
 	}
 	dataDir := filepath.Join(home, "Library", "Application Support", dataDirName)
 	kahyaDir := filepath.Join(home, kahyaDirName)
@@ -1474,9 +1533,27 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	}
 }
 
+// envNamePattern is the constraint a non-prod KAHYA_ENV profile name must
+// satisfy (W78-02 D1): lowercase letters, digits, and hyphens only. This is
+// deliberately strict enough that a profile name can NEVER contain a path
+// separator, whitespace, "..", or any other rune that could make
+// "Kahya-<name>" / "kahyad-<name>.sock" traverse out of its intended
+// directory or collide with the prod paths - a malicious KAHYA_ENV export
+// (e.g. "../Kahya", "prod ", "dev/../..") fails Load closed here rather than
+// silently resolving somewhere dangerous.
+var envNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// validateEnv fails Load closed (same posture as every other validate*
+// function) on a malformed KAHYA_ENV. The empty string and "prod" both mean
+// production (Load normalizes "" to EnvProd before this ever runs, but "" is
+// accepted here too for total-ness); any other value must match
+// envNamePattern to be usable as a "-<name>"-suffixed profile directory.
 func validateEnv(env string) error {
-	if env != EnvProd && env != EnvDev {
-		return fmt.Errorf("config: KAHYA_ENV=%q invalid, must be %q or %q", env, EnvProd, EnvDev)
+	if env == "" || env == EnvProd {
+		return nil
+	}
+	if !envNamePattern.MatchString(env) {
+		return fmt.Errorf("config: KAHYA_ENV=%q invalid, must be %q or a profile name matching %s (lowercase letters/digits/hyphen only)", env, EnvProd, envNamePattern.String())
 	}
 	return nil
 }

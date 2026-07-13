@@ -1,0 +1,127 @@
+# policy.yaml — Kâhya's single source of truth for tool registrations,
+# action-class labels, undo recipes, secret-lane globs, fs write-deny
+# globs, and the egress allowlist/volume budgets (W3-01).
+#
+# Loaded and strictly validated by kahyad/internal/policy (unknown keys are
+# a hard error). ANY validation failure puts kahyad into deny-all mode at
+# boot (tasks/README.md global convention: policy error => DENY, never a
+# permissive fallback) — see kahyad/internal/policy/loader.go.
+#
+# Action classes (HANDOFF §4, defined before first use):
+#   R  = salt-okuma (read-only)
+#   W1 = geri-alinabilir yazma (undoable write)
+#   W2 = sert/zor geri alinir yazma (hard-to-undo write)
+#   W3 = geri donussuz (irreversible: para * prod * kimlik * senin adina mesaj)
+#
+# Enforcement (autonomy ladder, undo execution, egress blocking,
+# content-based secret-lane classification) is NOT this file's job — that
+# is W3-02/W3-03/W3-05/W3-08. This file is metadata only.
+
+tools:
+  - name: memory_search
+    class: R
+    reversible: false
+
+  - name: memory_write
+    class: W1
+    reversible: true
+    undo: "git revert of the memory commit"
+
+  - name: memory_forget
+    class: W1
+    reversible: true
+    undo: "git revert"
+
+  - name: fs_read
+    class: R
+    reversible: false
+
+  - name: fs_write
+    class: W1
+    reversible: true
+    undo: "pre-op git checkpoint restore"
+
+  - name: fs_delete
+    class: W1
+    reversible: true
+    undo: "move back from Trash"
+
+  - name: shell_docker
+    class: W2
+    reversible: false
+
+  - name: shell_host
+    class: W2
+    reversible: false
+
+  - name: applescript_run
+    class: W2
+    reversible: false
+
+  - name: jxa_run
+    class: W2
+    reversible: false
+
+  - name: shortcuts_run
+    class: W2
+    reversible: false
+
+  - name: mail_draft
+    class: W1
+    reversible: true
+    undo: "taslak-asla-gönderme — draft is never sent, delete draft"
+
+  - name: mail_send
+    class: W3
+    reversible: false
+
+  - name: telegram_send
+    class: W2
+    reversible: false
+
+# File-path globs only. Content-sourced data (mail bodies, fetched web
+# pages, etc.) is classified at ingest time by W3-08's local content
+# pre-classifier, NEVER by matching a glob against a path — HANDOFF §4's
+# ordering invariant ("policy.yaml globlari yalniz dosya yollari icin")
+# means these globs never see the inside of a file, only its path.
+secret_lane_globs:
+  - "~/Kahya/memory/finans*.md"
+  - "~/Documents/saglik/**"
+  - "~/Documents/kimlik/**"
+
+# Day-1 invariants (HANDOFF §5 safety #6 [flag]). The loader hard-rejects
+# any policy.yaml whose fs_write_deny_globs is missing ANY one of these,
+# verbatim — they exist so a compromised/over-eager agent can never
+# rewrite your shell startup files, LaunchAgents, Hammerspoon config, or
+# kahyad's own ledger/DB directory.
+fs_write_deny_globs:
+  - "~/.zshrc"
+  - "~/.zprofile"
+  - "~/.zshenv"
+  - "~/.bashrc"
+  - "~/.bash_profile"
+  - "~/.profile"
+  - "~/Library/LaunchAgents/**"
+  - "~/.hammerspoon/**"
+  - "~/Library/Application Support/Kahya/**"
+
+# egress.allowlist entries below all omit `ports:`, which now defaults to
+# 443 (HTTPS) ONLY (egress-security review, MINOR G fix —
+# kahyad/internal/policy's EgressAllowEntry doc comment) — every one of
+# these hosts is in fact HTTPS-only, so this is not a behavior change for
+# any of them; add an explicit `ports:` list on an entry if it ever
+# genuinely needs a different/additional port.
+# W78-02 dev-profile policy: DENY-ALL egress. This profile is for the isolated
+# red-team drill (KAHYA_ENV=dev): no off-box byte may ever leave, so no REAL
+# host is allowlisted. The single sentinel entry below uses the RFC 2606
+# `.invalid` reserved TLD, which can never resolve to or match any real host -
+# so every actual egress target (api.anthropic.com, api.telegram.org, an
+# attacker exfil host, ...) is NOT in the allowlist and is refused
+# (egress_blocked_allowlist), and any sensitive-read session's exfil attempt is
+# refused (egress_blocked_sensitive). The loader requires at least one entry
+# (an empty allowlist is a hard error), so this sentinel is how a *loadable*
+# policy expresses deny-all. Do NOT add a real host here.
+egress:
+  allowlist:
+    - host: deny-all.invalid
+  default_daily_byte_budget: 26214400 # 25 MiB, per host (unreached: deny-all blocks first)

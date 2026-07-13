@@ -24,7 +24,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval sandbox-image docker-up hammerspoon-install
+.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam sandbox-image docker-up hammerspoon-install
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -275,3 +275,18 @@ accept-w4: build
 # non-zero when precision < 0.80 (çekimserlik dahil).
 eval-retrieval: build
 	./bin/kahya eval retrieval
+
+# eval-redteam: the W78-02 red-team LIVE DRILL (HANDOFF §6 W7-8 ⚑ "kırmızı-
+# takım evali yalnız KAHYA_ENV=dev profilinde koşar"). It runs `kahya eval
+# redteam` under KAHYA_ENV=dev, which runs the four adversarial scenarios
+# against the ISOLATED dev-profile brain.db (no network, no worker, no cloud -
+# egress deny-all + record-replay), prints a Turkish BLOKE/ATLATILDI table,
+# and exits non-zero if ANY scenario is not blocked. On completion it records
+# the counts/hashes-only eval.redteam.result summary row in the PRODUCTION
+# ledger over the prod kahyad UDS (the only production touchpoint; needs a
+# running prod daemon - user-assist). The four scenarios' BLOCKING is ALSO
+# proven hermetically under `make test` (kahyad/internal/eval
+# TestRedteamAllScenariosBlocked), which needs no daemon and no network.
+# Prerequisite: run scripts/kahya-dev-env.sh once to provision the dev profile.
+eval-redteam: build
+	KAHYA_ENV=dev ./bin/kahya eval redteam
