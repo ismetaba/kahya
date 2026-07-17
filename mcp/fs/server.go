@@ -234,8 +234,29 @@ type Server struct {
 	// kahyad/internal/secretlane directly (internal-package boundary).
 	SecretLaneEscalator SecretLaneEscalator
 
+	// SessionTaintRaiser (optional; nil = no-op) raises the OWNING SESSION's
+	// taint tier to tainted when fs_read returns secret-lane content
+	// (project-review #12). Distinct from SecretLaneEscalator (which widens
+	// the task LANE so cloud egress is blocked): this widens the SESSION
+	// TAINT tier so subsequent non-R (W1/W2/W3) tool calls from the same
+	// session are denied (taint gate = R-tools + notify only). Best-effort:
+	// a raise failure is logged, not fatal — #2's lane escalation already
+	// fail-closes the actual cloud-leak path, and taint.Get's own default
+	// already treats an unresolvable session as tainted, so a transient
+	// resolver hiccup here never opens a hole. kahyad wires this to the
+	// server-side session resolver + taint.Tracker.Raise (this package
+	// cannot import either directly — internal-package boundary).
+	SessionTaintRaiser SessionTaintRaiser
+
 	registry *undoRegistry
 	now      func() time.Time
+}
+
+// SessionTaintRaiser raises the session owning (traceID, taskID) to the
+// tainted tier. Implementations resolve the server-persisted session_id
+// from the trace/task correlation (never a caller-supplied id) themselves.
+type SessionTaintRaiser interface {
+	RaiseSessionTaint(ctx context.Context, traceID, taskID, reason string) error
 }
 
 // SecretLaneEscalator stickily widens taskID's persisted lane to secret.
@@ -504,6 +525,16 @@ func (s *Server) HandleRead(ctx context.Context, traceID, taskID string, args Fs
 			if err := s.SecretLaneEscalator.EscalateTaskLane(ctx, taskID, traceID, ""); err != nil {
 				s.Log.With(traceID).Error("secret_lane_read_escalation_failed", "err", err.Error(), "task_id", taskID)
 				return FsReadOutput{}, fmt.Errorf("fs_read: secret-lane escalation failed: %w", err)
+			}
+		}
+
+		// Project-review #12: also raise the owning SESSION's taint tier so
+		// subsequent non-R tool calls from this session are denied. Best-
+		// effort (see the SessionTaintRaiser field's doc comment for why a
+		// failure here is logged, not fatal).
+		if s.SessionTaintRaiser != nil && traceID != "" {
+			if err := s.SessionTaintRaiser.RaiseSessionTaint(ctx, traceID, taskID, "fs_read:secret_lane"); err != nil {
+				s.Log.With(traceID).Warn("secret_lane_read_taint_raise_failed", "err", err.Error())
 			}
 		}
 	}

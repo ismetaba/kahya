@@ -298,6 +298,33 @@ func TestHandleReadSecretLaneEscalatesOwningTaskLane(t *testing.T) {
 	}
 }
 
+// fakeTaintRaiser records RaiseSessionTaint calls (project-review #12).
+type fakeTaintRaiser struct{ calls []string }
+
+func (f *fakeTaintRaiser) RaiseSessionTaint(_ context.Context, _, taskID, _ string) error {
+	f.calls = append(f.calls, taskID)
+	return nil
+}
+
+// TestHandleReadSecretLaneRaisesSessionTaint is project-review #12's
+// regression: a secret-lane fs_read raises the owning session's taint tier
+// (so subsequent non-R tool calls from that session are denied).
+func TestHandleReadSecretLaneRaisesSessionTaint(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "Documents", "saglik", "t.pdf"), "gizli")
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	raiser := &fakeTaintRaiser{}
+	s := newTestServer(t, home, nil, secretLaneGlobs, pc, &fakeLedger{})
+	s.SessionTaintRaiser = raiser
+	if _, err := s.HandleRead(context.Background(), "trace-taint", "task-taint", FsReadArgs{Path: "~/Documents/saglik/t.pdf"}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if len(raiser.calls) != 1 || raiser.calls[0] != "task-taint" {
+		t.Fatalf("RaiseSessionTaint calls = %v, want [task-taint]", raiser.calls)
+	}
+}
+
 // TestHandleReadSecretLaneAlwaysMarksTaintOnRequestTraceID is the BLOCKER
 // A regression test (replaces the old
 // TestHandleReadSecretLaneSkipsMarkerWithoutSessionID, which proved the
