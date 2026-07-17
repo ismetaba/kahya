@@ -105,8 +105,8 @@ func TestPolicyApprovalsListAndDetail_FSWrite(t *testing.T) {
 	}
 
 	var feedbackResp policyFeedbackResponse
-	postJSON(t, f.client, "/policy/feedback", map[string]any{
-		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local",
+	f.postControlJSON(t, "/policy/feedback", map[string]any{
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID,
 	}, &feedbackResp)
 	if !feedbackResp.OK || feedbackResp.Token == "" {
 		t.Fatalf("approve = %+v, want ok with a token", feedbackResp)
@@ -139,25 +139,74 @@ func TestPolicyFeedback_W3RefusesNonLocalSurface(t *testing.T) {
 		t.Fatalf("policy/check(mail_send) = %+v, want needs_approval", checkResp)
 	}
 
-	var rejected policyFeedbackResponse
-	resp := postJSON(t, f.client, "/policy/feedback", map[string]any{
-		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "telegram",
-	}, &rejected)
-	if resp.StatusCode == http.StatusOK && rejected.OK {
-		t.Fatalf("approve(surface=telegram) on W3 succeeded, want rejected")
-	}
-	assertLedgerHasKind(t, f.store, "trace-w3-http", "w3_nonlocal_approval_rejected")
-
+	// A W3 approve over the CONTROL socket with the byte-exact typed
+	// "onayla" succeeds and mints a token. The `surface` field no longer
+	// exists on the wire; the control listener IS the authenticated local
+	// surface (the engine receives the hardcoded "local").
 	var approved policyFeedbackResponse
-	postJSON(t, f.client, "/policy/feedback", map[string]any{
-		// W6-01: a W3 approve now additionally requires the byte-exact
-		// typed confirmation "onayla" (kahyad/internal/policy.Engine.
-		// Approve's own doc comment) - surface=local alone is no longer
-		// sufficient.
-		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
+	f.postControlJSON(t, "/policy/feedback", map[string]any{
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "typed": "onayla",
 	}, &approved)
 	if !approved.OK || approved.Token == "" {
-		t.Fatalf("approve(surface=local, typed=onayla) = %+v, want ok with a token", approved)
+		t.Fatalf("control approve(typed=onayla) = %+v, want ok with a token", approved)
+	}
+}
+
+// TestWorkerSocketCannotReachApprovalRoutes is the core regression for the
+// W3 self-approval fix (project-review finding #1): a caller holding only
+// the worker socket (KAHYA_SOCKET) — i.e. a prompt-injected worker — cannot
+// reach ANY route that could grant a W3 action, no matter what JSON it
+// POSTs. The privileged mutating routes live only on the human-only control
+// listener; on the worker socket they are simply not mounted (404). This is
+// the structural replacement for the old "surface flag" check, which a
+// worker could forge by sending {"surface":"local"}.
+func TestWorkerSocketCannotReachApprovalRoutes(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+
+	var checkResp policyCheckResponse
+	postJSON(t, f.client, "/policy/check", map[string]any{
+		"trace_id": "trace-w3-worker", "task_id": "t1", "tool_name": "mail_send",
+		"tool_input": map[string]any{"to": "a@b.com", "body": "merhaba"},
+	}, &checkResp)
+	if checkResp.Decision != "needs_approval" || checkResp.PendingApprovalID == "" {
+		t.Fatalf("policy/check(mail_send) = %+v, want needs_approval with an id", checkResp)
+	}
+
+	// Forge every self-approval attempt a worker could make on ITS socket.
+	forgeries := []struct {
+		method, path string
+		body         map[string]any
+	}{
+		{http.MethodPost, "/policy/feedback", map[string]any{"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla"}},
+		{http.MethodPost, "/approvals/" + checkResp.PendingApprovalID + "/decision", map[string]any{"approve": true, "typed": "onayla"}},
+		{http.MethodPost, "/policy/promote", map[string]any{"tool": "mail_send", "class": "W3", "scope": "default"}},
+		{http.MethodPost, "/halt", map[string]any{}},
+	}
+	for _, fo := range forgeries {
+		b, _ := json.Marshal(fo.body)
+		req, _ := http.NewRequest(fo.method, "http://kahyad"+fo.path, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := f.client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", fo.method, fo.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("worker-socket %s %s = %d, want 404 (route not mounted on worker socket)", fo.method, fo.path, resp.StatusCode)
+		}
+	}
+
+	// And the control socket without the bearer is 401, not a silent grant.
+	b, _ := json.Marshal(map[string]any{"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "typed": "onayla"})
+	req, _ := http.NewRequest(http.MethodPost, "http://kahyad/policy/feedback", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := f.controlClient.Do(req) // no Authorization header
+	if err != nil {
+		t.Fatalf("control POST without bearer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("control /policy/feedback without bearer = %d, want 401", resp.StatusCode)
 	}
 }
 

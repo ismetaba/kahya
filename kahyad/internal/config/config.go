@@ -826,6 +826,25 @@ func ProdSocketPath() (string, error) {
 	return defaults(home, EnvProd).Socket, nil
 }
 
+// ControlSocketPath / ControlSecretPath derive the human-only control
+// socket + its per-boot bearer-secret file, both siblings of the main
+// socket. kahyad (server) and the kahya CLI derive them from the SAME
+// agreed main-socket path, so they never disagree without a shared config
+// field. The control listener carries the privileged mutating routes
+// (approve/deny/promote/undo/halt) that grant W3 actions; the per-task
+// worker is never told about it (it only ever gets KAHYA_SOCKET = the main
+// socket), so a prompt-injected worker cannot reach any approval-granting
+// route regardless of the JSON it POSTs. See the server package's
+// Server.controlLn doc comment for the full threat model.
+func ControlSocketPath(mainSocket string) string {
+	return filepath.Join(filepath.Dir(mainSocket), "kahyad-control.sock")
+}
+
+// ControlSecretPath — see ControlSocketPath.
+func ControlSecretPath(mainSocket string) string {
+	return filepath.Join(filepath.Dir(mainSocket), "kahyad-control.secret")
+}
+
 // DefaultRedteamScenariosDir resolves "<repo>/eval/redteam/scenarios", using
 // the exact same repo-root derivation as defaultPolicyPath (two directories
 // up from the running executable). The committed red-team scenario set lives

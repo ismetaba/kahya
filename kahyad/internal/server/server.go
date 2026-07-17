@@ -7,7 +7,9 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -308,6 +310,25 @@ type Server struct {
 	// The kernel releases it on any process death, including SIGKILL.
 	lock *os.File
 
+	// controlLn / controlHTTP are the SECOND, human-only listener (the W3
+	// self-approval fix). The privileged mutating routes (approve/deny a
+	// pending approval, promote/demote autonomy, undo, halt) are mounted
+	// ONLY here, on a separate UDS socket the per-task worker is never told
+	// about (the worker only ever receives KAHYA_SOCKET = cfg.Socket, the
+	// main listener). A prompt-injected worker confined to its own socket
+	// therefore cannot reach any route that could grant a W3 action, no
+	// matter what JSON it POSTs — HANDOFF §5's "yazılı 'onayla' YALNIZ yerel
+	// yüzeyden" enforced by transport reachability, not a self-declared
+	// `surface` flag. controlSecret is a per-boot bearer (defense in depth):
+	// the control mux additionally requires Authorization: Bearer
+	// <controlSecret>, written 0600 to controlSecretPath for the CLI /
+	// Hammerspoon to read; it is never placed in the worker's environment.
+	controlLn         net.Listener
+	controlHTTP       *http.Server
+	controlSecret     string
+	controlSocketPath string
+	controlSecretPath string
+
 	started time.Time
 }
 
@@ -395,17 +416,12 @@ func (s *Server) Prepare() error {
 	mux.HandleFunc("/v1/task", s.handleTask)
 	mux.HandleFunc("/policy/check", s.handlePolicyCheck)
 	mux.HandleFunc("/policy/consume-token", s.handlePolicyConsumeToken)
-	mux.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
 	mux.HandleFunc("/policy/approvals", s.handlePolicyApprovals)
-	// W6-01: the Hammerspoon-facing approval routes (hammerspoon/kahya.lua,
-	// kahyad/cmd/kahya's `kahya approvals show|decide`) — see
-	// approvals_decision.go's own package doc comment.
+	// Read-only approval/state routes stay on the main socket: listing
+	// pending approvals or reading autonomy state can never GRANT an
+	// action, so they are not part of the W3 approval boundary.
 	mux.HandleFunc("GET /approvals/pending", s.handleApprovalsPending)
-	mux.HandleFunc("POST /approvals/{id}/decision", s.handleApprovalsDecision)
-	mux.HandleFunc("POST /debug/emit-approval", s.handleDebugEmitApproval)
 	mux.HandleFunc("/policy/state", s.handlePolicyState)
-	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
-	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
 	mux.HandleFunc("/session/sensitive-read", s.handleSensitiveRead)
 	mux.HandleFunc(jobTriggerPrefix, s.handleJobTrigger)
 	mux.HandleFunc("/v1/task/status", s.handleTaskStatus)
@@ -434,20 +450,104 @@ func (s *Server) Prepare() error {
 	// rows + the metrics aggregates (`kahya readiness`) - see readiness.go's
 	// own doc comment.
 	mux.HandleFunc("GET /readiness", s.handleReadiness)
-	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
-	// ⌥⎋ binding both call this (halt.go's own doc comment).
-	mux.HandleFunc("POST /halt", s.handleHalt)
-
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(mux),
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
+
+	// Second, human-only control listener + mux. Every route mounted here
+	// can GRANT or act on an approval (or halt the daemon); none are
+	// reachable on the worker's socket. See the Server.controlLn doc
+	// comment for the threat model.
+	if err := s.prepareControlListener(); err != nil {
+		return err
+	}
+	control := http.NewServeMux()
+	control.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
+	control.HandleFunc("POST /approvals/{id}/decision", s.handleApprovalsDecision)
+	control.HandleFunc("POST /debug/emit-approval", s.handleDebugEmitApproval)
+	control.HandleFunc("/policy/promote", s.handlePolicyPromote)
+	control.HandleFunc("/policy/undo", s.handlePolicyUndo)
+	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
+	// ⌥⎋ binding both call this (halt.go's own doc comment).
+	control.HandleFunc("POST /halt", s.handleHalt)
+	s.controlHTTP = &http.Server{
+		Handler:           s.withTraceLogging(s.requireControlAuth(control)),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	return nil
 }
 
+// prepareControlListener mints the per-boot bearer secret, writes it 0600
+// for the CLI/Hammerspoon to read, and binds the human-only control
+// socket. A stale socket file from a crashed prior boot is unlinked first
+// (the main listener's flock, held since Prepare, already guarantees no
+// live peer owns it). Fail-closed: any error here aborts Prepare, so the
+// daemon never comes up with the privileged routes unprotected.
+func (s *Server) prepareControlListener() error {
+	s.controlSocketPath = config.ControlSocketPath(s.cfg.Socket)
+	s.controlSecretPath = config.ControlSecretPath(s.cfg.Socket)
+
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return fmt.Errorf("control listener: mint bearer secret: %w", err)
+	}
+	s.controlSecret = hex.EncodeToString(secret)
+	if err := os.WriteFile(s.controlSecretPath, []byte(s.controlSecret), 0o600); err != nil {
+		return fmt.Errorf("control listener: write bearer secret: %w", err)
+	}
+
+	_ = os.Remove(s.controlSocketPath)
+	ln, err := net.Listen("unix", s.controlSocketPath)
+	if err != nil {
+		return fmt.Errorf("control listener: bind %s: %w", s.controlSocketPath, err)
+	}
+	if err := os.Chmod(s.controlSocketPath, 0o600); err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("control listener: chmod %s: %w", s.controlSocketPath, err)
+	}
+	s.controlLn = ln
+	return nil
+}
+
+// requireControlAuth is the bearer gate on the control mux (defense in
+// depth behind socket separation). A missing or non-matching
+// Authorization: Bearer <controlSecret> is rejected with 401 WITHOUT ever
+// reaching the policy engine — fail-closed, and the engine's ladder is
+// never touched by an unauthenticated caller. Constant-time compare so the
+// secret cannot be recovered by timing.
+func (s *Server) requireControlAuth(next http.Handler) http.Handler {
+	want := []byte("Bearer " + s.controlSecret)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if s.controlSecret == "" || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Serve blocks accepting connections until Shutdown is called or a fatal
 // listener error occurs. It returns nil on a clean shutdown.
 func (s *Server) Serve() error {
+	// The human-only control listener runs in its own goroutine; a fatal
+	// error on either listener returns from Serve. ErrServerClosed on the
+	// control side (graceful Shutdown) is not fatal.
+	controlErr := make(chan error, 1)
+	if s.controlHTTP != nil && s.controlLn != nil {
+		go func() {
+			err := s.controlHTTP.Serve(s.controlLn)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				controlErr <- err
+				return
+			}
+			controlErr <- nil
+		}()
+	} else {
+		controlErr <- nil
+	}
+
 	err := s.http.Serve(s.ln)
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -463,6 +563,18 @@ func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(ctx)
+
+	// Stop the human-only control listener too, and remove its socket +
+	// bearer-secret file (both live under the same flock-guarded dir).
+	if s.controlHTTP != nil {
+		_ = s.controlHTTP.Shutdown(ctx)
+	}
+	if s.controlSocketPath != "" {
+		_ = os.Remove(s.controlSocketPath)
+	}
+	if s.controlSecretPath != "" {
+		_ = os.Remove(s.controlSecretPath)
+	}
 
 	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled
 	// kahya.task_id" - best-effort, never fails shutdown itself over a

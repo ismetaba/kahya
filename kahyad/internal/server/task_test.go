@@ -122,7 +122,38 @@ func spawnTestdataDir(t *testing.T) string {
 type taskTestFixture struct {
 	srv    *Server
 	client *http.Client
-	store  *store.Store
+	// controlClient dials the SECOND, human-only control socket (the W3
+	// self-approval fix). Privileged routes (/policy/feedback,
+	// /approvals/{id}/decision, /policy/promote, /policy/undo, /halt) are
+	// reachable only here; use postControlJSON so the per-boot bearer is
+	// attached.
+	controlClient *http.Client
+	store         *store.Store
+}
+
+// postControlJSON POSTs to a privileged route on the control socket with
+// the per-boot bearer attached. Mirrors postJSON but targets f.controlClient.
+func (f taskTestFixture) postControlJSON(t *testing.T, path string, body any, out any) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal control body: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://kahyad"+path, bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("new control request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+f.srv.controlSecret)
+	resp, err := f.controlClient.Do(req)
+	if err != nil {
+		t.Fatalf("control POST %s: %v", path, err)
+	}
+	if out != nil {
+		defer resp.Body.Close()
+		_ = json.NewDecoder(resp.Body).Decode(out)
+	}
+	return resp
 }
 
 func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTestFixture {
@@ -182,7 +213,12 @@ func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return taskTestFixture{srv: srv, client: unixHTTPClient(cfg.Socket), store: st}
+	return taskTestFixture{
+		srv:           srv,
+		client:        unixHTTPClient(cfg.Socket),
+		controlClient: unixHTTPClient(srv.controlSocketPath),
+		store:         st,
+	}
 }
 
 // sseFrame is one parsed "event: X\ndata: Y" frame from a raw SSE body.

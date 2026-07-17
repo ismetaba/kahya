@@ -92,28 +92,76 @@ type streamIncompleteError struct {
 
 func (e *streamIncompleteError) Error() string { return fmt.Sprintf(MsgStreamIncomplete, e.traceID) }
 
-// Client talks HTTP-over-UDS to kahyad.
+// Client talks HTTP-over-UDS to kahyad. It holds TWO transports: the main
+// socket (`sock`) for ordinary routes, and the human-only control socket
+// (`controlSock`) for the privileged mutating routes that grant a W3 action
+// (approve/deny/promote/undo/halt). The control routes additionally require
+// a per-boot bearer (`controlSecret`, read from the 0600 secret file kahyad
+// wrote beside the socket). See config.ControlSocketPath / the server's
+// Server.controlLn doc comment for why these live on a separate socket.
 type Client struct {
-	sock string
-	http *http.Client
+	sock          string
+	http          *http.Client
+	controlSock   string
+	controlSecret string
+	controlHTTP   *http.Client
 }
 
 // newClient builds a Client dialing sock. It sets no blanket client
 // Timeout: /v1/task's SSE stream can legitimately run long, so only the
 // dial (connectTimeout) and the SSE idle-read gap (idleReadTimeout,
-// enforced in readSSE) are bounded.
+// enforced in readSSE) are bounded. It also derives the control socket
+// (config.ControlSocketPath(sock)) and best-effort reads its bearer secret;
+// if the secret file is unreadable the privileged calls simply get a 401
+// (fail-closed) rather than a silent success.
 func newClient(sock string) *Client {
-	return &Client{
-		sock: sock,
-		http: &http.Client{
+	dial := func(target string) *http.Client {
+		return &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					d := net.Dialer{Timeout: connectTimeout}
-					return d.DialContext(ctx, "unix", sock)
+					return d.DialContext(ctx, "unix", target)
 				},
 			},
-		},
+		}
 	}
+	controlSock := config.ControlSocketPath(sock)
+	secret := ""
+	if b, err := os.ReadFile(config.ControlSecretPath(sock)); err == nil {
+		secret = strings.TrimSpace(string(b))
+	}
+	return &Client{
+		sock:          sock,
+		http:          dial(sock),
+		controlSock:   controlSock,
+		controlSecret: secret,
+		controlHTTP:   dial(controlSock),
+	}
+}
+
+// newControlRequest builds a request for a privileged control-socket route,
+// attaching the per-boot bearer. Callers pair it with doControl.
+func (c *Client) newControlRequest(ctx context.Context, method, path, traceID string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, "http://kahyad"+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Kahya-Trace-Id", traceID)
+	req.Header.Set("Authorization", "Bearer "+c.controlSecret)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+// doControl runs a request against the control socket, wrapping transport
+// failures against the control socket path.
+func (c *Client) doControl(req *http.Request) (*http.Response, error) {
+	resp, err := c.controlHTTP.Do(req)
+	if err != nil {
+		return nil, &unreachableError{sock: c.controlSock, err: err}
+	}
+	return resp, nil
 }
 
 // newRequest builds a request against the fake "kahyad" host (only the UDS
@@ -310,11 +358,11 @@ func (c *Client) PolicyPromote(ctx context.Context, traceID, tool, class, scope 
 	if err != nil {
 		return 0, err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/policy/promote", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/policy/promote", traceID, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return 0, err
 	}
@@ -342,11 +390,11 @@ func (c *Client) PolicyUndo(ctx context.Context, traceID, targetTraceID string) 
 	if err != nil {
 		return "", err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/policy/undo", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/policy/undo", traceID, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return "", err
 	}
@@ -462,11 +510,11 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 	if err != nil {
 		return "", err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/policy/feedback", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/policy/feedback", traceID, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return "", err
 	}
@@ -501,11 +549,11 @@ func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, appro
 	if err != nil {
 		return "", err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/approvals/"+url.PathEscape(id)+"/decision", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/approvals/"+url.PathEscape(id)+"/decision", traceID, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return "", err
 	}
@@ -537,11 +585,11 @@ func (c *Client) DebugEmitApproval(ctx context.Context, traceID, class string) (
 	if err != nil {
 		return "", err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/debug/emit-approval", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/debug/emit-approval", traceID, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return "", err
 	}
@@ -704,11 +752,11 @@ func (c *Client) Halt(ctx context.Context, traceID, taskID string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/halt", traceID, bytes.NewReader(body))
+	req, err := c.newControlRequest(ctx, http.MethodPost, "/halt", traceID, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
-	resp, err := c.do(req)
+	resp, err := c.doControl(req)
 	if err != nil {
 		return 0, err
 	}
@@ -718,7 +766,7 @@ func (c *Client) Halt(ctx context.Context, traceID, taskID string) (int, error) 
 		if msg := apiError(resp.Body); msg != "" {
 			return 0, fmt.Errorf("%s", msg)
 		}
-		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("halt: status %d", resp.StatusCode)}
+		return 0, &unreachableError{sock: c.controlSock, err: fmt.Errorf("halt: status %d", resp.StatusCode)}
 	}
 	var hr haltResponse
 	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
