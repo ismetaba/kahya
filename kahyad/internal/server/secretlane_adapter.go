@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"errors"
 
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -43,6 +44,27 @@ func (a *SecretLaneStoreAdapter) SetTaskLane(ctx context.Context, taskID, lane, 
 		UpdatedAt:      rfc3339Now(),
 		ID:             taskID,
 	})
+}
+
+// EscalateTaskLane implements mcp/fs.SecretLaneEscalator (project-review
+// #2): a secret-lane fs_read stickily widens the owning task's lane to
+// secret so the W12-08 proxy backstop 403s the worker's subsequent cloud
+// call. Widen-only: an already-secret task keeps its (possibly more
+// specific) category rather than being clobbered with "unknown". category
+// is "" when the caller matched only a PATH glob and cannot name the
+// finans/saglik/kimlik sub-category — CategoryUnknown is the honest label.
+func (a *SecretLaneStoreAdapter) EscalateTaskLane(ctx context.Context, taskID, traceID, category string) error {
+	if category == "" {
+		category = secretlane.CategoryUnknown
+	}
+	curLane, curCat, found, err := a.GetTaskLane(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if found && curLane == secretlane.LaneSecret && curCat != "" && curCat != secretlane.CategoryNone {
+		return nil // already secret with a specific category; nothing to widen
+	}
+	return a.SetTaskLane(ctx, taskID, secretlane.LaneSecret, category)
 }
 
 // GetTaskLane implements BOTH kahyad/internal/secretlane.TaskLaneStore and
