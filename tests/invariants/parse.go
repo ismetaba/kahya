@@ -216,6 +216,79 @@ func splitRow(row string) []string {
 	return out
 }
 
+// coveredFilePathRE matches a backtick-quoted, repo-relative file path: a
+// slash-containing path ending in a known committed-file extension, with no
+// whitespace, glob (`*`), or leading `/`/`~`. It is deliberately narrow so
+// backtick-wrapped tokens that are NOT committed files are never mistaken for
+// deliverables: tool names (`memory_search`) and columns (`source_tier`) have
+// no slash; pkg/TestName citations (`kahyad/internal/policy/TestFoo`) have a
+// slash but no file extension; globs (`*.md`) and home-relative paths
+// (`~/.zshrc`) are excluded by the character class and leading-char rule.
+var coveredFilePathRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.(?:md|html|txt|go|sql|ya?ml|json|sh|plist|py|toml)$`)
+
+// backtickTokenRE extracts each backtick-delimited span from a raw line
+// (splitRow strips backticks, losing the token boundaries, so committed-file
+// scanning re-reads them from the untouched line text).
+var backtickTokenRE = regexp.MustCompile("`([^`]+)`")
+
+// CoveredFileDeliverable is one committed-file claim in a coverage-map row
+// whose status cell is exactly "covered": a repo-relative path the row
+// asserts is committed. TestCoverageMapCommittedFilesExist os.Stats each one
+// so a "covered" status can never outrun the file it claims.
+type CoveredFileDeliverable struct {
+	Path string // repo-relative file path, e.g. "docs/ipc.md"
+	Line int    // 1-based line number in docs/coverage.md
+}
+
+// ParseCoveredFileDeliverables scans docs/coverage.md for table rows whose
+// status cell is exactly "covered" and returns every backtick-quoted
+// repo-relative file path (coveredFilePathRE) cited in such a row. Rows with
+// any other status — "partial", "GAP …", or a §5-map class cell
+// (ci-hermetic/local-integration, which never equals "covered") — are
+// ignored, so a legitimately-uncommitted deliverable simply must not be
+// marked "covered". This is the file analogue of ParseCoverageMap's cited-
+// test honesty guard.
+func ParseCoveredFileDeliverables(path string) ([]CoveredFileDeliverable, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []CoveredFileDeliverable
+	lineNo := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		lineNo++
+		raw := sc.Text()
+		trimmed := strings.TrimSpace(raw)
+		if !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		covered := false
+		for _, cell := range splitRow(trimmed) {
+			if cell == "covered" {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			continue
+		}
+		for _, m := range backtickTokenRE.FindAllStringSubmatch(raw, -1) {
+			tok := strings.TrimSpace(m[1])
+			if coveredFilePathRE.MatchString(tok) {
+				out = append(out, CoveredFileDeliverable{Path: tok, Line: lineNo})
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TestFuncExists reports whether pkgDir (repo-relative) contains a
 // *_test.go file declaring a top-level func named testName. It parses
 // source with go/parser and therefore sees test functions regardless of

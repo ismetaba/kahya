@@ -33,6 +33,33 @@ const (
 	minSQLiteMinor = 45
 )
 
+// minVecMajor/minVecMinor/minVecPatch is the sqlite-vec floor asserted by
+// assertSQLiteFeatures against vec_version(). The LOCKED design mandates
+// sqlite-vec >= 0.1.9 (HANDOFF §4 stack ⚑: "sqlite-vec (≥0.1.9 pinle …)",
+// docs/HANDOFF.md:88). No upstream github.com/asg017/sqlite-vec-go-bindings
+// release embeds a sqlite-vec C amalgamation >= 0.1.9 yet: the newest
+// published binding is v0.1.7-alpha.2 and the newest STABLE release (what
+// `go get …@latest` selects, and what go.mod pins) is v0.1.6, whose
+// cgo/sqlite-vec.h defines SQLITE_VEC_VERSION "v0.1.6". Pinning the runtime
+// floor at the design's 0.1.9 would fail-closed at boot on the ONLY
+// available binding (HANDOFF §4 ⚑ fail-closed), permanently wedging the
+// daemon, so the enforced floor tracks the achievable embedded version
+// (0.1.6) for now and the honest coverage status is "partial"
+// (docs/coverage.md §4 stack row).
+//
+// TODO(upstream sqlite-vec floor): raise this floor to 0/1/9 once
+// github.com/asg017/sqlite-vec-go-bindings ships a release embedding
+// sqlite-vec C amalgamation >= v0.1.9. Blocked upstream: no such release
+// exists as of 2026-07 (max published binding is v0.1.7-alpha.2). When it
+// lands, bump the go.mod pin, verify SQLITE_VEC_VERSION in the module cache
+// header, raise these three consts, and flip docs/coverage.md §4 stack row
+// from "partial" back to "covered".
+const (
+	minVecMajor = 0
+	minVecMinor = 1
+	minVecPatch = 6
+)
+
 // ErrSQLiteFeatureMissing is returned by Open when the linked SQLite build
 // lacks a feature kahyad's schema requires (too-old sqlite_version(), or no
 // vec_version() at all because sqlite-vec did not load). The caller must
@@ -157,10 +184,13 @@ func migrate(db *sql.DB) error {
 
 // assertSQLiteFeatures fails closed (HANDOFF §4 ⚑) when the linked SQLite
 // build is missing something kahyad's schema depends on: a modern-enough
-// sqlite_version() (>= 3.45, needed by the FTS5/vec0 DDL in migrations/0002)
-// or a working vec_version() (proves the sqlite-vec extension actually
-// loaded on this connection, not just that init() ran). Both are cheap,
-// read-only checks run once at boot, right after migration.
+// sqlite_version() (>= 3.45, needed by the FTS5/vec0 DDL in migrations/0002),
+// a working vec_version() (proves the sqlite-vec extension actually loaded on
+// this connection, not just that init() ran), and a vec_version() at or above
+// the enforced sqlite-vec floor (minVecMajor/Minor/Patch — see that const
+// block for why the floor currently tracks the achievable 0.1.6 rather than
+// the design's 0.1.9). All are cheap, read-only checks run once at boot,
+// right after migration.
 func assertSQLiteFeatures(db *sql.DB) error {
 	var sqliteVersion string
 	if err := db.QueryRow(`SELECT sqlite_version()`).Scan(&sqliteVersion); err != nil {
@@ -177,6 +207,15 @@ func assertSQLiteFeatures(db *sql.DB) error {
 	var vecVersion string
 	if err := db.QueryRow(`SELECT vec_version()`).Scan(&vecVersion); err != nil {
 		return fmt.Errorf("%w: vec_version() query failed (sqlite-vec extension not loaded): %v", ErrSQLiteFeatureMissing, err)
+	}
+	vecMajor, vecMinor, vecPatch, err := parseVecVersion(vecVersion)
+	if err != nil {
+		return err
+	}
+	if vecMajor < minVecMajor ||
+		(vecMajor == minVecMajor && vecMinor < minVecMinor) ||
+		(vecMajor == minVecMajor && vecMinor == minVecMinor && vecPatch < minVecPatch) {
+		return fmt.Errorf("%w: vec_version()=%s, need >= %d.%d.%d", ErrSQLiteFeatureMissing, vecVersion, minVecMajor, minVecMinor, minVecPatch)
 	}
 
 	return nil
@@ -199,6 +238,35 @@ func parseSQLiteVersion(v string) (major, minor int, err error) {
 		return 0, 0, fmt.Errorf("store: malformed sqlite_version() %q: %w", v, err)
 	}
 	return major, minor, nil
+}
+
+// parseVecVersion extracts the major/minor/patch components from a
+// vec_version() string. sqlite-vec reports its version "v"-prefixed
+// ("v0.1.6"), so a leading 'v' is trimmed before splitting on '.'. Unlike
+// parseSQLiteVersion (a major.minor >= 3.45 floor), the sqlite-vec floor is
+// specified to patch precision (>= 0.1.9 in the locked design), so all three
+// components are parsed. A malformed value is wrapped as the
+// ErrSQLiteFeatureMissing sentinel so assertSQLiteFeatures fails closed on it
+// (HANDOFF §4 ⚑) exactly like a missing feature, and main.go can errors.Is it
+// as event=sqlite_feature_missing.
+func parseVecVersion(v string) (major, minor, patch int, err error) {
+	malformed := func() error {
+		return fmt.Errorf("%w: malformed vec_version() %q", ErrSQLiteFeatureMissing, v)
+	}
+	parts := strings.SplitN(strings.TrimPrefix(v, "v"), ".", 3)
+	if len(parts) < 3 {
+		return 0, 0, 0, malformed()
+	}
+	if major, err = strconv.Atoi(parts[0]); err != nil {
+		return 0, 0, 0, malformed()
+	}
+	if minor, err = strconv.Atoi(parts[1]); err != nil {
+		return 0, 0, 0, malformed()
+	}
+	if patch, err = strconv.Atoi(parts[2]); err != nil {
+		return 0, 0, 0, malformed()
+	}
+	return major, minor, patch, nil
 }
 
 // DB returns the underlying *sql.DB for callers that need raw access (e.g.

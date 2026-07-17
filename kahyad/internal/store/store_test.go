@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -468,6 +469,80 @@ func TestParseSQLiteVersion(t *testing.T) {
 		if major != c.wantMajor || minor != c.wantMinor {
 			t.Errorf("parseSQLiteVersion(%q) = (%d, %d), want (%d, %d)", c.in, major, minor, c.wantMajor, c.wantMinor)
 		}
+	}
+}
+
+// TestParseVecVersion is a pure unit test of the major.minor.patch parser
+// used by assertSQLiteFeatures's sqlite-vec floor check. It covers the
+// "v"-prefixed form sqlite-vec actually reports, and asserts a malformed
+// value fails closed as the ErrSQLiteFeatureMissing sentinel (so main.go can
+// errors.Is it, same as a missing feature).
+func TestParseVecVersion(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantMajor int
+		wantMinor int
+		wantPatch int
+		wantErr   bool
+	}{
+		{in: "v0.1.6", wantMajor: 0, wantMinor: 1, wantPatch: 6},
+		{in: "0.1.6", wantMajor: 0, wantMinor: 1, wantPatch: 6},
+		{in: "v0.1.9", wantMajor: 0, wantMinor: 1, wantPatch: 9},
+		{in: "v1.2.30", wantMajor: 1, wantMinor: 2, wantPatch: 30},
+		{in: "garbage", wantErr: true},
+		{in: "v0.1", wantErr: true},
+		{in: "0.1", wantErr: true},
+		{in: "v0.x.6", wantErr: true},
+		{in: "", wantErr: true},
+	}
+	for _, c := range cases {
+		major, minor, patch, err := parseVecVersion(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseVecVersion(%q) error = nil, want error", c.in)
+				continue
+			}
+			if !errors.Is(err, ErrSQLiteFeatureMissing) {
+				t.Errorf("parseVecVersion(%q) error = %v, want it to wrap ErrSQLiteFeatureMissing", c.in, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseVecVersion(%q) error = %v, want nil", c.in, err)
+			continue
+		}
+		if major != c.wantMajor || minor != c.wantMinor || patch != c.wantPatch {
+			t.Errorf("parseVecVersion(%q) = (%d, %d, %d), want (%d, %d, %d)", c.in, major, minor, patch, c.wantMajor, c.wantMinor, c.wantPatch)
+		}
+	}
+}
+
+// TestVecVersionMeetsEnforcedFloor asserts the actually-linked sqlite-vec
+// build satisfies the enforced minVecMajor/Minor/Patch floor, so
+// assertSQLiteFeatures does not fail-closed at Open on the pinned binding.
+// This is the guard that keeps the "achievable floor" honest: if the go.mod
+// binding pin ever drops below the enforced floor, this goes red.
+func TestVecVersionMeetsEnforcedFloor(t *testing.T) {
+	s, err := Open(testCfg(t))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	var vecVersion string
+	if err := s.DB().QueryRow(`SELECT vec_version()`).Scan(&vecVersion); err != nil {
+		t.Fatalf("vec_version(): %v (sqlite-vec extension not loaded)", err)
+	}
+	major, minor, patch, err := parseVecVersion(vecVersion)
+	if err != nil {
+		t.Fatalf("parseVecVersion(%q): %v", vecVersion, err)
+	}
+	below := major < minVecMajor ||
+		(major == minVecMajor && minor < minVecMinor) ||
+		(major == minVecMajor && minor == minVecMinor && patch < minVecPatch)
+	if below {
+		t.Errorf("vec_version() = %s, below enforced floor %d.%d.%d (assertSQLiteFeatures would fail-closed at Open)",
+			vecVersion, minVecMajor, minVecMinor, minVecPatch)
 	}
 }
 
