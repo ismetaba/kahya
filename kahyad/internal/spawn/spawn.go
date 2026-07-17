@@ -81,6 +81,18 @@ const cloudUnreachableEvent = "cloud_unreachable"
 // line.
 const clarificationTurnEvent = "clarification_turn"
 
+// credentialModeKeychain/Passthrough mirror config.CredentialModeKeychain/
+// Passthrough (and kahyad/internal/anthproxy's own copies) — package spawn
+// duplicates the two literals by hand rather than importing config, matching
+// this codebase's established "keep the string values in sync by hand"
+// precedent for these modes. BuildEnv selects how the per-task local token
+// is presented to the worker's CLI based on which of these cfg.CredentialMode
+// carries.
+const (
+	credentialModeKeychain    = "keychain"
+	credentialModePassthrough = "passthrough"
+)
+
 // Config bundles everything Run needs to launch and instrument one worker
 // process for one task (HANDOFF §4 IPC ⚑, frozen in docs/ipc.md).
 type Config struct {
@@ -105,9 +117,13 @@ type Config struct {
 	// governor, cache-hit metric, and egress-gate hook all live at that
 	// proxy point, never in this package).
 	AnthropicBaseURL string
-	// APIKey is ANTHROPIC_API_KEY: a per-task random token
-	// (NewAPIKey, "kahya-task-<hex32>"), NOT a real Anthropic key - the
-	// real key never leaves kahyad (HANDOFF §4 IPC ⚑).
+	// APIKey is the per-task random LOCAL token (NewAPIKey,
+	// "kahya-task-<hex32>"), NOT a real Anthropic key — the real key never
+	// leaves kahyad (HANDOFF §4 IPC ⚑). BuildEnv presents it to the worker's
+	// CLI differently per CredentialMode: as ANTHROPIC_API_KEY in keychain
+	// mode (sent upstream-ward as x-api-key, validated then replaced by the
+	// proxy) or inside ANTHROPIC_CUSTOM_HEADERS as X-Kahya-Task-Token in
+	// passthrough mode (so it never shadows the real upstream credential).
 	APIKey string
 	// MCPBridgePath is KAHYA_MCP_BRIDGE (W12-09): the absolute path to the
 	// kahya-mcp stdio<->UDS bridge binary (bin/kahya-mcp, W12-05) the
@@ -498,6 +514,12 @@ var secretEnvDenylist = map[string]bool{
 	"KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
 	"ANTHROPIC_API_KEY":            true,
 	"ANTHROPIC_AUTH_TOKEN":         true,
+	// ANTHROPIC_CUSTOM_HEADERS: BuildEnv sets this itself in passthrough mode
+	// (carrying ONLY the per-task X-Kahya-Task-Token local proof); an
+	// inherited parent-process value must never shadow that, nor leak an
+	// arbitrary parent-set header straight to the real upstream in keychain
+	// mode (where BuildEnv does not set it at all).
+	"ANTHROPIC_CUSTOM_HEADERS": true,
 }
 
 // filterSecretEnv returns a copy of in with every entry whose NAME (the
@@ -566,7 +588,6 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"KAHYA_SOCKET=" + cfg.Socket,
 		"KAHYA_LOG_DIR=" + cfg.LogDir,
 		"ANTHROPIC_BASE_URL=" + cfg.AnthropicBaseURL,
-		"ANTHROPIC_API_KEY=" + cfg.APIKey,
 		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
 		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
 		"KAHYA_TMP_DIR=" + cfg.TmpDir,
@@ -587,6 +608,27 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_BUG_COMMAND=1",
 	}
+
+	// How the per-task local token is presented to the worker's CLI depends
+	// on credential_mode (finding: a passthrough worker must NOT set
+	// ANTHROPIC_API_KEY to the local token — it would be sent as x-api-key,
+	// shadow the worker's own upstream credential, and then be stripped by
+	// the proxy, leaving the outbound request with no upstream auth at all):
+	//   - passthrough: carry the token in ANTHROPIC_CUSTOM_HEADERS (the CLI
+	//     forwards it on every request as X-Kahya-Task-Token), leaving
+	//     x-api-key/Authorization free for the real upstream credential
+	//     kahyad injects at the proxy.
+	//   - keychain (and the empty default): set ANTHROPIC_API_KEY=<token>;
+	//     the CLI sends it as x-api-key, the proxy validates it locally then
+	//     replaces it with the real Keychain key upstream.
+	// The real upstream credential is NEVER placed here either way (HANDOFF
+	// §4 IPC ⚑: "API anahtarı worker'a verilmez").
+	if cfg.CredentialMode == credentialModePassthrough {
+		extra = append(extra, "ANTHROPIC_CUSTOM_HEADERS=X-Kahya-Task-Token: "+cfg.APIKey)
+	} else {
+		extra = append(extra, "ANTHROPIC_API_KEY="+cfg.APIKey)
+	}
+
 	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
 		pythonPath := wd
 		if existing := os.Getenv("PYTHONPATH"); existing != "" {

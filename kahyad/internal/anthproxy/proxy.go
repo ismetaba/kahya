@@ -190,6 +190,18 @@ type ProxyConfig struct {
 	CredentialMode string // CredentialModeKeychain | CredentialModePassthrough; defaults to passthrough
 	Credential     CredentialSource
 
+	// UpstreamBearer is the real upstream Anthropic credential injected in
+	// passthrough mode (config key upstream_bearer). After the passthrough
+	// Director strips the per-task local-token header, it sets
+	// "Authorization: Bearer <UpstreamBearer>" so the outbound request
+	// actually carries a usable upstream credential (finding: the shipped
+	// passthrough default otherwise reached the upstream with NO credential
+	// and 401'd). Empty leaves Authorization untouched — the hermetic tests
+	// (and a worker that forwards its own credential) rely on that. This
+	// value lives ONLY in kahyad, never in the worker's env, exactly like
+	// keychain mode's Keychain key.
+	UpstreamBearer string
+
 	Governor    *Governor
 	Notifier    notify.Notifier
 	EventLedger EventLedger
@@ -317,7 +329,18 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 					req.Header.Set(cred.name, cred.value)
 				}
 			default: // CredentialModePassthrough
-				stripTokenHeader(req.Header, p.cfg.Token)
+				// The per-task local token rode in X-Kahya-Task-Token (the
+				// worker's CLI forwards it via ANTHROPIC_CUSTOM_HEADERS - see
+				// spawn.BuildEnv); it is NOT a real Anthropic credential and
+				// must never reach the upstream. Strip it, then inject the
+				// real upstream bearer kahyad holds (only when configured;
+				// empty leaves Authorization as-is so hermetic tests without a
+				// bearer still work), exactly as keychain mode injects its
+				// own credential.
+				req.Header.Del("X-Kahya-Task-Token")
+				if p.cfg.UpstreamBearer != "" {
+					req.Header.Set("Authorization", "Bearer "+p.cfg.UpstreamBearer)
+				}
 			}
 		},
 		ModifyResponse: p.wrapResponseBody,
@@ -514,14 +537,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.rp.ServeHTTP(w, r)
 }
 
-// checkLocalAuth implements the task spec's "Reject inbound whose
-// x-api-key/authorization != this task's kahya-task-<hex32> token" — the
-// local token proves this request came from this task's own spawned
-// worker (whichever header the worker's HTTP client happened to carry it
-// in); it does not, on its own, decide what (if anything) is forwarded
-// upstream — applyCredential/Director does that per credential_mode.
+// checkLocalAuth verifies the inbound request carries this task's
+// kahya-task-<hex32> local token — proof it came from this task's own
+// spawned worker. It does not, on its own, decide what (if anything) is
+// forwarded upstream — the Director does that per credential_mode.
+//
+// WHERE the token rides differs by mode: in keychain mode the worker sets
+// ANTHROPIC_API_KEY=<token>, so the CLI presents it as x-api-key (or, for
+// some clients, Authorization). In passthrough mode ANTHROPIC_API_KEY is
+// NOT the local token (it would shadow the worker's own upstream
+// credential and then be stripped, leaving no upstream auth); instead the
+// worker carries the token in a dedicated X-Kahya-Task-Token header via
+// ANTHROPIC_CUSTOM_HEADERS (see spawn.BuildEnv), so this validates THAT
+// header — x-api-key/Authorization in passthrough belong to the upstream.
 func (p *Proxy) checkLocalAuth(r *http.Request) bool {
 	token := p.cfg.Token
+	if p.cfg.CredentialMode == CredentialModePassthrough {
+		if v := r.Header.Get("X-Kahya-Task-Token"); v != "" {
+			return v == token
+		}
+		return false
+	}
 	if v := r.Header.Get("x-api-key"); v != "" {
 		return v == token
 	}
@@ -529,20 +565,6 @@ func (p *Proxy) checkLocalAuth(r *http.Request) bool {
 		return v == token || v == "Bearer "+token
 	}
 	return false
-}
-
-// stripTokenHeader removes exactly the header that carried the local
-// per-task token (passthrough mode, task spec: "forward the worker's own
-// upstream auth header unchanged" — the local token is NOT a real
-// Anthropic credential and must never reach the real upstream; any OTHER
-// auth header is left completely untouched).
-func stripTokenHeader(h http.Header, token string) {
-	if h.Get("x-api-key") == token {
-		h.Del("x-api-key")
-	}
-	if auth := h.Get("Authorization"); auth == token || auth == "Bearer "+token {
-		h.Del("Authorization")
-	}
 }
 
 func (p *Proxy) ledgerAuthReject(ctx context.Context, r *http.Request) {
@@ -678,6 +700,30 @@ func (b *usageCapturingBody) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// Close records usage once on an EARLY teardown that Read never observed
+// an EOF/error for (finding #15): when a task times out mid-stream,
+// killGroup SIGKILLs the worker, the reverse proxy's body copy fails on the
+// WRITE side and returns without a further Read, then Close()s the upstream
+// body — so onDone would otherwise never fire and the call's real cost
+// would never be billed to the governor, letting daily.usd drift below
+// actual spend and slip past the $10/day cap. The `done` guard makes this
+// exactly-once with the Read path (RecordUsage/releaseLocked are already
+// idempotent); io.ErrUnexpectedEOF (not io.EOF) makes onDone mark
+// status="error". No locking: the ReverseProxy performs the body copy and
+// Close on the same goroutine.
+func (b *usageCapturingBody) Close() error {
+	if !b.done {
+		b.done = true
+		if b.isSSE {
+			b.onDone(b.sse.Usage(), io.ErrUnexpectedEOF)
+		} else {
+			u, _ := ParseNonStreamUsage(b.jsonBuf.Bytes())
+			b.onDone(u, io.ErrUnexpectedEOF)
+		}
+	}
+	return b.ReadCloser.Close()
 }
 
 func (b *usageCapturingBody) feedSSE(chunk []byte) {

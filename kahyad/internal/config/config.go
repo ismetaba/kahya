@@ -189,15 +189,27 @@ type Config struct {
 	// comment for the full estimation strategy.
 	EstRequestTokens int64 `yaml:"est_request_tokens"`
 	// CredentialMode selects how kahyad/internal/anthproxy authenticates
-	// to cfg.AnthropicUpstreamURL: "keychain" (original HANDOFF design -
-	// kahyad reads kahya.anthropic from the macOS Keychain and injects
-	// it) or "passthrough" (OWNER AUTH DECISION default - see
-	// kahyad/internal/anthproxy's package doc comment for the full
-	// rationale: the worker authenticates via its own Claude Code SDK
-	// session, so kahyad injects no credential and simply forwards the
-	// worker's own upstream auth header unchanged after validating the
-	// per-task local token).
+	// to cfg.AnthropicUpstreamURL: "keychain" (the shipped DEFAULT - the
+	// original HANDOFF design: kahyad reads kahya.anthropic from the macOS
+	// Keychain and injects it as the outbound credential) or "passthrough"
+	// (the OWNER AUTH DECISION mode - see kahyad/internal/anthproxy's package
+	// doc comment: the worker proves it is this task's own worker with a
+	// per-task local token carried in a dedicated header, and kahyad injects
+	// UpstreamBearer below as the real upstream credential). NOTE: the
+	// default was flipped to keychain (from passthrough) because a shipped
+	// passthrough default with no configured UpstreamBearer has no viable
+	// upstream credential and 401s every cloud task.
 	CredentialMode string `yaml:"credential_mode"`
+
+	// UpstreamBearer is the real upstream Anthropic credential
+	// kahyad/internal/anthproxy injects as "Authorization: Bearer
+	// <UpstreamBearer>" in passthrough mode, after stripping the per-task
+	// local token the worker attached. It lives ONLY in kahyad (never in the
+	// worker's env - spawn.BuildEnv must not carry it), the same isolation
+	// the Keychain key gets in keychain mode. Empty (the default) leaves the
+	// outbound Authorization header untouched, which is what the hermetic
+	// anthproxy tests rely on. Ignored entirely in keychain mode.
+	UpstreamBearer string `yaml:"upstream_bearer"`
 
 	// --- W3-07 Telegram approval bot ---
 
@@ -574,6 +586,7 @@ type fileConfig struct {
 	DowngradeAtRatio              *float64     `yaml:"downgrade_at_ratio"`
 	CacheHitAlarmThreshold        *float64     `yaml:"cache_hit_alarm_threshold"`
 	CredentialMode                *string      `yaml:"credential_mode"`
+	UpstreamBearer                *string      `yaml:"upstream_bearer"`
 	EstRequestTokens              *int64       `yaml:"est_request_tokens"`
 	TelegramChatID                *int64       `yaml:"telegram_chat_id"`
 	TelegramUserID                *int64       `yaml:"telegram_user_id"`
@@ -935,7 +948,10 @@ func defaults(home, env string) Config {
 		TaskTokenCeiling:       500000,
 		DowngradeAtRatio:       0.8,
 		CacheHitAlarmThreshold: 0.5,
-		CredentialMode:         CredentialModePassthrough,
+		// Default keychain (NOT passthrough): the shipped passthrough default
+		// had no viable upstream-auth path (no configured UpstreamBearer), so
+		// every cloud task 401'd. Keychain injects the real Keychain key.
+		CredentialMode: CredentialModeKeychain,
 		// BLOCKER 2's fail-closed reservation fallback (see the field's own
 		// doc comment) - a conservative, committed default: big enough to
 		// not fire on every ordinary call, small enough that a handful of
@@ -1345,6 +1361,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.CredentialMode != nil {
 		cfg.CredentialMode = *fc.CredentialMode
+	}
+	if fc.UpstreamBearer != nil {
+		cfg.UpstreamBearer = *fc.UpstreamBearer
 	}
 	if fc.EstRequestTokens != nil {
 		cfg.EstRequestTokens = *fc.EstRequestTokens
