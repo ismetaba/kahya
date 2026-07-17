@@ -36,6 +36,13 @@ Only **W0-04 (Keychain)** actually gates operation, and finding #4 makes it doub
 
 ---
 
+## Fix status
+
+All 17 findings were addressed on branch `claude/project-review-findings-iat5r9`, one commit per finding (or per co-located cluster), each with a regression test. Verified green with `go build -tags sqlite_fts5 ./...` and the Go test suite (the only packages that don't pass on the Linux review box are the macOS-only ones — `vm_stat`, the Python/MLX worker spawn, and a git default-branch test quirk — which pass on the `macos-latest` CI runner). Two items were deliberately scoped with documented follow-ups:
+
+- **#9** — the two data-safety defects are fixed (undo-window deadline refresh; per-write pre-image stack so no earlier write's pre-image is lost or its fallback copy orphaned). Two lower-impact / higher-blast-radius parts are deferred and documented in the commit: the multi-undo window *re-open* (walk one `kahya undo` back through every write in a task) and Defect C (a query-plane `CheckAdvisory` so the non-binding `/policy/check` early-reject stops minting a token + opening a window).
+- **#11** — a runtime `sqlite-vec` version floor + an honest `coverage.md` were added, but **no upstream `sqlite-vec-go-bindings` release ≥ 0.1.9 exists** (newest is `v0.1.7-alpha.2`; newest stable `v0.1.6`), so the pin honestly stays at 0.1.6 with the floor set to the achievable version and a TODO; `coverage.md` now reads "partial — blocked on upstream release" instead of "covered". Raising to 0.1.9 is blocked on upstream.
+
 ## Findings
 
 Severity: **blocker** (ships broken / defeats a defining safety promise) · **high** (real exploit or data-loss under normal use) · **medium** (correctness/invariant erosion) · **low** (hygiene, hardening, TOCTOU, accounting).
