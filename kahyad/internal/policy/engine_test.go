@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/store"
@@ -542,5 +543,46 @@ func TestUndoWindowIdempotentOnRetry(t *testing.T) {
 
 	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
 		t.Fatalf("open undo_windows rows after 2 identical Check calls = %d, want exactly 1", n)
+	}
+}
+
+// TestUndoWindowDeadlineRefreshedOnReuse is project-review #9's Defect A
+// regression: a second W1 write reusing the first write's window (one
+// trace_id per task) must EXTEND the window's deadline, not leave it pinned
+// at first-open, so the later write gets the full undo grace.
+func TestUndoWindowDeadlineRefreshedOnReuse(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
+
+	base := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	e.SetClock(func() time.Time { return base })
+	in := CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-refresh", ToolInput: []byte(`{}`)}
+	if _, err := e.Check(ctx, in); err != nil {
+		t.Fatalf("first Check: %v", err)
+	}
+	var firstDeadline string
+	if err := st.DB().QueryRow(
+		`SELECT deadline FROM undo_windows WHERE task_id='t1' AND tool='fs_write' AND state='open'`,
+	).Scan(&firstDeadline); err != nil {
+		t.Fatalf("read first deadline: %v", err)
+	}
+
+	// Advance the clock and issue a second write; the deadline must move.
+	e.SetClock(func() time.Time { return base.Add(2 * time.Minute) })
+	if _, err := e.Check(ctx, in); err != nil {
+		t.Fatalf("second Check: %v", err)
+	}
+	var secondDeadline string
+	if err := st.DB().QueryRow(
+		`SELECT deadline FROM undo_windows WHERE task_id='t1' AND tool='fs_write' AND state='open'`,
+	).Scan(&secondDeadline); err != nil {
+		t.Fatalf("read second deadline: %v", err)
+	}
+	if secondDeadline <= firstDeadline {
+		t.Fatalf("deadline after reuse = %s, want later than first-open %s (RFC3339 lexicographic)", secondDeadline, firstDeadline)
+	}
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
+		t.Fatalf("open undo_windows = %d, want still exactly 1 (refreshed, not duplicated)", n)
 	}
 }

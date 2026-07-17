@@ -235,6 +235,16 @@ WHERE task_id = ? AND tool = ? AND trace_id = ? AND state = 'open'
 ORDER BY opened_at DESC
 LIMIT 1;
 
+-- name: RefreshUndoWindowDeadline :exec
+-- Project-review #9 (Defect A): extend an already-open window's deadline.
+-- One trace_id covers a whole task, so a second W1 write reuses the first
+-- write's window (GetOpenUndoWindowByTaskToolTrace above); without this the
+-- window's deadline stayed pinned at first-open, so later writes got less
+-- than the full 5-minute grace. openUndoWindow refreshes it on every reuse.
+UPDATE undo_windows
+SET deadline = ?
+WHERE id = ?;
+
 -- name: ListOpenUndoWindows :many
 SELECT id, task_id, tool, trace_id, opened_at, deadline, state
 FROM undo_windows

@@ -537,6 +537,12 @@ type Querier interface {
 	// definition). There is no corresponding statement anywhere in this
 	// codebase that ever sets tier back to 'clean' on an existing row.
 	RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintParams) error
+	// Project-review #9 (Defect A): extend an already-open window's deadline.
+	// One trace_id covers a whole task, so a second W1 write reuses the first
+	// write's window (GetOpenUndoWindowByTaskToolTrace above); without this the
+	// window's deadline stayed pinned at first-open, so later writes got less
+	// than the full 5-minute grace. openUndoWindow refreshes it on every reuse.
+	RefreshUndoWindowDeadline(ctx context.Context, arg RefreshUndoWindowDeadlineParams) error
 	// Task durability BLOCKER 2(b) fix: kahyad/internal/outbox.Dispatcher's
 	// heartbeat goroutine calls this every leaseDuration/3 for as long as
 	// spawn.Run blocks on a claimed row's re-spawned worker, so a

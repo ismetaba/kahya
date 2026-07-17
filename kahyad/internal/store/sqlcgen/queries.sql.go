@@ -3146,6 +3146,27 @@ func (q *Queries) RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintPa
 	return err
 }
 
+const refreshUndoWindowDeadline = `-- name: RefreshUndoWindowDeadline :exec
+UPDATE undo_windows
+SET deadline = ?
+WHERE id = ?
+`
+
+type RefreshUndoWindowDeadlineParams struct {
+	Deadline string `json:"deadline"`
+	ID       int64  `json:"id"`
+}
+
+// Project-review #9 (Defect A): extend an already-open window's deadline.
+// One trace_id covers a whole task, so a second W1 write reuses the first
+// write's window (GetOpenUndoWindowByTaskToolTrace above); without this the
+// window's deadline stayed pinned at first-open, so later writes got less
+// than the full 5-minute grace. openUndoWindow refreshes it on every reuse.
+func (q *Queries) RefreshUndoWindowDeadline(ctx context.Context, arg RefreshUndoWindowDeadlineParams) error {
+	_, err := q.db.ExecContext(ctx, refreshUndoWindowDeadline, arg.Deadline, arg.ID)
+	return err
+}
+
 const renewOutboxLease = `-- name: RenewOutboxLease :exec
 UPDATE outbox
 SET lease_until = ?

@@ -60,33 +60,70 @@ type undoRecord struct {
 	TrashPath string
 }
 
-// undoRegistry is a small in-memory, mutex-guarded map[trace_id]undoRecord.
+// undoRegistry is a small in-memory, mutex-guarded map[trace_id][]undoRecord.
+//
+// Project-review #9 (Defect B): the value is a STACK, not a single record.
+// One KAHYA_TRACE_ID covers a whole task, so a task doing two fs_writes
+// used to have the second OVERWRITE the first's record — the earlier
+// write's pre-image became unrecoverable and its UndoDir fallback copy was
+// orphaned on disk. Appending instead preserves every write's pre-image;
+// PopByTool consumes them most-recent-first, so `kahya undo` walks back
+// through the writes one at a time.
 type undoRegistry struct {
 	mu      sync.Mutex
-	records map[string]undoRecord
+	records map[string][]undoRecord
 }
 
 func newUndoRegistry() *undoRegistry {
-	return &undoRegistry{records: make(map[string]undoRecord)}
+	return &undoRegistry{records: make(map[string][]undoRecord)}
 }
 
+// Put appends rec to traceID's stack (never overwrites — see the type doc).
 func (r *undoRegistry) Put(traceID string, rec undoRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.records[traceID] = rec
+	r.records[traceID] = append(r.records[traceID], rec)
 }
 
-func (r *undoRegistry) Get(traceID string) (undoRecord, bool) {
+// PopByTool removes and returns the MOST RECENT record for traceID whose
+// Tool == tool (a task may interleave fs_write and fs_delete under one
+// trace; the dispatch decides which recipe to run from the owning
+// undo_windows row's tool, so undo must consume the matching record, not
+// merely the last one pushed). The key is deleted when its stack empties.
+func (r *undoRegistry) PopByTool(traceID, tool string) (undoRecord, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.records[traceID]
-	return rec, ok
+	recs := r.records[traceID]
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Tool == tool {
+			rec := recs[i]
+			r.records[traceID] = append(recs[:i], recs[i+1:]...)
+			if len(r.records[traceID]) == 0 {
+				delete(r.records, traceID)
+			}
+			return rec, true
+		}
+	}
+	return undoRecord{}, false
 }
 
-func (r *undoRegistry) Delete(traceID string) {
+// RemainingUndo reports how many records for traceID are still un-consumed
+// (any tool) — the server's undo dispatch re-opens the window while >0 so a
+// later `kahya undo` can walk back through every write.
+func (r *undoRegistry) RemainingUndo(traceID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return len(r.records[traceID])
+}
+
+// popAll removes and returns every record for traceID (PurgeExpired uses it
+// to clean up ALL orphaned fallback copies when the window expires).
+func (r *undoRegistry) popAll(traceID string) []undoRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	recs := r.records[traceID]
 	delete(r.records, traceID)
+	return recs
 }
 
 // ErrNoUndoRecord is returned by UndoWrite/UndoDelete when no undo record
@@ -115,8 +152,11 @@ var ErrNoUndoRecord = errors.New("fs: no undo record for this trace")
 // writing back unverified bytes could do more damage than refusing), and
 // then written back atomically.
 func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
-	rec, ok := s.registry.Get(traceID)
-	if !ok || rec.Tool != "fs_write" {
+	// Project-review #9 (Defect B): consume the MOST RECENT fs_write record
+	// for this trace (a stack), not a single overwritten one — so a task's
+	// earlier writes are still recoverable one undo at a time.
+	rec, ok := s.registry.PopByTool(traceID, "fs_write")
+	if !ok {
 		return ErrNoUndoRecord
 	}
 
@@ -125,7 +165,6 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 			return fmt.Errorf("fs undo_write: remove newly-created file: %w", err)
 		}
 		s.ledgerUndoExecuted(ctx, traceID, "fs_write", rec.CanonicalPath)
-		s.registry.Delete(traceID)
 		return nil
 	}
 
@@ -155,8 +194,14 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 	}
 
 	s.ledgerUndoExecuted(ctx, traceID, "fs_write", rec.CanonicalPath)
-	s.registry.Delete(traceID)
 	return nil
+}
+
+// RemainingUndo reports how many un-consumed undo records remain for
+// traceID (project-review #9). The server's undo dispatch re-opens the undo
+// window while this is >0 so `kahya undo` can walk back through every write.
+func (s *Server) RemainingUndo(traceID string) int {
+	return s.registry.RemainingUndo(traceID)
 }
 
 // UndoDelete implements fs_delete's undo recipe: moves the file back from
@@ -165,8 +210,8 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 // copy-loses-the-original shortcut), confined to rec.AncestorDir exactly
 // like a fresh write (BLOCKER fix).
 func (s *Server) UndoDelete(ctx context.Context, traceID string) error {
-	rec, ok := s.registry.Get(traceID)
-	if !ok || rec.Tool != "fs_delete" {
+	rec, ok := s.registry.PopByTool(traceID, "fs_delete")
+	if !ok {
 		return ErrNoUndoRecord
 	}
 
@@ -177,7 +222,6 @@ func (s *Server) UndoDelete(ctx context.Context, traceID string) error {
 	}
 
 	s.ledgerUndoExecuted(ctx, traceID, "fs_delete", rec.CanonicalPath)
-	s.registry.Delete(traceID)
 	return nil
 }
 
@@ -202,14 +246,14 @@ func (s *Server) ledgerUndoExecuted(ctx context.Context, traceID, tool, canonica
 // record — which has no CopyPath to purge) — then simply a no-op beyond
 // forgetting the registry entry.
 func (s *Server) PurgeExpired(traceID, taskID, tool string) {
-	rec, ok := s.registry.Get(traceID)
-	if !ok {
-		return
-	}
-	if rec.CopyPath != "" {
-		if err := os.Remove(rec.CopyPath); err != nil && !os.IsNotExist(err) {
-			s.Log.Warn("fs_undo_purge_error", "path", rec.CopyPath, "task_id", taskID, "tool", tool, "err", err.Error())
+	// Project-review #9 (Defect B): purge EVERY record for the expired
+	// trace, removing each fallback copy — the old single-record Get left
+	// earlier writes' UndoDir copies orphaned on disk.
+	for _, rec := range s.registry.popAll(traceID) {
+		if rec.CopyPath != "" {
+			if err := os.Remove(rec.CopyPath); err != nil && !os.IsNotExist(err) {
+				s.Log.Warn("fs_undo_purge_error", "path", rec.CopyPath, "task_id", taskID, "tool", tool, "err", err.Error())
+			}
 		}
 	}
-	s.registry.Delete(traceID)
 }

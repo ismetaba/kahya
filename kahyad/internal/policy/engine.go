@@ -199,6 +199,7 @@ type Store interface {
 	InsertUndoWindow(ctx context.Context, arg sqlcgen.InsertUndoWindowParams) (sqlcgen.UndoWindow, error)
 	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error)
 	GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg sqlcgen.GetOpenUndoWindowByTaskToolTraceParams) (sqlcgen.UndoWindow, error)
+	RefreshUndoWindowDeadline(ctx context.Context, arg sqlcgen.RefreshUndoWindowDeadlineParams) error
 	ListOpenUndoWindows(ctx context.Context) ([]sqlcgen.UndoWindow, error)
 	SetUndoWindowState(ctx context.Context, arg sqlcgen.SetUndoWindowStateParams) error
 }
@@ -855,15 +856,29 @@ func (e *Engine) demote(ctx context.Context, tool string, class ActionClass, sco
 // second one, so a retry never leaves multiple simultaneously-open undo
 // windows for the same action.
 func (e *Engine) openUndoWindow(ctx context.Context, taskID, tool, traceID string) error {
-	if _, err := e.store.GetOpenUndoWindowByTaskToolTrace(ctx, sqlcgen.GetOpenUndoWindowByTaskToolTraceParams{
+	now := e.nowUTC()
+	if existing, err := e.store.GetOpenUndoWindowByTaskToolTrace(ctx, sqlcgen.GetOpenUndoWindowByTaskToolTraceParams{
 		TaskID: taskID, Tool: tool, TraceID: traceID,
 	}); err == nil {
-		return nil // already open - nothing to do
+		// Project-review #9 (Defect A): a window already exists for this
+		// (task, tool, trace) — one trace covers a whole task, so this is a
+		// LATER write reusing the first write's window. Refresh the deadline
+		// so this write also gets the full undo grace instead of whatever
+		// remained of the first write's clock.
+		deadline := rfc3339(now.Add(e.undoWindowDuration))
+		if rerr := e.store.RefreshUndoWindowDeadline(ctx, sqlcgen.RefreshUndoWindowDeadlineParams{
+			Deadline: deadline, ID: existing.ID,
+		}); rerr != nil {
+			return rerr
+		}
+		e.ledgerRaw(ctx, traceID, "undo_window_refreshed", map[string]any{
+			"event": "undo_window_refreshed", "task_id": taskID, "tool": tool, "deadline": deadline,
+		})
+		return nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 
-	now := e.nowUTC()
 	row, err := e.store.InsertUndoWindow(ctx, sqlcgen.InsertUndoWindowParams{
 		TaskID: taskID, Tool: tool, TraceID: traceID,
 		OpenedAt: rfc3339(now), Deadline: rfc3339(now.Add(e.undoWindowDuration)),
