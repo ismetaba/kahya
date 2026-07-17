@@ -349,6 +349,45 @@ func (g *Gate) MeterUsage(ctx context.Context, host string, nbytes int64, sessio
 	g.record(ctx, session, EventMetered, map[string]any{"host": canonical, "bytes": nbytes})
 }
 
+// RemainingBudget reports how many more bytes host may still send against
+// its daily budget TODAY, so proxy.go can cap a CONNECT tunnel or a
+// plain-HTTP response body MID-STREAM (a running cap) rather than only
+// metering it post-hoc. It closes the gap that made an opaque tunnel
+// unbounded: Check admits a CONNECT with nbytes=0 (a tunnel has no
+// pre-known size), so its budget test current+0 > limit only ever refuses
+// a host ALREADY over budget — never the single connection that streams
+// past the limit; MeterUsage then blocks only the NEXT connection.
+//
+// limited is false when the effective limit is unlimited (limit <= 0), in
+// which case remaining is meaningless and the caller MUST NOT cap.
+// Fail-closed (tasks/README.md): a canonicalize or budget-store error
+// returns (0, true, err) so the caller denies, never streams — never a
+// permissive fallback.
+func (g *Gate) RemainingBudget(ctx context.Context, host string) (remaining int64, limited bool, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	canonical, err := CanonicalizeHost(host)
+	if err != nil {
+		return 0, true, fmt.Errorf("egress: RemainingBudget canonicalize %s: %w", host, err)
+	}
+	limit := g.defaultDailyByteBudget
+	if override, ok := g.perHostDailyByteBudget[canonical]; ok {
+		limit = override
+	}
+	if limit <= 0 {
+		return 0, false, nil
+	}
+	var current int64
+	if g.budget != nil {
+		current, err = g.budget.Bytes(ctx, canonical, g.now().Format("2006-01-02"))
+		if err != nil {
+			return 0, true, fmt.Errorf("egress: RemainingBudget read %s: %w", canonical, err)
+		}
+	}
+	return limit - current, true, nil
+}
+
 // MarkSensitiveRead flags sessionID sensitive (SensitiveTracker.Mark,
 // rises-only) and ledgers/logs EventSensitiveMarked — this is the Go-level
 // counterpart of POST /session/sensitive-read: kahyad/internal/server/
@@ -384,6 +423,32 @@ func (g *Gate) DenyDNSRebind(ctx context.Context, host string, session SessionIn
 	defer g.mu.Unlock()
 	reason := fmt.Sprintf(reasonDNSRebindFmt, host)
 	return g.deny(ctx, host, EventBlockedDNSRebind, reason, session)
+}
+
+// DenyBudget records a per-connection budget denial: proxy.go calls this
+// when a CONNECT tunnel's or a plain-HTTP response body's RUNNING byte cap
+// was hit mid-stream (a limit Check's admission test cannot enforce for an
+// opaque tunnel or a streaming body — see RemainingBudget). Mirrors
+// DenyDNSRebind's shape (a SEPARATE deny the proxy performs AFTER Check has
+// already admitted the connection), but reuses Check's own budget event
+// kind (EventBlockedBudget) and Turkish notify, because the cause is the
+// very same daily-budget limit — just enforced in-flight rather than up
+// front — so a ledger/JSONL reader sees one budget vocabulary either way.
+func (g *Gate) DenyBudget(ctx context.Context, host string, session SessionInfo) Decision {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	canonical, err := CanonicalizeHost(host)
+	if err != nil {
+		canonical = host
+	}
+	reason := fmt.Sprintf(reasonBudgetFmt, canonical)
+	d := g.deny(ctx, canonical, EventBlockedBudget, reason, session)
+	if g.notifier != nil {
+		_ = g.notifier.Alarm(ctx, session.TraceID, EventBlockedBudget, reason, map[string]any{
+			"host": canonical, "task_id": session.TaskID,
+		})
+	}
+	return d
 }
 
 func (g *Gate) deny(ctx context.Context, host, event, reason string, session SessionInfo) Decision {

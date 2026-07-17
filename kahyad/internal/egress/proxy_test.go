@@ -536,3 +536,122 @@ func TestProxy_PlainHTTP_AllowlistedHostSucceeds(t *testing.T) {
 		t.Fatalf("body = %q, want %q", body, "hello-plain")
 	}
 }
+
+// ---- FINDING #8: per-connection egress budget cap ----
+
+// TestProxy_CONNECT_TunnelSeveredWhenStreamingPastBudget is FINDING #8's
+// regression test: a single CONNECT tunnel to an allowlisted host must not
+// stream unbounded past that host's daily budget. With a small per-host
+// budget and a response far larger than it, the tunnel must be SEVERED
+// mid-stream (the client never receives the full payload) AND a
+// egress_blocked_budget ledger row must be written — the running cap Check's
+// nbytes=0 admission test alone cannot enforce for an opaque tunnel.
+func TestProxy_CONNECT_TunnelSeveredWhenStreamingPastBudget(t *testing.T) {
+	const payloadSize = 1 << 20 // 1 MiB — far larger than the budget below
+	payload := strings.Repeat("k", payloadSize)
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer backend.Close()
+	backendAddr := backend.Listener.Addr().(*net.TCPAddr)
+
+	ledger := &fakeLedger{}
+	cfg := policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "127.0.0.1", Ports: []int{backendAddr.Port}}},
+		DefaultDailyByteBudget: 64 * 1024, // small enough that a 1 MiB body streams past it
+	}
+	gate := NewGate(cfg, NewSensitiveTracker(), newFakeBudget(), ledger, nil, nil)
+	proxyAddr := startProxy(t, gate)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           proxyURL(proxyAddr),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test-only, self-signed httptest cert
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := httpClient.Get(backend.URL)
+	got := 0
+	if err == nil {
+		body, _ := io.ReadAll(resp.Body) // truncated read once the tunnel is severed
+		resp.Body.Close()
+		got = len(body)
+	}
+	// The tunnel must have been severed: the client either failed outright or
+	// received strictly fewer bytes than the full payload.
+	if err == nil && got >= payloadSize {
+		t.Fatalf("received the full %d-byte payload; the tunnel was NOT severed at the budget cap", got)
+	}
+
+	// A budget denial must have been ledgered. DenyBudget runs after the
+	// tunnel closes (post wg.Wait), which races the client observing the
+	// close, so poll briefly.
+	deadline := time.Now().Add(3 * time.Second)
+	for ledger.count(EventBlockedBudget) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ledger.count(EventBlockedBudget) == 0 {
+		t.Fatal("expected an egress_blocked_budget ledger row after the tunnel was severed at the budget cap")
+	}
+}
+
+// TestProxy_PlainHTTP_RequestBodyCountedExactlyOnce is FINDING #13's
+// regression test: a plain-HTTP POST with a known-size request body must
+// raise the host's daily budget by EXACTLY (request-body + response-body)
+// bytes — not (request-body*2 + response-body), which the old admission-time
+// Check(nbytes=ContentLength) + post-hoc MeterUsage double-count produced.
+func TestProxy_PlainHTTP_RequestBodyCountedExactlyOnce(t *testing.T) {
+	responsePayload := strings.Repeat("r", 300)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = io.WriteString(w, responsePayload)
+	}))
+	defer backend.Close()
+	backendAddr := backend.Listener.Addr().(*net.TCPAddr)
+
+	budget := newFakeBudget()
+	cfg := policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "127.0.0.1", Ports: []int{backendAddr.Port}}},
+		DefaultDailyByteBudget: 1 << 20,
+	}
+	gate := NewGate(cfg, NewSensitiveTracker(), budget, &fakeLedger{}, nil, nil)
+	proxyAddr := startProxy(t, gate)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{Proxy: proxyURL(proxyAddr)},
+		Timeout:   5 * time.Second,
+	}
+
+	requestPayload := strings.Repeat("q", 500)
+	// http.NewRequest with a *strings.Reader sets ContentLength=500 — a
+	// non-chunked body with a known Content-Length, exactly the shape that
+	// used to be double-counted.
+	req, err := http.NewRequest(http.MethodPost, backend.URL, strings.NewReader(requestPayload))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST through proxy failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != responsePayload {
+		t.Fatalf("response body length = %d, want %d", len(body), len(responsePayload))
+	}
+
+	total, err := budget.Bytes(context.Background(), "127.0.0.1", time.Now().Format("2006-01-02"))
+	if err != nil {
+		t.Fatalf("budget.Bytes: %v", err)
+	}
+	want := int64(len(requestPayload) + len(responsePayload))
+	if total != want {
+		t.Fatalf("metered budget = %d, want exactly %d (request-body %d + response-body %d, each counted once)",
+			total, want, len(requestPayload), len(responsePayload))
+	}
+}
