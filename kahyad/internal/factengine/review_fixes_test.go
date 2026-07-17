@@ -165,3 +165,97 @@ func TestAgentDerivedSaturatesAtCapAcrossSessions(t *testing.T) {
 		t.Fatalf("confidence = %v, want the agent_derived cap %v (must SATURATE, not sum below it)", fact.Confidence, CapLogOddsAgentDerived)
 	}
 }
+
+// TestReaffirmationRecoversDeniedFactConfidence is the regression test for
+// review-fix #7: user denial/retraction was irreversible because
+// recomputeConfidence deduped POSITIVE evidence by TIER alone, collapsing
+// every user_asserted affirmation (all carrying the identical
+// CapLogOddsUserAsserted weight) across all sessions to a single
+// contribution, while each independent-session denial added a fresh
+// DenialLogOdds. Once a fact took >=2 same-tier denials (the normal
+// suppression path) no later re-affirmation could raise it - contradicting
+// DenyFact's own contract that a denied-but-still-active fact can recover.
+//
+// Positive evidence must now ACCUMULATE across DISTINCT sessions (enabling
+// recovery) while negative-weight tiers still saturate. Sequence:
+// user_asserted(sessionA) -> deny(sessionB) -> deny(sessionC) [below the
+// injection threshold] -> user_asserted(sessionD) -> confidence back up to
+// 2*CapLogOddsUserAsserted + 2*DenialLogOdds and injection-eligible again.
+func TestReaffirmationRecoversDeniedFactConfidence(t *testing.T) {
+	e, st := newTestEngine(t)
+	ctx := context.Background()
+
+	sessionA := "reaffirm-session-a"
+	sessionD := "reaffirm-session-d"
+	insertCleanSession(t, st, sessionA)
+	insertCleanSession(t, st, sessionD)
+
+	base := Candidate{
+		Subject: "user", Predicate: "likes", Object: "kahve",
+		Provenance: ProvenanceUserAsserted, Evidentiality: Witnessed,
+		ExtractorVer: "user_direct_v1",
+	}
+
+	// 1) Initial user-asserted affirmation from a clean session.
+	firstCand := base
+	firstCand.SessionID = sessionA
+	factID, err := e.WriteFact(ctx, "trace-affirm-1", firstCand)
+	if err != nil {
+		t.Fatalf("WriteFact(user_asserted, sessionA) error = %v", err)
+	}
+	afterFirst, err := e.GetFact(ctx, factID)
+	if err != nil {
+		t.Fatalf("GetFact(after first affirm) error = %v", err)
+	}
+	if !almostEqual(afterFirst.Confidence, CapLogOddsUserAsserted) {
+		t.Fatalf("confidence after first affirm = %v, want %v", afterFirst.Confidence, CapLogOddsUserAsserted)
+	}
+	if !InjectionEligible(afterFirst) {
+		t.Fatal("freshly user-asserted fact must be injection-eligible")
+	}
+
+	// 2) Two denials from DISTINCT sessions (the normal suppression path)
+	//    drive confidence below the injection threshold.
+	if err := e.DenyFact(ctx, "trace-deny-b", factID, "reaffirm-session-b"); err != nil {
+		t.Fatalf("DenyFact(sessionB) error = %v", err)
+	}
+	if err := e.DenyFact(ctx, "trace-deny-c", factID, "reaffirm-session-c"); err != nil {
+		t.Fatalf("DenyFact(sessionC) error = %v", err)
+	}
+	afterDenials, err := e.GetFact(ctx, factID)
+	if err != nil {
+		t.Fatalf("GetFact(after denials) error = %v", err)
+	}
+	wantAfterDenials := CapLogOddsUserAsserted + 2*DenialLogOdds
+	if !almostEqual(afterDenials.Confidence, wantAfterDenials) {
+		t.Fatalf("confidence after two denials = %v, want %v", afterDenials.Confidence, wantAfterDenials)
+	}
+	if afterDenials.Confidence >= InjectionThresholdLogOdds {
+		t.Fatalf("confidence after two denials = %v, want below injection threshold %v", afterDenials.Confidence, InjectionThresholdLogOdds)
+	}
+	if InjectionEligible(afterDenials) {
+		t.Fatal("a fact suppressed by two denials must not be injection-eligible")
+	}
+
+	// 3) A fresh user-asserted affirmation from a DISTINCT clean session
+	//    accumulates a second positive contribution and recovers confidence.
+	fourthCand := base
+	fourthCand.SessionID = sessionD
+	if _, err := e.WriteFact(ctx, "trace-affirm-2", fourthCand); err != nil {
+		t.Fatalf("WriteFact(user_asserted, sessionD) error = %v", err)
+	}
+	recovered, err := e.GetFact(ctx, factID)
+	if err != nil {
+		t.Fatalf("GetFact(after re-affirm) error = %v", err)
+	}
+	wantRecovered := 2*CapLogOddsUserAsserted + 2*DenialLogOdds
+	if !almostEqual(recovered.Confidence, wantRecovered) {
+		t.Fatalf("confidence after re-affirmation = %v, want %v (positive evidence must accumulate across distinct sessions)", recovered.Confidence, wantRecovered)
+	}
+	if recovered.Confidence <= afterDenials.Confidence {
+		t.Errorf("re-affirmation must RAISE confidence: got %v, was %v after denials", recovered.Confidence, afterDenials.Confidence)
+	}
+	if !InjectionEligible(recovered) {
+		t.Fatal("re-affirmed fact must recover injection eligibility (denial/retraction is NOT irreversible)")
+	}
+}
