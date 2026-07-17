@@ -467,14 +467,27 @@ func (idx *Indexer) processFile(ctx context.Context, e fileEntry, full bool) (fi
 		return 0, 0, fmt.Errorf("lookup episode for %s: %w", e.relPath, err)
 	}
 
-	// Skip only when truly unchanged: same hash AND already active. A
-	// resurrected file (status='deleted' from a prior run, now back on
-	// disk with the SAME bytes it had before deletion) must still be
-	// rechunked - its chunks/FTS rows were removed when it was marked
-	// deleted, so a hash-only comparison would wrongly leave it
-	// unsearchable forever.
+	// Skip only when truly unchanged: same hash AND already active AND the
+	// stored tier still matches the tier we just resolved. A resurrected
+	// file (status='deleted' from a prior run, now back on disk with the
+	// SAME bytes it had before deletion) must still be rechunked - its
+	// chunks/FTS rows were removed when it was marked deleted, so a
+	// hash-only comparison would wrongly leave it unsearchable forever.
+	//
+	// The source_tier check matters because resolveUserEditTier depends on
+	// git state (clean tree + author=='user <user@kahya.local>'), NOT on
+	// file bytes: a file's authoritative tier can change while its hash does
+	// not. Example: an external edit indexed against a dirty tree stores
+	// 'user_asserted', then a later byte-preserving user-authored commit
+	// resolves 'user_edit' - without this check the fast path would freeze
+	// the stale 'user_asserted' forever, leaving the top-of-lattice
+	// 'user_edit' tier unreachable. The symmetric downgrade (a
+	// byte-preserving author rewrite that should drop a stale 'user_edit')
+	// is covered too. A tier-only change falls through to the update branch
+	// below, which re-chunks and re-persists the corrected tier.
 	if !full && !notFound && existing.Status == statusActive &&
-		existing.SourceHash.Valid && existing.SourceHash.String == hash {
+		existing.SourceHash.Valid && existing.SourceHash.String == hash &&
+		existing.SourceTier == tier {
 		return fileUnchanged, 0, nil
 	}
 
