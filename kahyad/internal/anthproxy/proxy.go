@@ -337,7 +337,16 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 				// empty leaves Authorization as-is so hermetic tests without a
 				// bearer still work), exactly as keychain mode injects its
 				// own credential.
+				// Strip EVERY carrier the per-task local token could have
+				// arrived in (X-Kahya-Task-Token canonically, but also
+				// x-api-key/Authorization for a client that set
+				// ANTHROPIC_API_KEY=<token> — see checkLocalAuth) so it never
+				// reaches the upstream, then inject the real upstream bearer
+				// kahyad holds (only when configured; empty leaves headers as-
+				// is so hermetic tests without a bearer still work).
 				req.Header.Del("X-Kahya-Task-Token")
+				req.Header.Del("x-api-key")
+				req.Header.Del("Authorization")
 				if p.cfg.UpstreamBearer != "" {
 					req.Header.Set("Authorization", "Bearer "+p.cfg.UpstreamBearer)
 				}
@@ -552,11 +561,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // header — x-api-key/Authorization in passthrough belong to the upstream.
 func (p *Proxy) checkLocalAuth(r *http.Request) bool {
 	token := p.cfg.Token
+	// Passthrough mode's canonical carrier is X-Kahya-Task-Token (the real
+	// worker's CLI forwards it via ANTHROPIC_CUSTOM_HEADERS). But local auth
+	// only proves the request carries kahyad's own per-task secret, so we
+	// also accept that same token presented the keychain-mode way (x-api-key
+	// / Authorization) — a client that sets ANTHROPIC_API_KEY=<token> is
+	// still an authenticated local caller. The passthrough Director strips
+	// ALL of these carriers before the request reaches the upstream, so
+	// accepting them here never lets the local token leak off-box.
 	if p.cfg.CredentialMode == CredentialModePassthrough {
 		if v := r.Header.Get("X-Kahya-Task-Token"); v != "" {
 			return v == token
 		}
-		return false
 	}
 	if v := r.Header.Get("x-api-key"); v != "" {
 		return v == token
