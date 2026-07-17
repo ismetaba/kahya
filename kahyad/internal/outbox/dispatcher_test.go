@@ -95,6 +95,49 @@ func newTestDispatcher(st *store.Store, m *task.Machine, cmd []string) *Dispatch
 	return d
 }
 
+// TestDispatcherAcksResumeRowForTerminalTask is project-review #6's own
+// regression: a resume row for an already-DONE task must be ACKed
+// (delivered), not left to be re-claimed every lease period forever
+// (illegal done->executing transition returned without markDelivered = a
+// zombie loop bumping attempts + appending events to the ledger on each
+// pass). One ClaimAndDispatch acks the row; a second pass claims nothing.
+func TestDispatcherAcksResumeRowForTerminalTask(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	// Force the task terminal directly (a worker completed it but was
+	// SIGKILLed before its own processResume acked the row).
+	if _, err := st.DB().Exec(`UPDATE tasks SET status = 'done' WHERE id = 't1'`); err != nil {
+		t.Fatalf("force done: %v", err)
+	}
+	enqueueResumeRow(t, st, "t1")
+	m := task.NewMachine(st.Queries, st)
+	d := newTestDispatcher(st, m, []string{"python3", "-c", "pass"})
+
+	claimed, err := d.ClaimAndDispatch(context.Background())
+	if err != nil {
+		t.Fatalf("ClaimAndDispatch() error = %v", err)
+	}
+	if claimed != 1 {
+		t.Fatalf("claimed = %d, want 1 (the terminal-task row is claimed then acked)", claimed)
+	}
+	var undelivered int
+	if err := st.DB().QueryRow(
+		`SELECT count(*) FROM outbox WHERE dispatched_at IS NULL AND canceled_at IS NULL`,
+	).Scan(&undelivered); err != nil {
+		t.Fatalf("count undelivered: %v", err)
+	}
+	if undelivered != 0 {
+		t.Fatalf("undelivered resume rows = %d, want 0 (a done task's row must be acked, never zombie-looped)", undelivered)
+	}
+	claimed2, err := d.ClaimAndDispatch(context.Background())
+	if err != nil {
+		t.Fatalf("2nd ClaimAndDispatch() error = %v", err)
+	}
+	if claimed2 != 0 {
+		t.Fatalf("2nd pass claimed = %d, want 0 (row already acked)", claimed2)
+	}
+}
+
 func TestDispatcherResumesWithOriginalSessionIDAndTraceID(t *testing.T) {
 	st := testStore(t)
 	insertTaskWithEnvelope(t, st, "t1", "sess-original-123")

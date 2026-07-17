@@ -119,6 +119,10 @@ type LiveChecker interface {
 // needs. *sqlcgen.Queries satisfies this directly.
 type OutboxEnqueuer interface {
 	InsertOutboxRow(ctx context.Context, arg sqlcgen.InsertOutboxRowParams) (sqlcgen.Outbox, error)
+	// CountUndeliveredResumeOutboxRows backs enqueueResume's dedup guard
+	// (project-review #6): don't stack a second task_resume row for a task
+	// that already has one pending.
+	CountUndeliveredResumeOutboxRows(ctx context.Context, taskID sql.NullString) (int64, error)
 }
 
 var _ OutboxEnqueuer = (*sqlcgen.Queries)(nil)
@@ -316,6 +320,17 @@ func writeOutboxResumeRowAt(ctx context.Context, outbox OutboxEnqueuer, traceID,
 // 'executing' in either case) and writes the resume row. The task's OWN
 // status is left at 'executing' throughout - nothing here changes it.
 func (r *Resume) enqueueResume(ctx context.Context, traceID, taskID string) error {
+	// Project-review #6 dedup: if a task_resume row for this task is already
+	// pending (undelivered, not canceled), do NOT enqueue another or bump
+	// attempts. The 30s resume scan can otherwise fire repeatedly while a
+	// task is still synchronously executing (not yet live-registered), and
+	// every extra row becomes a done-zombie re-claimed forever once the task
+	// finishes. A count error is non-fatal — fall through and enqueue (the
+	// dispatcher's own terminal-state guard now acks any stragglers), never
+	// silently drop a legitimate resume.
+	if n, err := r.outbox.CountUndeliveredResumeOutboxRows(ctx, sql.NullString{String: taskID, Valid: true}); err == nil && n > 0 {
+		return nil
+	}
 	ts := r.nowRFC3339()
 	if _, err := r.store.IncrementTaskAttempts(ctx, sqlcgen.IncrementTaskAttemptsParams{UpdatedAt: ts, ID: taskID}); err != nil {
 		return fmt.Errorf("increment attempts: %w", err)

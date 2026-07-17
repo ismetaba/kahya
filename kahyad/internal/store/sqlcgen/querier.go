@@ -76,6 +76,12 @@ type Querier interface {
 	// of its current status.
 	CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error)
 	CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID string) (int64, error)
+	// Project-review #6: how many task_resume rows are already pending (not yet
+	// delivered, not canceled) for taskID. enqueueResume consults this before
+	// inserting another, so the 30s resume scan cannot stack duplicate resume
+	// rows for a task that is still (synchronously) executing; duplicates are
+	// what later become done-zombies re-claimed forever once the task finishes.
+	CountUndeliveredResumeOutboxRows(ctx context.Context, taskID sql.NullString) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
 	// WriteFact's upsert lookup: an existing ACTIVE fact for this exact
 	// (subject, predicate, object) gets a new evidence row instead of a

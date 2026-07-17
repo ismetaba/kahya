@@ -219,6 +219,24 @@ func (q *Queries) CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID 
 	return count, err
 }
 
+const countUndeliveredResumeOutboxRows = `-- name: CountUndeliveredResumeOutboxRows :one
+SELECT COUNT(*) FROM outbox
+WHERE task_id = ? AND kind = 'task_resume'
+  AND dispatched_at IS NULL AND canceled_at IS NULL
+`
+
+// Project-review #6: how many task_resume rows are already pending (not yet
+// delivered, not canceled) for taskID. enqueueResume consults this before
+// inserting another, so the 30s resume scan cannot stack duplicate resume
+// rows for a task that is still (synchronously) executing; duplicates are
+// what later become done-zombies re-claimed forever once the task finishes.
+func (q *Queries) CountUndeliveredResumeOutboxRows(ctx context.Context, taskID sql.NullString) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUndeliveredResumeOutboxRows, taskID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
 DELETE FROM chunks WHERE episode_id = ?
 `
