@@ -102,8 +102,15 @@ test: venv build
 		echo "W5-05 acceptance gate FAILED" >&2; \
 		exit 1; \
 	fi
+	@# FINDING #17 fix: with Docker up, mcp/shell's container tests must
+	@# PASS (never skip), but they need the pinned sandbox image present -
+	@# `test` does not otherwise depend on `sandbox-image`, so on a box that
+	@# never built it the tag kahya-sandbox:0.1.0 is missing, the digest pin
+	@# check fails, and container_test.go t.Fatalf's. Build (and re-pin) the
+	@# reproducible image FIRST so the committed digest matches what's built.
 	@if docker info >/dev/null 2>&1; then \
 		echo "docker daemon detected -- exporting KAHYA_DOCKER_TESTS=1 (mcp/shell's container tests must PASS, never skip, from here on)"; \
+		$(MAKE) sandbox-image; \
 		KAHYA_DOCKER_TESTS=1 go test -tags $(TEST_TAGS) ./...; \
 	else \
 		echo "docker daemon not available -- mcp/shell's container-requiring tests are NOT run (KAHYA_DOCKER_TESTS unset); suite stays green"; \

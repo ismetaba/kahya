@@ -29,6 +29,11 @@ make sandbox-image   # builds kahya-sandbox:<version>, pins docker/sandbox/IMAGE
 
 `shell_docker` refuses to run until this has completed once (fail-closed).
 
+With Docker running, run `make sandbox-image` before `make test` (or just
+run `make test` — it builds and re-pins the image for you first, so the
+container tests find the pinned image and PASS rather than fail the digest
+check).
+
 ## Egress network (W3-05)
 
 `needs_network: true` shell_docker jobs attach to an internal Docker

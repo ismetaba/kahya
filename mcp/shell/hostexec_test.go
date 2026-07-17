@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -247,5 +248,82 @@ func TestHandle_LsAndStatCanonicalizePaths(t *testing.T) {
 	_, err = h.Handle(context.Background(), "trace-2", "task-1", HostExecArgs{Command: "stat", Args: []string{"-l", target}})
 	if err == nil {
 		t.Fatal("expected flag-shaped stat arg to be denied")
+	}
+}
+
+// ---- FINDING #3: a repo-local <repo>/.git/config must NOT run arbitrary
+// host programs during `git status`. Exercises the REAL host git path (no
+// fakeExecutor — NewHostExec's default processExecutor, which shells out to
+// git for real), so it needs `git` on PATH; skips cleanly if absent. ----
+
+func TestHandle_GitStatusIgnoresRepoLocalFsmonitor(t *testing.T) {
+	if _, err := osexec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH — skipping the real-host-git FINDING #3 test")
+	}
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(t.TempDir()): %v", err)
+	}
+	// A model would fs_write ~/scratch/r/.git/config; mirror that layout.
+	repo := filepath.Join(home, "scratch", "r")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// git setup runs with the SYSTEM/GLOBAL config already neutralized so a
+	// stray host ~/.gitconfig can never make this fixture flaky.
+	gitEnv := append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := osexec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init")
+	// A staged file makes the index non-empty, so `git status` refreshes it
+	// against fsmonitor — i.e. WITHOUT the fix, git would invoke the hostile
+	// program below.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "a.txt")
+
+	// core.fsmonitor is invoked as a PROGRAM by `git status`; point it at a
+	// marker-writing script. If git ever runs it, the marker appears.
+	marker := filepath.Join(home, "PWNED")
+	script := filepath.Join(home, "fsmonitor.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+marker+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(repo, ".git", "config")
+	f, err := os.OpenFile(cfg, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("[core]\n\tfsmonitor = " + script + "\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// exec == nil → NewHostExec wires the real processExecutor (scrubGitEnv
+	// on); policy allows so the run reaches git for real.
+	h := NewHostExec(home, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, newFakeLogger(), nil)
+	out, err := h.Handle(context.Background(), "trace-1", "task-1", HostExecArgs{
+		Command: "git", RepoPath: repo, Args: []string{"status"},
+	})
+	if err != nil {
+		t.Fatalf("git status should still execute cleanly: %v (stderr=%s)", err, out.Stderr)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("core.fsmonitor program was executed — marker %q exists: host code execution NOT prevented", marker)
+	}
+	if !strings.Contains(strings.Join(out.Argv, " "), "-c core.fsmonitor=false") {
+		t.Fatalf("executed argv must disable core.fsmonitor, got: %v", out.Argv)
 	}
 }

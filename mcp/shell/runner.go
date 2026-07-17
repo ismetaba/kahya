@@ -183,10 +183,33 @@ type Executor interface {
 // NEVER a shell string, anywhere (HANDOFF §5 safety #6's "ikili-allowlist
 // güvenlik sınırı değil" applies equally to how THIS package itself
 // invokes docker/git/ls/stat: no interpolation, ever).
-type processExecutor struct{}
+type processExecutor struct {
+	// scrubGitEnv, when set, ALSO hardens the ENVIRONMENT a `git` child
+	// runs under (FINDING #3 fix, LAYER 2 — companion to hostexec.go's
+	// hardenedGitArgv). hostexec.go's -c overrides neutralize a hostile
+	// repo-local <repo>/.git/config, but git still reads the SYSTEM/GLOBAL
+	// config files and $GIT_CONFIG_* — a poisoned ~/.gitconfig or an
+	// inherited GIT_CONFIG_GLOBAL could reintroduce the very
+	// core.fsmonitor/diff.external code-exec knobs LAYER 1 disables.
+	// Pointing all three config scopes at /dev/null + GIT_CONFIG_NOSYSTEM,
+	// and refusing terminal prompts / optional index locks, closes that
+	// off. Only NewHostExec's default executor sets this (its git/ls/stat
+	// host commands); the shell_docker Runner's own processExecutor leaves
+	// it false — it never shells out to git at all.
+	scrubGitEnv bool
+}
 
-func (processExecutor) Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error) {
+func (p processExecutor) Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if p.scrubGitEnv && name == "git" {
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_OPTIONAL_LOCKS=0",
+		)
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -510,7 +533,10 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 
 	containerName := containerNameFor(taskID)
 	spec := dockerRunSpec{
-		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
+		// ImageRef is the digest-pin-VERIFIED config ID (== r.PinnedDigest),
+		// which is exactly what docker run targets (FINDING #14 TOCTOU fix);
+		// ImageTag is retained for the log line only.
+		ImageTag: r.ImageTag, ImageRef: actualDigest, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
 		Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
 	}
 	if in.NeedsNetwork {
@@ -666,7 +692,21 @@ func (r *Runner) logWith(traceID string) Logger {
 
 // dockerRunSpec is buildDockerRunArgs' input.
 type dockerRunSpec struct {
-	ImageTag      string
+	// ImageTag is the mutable, human-readable sandbox tag — kept ONLY for
+	// the log/transcript line (Run logs r.ImageTag directly); it is NOT
+	// what `docker run` targets anymore (see ImageRef).
+	ImageTag string
+	// ImageRef is the image `docker run` actually targets as its
+	// positional image argument — set to the CONFIG ID the digest pin just
+	// VERIFIED (== PinnedDigest), NEVER the mutable ImageTag (FINDING #14
+	// TOCTOU fix). The pin resolves the tag to an ID and refuses unless it
+	// matches, but then running by the TAG would reopen the window where
+	// the tag could be re-pointed at a different image between the inspect
+	// and the run; running by that exact ID (`docker run sha256:<id> ...`,
+	// a valid form) closes it. NOTE the pin is a config ID, not a manifest
+	// digest, so the tag@digest form would not resolve for a local-only
+	// build — the bare ID is the correct reference here.
+	ImageRef      string
 	ContainerName string
 	TaskID        string
 	// TraceID carries the `kahya.trace_id` container label (W6-03) -
@@ -737,7 +777,9 @@ func buildDockerRunArgs(spec dockerRunSpec) []string {
 	}
 	args = appendSortedEnvPairs(args, spec.ProxyEnvPairs)
 	args = appendSortedEnvPairs(args, spec.EnvPairs)
-	args = append(args, spec.ImageTag, "/bin/sh")
+	// FINDING #14: target the digest-pin-VERIFIED image ID (spec.ImageRef),
+	// never the mutable spec.ImageTag — see dockerRunSpec.ImageRef.
+	args = append(args, spec.ImageRef, "/bin/sh")
 	return args
 }
 

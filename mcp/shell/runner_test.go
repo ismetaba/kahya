@@ -46,7 +46,7 @@ func baseFixture(t *testing.T) (home, workdir string) {
 
 func TestBuildDockerRunArgs_NonNegotiableFlags(t *testing.T) {
 	args := buildDockerRunArgs(dockerRunSpec{
-		ImageTag: "kahya-sandbox:0.1.0", ContainerName: "kahya-sandbox-abc123", TaskID: "task-1",
+		ImageTag: "kahya-sandbox:0.1.0", ImageRef: "sha256:verifiedid", ContainerName: "kahya-sandbox-abc123", TaskID: "task-1",
 		Workdir: "/canonical/workdir",
 	})
 	joined := " " + strings.Join(args, " ") + " "
@@ -69,8 +69,13 @@ func TestBuildDockerRunArgs_NonNegotiableFlags(t *testing.T) {
 			t.Errorf("docker run args missing %q\nfull args: %v", want, args)
 		}
 	}
-	if !strings.Contains(joined, " kahya-sandbox:0.1.0 /bin/sh") {
-		t.Errorf("docker run args must end with the image tag + /bin/sh, got: %v", args)
+	// FINDING #14: docker run targets the digest-pin-VERIFIED image ID
+	// (ImageRef), never the mutable tag (ImageTag) — see dockerRunSpec.ImageRef.
+	if !strings.Contains(joined, " sha256:verifiedid /bin/sh") {
+		t.Errorf("docker run args must end with the resolved image ID + /bin/sh, got: %v", args)
+	}
+	if strings.Contains(joined, " kahya-sandbox:0.1.0 /bin/sh") {
+		t.Errorf("docker run must NOT target the mutable tag as its positional image arg: %v", args)
 	}
 	// The Docker socket must NEVER be mounted (this task's own gotcha).
 	if strings.Contains(joined, "docker.sock") {
