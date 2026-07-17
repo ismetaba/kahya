@@ -24,7 +24,7 @@
 | Autonomy ladder per tool×class×scope; promotion SUGGESTED at 20/0, never auto; demotion; W3 always approval | §4 ⚑ | W3-02 | covered |
 | `reversible` flag + per-tool undo recipes (Trash, git checkpoint); W1 5-min window | §4 | W3-01, W3-02, W3-03 | covered |
 | goose migrations at kahyad startup; `PRAGMA user_version` | §4 stack ⚑ | W12-02 | covered |
-| FTS5 dual index trigram+unicode61, BM25 fusion; sqlite-vec ≥0.1.9 | §4 stack ⚑ | W12-03 (+W12-11 KNN leg) | covered |
+| FTS5 dual index trigram+unicode61, BM25 fusion; sqlite-vec ≥0.1.9 | §4 stack ⚑ | W12-03 (+W12-11 KNN leg) | partial — binding pins 0.1.6; >=0.1.9 blocked on upstream release (max published `sqlite-vec-go-bindings` is v0.1.7-alpha.2); runtime floor enforced at achievable 0.1.6, see `kahyad/internal/store/db.go` minVec* TODO |
 | Scheduling: launchd `StartCalendarInterval` for wall-clock; in-daemon cron only for ticks | §4 stack ⚑ | W4-01 | covered |
 | SQLite outbox (embedded NATS = v2) | §4 stack | W4-02 | covered |
 | STT `whisper-large-v3-turbo`, `language=tr` fixed, PTT | §4 stack | W6-02 | covered |
@@ -96,7 +96,7 @@
 | Keychain locked ⇒ cloud fail-fast + notify, local lane keeps working | W12-08 | covered |
 | TCC checklist: Hammerspoon Accessibility/Mic/Input-Monitoring; Automation per app; test under launchd | W6-01 (`docs/tcc-w6-checklist.md`), W3-09 (`docs/tcc-automation.md`), W5-01 (Calendar) | covered |
 | TCC checklist: Full Disk Access for the fs tool | W6-01 (`docs/tcc-w6-checklist.md` now includes the §7 row-3 FDA section: grant to launchd-started codesigned kahyad, verification via protected-dir `fs_read`, blocked-user handling), W3-03 (`Tam Disk Erişimi gerekli: <path>` error seam) | covered |
-| `docs/design.html` committed | W0-05 | covered |
+| `docs/design.html` committed | W0-05 | GAP (blocked — W0-05 [!], user must export design.html) |
 | First e2e loop + first "hatırladı" moment in week 1 | W12-09 (live RoomPlan check) | covered |
 
 ## §9 MVP-done criteria

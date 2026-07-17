@@ -34,10 +34,22 @@ type fsPathToolInput struct {
 // fix — whose file CONTENT (fs_write only; fs_delete carries none) matches
 // kahyad/internal/secretlane's deterministic pre-pass. Only fs_write/
 // fs_delete carry a structured path field today (the same two tools
-// render.go's renderPendingApprovalPayload understands); every other
-// tool's tool_input is opaque to this function and is therefore NEVER
-// flagged secret-lane here (mail_send/telegram_send-shaped tools have no
-// landed MCP implementation yet to carry a body through this path at all).
+// render.go's renderPendingApprovalPayload understands), so their content
+// check runs against the decoded {"content_base64"} body specifically.
+//
+// review-fix #5: for EVERY other tool (policy.yaml classifies shell_docker,
+// shell_host, applescript_run, jxa_run, shortcuts_run, telegram_send as W2),
+// renderPendingApprovalPayload falls through to BuildOsascript, which dumps
+// the ENTIRE raw tool_input JSON verbatim into the inline-keyboard card. So
+// a secret-lane LOCAL worker that emits e.g. an applescript_run whose script
+// embeds a TCKN/IBAN/card/health value would otherwise ship those bytes
+// straight to api.telegram.org. The default branch therefore runs the SAME
+// deterministic pre-pass over the raw tool_input JSON string: because the
+// card dumps the whole envelope, scanning string(toolInput) covers
+// script/command/body fields regardless of field name, and any newly-added
+// content-bearing tool is covered automatically. HANDOFF §5 safety #9
+// (secret-lane content is NEVER sent to Telegram) draws no per-tool
+// exception.
 func isSecretLane(home string, secretLaneGlobs []string, tool string, toolInput []byte) bool {
 	switch tool {
 	case "fs_write", "fs_delete":
@@ -64,6 +76,9 @@ func isSecretLane(home string, secretLaneGlobs []string, tool string, toolInput 
 		}
 		return false
 	default:
+		if secretlane.ClassifyDeterministic(string(toolInput)).SecretLane {
+			return true
+		}
 		return false
 	}
 }

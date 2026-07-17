@@ -36,6 +36,24 @@ func startFakeServer(t *testing.T, handler http.Handler) string {
 	srv := &http.Server{Handler: handler}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
+
+	// The privileged routes (approve/deny/promote/undo/halt) moved to a
+	// second, human-only control socket beside the main one. Serve the SAME
+	// stand-in handler there so the CLI's control-socket calls reach it, and
+	// write the 0600 bearer-secret file newClient reads. The fake handler
+	// does not enforce the bearer (that is the server package's own test);
+	// this only proves the CLI dials the right socket with the right header.
+	controlSock := config.ControlSocketPath(sock)
+	if err := os.WriteFile(config.ControlSecretPath(sock), []byte("test-control-secret"), 0o600); err != nil {
+		t.Fatalf("write control secret: %v", err)
+	}
+	cln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", controlSock, err)
+	}
+	csrv := &http.Server{Handler: handler}
+	go csrv.Serve(cln)
+	t.Cleanup(func() { csrv.Close() })
 	return sock
 }
 

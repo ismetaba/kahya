@@ -87,19 +87,19 @@ func (s *Server) handlePolicyConsumeToken(w http.ResponseWriter, r *http.Request
 type policyFeedbackRequest struct {
 	Kind              string `json:"kind"` // "approve" | "deny" | "undo"
 	PendingApprovalID string `json:"pending_approval_id,omitempty"`
-	// Surface must be "local" for a W3-class pending approval (HANDOFF §5
-	// safety #5: Telegram may notify, never approve, a W3 action) -
-	// enforced in kahyad/internal/policy.Engine.Approve, not here. This is
-	// this route's pre-existing (pre-W6-01) wire shape, kept unchanged for
-	// the CLI's own `kahya approve <id>` caller (kahyad/cmd/kahya's
-	// runApprove, which sends the literal "local" for its own approve
-	// calls, exactly as it always has) - W6-01's NEW POST
-	// /approvals/{id}/decision route (kahyad/internal/server/
-	// approvals_decision.go) is the one that structurally cannot forge
-	// this field at all (no Surface field on that route's own request
-	// struct); this pre-existing route is not rewired to match, per this
-	// task's own scope.
-	Surface string `json:"surface,omitempty"`
+	// NOTE: there is deliberately NO Surface field here. /policy/feedback is
+	// now mounted ONLY on the human-only control listener (server.go's
+	// Server.controlLn), which the per-task worker cannot reach at all, so
+	// the approving caller IS the local human surface by construction —
+	// handlePolicyFeedback passes the hardcoded "local" to Engine.Approve
+	// (mirroring POST /approvals/{id}/decision's approvalsDecisionSurface).
+	// Trusting a caller-supplied `surface` field was the W3 self-approval
+	// hole (a worker POSTing {"surface":"local"} self-approved a W3 action);
+	// removing the field closes it structurally. Telegram approvals never
+	// reach this route — they call Engine.Approve("telegram", ...)
+	// in-process (kahyad/internal/telegram/approvals.go), where the engine's
+	// own surface!="local" check still rejects any W3.
+	//
 	// Typed is W6-01's addition: the exact text a human typed into a W3
 	// approval's confirmation prompt, forwarded here so
 	// kahyad/internal/policy.Engine.Approve can verify it server-side
@@ -133,7 +133,7 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Kind {
 	case "approve":
-		result, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, req.Surface, req.Typed)
+		result, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, approvalsDecisionSurface, req.Typed)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: err.Error()})
 			return

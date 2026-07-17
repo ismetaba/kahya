@@ -84,7 +84,11 @@ func NewHostExec(home string, policy PolicyClient, ledger Ledger, log Logger, ex
 		log = noopLogger{}
 	}
 	if exec == nil {
-		exec = processExecutor{}
+		// scrubGitEnv: shell_host's git path runs with the SYSTEM/GLOBAL
+		// git config neutralized (FINDING #3 fix, LAYER 2 — see
+		// processExecutor.scrubGitEnv); harmless for ls/stat, which the
+		// flag never touches (it gates on name=="git").
+		exec = processExecutor{scrubGitEnv: true}
 	}
 	return &HostExec{Home: home, Policy: policy, Ledger: ledger, Log: log, Exec: exec}
 }
@@ -152,7 +156,7 @@ func (h *HostExec) validate(in HostExecArgs) (argv []string, canonRepo string, e
 		if cerr != nil {
 			return nil, "", errHostExecDenied
 		}
-		argv = append([]string{"git", "-C", cp.Op}, in.Args...)
+		argv = hardenedGitArgv(cp.Op, in.Args)
 		return argv, cp.Match, nil
 
 	case "ls", "stat":
@@ -197,6 +201,38 @@ func validateGitArgs(args []string) error {
 		}
 	}
 	return nil
+}
+
+// hardenedGitArgv builds shell_host's ACTUAL git argv — validateGitArgs
+// has already proven args[0] is one of status|log|diff|show and that no
+// args[1:] entry is flag-shaped, so this only has to HARDEN the invocation
+// (FINDING #3 fix, LAYER 1). The argv validator alone is not enough: a
+// model can fs_write a repo-local <repo>/.git/config first, and git STILL
+// honors that file's core.fsmonitor / core.hooksPath (hook programs run
+// during status), diff.external and the per-driver textconv/command (run
+// while rendering diffs) — each of which executes an arbitrary HOST
+// program, outside the Docker sandbox, during these otherwise read-only
+// subcommands. The four `-c key=...` overrides below win over anything
+// .git/config sets (git's last-value-wins precedence for -c), neutralizing
+// every such knob; the --no-ext-diff/--no-textconv subcommand flags
+// belt-and-suspenders the diff-driver path for the three subcommands that
+// actually render diffs (status takes neither flag). This hardens ONLY the
+// executed argv — the WYSIWYE envelope hash (buildHostExecToolInput) still
+// sees the model's original Command/RepoPath/Args, unchanged.
+func hardenedGitArgv(repoOp string, args []string) []string {
+	sub := args[0]
+	argv := []string{
+		"git", "-C", repoOp,
+		"-c", "core.fsmonitor=false",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "diff.external=",
+		"-c", "uploadpack.packObjectsHook=",
+		sub,
+	}
+	if sub == "diff" || sub == "show" || sub == "log" {
+		argv = append(argv, "--no-ext-diff", "--no-textconv")
+	}
+	return append(argv, args[1:]...)
 }
 
 // validatePlainPaths enforces ls/stat's narrow shape: at least one target

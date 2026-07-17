@@ -546,15 +546,36 @@ func (e *Engine) addEvidence(ctx context.Context, factID, episodeID int64, sessi
 }
 
 // recomputeConfidence implements HANDOFF S5 memory #3's "noisy-OR ratchet
-// yok: evidence sums, per-session deduped, tier cap clamps" literally:
-// sum every DISTINCT (session_id, polarity) evidence row's weight (the
-// dedupe defensively re-applied here too, even though addEvidence already
-// prevents a duplicate row from ever existing), then clamp the total to
-// at most the HIGHEST positive-evidence tier cap represented among the
-// rows summed (a fact that has ever received real user_asserted evidence
-// can rise to that ceiling; one that has only ever received agent_derived
-// evidence can never rise above THAT tier's - deliberately low - ceiling,
-// no matter how many separate agent_derived observations pile up).
+// yok: evidence sums, per-session deduped, tier cap clamps" as an
+// ACCUMULATE-THEN-CLAMP: it sums each DISTINCT piece of evidence's
+// contribution and clamps only the FINAL total to the highest positive
+// tier cap represented (the dedupe defensively re-applied here too, even
+// though addEvidence already prevents a duplicate row from existing).
+//
+// The two polarities dedupe on DIFFERENT keys, on purpose:
+//
+//   - NEGATIVE (denial) rows dedupe by (session) so a same-session repeat is
+//     one denial while independent-session denials ACCUMULATE downward -
+//     each fresh session's denial adds another DenialLogOdds. Their sum is
+//     negSum.
+//
+//   - POSITIVE (supporting) rows dedupe by (tier weight, session): a
+//     same-tier same-session repeat is one observation, but the same tier
+//     from a DISTINCT session counts again. A positive-cap tier
+//     (user_asserted/external_doc/screen, weight >= 0) then contributes its
+//     cap ONCE PER DISTINCT SESSION, so re-affirming a fact after it was
+//     denied can raise confidence back up (a denied-but-still-active fact
+//     recovers - DenyFact's contract). A NEGATIVE-weight tier (agent_derived,
+//     logit(0.4) < 0) instead SATURATES at a single instance: piling on more
+//     agent_derived observations must never drive confidence further DOWN
+//     past that tier's own ceiling (the W5-04 review's #2/#3, preserved).
+//     Their sum is posSum.
+//
+// confidence = posSum + negSum, then clamped DOWN to maxCap (the highest
+// positive-tier weight seen) if it would exceed it - an upside clamp only,
+// no floor, and the positive subtotal is NOT clamped before the negatives
+// are added (clamping it first would re-freeze the positive contribution
+// and re-break recovery).
 func (e *Engine) recomputeConfidence(ctx context.Context, factID int64) error {
 	rows, err := e.store.ListEvidenceByFact(ctx, factID)
 	if err != nil {
@@ -562,45 +583,62 @@ func (e *Engine) recomputeConfidence(ctx context.Context, factID int64) error {
 	}
 
 	seen := make(map[string]bool, len(rows))
-	sum := 0.0
+	negSum := 0.0
+	// posSessionsByTier counts the DISTINCT sessions that supplied each
+	// positive tier weight (after per-(tier,session) dedupe).
+	posSessionsByTier := make(map[float64]int)
 	maxCap := 0.0
 	hasCap := false
 	for _, r := range rows {
-		// Dedup key, by polarity:
-		//   POSITIVE (supporting): key by TIER (its weight IS the tier cap, so
-		//   equal weights are the same tier). Every distinct tier contributes
-		//   its cap exactly ONCE - so different tiers SUM
-		//   (agent_derived + external_doc, the cross-session test), while
-		//   repeated same-tier observations SATURATE at that tier's cap
-		//   instead of piling further. Without this, a tier whose cap is
-		//   NEGATIVE (agent_derived, logit(0.4) < 0) summed each extra positive
-		//   observation DOWNWARD, past its own ceiling - more supporting
-		//   evidence wrongly LOWERING confidence (the W5-04 review's #2/#3).
-		//   NEGATIVE (denial): key by (session, polarity) so a same-session
-		//   repeat is one denial while independent-session denials accumulate.
-		var key string
 		if r.Polarity > 0 {
-			key = "pos|" + strconv.FormatFloat(r.Weight, 'g', -1, 64)
-		} else {
+			// Dedup positive rows by (tier weight, session): the tier's weight
+			// IS its cap, so equal weights are the same tier; a distinct
+			// session counts again, enabling recovery via re-affirmation.
 			sk := r.SessionID.String
 			if !r.SessionID.Valid || sk == "" {
 				// No session context (e.g. hot-window promotion) - key by the
 				// row's own identity so distinct observations are not collapsed.
 				sk = "row:" + strconv.FormatInt(r.ID, 10)
 			}
-			key = "neg|" + sk
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		sum += r.Weight
-		if r.Polarity > 0 && (!hasCap || r.Weight > maxCap) {
-			maxCap = r.Weight
-			hasCap = true
+			key := "pos|" + strconv.FormatFloat(r.Weight, 'f', -1, 64) + "|" + sk
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			posSessionsByTier[r.Weight]++
+			if !hasCap || r.Weight > maxCap {
+				maxCap = r.Weight
+				hasCap = true
+			}
+		} else {
+			// Dedup negative rows by session so independent-session denials
+			// accumulate while same-session repeats collapse to one.
+			sk := r.SessionID.String
+			if !r.SessionID.Valid || sk == "" {
+				sk = "row:" + strconv.FormatInt(r.ID, 10)
+			}
+			key := "neg|" + sk
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			negSum += r.Weight
 		}
 	}
-	confidence := sum
+
+	posSum := 0.0
+	for tierWeight, sessions := range posSessionsByTier {
+		if tierWeight >= 0 {
+			// Positive-cap tier ACCUMULATES across distinct sessions so
+			// re-affirmation offsets denials.
+			posSum += tierWeight * float64(sessions)
+		} else {
+			// Negative-weight tier (agent_derived) SATURATES at one instance.
+			posSum += tierWeight
+		}
+	}
+
+	confidence := posSum + negSum
 	if hasCap && confidence > maxCap {
 		confidence = maxCap
 	}

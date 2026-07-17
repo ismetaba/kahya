@@ -298,7 +298,19 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// moved to blocked_user (the resume scan's own W1-cap/W2-W3 branch) or
 	// user_halted (a later ⌥⎋, W6-03) any time between enqueue and this
 	// claim.
-	if t.Status == task.StatusUserHalted || t.Status == task.StatusBlockedUser {
+	// Project-review #6: also ack a row for an already-TERMINAL task (done/
+	// failed). Without done/failed here the row fell through to
+	// machine.Transition(->executing) below, which is illegal from a
+	// terminal state, so it returned WITHOUT markDelivered and the row was
+	// re-claimed every lease period forever — a zombie loop bumping
+	// outbox.attempts and appending two events to the anchored ledger on
+	// each pass. A done/failed task with an un-acked resume row is reachable
+	// when a worker completed the task but was SIGKILLed before its own
+	// processResume acked the row (or when a duplicate resume row was
+	// enqueued for a still-executing task that later finished — see the
+	// enqueueResume dedup in kahyad/internal/task/resume.go).
+	if t.Status == task.StatusUserHalted || t.Status == task.StatusBlockedUser ||
+		t.Status == task.StatusDone || t.Status == task.StatusFailed {
 		d.ledgerRaw(ctx, t.TraceID, EventRedeliveryGuarded, map[string]any{
 			"event": EventRedeliveryGuarded, "task_id": t.ID, "status": t.Status,
 		})
@@ -345,6 +357,14 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
 			"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
 		})
+		// Project-review #6: an ILLEGAL transition here means the task raced
+		// into a terminal state between the guard check above and now — the
+		// row can never legally dispatch, so ack it instead of leaving it to
+		// be re-claimed forever. (Any other transition error is a transient
+		// DB fault; leave the row for lease-expiry re-claim as before.)
+		if errors.Is(err, task.ErrIllegalTransition) {
+			d.markDelivered(ctx, row.ID)
+		}
 		return
 	}
 

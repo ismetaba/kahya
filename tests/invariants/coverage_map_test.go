@@ -8,6 +8,8 @@ package invariants
 // step of `make invariants`; renaming a cited test makes it go red.
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -61,5 +63,28 @@ func TestCoverageMapEveryInvariantHasCIHermetic(t *testing.T) {
 	// every required invariant present AND each with a ci-hermetic citation.
 	for _, e := range ClassCoverageErrors(cites) {
 		t.Error(e)
+	}
+}
+
+// TestCoverageMapCommittedFilesExist enforces the file-deliverable honesty
+// rule: any coverage-map row that marks a committed-file claim "covered"
+// must reference a file that actually exists in the repo. It is the file
+// analogue of TestCoverageMapAllTestsExist (which guards cited tests): a row
+// for a not-yet-committed deliverable (e.g. `docs/design.html` while W0-05 is
+// [!] blocked) must be marked GAP/partial, not "covered", or this goes red.
+func TestCoverageMapCommittedFilesExist(t *testing.T) {
+	root, path := coverageMapPath(t)
+	files, err := ParseCoveredFileDeliverables(path)
+	if err != nil {
+		t.Fatalf("ParseCoveredFileDeliverables: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("parsed zero committed-file deliverables from the coverage map; the parser or coverage.md changed shape")
+	}
+	for _, fd := range files {
+		abs := filepath.Join(root, filepath.FromSlash(fd.Path))
+		if _, err := os.Stat(abs); err != nil {
+			t.Errorf("coverage.md:%d marks `%s` covered but the file does not exist: %v", fd.Line, fd.Path, err)
+		}
 	}
 }

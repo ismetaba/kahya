@@ -11,6 +11,8 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -25,8 +27,36 @@ import (
 // underlying *store.Store a test needs to both drive the routes and
 // inspect the ledger directly.
 type approvalsDecisionFixture struct {
-	client *http.Client
-	store  *store.Store
+	client        *http.Client
+	controlClient *http.Client
+	secret        string
+	store         *store.Store
+}
+
+// postControl POSTs to a privileged control-socket route with the per-boot
+// bearer attached (the W3 self-approval fix moved these routes off the
+// worker socket).
+func (f approvalsDecisionFixture) postControl(t *testing.T, path string, body any, out any) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal control body: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://kahyad"+path, bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("new control request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+f.secret)
+	resp, err := f.controlClient.Do(req)
+	if err != nil {
+		t.Fatalf("control POST %s: %v", path, err)
+	}
+	if out != nil {
+		defer resp.Body.Close()
+		_ = json.NewDecoder(resp.Body).Decode(out)
+	}
+	return resp
 }
 
 // newApprovalsDecisionFixture builds a minimal Server (real store, real
@@ -55,7 +85,12 @@ func newApprovalsDecisionFixture(t *testing.T, env string) approvalsDecisionFixt
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return approvalsDecisionFixture{client: unixHTTPClient(cfg.Socket), store: st}
+	return approvalsDecisionFixture{
+		client:        unixHTTPClient(cfg.Socket),
+		controlClient: unixHTTPClient(srv.controlSocketPath),
+		secret:        srv.controlSecret,
+		store:         st,
+	}
 }
 
 // TestApprovalsDecisionSurfaceForgeryIgnored is this task's own core
@@ -77,7 +112,7 @@ func TestApprovalsDecisionSurfaceForgeryIgnored(t *testing.T) {
 	}
 
 	var decision approvalDecisionResponse
-	resp := postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+	resp := f.postControl(t, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla", "surface": "remote",
 	}, &decision)
 	if resp.StatusCode != 200 || !decision.OK || decision.Token == "" {
@@ -115,7 +150,7 @@ func TestApprovalsDecisionW3RequiresTyped(t *testing.T) {
 	}
 
 	var rejected approvalDecisionResponse
-	resp := postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+	resp := f.postControl(t, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "evet",
 	}, &rejected)
 	if resp.StatusCode == 200 && rejected.OK {
@@ -123,7 +158,7 @@ func TestApprovalsDecisionW3RequiresTyped(t *testing.T) {
 	}
 
 	var approved approvalDecisionResponse
-	postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+	f.postControl(t, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla",
 	}, &approved)
 	if !approved.OK || approved.Token == "" {
@@ -147,7 +182,7 @@ func TestApprovalsDecisionReject(t *testing.T) {
 	}
 
 	var denied approvalDecisionResponse
-	resp := postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+	resp := f.postControl(t, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": false,
 	}, &denied)
 	if resp.StatusCode != 200 || !denied.OK {
@@ -157,7 +192,7 @@ func TestApprovalsDecisionReject(t *testing.T) {
 	// One-time token: a SECOND decision on the same (already-consumed) id
 	// must fail regardless of what it asks for.
 	var replay approvalDecisionResponse
-	resp2 := postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+	resp2 := f.postControl(t, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": false,
 	}, &replay)
 	if resp2.StatusCode == 200 && replay.OK {
@@ -199,7 +234,7 @@ func TestDebugEmitApprovalRefusedOutsideDev(t *testing.T) {
 	f := newApprovalsDecisionFixture(t, "prod")
 
 	var resp debugEmitApprovalResponse
-	httpResp := postJSON(t, f.client, "/debug/emit-approval", map[string]any{"class": "W2"}, &resp)
+	httpResp := f.postControl(t, "/debug/emit-approval", map[string]any{"class": "W2"}, &resp)
 	if httpResp.StatusCode != 403 || resp.ID != "" {
 		t.Fatalf("debug/emit-approval outside dev = status %d body %+v, want 403 with no id", httpResp.StatusCode, resp)
 	}
@@ -211,7 +246,7 @@ func TestDebugEmitApprovalAllowedUnderDev(t *testing.T) {
 	f := newApprovalsDecisionFixture(t, "dev")
 
 	var resp debugEmitApprovalResponse
-	httpResp := postJSON(t, f.client, "/debug/emit-approval", map[string]any{"class": "W3"}, &resp)
+	httpResp := f.postControl(t, "/debug/emit-approval", map[string]any{"class": "W3"}, &resp)
 	if httpResp.StatusCode != 200 || resp.ID == "" {
 		t.Fatalf("debug/emit-approval under dev = status %d body %+v, want 200 with an id", httpResp.StatusCode, resp)
 	}

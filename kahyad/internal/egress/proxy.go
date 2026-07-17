@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kahya/kahyad/internal/traceid"
@@ -257,6 +258,24 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FINDING #8: Check admitted this tunnel with nbytes=0 (an opaque
+	// CONNECT has no pre-known size), so its budget test alone would only
+	// ever refuse a host ALREADY over budget — never THIS tunnel as it
+	// streams past the limit. Fetch the host's REMAINING daily budget here
+	// so the io.Copy loops below can enforce it as a RUNNING cap, and deny
+	// up front (never even dialing) when the host has no budget left.
+	remaining, limited, err := p.Gate.RemainingBudget(r.Context(), host)
+	if err != nil {
+		// Fail-closed (tasks/README.md): a budget-store error is a deny.
+		denyResponse(w, "Egress kapisi hata verdi; guvenlik geregi reddedildi.")
+		return
+	}
+	if limited && remaining <= 0 {
+		d := p.Gate.DenyBudget(r.Context(), host, session)
+		denyResponse(w, d.Reason)
+		return
+	}
+
 	// BLOCKER D: resolve+validate host's OWN DNS answer before ever
 	// dialing, even though Check already allowed the hostname itself —
 	// see resolveAndPin's doc comment.
@@ -294,12 +313,37 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var mu sync.Mutex
-	var total int64
-	add := func(n int64) {
-		mu.Lock()
-		total += n
-		mu.Unlock()
+	// FINDING #8: both tunnel directions share ONE atomic byte counter and
+	// the SAME remaining-budget cap. total accumulates only bytes actually
+	// FORWARDED, so MeterUsage below is exact. When limited, a goroutine
+	// that is about to push the running total past remaining severs BOTH
+	// ends and stops BEFORE forwarding that buffer — bounding the overshoot
+	// to at most one in-flight buffer per direction (the check-then-write
+	// race between the two goroutines can add one peer buffer, never
+	// unbounded). Closing both conns unblocks the peer goroutine's blocked
+	// Read/Write so the WaitGroup always completes.
+	var total atomic.Int64
+	var capped atomic.Bool
+	copyDir := func(dst io.Writer, src io.Reader) {
+		buf := make([]byte, 32*1024)
+		for {
+			nr, er := src.Read(buf)
+			if nr > 0 {
+				if limited && total.Load()+int64(nr) > remaining {
+					capped.Store(true)
+					_ = client.Close()
+					_ = upstream.Close()
+					return
+				}
+				if _, ew := dst.Write(buf[:nr]); ew != nil {
+					return
+				}
+				total.Add(int64(nr))
+			}
+			if er != nil {
+				return
+			}
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -312,8 +356,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// bufio.Reader read the request line/headers from — those bytes
 		// live in clientBuf.Reader's buffer, not on the raw net.Conn, and
 		// reading from client directly here would silently drop them.
-		n, _ := io.Copy(upstream, clientBuf.Reader)
-		add(n)
+		copyDir(upstream, clientBuf.Reader)
 	}()
 	go func() {
 		defer wg.Done()
@@ -321,12 +364,18 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// upstream of the server ever wrote to the client on our behalf
 		// before this point) — a plain write straight to the raw conn is
 		// correct.
-		n, _ := io.Copy(client, upstream)
-		add(n)
+		copyDir(client, upstream)
 	}()
 	wg.Wait()
 
-	p.Gate.MeterUsage(context.Background(), host, total, session)
+	p.Gate.MeterUsage(context.Background(), host, total.Load(), session)
+	if capped.Load() {
+		// The tunnel was severed at the daily-budget boundary: record it as
+		// a budget denial (EventBlockedBudget + Turkish notify), consistent
+		// with every other budget refusal, so the ledger shows WHY the
+		// connection ended.
+		p.Gate.DenyBudget(context.Background(), host, session)
+	}
 }
 
 // handlePlainHTTP implements the plain-HTTP forwarding path: the target
@@ -348,27 +397,40 @@ func (p *Proxy) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MINOR F: nbytes is only ever a pre-admission ESTIMATE (Content-Length
-	// -1 for a chunked body clamps to 0, same as it always has) — the
-	// ACTUAL bytes streamed upstream are counted for real below (reqCounter)
-	// and added to the post-hoc MeterUsage call, so a chunked request body
-	// is no longer invisible to the budget.
-	nbytes := r.ContentLength
-	if nbytes < 0 {
-		nbytes = 0
-	}
-
 	// BLOCKER B/C: attribute this request to a per-task session via its
 	// Proxy-Authorization credential (needs_network:true containers), not
 	// an always-fresh, always-anonymous one.
 	session := p.sessionForRequest(r)
-	decision, err := p.Gate.Check(r.Context(), Target{Host: host, Port: port}, nbytes, session)
+	// FINDING #13: admit with nbytes=0, exactly like the CONNECT path. The
+	// request body's ACTUAL bytes are metered post-hoc (reqCounter +
+	// MeterUsage below); passing r.ContentLength here too would Add them to
+	// the budget a SECOND time (Check.Add at admission, then MeterUsage
+	// after RoundTrip). With nbytes=0 Check still denies a host already over
+	// budget but Adds nothing (gate.go guards Add on nbytes>0), leaving
+	// MeterUsage the sole request-body count.
+	decision, err := p.Gate.Check(r.Context(), Target{Host: host, Port: port}, 0, session)
 	if err != nil {
 		denyResponse(w, "Egress kapisi hata verdi; guvenlik geregi reddedildi.")
 		return
 	}
 	if !decision.Allow {
 		denyResponse(w, decision.Reason)
+		return
+	}
+
+	// FINDING #8: fetch the host's REMAINING daily budget so the response
+	// body copy below can be enforced as a RUNNING cap — a large download on
+	// an allowlisted host would otherwise stream unbounded past the budget,
+	// blocking only the NEXT request. Deny up front when nothing is left.
+	remaining, limited, err := p.Gate.RemainingBudget(r.Context(), host)
+	if err != nil {
+		// Fail-closed (tasks/README.md): a budget-store error is a deny.
+		denyResponse(w, "Egress kapisi hata verdi; guvenlik geregi reddedildi.")
+		return
+	}
+	if limited && remaining <= 0 {
+		d := p.Gate.DenyBudget(r.Context(), host, session)
+		denyResponse(w, d.Reason)
 		return
 	}
 
@@ -414,13 +476,50 @@ func (p *Proxy) handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
+	// FINDING #8: cap the response body at the host's remaining daily budget
+	// (a RUNNING limit), mirroring the CONNECT tunnel — a large streaming
+	// download must not blow past the budget and only block the NEXT
+	// request. n counts bytes actually forwarded, so MeterUsage stays exact.
+	n, capped := copyCapped(w, resp.Body, remaining, limited)
 
 	var reqBytes int64
 	if reqCounter != nil {
 		reqBytes = reqCounter.n
 	}
 	p.Gate.MeterUsage(context.Background(), host, n+reqBytes, session)
+	if capped {
+		// The response body was severed at the daily-budget boundary: record
+		// it as a budget denial (EventBlockedBudget + Turkish notify),
+		// consistent with the CONNECT cap and every other budget refusal.
+		p.Gate.DenyBudget(context.Background(), host, session)
+	}
+}
+
+// copyCapped streams src->dst like io.Copy, but when limited it stops the
+// moment forwarding the next buffer would push the running total past
+// remaining — returning how many bytes it actually forwarded and whether it
+// was cut short by the cap (FINDING #8). It checks BEFORE each dst.Write, so
+// the forwarded total never exceeds remaining (the read overshoots by at
+// most one buffer, which is never forwarded). When !limited it is a plain
+// copy that never caps.
+func copyCapped(dst io.Writer, src io.Reader, remaining int64, limited bool) (written int64, capped bool) {
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			if limited && written+int64(nr) > remaining {
+				return written, true
+			}
+			wn, ew := dst.Write(buf[:nr])
+			written += int64(wn)
+			if ew != nil {
+				return written, false
+			}
+		}
+		if er != nil {
+			return written, false
+		}
+	}
 }
 
 // countingReadCloser wraps an io.ReadCloser, counting every byte Read

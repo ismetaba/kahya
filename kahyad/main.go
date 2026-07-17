@@ -499,6 +499,22 @@ func run() int {
 	// marks the session sensitive (see mcp/fs.Server.ContentClassifier's
 	// own doc comment).
 	fsTool.ContentClassifier = server.NewFSContentClassifier()
+	// Project-review #2: a secret-lane fs_read must stickily escalate the
+	// OWNING TASK's lane to secret so the W12-08 proxy backstop 403s the
+	// worker's subsequent cloud call (otherwise a task whose PROMPT tripped
+	// no secret-lane lexicon keyword spawns a cloud worker that can carry
+	// the file's bytes off-box). Reuses the SAME SetTaskLane adapter the
+	// proxy backstop already consults by task_id.
+	fsTool.SecretLaneEscalator = server.NewSecretLaneStoreAdapter(st.Queries)
+	// Project-review #12: a secret-lane fs_read also raises the owning
+	// SESSION's taint tier (best-effort) so later non-R tool calls from that
+	// session are denied. Shares the SAME taintTracker + session-resolver
+	// pattern the policy taint gate uses (both wired below); constructed here
+	// with fresh instances over the same store to avoid a wiring-order
+	// dependency (taint.New/NewStoreSessionResolver are cheap, stateless
+	// views over st).
+	fsTool.SessionTaintRaiser = server.NewFSSessionTaintRaiser(
+		policy.NewStoreSessionResolver(st.Queries), taint.New(st.Queries, st))
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
 

@@ -219,6 +219,24 @@ func (q *Queries) CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID 
 	return count, err
 }
 
+const countUndeliveredResumeOutboxRows = `-- name: CountUndeliveredResumeOutboxRows :one
+SELECT COUNT(*) FROM outbox
+WHERE task_id = ? AND kind = 'task_resume'
+  AND dispatched_at IS NULL AND canceled_at IS NULL
+`
+
+// Project-review #6: how many task_resume rows are already pending (not yet
+// delivered, not canceled) for taskID. enqueueResume consults this before
+// inserting another, so the 30s resume scan cannot stack duplicate resume
+// rows for a task that is still (synchronously) executing; duplicates are
+// what later become done-zombies re-claimed forever once the task finishes.
+func (q *Queries) CountUndeliveredResumeOutboxRows(ctx context.Context, taskID sql.NullString) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUndeliveredResumeOutboxRows, taskID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteChunksByEpisode = `-- name: DeleteChunksByEpisode :exec
 DELETE FROM chunks WHERE episode_id = ?
 `
@@ -3125,6 +3143,27 @@ type RaiseSessionTaintParams struct {
 // codebase that ever sets tier back to 'clean' on an existing row.
 func (q *Queries) RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintParams) error {
 	_, err := q.db.ExecContext(ctx, raiseSessionTaint, arg.SessionID, arg.Reason, arg.UpdatedAt)
+	return err
+}
+
+const refreshUndoWindowDeadline = `-- name: RefreshUndoWindowDeadline :exec
+UPDATE undo_windows
+SET deadline = ?
+WHERE id = ?
+`
+
+type RefreshUndoWindowDeadlineParams struct {
+	Deadline string `json:"deadline"`
+	ID       int64  `json:"id"`
+}
+
+// Project-review #9 (Defect A): extend an already-open window's deadline.
+// One trace_id covers a whole task, so a second W1 write reuses the first
+// write's window (GetOpenUndoWindowByTaskToolTrace above); without this the
+// window's deadline stayed pinned at first-open, so later writes got less
+// than the full 5-minute grace. openUndoWindow refreshes it on every reuse.
+func (q *Queries) RefreshUndoWindowDeadline(ctx context.Context, arg RefreshUndoWindowDeadlineParams) error {
+	_, err := q.db.ExecContext(ctx, refreshUndoWindowDeadline, arg.Deadline, arg.ID)
 	return err
 }
 

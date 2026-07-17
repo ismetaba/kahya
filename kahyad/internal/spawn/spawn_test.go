@@ -512,6 +512,45 @@ func TestBuildEnvIncludesMCPBridgeAndCredentialMode(t *testing.T) {
 	if got := resolved["KAHYA_CREDENTIAL_MODE"]; got != "passthrough" {
 		t.Errorf("KAHYA_CREDENTIAL_MODE = %q, want %q", got, "passthrough")
 	}
+	// In passthrough mode the local token rides in ANTHROPIC_CUSTOM_HEADERS
+	// as X-Kahya-Task-Token, NOT as ANTHROPIC_API_KEY (which would shadow the
+	// worker's own upstream credential and then be stripped by the proxy,
+	// leaving the outbound request with no upstream auth).
+	if got, want := resolved["ANTHROPIC_CUSTOM_HEADERS"], "X-Kahya-Task-Token: "+cfg.APIKey; got != want {
+		t.Errorf("ANTHROPIC_CUSTOM_HEADERS = %q, want %q", got, want)
+	}
+	if _, ok := resolved["ANTHROPIC_API_KEY"]; ok {
+		t.Error("passthrough mode must NOT set ANTHROPIC_API_KEY (it would shadow the worker's own upstream credential)")
+	}
+}
+
+// TestBuildEnvKeychainModeSetsAPIKeyNotCustomHeaders is the keychain-mode
+// twin: keychain mode presents the local token as ANTHROPIC_API_KEY (the
+// worker's CLI sends it as x-api-key, which the proxy validates then replaces
+// with the real Keychain key) and never as ANTHROPIC_CUSTOM_HEADERS.
+func TestBuildEnvKeychainModeSetsAPIKeyNotCustomHeaders(t *testing.T) {
+	cfg := Config{
+		Socket:           "/s.sock",
+		LogDir:           "/logs",
+		AnthropicBaseURL: "https://upstream.invalid",
+		APIKey:           "kahya-task-abc",
+		CredentialMode:   "keychain",
+	}
+	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
+
+	got := BuildEnv(cfg, env)
+	resolved := map[string]string{}
+	for _, kv := range got {
+		if parts := strings.SplitN(kv, "=", 2); len(parts) == 2 {
+			resolved[parts[0]] = parts[1]
+		}
+	}
+	if got := resolved["ANTHROPIC_API_KEY"]; got != "kahya-task-abc" {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want the per-task token in keychain mode", got)
+	}
+	if _, ok := resolved["ANTHROPIC_CUSTOM_HEADERS"]; ok {
+		t.Error("keychain mode must NOT set ANTHROPIC_CUSTOM_HEADERS")
+	}
 }
 
 // TestBuildEnvDisablesCLISideChannelEgress guards the §5-safety-#1 hardening:

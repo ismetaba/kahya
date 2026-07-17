@@ -28,7 +28,21 @@ import (
 // LiveRegistry + a real halt.Executor (approvals/docker left nil - this
 // file only needs the process-status half) into a real kahyad Server
 // served over a real UDS socket.
-func newHaltTestFixture(t *testing.T) (client *http.Client, st *store.Store) {
+// postHalt POSTs to /halt, now a human-only control-socket route (the W3
+// self-approval fix): the client dials the control socket and the per-boot
+// bearer is attached.
+func postHalt(t *testing.T, client *http.Client, secret string, body []byte) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://kahyad/halt", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+secret)
+	return client.Do(req)
+}
+
+func newHaltTestFixture(t *testing.T) (client *http.Client, secret string, st *store.Store) {
 	t.Helper()
 	cfg := config.Config{
 		DBPath: filepath.Join(t.TempDir(), "brain.db"),
@@ -52,7 +66,7 @@ func newHaltTestFixture(t *testing.T) (client *http.Client, st *store.Store) {
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return unixHTTPClient(cfg.Socket), st
+	return unixHTTPClient(srv.controlSocketPath), srv.controlSecret, st
 }
 
 func insertHaltTestTask(t *testing.T, st *store.Store, id string) {
@@ -88,9 +102,10 @@ func TestHandleHaltUnwiredIs503(t *testing.T) {
 	go srv.Serve() //nolint:errcheck
 	defer srv.Shutdown()
 
-	client := unixHTTPClient(cfg.Socket)
+	client := unixHTTPClient(srv.controlSocketPath)
+	secret := srv.controlSecret
 	body, _ := json.Marshal(map[string]bool{"all": true})
-	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	resp, err := postHalt(t, client, secret, body)
 	if err != nil {
 		t.Fatalf("POST /halt: %v", err)
 	}
@@ -101,12 +116,12 @@ func TestHandleHaltUnwiredIs503(t *testing.T) {
 }
 
 func TestHandleHaltAllHaltsEveryExecutingTask(t *testing.T) {
-	client, st := newHaltTestFixture(t)
+	client, secret, st := newHaltTestFixture(t)
 	insertHaltTestTask(t, st, "t1")
 	insertHaltTestTask(t, st, "t2")
 
 	body, _ := json.Marshal(map[string]bool{"all": true})
-	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	resp, err := postHalt(t, client, secret, body)
 	if err != nil {
 		t.Fatalf("POST /halt: %v", err)
 	}
@@ -134,12 +149,12 @@ func TestHandleHaltAllHaltsEveryExecutingTask(t *testing.T) {
 }
 
 func TestHandleHaltSingleTaskID(t *testing.T) {
-	client, st := newHaltTestFixture(t)
+	client, secret, st := newHaltTestFixture(t)
 	insertHaltTestTask(t, st, "t1")
 	insertHaltTestTask(t, st, "t2")
 
 	body, _ := json.Marshal(map[string]string{"task_id": "t1"})
-	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	resp, err := postHalt(t, client, secret, body)
 	if err != nil {
 		t.Fatalf("POST /halt: %v", err)
 	}
@@ -172,10 +187,10 @@ func TestHandleHaltSingleTaskID(t *testing.T) {
 }
 
 func TestHandleHaltUnknownTaskIDIsZeroHaltedNotAnError(t *testing.T) {
-	client, _ := newHaltTestFixture(t)
+	client, secret, _ := newHaltTestFixture(t)
 
 	body, _ := json.Marshal(map[string]string{"task_id": "does-not-exist"})
-	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	resp, err := postHalt(t, client, secret, body)
 	if err != nil {
 		t.Fatalf("POST /halt: %v", err)
 	}
@@ -193,10 +208,10 @@ func TestHandleHaltUnknownTaskIDIsZeroHaltedNotAnError(t *testing.T) {
 }
 
 func TestHandleHaltEmptyBodyIsBadRequest(t *testing.T) {
-	client, _ := newHaltTestFixture(t)
+	client, secret, _ := newHaltTestFixture(t)
 
 	body, _ := json.Marshal(map[string]string{})
-	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	resp, err := postHalt(t, client, secret, body)
 	if err != nil {
 		t.Fatalf("POST /halt: %v", err)
 	}

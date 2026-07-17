@@ -185,3 +185,105 @@ func TestProcessFileFallsBackOnNonUserCommitAuthor(t *testing.T) {
 		t.Errorf("source_tier = %q, want fallback default %q (non-user commit author)", got, DefaultSourceTier)
 	}
 }
+
+// TestReindexUpgradesTierOnByteUnchangedUserCommit is the review-fix #10
+// under-trust proof: a file first indexed against a DIRTY tree stores the
+// fallback 'user_asserted', then a later byte-preserving user-authored
+// commit must upgrade it to 'user_edit' even though its hash never changed.
+// Before the fix the unchanged-file fast path returned fileUnchanged on the
+// hash match alone and froze the stale tier forever.
+func TestReindexUpgradesTierOnByteUnchangedUserCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not on PATH")
+	}
+	memDir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", memDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	runGit("init", "-q")
+	runGit("config", "user.name", "user")
+	runGit("config", "user.email", "user@kahya.local")
+
+	relPath := "notlar/degismeden-yukselen.md"
+	writeFixture(t, memDir, relPath, "# Not\n\nOnce kirli agacta indekslenip sonra kullanici tarafindan islenen not.\n")
+
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+	idx.SetGitRunner(backup.NewExecGitRunner())
+
+	// First pass: file is still UNTRACKED (dirty tree), so the git-author
+	// derivation is ambiguous and the tier falls back to the default.
+	if _, err := idx.Reindex(context.Background(), "trace-dirty", false); err != nil {
+		t.Fatalf("first Reindex() error = %v", err)
+	}
+	if got := lookupEpisodeSourceTier(t, idx, relPath); got != DefaultSourceTier {
+		t.Fatalf("after dirty-tree index: source_tier = %q, want %q", got, DefaultSourceTier)
+	}
+
+	// Commit the SAME bytes as author=user: the hash is unchanged but the
+	// authoritative tier is now user_edit.
+	runGit("add", "-A")
+	runGit("commit", "-q", "--author=user <user@kahya.local>", "-m", "user edit")
+
+	if _, err := idx.Reindex(context.Background(), "trace-clean", false); err != nil {
+		t.Fatalf("second Reindex() error = %v", err)
+	}
+	if got := lookupEpisodeSourceTier(t, idx, relPath); got != userEditTier {
+		t.Errorf("after byte-unchanged user commit: source_tier = %q, want upgraded %q", got, userEditTier)
+	}
+}
+
+// TestReindexDowngradesTierOnByteUnchangedAuthorRewrite is the review-fix
+// #10 over-trust proof: a file committed clean as author=user earns
+// 'user_edit', then a byte-preserving author rewrite (amend to author=kahyad)
+// must downgrade it back to the default tier even though its hash never
+// changed. Before the fix the stale 'user_edit' would persist forever.
+func TestReindexDowngradesTierOnByteUnchangedAuthorRewrite(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not on PATH")
+	}
+	memDir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", memDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	runGit("init", "-q")
+	runGit("config", "user.name", "user")
+	runGit("config", "user.email", "user@kahya.local")
+
+	relPath := "notlar/yukseklikten-dusen.md"
+	writeFixture(t, memDir, relPath, "# Not\n\nOnce kullanici olarak islenip sonra kahyad'a yeniden atfedilen not.\n")
+	runGit("add", "-A")
+	runGit("commit", "-q", "--author=user <user@kahya.local>", "-m", "user edit")
+
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+	idx.SetGitRunner(backup.NewExecGitRunner())
+
+	if _, err := idx.Reindex(context.Background(), "trace-user", false); err != nil {
+		t.Fatalf("first Reindex() error = %v", err)
+	}
+	if got := lookupEpisodeSourceTier(t, idx, relPath); got != userEditTier {
+		t.Fatalf("after clean user commit: source_tier = %q, want %q", got, userEditTier)
+	}
+
+	// Rewrite the commit's author to kahyad WITHOUT touching the file bytes:
+	// the hash is unchanged but the file no longer earns user_edit.
+	runGit("commit", "--amend", "--no-edit", "--author=kahyad <kahyad@kahya.local>")
+
+	if _, err := idx.Reindex(context.Background(), "trace-kahyad", false); err != nil {
+		t.Fatalf("second Reindex() error = %v", err)
+	}
+	if got := lookupEpisodeSourceTier(t, idx, relPath); got != DefaultSourceTier {
+		t.Errorf("after byte-unchanged author rewrite: source_tier = %q, want downgraded %q", got, DefaultSourceTier)
+	}
+}

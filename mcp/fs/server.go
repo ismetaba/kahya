@@ -219,8 +219,51 @@ type Server struct {
 	// so wiring this never takes a live-MLX dependency.
 	ContentClassifier ContentClassifier
 
+	// SecretLaneEscalator (optional; nil = no-op) stickily widens the
+	// OWNING TASK's lane to secret when fs_read returns the bytes of a
+	// secret-lane-glob file. Without this, a task classified `normal` at
+	// creation (because its PROMPT tripped no lexicon keyword — e.g.
+	// "summarize Documents/kimlik/pasaport.txt") spawns a CLOUD worker,
+	// fs_read hands it the secret file's bytes, and nothing stops the
+	// worker's next cloud call from carrying them off-box: the sensitive-
+	// read egress mark only blocks allowlist-EXTERNAL hosts, and the proxy
+	// backstop only 403s lane==secret tasks. Escalating the lane here makes
+	// that backstop fire on the worker's subsequent /v1/messages call
+	// (HANDOFF §4 ordering invariant: no secret byte reaches a cloud model).
+	// kahyad wires this to SetTaskLane; this package cannot import
+	// kahyad/internal/secretlane directly (internal-package boundary).
+	SecretLaneEscalator SecretLaneEscalator
+
+	// SessionTaintRaiser (optional; nil = no-op) raises the OWNING SESSION's
+	// taint tier to tainted when fs_read returns secret-lane content
+	// (project-review #12). Distinct from SecretLaneEscalator (which widens
+	// the task LANE so cloud egress is blocked): this widens the SESSION
+	// TAINT tier so subsequent non-R (W1/W2/W3) tool calls from the same
+	// session are denied (taint gate = R-tools + notify only). Best-effort:
+	// a raise failure is logged, not fatal — #2's lane escalation already
+	// fail-closes the actual cloud-leak path, and taint.Get's own default
+	// already treats an unresolvable session as tainted, so a transient
+	// resolver hiccup here never opens a hole. kahyad wires this to the
+	// server-side session resolver + taint.Tracker.Raise (this package
+	// cannot import either directly — internal-package boundary).
+	SessionTaintRaiser SessionTaintRaiser
+
 	registry *undoRegistry
 	now      func() time.Time
+}
+
+// SessionTaintRaiser raises the session owning (traceID, taskID) to the
+// tainted tier. Implementations resolve the server-persisted session_id
+// from the trace/task correlation (never a caller-supplied id) themselves.
+type SessionTaintRaiser interface {
+	RaiseSessionTaint(ctx context.Context, traceID, taskID, reason string) error
+}
+
+// SecretLaneEscalator stickily widens taskID's persisted lane to secret.
+// EscalateTaskLane must be idempotent and never a downgrade (HandleRead
+// only ever calls it on a secret hit). category may be "" (unknown).
+type SecretLaneEscalator interface {
+	EscalateTaskLane(ctx context.Context, taskID, traceID, category string) error
 }
 
 // ContentClassifier is HandleRead's optional content-based secret-lane
@@ -404,7 +447,7 @@ func buildToolInput(path string, content []byte) []byte {
 // HandleRead implements fs_read (class R). Exported so tests — and
 // kahyad's own gate wiring — can invoke it directly, "below the MCP
 // transport", matching mcp/memory.Server.HandleSearch's convention.
-func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs) (FsReadOutput, error) {
+func (s *Server) HandleRead(ctx context.Context, traceID, taskID string, args FsReadArgs) (FsReadOutput, error) {
 	cp, err := s.canonicalize(args.Path)
 	if err != nil {
 		return FsReadOutput{}, fmt.Errorf("fs_read: %w", err)
@@ -466,6 +509,32 @@ func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs
 		if s.SensitiveMarker != nil && traceID != "" {
 			if err := s.SensitiveMarker.MarkSensitiveRead(ctx, traceID, traceID); err != nil {
 				s.Log.With(traceID).Warn("secret_lane_read_sensitive_mark_failed", "err", err.Error())
+			}
+		}
+
+		// Project-review #2: stickily escalate the OWNING TASK's lane to
+		// secret so the W12-08 proxy backstop 403s the worker's subsequent
+		// cloud call — the file's bytes must not reach a cloud model just
+		// because the task's PROMPT tripped no secret-lane lexicon keyword.
+		// Fail-CLOSED: if the escalation cannot be persisted we return the
+		// error INSTEAD OF the content, because otherwise the backstop would
+		// not yet see lane=secret when the worker makes its cloud call and
+		// the bytes would leak. Skipped only when unwired (nil escalator, in
+		// unit tests) or for a direct in-process caller with no task_id.
+		if s.SecretLaneEscalator != nil && taskID != "" {
+			if err := s.SecretLaneEscalator.EscalateTaskLane(ctx, taskID, traceID, ""); err != nil {
+				s.Log.With(traceID).Error("secret_lane_read_escalation_failed", "err", err.Error(), "task_id", taskID)
+				return FsReadOutput{}, fmt.Errorf("fs_read: secret-lane escalation failed: %w", err)
+			}
+		}
+
+		// Project-review #12: also raise the owning SESSION's taint tier so
+		// subsequent non-R tool calls from this session are denied. Best-
+		// effort (see the SessionTaintRaiser field's doc comment for why a
+		// failure here is logged, not fatal).
+		if s.SessionTaintRaiser != nil && traceID != "" {
+			if err := s.SessionTaintRaiser.RaiseSessionTaint(ctx, traceID, taskID, "fs_read:secret_lane"); err != nil {
+				s.Log.With(traceID).Warn("secret_lane_read_taint_raise_failed", "err", err.Error())
 			}
 		}
 	}
@@ -614,7 +683,7 @@ func (s *Server) RegisterTools(srv *mcp.Server) {
 		Name:        "fs_read",
 		Description: "Dosya sisteminden bir dosya okur; kanonik yol, boyut ve gizli-şerit etiketiyle döner.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args FsReadArgs) (*mcp.CallToolResult, FsReadOutput, error) {
-		out, err := s.HandleRead(ctx, traceIDFromRequest(req), args)
+		out, err := s.HandleRead(ctx, traceIDFromRequest(req), taskIDFromRequest(req), args)
 		return nil, out, err
 	})
 

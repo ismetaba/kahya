@@ -389,6 +389,10 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 		Token:          apiKey,
 		UpstreamURL:    s.cfg.AnthropicUpstreamURL,
 		CredentialMode: s.cfg.CredentialMode,
+		// Project-review #4 follow-up: pass the passthrough-mode upstream
+		// bearer through so the proxy Director can inject it. Lives only in
+		// kahyad's config, never in the worker env.
+		UpstreamBearer: s.cfg.UpstreamBearer,
 		Credential:     s.anthCredential,
 		Governor:       s.anthGovernor,
 		Notifier:       s.anthNotifier,

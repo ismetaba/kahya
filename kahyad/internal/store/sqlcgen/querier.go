@@ -76,6 +76,12 @@ type Querier interface {
 	// of its current status.
 	CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error)
 	CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID string) (int64, error)
+	// Project-review #6: how many task_resume rows are already pending (not yet
+	// delivered, not canceled) for taskID. enqueueResume consults this before
+	// inserting another, so the 30s resume scan cannot stack duplicate resume
+	// rows for a task that is still (synchronously) executing; duplicates are
+	// what later become done-zombies re-claimed forever once the task finishes.
+	CountUndeliveredResumeOutboxRows(ctx context.Context, taskID sql.NullString) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
 	// WriteFact's upsert lookup: an existing ACTIVE fact for this exact
 	// (subject, predicate, object) gets a new evidence row instead of a
@@ -531,6 +537,12 @@ type Querier interface {
 	// definition). There is no corresponding statement anywhere in this
 	// codebase that ever sets tier back to 'clean' on an existing row.
 	RaiseSessionTaint(ctx context.Context, arg RaiseSessionTaintParams) error
+	// Project-review #9 (Defect A): extend an already-open window's deadline.
+	// One trace_id covers a whole task, so a second W1 write reuses the first
+	// write's window (GetOpenUndoWindowByTaskToolTrace above); without this the
+	// window's deadline stayed pinned at first-open, so later writes got less
+	// than the full 5-minute grace. openUndoWindow refreshes it on every reuse.
+	RefreshUndoWindowDeadline(ctx context.Context, arg RefreshUndoWindowDeadlineParams) error
 	// Task durability BLOCKER 2(b) fix: kahyad/internal/outbox.Dispatcher's
 	// heartbeat goroutine calls this every leaseDuration/3 for as long as
 	// spawn.Run blocks on a claimed row's re-spawned worker, so a

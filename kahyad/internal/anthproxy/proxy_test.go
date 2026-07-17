@@ -92,9 +92,19 @@ func testProxyConfig(t *testing.T, upstreamURL string, governor *Governor, ledge
 		TraceID:     "trace_test",
 		Token:       testToken,
 		UpstreamURL: upstreamURL,
-		Governor:    governor,
-		EventLedger: ledger,
-		Notifier:    notifier,
+		// Default to keychain mode — the shipped default. Every
+		// credential-mode-agnostic test in this suite presents the local
+		// token as x-api-key, which is exactly keychain mode's local-auth
+		// header; a benign fake Keychain key is injected upstream (the mock
+		// upstreams don't inspect it). Tests that assert the passthrough
+		// contract, keychain-unavailable behavior, or a specific injected
+		// upstream credential set CredentialMode/Credential/UpstreamBearer
+		// explicitly, overriding these.
+		CredentialMode: CredentialModeKeychain,
+		Credential:     NewKeychainCredentialSource(&fakeKeychainReader{key: "sk-ant-test-helper-key"}, "prod", nil),
+		Governor:       governor,
+		EventLedger:    ledger,
+		Notifier:       notifier,
 	}
 }
 
@@ -383,19 +393,21 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 	}
 }
 
-// --- (f) passthrough mode forwards the worker's own auth unchanged ---
+// --- (f) passthrough mode: the local token (X-Kahya-Task-Token) is
+// stripped and never reaches the upstream; with no bearer configured,
+// Authorization is left untouched (the hermetic default). ---
 
-func TestProxyPassthroughForwardsWorkerAuthUnchanged(t *testing.T) {
+func TestProxyPassthroughStripsLocalTokenWithoutBearer(t *testing.T) {
 	upstream := newJSONUpstream(t, 200, `{"usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`)
 	ledger := &fakeLedger{}
 	governor := generousGovernor()
 	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
 	cfg.CredentialMode = CredentialModePassthrough
+	// No UpstreamBearer configured — the hermetic default.
 	baseURL, _ := startTestProxy(t, cfg)
 
 	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)                                  // local-loopback proof only
-	req.Header.Set("Authorization", "Bearer worker-own-session-credential") // the worker's real upstream auth
+	req.Header.Set("X-Kahya-Task-Token", testToken) // the passthrough local-loopback proof
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -407,15 +419,159 @@ func TestProxyPassthroughForwardsWorkerAuthUnchanged(t *testing.T) {
 	}
 
 	got := upstream.last().headers
-	if got.Get("Authorization") != "Bearer worker-own-session-credential" {
-		t.Errorf("upstream Authorization = %q, want the worker's own credential forwarded unchanged", got.Get("Authorization"))
+	if got.Get("X-Kahya-Task-Token") != "" {
+		t.Errorf("upstream X-Kahya-Task-Token = %q, want empty - the local token must never reach the upstream", got.Get("X-Kahya-Task-Token"))
 	}
 	if got.Get("x-api-key") != "" {
-		t.Errorf("upstream x-api-key = %q, want empty - the local token must never reach the upstream", got.Get("x-api-key"))
+		t.Errorf("upstream x-api-key = %q, want empty", got.Get("x-api-key"))
+	}
+	if got.Get("Authorization") != "" {
+		t.Errorf("upstream Authorization = %q, want empty - no bearer configured, nothing injected", got.Get("Authorization"))
 	}
 
 	if !waitForCondition(t, time.Second, func() bool { return ledger.countKind(EventModelCall) == 1 }) {
 		t.Fatal("model_call never ledgered in passthrough mode - metering must still happen")
+	}
+}
+
+// newAuthRequiringUpstream answers 200 only when the named header carries
+// the exact required value, and 401s otherwise — proving the proxy actually
+// injected a usable upstream credential (a hermetic stand-in for the real
+// Anthropic upstream's own auth check, which the other mock upstreams skip).
+func newAuthRequiringUpstream(t *testing.T, requiredHeader, requiredValue string) *recordingUpstream {
+	t.Helper()
+	u := &recordingUpstream{}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		u.requests = append(u.requests, recordedRequest{headers: r.Header.Clone()})
+		u.mu.Unlock()
+		if r.Header.Get(requiredHeader) != requiredValue {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"missing upstream credential"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`))
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+// TestProxyInjectsCredentialForAuthRequiringUpstream is the finding's
+// regression test: against an upstream that 401s without the exact expected
+// credential, (a) a keychain-mode call reaches the upstream WITH the injected
+// Keychain key, and (b) a passthrough-mode call with upstream_bearer set
+// reaches the upstream WITH the injected bearer and WITHOUT the local
+// X-Kahya-Task-Token header. Both would 401 under the pre-fix behavior (the
+// keychain path was already correct; the passthrough default shipped with no
+// upstream credential at all).
+func TestProxyInjectsCredentialForAuthRequiringUpstream(t *testing.T) {
+	t.Run("keychain injects the real key", func(t *testing.T) {
+		upstream := newAuthRequiringUpstream(t, "x-api-key", "sk-ant-real-keychain-key")
+		cfg := testProxyConfig(t, upstream.srv.URL, generousGovernor(), &fakeLedger{}, nil)
+		cfg.CredentialMode = CredentialModeKeychain
+		cfg.Credential = NewKeychainCredentialSource(&fakeKeychainReader{key: "sk-ant-real-keychain-key"}, "prod", nil)
+		baseURL, _ := startTestProxy(t, cfg)
+
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+		req.Header.Set("x-api-key", testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200 - keychain must inject the credential the upstream requires", resp.StatusCode)
+		}
+		if got := upstream.last().headers.Get("x-api-key"); got != "sk-ant-real-keychain-key" {
+			t.Errorf("upstream x-api-key = %q, want the injected keychain key", got)
+		}
+	})
+
+	t.Run("passthrough injects upstream_bearer and strips local token", func(t *testing.T) {
+		upstream := newAuthRequiringUpstream(t, "Authorization", "Bearer sk-ant-upstream-bearer")
+		cfg := testProxyConfig(t, upstream.srv.URL, generousGovernor(), &fakeLedger{}, nil)
+		cfg.CredentialMode = CredentialModePassthrough
+		cfg.UpstreamBearer = "sk-ant-upstream-bearer"
+		baseURL, _ := startTestProxy(t, cfg)
+
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+		req.Header.Set("X-Kahya-Task-Token", testToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200 - passthrough must inject upstream_bearer as the upstream credential", resp.StatusCode)
+		}
+		got := upstream.last().headers
+		if got.Get("Authorization") != "Bearer sk-ant-upstream-bearer" {
+			t.Errorf("upstream Authorization = %q, want the injected bearer", got.Get("Authorization"))
+		}
+		if got.Get("X-Kahya-Task-Token") != "" {
+			t.Errorf("upstream X-Kahya-Task-Token = %q, want empty - the local token must never reach the upstream", got.Get("X-Kahya-Task-Token"))
+		}
+	})
+}
+
+// TestUsageCapturingBodyCloseBillsTruncatedCall is finding #15's regression:
+// when the worker connection is torn mid-stream (task timeout -> killGroup
+// SIGKILLs the worker), httputil.ReverseProxy returns on the write error and
+// Close()s the upstream body without a further Read. Close() must still fire
+// onDone exactly once so the truncated call's cost is billed to the governor
+// with status="error" (before the fix, onDone only ran from Read on EOF, so a
+// mid-stream teardown was never recorded and daily.usd drifted below real
+// spend).
+func TestUsageCapturingBodyCloseBillsTruncatedCall(t *testing.T) {
+	ledger := &fakeLedger{}
+	cfg := testProxyConfig(t, "http://unused.invalid", generousGovernor(), ledger, nil)
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	// A non-stream JSON body torn off mid-stream (Close before EOF).
+	src := io.NopCloser(strings.NewReader(`{"usage":{"input_tokens":5,"output`))
+	req, _ := http.NewRequest("POST", "http://unused.invalid/v1/messages", nil)
+	req = req.WithContext(context.WithValue(req.Context(), reqDataCtxKey{}, &reqData{Model: "claude-sonnet-5", Start: time.Now()}))
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       src,
+		Request:    req,
+	}
+	if err := p.wrapResponseBody(resp); err != nil {
+		t.Fatalf("wrapResponseBody() error = %v", err)
+	}
+
+	// The reverse proxy copies some bytes, then the worker write fails and it
+	// Close()s the body without a further Read.
+	buf := make([]byte, 8)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("Read() error = %v, want the partial body to read cleanly", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if got := ledger.countKind(EventModelCall); got != 1 {
+		t.Fatalf("model_call recorded %d times on early Close(), want exactly 1", got)
+	}
+	call := ledger.calls[len(ledger.calls)-1]
+	if call.payload["status"] != "error" {
+		t.Errorf("recorded status = %v, want \"error\" (a truncated call is billed as an error)", call.payload["status"])
+	}
+
+	// Exactly-once: a later EOF Read and a second Close must NOT double-record.
+	_, _ = resp.Body.Read(buf)
+	_ = resp.Body.Close()
+	if got := ledger.countKind(EventModelCall); got != 1 {
+		t.Errorf("model_call recorded %d times after extra Read/Close, want still exactly 1 (the done guard makes it idempotent)", got)
 	}
 }
 

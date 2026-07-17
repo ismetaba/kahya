@@ -93,6 +93,85 @@ func TestHandleWriteNonGitFallbackCopyThenUndoRestore(t *testing.T) {
 	}
 }
 
+// TestUndoWriteStackRecoversEachWriteUnderOneTrace is project-review #9's
+// Defect B regression: two fs_writes to different files under ONE trace_id
+// (one trace covers a whole task) must BOTH be recoverable — the earlier
+// write's pre-image and its fallback copy must not be lost/orphaned by the
+// second write. Undo pops most-recent-first.
+func TestUndoWriteStackRecoversEachWriteUnderOneTrace(t *testing.T) {
+	home := testHome(t)
+	targetA := filepath.Join(home, "a.txt")
+	targetB := filepath.Join(home, "b.txt")
+	const origA, origB = "A original\n", "B original\n"
+	mustWriteFile(t, targetA, origA)
+	mustWriteFile(t, targetB, origB)
+
+	pc := &fakePolicyClient{decision: allowDecision("tok-stack-a")}
+	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
+
+	if _, err := s.HandleWrite(context.Background(), "trace-stack", "task-s", FsWriteArgs{Path: "~/a.txt", ContentBase64: b64("A new\n")}); err != nil {
+		t.Fatalf("HandleWrite A: %v", err)
+	}
+	pc.decision = allowDecision("tok-stack-b") // distinct one-time token per write
+	if _, err := s.HandleWrite(context.Background(), "trace-stack", "task-s", FsWriteArgs{Path: "~/b.txt", ContentBase64: b64("B new\n")}); err != nil {
+		t.Fatalf("HandleWrite B: %v", err)
+	}
+	if got := s.RemainingUndo("trace-stack"); got != 2 {
+		t.Fatalf("RemainingUndo after 2 writes = %d, want 2 (earlier write not overwritten)", got)
+	}
+
+	// First undo reverts the MOST RECENT write (b.txt); a.txt still new.
+	if err := s.UndoWrite(context.Background(), "trace-stack"); err != nil {
+		t.Fatalf("UndoWrite 1: %v", err)
+	}
+	if b, _ := os.ReadFile(targetB); string(b) != origB {
+		t.Fatalf("b.txt = %q, want restored %q", b, origB)
+	}
+	if a, _ := os.ReadFile(targetA); string(a) != "A new\n" {
+		t.Fatalf("a.txt = %q, want still-new (only the most recent write undone)", a)
+	}
+	// Second undo reverts the EARLIER write (a.txt) — impossible before the
+	// stack fix, which had lost a.txt's pre-image.
+	if err := s.UndoWrite(context.Background(), "trace-stack"); err != nil {
+		t.Fatalf("UndoWrite 2: %v", err)
+	}
+	if a, _ := os.ReadFile(targetA); string(a) != origA {
+		t.Fatalf("a.txt = %q, want restored %q (earlier write recoverable)", a, origA)
+	}
+	if got := s.RemainingUndo("trace-stack"); got != 0 {
+		t.Fatalf("RemainingUndo after 2 undos = %d, want 0", got)
+	}
+}
+
+// TestPurgeExpiredCleansAllStackedCopies is Defect B's leak-fix regression:
+// PurgeExpired removes EVERY stacked write's fallback copy for the trace,
+// not just one (the old single-record purge orphaned earlier copies).
+func TestPurgeExpiredCleansAllStackedCopies(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "a.txt"), "A\n")
+	mustWriteFile(t, filepath.Join(home, "b.txt"), "B\n")
+	pc := &fakePolicyClient{decision: allowDecision("tok-purge-a")}
+	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
+	if _, err := s.HandleWrite(context.Background(), "trace-purge", "task-p", FsWriteArgs{Path: "~/a.txt", ContentBase64: b64("A2\n")}); err != nil {
+		t.Fatalf("HandleWrite A: %v", err)
+	}
+	pc.decision = allowDecision("tok-purge-b") // distinct one-time token per write
+	if _, err := s.HandleWrite(context.Background(), "trace-purge", "task-p", FsWriteArgs{Path: "~/b.txt", ContentBase64: b64("B2\n")}); err != nil {
+		t.Fatalf("HandleWrite B: %v", err)
+	}
+	copyDir := filepath.Join(home, "undo", "task-p")
+	if entries, _ := os.ReadDir(copyDir); len(entries) != 2 {
+		t.Fatalf("undo copy dir entries = %d, want 2", len(entries))
+	}
+	s.PurgeExpired("trace-purge", "task-p", "fs_write")
+	if entries, _ := os.ReadDir(copyDir); len(entries) != 0 {
+		t.Fatalf("undo copy dir entries after purge = %d, want 0 (every stacked copy cleaned)", len(entries))
+	}
+	if got := s.RemainingUndo("trace-purge"); got != 0 {
+		t.Fatalf("RemainingUndo after purge = %d, want 0", got)
+	}
+}
+
 func TestHandleWriteNewFileUndoMovesToTrash(t *testing.T) {
 	home := testHome(t)
 	pc := &fakePolicyClient{decision: allowDecision("tok-new")}

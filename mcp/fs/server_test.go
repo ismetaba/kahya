@@ -145,7 +145,7 @@ func TestHandleReadReturnsContentAndMetadata(t *testing.T) {
 	led := &fakeLedger{}
 	s := newTestServer(t, home, nil, nil, pc, led)
 
-	out, err := s.HandleRead(context.Background(), "trace-1", FsReadArgs{Path: "~/notes/a.md"})
+	out, err := s.HandleRead(context.Background(), "trace-1", "", FsReadArgs{Path: "~/notes/a.md"})
 	if err != nil {
 		t.Fatalf("HandleRead: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestHandleReadNeedsApprovalFailsAndNeverTouchesDisk(t *testing.T) {
 	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultNeedsApproval, Reason: "Bu eylem icin onay gerekiyor."}}
 	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
 
-	if _, err := s.HandleRead(context.Background(), "trace-1", FsReadArgs{Path: "~/notes/a.md"}); err == nil {
+	if _, err := s.HandleRead(context.Background(), "trace-1", "", FsReadArgs{Path: "~/notes/a.md"}); err == nil {
 		t.Fatal("HandleRead with NEEDS_APPROVAL decision = nil error, want error")
 	}
 }
@@ -188,7 +188,7 @@ func TestHandleReadSecretLaneMarksLedgerAndMetadata(t *testing.T) {
 	led := &fakeLedger{}
 	s := newTestServer(t, home, nil, secretLaneGlobs, pc, led)
 
-	out, err := s.HandleRead(context.Background(), "trace-secret", FsReadArgs{Path: "~/Documents/saglik/tahlil-sonuçları.pdf"})
+	out, err := s.HandleRead(context.Background(), "trace-secret", "", FsReadArgs{Path: "~/Documents/saglik/tahlil-sonuçları.pdf"})
 	if err != nil {
 		t.Fatalf("HandleRead: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
 	marker := &fakeSensitiveMarker{}
 	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
 
-	if _, err := s.HandleRead(context.Background(), "trace-mark", FsReadArgs{
+	if _, err := s.HandleRead(context.Background(), "trace-mark", "", FsReadArgs{
 		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
 	}); err != nil {
 		t.Fatalf("HandleRead: %v", err)
@@ -239,6 +239,89 @@ func TestHandleReadSecretLaneCallsSensitiveMarker(t *testing.T) {
 	got := marker.calls[0]
 	if got.sessionID != "trace-mark" || got.traceID != "trace-mark" {
 		t.Errorf("MarkSensitiveRead called with (%q, %q), want (%q, %q) — taint keyed on the REQUEST trace_id", got.sessionID, got.traceID, "trace-mark", "trace-mark")
+	}
+}
+
+// fakeEscalator records EscalateTaskLane calls and can be told to fail, to
+// exercise project-review #2's fail-closed "error ⇒ return no content" path.
+type fakeEscalator struct {
+	calls   []string // task IDs escalated
+	failErr error
+}
+
+func (f *fakeEscalator) EscalateTaskLane(_ context.Context, taskID, _, _ string) error {
+	if f.failErr != nil {
+		return f.failErr
+	}
+	f.calls = append(f.calls, taskID)
+	return nil
+}
+
+// TestHandleReadSecretLaneEscalatesOwningTaskLane is project-review #2's own
+// regression: a secret-lane fs_read with a task_id must stickily escalate
+// that task's lane to secret (so the proxy backstop later 403s the worker's
+// cloud call), and if the escalation cannot be persisted HandleRead must
+// return an error INSTEAD OF the file's content (fail-closed — otherwise the
+// bytes leak before the backstop sees lane=secret).
+func TestHandleReadSecretLaneEscalatesOwningTaskLane(t *testing.T) {
+	home := testHome(t)
+	rel := "Documents/saglik/tahlil.pdf"
+	mustWriteFile(t, filepath.Join(home, filepath.FromSlash(rel)), "gizli tahlil verisi")
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+
+	// Happy path: escalation succeeds, content returned.
+	esc := &fakeEscalator{}
+	s := newTestServer(t, home, nil, secretLaneGlobs, pc, &fakeLedger{})
+	s.SecretLaneEscalator = esc
+	out, err := s.HandleRead(context.Background(), "trace-esc", "task-esc", FsReadArgs{Path: "~/Documents/saglik/tahlil.pdf"})
+	if err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if out.ContentBase64 == "" {
+		t.Fatal("want file content on a successful secret-lane read")
+	}
+	if len(esc.calls) != 1 || esc.calls[0] != "task-esc" {
+		t.Fatalf("EscalateTaskLane calls = %v, want [task-esc]", esc.calls)
+	}
+
+	// Fail-closed: escalation error ⇒ error return, NO content.
+	failEsc := &fakeEscalator{failErr: errors.New("db down")}
+	s2 := newTestServer(t, home, nil, secretLaneGlobs, pc, &fakeLedger{})
+	s2.SecretLaneEscalator = failEsc
+	out2, err2 := s2.HandleRead(context.Background(), "trace-esc2", "task-esc2", FsReadArgs{Path: "~/Documents/saglik/tahlil.pdf"})
+	if err2 == nil {
+		t.Fatal("want an error when escalation fails, got nil")
+	}
+	if out2.ContentBase64 != "" {
+		t.Fatal("must NOT return content when secret-lane escalation fails (bytes would leak)")
+	}
+}
+
+// fakeTaintRaiser records RaiseSessionTaint calls (project-review #12).
+type fakeTaintRaiser struct{ calls []string }
+
+func (f *fakeTaintRaiser) RaiseSessionTaint(_ context.Context, _, taskID, _ string) error {
+	f.calls = append(f.calls, taskID)
+	return nil
+}
+
+// TestHandleReadSecretLaneRaisesSessionTaint is project-review #12's
+// regression: a secret-lane fs_read raises the owning session's taint tier
+// (so subsequent non-R tool calls from that session are denied).
+func TestHandleReadSecretLaneRaisesSessionTaint(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "Documents", "saglik", "t.pdf"), "gizli")
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	raiser := &fakeTaintRaiser{}
+	s := newTestServer(t, home, nil, secretLaneGlobs, pc, &fakeLedger{})
+	s.SessionTaintRaiser = raiser
+	if _, err := s.HandleRead(context.Background(), "trace-taint", "task-taint", FsReadArgs{Path: "~/Documents/saglik/t.pdf"}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if len(raiser.calls) != 1 || raiser.calls[0] != "task-taint" {
+		t.Fatalf("RaiseSessionTaint calls = %v, want [task-taint]", raiser.calls)
 	}
 }
 
@@ -261,7 +344,7 @@ func TestHandleReadSecretLaneAlwaysMarksTaintOnRequestTraceID(t *testing.T) {
 	marker := &fakeSensitiveMarker{}
 	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
 
-	if _, err := s.HandleRead(context.Background(), "trace-nomark", FsReadArgs{
+	if _, err := s.HandleRead(context.Background(), "trace-nomark", "", FsReadArgs{
 		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
 	}); err != nil {
 		t.Fatalf("HandleRead: %v", err)
@@ -290,7 +373,7 @@ func TestHandleReadFullDiskAccessErrorOnPermissionDenied(t *testing.T) {
 	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
 	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
 
-	_, err := s.HandleRead(context.Background(), "trace-1", FsReadArgs{Path: "~/locked.txt"})
+	_, err := s.HandleRead(context.Background(), "trace-1", "", FsReadArgs{Path: "~/locked.txt"})
 	if err == nil {
 		t.Skip("read of a chmod-0000 file unexpectedly succeeded on this platform/user; skipping")
 	}

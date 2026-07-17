@@ -25,3 +25,4 @@ worker/.venv/
 
 # macOS
 .DS_Store
+.claude/worktrees/
