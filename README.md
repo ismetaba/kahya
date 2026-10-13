@@ -15,7 +15,8 @@ The metaphor: an Ottoman **kâhya** — runs the household *on its own* in the o
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | **The locked design document.** Architecture, locked decisions (§4), safety/memory invariants (§5), 8-week MVP critical path (§6), day-1 kickoff (§7). Source of truth for everything. |
 | [`tasks/README.md`](tasks/README.md) | How to work the backlog: task-picking protocol, conventions, hard rules, task file template. |
 | [`tasks/BACKLOG.md`](tasks/BACKLOG.md) | Ordered index of all build tasks with dependencies and status. |
-| `docs/design.html` | Full design artifact copy (committed by task W0-05). |
+| [`docs/review/kahya-inceleme.md`](docs/review/kahya-inceleme.md) | 2026-10 full code review + remediation handbook (Turkish): findings, fix recipes, owner decisions; fixes land as `[FIX-<id>]` commits. |
+| `docs/design.html` | Full design artifact copy (W0-05 — **pending**, the user must export it; absent at HEAD). |
 
 ## Repo layout
 
@@ -50,6 +51,13 @@ real worker venv; a working venv is kept.
 
 ## Status
 
-Greenfield. Design is complete and locked. Next: execute `tasks/BACKLOG.md` top to bottom.
+**Build phase complete (W0 → W7–8).** 46 of the 50 tasks in `tasks/BACKLOG.md` are `[x]`; the other
+four are user-assist tasks that stay `[!]` until the user acts: W0-04 (Keychain secrets), W0-05
+(`docs/design.html` export), W3-07 (Telegram bot token + chat_id), W3-09 (live TCC Automation
+dialog). The MVP has **not** entered the 2-week dogfood window yet (`docs/dogfood.md`); the start
+gate is `make readiness` (`docs/mvp-readiness.md`). A full code review (2026-10-08) found
+pre-dogfood blockers; its remediation handbook is
+[`docs/review/kahya-inceleme.md`](docs/review/kahya-inceleme.md) and the fixes land as `[FIX-<id>]`
+commits before dogfood starts.
 
 **MVP is done when:** 2 weeks of uninterrupted daily use · zero data-loss events (one rehearsed backup restore) · ≥10 commands/day · ≥5 "it remembered" moments/week · egress / secret-lane / W3 invariants covered by code tests, green in CI.

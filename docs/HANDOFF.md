@@ -23,7 +23,7 @@ Metafor: Osmanlı **kâhya**sı — evi sahibinin adına *kendi başına* yönet
 
 ## 2 · Durum
 
-- **Greenfield.** Henüz kod yok. Tasarım tamam ve kilitli (5-mimar + 3-hasım-eleştirmen sürecinden geçti; ardından mimari inceleme + hasım-doğrulama).
+- **Durum (2026-10-08):** W0–W7-8 backlog'u (46 görev) tamamlandı; 4 kullanıcı-asistli görev açık (W0-04, W0-05, W3-07, W3-09). Tasarım tamam ve kilitli (5-mimar + 3-hasım-eleştirmen sürecinden geçti; ardından mimari inceleme + hasım-doğrulama). Dogfood penceresi henüz başlamadı; 2026-10-08 incelemesinin bulguları `[FIX-*]` commit'leriyle kapatılıyor.
 - Bir sonraki iş: **8 haftalık MVP kritik yolu** (§6).
 - Kural: **MVP 2 hafta gerçek günlük kullanımdan sağ çıkmadan v1'den hiçbir şey başlamaz.**
 
