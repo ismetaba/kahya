@@ -1,0 +1,203 @@
+// turkish_text_test.go pins G12-N4's user-facing-text fixes (2026-10
+// review handbook docs/review/kahya-inceleme.md): every flag help text a
+// user can see via `-h` is Turkish and never ASCII-folded, no help text
+// leaks an internal backlog task id (W6-05 & co.), and the kahyad-side
+// English error bodies of ledger/consolidation/job/log get a Turkish frame
+// (the English technical detail itself is kept verbatim after the frame,
+// HANDOFF §3).
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// internalTaskIDRe matches a backlog task id such as W0-03 or W6-05 (never
+// a bare action class like W2/W3, which IS user vocabulary).
+var internalTaskIDRe = regexp.MustCompile(`\bW[0-9]+-[0-9]+\b`)
+
+// noDaemonSocket points KAHYA_SOCKET at a path nothing listens on, so a
+// `-h` run never reads the real config and could never reach a daemon.
+func noDaemonSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "k")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "none.sock")
+	t.Setenv("KAHYA_SOCKET", sock)
+	return sock
+}
+
+// runHelp runs `kahya <args...>` (args ending in -h) and returns stderr,
+// failing unless the flag package's help path exited 2.
+func runHelp(t *testing.T, args ...string) string {
+	t.Helper()
+	noDaemonSocket(t)
+	var stdout, stderr bytes.Buffer
+	if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Fatalf("kahya %s: exit code = %d, want 2 (stderr=%q)", strings.Join(args, " "), code, stderr.String())
+	}
+	return stderr.String()
+}
+
+func TestLogHelpIsTurkish(t *testing.T) {
+	out := runHelp(t, "log", "-h")
+	for _, want := range []string{
+		MsgLogUsage,
+		"bu trace_id'nin log satırlarını göster",
+		"biçimli çıktı yerine ham JSONL satırlarını bas",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("kahya log -h output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, english := range []string{"render this trace_id", "dump raw JSONL", "Usage of log"} {
+		if strings.Contains(out, english) {
+			t.Errorf("kahya log -h output still carries English %q:\n%s", english, out)
+		}
+	}
+}
+
+func TestFlagHelpTextsAreNotAsciiFolded(t *testing.T) {
+	cases := []struct {
+		args   []string
+		want   string // byte-exact Turkish help text
+		folded string // the old ASCII-folded spelling that must be gone
+	}{
+		{[]string{"reindex", "-h"}, "tüm parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)", "tum parçaları"},
+		// The two positional entity ids come BEFORE the flags (runEntityMerge).
+		{[]string{"entity", "merge", "1", "2", "-h"}, "ayırt edici kanıt olgu id'si (zorunlu)", "ayirt edici kanit"},
+		{[]string{"undo", "-h"}, "geri al: bu trace_id'nin açık geri-alma penceresini tetikle", "acik geri-alma"},
+		{[]string{"approvals", "show", "-h"}, "makine-okunur JSON çıktısı", "makine-okur JSON"},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, "_"), func(t *testing.T) {
+			out := runHelp(t, c.args...)
+			if !strings.Contains(out, c.want) {
+				t.Errorf("kahya %s output lacks %q:\n%s", strings.Join(c.args, " "), c.want, out)
+			}
+			if strings.Contains(out, c.folded) {
+				t.Errorf("kahya %s output still has the ASCII-folded %q:\n%s", strings.Join(c.args, " "), c.folded, out)
+			}
+		})
+	}
+}
+
+// TestAskHelpCarriesNoInternalTaskID covers G12-N4-E1: `kahya ask -h`
+// printed "(W6-05)" in the --speak help text.
+func TestAskHelpCarriesNoInternalTaskID(t *testing.T) {
+	out := runHelp(t, "ask", "-h")
+	if m := internalTaskIDRe.FindString(out); m != "" {
+		t.Errorf("kahya ask -h leaks internal task id %q:\n%s", m, out)
+	}
+	if !strings.Contains(out, "cevabı sesli oku (say -v Yelda) - tts.enabled kapalı olsa bile, sadece bu görev için") {
+		t.Errorf("kahya ask -h lacks the byte-exact --speak help text:\n%s", out)
+	}
+}
+
+// errorBodyServer answers every request with status and a JSON body.
+func errorBodyServer(t *testing.T, status int, body map[string]any) {
+	t.Helper()
+	sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	t.Setenv("KAHYA_SOCKET", sock)
+}
+
+// assertWrapped runs `kahya <args...>` and requires exit 2 and stderr to be
+// EXACTLY the Turkish frame around the server's English detail - one line,
+// nothing else (the frame adds meaning, it never swallows the detail).
+func assertWrapped(t *testing.T, args []string, stdin, format, detail string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run(args, strings.NewReader(stdin), &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("kahya %s: exit code = %d, want 2", strings.Join(args, " "), code)
+	}
+	if want := fmt.Sprintf(format, detail) + "\n"; stderr.String() != want {
+		t.Errorf("kahya %s: stderr = %q, want exactly %q", strings.Join(args, " "), stderr.String(), want)
+	}
+}
+
+func TestLedgerVerifyServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "anchor: git pull: exit status 128: fatal: could not read from remote repository"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"error": detail})
+	assertWrapped(t, []string{"ledger", "verify"}, "", MsgLedgerVerifyFailed, detail)
+}
+
+func TestConsolidationRejectServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "consolidation: git branch -D kahya/consolidation-20261008: exit status 1 (error: branch not found)"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"ok": false, "error": detail})
+	assertWrapped(t, []string{"consolidation", "reject"}, "", MsgConsolidationFailed, detail)
+}
+
+func TestConsolidationShowServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "consolidation: git worktree list: exit status 128 (fatal: not a git repository)"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"error": detail})
+	assertWrapped(t, []string{"consolidation", "show"}, "", MsgConsolidationFailed, detail)
+}
+
+// TestConsolidationApproveServerErrorIsWrappedInTurkish: the diff renders,
+// the user types the literal "onayla", then the merge itself fails
+// server-side - that failure is framed too (stdout keeps the diff+prompt).
+func TestConsolidationApproveServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "consolidation: git merge --ff-only kahya/consolidation-20261008: exit status 128 (fatal: Not possible to fast-forward, aborting.)"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/consolidation", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"found": true, "diff": "some diff content\n"})
+	})
+	mux.HandleFunc("/v1/consolidation/approve", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": detail})
+	})
+	sock := startFakeServer(t, mux)
+	t.Setenv("KAHYA_SOCKET", sock)
+	assertWrapped(t, []string{"consolidation", "approve"}, "onayla\n", MsgConsolidationFailed, detail)
+}
+
+func TestJobRunServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "scheduler: job runner panicked"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"error": detail})
+	assertWrapped(t, []string{"job", "run", "morning-briefing"}, "", MsgJobTriggerFailed, detail)
+}
+
+func TestLogServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "log: open /x/kahyad.jsonl: permission denied"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"error": detail})
+	assertWrapped(t, []string{"log", "--trace", "abc"}, "", MsgLogFailed, detail)
+}
+
+// TestServerErrorFrameLeavesUnreachableErrorAlone: with no daemon at all
+// the already-Turkish MsgDaemonUnreachable line is printed as-is, never
+// double-framed ("Defter doğrulaması çalıştırılamadı: kahyad'a ...").
+func TestServerErrorFrameLeavesUnreachableErrorAlone(t *testing.T) {
+	for _, args := range [][]string{
+		{"ledger", "verify"},
+		{"consolidation", "show"},
+		{"consolidation", "reject"},
+		{"job", "run", "morning-briefing"},
+		{"log", "--trace", "abc"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			sock := noDaemonSocket(t)
+			var stdout, stderr bytes.Buffer
+			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
+				t.Errorf("exit code = %d, want 2", code)
+			}
+			if want := fmt.Sprintf(MsgDaemonUnreachable, sock) + "\n"; stderr.String() != want {
+				t.Errorf("stderr = %q, want exactly %q", stderr.String(), want)
+			}
+		})
+	}
+}

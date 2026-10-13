@@ -46,8 +46,12 @@ const EventRememberedMoment = "remembered_moment"
 const EventRememberedDuplicate = "remembered_moment.duplicate"
 
 // ErrEmptyTrace is returned by Mark when traceID is blank - never a valid
-// events.trace_id to look up or mark.
-var ErrEmptyTrace = errors.New("remembered: trace_id bos olamaz")
+// events.trace_id to look up or mark. It is an internal argument error
+// (every caller validates first: the CLI prints MsgRememberedTraceRequired,
+// POST /v1/remembered answers 400, the Telegram callback maps any Mark
+// error to toastRememberedFailed), so it is English like every other
+// non-user-facing error in this codebase (G12-N4).
+var ErrEmptyTrace = errors.New("remembered: trace_id must not be empty")
 
 // ErrUnknownTrace is returned by Mark when traceID has no row at all in
 // the events ledger - there is no task/ritual run for the CLI/Telegram

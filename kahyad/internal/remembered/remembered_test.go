@@ -71,6 +71,22 @@ func TestMarkEmptyTraceRejected(t *testing.T) {
 	}
 }
 
+// TestErrEmptyTraceIsEnglishInternalError pins G12-N4 (c): ErrEmptyTrace
+// never reaches a user (the CLI prints MsgRememberedTraceRequired first,
+// POST /v1/remembered answers 400 before Mark, the Telegram button maps
+// any Mark error to toastRememberedFailed), so it is an internal argument
+// error and English like every other non-user-facing error - not an
+// ASCII-folded Turkish string. ErrUnknownTrace, by contrast, IS the
+// user-facing Turkish text and stays so.
+func TestErrEmptyTraceIsEnglishInternalError(t *testing.T) {
+	if got, want := ErrEmptyTrace.Error(), "remembered: trace_id must not be empty"; got != want {
+		t.Errorf("ErrEmptyTrace = %q, want %q", got, want)
+	}
+	if got := ErrUnknownTrace.Error(); got != "Bilinmeyen iz (trace_id): böyle bir görev/ritüel bulunamadı." {
+		t.Errorf("ErrUnknownTrace = %q, want the byte-exact W5-03 Turkish text", got)
+	}
+}
+
 // TestMarkKnownTraceInsertsExactlyOneRowThenIdempotent is the core W5-03
 // acceptance criterion: a real trace (an existing events row under it)
 // marks cleanly once; a second Mark for the SAME trace_id inserts nothing

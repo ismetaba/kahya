@@ -521,4 +521,30 @@ const (
 	// docs/dogfood.md cannot be read (fail-closed: the gate goes red). %s = the
 	// path tried.
 	MsgReadinessDogfoodMissing = "docs/dogfood.md okunamadı (%s) — veri-kaybı kapısı doğrulanamıyor"
+
+	// MsgLogUsage heads `kahya log -h` (W12-06's log command; its flag help
+	// strings are Turkish like every other subcommand's - G12-N4).
+	MsgLogUsage = "kullanım: kahya log --trace <id> [--raw]"
+
+	// The four MsgXFailed frames below wrap a kahyad-side error body (%s =
+	// the daemon's own English detail, e.g. git/anchor stderr - technical
+	// detail stays English after the Turkish frame, HANDOFF §3) so the user
+	// always learns WHAT failed in Turkish (G12-N4 (e)). The already-Turkish
+	// unreachable error is never wrapped (main.go wrapServerError).
+
+	// MsgLedgerVerifyFailed wraps a kahyad-side failure of POST
+	// /v1/ledger/verify (typically anchor git clone/pull stderr). A
+	// verification MISMATCH is not a failure here: its Turkish alarm text is
+	// printed verbatim (runLedgerVerify).
+	MsgLedgerVerifyFailed = "Defter doğrulaması çalıştırılamadı: %s"
+	// MsgConsolidationFailed wraps a kahyad-side failure of GET/POST
+	// /v1/consolidation{,/approve,/reject} (git worktree/merge stderr).
+	MsgConsolidationFailed = "Konsolidasyon işlemi başarısız: %s"
+	// MsgJobTriggerFailed wraps any non-202 error body of POST
+	// /jobs/trigger/{name} - client.go TriggerJob does not distinguish the
+	// 404 "unknown job: <name>" from a 500, so both get this frame.
+	MsgJobTriggerFailed = "İş tetiklenemedi: %s"
+	// MsgLogFailed wraps a kahyad-side failure of GET /v1/log (the daemon's
+	// own English log-read errors).
+	MsgLogFailed = "Log okunamadı: %s"
 )

@@ -124,7 +124,7 @@ func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
 	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
 	audio := fs.String("audio", "", "ses dosyası yolu (wav) - transkript kahyad tarafından yerelde çıkarılır (hammerspoon/kahya.lua basılı-tut kullanır)")
-	speak := fs.Bool("speak", false, "cevabı sesli oku (say -v Yelda) - tts.enabled kapalı olsa bile, sadece bu görev için (W6-05)")
+	speak := fs.Bool("speak", false, "cevabı sesli oku (say -v Yelda) - tts.enabled kapalı olsa bile, sadece bu görev için")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -307,7 +307,7 @@ func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reindex", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	full := fs.Bool("full", false, "tam yeniden indeksleme")
-	reEmbed := fs.Bool("re-embed", false, "tum parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)")
+	reEmbed := fs.Bool("re-embed", false, "tüm parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -337,7 +337,7 @@ func runJob(client *Client, args []string, stdout, stderr io.Writer) int {
 
 	traceID, err := client.TriggerJob(context.Background(), traceid.New(), name)
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgJobTriggerFailed, err))
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgJobTriggered+"\n", name, traceID)
@@ -372,7 +372,7 @@ func runConsolidation(client *Client, args []string, stdin io.Reader, stdout, st
 func runConsolidationShow(client *Client, stdout, stderr io.Writer) int {
 	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2
 	}
 	if !found {
@@ -386,7 +386,7 @@ func runConsolidationShow(client *Client, stdout, stderr io.Writer) int {
 func runConsolidationApprove(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2
 	}
 	if !found {
@@ -411,7 +411,7 @@ func runConsolidationApprove(client *Client, stdin io.Reader, stdout, stderr io.
 			fmt.Fprintln(stdout, MsgConsolidationEmpty)
 			return 0
 		}
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgConsolidationApproved)
@@ -424,11 +424,27 @@ func runConsolidationReject(client *Client, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, MsgConsolidationEmpty)
 			return 0
 		}
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgConsolidationRejected)
 	return 0
+}
+
+// wrapServerError renders err inside a Turkish MsgXFailed frame (format
+// has exactly one %s: the kahyad error body, whose technical detail stays
+// English - HANDOFF §3), so the user always learns WHAT failed (G12-N4
+// (e)). The already-Turkish *unreachableError (MsgDaemonUnreachable) is
+// returned as-is, never double-framed. Scoped on purpose to commands whose
+// server errors are English (ledger verify, consolidation, job run, log):
+// routes that already answer in Turkish (e.g. remembered's verbatim
+// ErrUnknownTrace) keep printing err.Error() unframed.
+func wrapServerError(format string, err error) string {
+	var ue *unreachableError
+	if errors.As(err, &ue) {
+		return err.Error()
+	}
+	return fmt.Sprintf(format, err.Error())
 }
 
 // runFact implements `kahya fact confirm <id>` and `kahya fact retract
@@ -527,7 +543,7 @@ func runEntityMerge(client *Client, args []string, stdout, stderr io.Writer) int
 
 	fs := flag.NewFlagSet("merge", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	evidence := fs.Int64("evidence", 0, "ayirt edici kanit olgu id'si (zorunlu)")
+	evidence := fs.Int64("evidence", 0, "ayırt edici kanıt olgu id'si (zorunlu)")
 	if err := fs.Parse(args[2:]); err != nil {
 		return 2
 	}
@@ -1055,7 +1071,7 @@ func runAutonomyPromote(client *Client, args []string, stdout, stderr io.Writer)
 func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("undo", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	trace := fs.String("trace", "", "geri al: bu trace_id'nin acik geri-alma penceresini tetikle")
+	trace := fs.String("trace", "", "geri al: bu trace_id'nin açık geri-alma penceresini tetikle")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1132,7 +1148,7 @@ func runApprovalsList(client *Client, stdout, stderr io.Writer) int {
 func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("approvals show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	asJSON := fs.Bool("json", false, "makine-okur JSON çıktısı")
+	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1467,7 +1483,7 @@ func runLedger(client *Client, args []string, stdout, stderr io.Writer) int {
 func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
 	result, err := client.LedgerVerify(context.Background(), traceid.New())
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgLedgerVerifyFailed, err))
 		return 2
 	}
 	if !result.OK {
@@ -1484,8 +1500,12 @@ func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
 func runLog(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("log", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	trace := fs.String("trace", "", "render this trace_id's log lines")
-	raw := fs.Bool("raw", false, "dump raw JSONL instead of pretty-printing")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, MsgLogUsage)
+		fs.PrintDefaults()
+	}
+	trace := fs.String("trace", "", "bu trace_id'nin log satırlarını göster")
+	raw := fs.Bool("raw", false, "biçimli çıktı yerine ham JSONL satırlarını bas")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1497,7 +1517,7 @@ func runLog(client *Client, args []string, stdout, stderr io.Writer) int {
 
 	lines, err := client.Log(context.Background(), traceid.New(), *trace)
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgLogFailed, err))
 		return 2
 	}
 	if len(lines) == 0 {
