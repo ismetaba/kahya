@@ -120,12 +120,24 @@ func newClient(sock string) *Client {
 // dial matters; the hostname is never resolved) and sets the one header
 // every kahyad route expects (W12-06 step 7: "Every request sets
 // X-Kahya-Trace-Id").
+//
+// G03 / B-3: it also attaches kahyad's per-boot control secret
+// (config.ControlSecretPath(c.sock), re-read on EVERY request so a daemon
+// restart's rotated secret is picked up without restarting anything here)
+// as config.ControlSecretHeader - this CLI is a human surface, and every
+// control route requires it. A missing/unreadable/malformed secret file
+// is silently ignored: this is the UX side, kahyad is the authority and
+// answers such a request 403 with its own Turkish message, which every
+// caller already prints via apiError.
 func (c *Client) newRequest(ctx context.Context, method, path, traceID string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://kahyad"+path, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Kahya-Trace-Id", traceID)
+	if secret, err := config.ReadControlSecret(c.sock); err == nil && secret != "" {
+		req.Header.Set(config.ControlSecretHeader, secret)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

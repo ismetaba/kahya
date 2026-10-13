@@ -427,3 +427,57 @@ func TestReadSSEIdleTimeout(t *testing.T) {
 		t.Errorf("error = %q, want %q", err.Error(), want)
 	}
 }
+
+// TestClientSendsControlSecretHeaderFromFile (G03 / B-3): the CLI is a
+// human surface, so every request it sends carries kahyad's per-boot
+// control secret, read from <socket>.secret - here via `kahya autonomy
+// promote`, the control route a worker must never reach.
+func TestClientSendsControlSecretHeaderFromFile(t *testing.T) {
+	var gotSecret, gotPath string
+	sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotSecret = r.Header.Get(config.ControlSecretHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"level":1}`))
+	}))
+	secret := strings.Repeat("0123456789abcdef", 4)
+	if err := os.WriteFile(config.ControlSecretPath(sock), []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var out, errOut strings.Builder
+	code := run([]string{"autonomy", "promote", "fs_write", "W1", "global"}, strings.NewReader(""), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("kahya autonomy promote = exit %d, stderr=%q", code, errOut.String())
+	}
+	if gotPath != "/policy/promote" {
+		t.Fatalf("path = %q, want /policy/promote", gotPath)
+	}
+	if gotSecret != secret {
+		t.Fatalf("%s = %q, want the secret file's value %q", config.ControlSecretHeader, gotSecret, secret)
+	}
+}
+
+// TestClientWithoutSecretFileOmitsHeader: no secret file (an old daemon,
+// a fake server) sends no header at all - the daemon decides.
+func TestClientWithoutSecretFileOmitsHeader(t *testing.T) {
+	var gotSecret string
+	var hadHeader bool
+	sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSecret = r.Header.Get(config.ControlSecretHeader)
+		_, hadHeader = r.Header[http.CanonicalHeaderKey(config.ControlSecretHeader)]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"level":1}`))
+	}))
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var out, errOut strings.Builder
+	code := run([]string{"autonomy", "promote", "fs_write", "W1", "global"}, strings.NewReader(""), &out, &errOut)
+	if code != 0 {
+		t.Fatalf("kahya autonomy promote = exit %d, stderr=%q", code, errOut.String())
+	}
+	if hadHeader || gotSecret != "" {
+		t.Fatalf("%s sent (%q) with no secret file present, want no header", config.ControlSecretHeader, gotSecret)
+	}
+}

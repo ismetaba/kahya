@@ -494,10 +494,17 @@ func killGroup(cmd *exec.Cmd) {
 //     means the ANTHROPIC_API_KEY the worker actually receives is always
 //     exactly the one BuildEnv appends below (the per-task token) - never
 //     shadowed-then-unshadowed by an inherited value of the same name.
+//   - KAHYA_CONTROL_SECRET / KAHYA_CONTROL_SECRET_PATH (G03 / B-3): no such
+//     variable exists today (kahyad's control-plane secret lives only in
+//     <socket>.secret and in kahyad's memory, never in any env), but if one
+//     is ever introduced for a CLI/script it must not ride os.Environ()
+//     inheritance into a worker, which must never reach control routes.
 var secretEnvDenylist = map[string]bool{
 	"KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
 	"ANTHROPIC_API_KEY":            true,
 	"ANTHROPIC_AUTH_TOKEN":         true,
+	"KAHYA_CONTROL_SECRET":         true,
+	"KAHYA_CONTROL_SECRET_PATH":    true,
 }
 
 // filterSecretEnv returns a copy of in with every entry whose NAME (the
@@ -558,6 +565,11 @@ func pythonWorkerDir(cmd []string) string {
 // `python -m kahya_worker` can import the package regardless of kahyad's
 // own cwd (this is the other BLOCKER 1 fix, alongside Run's cmd.Dir - see
 // pythonWorkerDir's own doc comment for why both are set).
+//
+// The control-plane secret (config.ControlSecretPath, G03 / B-3) is never
+// placed in the worker env - neither its value nor its path; see
+// kahyad/internal/server/controlauth.go. KAHYA_SOCKET alone reaches only
+// the worker routes.
 func BuildEnv(cfg Config, env Envelope) []string {
 	base := filterSecretEnv(os.Environ())
 	extra := []string{

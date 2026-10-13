@@ -1311,3 +1311,57 @@ func TestLoadRejectsInvalidJobName(t *testing.T) {
 		t.Fatal("Load() error = nil, want rejection of an invalid jobs[].name")
 	}
 }
+
+// TestReadControlSecret covers the G03 / B-3 client-side helper every
+// human surface (kahya CLI, kahya-trigger) uses to attach kahyad's
+// per-boot control secret: a missing file is ("", nil) - send no header -
+// while any present-but-malformed content is an error, never a value.
+func TestReadControlSecret(t *testing.T) {
+	if got := ControlSecretPath("/a/k.sock"); got != "/a/k.sock.secret" {
+		t.Fatalf("ControlSecretPath(/a/k.sock) = %q, want /a/k.sock.secret", got)
+	}
+
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "k.sock")
+
+	if s, err := ReadControlSecret(sock); s != "" || err != nil {
+		t.Fatalf("missing file: ReadControlSecret = %q, %v; want \"\", nil", s, err)
+	}
+
+	valid := strings.Repeat("0123456789abcdef", 4)
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(ControlSecretPath(sock), []byte(content), 0o600); err != nil {
+			t.Fatalf("write secret: %v", err)
+		}
+	}
+
+	write(valid + "\n")
+	if s, err := ReadControlSecret(sock); s != valid || err != nil {
+		t.Fatalf("valid file: ReadControlSecret = %q, %v; want %q, nil", s, err, valid)
+	}
+
+	for name, content := range map[string]string{
+		"too short": "0123456789",
+		"too long":  valid + "00",
+		"not hex":   strings.Repeat("zz", 32),
+		"empty":     "\n",
+	} {
+		write(content)
+		if s, err := ReadControlSecret(sock); err == nil || s != "" {
+			t.Errorf("%s: ReadControlSecret = %q, %v; want an error and no value", name, s, err)
+		}
+	}
+
+	// An unreadable path (a directory where the file should be) is an
+	// error too, not "no secret".
+	if err := os.Remove(ControlSecretPath(sock)); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Mkdir(ControlSecretPath(sock), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if s, err := ReadControlSecret(sock); err == nil || s != "" {
+		t.Errorf("directory at secret path: ReadControlSecret = %q, %v; want an error", s, err)
+	}
+}

@@ -12,6 +12,6 @@
 
 `GET /policy/state` → `{states: [{tool, class, scope, level, consecutive_approvals, updated_at}]}`.
 
-`POST /policy/promote` `{tool, class, scope}` → `{level}` — the only path that ever raises a level (`kahya autonomy promote`).
+`POST /policy/promote` `{tool, class, scope}` → `{level}` — the only path that ever raises a level (`kahya autonomy promote`). Control route: requires `X-Kahya-Control-Secret` (kahyad/internal/server/controlauth.go), unreachable from a worker.
 
 `POST /policy/undo` `{trace_id}` → `{ok, tool, task_id}` — triggers an open undo window; recipe execution is the owning tool's job (W3-03).

@@ -95,6 +95,13 @@ container), kahyad sets exactly eight variables (`spawn.BuildEnv`):
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
 | `KAHYA_TMP_DIR` | Since W6-02: `config.Config.TmpDir()` (`<data_dir>/tmp`, e.g. `~/Library/Application Support/Kahya/tmp` — created 0700 at kahyad startup). `mode=="stt"` sessions read this to decide whether `input_audio_path` is safe to delete after transcription (`kahya_worker.__main__._maybe_delete_audio`): a file is deleted **iff** its resolved parent directory equals this exact value — never a repo fixture, never any other path. Empty/unset is a fail-CLOSED no-op (never delete). |
 
+`KAHYA_SOCKET` alone reaches only the four **worker routes** (see §5a);
+every control route (`/policy/promote`, `/policy/feedback`,
+`/approvals/{id}/decision`, `/halt`, `/v1/task`, ...) additionally requires
+kahyad's per-boot control secret (`<socket>.secret`), which is never in the
+worker env (`spawn.secretEnvDenylist` strips `KAHYA_CONTROL_SECRET` /
+`KAHYA_CONTROL_SECRET_PATH` defensively; neither exists today).
+
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 
 HANDOFF §4 assumes kahyad reads a real Anthropic API key from the macOS
@@ -446,6 +453,70 @@ All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a
 timeout — which cancels the timeout context by design — never prevents
 kahyad from recording that the task timed out.
+
+## 5a · Control-plane identity (G03 / B-3)
+
+kahyad's one UDS listener serves both the human surfaces (the `kahya` CLI,
+`kahya-trigger` under launchd, Hammerspoon — which only ever talks through
+the CLI) and every worker kahyad spawns (`KAHYA_SOCKET`, §3). Socket mode
+0600 separates uids only and the worker runs as the same uid, so kahyad
+needs a second identity to tell them apart.
+
+**Secret.** On every boot (`server.Prepare`, while the startup flock is
+held, before `Serve`) kahyad mints 32 random bytes and writes them as 64
+lowercase hex chars plus `\n` to `<socket>.secret` (e.g.
+`~/Library/Application Support/Kahya/kahyad.sock.secret`, mode 0600, in the
+0700 socket dir; temp file + rename). The path is derived from the socket
+path (`config.ControlSecretPath`), so the dev profile gets
+`kahyad-dev.sock.secret` automatically; there is no config key. If the file
+cannot be written, `Prepare` fails and no listener is served (fail-closed).
+`Shutdown` removes the file as its last step (after the listener is closed,
+while the flock is still held). The secret rotates on every restart; clients
+re-read the file on every request (`config.ReadControlSecret`), so a
+running Hammerspoon or a long test harness picks up the new value.
+
+**Header.** `X-Kahya-Control-Secret: <64 hex>` (`config.ControlSecretHeader`),
+compared in constant time against the secret kahyad holds in memory (never
+against the file).
+
+**Route classes** (`kahyad/internal/server/controlauth.go classifyRoute`,
+exact path match):
+
+| Class | Paths | Rule |
+|---|---|---|
+| open | `/health` | no identity needed |
+| worker | `/policy/check`, `/v1/memory/search`, `/v1/mcp`, `/policy/consume-token` | reachable without the secret (a worker never has it) |
+| control | everything else — including any unknown/unclean path and every route added later without a deliberate classification | requires the secret |
+
+Read-only routes `GET /metrics`, `GET /readiness`, `GET /v1/log`,
+`GET /policy/state` are deliberately **control** (owner decision G03-4): a
+tainted worker must not read other tasks' log lines or ledger summaries.
+`POST /session/sensitive-read` is control too — it has no caller outside
+kahyad's own process today.
+
+**Rejection.** A control route called with a missing or wrong secret
+answers `403` + `{"error": "Kontrol anahtarı eksik ya da geçersiz
+(fail-closed). Bu uç nokta yalnızca kahya CLI, kahya-trigger ve Hammerspoon
+içindir."}` (`server.MsgControlSecretRejected`, byte-exact) and is ledgered
+as `kind=control_auth_rejected` with `payload.reason` = `missing_secret` |
+`bad_secret` (plus `path`, `method`) under the request's trace id. The outer
+`event=http_request` JSONL line still records `status=403`.
+
+**Who sends it.** The `kahya` CLI (`Client.newRequest`, every request),
+`kahya-trigger`, the test harnesses (`tests/w3`, `tests/acceptance/w4,w6`,
+`tests/e2e`, `kahyad/internal/mlxe2e`) and the shell scripts
+(`scripts/restore-drill.sh`, `scripts/accept_w4.sh`: `-H
+"X-Kahya-Control-Secret: $(cat "$SOCK.secret")"`). `surface=local` on
+`/approvals/{id}/decision` and `/policy/feedback` therefore means "a
+control-secret-authenticated UDS call". The `kahya-mcp` bridge is
+worker-plane and never reads or sends the secret.
+
+**Same-uid limit.** A worker compromised to the point of reading arbitrary
+files as the user can read `<socket>.secret`; this gate closes the path for
+everything that only uses what a worker is *given* (its env, its tools, a
+prompt-injected model). Sandboxing the worker (`sandbox-exec`), a
+Keychain-ACL'd secret, or a separate uid were considered and declined for
+now (owner decisions G03-1/2/3).
 
 ## 6 · `POST /policy/check` (HTTP-over-UDS, same socket)
 

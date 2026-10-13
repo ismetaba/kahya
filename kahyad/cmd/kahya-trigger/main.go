@@ -14,6 +14,10 @@
 // every real decision - job lookup, ledgering, running the handler), so
 // job-dispatch behavior can never diverge between "scheduled" and
 // "manual" - there is exactly one way a job ever runs.
+//
+// /jobs/trigger/{name} is a control route (G03 / B-3): every request
+// carries kahyad's per-boot control secret, read from <socket>.secret
+// (config.ReadControlSecret) right before it is sent.
 package main
 
 import (
@@ -66,6 +70,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "kahya-trigger: build request:", err)
 		return 1
+	}
+	// G03 / B-3: /jobs/trigger/{name} is a control route - attach kahyad's
+	// per-boot control secret (<socket>.secret). A missing/unreadable file
+	// sends no header; kahyad then answers 403 and that body is printed
+	// below like any other non-2xx response.
+	if secret, err := config.ReadControlSecret(sock); err == nil && secret != "" {
+		req.Header.Set(config.ControlSecretHeader, secret)
 	}
 
 	resp, err := client.Do(req)

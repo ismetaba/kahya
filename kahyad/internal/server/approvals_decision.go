@@ -15,10 +15,14 @@
 // key to land — json.Unmarshal simply ignores it, by construction, not by
 // a runtime check someone could forget to add. handleApprovalsDecision
 // always calls Engine.Approve with the hardcoded approvalsDecisionSurface
-// constant, because the ONLY way to reach this route at all is over
-// kahyad's own UDS control socket (channel-derived, exactly like every
-// other route this package mounts) — see approvals_decision_test.go's
-// TestApprovalsDecisionSurfaceForgeryIgnored for the regression test.
+// constant, because the ONLY way to reach this route at all is a
+// CONTROL-SECRET-AUTHENTICATED call over kahyad's UDS socket (G03 / B-3:
+// this is a control route, controlauth.go, so withControlAuth answers 403
+// to any caller without this boot's <socket>.secret value - a worker,
+// which shares the socket and the uid but never gets the secret, cannot
+// reach it, let alone self-approve its own W3 action) — see
+// approvals_decision_test.go's TestApprovalsDecisionSurfaceForgeryIgnored
+// and TestApprovalsDecisionRequiresControlSecret for the regression tests.
 package server
 
 import (
@@ -31,7 +35,7 @@ import (
 )
 
 // approvalsDecisionSurface is the hardcoded, non-configurable surface
-// label the UDS control socket implies for every POST
+// label a control-secret-authenticated UDS call implies for every POST
 // /approvals/{id}/decision call (see this file's own package doc
 // comment). Named as a constant, rather than an inline literal, purely so
 // grepping for kahyad's "local" surface call sites reliably finds this

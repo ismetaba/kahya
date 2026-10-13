@@ -54,6 +54,9 @@ EQUIV_K="${EQUIV_K:-8}"
 # this drill hardcodes the standard layout and then GUARDS it) ----------------
 PROD_APP_SUPPORT="$HOME/Library/Application Support/Kahya"
 PROD_SOCK="$PROD_APP_SUPPORT/kahyad.sock"
+# G03 / B-3: kahyad's control routes require the per-boot control secret
+# kahyad writes next to its socket ("<socket>.secret", 0600) - those curls
+# below send it as X-Kahya-Control-Secret. /health stays open.
 PROD_DB="$PROD_APP_SUPPORT/brain.db"
 PROD_KAHYA="$HOME/Kahya"
 BACKUP_DIR="$PROD_KAHYA/backups"
@@ -112,7 +115,8 @@ echo "==> triggering a fresh backup-nightly on production"
 prior_backup="$(ls -1 "$BACKUP_DIR"/brain-*.db 2>/dev/null | sort | tail -1)"
 PRIOR_MTIME=0
 [ -n "$prior_backup" ] && PRIOR_MTIME="$(stat -f %m "$prior_backup" 2>/dev/null || echo 0)"
-TRIG_CODE="$(curl -s --unix-socket "$PROD_SOCK" -o /dev/null -w '%{http_code}' -X POST http://x/jobs/trigger/backup-nightly)"
+TRIG_CODE="$(curl -s --unix-socket "$PROD_SOCK" -o /dev/null -w '%{http_code}' -X POST http://x/jobs/trigger/backup-nightly \
+	-H "X-Kahya-Control-Secret: $(cat "$PROD_SOCK.secret")")"
 if [ "$TRIG_CODE" != "202" ]; then
 	fail "backup-nightly trigger returned HTTP $TRIG_CODE, want 202"
 fi
@@ -199,6 +203,7 @@ echo "    user_version: $USER_VERSION (matches production)"
 # --- 6. reindex from the cloned markdown -- must be an incremental no-op ------
 echo "==> reindexing scratch from $RESTORE_MEM (expect no-op)"
 REIDX="$(curl -sS --unix-socket "$RESTORE_SOCK" -X POST http://x/v1/reindex \
+	-H "X-Kahya-Control-Secret: $(cat "$RESTORE_SOCK.secret")" \
 	-H 'Content-Type: application/json' -d '{"full":false}')" || fail "scratch reindex failed"
 # A clean no-op = nothing added/removed/rechunked AND nothing errored AND at
 # least one file was seen-and-unchanged. Omitting files_errored would let a
@@ -254,6 +259,7 @@ echo "    ledger survives: events $R_EVENTS>=$REF_EVENTS, episodes $R_EPISODES>=
 BACKUP_BASENAME="$(basename "$BACKUP_FILE")"
 echo "==> recording restore.drill.result on production kahyad"
 REC_CODE="$(curl -s --unix-socket "$PROD_SOCK" -o /dev/null -w '%{http_code}' -X POST http://x/v1/restore/drill-result \
+	-H "X-Kahya-Control-Secret: $(cat "$PROD_SOCK.secret")" \
 	-H 'Content-Type: application/json' \
 	-d "{\"ok\":true,\"ref_query_sha\":\"$REF_QUERY_SHA\",\"backup_file\":\"$BACKUP_BASENAME\"}")"
 [ "$REC_CODE" = "200" ] || fail "recording restore.drill.result returned HTTP $REC_CODE, want 200"

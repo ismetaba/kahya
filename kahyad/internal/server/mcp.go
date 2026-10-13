@@ -272,7 +272,9 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     approval (Check -> needs_approval -> deny() here), so mail_send etc.
 //     stays unreachable taint or no taint; the autonomy ladder still gates
 //     every W1/W2 call by kahyad-side state, so only user-promoted tools
-//     auto-allow; fs_*/shell_*/osascript_* run their OWN deny-glob/
+//     auto-allow (/policy/promote is a control route, controlauth.go, that
+//     a worker cannot reach, so "user-promoted" is enforced, not assumed -
+//     G03 / B-3); fs_*/shell_*/osascript_* run their OWN deny-glob/
 //     digest-pin/egress/arg-validator chain (the fsOwnedTools/shellOwnedTools/
 //     osascriptOwnedTools bypass above) regardless - and share this EXACT
 //     same no-session_id limitation via enginePolicyClient (fs.go), for the

@@ -40,6 +40,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 )
@@ -414,16 +415,35 @@ func mlxDumpKahyadLogs(homeDir string) string {
 // loopback listener is - but the SAME client is reused for both the UDS
 // control-plane calls and reading kahyad's own /health, so its timeout is
 // sized for the slower of the two paths).
+//
+// G03 / B-3: the client attaches kahyad's per-boot control secret
+// (config.ReadControlSecret, re-read per request) - /v1/reindex is a
+// control route.
 func mlxNewUDSClient(sock string) *http.Client {
 	return &http.Client{
-		Transport: &http.Transport{
+		Transport: &mlxSecretRoundTripper{sock: sock, inner: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				d := net.Dialer{Timeout: 2 * time.Second}
 				return d.DialContext(ctx, "unix", sock)
 			},
-		},
+		}},
 		Timeout: 90 * time.Second,
 	}
+}
+
+// mlxSecretRoundTripper sets config.ControlSecretHeader on a clone of
+// every request from config.ReadControlSecret(sock).
+type mlxSecretRoundTripper struct {
+	sock  string
+	inner http.RoundTripper
+}
+
+func (t *mlxSecretRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if secret, err := config.ReadControlSecret(t.sock); err == nil && secret != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set(config.ControlSecretHeader, secret)
+	}
+	return t.inner.RoundTrip(req)
 }
 
 type mlxMemSearchResult struct {

@@ -639,6 +639,38 @@ func TestBuildEnvFiltersSecretBearingParentEnvVars(t *testing.T) {
 	}
 }
 
+// TestBuildEnvStripsControlSecretVars (G03 / B-3): kahyad's control-plane
+// secret must never reach a worker, by value or by path - even if some
+// future CLI/script convention exported it into kahyad's own environment.
+// The worker gets KAHYA_SOCKET (worker routes only) and nothing that
+// unlocks the control routes.
+func TestBuildEnvStripsControlSecretVars(t *testing.T) {
+	t.Setenv("KAHYA_CONTROL_SECRET", strings.Repeat("ab", 32))
+	t.Setenv("KAHYA_CONTROL_SECRET_PATH", "/s.sock.secret")
+
+	cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "https://upstream.invalid", APIKey: "kahya-task-abcdef0123456789abcdef0123456789"}
+	got := BuildEnv(cfg, Envelope{TaskID: "t_abc", TraceID: "trace-abc"})
+
+	for _, kv := range got {
+		name, value, _ := strings.Cut(kv, "=")
+		if name == "KAHYA_CONTROL_SECRET" || name == "KAHYA_CONTROL_SECRET_PATH" {
+			t.Errorf("worker env carries %s", kv)
+		}
+		if strings.Contains(value, strings.Repeat("ab", 32)) || strings.Contains(value, ".secret") {
+			t.Errorf("worker env leaks the control secret or its path: %q", kv)
+		}
+	}
+	var sawSocket bool
+	for _, kv := range got {
+		if kv == "KAHYA_SOCKET=/s.sock" {
+			sawSocket = true
+		}
+	}
+	if !sawSocket {
+		t.Errorf("KAHYA_SOCKET=/s.sock missing from worker env %v", got)
+	}
+}
+
 // TestRunSpawnsRealDefaultWorkerCommandBlocker1 is BLOCKER 1's regression
 // test: it runs the ACTUAL default worker command
 // ("<repo>/worker/.venv/bin/python -m kahya_worker") via Run against a

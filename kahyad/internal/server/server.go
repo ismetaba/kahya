@@ -300,6 +300,13 @@ type Server struct {
 	// a startup-time, not a runtime-recoverable, condition).
 	denyAll bool
 
+	// controlSecret is G03 / B-3's per-boot control-plane secret: minted
+	// by Prepare (mintControlSecret) into config.ControlSecretPath(socket)
+	// and required on every control route by withControlAuth - see
+	// controlauth.go. Empty until Prepare succeeds, and an empty secret
+	// never matches any header (fail-closed).
+	controlSecret string
+
 	ln   net.Listener
 	http *http.Server
 	// lock is the exclusive startup flock on <socket>.lock, held for the
@@ -373,7 +380,9 @@ func (s *Server) DenyAll() bool {
 //     ErrAlreadyRunning (already logged as event=already_running).
 //   - socket file present but dead (dial fails) → unlink and bind fresh.
 //
-// The bound socket is chmod'd 0600.
+// The bound socket is chmod'd 0600. Prepare also mints this boot's
+// control-plane secret into config.ControlSecretPath(socket) (G03 / B-3,
+// controlauth.go) and fails - closing the listener - if it cannot.
 func (s *Server) Prepare() error {
 	ln, lock, err := prepareListener(s.cfg.Socket, s.lock)
 	if err != nil {
@@ -386,63 +395,103 @@ func (s *Server) Prepare() error {
 	s.lock = lock
 	s.started = time.Now()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/v1/memory/search", s.handleMemorySearch)
-	mux.HandleFunc("/v1/reindex", s.handleReindex)
-	mux.HandleFunc("/v1/log", s.handleLog)
-	mux.Handle("/v1/mcp", s.buildMCPHandler())
-	mux.HandleFunc("/v1/task", s.handleTask)
-	mux.HandleFunc("/policy/check", s.handlePolicyCheck)
-	mux.HandleFunc("/policy/consume-token", s.handlePolicyConsumeToken)
-	mux.HandleFunc("/policy/feedback", s.handlePolicyFeedback)
-	mux.HandleFunc("/policy/approvals", s.handlePolicyApprovals)
-	// W6-01: the Hammerspoon-facing approval routes (hammerspoon/kahya.lua,
-	// kahyad/cmd/kahya's `kahya approvals show|decide`) — see
-	// approvals_decision.go's own package doc comment.
-	mux.HandleFunc("GET /approvals/pending", s.handleApprovalsPending)
-	mux.HandleFunc("POST /approvals/{id}/decision", s.handleApprovalsDecision)
-	mux.HandleFunc("POST /debug/emit-approval", s.handleDebugEmitApproval)
-	mux.HandleFunc("/policy/state", s.handlePolicyState)
-	mux.HandleFunc("/policy/promote", s.handlePolicyPromote)
-	mux.HandleFunc("/policy/undo", s.handlePolicyUndo)
-	mux.HandleFunc("/session/sensitive-read", s.handleSensitiveRead)
-	mux.HandleFunc(jobTriggerPrefix, s.handleJobTrigger)
-	mux.HandleFunc("/v1/task/status", s.handleTaskStatus)
-	mux.HandleFunc("/v1/task/resolve", s.handleTaskResolve)
-	mux.HandleFunc("/v1/ledger/verify", s.handleLedgerVerify)
-	mux.HandleFunc("/v1/consolidation", s.handleConsolidationShow)
-	mux.HandleFunc("/v1/consolidation/approve", s.handleConsolidationApprove)
-	mux.HandleFunc("/v1/consolidation/reject", s.handleConsolidationReject)
-	mux.HandleFunc("/v1/eval/mini/run", s.handleEvalMiniRun)
-	mux.HandleFunc("/v1/eval/retrieval", s.handleEvalRetrievalRun)
-	mux.HandleFunc("/v1/eval/export-ritual", s.handleEvalExportRitual)
-	mux.HandleFunc("/v1/eval/redteam", s.handleEvalRedteamRecord)
-	// W78-05: the ONE production touchpoint of the backup restore drill -
-	// records the counts/hashes-only restore.drill.result summary row (see
-	// restoredrill.go's own package doc comment).
-	mux.HandleFunc("/v1/restore/drill-result", s.handleRestoreDrillResult)
-	mux.HandleFunc("/v1/fact/confirm", s.handleFactConfirm)
-	mux.HandleFunc("/v1/fact/retract", s.handleFactRetract)
-	mux.HandleFunc("/v1/entity/merge", s.handleEntityMerge)
-	mux.HandleFunc("/v1/entity/split", s.handleEntitySplit)
-	mux.HandleFunc("/v1/remembered", s.handleRemembered)
-	// W78-04: read-only metrics reporting over the events ledger (`kahya
-	// metrics`) - see metrics.go's own doc comment.
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	// W78-06: read-only dogfood-readiness readout over the recorded evidence
-	// rows + the metrics aggregates (`kahya readiness`) - see readiness.go's
-	// own doc comment.
-	mux.HandleFunc("GET /readiness", s.handleReadiness)
-	// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
-	// ⌥⎋ binding both call this (halt.go's own doc comment).
-	mux.HandleFunc("POST /halt", s.handleHalt)
+	// G03 / B-3: mint this boot's control secret BEFORE any request can
+	// be served (Serve has not been called yet, so no request can ever
+	// reach a secret-less server). Fail-closed: no secret, no listener.
+	secretPath := config.ControlSecretPath(s.cfg.Socket)
+	secret, err := mintControlSecret(secretPath)
+	if err != nil {
+		ln.Close()
+		if lock != nil {
+			lock.Close()
+		}
+		s.ln, s.lock = nil, nil
+		return err
+	}
+	s.controlSecret = secret
+	s.log.Info("control_secret_minted", "path", secretPath)
 
+	mux := http.NewServeMux()
+	for _, rt := range s.routeTable() {
+		mux.Handle(rt.pattern, rt.handler)
+	}
+
+	// Order is fixed: withTraceLogging OUTSIDE (every request - rejected
+	// ones included - gets its event=http_request line and a resolved
+	// trace id), withControlAuth INSIDE (controlauth.go), mux innermost.
 	s.http = &http.Server{
-		Handler:           s.withTraceLogging(mux),
+		Handler:           s.withTraceLogging(s.withControlAuth(mux)),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	return nil
+}
+
+// route is one (pattern, handler) pair Prepare mounts onto its mux.
+type route struct {
+	pattern string
+	handler http.Handler
+}
+
+// routeTable lists every (pattern, handler) Prepare mounts. It is a table
+// (rather than inline mux calls) so TestRouteTableClassifiesEveryMuxRoute
+// can assert each pattern's path is classified by classifyRoute
+// (controlauth.go) and that only the five documented open/worker paths
+// are non-control: a route added here is control-plane unless it is
+// deliberately listed in openPaths/workerPaths.
+func (s *Server) routeTable() []route {
+	h := func(f http.HandlerFunc) http.Handler { return f }
+	return []route{
+		{"/health", h(s.handleHealth)},
+		{"/v1/memory/search", h(s.handleMemorySearch)},
+		{"/v1/reindex", h(s.handleReindex)},
+		{"/v1/log", h(s.handleLog)},
+		{"/v1/mcp", s.buildMCPHandler()},
+		{"/v1/task", h(s.handleTask)},
+		{"/policy/check", h(s.handlePolicyCheck)},
+		{"/policy/consume-token", h(s.handlePolicyConsumeToken)},
+		{"/policy/feedback", h(s.handlePolicyFeedback)},
+		{"/policy/approvals", h(s.handlePolicyApprovals)},
+		// W6-01: the Hammerspoon-facing approval routes (hammerspoon/kahya.lua,
+		// kahyad/cmd/kahya's `kahya approvals show|decide`) — see
+		// approvals_decision.go's own package doc comment.
+		{"GET /approvals/pending", h(s.handleApprovalsPending)},
+		{"POST /approvals/{id}/decision", h(s.handleApprovalsDecision)},
+		{"POST /debug/emit-approval", h(s.handleDebugEmitApproval)},
+		{"/policy/state", h(s.handlePolicyState)},
+		{"/policy/promote", h(s.handlePolicyPromote)},
+		{"/policy/undo", h(s.handlePolicyUndo)},
+		{"/session/sensitive-read", h(s.handleSensitiveRead)},
+		{jobTriggerPrefix, h(s.handleJobTrigger)},
+		{"/v1/task/status", h(s.handleTaskStatus)},
+		{"/v1/task/resolve", h(s.handleTaskResolve)},
+		{"/v1/ledger/verify", h(s.handleLedgerVerify)},
+		{"/v1/consolidation", h(s.handleConsolidationShow)},
+		{"/v1/consolidation/approve", h(s.handleConsolidationApprove)},
+		{"/v1/consolidation/reject", h(s.handleConsolidationReject)},
+		{"/v1/eval/mini/run", h(s.handleEvalMiniRun)},
+		{"/v1/eval/retrieval", h(s.handleEvalRetrievalRun)},
+		{"/v1/eval/export-ritual", h(s.handleEvalExportRitual)},
+		{"/v1/eval/redteam", h(s.handleEvalRedteamRecord)},
+		// W78-05: the ONE production touchpoint of the backup restore drill -
+		// records the counts/hashes-only restore.drill.result summary row (see
+		// restoredrill.go's own package doc comment).
+		{"/v1/restore/drill-result", h(s.handleRestoreDrillResult)},
+		{"/v1/fact/confirm", h(s.handleFactConfirm)},
+		{"/v1/fact/retract", h(s.handleFactRetract)},
+		{"/v1/entity/merge", h(s.handleEntityMerge)},
+		{"/v1/entity/split", h(s.handleEntitySplit)},
+		{"/v1/remembered", h(s.handleRemembered)},
+		// W78-04: read-only metrics reporting over the events ledger (`kahya
+		// metrics`) - see metrics.go's own doc comment.
+		{"GET /metrics", h(s.handleMetrics)},
+		// W78-06: read-only dogfood-readiness readout over the recorded evidence
+		// rows + the metrics aggregates (`kahya readiness`) - see readiness.go's
+		// own doc comment.
+		{"GET /readiness", h(s.handleReadiness)},
+		// W6-03: the emergency-halt route - `kahya halt`/hammerspoon/kahya.lua's
+		// ⌥⎋ binding both call this (halt.go's own doc comment).
+		{"POST /halt", h(s.handleHalt)},
+	}
 }
 
 // Serve blocks accepting connections until Shutdown is called or a fatal
@@ -456,7 +505,8 @@ func (s *Server) Serve() error {
 }
 
 // Shutdown gracefully stops the HTTP server (5s budget) and unlinks the
-// socket file. It does not log shutdown_complete — the caller (main.go)
+// socket file and, last, the per-boot control secret file (G03 / B-3) -
+// both while the startup flock is still held. It does not log shutdown_complete — the caller (main.go)
 // logs that on its boot-scoped logger after Shutdown returns, since it is
 // not tied to any single request.
 func (s *Server) Shutdown() error {
@@ -476,6 +526,14 @@ func (s *Server) Shutdown() error {
 	// Safe: we have held the startup flock since Prepare, so no other
 	// daemon can have bound this path in the meantime.
 	_ = os.Remove(s.cfg.Socket)
+	// G03 / B-3 (G00 C-5): the per-boot control secret goes LAST, after
+	// the listener is closed and the socket unlinked - but still while the
+	// startup flock is held, so a successor kahyad (which must take that
+	// flock before it can mint) can never have its fresh secret deleted
+	// here. Any step G10 adds to Shutdown goes above this line.
+	if s.controlSecret != "" {
+		_ = os.Remove(config.ControlSecretPath(s.cfg.Socket))
+	}
 	if s.lock != nil {
 		_ = s.lock.Close() // releases the flock; the .lock file stays (never unlink a lock file)
 		s.lock = nil

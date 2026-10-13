@@ -7,7 +7,9 @@
 // ForgeryIgnored proves: a request body that smuggles a "surface" key
 // into POST /approvals/{id}/decision has NOTHING to attach to (the
 // request struct has no Surface field at all) - the ledgered decision is
-// ALWAYS surface:"local", channel-derived, never client-supplied.
+// ALWAYS surface:"local", derived from the control-secret-authenticated
+// channel (G03 / B-3), never client-supplied. TestApprovalsDecision
+// RequiresControlSecret proves a worker-plane caller cannot reach it.
 package server
 
 import (
@@ -26,7 +28,10 @@ import (
 // inspect the ledger directly.
 type approvalsDecisionFixture struct {
 	client *http.Client
-	store  *store.Store
+	// noSecret is the SAME socket without kahyad's control secret - the
+	// view a worker has (G03 / B-3).
+	noSecret *http.Client
+	store    *store.Store
 }
 
 // newApprovalsDecisionFixture builds a minimal Server (real store, real
@@ -55,7 +60,61 @@ func newApprovalsDecisionFixture(t *testing.T, env string) approvalsDecisionFixt
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return approvalsDecisionFixture{client: unixHTTPClient(cfg.Socket), store: st}
+	return approvalsDecisionFixture{client: unixHTTPClient(cfg.Socket), noSecret: unixHTTPClientNoSecret(cfg.Socket), store: st}
+}
+
+// TestApprovalsDecisionRequiresControlSecret is G03 / B-3's core repro: a
+// worker-plane caller (same socket, same uid, but no control secret)
+// produces its own W3 (mail_send) pending approval via /policy/check and
+// then tries to approve it itself as surface="local" with the correct
+// typed word - on BOTH approval routes. Both answer 403 without consuming
+// the approval (no policy_feedback_approved row), and the SAME pending
+// approval is still approvable afterwards by the real, secret-carrying
+// local surface.
+func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
+	f := newApprovalsDecisionFixture(t, "prod")
+
+	var checkResp policyCheckResponse
+	resp := postJSON(t, f.noSecret, "/policy/check", map[string]any{
+		"trace_id": "trace-g03-self", "task_id": "t1", "tool_name": "mail_send",
+		"tool_input": map[string]any{"to": "a@b.com", "body": "merhaba"},
+	}, &checkResp)
+	if resp.StatusCode != http.StatusOK || checkResp.Decision != "needs_approval" || checkResp.PendingApprovalID == "" {
+		t.Fatalf("policy/check(mail_send) = %d %+v, want needs_approval with a pending id", resp.StatusCode, checkResp)
+	}
+
+	var self approvalDecisionResponse
+	resp = postJSON(t, f.noSecret, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+		"approve": true, "typed": "onayla",
+	}, &self)
+	if resp.StatusCode != http.StatusForbidden || self.OK || self.Token != "" || self.Error != MsgControlSecretRejected {
+		t.Fatalf("self-approve via /approvals/{id}/decision without secret = %d %+v, want 403 %q", resp.StatusCode, self, MsgControlSecretRejected)
+	}
+	var feedback policyFeedbackResponse
+	resp = postJSON(t, f.noSecret, "/policy/feedback", map[string]any{
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
+	}, &feedback)
+	if resp.StatusCode != http.StatusForbidden || feedback.OK || feedback.Token != "" {
+		t.Fatalf("self-approve via /policy/feedback without secret = %d %+v, want 403", resp.StatusCode, feedback)
+	}
+
+	var approved int
+	if err := f.store.DB().QueryRow(
+		`SELECT count(*) FROM events WHERE kind = 'policy_feedback_approved'`,
+	).Scan(&approved); err != nil {
+		t.Fatalf("count policy_feedback_approved: %v", err)
+	}
+	if approved != 0 {
+		t.Fatalf("policy_feedback_approved rows after two rejected self-approvals = %d, want 0", approved)
+	}
+
+	var decision approvalDecisionResponse
+	resp = postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+		"approve": true, "typed": "onayla",
+	}, &decision)
+	if resp.StatusCode != http.StatusOK || !decision.OK || decision.Token == "" {
+		t.Fatalf("local approve with the control secret = %d %+v, want ok with a token (the approval must not have been burned)", resp.StatusCode, decision)
+	}
 }
 
 // TestApprovalsDecisionSurfaceForgeryIgnored is this task's own core

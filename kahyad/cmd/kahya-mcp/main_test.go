@@ -201,3 +201,36 @@ func TestRunEmptyStdinExitsZero(t *testing.T) {
 		t.Errorf("stdout = %q, want empty", out.String())
 	}
 }
+
+// TestRelayNeverSendsControlSecretHeader (G03 / B-3): the bridge is
+// worker-plane. Even with kahyad's <socket>.secret file present and
+// readable right next to the socket, it never reads it and never sends
+// X-Kahya-Control-Secret - only the trace/task correlation headers.
+func TestRelayNeverSendsControlSecretHeader(t *testing.T) {
+	var sawSecret []string
+	var sawTrace string
+	sock := startFakeKahyad(t, func(w http.ResponseWriter, r *http.Request) {
+		sawSecret = append(sawSecret, r.Header.Values("X-Kahya-Control-Secret")...)
+		sawTrace = r.Header.Get("X-Kahya-Trace-Id")
+		io.Copy(io.Discard, r.Body) //nolint:errcheck
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`)) //nolint:errcheck
+	})
+	if err := os.WriteFile(sock+".secret", []byte(strings.Repeat("ab", 32)+"\n"), 0o600); err != nil {
+		t.Fatalf("write secret file: %v", err)
+	}
+	t.Setenv("KAHYA_SOCKET", sock)
+	t.Setenv("KAHYA_TRACE_ID", "trace-bridge")
+
+	in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}` + "\n")
+	var out, errOut bytes.Buffer
+	if code := run(in, &out, &errOut); code != 0 {
+		t.Fatalf("run() = %d; stderr=%s", code, errOut.String())
+	}
+	if sawTrace != "trace-bridge" {
+		t.Fatalf("X-Kahya-Trace-Id = %q, want trace-bridge (request not relayed?)", sawTrace)
+	}
+	if len(sawSecret) != 0 {
+		t.Fatalf("bridge sent X-Kahya-Control-Secret %q; a worker-plane process must never send it", sawSecret)
+	}
+}

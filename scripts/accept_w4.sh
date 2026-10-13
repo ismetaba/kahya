@@ -230,8 +230,11 @@ post_task() {
 	# post_task <sock> <trace_id> <prompt> -- fires the SSE request in the
 	# background (discarding its body - this script cares about ledger/db
 	# side effects, not the streamed text) and returns immediately.
+	# /v1/task is a control route (G03 / B-3): send the per-boot control
+	# secret kahyad writes next to its socket.
 	local sock="$1" trace="$2" prompt="$3"
 	( curl -s --unix-socket "$sock" -X POST http://x/v1/task \
+		-H "X-Kahya-Control-Secret: $(cat "$sock.secret")" \
 		-d "$(printf '{"trace_id":%s,"prompt":%s}' "$(json_quote "$trace")" "$(json_quote "$prompt")")" \
 		>/dev/null 2>&1 & )
 }

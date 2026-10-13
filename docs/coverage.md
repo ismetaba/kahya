@@ -170,6 +170,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | #0 | fs tool called directly (no `can_use_tool`) with no token ⇒ refuse, disk untouched | `mcp/fs/TestHandleWriteNeedsApprovalFailsWithoutToken` | W3-01 | ci-hermetic |
 | #0 | fs tool token replay refused | `mcp/fs/TestHandleWriteTokenReplayFails` | W3-01 | ci-hermetic |
 | #0 | end-to-end binding decision in kahyad (real bins) | `tests/e2e/TestW12Acceptance` | W12-10 | local-integration |
+| #0 | control-plane routes (promote/feedback/undo/halt/approvals/task) refuse without kahyad's per-boot control secret | `kahyad/internal/server/TestControlRoutesRequireSecret` | FIX-B-3 | ci-hermetic |
+| #0 | a worker-plane caller cannot self-approve a W3 pending approval via /approvals/{id}/decision | `kahyad/internal/server/TestApprovalsDecisionRequiresControlSecret` | FIX-B-3 | ci-hermetic |
 | Safety #1 | allowlist-external egress hard-blocked after sensitive read, session-lifetime | `kahyad/internal/egress/TestCheck_SensitiveReadBlocksNonAllowlistedHost` | W3-05 | ci-hermetic |
 | Safety #1 | sensitive-read flag only rises, never clears | `kahyad/internal/egress/TestSensitiveTracker_RisesOnlyNeverClears` | W3-05 | ci-hermetic |
 | Safety #1 | non-allowlisted host denied (allowlist is the gate) | `kahyad/internal/egress/TestCheck_NotInAllowlistDenies` | W3-05 | ci-hermetic |

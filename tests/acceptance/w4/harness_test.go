@@ -256,14 +256,35 @@ func (d *daemon) restart(opts daemonOpts) {
 
 func newUDSClient(sock string) *http.Client {
 	return &http.Client{
-		Transport: &http.Transport{
+		Transport: &secretRoundTripper{sock: sock, inner: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				dialer := net.Dialer{Timeout: 2 * time.Second}
 				return dialer.DialContext(ctx, "unix", sock)
 			},
-		},
+		}},
 		Timeout: 20 * time.Second,
 	}
+}
+
+// secretRoundTripper attaches kahyad's per-boot control secret
+// (<socket>.secret, G03 / B-3) to every request, exactly like the kahya
+// CLI does. Read per request on purpose: a daemon restart rotates the
+// secret. A missing file sends no header. (tests/* cannot import
+// kahya/kahyad/internal/config - Go's internal rule - hence this local
+// copy of config.ReadControlSecret's header behavior.)
+type secretRoundTripper struct {
+	sock  string
+	inner http.RoundTripper
+}
+
+func (t *secretRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if b, err := os.ReadFile(t.sock + ".secret"); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			req = req.Clone(req.Context())
+			req.Header.Set("X-Kahya-Control-Secret", s)
+		}
+	}
+	return t.inner.RoundTrip(req)
 }
 
 func waitForHealth(t *testing.T, client *http.Client, homeDir string) {

@@ -102,9 +102,13 @@ guard against clobbering prod.
 ## 6 · Reindex from the cloned markdown — must be a no-op
 
 ```bash
-curl -sS --unix-socket ~/Library/Application\ Support/Kahya-restore/kahyad-restore.sock \
+SOCK=~/Library/Application\ Support/Kahya-restore/kahyad-restore.sock
+curl -sS --unix-socket "$SOCK" -H "X-Kahya-Control-Secret: $(cat "$SOCK.secret")" \
   -X POST http://kahyad/v1/reindex -H 'Content-Type: application/json' -d '{"full":false}'
 ```
+
+(`/v1/reindex` is a control route: it needs the per-boot control secret kahyad
+writes next to its socket — `docs/ipc.md` §5a.)
 
 Because the clone and the backup were taken at the same point, the incremental
 (file-hash) reindex must be a **no-op**: `files_indexed`, `files_removed`, and

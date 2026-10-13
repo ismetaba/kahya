@@ -134,8 +134,20 @@ func (f *loggingFakeSearcher) Search(_ context.Context, traceID, q string, _ int
 }
 
 // unixHTTPClient returns an http.Client that dials socketPath for every
-// request, matching how the real kahya CLI talks to kahyad.
+// request, matching how the real kahya CLI talks to kahyad - including the
+// CLI's G03 / B-3 behavior of attaching kahyad's per-boot control secret
+// (config.ControlSecretPath(socketPath)) to every request. Tests that must
+// behave like a WORKER (same socket, no secret) use unixHTTPClientNoSecret.
 func unixHTTPClient(socketPath string) *http.Client {
+	c := unixHTTPClientNoSecret(socketPath)
+	c.Transport = &controlSecretRoundTripper{sock: socketPath, inner: c.Transport}
+	return c
+}
+
+// unixHTTPClientNoSecret is unixHTTPClient without the control secret: the
+// exact view a spawned worker (or any other same-uid process that was only
+// GIVEN KAHYA_SOCKET) has of kahyad.
+func unixHTTPClientNoSecret(socketPath string) *http.Client {
 	return &http.Client{
 		Timeout: 2 * time.Second,
 		Transport: &http.Transport{
@@ -145,6 +157,37 @@ func unixHTTPClient(socketPath string) *http.Client {
 			},
 		},
 	}
+}
+
+// controlSecretRoundTripper sets config.ControlSecretHeader from
+// config.ReadControlSecret(sock) on a clone of every request (re-read per
+// request, exactly like the CLI, so a restarted server's rotated secret is
+// picked up). A missing/unreadable file sends no header.
+type controlSecretRoundTripper struct {
+	sock  string
+	inner http.RoundTripper
+}
+
+func (t *controlSecretRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if secret, err := config.ReadControlSecret(t.sock); err == nil && secret != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set(config.ControlSecretHeader, secret)
+	}
+	return t.inner.RoundTrip(req)
+}
+
+// dialUnixForTest opens a raw UDS connection to socketPath. It lives here
+// (server_test.go is on make lint's single-egress-gate allowlist for local
+// UDS dials) so other test files in this package never spell a dial
+// themselves.
+func dialUnixForTest(t *testing.T, socketPath string) net.Conn {
+	t.Helper()
+	var d net.Dialer
+	c, err := d.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial unix %s: %v", socketPath, err)
+	}
+	return c
 }
 
 func TestHealthEndpoint(t *testing.T) {

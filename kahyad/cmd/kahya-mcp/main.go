@@ -7,6 +7,10 @@
 // back to stdout as one line. It propagates KAHYA_TRACE_ID (env) as the
 // X-Kahya-Trace-Id header on every request.
 //
+// This bridge is worker-plane (G03 / B-3): it never reads or sends
+// X-Kahya-Control-Secret (config.ControlSecretHeader) - see
+// TestRelayNeverSendsControlSecretHeader.
+//
 // Deliberate SDK-usage choice (documented per the task spec's escape
 // hatch: "if the SDK's API is unclear, implement a correct minimal
 // JSON-RPC 2.0 ... by hand rather than guessing SDK calls - correctness

@@ -98,7 +98,11 @@ type policyFeedbackRequest struct {
 	// approvals_decision.go) is the one that structurally cannot forge
 	// this field at all (no Surface field on that route's own request
 	// struct); this pre-existing route is not rewired to match, per this
-	// task's own scope.
+	// task's own scope. G03 / B-3: "local" now means a CONTROL-SECRET-
+	// AUTHENTICATED UDS call, not merely "came in over the socket" -
+	// /policy/feedback is a control route (controlauth.go), so a worker
+	// (same socket, same uid, no secret) is answered 403 before this
+	// field is ever read.
 	Surface string `json:"surface,omitempty"`
 	// Typed is W6-01's addition: the exact text a human typed into a W3
 	// approval's confirmation prompt, forwarded here so
@@ -215,7 +219,10 @@ func (s *Server) handlePolicyState(w http.ResponseWriter, r *http.Request) {
 
 // policyPromoteRequest is POST /policy/promote's request body - the
 // ONLY promotion path (HANDOFF S4), invoked exclusively by
-// `kahya autonomy promote <tool> <class> <scope>`.
+// `kahya autonomy promote <tool> <class> <scope>`. Control route:
+// requires X-Kahya-Control-Secret (controlauth.go, G03 / B-3), so it is
+// unreachable from a worker - "invoked exclusively by the CLI" is
+// enforced, not assumed.
 type policyPromoteRequest struct {
 	TraceID string `json:"trace_id"`
 	Tool    string `json:"tool"`

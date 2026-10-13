@@ -291,10 +291,13 @@ end)
 -- sendApprovalDecision calls `kahya approvals decide <id> --approve
 -- --typed <text> | --reject` — the CLI's own client talks to kahyad's
 -- POST /approvals/{id}/decision, which stamps surface="local" itself
--- (channel-derived, never read from this Lua file or the CLI's own
--- request body) and, for a W3 approval, verifies `typed` byte-exact
--- against "onayla" server-side. This function never decides anything on
--- its own; it only relays the human's already-made choice.
+-- (never read from this Lua file or the CLI's own request body) and, for
+-- a W3 approval, verifies `typed` byte-exact against "onayla"
+-- server-side. The CLI attaches kahyad's per-boot control secret
+-- (<socket>.secret, G03 / B-3) so kahyad can tell this human surface
+-- apart from a worker on the same socket; surface="local" is stamped only
+-- for control-authenticated calls. This function never decides anything
+-- on its own; it only relays the human's already-made choice.
 local function sendApprovalDecision(id, approve, typed)
   local args = { "approvals", "decide", id }
   if approve then

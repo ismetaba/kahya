@@ -9,6 +9,8 @@
 package config
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1715,4 +1717,49 @@ func validateASCIIPaths(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+// ControlSecretHeader is the HTTP header every control-plane route of
+// kahyad's UDS listener requires (G03 / B-3). Worker-plane routes
+// (/policy/check, /v1/memory/search, /v1/mcp, /policy/consume-token)
+// accept it too, but only need it from a caller kahyad cannot attribute
+// to a live worker it spawned (G03 / B-14); /health never requires it.
+// See kahyad/internal/server/controlauth.go and docs/ipc.md section 5a.
+const ControlSecretHeader = "X-Kahya-Control-Secret"
+
+// ControlSecretPath returns where kahyad writes the per-boot control
+// secret for socketPath - "<socket>.secret", mirroring the
+// "<socket>.lock" convention of server.AcquireStartupLock, so a dev
+// profile (kahyad-dev.sock) automatically gets its own file. No config
+// key exists for it on purpose: the path is derived from the socket path,
+// which validateASCIIPaths already checks.
+func ControlSecretPath(socketPath string) string { return socketPath + ".secret" }
+
+// controlSecretHexLen is the exact length of a valid secret (32 random
+// bytes, lowercase hex).
+const controlSecretHexLen = 64
+
+// ReadControlSecret reads and validates ControlSecretPath(socketPath).
+// A missing file returns ("", nil) - the caller simply sends no header
+// (an old daemon, or a fake test server, then decides). Any other read
+// error, or malformed content, is returned as an error. This is a client
+// convenience only: kahyad itself is the authority (it compares the
+// header against the secret it holds in memory, never against the file).
+func ReadControlSecret(socketPath string) (string, error) {
+	path := ControlSecretPath(socketPath)
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("config: read control secret: %w", err)
+	}
+	s := strings.TrimSpace(string(b))
+	if len(s) != controlSecretHexLen {
+		return "", fmt.Errorf("config: control secret %s: want %d hex chars, got %d", path, controlSecretHexLen, len(s))
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return "", fmt.Errorf("config: control secret %s: not hex: %w", path, err)
+	}
+	return s, nil
 }
