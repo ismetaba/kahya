@@ -45,9 +45,12 @@ Python (`worker/.venv`, built by `make venv` from `worker/requirements.lock`) fo
 **Platform note.** `make test` is macOS-only: `make venv` installs `worker/requirements.lock`, which pins
 Apple-silicon-only wheels (`mlx`, `mlx-metal`, `mlx-whisper` for in-worker STT). On Linux run the Go suite
 directly (`go test -tags sqlite_fts5 ./...`; `tests/e2e` and the spawn tests skip without a worker venv)
-and the Python suite from a venv built with the darwin-only lines removed. A `make venv` whose pip install
-fails removes a half-built venv (one that cannot import `claude_agent_sdk`) so it never masquerades as a
-real worker venv; a working venv is kept.
+and the Python suite from a venv built with the darwin-only lines removed. A failed `make venv` removes a
+half-built venv (one that cannot import `claude_agent_sdk`) so it never masquerades as a real worker venv,
+but only one it created itself (marker file `.kahya-make-venv`), never through a symlink, and never a
+working venv. Any other directory at `VENV` (your data, another project's venv, a venv built before the
+marker existed) is left alone; remove a stale one by hand (`rm -rf worker/.venv`). `VENV` must be one plain
+path (letters, digits, `. _ / + -`), and overlapping `make venv` runs are serialized by a lock on the Makefile.
 
 ## Status
 

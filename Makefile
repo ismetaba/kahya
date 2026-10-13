@@ -1,4 +1,7 @@
 SQLC_VERSION ?= v1.30.0        # pin; bump deliberately, never 'latest'
+# THIS_MAKEFILE: this file's absolute path, read before any include so
+# lastword is this file. `make venv` flocks it (see the venv target).
+THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
 VENV := worker/.venv
 PY := $(VENV)/bin/python
 WORKER_LOCK := worker/requirements.lock
@@ -25,7 +28,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill readiness readiness-complete
+.PHONY: build test lint venv venv-locked mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill readiness readiness-complete
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -51,18 +54,40 @@ build:
 # is macOS-only - WORKER_LOCK pins Apple-silicon-only wheels (mlx,
 # mlx-metal, mlx-whisper for in-worker STT) that pip cannot resolve on
 # Linux; see README.md "Build / test" for running the suites elsewhere.
-# A failed pip install must never leave a HALF-BUILT venv behind (G12-N3-E1):
+# A failed build must never leave a HALF-BUILT venv behind (G12-N3-E1):
 # the spawn/e2e Go tests only probe for worker/.venv/bin/python and would
-# run against a worker that cannot import claude_agent_sdk. So on failure
-# the venv is removed unless claude_agent_sdk still imports from it - a
-# working venv survives a failed re-install (no forced full reinstall);
+# run against a worker that cannot import claude_agent_sdk. That cleanup is
+# an rm -rf on a path the caller can override (VENV=...), so it is fenced:
+#  - VENV must be ONE plain path (letters, digits, . _ / + -; no leading
+#    '-', no trailing '/'): no word splitting, no globbing, no rm option.
+#  - Only a directory THIS target created is ever removed. It mkdirs
+#    $(VENV) itself (atomic: fails if anything is already there) and drops
+#    $(VENV_MARKER) into it before python3 -m venv runs. A directory that
+#    was already there without the marker - user data, another project's
+#    venv, a venv built before the marker existed - is never removed.
+#  - Never through a symlink, and never while claude_agent_sdk still
+#    imports from it: a working venv survives a failed re-install (no
+#    forced full reinstall over one transient pip failure).
+#  - The build runs under an exclusive flock on this Makefile, so
+#    overlapping `make venv` runs are serialized: one run's import probe
+#    can never see another run's mid-reinstall state (and two pips never
+#    write the same site-packages at once).
 # make stops on the error either way. worker/tests/test_smoke.py
-# (TestMakeVenvTarget) pins both halves.
+# (TestMakeVenvTarget) pins every fence.
+VENV_MARKER = $(VENV)/.kahya-make-venv
+VENV_DROP_HALF_BUILT = if [ -f $(VENV_MARKER) ] && [ ! -L $(VENV) ] && ! $(PY) -I -c 'import claude_agent_sdk' >/dev/null 2>&1; then \
+	echo "make venv: removing half-built $(VENV)" >&2; rm -rf $(VENV); \
+	else echo "make venv: failed; not removing $(VENV) (absent, not created by make venv, a symlink, or claude_agent_sdk still imports)" >&2; fi
 venv:
-	test -d $(VENV) || python3 -m venv $(VENV)
-	$(PY) -m pip install --quiet -r $(WORKER_LOCK) || { \
-		$(PY) -c 'import claude_agent_sdk' >/dev/null 2>&1 || rm -rf $(VENV); \
-		exit 1; }
+	@KAHYA_VENV_LOCKED=1 python3 -c 'import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); fcntl.flock(fd, fcntl.LOCK_EX); os.set_inheritable(fd, True); os.execvp(sys.argv[2], sys.argv[2:])' \
+		'$(THIS_MAKEFILE)' $(MAKE) --no-print-directory -f '$(THIS_MAKEFILE)' venv-locked
+# venv-locked: the body of `venv`; internal - only ever run under its lock.
+venv-locked:
+	@test "$$KAHYA_VENV_LOCKED" = 1 || { echo "make venv-locked: internal target, run make venv" >&2; exit 1; }
+	@case '$(VENV)' in ''|-*|*/|*[!A-Za-z0-9._/+-]*) \
+		echo "make venv: refusing VENV='$(VENV)': want one plain path (letters, digits, . _ / + -; no leading -, no trailing /)" >&2; exit 1;; esac
+	@test -d $(VENV) || { echo "make venv: python3 -m venv $(VENV)"; mkdir -p "$$(dirname $(VENV))" && mkdir $(VENV) && touch $(VENV_MARKER) && python3 -m venv $(VENV); } || { $(VENV_DROP_HALF_BUILT); exit 1; }
+	@echo "make venv: $(PY) -m pip install --quiet -r $(WORKER_LOCK)"; $(PY) -m pip install --quiet -r $(WORKER_LOCK) || { $(VENV_DROP_HALF_BUILT); exit 1; }
 test: venv build
 	@# W4-07 acceptance gate runs FIRST, before the main suite, so its
 	@# anti-vacuous-green guard is ALWAYS reached: make aborts a target at the
