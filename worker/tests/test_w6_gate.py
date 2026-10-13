@@ -129,7 +129,7 @@ class TestW6GateOfflineSttWithinTaskLoop(unittest.TestCase):
 # Model-missing Turkish string the worker emits when the whisper model is not
 # resolvable offline - byte-exact, from kahya_worker.stt.MSG_MODEL_MISSING
 # (CLAUDE.md language policy; never .lower()/.casefold()).
-MSG_MODEL_MISSING = "STT modeli indirilmemiş (W0-03) — ağdan indirme yapılmadı"
+MSG_MODEL_MISSING = "STT modeli (whisper-large-v3-turbo) yerelde bulunamadı — ağdan indirme yapılmadı"
 
 
 class TestW6GateOfflineSttFailsClosedWithoutModel(unittest.TestCase):

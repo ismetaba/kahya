@@ -36,8 +36,11 @@ MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 # step 2 / tasks/README.md's byte-exact-fixture rule): emitted whenever the
 # model is not already present in the local Hugging Face cache. NEVER
 # triggers a network download in response — see resolve_model's own doc
-# comment.
-MSG_MODEL_MISSING = "STT modeli indirilmemiş (W0-03) — ağdan indirme yapılmadı"
+# comment. Wording fixed by G12-N4 (no internal task id in user-facing
+# text); literal copies that must stay byte-identical:
+# worker/tests/test_w6_gate.py, kahyad/internal/server/stt_task_test.go,
+# kahyad/internal/spawn/testdata/stt_error_worker.py.
+MSG_MODEL_MISSING = "STT modeli (whisper-large-v3-turbo) yerelde bulunamadı — ağdan indirme yapılmadı"
 
 
 class SttModelMissingError(Exception):

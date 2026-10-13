@@ -103,9 +103,11 @@ const (
 )
 
 // MsgVoiceMissing is the BYTE-EXACT Turkish notification text (CLAUDE.md
-// language policy; task spec, verbatim) shown exactly once per daemon
-// lifetime when the configured voice (Yelda) is not installed.
-const MsgVoiceMissing = "Yelda sesi yüklü değil — Sistem Ayarları > Erişilebilirlik'ten indirin (bkz. W0-03)"
+// language policy; tasks/w6-voice/W6-05-tts-yelda.md, verbatim) shown
+// exactly once per daemon lifetime when the configured voice (Yelda) is
+// not installed. Wording fixed by G12-N4: it names the macOS Settings path
+// and carries no internal task id (TestMsgVoiceMissingCarriesNoInternalTaskID).
+const MsgVoiceMissing = "Yelda sesi yüklü değil — Sistem Ayarları > Erişilebilirlik > Konuşulan İçerik > Sesleri Yönet bölümünden indirin"
 
 // SpeakerConfig is Speaker's own narrow constructor input - the five
 // cfg.tts.* keys (kahyad/internal/config.Config's TTSEnabled/TTSVoice/

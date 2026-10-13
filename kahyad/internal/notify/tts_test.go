@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -457,5 +458,14 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 			t.Fatalf("file %s never appeared within %s", path, timeout)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestMsgVoiceMissingCarriesNoInternalTaskID: user-facing notification
+// text must not leak backlog task ids such as W0-03 (G12-N4 (d); CLAUDE.md
+// language policy: Turkish, user-facing, no engineering references).
+func TestMsgVoiceMissingCarriesNoInternalTaskID(t *testing.T) {
+	if m := regexp.MustCompile(`\bW[0-9]+-[0-9]+\b`).FindString(MsgVoiceMissing); m != "" {
+		t.Fatalf("MsgVoiceMissing = %q, must not reference internal task id %q", MsgVoiceMissing, m)
 	}
 }

@@ -24,7 +24,7 @@ Kâhya can speak. Behind a config toggle (default **off**), locally delivered an
 - Config keys (defaults committed in code): `tts.enabled` (false), `tts.voice` (`Yelda`), `tts.say_bin` (`/usr/bin/say`), `tts.max_chars` (280), `tts.speak_secret_lane` (false).
 - Wiring in W6-01's local delivery helper: when `tts.enabled` (or the task carries the `--speak` override), speak the same Turkish text delivered via `kahyaNotify`/`hs.notify`, after dispatching the visual notification. Telegram/remote deliveries never reach the Speaker.
 - `kahyad/cmd/kahya`: `kahya ask --speak` flag — one-shot override that voices this task's result even when `tts.enabled=false` (still local-only; plumbed via the task envelope/row like `palette_opened_at`).
-- Voice-missing handling: on first speak attempt, check `say -v '?'` output for the configured voice (cached per daemon lifetime); missing ⇒ single Turkish notification `Yelda sesi yüklü değil — Sistem Ayarları > Erişilebilirlik'ten indirin (bkz. W0-03)` + ledger event `tts.voice_missing`, then stay silent. Never block the task.
+- Voice-missing handling: on first speak attempt, check `say -v '?'` output for the configured voice (cached per daemon lifetime); missing ⇒ single Turkish notification `Yelda sesi yüklü değil — Sistem Ayarları > Erişilebilirlik > Konuşulan İçerik > Sesleri Yönet bölümünden indirin` + ledger event `tts.voice_missing`, then stay silent. Never block the task.
 - Tests with a fake `say` binary (testdata script recording argv + stdin), wired into `make test`.
 
 ## Steps

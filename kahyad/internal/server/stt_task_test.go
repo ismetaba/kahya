@@ -212,7 +212,7 @@ func TestTaskInputAudioPathMissingModelFailsClosed(t *testing.T) {
 			}
 		}
 	}
-	const wantMsg = "STT modeli indirilmemiş (W0-03) — ağdan indirme yapılmadı"
+	const wantMsg = "STT modeli (whisper-large-v3-turbo) yerelde bulunamadı — ağdan indirme yapılmadı"
 	if errMsg != wantMsg {
 		t.Errorf("error message = %q, want %q", errMsg, wantMsg)
 	}

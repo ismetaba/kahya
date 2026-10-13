@@ -117,6 +117,12 @@ class TestResolveModelFailsClosed(unittest.TestCase):
             self.assertEqual(before, after, "local_files_only=True must never write to the cache on a miss")
             self.assertEqual(after, [], "an empty cache_dir must stay empty - no download attempted")
 
+    def test_model_missing_message_carries_no_internal_task_id(self) -> None:
+        # G12-N4 (d): user-facing text never leaks a backlog task id, e.g. W0-03.
+        from kahya_worker import stt
+
+        self.assertNotRegex(stt.MSG_MODEL_MISSING, r"\bW\d+-\d+\b")
+
     def test_resolve_model_wraps_any_resolution_failure_as_typed_error(self) -> None:
         from kahya_worker import stt
 
