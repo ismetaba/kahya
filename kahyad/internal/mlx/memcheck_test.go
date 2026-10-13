@@ -2,6 +2,7 @@ package mlx
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -139,15 +140,47 @@ func TestHasSufficientMemoryCheckErrorIsFailClosed(t *testing.T) {
 }
 
 // TestRealVMStatCheckRuns is a light sanity check that the real vm_stat
-// integration at least runs and parses successfully on this (macOS) dev
-// machine - not a memory-threshold assertion (that depends on the actual
-// live machine state, which this test must not assume anything about).
+// integration at least runs and parses successfully on a macOS dev machine
+// or CI runner - not a memory-threshold assertion (that depends on the
+// actual live machine state, which this test must not assume anything
+// about). It skips (never fails) on any other GOOS: vm_stat is a Mach
+// host_statistics64 wrapper that only exists on macOS, and the product is
+// macOS-only. Deliberately NOT an exec.LookPath skip: on darwin a missing
+// vm_stat is a real defect that CI (macos-latest) must catch.
 func TestRealVMStatCheckRuns(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("vm_stat is a macOS (Mach host_statistics64) tool; RealVMStatCheck is darwin-only (GOOS=%s)", runtime.GOOS)
+	}
 	st, err := RealVMStatCheck()
 	if err != nil {
 		t.Fatalf("RealVMStatCheck() error = %v", err)
 	}
 	if st.PageSizeBytes == 0 {
 		t.Error("RealVMStatCheck() PageSizeBytes = 0, want a real page size")
+	}
+}
+
+// TestRealVMStatCheckMissingBinaryFailsClosed runs on EVERY GOOS: with no
+// vm_stat anywhere on PATH, the real production CheckFunc must error and
+// HasSufficientMemory(nil) (nil => RealVMStatCheck) must resolve to
+// sufficient=false - never true (HANDOFF §4 memory-pressure fail-closed:
+// an undeterminable memory state blocks the local model, and secret-lane
+// work then refuses instead of ever falling back to cloud).
+func TestRealVMStatCheckMissingBinaryFailsClosed(t *testing.T) {
+	// A fresh empty directory, so exec.LookPath("vm_stat") finds nothing
+	// (not PATH="" - an empty PATH element means the current directory).
+	t.Setenv("PATH", t.TempDir())
+	if _, err := RealVMStatCheck(); err == nil {
+		t.Fatal("RealVMStatCheck() error = nil with no vm_stat on PATH, want an exec error")
+	}
+	ok, st, err := HasSufficientMemory(nil)
+	if ok {
+		t.Fatal("HasSufficientMemory(nil) = true when vm_stat cannot run, want false (fail-closed)")
+	}
+	if err == nil {
+		t.Fatal("HasSufficientMemory(nil) error = nil, want the vm_stat exec error surfaced")
+	}
+	if st != (MemStatus{}) {
+		t.Errorf("HasSufficientMemory(nil) status = %+v on a check error, want the zero MemStatus", st)
 	}
 }
