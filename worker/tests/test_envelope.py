@@ -2,7 +2,9 @@
 kahyad/internal/spawn.Envelope.Validate's own test matrix one for one."""
 
 import json
+import re
 import unittest
+from pathlib import Path
 
 import _pathfix  # noqa: F401
 
@@ -239,6 +241,42 @@ class TestParseEnvelope(unittest.TestCase):
         env = parse_envelope(encode(d))
         self.assertEqual(env.mode, "")
         self.assertEqual(env.input_audio_path, "/tmp/x.wav")
+
+
+HANDOFF = Path(__file__).resolve().parents[2] / "docs" / "HANDOFF.md"
+CLAUDE_ID_RE = re.compile(r"`(claude-[a-z0-9-]+)`")
+
+
+def handoff_section_9_model_ids() -> tuple:
+    """(current, legacy) cloud model ids from docs/HANDOFF.md §9 - the Python
+    mirror of kahyad/internal/server's TestModelIDsMatchHandoffSection9
+    parser: current = the "- **Model ID'leri:**" line before "Yerel:";
+    legacy = the optional "- **Eski model ID'leri" line a model-id bump
+    adds (accepted, never selected)."""
+    current, legacy = set(), set()
+    for line in HANDOFF.read_text(encoding="utf-8").splitlines():
+        if line.startswith("- **Model ID'leri:**"):
+            current |= set(CLAUDE_ID_RE.findall(line.split("Yerel:")[0]))
+        elif line.startswith("- **Eski model ID'leri"):
+            legacy |= set(CLAUDE_ID_RE.findall(line.split("Yerel:")[0]))
+    return current, legacy
+
+
+class TestAllowedModelsHandoff(unittest.TestCase):
+    """G12-N2 step-0 drift guard, worker side: ALLOWED_MODELS must track
+    HANDOFF §9 (tasks/README.md: model ids come from §9, never invented)."""
+
+    def test_allowed_models_cover_handoff_section_9(self) -> None:
+        current, _ = handoff_section_9_model_ids()
+        self.assertTrue(current, "no claude-* ids parsed from HANDOFF §9")
+        self.assertLessEqual(
+            current, ALLOWED_MODELS, f"missing from ALLOWED_MODELS: {sorted(current - ALLOWED_MODELS)}"
+        )
+
+    def test_every_allowed_model_is_named_in_handoff_section_9(self) -> None:
+        current, legacy = handoff_section_9_model_ids()
+        invented = ALLOWED_MODELS - current - legacy
+        self.assertFalse(invented, f"ALLOWED_MODELS ids absent from HANDOFF §9: {sorted(invented)}")
 
 
 if __name__ == "__main__":

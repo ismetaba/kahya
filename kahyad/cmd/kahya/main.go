@@ -121,7 +121,7 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	derin := fs.Bool("derin", false, "derin düşün (claude-fable-5 kullanır, ek maliyetlidir)")
+	derin := fs.Bool("derin", false, "derin düşün (en güçlü bulut modelini kullanır, ek maliyetlidir)")
 	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
 	audio := fs.String("audio", "", "ses dosyası yolu (wav) - transkript kahyad tarafından yerelde çıkarılır (hammerspoon/kahya.lua basılı-tut kullanır)")
 	speak := fs.Bool("speak", false, "cevabı sesli oku (say -v Yelda) - tts.enabled kapalı olsa bile, sadece bu görev için")

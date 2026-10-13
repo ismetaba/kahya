@@ -104,6 +104,19 @@ func TestAskHelpCarriesNoInternalTaskID(t *testing.T) {
 	}
 }
 
+// TestAskHelpCarriesNoModelID covers G12-N2 step 0.3: the user-facing
+// --derin help text named a model id ("claude-fable-5"), a drift source
+// every model-id bump would have to remember; it describes the effect.
+func TestAskHelpCarriesNoModelID(t *testing.T) {
+	out := runHelp(t, "ask", "-h")
+	if m := regexp.MustCompile(`claude-[a-z0-9-]+`).FindString(out); m != "" {
+		t.Errorf("kahya ask -h names model id %q:\n%s", m, out)
+	}
+	if !strings.Contains(out, "derin düşün (en güçlü bulut modelini kullanır, ek maliyetlidir)") {
+		t.Errorf("kahya ask -h lacks the byte-exact --derin help text:\n%s", out)
+	}
+}
+
 // errorBodyServer answers every request with status and a JSON body.
 func errorBodyServer(t *testing.T, status int, body map[string]any) {
 	t.Helper()
