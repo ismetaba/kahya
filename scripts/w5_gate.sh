@@ -284,7 +284,12 @@ PYEOF
 			deferred "taint-tainted-deny" "Madde 1'in brifing işi henüz tamamlanmadı (muhtemelen collect_calendar.go'nun osascript çağrısı askıda) - taint satırı hiç commit edilmemiş olabilir"
 		fi
 	else
+		# /policy/check from this shell (not a live worker kahyad spawned) is
+		# unattributable, so kahyad requires the per-boot control secret
+		# (G03 / B-14, docs/ipc.md section 5a) - the declared task_id/
+		# trace_id are then honored as-is.
 		TAINTED_JSON="$(curl -sS --unix-socket "$SOCK" -X POST http://kahyad/policy/check \
+			-H "X-Kahya-Control-Secret: $(cat "$SOCK.secret")" \
 			-H 'Content-Type: application/json' \
 			-d "$(python3 -c "import json,sys; print(json.dumps({'trace_id': sys.argv[1], 'task_id': sys.argv[2], 'tool_name': sys.argv[3], 'tool_input': json.loads(sys.argv[4])}))" \
 				"$TRACE1" "$TASK1" "$TOOL_NAME" "$TOOL_INPUT")" 2>&1)"
@@ -309,6 +314,7 @@ PYEOF
 		CLEAN_TASK_ID="$(printf '%s' "$CLEAN_ROW" | cut -d'|' -f1)"
 		CLEAN_TRACE_ID="$(printf '%s' "$CLEAN_ROW" | cut -d'|' -f2)"
 		CLEAN_JSON="$(curl -sS --unix-socket "$SOCK" -X POST http://kahyad/policy/check \
+			-H "X-Kahya-Control-Secret: $(cat "$SOCK.secret")" \
 			-H 'Content-Type: application/json' \
 			-d "$(python3 -c "import json,sys; print(json.dumps({'trace_id': sys.argv[1], 'task_id': sys.argv[2], 'tool_name': sys.argv[3], 'tool_input': json.loads(sys.argv[4])}))" \
 				"$CLEAN_TRACE_ID" "$CLEAN_TASK_ID" "$TOOL_NAME" "$TOOL_INPUT")" 2>&1)"

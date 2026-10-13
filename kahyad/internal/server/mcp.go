@@ -51,16 +51,16 @@ type EventLogger interface {
 // packages intentionally don't share code across the internal boundary).
 const traceHeader = "X-Kahya-Trace-Id"
 
-// taskHeader is the HTTP header a future bridge MAY propagate a task's
-// task_id through as (kahyad/cmd/kahya-mcp does not send this today - its
-// own package doc comment only names KAHYA_TRACE_ID). policyGateMiddleware
-// below reads it defensively (BLOCKER 1+2 fix): when present, it lets
-// policy.Engine's SessionResolver resolve by the exact task_id primary key
-// instead of only ever falling back to trace_id; when absent (today's
-// actual bridge behavior), TaskID is simply left empty on CheckInput and
-// resolution proceeds via TraceID alone - kahyad/internal/spawn sets the
-// worker's KAHYA_TRACE_ID env to this exact task's own trace_id, so a
-// trace_id-only resolution already finds the right tasks row.
+// taskHeader is the HTTP header kahyad/cmd/kahya-mcp forwards the
+// worker's KAHYA_TASK_ID through as (since W4-07). policyGateMiddleware
+// below reads it (BLOCKER 1+2 fix) so policy.Engine's SessionResolver
+// resolves by the exact task_id primary key. Since G03 / B-14 neither this
+// header nor traceHeader is the worker's word any more: for a caller
+// attributable to a live worker, withControlAuth (controlauth.go)
+// OVERWRITES both with that worker's own task_id/trace_id before the MCP
+// handler ever sees the request (a conflicting declaration is ledgered as
+// worker_identity_override); an unattributed caller only gets here with
+// the control secret.
 const taskHeader = "X-Kahya-Task-Id"
 
 // SetEventLogger wires the append-only events ledger used by (a) the
@@ -214,9 +214,9 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 // silently SKIPPED the W4-03 taint check on every single /v1/mcp call,
 // tainted session or not (a fail-open hole a tainted session's
 // memory_write/memory_forget could walk straight through). Check now
-// resolves the session identity SERVER-SIDE from TraceID (and TaskID,
-// when a future bridge sends the X-Kahya-Task-Id header - see taskHeader's
-// doc comment) via its own SessionResolver, so the taint check runs here
+// resolves the session identity SERVER-SIDE from TraceID and TaskID (the
+// X-Kahya-Trace-Id / X-Kahya-Task-Id headers - see taskHeader's doc
+// comment) via its own SessionResolver, so the taint check runs here
 // exactly as it does on POST /policy/check - see policy.CheckInput and
 // policy.SessionResolver's own doc comments for the full mechanism.
 //
@@ -237,63 +237,44 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 // entirely) is STILL denied here. can_use_tool (W12-09) is a separate,
 // non-binding, worker-side early-reject layer.
 //
-// KNOWN, ACCEPTED DEFENSE-IN-DEPTH LIMITATION (W4-03 session taint):
-// this middleware does NOT thread a SessionID into Engine.Check, so the
-// W4-03 taint gate (Engine.Check's "tainted session => only R-class"
-// hook, keyed on CheckInput.SessionID) is SKIPPED on the /v1/mcp route -
-// Check treats an empty SessionID as "no session concept applies" and
-// falls straight through to the ladder. This is deliberate, not an
-// oversight, and specifically NOT "just not wired yet": there is no
-// non-forgeable session_id available on this route to thread.
-//   - No tool mounted here carries a session_id argument in its schema
-//     (memory_search/write/forget - mcp/memory; fs_* - mcp/fs; shell_* -
-//     mcp/shell; applescript/jxa/shortcuts - mcp/osascript), and the only
-//     per-request identity kahya-mcp's bridge propagates is the trace_id
-//     header (X-Kahya-Trace-Id), sourced from the worker's own
-//     KAHYA_TRACE_ID env - i.e. worker-supplied.
-//   - The adversary this middleware exists to stop is a COMPROMISED
-//     worker (RCE-level, not a merely prompt-injected model) crafting
-//     arbitrary POSTs to the shared control socket. ANY session identity
-//     that adversary supplies - a tool arg, or a header the bridge/worker
-//     sets - is attacker-chosen: it would omit it (taint skipped) or name
-//     a known-clean session (taint passes). A worker-supplied session_id
-//     here therefore buys no security against this adversary; wiring one
-//     would be security theater that reads as protection it does not give.
-//   - Taint fundamentally defends against a prompt-injected MODEL, whose
-//     tool calls flow through the ORDINARY path (can_use_tool -> POST
-//     /policy/check -> handlePolicyCheck), which DOES pass the worker's own
-//     session_id into this same Engine.Check taint hook - that is where the
-//     HANDOFF §5 safety #2 invariant binds. This middleware backstops a
-//     strictly stronger adversary, for whom taint keyed on a forgeable
-//     session adds nothing, but for whom the controls kahyad evaluates
-//     authoritatively (from the tool name + its own autonomy_state + the
-//     call's args, never from any worker-supplied session/trace value) DO
-//     still bind: class W3 never auto-allows and always needs written LOCAL
-//     approval (Check -> needs_approval -> deny() here), so mail_send etc.
-//     stays unreachable taint or no taint; the autonomy ladder still gates
-//     every W1/W2 call by kahyad-side state, so only user-promoted tools
-//     auto-allow (/policy/promote is a control route, controlauth.go, that
-//     a worker cannot reach, so "user-promoted" is enforced, not assumed -
-//     G03 / B-3); fs_*/shell_*/osascript_* run their OWN deny-glob/
-//     digest-pin/egress/arg-validator chain (the fsOwnedTools/shellOwnedTools/
-//     osascriptOwnedTools bypass above) regardless - and share this EXACT
-//     same no-session_id limitation via enginePolicyClient (fs.go), for the
-//     same reason; deny-all still fails closed at boot; every decision is
-//     ledgered; an auto-allowed W1 still opens a 5-minute undo window.
-//   - The residual risk taint would otherwise cover on this path is thus
-//     narrow: an RCE-compromised worker, whose session is tainted, using
-//     this bypass (not the ordinary path) to invoke a W1/W2 tool the user
-//     ALREADY promoted to auto-allow - which is still ledgered and (for W1)
-//     undoable.
-//   - A SOUND fix needs an UNFORGEABLE binding between the incoming /v1/mcp
-//     request and a specific session: a dedicated authenticated per-task
-//     channel, or a kahyad-minted per-task secret this middleware MANDATES
-//     (deny on absence) and resolves server-side to that task's captured
-//     session_id. All workers share one control socket today with no
-//     per-connection identity, so that is a larger, separate change, tracked
-//     in tasks/w4-durability/W4-03-taint-reader-actor.md's "Deviations".
-//     TestMCPGateTaintCheckSkippedNoSessionOnThisPath (mcp_test.go) pins
-//     this documented behavior.
+// SESSION BINDING ON THIS ROUTE (W4-03 taint; closed by G03 / B-14):
+// no tool mounted here carries a session_id argument, so the session the
+// taint gate keys on is resolved server-side from the trace/task headers
+// above. Those headers used to be worker-supplied (kahya-mcp forwards the
+// worker's KAHYA_TRACE_ID / KAHYA_TASK_ID env), so a compromised worker
+// POSTing /v1/mcp directly could name a clean task's ids and launder its
+// taint - this comment used to document that as an accepted limitation
+// whose sound fix needed "an UNFORGEABLE binding between the incoming
+// /v1/mcp request and a specific session". That binding now exists:
+//   - withControlAuth (controlauth.go) takes the OS-level UDS peer pid of
+//     the connection (LOCAL_PEERPID / SO_PEERCRED), maps its process group
+//     to a live worker kahyad itself spawned (task.LiveRegistry.ByPGID -
+//     every worker is its own group leader and the kahya-mcp bridge stays
+//     in that group) and OVERWRITES both headers with that worker's own
+//     task_id/trace_id, ledgering worker_identity_override on a conflicting
+//     declaration. The session therefore resolves from the caller's REAL
+//     task, never from its claim.
+//   - A caller NOT attributable to a live worker (a CLI/script/test
+//     harness) is served only with kahyad's per-boot control secret and
+//     keeps its declared ids - that is the legacy no-session path
+//     TestMCPGateTaintCheckSkippedNoSessionOnThisPath pins (no resolver
+//     wired, no pinning, taint skipped); the attributed-worker path is
+//     TestMCPGateTaintCheckUsesAttributedSession.
+//   - The controls kahyad evaluates authoritatively still bind on top:
+//     class W3 never auto-allows and always needs written LOCAL approval
+//     (Check -> needs_approval -> deny() here); the autonomy ladder gates
+//     every W1/W2 call by kahyad-side state, and /policy/promote is a
+//     control route a worker cannot reach (G03 / B-3), so only
+//     user-promoted tools auto-allow; fs_*/shell_*/osascript_* run their
+//     OWN deny-glob/digest-pin/egress/arg-validator chain (the
+//     fsOwnedTools/shellOwnedTools/osascriptOwnedTools bypass above) and
+//     read the SAME pinned headers; deny-all still fails closed at boot;
+//     every decision is ledgered; an auto-allowed W1 still opens a
+//     5-minute undo window.
+//   - Residual: a worker that escapes its own process group (setsid + a
+//     double fork) is unattributable and therefore refused here outright
+//     (403 unattributable_worker_route) unless it ALSO read the control
+//     secret file - the same-uid limit docs/ipc.md section 5a documents.
 func (s *Server) policyGateMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
@@ -312,13 +293,13 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			taskID := ""
 			if callReq.Extra != nil && callReq.Extra.Header != nil {
 				traceID = callReq.Extra.Header.Get(traceHeader)
-				// BLOCKER 1+2 fix: propagated when a future bridge sends
-				// it (taskHeader's own doc comment - kahya-mcp does not
-				// today); left "" otherwise, so policy.Engine's
-				// SessionResolver falls back to resolving by traceID
-				// alone, which is already sufficient (kahyad/internal/
-				// spawn sets the worker's KAHYA_TRACE_ID env to this
-				// exact task's own trace_id).
+				// BLOCKER 1+2 fix: kahya-mcp forwards KAHYA_TASK_ID as
+				// this header (since W4-07). Both values are pinned by
+				// withControlAuth to the live worker's own ids when the
+				// caller is attributable (G03 / B-14), so they are
+				// kahyad's word here, not the worker's; left "" (resolve by
+				// traceID alone) only for an unattributed, control-secret-
+				// authenticated caller that omitted it.
 				taskID = callReq.Extra.Header.Get(taskHeader)
 			}
 			if traceID == "" {

@@ -6,6 +6,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,9 +15,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/search"
+	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/taint"
+	"kahya/kahyad/internal/task"
 )
 
 // doRaw sends one request with an explicit trace id and (optionally) an
@@ -303,9 +310,9 @@ func TestControlRoutesRequireSecret(t *testing.T) {
 	}
 }
 
-// TestOpenRoutesDoNotRequireSecret: /health is open, and (B-3) the four
-// worker routes are reachable without the control secret - a worker never
-// has it.
+// TestOpenRoutesDoNotRequireSecret: /health is open - no secret, no
+// attribution (every script's readiness loop and probeHealth depend on
+// it).
 func TestOpenRoutesDoNotRequireSecret(t *testing.T) {
 	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
 	noSecret := unixHTTPClientNoSecret(f.srv.cfg.Socket)
@@ -313,34 +320,249 @@ func TestOpenRoutesDoNotRequireSecret(t *testing.T) {
 	if status, _ := doRaw(t, noSecret, http.MethodGet, "/health", "trace-open-health", "", ""); status != http.StatusOK {
 		t.Fatalf("GET /health without secret = %d, want 200", status)
 	}
+	if status, _ := doRaw(t, noSecret, http.MethodGet, "/health", "trace-open-health-bad", "deadbeef", ""); status != http.StatusOK {
+		t.Fatalf("GET /health with a wrong secret = %d, want 200 (open route ignores the header)", status)
+	}
+}
 
-	var check policyCheckResponse
-	resp := postJSON(t, noSecret, "/policy/check", map[string]any{
-		"trace_id": "trace-open-check", "task_id": "t1", "tool_name": "memory_search",
-		"tool_input": map[string]any{"query": "x"},
-	}, &check)
-	if resp.StatusCode != http.StatusOK || check.Decision == "" {
-		t.Fatalf("POST /policy/check without secret = %d %+v, want 200 with a decision", resp.StatusCode, check)
+// TestWorkerRouteUnattributableRequiresSecret (G03 / B-14): a worker-route
+// caller kahyad cannot attribute to a live worker it spawned (here: no
+// live registry wired at all, so nobody is attributable) is served only
+// with the control secret - without it, 403 + MsgControlSecretRejected
+// and control_auth_rejected reason=unattributable_worker_route.
+func TestWorkerRouteUnattributableRequiresSecret(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	noSecret := unixHTTPClientNoSecret(f.srv.cfg.Socket)
+	secret := readSecretFile(t, f.srv.cfg.Socket)
+
+	probes := []controlProbe{
+		{http.MethodPost, "/policy/check", `{"trace_id":"x","task_id":"t1","tool_name":"memory_search","tool_input":{"query":"x"}}`},
+		{http.MethodPost, "/v1/memory/search", `{"query":"x"}`},
+		{http.MethodPost, "/policy/consume-token", `{}`},
+		{http.MethodPost, "/v1/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`},
+	}
+	for i, p := range probes {
+		trace := fmt.Sprintf("trace-unattr-%d", i)
+		status, errBody := doRaw(t, noSecret, p.method, p.path, trace, "", p.body)
+		if status != http.StatusForbidden || errBody != MsgControlSecretRejected {
+			t.Errorf("%s %s unattributed, no secret = %d %q, want 403 %q", p.method, p.path, status, errBody, MsgControlSecretRejected)
+		}
+		if n := controlRejectCount(t, f, trace, controlRejectUnattributable); n != 1 {
+			t.Errorf("%s %s: control_auth_rejected(unattributable_worker_route) rows = %d, want 1", p.method, p.path, n)
+		}
+		okTrace := fmt.Sprintf("trace-unattr-ok-%d", i)
+		if status, errBody := doRaw(t, noSecret, p.method, p.path, okTrace, secret, p.body); status == http.StatusForbidden || errBody == MsgControlSecretRejected {
+			t.Errorf("%s %s unattributed WITH the secret = %d %q, want served", p.method, p.path, status, errBody)
+		}
 	}
 
-	// newTaskTestFixture wires no Searcher, so this answers 503 - the point
-	// is only that the gate did not answer 403.
-	if status, errBody := doRaw(t, noSecret, http.MethodPost, "/v1/memory/search", "trace-open-search", "", `{"query":"x"}`); status == http.StatusForbidden || errBody == MsgControlSecretRejected {
-		t.Fatalf("POST /v1/memory/search without secret = %d %q, want not 403", status, errBody)
-	}
-
-	var consume policyConsumeTokenResponse
-	resp = postJSON(t, noSecret, "/policy/consume-token", map[string]any{}, &consume)
-	if resp.StatusCode != http.StatusOK || consume.OK {
-		t.Fatalf("POST /policy/consume-token without secret = %d %+v, want 200 ok:false", resp.StatusCode, consume)
-	}
-
+	// /v1/mcp served end to end for the secret-carrying, unattributed
+	// caller (a CLI/script).
 	mf := newMCPTestFixture(t)
-	mresp := postMCP(t, unixHTTPClientNoSecret(mf.srv.cfg.Socket), `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+	mresp := postMCP(t, unixHTTPClient(mf.srv.cfg.Socket), `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
 	defer mresp.Body.Close()
 	if mresp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(mresp.Body)
-		t.Fatalf("POST /v1/mcp tools/list without secret = %d %s, want 200", mresp.StatusCode, b)
+		t.Fatalf("POST /v1/mcp tools/list with secret = %d %s, want 200", mresp.StatusCode, b)
+	}
+	nresp := postMCP(t, unixHTTPClientNoSecret(mf.srv.cfg.Socket), `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+	defer nresp.Body.Close()
+	if nresp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /v1/mcp tools/list unattributed, no secret = %d, want 403", nresp.StatusCode)
+	}
+}
+
+// seedTaintedAndCleanTasks wires a real taint tracker + server-side
+// session resolver onto f's engine and seeds two running tasks: t-clean
+// (session sess-clean, clean) and t-dirty (session sess-dirty, tainted) -
+// the B-14 repro's exact setup.
+func seedTaintedAndCleanTasks(t *testing.T, st *store.Store, eng *policy.Engine) {
+	t.Helper()
+	ctx := context.Background()
+	tr := taint.New(st.Queries, st)
+	eng.SetTaintChecker(tr)
+	eng.SetSessionResolver(policy.NewStoreSessionResolver(st.Queries))
+	for _, row := range [][3]string{{"t-clean", "trace-clean", "sess-clean"}, {"t-dirty", "trace-dirty", "sess-dirty"}} {
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO tasks (id, trace_id, session_id, state, updated_at, created_at, lane) VALUES (?, ?, ?, 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'normal')`,
+			row[0], row[1], row[2]); err != nil {
+			t.Fatalf("seed task %s: %v", row[0], err)
+		}
+	}
+	if err := tr.InsertClean(ctx, "trace-clean", "sess-clean"); err != nil {
+		t.Fatalf("InsertClean: %v", err)
+	}
+	if err := tr.Raise(ctx, "trace-dirty", "sess-dirty", "untrusted_output:web_read"); err != nil {
+		t.Fatalf("Raise: %v", err)
+	}
+}
+
+// identityOverrideCount counts worker_identity_override rows ledgered
+// under traceID for path/source/claimed_task_id.
+func identityOverrideCount(t *testing.T, st *store.Store, traceID, path, source, claimedTask string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(
+		`SELECT count(*) FROM events WHERE kind = 'worker_identity_override' AND trace_id = ?
+		   AND json_extract(payload, '$.path') = ? AND json_extract(payload, '$.source') = ?
+		   AND json_extract(payload, '$.claimed_task_id') = ?`,
+		traceID, path, source, claimedTask,
+	).Scan(&n); err != nil {
+		t.Fatalf("count worker_identity_override: %v", err)
+	}
+	return n
+}
+
+// TestWorkerIdentityPinnedToLiveWorker is G03 / B-14's core regression
+// test: a TAINTED live worker (this test process, registered under
+// t-dirty by its own process group - exactly how handleTask registers a
+// spawned worker) that names the CLEAN task's ids on /policy/check is
+// still taint-denied, because kahyad pins the caller to its attributed
+// task; the override is ledgered under the worker's own trace. The same
+// pinning applies to /policy/consume-token (extra finding E-1). Before the
+// fix the laundered call fell through to the ladder (needs_approval).
+func TestWorkerIdentityPinnedToLiveWorker(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	seedTaintedAndCleanTasks(t, f.store, f.srv.policyEngine)
+	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), syscall.Getpgrp())
+	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket) // a worker never has the secret
+
+	fsWrite := func(task, trace string) map[string]any {
+		return map[string]any{
+			"trace_id": trace, "task_id": task, "tool_name": "fs_write",
+			"tool_input": map[string]any{"path": "x", "content_base64": "eA=="},
+		}
+	}
+
+	t.Run("policy_check", func(t *testing.T) {
+		var resp policyCheckResponse
+		r := postJSON(t, worker, "/policy/check", fsWrite("t-clean", "trace-clean"), &resp)
+		if r.StatusCode != http.StatusOK || resp.Decision != policy.ResultDeny || resp.Rule != policy.RuleTaintedSessionV1 {
+			t.Fatalf("laundered fs_write = %d %+v, want deny rule=%s (pinned to the tainted worker's own task)", r.StatusCode, resp, policy.RuleTaintedSessionV1)
+		}
+		if n := identityOverrideCount(t, f.store, "trace-dirty", "/policy/check", "body", "t-clean"); n != 1 {
+			t.Fatalf("worker_identity_override(body, claimed t-clean) under trace-dirty = %d, want 1", n)
+		}
+		var cleanDecisions int
+		if err := f.store.DB().QueryRow(`SELECT count(*) FROM events WHERE kind = 'policy_decision' AND trace_id = 'trace-clean'`).Scan(&cleanDecisions); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if cleanDecisions != 0 {
+			t.Fatalf("policy_decision rows ledgered under the CLEAN task's trace = %d, want 0 (forensic trail must name the real caller)", cleanDecisions)
+		}
+
+		// Its OWN ids are of course denied the same way, and naming them
+		// is no override.
+		r = postJSON(t, worker, "/policy/check", fsWrite("t-dirty", "trace-dirty"), &resp)
+		if resp.Rule != policy.RuleTaintedSessionV1 {
+			t.Fatalf("own-ids fs_write = %+v, want tainted_session deny", resp)
+		}
+		if n := identityOverrideCount(t, f.store, "trace-dirty", "/policy/check", "body", "t-dirty"); n != 0 {
+			t.Fatalf("worker naming its own ids ledgered %d overrides, want 0", n)
+		}
+	})
+
+	t.Run("consume_token", func(t *testing.T) {
+		var resp policyConsumeTokenResponse
+		r := postJSON(t, worker, "/policy/consume-token", map[string]any{
+			"trace_id": "trace-clean", "task_id": "t-clean", "tool": "fs_write", "class": "W1", "scope": "global",
+			"token": strings.Repeat("0", 64), "tool_input": map[string]any{"path": "x"},
+		}, &resp)
+		if r.StatusCode != http.StatusOK || resp.OK {
+			t.Fatalf("consume-token naming t-clean = %d %+v, want 200 ok:false", r.StatusCode, resp)
+		}
+		if n := identityOverrideCount(t, f.store, "trace-dirty", "/policy/consume-token", "body", "t-clean"); n != 1 {
+			t.Fatalf("worker_identity_override(consume-token, claimed t-clean) under trace-dirty = %d, want 1", n)
+		}
+	})
+
+	t.Run("unattributed_secret_caller_keeps_declaration", func(t *testing.T) {
+		// Once the worker is gone, the same process is just a CLI/script:
+		// with the control secret its declared ids stand (no pinning), so
+		// naming t-clean resolves the CLEAN session and reaches the ladder.
+		reg.Unregister("t-dirty")
+		var resp policyCheckResponse
+		postJSON(t, f.client, "/policy/check", fsWrite("t-clean", "trace-clean"), &resp)
+		if resp.Rule == policy.RuleTaintedSessionV1 || resp.Decision != "needs_approval" {
+			t.Fatalf("secret-carrying unattributed fs_write(t-clean) = %+v, want needs_approval via the ladder", resp)
+		}
+	})
+}
+
+// TestWorkerAttributionIsPerRequest: attribution is resolved on every
+// request, not once per connection - a kept-alive connection opened
+// BEFORE the worker registered is attributed once it is, and stops being
+// attributed (fail-closed: 403 without a secret) once it unregisters.
+func TestWorkerAttributionIsPerRequest(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
+	body := `{"trace_id":"x","task_id":"t1","tool_name":"memory_search","tool_input":{"query":"x"}}`
+
+	if status, _ := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-pr-1", "", body); status != http.StatusForbidden {
+		t.Fatalf("before registration = %d, want 403", status)
+	}
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+	if status, _ := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-pr-2", "", body); status != http.StatusOK {
+		t.Fatalf("after registration (same keep-alive client) = %d, want 200", status)
+	}
+	if n := identityOverrideCount(t, f.store, "trace-live", "/policy/check", "header", ""); n != 1 {
+		t.Fatalf("header override (declared trace trace-pr-2) under trace-live = %d, want 1", n)
+	}
+	reg.Unregister("t-live")
+	if status, _ := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-pr-3", "", body); status != http.StatusForbidden {
+		t.Fatalf("after Unregister (same keep-alive client) = %d, want 403", status)
+	}
+}
+
+// TestControlRouteRefusesLiveWorkerEvenWithSecret (G03 / B-14): a caller
+// inside a live worker's process group is refused on control routes even
+// if it read <socket>.secret - reason live_worker_on_control_route.
+func TestControlRouteRefusesLiveWorkerEvenWithSecret(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+	secret := readSecretFile(t, f.srv.cfg.Socket)
+	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
+
+	for i, p := range controlProbes {
+		trace := fmt.Sprintf("trace-wctl-%d", i)
+		status, errBody := doRaw(t, worker, p.method, p.path, trace, secret, p.body)
+		if status != http.StatusForbidden || errBody != MsgControlSecretRejected {
+			t.Errorf("%s %s from a live worker WITH the secret = %d %q, want 403", p.method, p.path, status, errBody)
+		}
+		if n := controlRejectCount(t, f, trace, controlRejectWorkerOnControl); n != 1 {
+			t.Errorf("%s %s: control_auth_rejected(live_worker_on_control_route) rows = %d, want 1", p.method, p.path, n)
+		}
+	}
+	reg.Unregister("t-live")
+	if status, _ := doRaw(t, worker, http.MethodGet, "/policy/state", "trace-wctl-after", secret, ""); status != http.StatusOK {
+		t.Fatalf("GET /policy/state with the secret after the worker exited = %d, want 200", status)
+	}
+}
+
+// TestAttributedWorkerWithoutTraceFailsClosed: a live entry registered
+// via the legacy pid-only Register (no trace_id) cannot be pinned
+// completely, so its worker-route calls are refused rather than served
+// half-pinned.
+func TestAttributedWorkerWithoutTraceFailsClosed(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	reg.Register("t-legacy", syscall.Getpgrp())
+	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
+
+	status, errBody := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-legacy", "",
+		`{"trace_id":"x","task_id":"t-legacy","tool_name":"memory_search","tool_input":{"query":"x"}}`)
+	if status != http.StatusForbidden || errBody != MsgControlSecretRejected {
+		t.Fatalf("legacy-registered worker /policy/check = %d %q, want 403", status, errBody)
+	}
+	if n := controlRejectCount(t, f, "trace-legacy", controlRejectNoTrace); n != 1 {
+		t.Fatalf("control_auth_rejected(attributed_worker_without_trace) rows = %d, want 1", n)
 	}
 }
 
@@ -371,5 +593,49 @@ func TestPolicyPromoteRequiresControlSecret(t *testing.T) {
 	resp = postJSON(t, f.client, "/policy/promote", body, &ok)
 	if resp.StatusCode != http.StatusOK || ok.Level != 1 {
 		t.Fatalf("promote with secret = %d %+v, want 200 level 1", resp.StatusCode, ok)
+	}
+}
+
+// TestMemorySearchHafizaInjectedPinnedToAttributedWorker (G03 / B-14):
+// the <hafiza> injection ledger row (HANDOFF §5 safety #4 forensic trail)
+// is written against the task that actually received the block - the
+// attributed live worker's - never the task_id/trace_id the caller
+// declared in the body.
+func TestMemorySearchHafizaInjectedPinnedToAttributedWorker(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 5, EpisodeID: 1, Path: "properties/kadikoy.md", Seq: 2, Text: "Kadıköy'de iki daire gezdik", Score: 0.9, SourceTier: "user_asserted"},
+	}}
+	led := &fakeEventLogger{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	srv.SetEventLogger(led)
+	reg := task.NewLiveRegistry()
+	srv.SetTaskLiveRegistry(reg)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve() //nolint:errcheck
+	defer srv.Shutdown()
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+
+	resp := postMemorySearch(t, unixHTTPClientNoSecret(socketPath), `{"query":"kadikoy","for_injection":true,"task_id":"task-forged","trace_id":"tid-forged"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if fs.lastTID != "trace-live" {
+		t.Errorf("search ran under trace %q, want the attributed trace-live", fs.lastTID)
+	}
+	events := led.eventsOfKind("hafiza_injected")
+	if len(events) != 1 {
+		t.Fatalf("hafiza_injected events = %d, want 1", len(events))
+	}
+	if events[0].traceID != "trace-live" || events[0].payload["task_id"] != "t-live" {
+		t.Fatalf("hafiza_injected ledgered under trace %q task %v, want trace-live / t-live", events[0].traceID, events[0].payload["task_id"])
+	}
+	overrides := led.eventsOfKind("worker_identity_override")
+	if len(overrides) != 1 || overrides[0].traceID != "trace-live" || overrides[0].payload["claimed_task_id"] != "task-forged" || overrides[0].payload["source"] != "body" {
+		t.Fatalf("worker_identity_override events = %+v, want one body override claiming task-forged under trace-live", overrides)
 	}
 }

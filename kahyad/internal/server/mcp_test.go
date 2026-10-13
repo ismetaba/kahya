@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -19,6 +20,7 @@ import (
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/taint"
+	"kahya/kahyad/internal/task"
 	"kahya/mcp/memory"
 )
 
@@ -328,19 +330,17 @@ func TestMCPGateAllowsMemorySearchThroughHTTP(t *testing.T) {
 	}
 }
 
-// TestMCPGateTaintCheckSkippedNoSessionOnThisPath pins the documented,
-// accepted defense-in-depth limitation on policyGateMiddleware (see its own
-// doc comment in mcp.go): the /v1/mcp route threads NO session_id into
-// Engine.Check, so the W4-03 taint gate never fires here - a memory_write
-// (W1) call is governed purely by the autonomy ladder, even when a taint
-// tracker IS wired and the session it would key on is tainted. The taint
-// invariant (HANDOFF §5 safety #2) binds on the ORDINARY can_use_tool ->
-// POST /policy/check path instead (engine_w403_test.go / handlePolicyCheck),
-// which carries the worker's own session_id; a worker-supplied session_id on
-// THIS route would be forgeable by the very compromised worker this
-// middleware defends against, so it is deliberately not threaded. If a
-// future change starts enforcing taint here (e.g. via an unforgeable
-// per-task binding), this test flips and must be updated deliberately.
+// TestMCPGateTaintCheckSkippedNoSessionOnThisPath pins the UNATTRIBUTED,
+// control-secret-authenticated caller path on /v1/mcp (a CLI/script, never
+// a live worker - G03 / B-14): no live worker owns this caller's process
+// group, so withControlAuth pins nothing and the request keeps its own
+// (here: absent) trace/task headers; with no SessionResolver wired and no
+// session_id on this route, Engine.Check's legacy no-session branch skips
+// the W4-03 taint gate - a memory_write (W1) call is governed purely by the
+// autonomy ladder even though a taint tracker IS wired. A live worker can
+// no longer take this path at all: its headers are overwritten with its own
+// attributed ids and its session resolves server-side - that is
+// TestMCPGateTaintCheckUsesAttributedSession.
 func TestMCPGateTaintCheckSkippedNoSessionOnThisPath(t *testing.T) {
 	f := newMCPTestFixture(t)
 
@@ -390,6 +390,74 @@ func TestMCPGateTaintCheckSkippedNoSessionOnThisPath(t *testing.T) {
 	}
 	if taintDenies != 0 {
 		t.Fatalf("tainted_session policy_decision rows = %d, want 0 (taint must not be enforced on /v1/mcp)", taintDenies)
+	}
+}
+
+// postMCPWithHeaders is postMCP with extra request headers (e.g. a forged
+// X-Kahya-Trace-Id / X-Kahya-Task-Id pair).
+func postMCPWithHeaders(t *testing.T, client *http.Client, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://kahyad/v1/mcp", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/mcp: %v", err)
+	}
+	return resp
+}
+
+// TestMCPGateTaintCheckUsesAttributedSession (G03 / B-14): a TAINTED live
+// worker (this test process, registered under t-dirty by its process
+// group) calling /v1/mcp with FORGED trace/task headers is pinned to its
+// own task: the memory_write (W1, ladder-promoted to auto-allow) is
+// taint-denied, no file is written, and the forgery is ledgered as a
+// header worker_identity_override under the worker's own trace. An R-class
+// memory_search still works for the tainted worker.
+func TestMCPGateTaintCheckUsesAttributedSession(t *testing.T) {
+	f := newMCPTestFixture(t)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	seedTaintedAndCleanTasks(t, f.store, f.srv.policyEngine)
+	seedAutonomyState(t, f.store, "memory_write", "W1", "global", 2)
+	// R auto-allows from L1 (policy.autoLevelFor); a fresh install is L0.
+	seedAutonomyState(t, f.store, "memory_search", "R", "global", 1)
+	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), syscall.Getpgrp())
+	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
+	forged := map[string]string{"X-Kahya-Trace-Id": "trace-clean", "X-Kahya-Task-Id": "t-clean"}
+
+	resp := postMCPWithHeaders(t, worker, `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory_write","arguments":{"content":"tainted-path yazi","file":"inbox/attributed.md"}}}`, forged)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var parsed jsonrpcToolCallResult
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("decode: %v\nbody=%s", err, body)
+	}
+	if !parsed.Result.IsError || len(parsed.Result.Content) == 0 || parsed.Result.Content[0].Text != policy.ReasonTaintedSession {
+		t.Fatalf("memory_write from a tainted live worker with forged clean headers = %s, want IsError with %q", body, policy.ReasonTaintedSession)
+	}
+	if _, err := os.Stat(filepath.Join(f.memoryDir, "inbox", "attributed.md")); !os.IsNotExist(err) {
+		t.Fatalf("memory_write file exists despite the taint deny (err=%v)", err)
+	}
+	if n := identityOverrideCount(t, f.store, "trace-dirty", "/v1/mcp", "header", "t-clean"); n != 1 {
+		t.Fatalf("worker_identity_override(header, claimed t-clean) under trace-dirty = %d, want 1", n)
+	}
+
+	resp = postMCPWithHeaders(t, worker, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"x"}}}`, forged)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	parsed = jsonrpcToolCallResult{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("decode memory_search: %v\nbody=%s", err, body)
+	}
+	if parsed.Result.IsError {
+		t.Fatalf("R-class memory_search from the tainted worker = %s, want allowed", body)
 	}
 }
 

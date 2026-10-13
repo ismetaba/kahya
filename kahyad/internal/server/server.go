@@ -192,6 +192,11 @@ type Server struct {
 	// separate field only because the two are conceptually different
 	// capabilities (read-only lookup vs. register/unregister).
 	taskLiveRegistry TaskLiveRegistry
+	// workerLookup is G03 / B-14's UDS caller-attribution source: the
+	// same *task.LiveRegistry as taskLiveRegistry, seen through its ByPGID
+	// reverse lookup (SetTaskLiveRegistry wires it). nil means no caller
+	// is ever attributable to a live worker - see controlauth.go.
+	workerLookup workerLookup
 
 	// taskMachine/taskCloudRetry wire the W4-04 cloud-call error taxonomy:
 	// taskMachine drives handleTask's own intent->executing transition
@@ -422,6 +427,9 @@ func (s *Server) Prepare() error {
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(s.withControlAuth(mux)),
 		ReadHeaderTimeout: readHeaderTimeout,
+		// G03 / B-14: record each connection's UDS peer pid/pgid for
+		// caller attribution (controlauth.go connContext).
+		ConnContext: s.connContext,
 	}
 	return nil
 }
@@ -795,7 +803,10 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	traceID := req.TraceID
+	// G03 / B-14: pinned to the attributed live worker's own ids when the
+	// caller is one (controlauth.go pinBodyIdentity), so hafiza_injected is
+	// always ledgered against the task that actually received the block.
+	taskID, traceID := s.pinBodyIdentity(r, req.TaskID, req.TraceID)
 	if traceID == "" {
 		// MINOR 6: fall back to withTraceLogging's resolved trace id (the
 		// inbound X-Kahya-Trace-Id header, or one it freshly minted) rather
@@ -863,7 +874,7 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 			}
 			sum := sha256.Sum256([]byte(block))
 			payload := map[string]any{
-				"task_id":      req.TaskID,
+				"task_id":      taskID,
 				"chunk_ids":    chunkIDs,
 				"block_sha256": hex.EncodeToString(sum[:]),
 				"block":        block,

@@ -70,7 +70,10 @@ else
 fi
 
 # --- 2. 'evlerimizden' search against the REAL corpus ---
+# (A shell caller is not a live worker, so this worker route needs kahyad's
+# per-boot control secret - G03 / B-14, docs/ipc.md section 5a.)
 SEARCH_JSON="$(curl -sS --unix-socket "$SOCK" -X POST http://kahyad/v1/memory/search \
+	-H "X-Kahya-Control-Secret: $(cat "$SOCK.secret")" \
 	-H 'Content-Type: application/json' \
 	-d '{"query":"evlerimizden","k":3}' 2>&1)"
 if [ $? -ne 0 ]; then

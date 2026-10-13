@@ -54,9 +54,10 @@ EQUIV_K="${EQUIV_K:-8}"
 # this drill hardcodes the standard layout and then GUARDS it) ----------------
 PROD_APP_SUPPORT="$HOME/Library/Application Support/Kahya"
 PROD_SOCK="$PROD_APP_SUPPORT/kahyad.sock"
-# G03 / B-3: kahyad's control routes require the per-boot control secret
-# kahyad writes next to its socket ("<socket>.secret", 0600) - those curls
-# below send it as X-Kahya-Control-Secret. /health stays open.
+# G03 / B-3: kahyad's control routes - and (B-14) its worker routes when
+# called from a shell rather than a live worker - require the per-boot
+# control secret kahyad writes next to its socket ("<socket>.secret", 0600);
+# every curl below except /health sends it as X-Kahya-Control-Secret.
 PROD_DB="$PROD_APP_SUPPORT/brain.db"
 PROD_KAHYA="$HOME/Kahya"
 BACKUP_DIR="$PROD_KAHYA/backups"
@@ -141,6 +142,7 @@ echo "    fresh backup: $BACKUP_FILE"
 echo "==> recording production reference (injected block)"
 mkdir -p "$DRILL_ARTIFACT_DIR"
 REF_RESP="$(curl -sS --unix-socket "$PROD_SOCK" -X POST http://x/v1/memory/search \
+	-H "X-Kahya-Control-Secret: $(cat "$PROD_SOCK.secret")" \
 	-H 'Content-Type: application/json' \
 	-d "{\"query\":\"$EQUIV_QUERY\",\"k\":$EQUIV_K,\"for_injection\":true,\"task_id\":\"restore-drill\"}")" \
 	|| fail "prod equivalence query failed"
@@ -216,6 +218,7 @@ echo "    reindex: clean no-op"
 # --- 7. equivalence query through the scratch daemon -------------------------
 echo "==> running equivalence query through scratch kahyad"
 RESTORE_RESP="$(curl -sS --unix-socket "$RESTORE_SOCK" -X POST http://x/v1/memory/search \
+	-H "X-Kahya-Control-Secret: $(cat "$RESTORE_SOCK.secret")" \
 	-H 'Content-Type: application/json' \
 	-d "{\"query\":\"$EQUIV_QUERY\",\"k\":$EQUIV_K,\"for_injection\":true,\"task_id\":\"restore-drill\"}")" \
 	|| fail "scratch equivalence query failed"

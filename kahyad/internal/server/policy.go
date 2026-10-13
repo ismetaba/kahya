@@ -54,7 +54,11 @@ func (s *Server) handlePolicyConsumeToken(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusOK, policyConsumeTokenResponse{OK: false, Error: "invalid request body"})
 		return
 	}
-	traceID := req.TraceID
+	// G03 / B-14 (extra finding E-1): pinned to the attributed live
+	// worker's own ids, like /policy/check - Engine.ConsumeToken compares
+	// the token's bound task_id against this one, so an attributed worker
+	// can only ever burn ITS OWN task's tokens.
+	taskID, traceID := s.pinBodyIdentity(r, req.TaskID, req.TraceID)
 	if traceID == "" {
 		traceID = traceIDFromContext(r)
 	}
@@ -65,7 +69,7 @@ func (s *Server) handlePolicyConsumeToken(w http.ResponseWriter, r *http.Request
 
 	err := s.policyEngine.ConsumeToken(r.Context(), policy.ConsumeInput{
 		Token: req.Token, Tool: req.Tool, Class: policy.ActionClass(req.Class), Scope: req.Scope,
-		TaskID: req.TaskID, TraceID: traceID, ToolInput: req.ToolInput,
+		TaskID: taskID, TraceID: traceID, ToolInput: req.ToolInput,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusOK, policyConsumeTokenResponse{OK: false, Error: err.Error()})

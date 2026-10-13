@@ -209,3 +209,8 @@ Reader model routing (§4 table, quote verbatim):
   so does not enforce the taint check on that specific bypass path — flagged as a follow-up,
   not fixed here (no tool call today carries a session_id argument on that route at all; adding
   one is a larger, separate change).
+  Closed by FIX-B-14 (peer-pid attribution): kahyad maps the UDS peer's process group to the
+  live worker it spawned and pins `/v1/mcp`'s trace/task headers (and `/policy/check`,
+  `/v1/memory/search`, `/policy/consume-token` body ids) to that worker's own task, so the
+  session resolves server-side from the caller's real task — see
+  `kahyad/internal/server/controlauth.go`.

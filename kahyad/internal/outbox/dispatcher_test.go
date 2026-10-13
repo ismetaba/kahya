@@ -364,7 +364,8 @@ func TestLeaseExpiryAllowsReClaim(t *testing.T) {
 }
 
 // countingLiveRegistry wraps a real *task.LiveRegistry and additionally
-// counts how many times Register has ever been called. The BLOCKER 2
+// counts how many times RegisterWorker (G03 / B-14; formerly Register)
+// has ever been called. The BLOCKER 2
 // regression test below uses this count as ground truth for "how many
 // times was a real worker actually spawned" - independent of how many
 // ClaimAndDispatch/processResume invocations raced to get there, and
@@ -374,17 +375,25 @@ type countingLiveRegistry struct {
 	inner *task.LiveRegistry
 	mu    sync.Mutex
 	regs  int
+	// last is the most recent RegisterWorker call's arguments (G03 /
+	// B-14: the dispatcher must hand the registry the task's trace_id and
+	// the worker's process group, not just its pid).
+	last struct {
+		taskID, traceID string
+		pid, pgid       int
+	}
 }
 
 func newCountingLiveRegistry() *countingLiveRegistry {
 	return &countingLiveRegistry{inner: task.NewLiveRegistry()}
 }
 
-func (c *countingLiveRegistry) Register(taskID string, pid int) {
+func (c *countingLiveRegistry) RegisterWorker(taskID, traceID string, pid, pgid int) {
 	c.mu.Lock()
 	c.regs++
+	c.last.taskID, c.last.traceID, c.last.pid, c.last.pgid = taskID, traceID, pid, pgid
 	c.mu.Unlock()
-	c.inner.Register(taskID, pid)
+	c.inner.RegisterWorker(taskID, traceID, pid, pgid)
 }
 func (c *countingLiveRegistry) Unregister(taskID string)  { c.inner.Unregister(taskID) }
 func (c *countingLiveRegistry) IsLive(taskID string) bool { return c.inner.IsLive(taskID) }
@@ -453,6 +462,12 @@ func TestLiveWorkerNeverDoubleSpawnedAcrossConcurrentDispatchers(t *testing.T) {
 
 	if got := live.Registrations(); got != 1 {
 		t.Fatalf("live worker registrations = %d, want exactly 1 (double-spawn guard failed)", got)
+	}
+	live.mu.Lock()
+	last := live.last
+	live.mu.Unlock()
+	if last.taskID != "t1" || last.traceID != "trace-t1" || last.pid <= 0 || last.pgid != last.pid {
+		t.Errorf("RegisterWorker(%+v), want task t1, trace trace-t1, pgid == pid > 0 (G03 / B-14 attribution)", last)
 	}
 	if n := countRows(t, st, `SELECT count(*) FROM events WHERE kind = ?`, EventResumeDispatched); n != 1 {
 		t.Errorf("outbox.resume_dispatched events = %d, want exactly 1", n)

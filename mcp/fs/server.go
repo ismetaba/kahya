@@ -67,11 +67,12 @@ import (
 // propagates a request's trace_id/task_id under (mirrors mcp/memory's own
 // unexported traceHeader constant — kept in sync by hand since the two
 // packages intentionally don't share code across the internal boundary).
-// taskHeader is a seam for when task_id propagation lands on the MCP path
-// (it does not yet — see kahyad/cmd/kahya-mcp's bridge, which today only
-// forwards X-Kahya-Trace-Id): until then, taskIDFromRequest always
-// resolves "", and this package's undo-copy fallback directory names fall
-// back to a fixed placeholder (taskDirName).
+// kahyad/cmd/kahya-mcp forwards both (W4-07); for a caller attributable
+// to a live worker, kahyad's withControlAuth (kahyad/internal/server/
+// controlauth.go, G03 / B-14) overwrites both with that worker's own
+// task_id/trace_id before this package ever reads them. When taskHeader
+// is absent, taskIDFromRequest resolves "" and this package's undo-copy
+// fallback directory names fall back to a fixed placeholder (taskDirName).
 const (
 	traceHeader = "X-Kahya-Trace-Id"
 	taskHeader  = "X-Kahya-Task-Id"

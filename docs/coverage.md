@@ -182,6 +182,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #2 | taint only rises (clean-after-tainted rejected) | `kahyad/internal/taint/TestRaiseThenInsertCleanFails` | W4-03 | ci-hermetic |
 | Safety #2 | taint persists across daemon restart | `kahyad/internal/taint/TestTaintSurvivesRestart` | W4-03 | ci-hermetic |
 | Safety #2 | tainted session ⇒ same W-tool DENY, clean session ⇒ ALLOW | `kahyad/internal/policy/TestSameToolSameTargetDeniedTaintedAllowedClean` | W5-05 | ci-hermetic |
+| Safety #2 | worker cannot launder taint by naming another task's id — identity pinned to the UDS peer's live worker | `kahyad/internal/server/TestWorkerIdentityPinnedToLiveWorker` | FIX-B-14 | ci-hermetic |
+| Safety #2 | /v1/mcp taint gate keys on the attributed live worker's session, not the bridge's headers | `kahyad/internal/server/TestMCPGateTaintCheckUsesAttributedSession` | FIX-B-14 | ci-hermetic |
 | Safety #3 | agent_derived / untrusted-sourced memory quarantined from injection | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W12-05 | ci-hermetic |
 | Safety #3 | memory search for-injection excludes agent_derived facts | `kahyad/internal/server/TestMemorySearchForInjectionExcludesAgentDerived` | W12-05 | ci-hermetic |
 | Safety #3 | red-team planted-mail-poisons-profile scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |

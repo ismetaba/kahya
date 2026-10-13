@@ -123,10 +123,14 @@ Run the same query production answered and compare the `<hafiza>` block. The
 (FTS retrieval → tier-eligibility filter → renderer):
 
 ```bash
-curl -sS --unix-socket ~/Library/Application\ Support/Kahya-restore/kahyad-restore.sock \
+SOCK=~/Library/Application\ Support/Kahya-restore/kahyad-restore.sock
+curl -sS --unix-socket "$SOCK" -H "X-Kahya-Control-Secret: $(cat "$SOCK.secret")" \
   -X POST http://kahyad/v1/memory/search -H 'Content-Type: application/json' \
   -d '{"query":"evlerimizden","k":8,"for_injection":true,"task_id":"restore-drill"}'
 ```
+
+(From a shell — not a live worker kahyad spawned — this worker route also needs
+the control secret: `docs/ipc.md` §5a.)
 
 Normalize **only** volatile fields — `trace_id` (32-hex) and RFC3339/Nano
 timestamps — then byte-compare the `hafiza_block` against the production

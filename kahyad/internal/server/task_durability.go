@@ -37,10 +37,13 @@ type LivePIDLookup interface {
 }
 
 // TaskLiveRegistry is the narrow subset of kahyad/internal/task.LiveRegistry
-// handleTask (task.go) needs to register/unregister a worker's pid for
-// the whole time it is actually running - see SetTaskLiveRegistry.
+// handleTask (task.go) needs to register/unregister a worker for the whole
+// time it is actually running - see SetTaskLiveRegistry. RegisterWorker
+// (G03 / B-14, replacing the pid-only Register) records the worker's
+// process group and its task's trace_id too, which is what UDS caller
+// attribution (controlauth.go) looks the caller up by.
 type TaskLiveRegistry interface {
-	Register(taskID string, pid int)
+	RegisterWorker(taskID, traceID string, pid, pgid int)
 	Unregister(taskID string)
 }
 
@@ -53,8 +56,20 @@ type TaskLiveRegistry interface {
 // apart from a crashed one DURING this process's own lifetime (it still
 // works correctly at kahyad's own startup, when the registry - wired or
 // not - is empty either way).
+//
+// G03 / B-14: when reg also implements workerLookup (a *task.LiveRegistry
+// does - ByPGID), the SAME registry becomes the source of UDS caller
+// attribution: a worker-route request whose peer process group belongs to
+// a worker registered here is pinned to that worker's own task_id/
+// trace_id (controlauth.go). Unwired (nil, or no ByPGID), no caller is
+// ever attributable, so every worker-route call then needs the control
+// secret (fail-closed).
 func (s *Server) SetTaskLiveRegistry(reg TaskLiveRegistry) {
 	s.taskLiveRegistry = reg
+	s.workerLookup = nil
+	if wl, ok := reg.(workerLookup); ok {
+		s.workerLookup = wl
+	}
 }
 
 // SetTaskDurability wires GET /v1/task/status and POST /v1/task/resolve

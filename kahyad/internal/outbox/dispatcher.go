@@ -121,8 +121,15 @@ type Ledger interface {
 // ever re-spawning a worker, so a row re-claimed while its task's
 // original worker is still genuinely running (e.g. after a lease elapsed
 // mid-run) is skipped rather than given a second, concurrent worker.
+//
+// RegisterWorker (G03 / B-14) replaces the old pid-only Register here: the
+// redispatched worker is recorded with its process group (== pid, Setpgid)
+// AND its task's trace_id, so kahyad's UDS caller attribution
+// (kahyad/internal/server/controlauth.go, task.LiveRegistry.ByPGID) pins
+// the resumed worker's /policy/check, /v1/memory/search and /v1/mcp calls
+// to this exact task - the same as handleTask does for a first spawn.
 type LiveRegistry interface {
-	Register(taskID string, pid int)
+	RegisterWorker(taskID, traceID string, pid, pgid int)
 	Unregister(taskID string)
 	IsLive(taskID string) bool
 }
@@ -388,7 +395,7 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	outcome, runErr := spawn.Run(ctx, spawnCfg, env, spawn.Callbacks{
 		OnStart: func(pid int) {
 			if d.live != nil {
-				d.live.Register(t.ID, pid)
+				d.live.RegisterWorker(t.ID, t.TraceID, pid, pid)
 			}
 			// W6-03: persist the redispatched worker's process-group id
 			// ALONGSIDE the in-memory registry above - see

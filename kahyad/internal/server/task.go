@@ -933,7 +933,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		OnStart: func(pid int) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
 			if s.taskLiveRegistry != nil {
-				s.taskLiveRegistry.Register(taskID, pid)
+				// G03 / B-14: pgid == pid (spawn.Run's Setpgid), plus this
+				// task's trace_id, so this worker's own UDS calls (and its
+				// kahya-mcp bridge child's, same group) are attributed to -
+				// and their correlation ids pinned to - THIS task.
+				s.taskLiveRegistry.RegisterWorker(taskID, traceID, pid, pid)
 			}
 			// W6-03: persist the worker's process-group id (spawn.Run always
 			// starts it as its own new group leader via Setpgid, so pid ==
@@ -1441,7 +1445,13 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	traceID := req.TraceID
+	// G03 / B-14: a caller attributable to a live worker kahyad spawned is
+	// pinned to THAT worker's own task_id/trace_id - the body's claim is
+	// ledgered (worker_identity_override) and ignored when it differs, so a
+	// tainted worker cannot launder its taint by naming a clean task. An
+	// unattributed caller reached here only with the control secret
+	// (controlauth.go) and keeps its declared ids.
+	taskID, traceID := s.pinBodyIdentity(r, req.TaskID, req.TraceID)
 	if traceID == "" {
 		traceID = traceIDFromContext(r)
 	}
@@ -1455,7 +1465,7 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		if s.eventLogger != nil {
 			payload := map[string]any{
 				"event": "policy_decision", "tool": policy.Canonicalize(req.ToolName),
-				"task_id": req.TaskID, "decision": policy.ResultDeny,
+				"task_id": taskID, "decision": policy.ResultDeny,
 				"rule": policy.RuleDenyAllV1, "reason": policy.ReasonDenyAll,
 			}
 			if err := s.eventLogger.LogEvent(r.Context(), traceID, "policy_decision", payload); err != nil {
@@ -1483,7 +1493,9 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	// send any session_id it likes, including a forged clean one, or none
 	// at all to make an old fail-open guard skip the check entirely).
 	// Check instead resolves the session SERVER-SIDE from TaskID/TraceID
-	// below via its own SessionResolver (main.go wires this alongside
+	// below - which, since G03 / B-14, are the UDS peer's attributed live
+	// worker's own ids, not the body's claim - via its own SessionResolver
+	// (main.go wires this alongside
 	// SetTaintChecker) - SessionID here is retained only as CheckInput's
 	// documented legacy fallback for callers/tests with no resolver wired
 	// at all. See policy.CheckInput/policy.SessionResolver's own doc
@@ -1493,7 +1505,7 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 		sessionID = *req.SessionID
 	}
 	decision, err := s.policyEngine.Check(r.Context(), policy.CheckInput{
-		Tool: req.ToolName, Scope: req.Scope, TaskID: req.TaskID, TraceID: traceID,
+		Tool: req.ToolName, Scope: req.Scope, TaskID: taskID, TraceID: traceID,
 		SessionID: sessionID, ToolInput: req.ToolInput,
 	})
 	if err != nil {

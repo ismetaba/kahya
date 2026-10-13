@@ -14,19 +14,23 @@ package server
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/task"
 )
 
 // approvalsDecisionFixture bundles the real UDS *http.Client and the
 // underlying *store.Store a test needs to both drive the routes and
 // inspect the ledger directly.
 type approvalsDecisionFixture struct {
+	srv    *Server
 	client *http.Client
 	// noSecret is the SAME socket without kahyad's control secret - the
 	// view a worker has (G03 / B-3).
@@ -60,54 +64,81 @@ func newApprovalsDecisionFixture(t *testing.T, env string) approvalsDecisionFixt
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return approvalsDecisionFixture{client: unixHTTPClient(cfg.Socket), noSecret: unixHTTPClientNoSecret(cfg.Socket), store: st}
+	return approvalsDecisionFixture{srv: srv, client: unixHTTPClient(cfg.Socket), noSecret: unixHTTPClientNoSecret(cfg.Socket), store: st}
 }
 
 // TestApprovalsDecisionRequiresControlSecret is G03 / B-3's core repro: a
-// worker-plane caller (same socket, same uid, but no control secret)
-// produces its own W3 (mail_send) pending approval via /policy/check and
-// then tries to approve it itself as surface="local" with the correct
-// typed word - on BOTH approval routes. Both answer 403 without consuming
-// the approval (no policy_feedback_approved row), and the SAME pending
-// approval is still approvable afterwards by the real, secret-carrying
-// local surface.
+// live worker (here: this test process, registered as one - same socket,
+// same uid, no control secret) produces its own W3 (mail_send) pending
+// approval via /policy/check and then tries to approve it itself as
+// surface="local" with the correct typed word - on BOTH approval routes,
+// first without the secret (B-3), then even WITH a stolen copy of the
+// secret (B-14: a live worker's process group is refused on every control
+// route). All attempts answer 403 without consuming the approval (no
+// policy_feedback_approved row), and the SAME pending approval is still
+// approvable afterwards by the real, secret-carrying local surface.
 func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 	f := newApprovalsDecisionFixture(t, "prod")
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+	reg.RegisterWorker("t-self", "trace-g03-self", os.Getpid(), syscall.Getpgrp())
 
 	var checkResp policyCheckResponse
 	resp := postJSON(t, f.noSecret, "/policy/check", map[string]any{
-		"trace_id": "trace-g03-self", "task_id": "t1", "tool_name": "mail_send",
+		"trace_id": "trace-g03-self", "task_id": "t-self", "tool_name": "mail_send",
 		"tool_input": map[string]any{"to": "a@b.com", "body": "merhaba"},
 	}, &checkResp)
 	if resp.StatusCode != http.StatusOK || checkResp.Decision != "needs_approval" || checkResp.PendingApprovalID == "" {
 		t.Fatalf("policy/check(mail_send) = %d %+v, want needs_approval with a pending id", resp.StatusCode, checkResp)
 	}
 
-	var self approvalDecisionResponse
-	resp = postJSON(t, f.noSecret, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
-		"approve": true, "typed": "onayla",
-	}, &self)
-	if resp.StatusCode != http.StatusForbidden || self.OK || self.Token != "" || self.Error != MsgControlSecretRejected {
-		t.Fatalf("self-approve via /approvals/{id}/decision without secret = %d %+v, want 403 %q", resp.StatusCode, self, MsgControlSecretRejected)
+	stolen := readSecretFile(t, f.srv.cfg.Socket)
+	for _, c := range []struct {
+		name   string
+		client *http.Client
+	}{{"no secret", f.noSecret}, {"stolen secret", f.client}} {
+		var self approvalDecisionResponse
+		resp = postJSON(t, c.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+			"approve": true, "typed": "onayla",
+		}, &self)
+		if resp.StatusCode != http.StatusForbidden || self.OK || self.Token != "" || self.Error != MsgControlSecretRejected {
+			t.Fatalf("worker self-approve via /approvals/{id}/decision (%s) = %d %+v, want 403 %q", c.name, resp.StatusCode, self, MsgControlSecretRejected)
+		}
+		var feedback policyFeedbackResponse
+		resp = postJSON(t, c.client, "/policy/feedback", map[string]any{
+			"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
+		}, &feedback)
+		if resp.StatusCode != http.StatusForbidden || feedback.OK || feedback.Token != "" {
+			t.Fatalf("worker self-approve via /policy/feedback (%s) = %d %+v, want 403", c.name, resp.StatusCode, feedback)
+		}
 	}
-	var feedback policyFeedbackResponse
-	resp = postJSON(t, f.noSecret, "/policy/feedback", map[string]any{
-		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
-	}, &feedback)
-	if resp.StatusCode != http.StatusForbidden || feedback.OK || feedback.Token != "" {
-		t.Fatalf("self-approve via /policy/feedback without secret = %d %+v, want 403", resp.StatusCode, feedback)
+	if stolen == "" {
+		t.Fatalf("no control secret to steal")
 	}
 
-	var approved int
+	var approved, workerRejects int
 	if err := f.store.DB().QueryRow(
 		`SELECT count(*) FROM events WHERE kind = 'policy_feedback_approved'`,
 	).Scan(&approved); err != nil {
 		t.Fatalf("count policy_feedback_approved: %v", err)
 	}
 	if approved != 0 {
-		t.Fatalf("policy_feedback_approved rows after two rejected self-approvals = %d, want 0", approved)
+		t.Fatalf("policy_feedback_approved rows after four rejected self-approvals = %d, want 0", approved)
+	}
+	if err := f.store.DB().QueryRow(
+		`SELECT count(*) FROM events WHERE kind = 'control_auth_rejected' AND json_extract(payload, '$.reason') = ? AND json_extract(payload, '$.task_id') = 't-self'`,
+		controlRejectWorkerOnControl,
+	).Scan(&workerRejects); err != nil {
+		t.Fatalf("count live_worker_on_control_route: %v", err)
+	}
+	if workerRejects != 4 {
+		t.Fatalf("control_auth_rejected(live_worker_on_control_route, task t-self) rows = %d, want 4", workerRejects)
 	}
 
+	// The worker is gone: the human's own local surface (the CLI, with the
+	// secret, from a process group that is no live worker) approves the
+	// still-unburned pending approval.
+	reg.Unregister("t-self")
 	var decision approvalDecisionResponse
 	resp = postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla",

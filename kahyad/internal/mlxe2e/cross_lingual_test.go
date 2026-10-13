@@ -418,7 +418,8 @@ func mlxDumpKahyadLogs(homeDir string) string {
 //
 // G03 / B-3: the client attaches kahyad's per-boot control secret
 // (config.ReadControlSecret, re-read per request) - /v1/reindex is a
-// control route.
+// control route, and /v1/memory/search from this test process (not a
+// live worker kahyad spawned) needs it too since G03 / B-14.
 func mlxNewUDSClient(sock string) *http.Client {
 	return &http.Client{
 		Transport: &mlxSecretRoundTripper{sock: sock, inner: &http.Transport{

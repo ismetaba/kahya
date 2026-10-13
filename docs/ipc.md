@@ -485,7 +485,7 @@ exact path match):
 | Class | Paths | Rule |
 |---|---|---|
 | open | `/health` | no identity needed |
-| worker | `/policy/check`, `/v1/memory/search`, `/v1/mcp`, `/policy/consume-token` | reachable without the secret (a worker never has it) |
+| worker | `/policy/check`, `/v1/memory/search`, `/v1/mcp`, `/policy/consume-token` | reachable without the secret (a worker never has it) — since B-14 only by a caller attributable to a live worker; anyone else needs the secret (see "Caller attribution" below) |
 | control | everything else — including any unknown/unclean path and every route added later without a deliberate classification | requires the secret |
 
 Read-only routes `GET /metrics`, `GET /readiness`, `GET /v1/log`,
@@ -505,17 +505,47 @@ as `kind=control_auth_rejected` with `payload.reason` = `missing_secret` |
 **Who sends it.** The `kahya` CLI (`Client.newRequest`, every request),
 `kahya-trigger`, the test harnesses (`tests/w3`, `tests/acceptance/w4,w6`,
 `tests/e2e`, `kahyad/internal/mlxe2e`) and the shell scripts
-(`scripts/restore-drill.sh`, `scripts/accept_w4.sh`: `-H
-"X-Kahya-Control-Secret: $(cat "$SOCK.secret")"`). `surface=local` on
+(`scripts/restore-drill.sh`, `scripts/accept_w4.sh`, `scripts/w5_gate.sh`,
+`scripts/accept-w12.sh`: `-H "X-Kahya-Control-Secret: $(cat
+"$SOCK.secret")"`) — the last two only call worker routes, which need it
+from a shell since B-14 (below). `surface=local` on
 `/approvals/{id}/decision` and `/policy/feedback` therefore means "a
 control-secret-authenticated UDS call". The `kahya-mcp` bridge is
 worker-plane and never reads or sends the secret.
 
+**Caller attribution (G03 / B-14).** The `task_id`/`trace_id` a caller
+*declares* on a worker route (JSON body on `/policy/check`,
+`/v1/memory/search`, `/policy/consume-token`; `X-Kahya-Trace-Id` /
+`X-Kahya-Task-Id` headers on `/v1/mcp`) are no longer trusted. kahyad
+records the OS-level peer pid of every accepted connection
+(`http.Server.ConnContext`: `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on
+Linux) and its process group, and on every request maps that group to a
+live worker it spawned (`task.LiveRegistry.ByPGID` — `spawn.Run` makes each
+worker its own group leader, `handleTask` and the outbox dispatcher register
+it with `RegisterWorker(task_id, trace_id, pid, pgid)`). The `kahya-mcp`
+bridge is the worker CLI's child in the same process group, so it is
+attributed to the same task.
+
+| Caller | Worker route | Control route |
+|---|---|---|
+| attributable to a live worker | served; ids **pinned** to the worker's own task (headers overwritten, body ids overridden); a conflicting declaration is ledgered as `kind=worker_identity_override` (`source` = `header` \| `body`, `claimed_task_id`, `claimed_trace_id`, `peer_pid`, `peer_pgid`) under the worker's own trace | **403** even with the secret (`reason=live_worker_on_control_route`) |
+| not attributable (shell script, test harness, CLI) | served only with the secret, declared ids honored; else **403** `reason=unattributable_worker_route` | secret required (above) |
+
+A live entry registered without a trace id (legacy pid-only `Register`)
+fails closed (`reason=attributed_worker_without_trace`). Because pinning
+happens before the handlers run, the outer `event=http_request` JSONL line
+keeps the trace id the caller *declared*, while `policy_decision`,
+`hafiza_injected` and `worker_identity_override` rows carry the pinned one —
+deliberately, so the two traces cross-reference each other. A worker that
+escapes its group (`setsid` + double fork; the sanctioned worker never does)
+is unattributable and therefore refused on worker routes without the secret.
+
 **Same-uid limit.** A worker compromised to the point of reading arbitrary
 files as the user can read `<socket>.secret`; this gate closes the path for
 everything that only uses what a worker is *given* (its env, its tools, a
-prompt-injected model). Sandboxing the worker (`sandbox-exec`), a
-Keychain-ACL'd secret, or a separate uid were considered and declined for
+prompt-injected model), and B-14 refuses the secret on control routes from
+inside a live worker's process group. Sandboxing the worker (`sandbox-exec`),
+a Keychain-ACL'd secret, or a separate uid were considered and declined for
 now (owner decisions G03-1/2/3).
 
 ## 6 · `POST /policy/check` (HTTP-over-UDS, same socket)
@@ -546,6 +576,13 @@ Request:
   "tool_input": {}
 }
 ```
+
+`task_id`/`trace_id` stay in the body (backward compatibility), but for a
+call from a live worker kahyad spawned the **authority is the UDS peer's
+attributed identity** (§5a): the body's values are overridden with the
+worker's own ids (and a mismatch is ledgered as `worker_identity_override`).
+Only an unattributed, control-secret-authenticated caller (a script) has its
+declared ids honored.
 
 `tool_name` is canonicalized before lookup: an SDK-style
 `mcp__<server>__<tool>` prefix (e.g.
