@@ -36,6 +36,18 @@ Related directories **outside** this repo (per HANDOFF §7/§9 — code and memo
 - `~/Library/Application Support/Kahya/brain.db` — derived SQLite index + ledger (WAL)
 - macOS Keychain — `kahya.anthropic` / `kahya.telegram` / `kahya.anchor`
 
+## Build / test
+
+`make build` · `make test` · `make lint` · `make invariants` — Go for kahyad, the CLI and the memory MCP;
+Python (`worker/.venv`, built by `make venv` from `worker/requirements.lock`) for the worker only.
+
+**Platform note.** `make test` is macOS-only: `make venv` installs `worker/requirements.lock`, which pins
+Apple-silicon-only wheels (`mlx`, `mlx-metal`, `mlx-whisper` for in-worker STT). On Linux run the Go suite
+directly (`go test -tags sqlite_fts5 ./...`; `tests/e2e` and the spawn tests skip without a worker venv)
+and the Python suite from a venv built with the darwin-only lines removed. A `make venv` whose pip install
+fails removes a half-built venv (one that cannot import `claude_agent_sdk`) so it never masquerades as a
+real worker venv; a working venv is kept.
+
 ## Status
 
 Greenfield. Design is complete and locked. Next: execute `tasks/BACKLOG.md` top to bottom.

@@ -1,6 +1,7 @@
 SQLC_VERSION ?= v1.30.0        # pin; bump deliberately, never 'latest'
 VENV := worker/.venv
 PY := $(VENV)/bin/python
+WORKER_LOCK := worker/requirements.lock
 # MLX_VENV is mlx/embed's OWN venv (W12-11) - separate process, separate
 # deps from worker/'s (HANDOFF §4 three-process architecture). Never
 # installed/activated by the plain `test`/`venv` targets: the embedding
@@ -46,9 +47,22 @@ build:
 	go build -tags $(GOTAGS) -o bin/kahya ./kahyad/cmd/kahya
 	go build -tags $(GOTAGS) -o bin/kahya-mcp ./kahyad/cmd/kahya-mcp
 	go build -tags $(GOTAGS) -o bin/kahya-trigger ./kahyad/cmd/kahya-trigger
+# venv: the worker venv from the pinned lock. Platform note: `make test`
+# is macOS-only - WORKER_LOCK pins Apple-silicon-only wheels (mlx,
+# mlx-metal, mlx-whisper for in-worker STT) that pip cannot resolve on
+# Linux; see README.md "Build / test" for running the suites elsewhere.
+# A failed pip install must never leave a HALF-BUILT venv behind (G12-N3-E1):
+# the spawn/e2e Go tests only probe for worker/.venv/bin/python and would
+# run against a worker that cannot import claude_agent_sdk. So on failure
+# the venv is removed unless claude_agent_sdk still imports from it - a
+# working venv survives a failed re-install (no forced full reinstall);
+# make stops on the error either way. worker/tests/test_smoke.py
+# (TestMakeVenvTarget) pins both halves.
 venv:
 	test -d $(VENV) || python3 -m venv $(VENV)
-	$(PY) -m pip install --quiet -r worker/requirements.lock
+	$(PY) -m pip install --quiet -r $(WORKER_LOCK) || { \
+		$(PY) -c 'import claude_agent_sdk' >/dev/null 2>&1 || rm -rf $(VENV); \
+		exit 1; }
 test: venv build
 	@# W4-07 acceptance gate runs FIRST, before the main suite, so its
 	@# anti-vacuous-green guard is ALWAYS reached: make aborts a target at the
