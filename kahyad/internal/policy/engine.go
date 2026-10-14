@@ -1088,6 +1088,19 @@ type FeedbackResult struct {
 // pending approval exists, it may never itself carry the approval).
 var ErrW3RequiresLocalSurface = errors.New("policy: W3 approval must carry surface=local")
 
+// ErrNonLocalRequiresReversible (B-11) is returned by Approve when a
+// non-local surface (Telegram - or any surface other than the literal
+// "local", the empty string included) tries to approve a tool whose
+// policy.yaml rule is not reversible: true (HANDOFF S4: "Telegram botu
+// (uzaktan onay, yalniz geri-alinabilir eylemler)"; S4 "'Geri-alinabilir'
+// siniflandirmasi Telegram onay kapisini besler"). Like
+// ErrW3RequiresLocalSurface it is checked BEFORE consuming, so the same id
+// stays usable for a later local approval. An unknown tool is treated as
+// irreversible (fail-closed). This is the Go-side backstop: whatever an
+// approval surface's UI offers, a remote tap can never execute an
+// irreversible action.
+var ErrNonLocalRequiresReversible = errors.New("policy: a non-local surface may only approve reversible tools")
+
 // w3TypedOnayla is the ONE literal word a W3 approval's typed confirmation
 // must equal, byte-exact, after NFC normalization (HANDOFF S5 safety #5 /
 // W6-01's own core invariant, verbatim: not "evet", not "y", not "Onayla",
@@ -1181,6 +1194,21 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface, typed 
 				"event": "w3_invalid_typed_onayla", "tool": pa.Tool, "class": class, "scope": pa.Scope,
 			})
 			return FeedbackResult{}, ErrW3RequiresTypedOnayla
+		}
+	}
+
+	// B-11: a non-local surface may approve only a reversible tool. Runs
+	// AFTER the W3 block (a W3 attempt keeps its own
+	// w3_nonlocal_approval_rejected event; loader.go already forbids a
+	// reversible W3) and BEFORE consuming (the id stays usable locally).
+	if surface != "local" {
+		rule, known := e.policy.ToolsByName[pa.Tool]
+		if !known || !rule.Reversible {
+			e.ledgerRaw(ctx, pa.TraceID, "nonlocal_irreversible_approval_rejected", map[string]any{
+				"event": "nonlocal_irreversible_approval_rejected", "tool": pa.Tool, "class": class,
+				"scope": pa.Scope, "surface": surface,
+			})
+			return FeedbackResult{}, ErrNonLocalRequiresReversible
 		}
 	}
 

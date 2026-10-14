@@ -8,7 +8,13 @@
 #   - fs_write/fs_delete are class W2 here (the real policy.yaml has them
 #     W1) so Gate 1 can exercise "a W2 action needs a byte-exact Telegram
 #     diff approval" against a real tool already wired end-to-end
-#     (mcp/fs), without inventing a new tool.
+#     (mcp/fs), without inventing a new tool. They are also reversible:
+#     true (with the real policy.yaml's own W1 undo recipes): since B-11
+#     kahyad/internal/policy.Engine.Approve lets a non-local surface
+#     (Telegram) approve ONLY a reversible tool (HANDOFF S4: "uzaktan onay,
+#     yalniz geri-alinabilir eylemler"), so a W2+reversible tool exists
+#     only in this fixture - every W2 in the real policy.yaml is
+#     reversible: false and therefore approvable only locally.
 #   - mail_send (W3) is kept, with no real MCP tool implementation behind
 #     it (none exists yet in the landed W3 stack) — Gate 2 only needs the
 #     REAL policy decision + Telegram notify-only + engine-level
@@ -34,11 +40,13 @@ tools:
 
   - name: fs_write
     class: W2
-    reversible: false
+    reversible: true
+    undo: "pre-op git checkpoint restore"
 
   - name: fs_delete
     class: W2
-    reversible: false
+    reversible: true
+    undo: "move back from Trash"
 
   - name: shell_docker
     class: W2

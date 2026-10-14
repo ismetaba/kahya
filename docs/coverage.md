@@ -208,6 +208,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | approved WYSIWYE bytes execute exactly once (approve -> same-task binding re-check redeems the grant once) | `kahyad/internal/policy/TestApprovedGrantRedeemedByBindingRecheck` | FIX-B-1 | ci-hermetic |
 | Safety #5 | approval grant bound to task + bytes (different bytes / another task never redeem it) | `kahyad/internal/policy/TestApprovedGrantNotRedeemedForDifferentBytesOrTask` | FIX-B-1 | ci-hermetic |
 | Safety #5 | a halt revokes approved-but-unexecuted grants (never redeemed afterwards) | `kahyad/internal/policy/TestHaltRevokedGrantNotRedeemable` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a non-local surface (Telegram) can approve only reversible tools — irreversible/unknown tools refused Go-side, id stays usable locally | `kahyad/internal/policy/TestApproveNonLocalIrreversibleRejected` | FIX-B-11 | ci-hermetic |
+| Safety #5 | a Telegram approve callback for an irreversible W2 is refused by the engine backstop (nothing approved) | `kahyad/internal/telegram/TestForgedIrreversibleW2CallbackRejectedAtEngine` | FIX-B-11 | ci-hermetic |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |

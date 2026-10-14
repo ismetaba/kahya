@@ -33,7 +33,10 @@ func testEngine(t *testing.T) (*Engine, *store.Store) {
 	tools := []ToolRule{
 		{Name: "memory_search", Class: ClassR, ScopeKey: "global"},
 		{Name: "fs_read", Class: ClassR, ScopeKey: "global"},
-		{Name: "fs_write", Class: ClassW1, ScopeKey: "global"},
+		// Reversible (B-11): the one tool a non-local (Telegram) surface may
+		// approve in this fixture; shell_docker/applescript_run stay
+		// irreversible for the rejection tests.
+		{Name: "fs_write", Class: ClassW1, Reversible: true, Undo: "pre-op git checkpoint restore", ScopeKey: "global"},
 		{Name: "shell_docker", Class: ClassW2, ScopeKey: "global"},
 		{Name: "applescript_run", Class: ClassW2, ScopeKey: "global"},
 		{Name: "mail_send", Class: ClassW3, ScopeKey: "global"},
@@ -221,7 +224,9 @@ func TestTwentyApprovalsSuggestPromotionButLevelUnchanged(t *testing.T) {
 		if d.Result != ResultNeedsApproval {
 			t.Fatalf("Check #%d: Result = %q, want needs_approval (level must stay 0 throughout)", i, d.Result)
 		}
-		if _, err := e.Approve(ctx, d.PendingApprovalID, "", ""); err != nil {
+		// surface "local": fs_read is not reversible, so (B-11) only a
+		// local surface may approve it - "" counts as non-local.
+		if _, err := e.Approve(ctx, d.PendingApprovalID, "local", ""); err != nil {
 			t.Fatalf("Approve #%d: %v", i, err)
 		}
 	}

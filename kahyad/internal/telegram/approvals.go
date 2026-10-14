@@ -280,7 +280,9 @@ func (b *Bot) handleCallback(c tele.Context) error {
 		// (TTL 10min), already consumed by a DIFFERENT surface, or (defense
 		// in depth — should be structurally unreachable, since a W3
 		// pending approval never gets a keyboard) the engine's own
-		// ErrW3RequiresLocalSurface backstop — gets the identical Turkish
+		// ErrW3RequiresLocalSurface backstop, or (B-11) its
+		// ErrNonLocalRequiresReversible backstop for an irreversible
+		// W1/W2 tool (the id stays approvable locally) — gets the identical Turkish
 		// "expired, ask again" reply: this bot has no way to distinguish
 		// these cases from each other, and all deserve the same
 		// fail-closed answer. The card (if we sent one) is edited to

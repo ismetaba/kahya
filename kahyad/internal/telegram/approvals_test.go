@@ -339,3 +339,39 @@ func countLedgerRows(t *testing.T, fix policyFixture, kind string) int {
 	}
 	return len(rows)
 }
+
+// TestForgedIrreversibleW2CallbackRejectedAtEngine (B-11 engine half): a
+// Telegram approve callback for an IRREVERSIBLE W2 pending approval - forged
+// or from a card - is refused by the engine's own backstop
+// (policy.ErrNonLocalRequiresReversible), surfaces as the generic expired
+// reply, approves nothing, and leaves the id approvable locally.
+func TestForgedIrreversibleW2CallbackRejectedAtEngine(t *testing.T) {
+	sender := &fakeSender{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, &fakeLedger{}, newAllowGate(t), fix.Engine, nil)
+
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "shell_docker", TaskID: "task-irrev", TraceID: "trace-forged-irrev", ToolInput: []byte(`{"command":"echo hi"}`),
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check(shell_docker) = %+v, %v", d, err)
+	}
+	forged, err := encodeCallbackData(cbActionApprove, d.PendingApprovalID)
+	if err != nil {
+		t.Fatalf("encodeCallbackData: %v", err)
+	}
+	b.tb.ProcessUpdate(callbackUpdate(testChatID, testUserID, forged))
+
+	if len(sender.responded) != 1 || sender.responded[0] != msgExpired {
+		t.Fatalf("responded = %v, want [%q]", sender.responded, msgExpired)
+	}
+	if n := countLedgerRows(t, fix, "nonlocal_irreversible_approval_rejected"); n != 1 {
+		t.Fatalf("nonlocal_irreversible_approval_rejected ledger rows = %d, want 1", n)
+	}
+	if n := countLedgerRows(t, fix, "policy_feedback_approved"); n != 0 {
+		t.Fatalf("policy_feedback_approved ledger rows = %d, want 0", n)
+	}
+	if _, err := fix.Engine.Approve(context.Background(), d.PendingApprovalID, "local", ""); err != nil {
+		t.Fatalf("Approve(surface=local) after the refused Telegram attempt: %v", err)
+	}
+}

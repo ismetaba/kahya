@@ -210,18 +210,22 @@ func newPolicyFixture(t *testing.T) policyFixture {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	pol := policy.Policy{
-		Tools: []policy.ToolRule{
-			{Name: "fs_write", Class: policy.ClassW2},
-			{Name: "fs_delete", Class: policy.ClassW2},
-			{Name: "mail_send", Class: policy.ClassW3},
-		},
-		ToolsByName: map[string]policy.ToolRule{
-			"fs_write":  {Name: "fs_write", Class: policy.ClassW2},
-			"fs_delete": {Name: "fs_delete", Class: policy.ClassW2},
-			"mail_send": {Name: "mail_send", Class: policy.ClassW3},
-		},
+	// fs_write/fs_delete are REVERSIBLE W2 here (B-11): the engine lets a
+	// non-local surface (this bot, surface "telegram") approve only a
+	// reversible tool, and these tests drive real Telegram approvals of
+	// them. shell_docker is the irreversible W2 the engine-backstop tests
+	// use (TestForgedIrreversibleW2CallbackRejectedAtEngine).
+	tools := []policy.ToolRule{
+		{Name: "fs_write", Class: policy.ClassW2, Reversible: true, Undo: "pre-op git checkpoint restore"},
+		{Name: "fs_delete", Class: policy.ClassW2, Reversible: true, Undo: "move back from Trash"},
+		{Name: "shell_docker", Class: policy.ClassW2},
+		{Name: "mail_send", Class: policy.ClassW3},
 	}
+	byName := make(map[string]policy.ToolRule, len(tools))
+	for _, tr := range tools {
+		byName[tr.Name] = tr
+	}
+	pol := policy.Policy{Tools: tools, ToolsByName: byName}
 	engine := policy.NewEngine(pol, st.Queries, st)
 	return policyFixture{Engine: engine, Store: st}
 }

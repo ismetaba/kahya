@@ -31,9 +31,11 @@ import (
 func testPolicyDoc() policy.Policy {
 	tools := []policy.ToolRule{
 		{Name: "memory_search", Class: policy.ClassR, ScopeKey: "global"},
-		{Name: "memory_write", Class: policy.ClassW1, ScopeKey: "global"},
-		{Name: "memory_forget", Class: policy.ClassW1, ScopeKey: "global"},
-		{Name: "fs_write", Class: policy.ClassW1, ScopeKey: "global"},
+		// Reversible (B-11), mirroring the real policy.yaml's W1 tools: a
+		// non-local surface may approve only a reversible tool.
+		{Name: "memory_write", Class: policy.ClassW1, Reversible: true, Undo: "git revert", ScopeKey: "global"},
+		{Name: "memory_forget", Class: policy.ClassW1, Reversible: true, Undo: "git revert", ScopeKey: "global"},
+		{Name: "fs_write", Class: policy.ClassW1, Reversible: true, Undo: "pre-op git checkpoint restore", ScopeKey: "global"},
 		{Name: "mail_send", Class: policy.ClassW3, ScopeKey: "global"},
 	}
 	byName := make(map[string]policy.ToolRule, len(tools))
