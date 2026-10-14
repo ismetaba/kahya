@@ -325,6 +325,82 @@ func TestNoMintPendingRecheckDoesNotMintSecondPending(t *testing.T) {
 	}
 }
 
+// TestPostWaitRecheckRedeemsOnlyItsOwnPendingGrant: two identical parked
+// calls (same task, same bytes) each hold their own pending row; a re-check
+// bound to one id never redeems the other id's grant, and a grant whose
+// binding does not match the call is never redeemed.
+func TestPostWaitRecheckRedeemsOnlyItsOwnPendingGrant(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	in := CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-own", ToolInput: []byte(`{"path":"~/own.md"}`)}
+	d1, _ := e.Check(ctx, in)
+	d2, _ := e.Check(ctx, in)
+	if d1.PendingApprovalID == "" || d2.PendingApprovalID == "" || d1.PendingApprovalID == d2.PendingApprovalID {
+		t.Fatalf("two parked calls = %+v / %+v, want two distinct pending ids", d1, d2)
+	}
+	if _, err := e.Approve(ctx, d1.PendingApprovalID, "local", ""); err != nil {
+		t.Fatalf("Approve(p1): %v", err)
+	}
+
+	other := in
+	other.NoMintPending, other.RedeemPendingApprovalID = true, d2.PendingApprovalID
+	if d, err := e.Check(ctx, other); err != nil || d.Result != ResultNeedsApproval || d.PendingApprovalID != "" {
+		t.Fatalf("re-check bound to p2 = %+v, %v; want needs_approval with no new id (p1's grant is not p2's)", d, err)
+	}
+	wrongBytes := in
+	wrongBytes.ToolInput = []byte(`{"path":"~/other.md"}`)
+	wrongBytes.RedeemPendingApprovalID = d1.PendingApprovalID
+	if d, _ := e.Check(ctx, wrongBytes); d.Result != ResultNeedsApproval {
+		t.Fatalf("re-check bound to p1 with other bytes = %+v, want needs_approval", d)
+	}
+	if n := countEvents(t, st, "approval_grant_binding_mismatch"); n != 1 {
+		t.Fatalf("approval_grant_binding_mismatch = %d, want 1", n)
+	}
+	if n := countEvents(t, st, "approval_grant_redeemed"); n != 0 {
+		t.Fatalf("approval_grant_redeemed = %d before the owner re-checks, want 0", n)
+	}
+
+	own := in
+	own.NoMintPending, own.RedeemPendingApprovalID = true, d1.PendingApprovalID
+	d, err := e.Check(ctx, own)
+	if err != nil || d.Result != ResultAllow || d.Token == "" || d.RedeemedPendingApprovalID != d1.PendingApprovalID {
+		t.Fatalf("re-check bound to p1 = %+v, %v; want allow redeeming p1", d, err)
+	}
+	if n := countPendingApprovals(t, st); n != 2 {
+		t.Fatalf("pending_approvals rows = %d, want 2 (no re-check minted one)", n)
+	}
+}
+
+// TestPostWaitRecheckNeverLadderAllows: a level raised while the call was
+// parked never lets that call run without its own approval, and the bound
+// re-check mints nothing (no pending row, no token) even without
+// NoMintPending.
+func TestPostWaitRecheckNeverLadderAllows(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	in := CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-ladder", ToolInput: []byte(`{"path":"~/l.md"}`)}
+	d1, _ := e.Check(ctx, in)
+	if d1.Result != ResultNeedsApproval || d1.PendingApprovalID == "" {
+		t.Fatalf("first Check = %+v", d1)
+	}
+	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
+
+	in.RedeemPendingApprovalID = d1.PendingApprovalID
+	d, err := e.Check(ctx, in)
+	if err != nil || d.Result != ResultNeedsApproval || d.PendingApprovalID != "" || d.Token != "" {
+		t.Fatalf("bound re-check at L2 without an approval = %+v, %v; want needs_approval, no id, no token", d, err)
+	}
+	if n := countPendingApprovals(t, st); n != 1 {
+		t.Fatalf("pending_approvals rows = %d, want 1", n)
+	}
+	if n := countApprovalTokens(t, st); n != 0 {
+		t.Fatalf("approval_tokens rows = %d, want 0 (no auto token for a parked call)", n)
+	}
+	if n := countAllOpenUndoWindows(t, st); n != 0 {
+		t.Fatalf("open undo_windows = %d, want 0", n)
+	}
+}
+
 // TestRedeemedRClassApprovalMintsNoToken: R needs no consume step, so its
 // redeemed approval is an ALLOW without a token (Decision.Token contract).
 func TestRedeemedRClassApprovalMintsNoToken(t *testing.T) {

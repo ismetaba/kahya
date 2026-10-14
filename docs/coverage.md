@@ -212,6 +212,12 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | a tool call parked on needs_approval executes exactly once after approval, never on denial | `kahyad/internal/server/TestMCPGateWaitsForApprovalThenExecutesExactlyOnce` | FIX-B-1 | ci-hermetic |
 | Safety #5 | a parked call whose client disconnected (worker killed) never redeems a later approval | `kahyad/internal/server/TestMCPGateWaitCanceledWhenClientDisconnects` | FIX-B-1 | ci-hermetic |
 | Safety #5 | a halt wakes a parked call as a denial — nothing executes | `kahyad/internal/server/TestHaltWakesApprovalWaiterWithDeny` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a denial of a parked call's own approval is final — a ladder level raised while it waited never lets it run | `kahyad/internal/server/TestMCPGateDenialAfterConcurrentPromotionNeverExecutes` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a halt of a parked call is final — a ladder level raised while it waited never lets it run | `kahyad/internal/server/TestHaltAfterConcurrentPromotionNeverExecutesParkedCall` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a denied parked call never redeems a sibling call's grant for the same task and bytes | `kahyad/internal/server/TestDeniedParkedCallNeverRedeemsSiblingGrant` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a parked call's post-wait re-check redeems only its own pending approval's grant | `kahyad/internal/server/TestParkedCallRecheckRedeemsOnlyItsOwnGrant` | FIX-B-1 | ci-hermetic |
+| Safety #5 | the bound re-check redeems only its own pending id's grant, never a mismatched binding | `kahyad/internal/policy/TestPostWaitRecheckRedeemsOnlyItsOwnPendingGrant` | FIX-B-1 | ci-hermetic |
+| Safety #5 | the bound re-check never ladder-allows and mints nothing (no pending row, no token) | `kahyad/internal/policy/TestPostWaitRecheckNeverLadderAllows` | FIX-B-1 | ci-hermetic |
 | Safety #5 | approve → the parked fs_write executes the approved bytes once over real bins (no ladder promotion) | `tests/w3/TestGate1c_ApprovalWaitParksCallThenExecutes` | FIX-B-1 | local-integration |
 | Safety #5 | a non-local surface (Telegram) can approve only reversible tools — irreversible/unknown tools refused Go-side, id stays usable locally | `kahyad/internal/policy/TestApproveNonLocalIrreversibleRejected` | FIX-B-11 | ci-hermetic |
 | Safety #5 | a Telegram approve callback for an irreversible W2 is refused by the engine backstop (nothing approved) | `kahyad/internal/telegram/TestForgedIrreversibleW2CallbackRejectedAtEngine` | FIX-B-11 | ci-hermetic |

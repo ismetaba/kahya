@@ -507,6 +507,16 @@ type CheckInput struct {
 	// a second pending_approvals row - the original one is still the one the
 	// human has to answer.
 	NoMintPending bool
+	// RedeemPendingApprovalID (B-1) binds that post-wait re-check to the
+	// parked call's OWN pending approval: only the grant Engine.Approve
+	// minted for exactly this pending_approvals id may be redeemed (and it
+	// must still match task_id, tool, scope and approved_bytes_hash) - a
+	// hash-matched grant of any other pending id is never touched, and
+	// nothing else lets the call run: with no redeemable own grant Check
+	// answers needs_approval (never a ladder auto-allow, never a new pending
+	// row). A parked call therefore executes only because the human
+	// approved THAT call.
+	RedeemPendingApprovalID string
 }
 
 // Decision is one Engine.Check outcome.
@@ -754,6 +764,13 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 			return d, nil
 		}
 	}
+	if in.RedeemPendingApprovalID != "" {
+		// A parked call's post-wait re-check runs only on its own approval:
+		// no ladder level raised while it waited lets it through (see
+		// CheckInput.RedeemPendingApprovalID). needsApproval mints nothing
+		// for it.
+		return e.needsApproval(ctx, in, class, scope, level, hash, ReasonNeedsApproval)
+	}
 
 	// HARD-CODED: W3 never auto-allows, at any level, ever - see this
 	// file's package doc comment and autoLevelFor's.
@@ -828,10 +845,11 @@ func (e *Engine) denyIfTainted(ctx context.Context, in CheckInput, class ActionC
 // approvable by nothing, which is a worse failure mode than an honest
 // deny.
 //
-// B-1: a Preflight or NoMintPending check answers needs_approval WITHOUT a
-// new row (PendingApprovalID stays empty) - see CheckInput's doc comments.
+// B-1: a Preflight, NoMintPending or RedeemPendingApprovalID check answers
+// needs_approval WITHOUT a new row (PendingApprovalID stays empty) - see
+// CheckInput's doc comments.
 func (e *Engine) needsApproval(ctx context.Context, in CheckInput, class ActionClass, scope string, level int, hash, reason string) (Decision, error) {
-	if in.Preflight || in.NoMintPending {
+	if in.Preflight || in.NoMintPending || in.RedeemPendingApprovalID != "" {
 		d := Decision{Result: ResultNeedsApproval, Reason: reason, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
 		e.ledgerDecision(ctx, in, class, scope, level, d)
 		return d, nil

@@ -4,9 +4,11 @@
 //
 //   - redeemApprovedGrant: the binding Engine.Check, run again by the SAME
 //     tool call after the human approved (kahyad/internal/server's
-//     checkWithApprovalWait), finds the single-use grant Engine.Approve
-//     persisted for exactly these (task_id, tool, scope, approved_bytes_hash),
-//     burns it, and answers ALLOW with a freshly minted token the tool
+//     checkWithApprovalWait, CheckInput.RedeemPendingApprovalID), finds the
+//     single-use grant Engine.Approve persisted for that call's OWN pending
+//     approval - bound to exactly these (task_id, tool, scope,
+//     approved_bytes_hash) - burns it, and answers ALLOW with a freshly
+//     minted token the tool
 //     consumes immediately (ConsumeToken is unchanged). The approved bytes
 //     never pass back through the model: the parked call resumes with the
 //     very bytes the human saw (HANDOFF S5 #5 WYSIWYE).
@@ -42,10 +44,23 @@ import (
 // loses that UPDATE and falls through to needs_approval. The exchanged
 // token is never itself redeemable (GetRedeemableApprovalGrant only ever
 // matches grant_kind='approval').
+//
+// Which grant: a parked call's post-wait re-check
+// (in.RedeemPendingApprovalID) may redeem ONLY the grant of its own pending
+// approval (lookupOwnGrant) - never a sibling's grant for the same task and
+// bytes, so a denial of THIS call cannot be bypassed by approving another.
+// Every other binding Check (the model's identical retry after a timeout)
+// redeems the most recent matching grant by (task_id, tool, scope, hash).
 func (e *Engine) redeemApprovedGrant(ctx context.Context, in CheckInput, class ActionClass, scope, hash string, level int) (Decision, bool) {
-	row, err := e.store.GetRedeemableApprovalGrant(ctx, sqlcgen.GetRedeemableApprovalGrantParams{
-		TaskID: in.TaskID, Tool: in.Tool, Scope: scope, ApprovedBytesHash: hash,
-	})
+	var row sqlcgen.ApprovalToken
+	var err error
+	if in.RedeemPendingApprovalID != "" {
+		row, err = e.lookupOwnGrant(ctx, in, scope, hash)
+	} else {
+		row, err = e.store.GetRedeemableApprovalGrant(ctx, sqlcgen.GetRedeemableApprovalGrantParams{
+			TaskID: in.TaskID, Tool: in.Tool, Scope: scope, ApprovedBytesHash: hash,
+		})
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return Decision{}, false
 	}
@@ -123,6 +138,32 @@ func (e *Engine) redeemApprovedGrant(ctx context.Context, in CheckInput, class A
 	d := Decision{Result: ResultAllow, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level, Token: tok, RedeemedPendingApprovalID: pendingID}
 	e.ledgerDecision(ctx, in, class, scope, level, d)
 	return d, true
+}
+
+// lookupOwnGrant (B-1) returns the still-redeemable grant Engine.Approve
+// minted for in.RedeemPendingApprovalID, or sql.ErrNoRows when there is none
+// (not approved, already redeemed, halt-revoked). A grant whose binding is
+// not exactly this call's (task_id, tool, scope, approved_bytes_hash) is
+// ledgered approval_grant_binding_mismatch and never redeemed - Approve
+// copies all four from the pending row this very call minted, so a
+// mismatch means the row was tampered with. Expiry and class are checked
+// by the caller, exactly as for a hash-matched grant.
+func (e *Engine) lookupOwnGrant(ctx context.Context, in CheckInput, scope, hash string) (sqlcgen.ApprovalToken, error) {
+	id := in.RedeemPendingApprovalID
+	row, err := e.store.GetApprovalGrantByPendingApprovalID(ctx, sql.NullString{String: id, Valid: true})
+	if err != nil {
+		return sqlcgen.ApprovalToken{}, err
+	}
+	if row.ConsumedAt.Valid || row.RevokedAt.Valid {
+		return sqlcgen.ApprovalToken{}, sql.ErrNoRows
+	}
+	if row.TaskID != in.TaskID || row.Tool != in.Tool || row.Scope != scope || row.ApprovedBytesHash != hash {
+		e.ledgerRaw(ctx, in.TraceID, "approval_grant_binding_mismatch", map[string]any{
+			"event": "approval_grant_binding_mismatch", "task_id": in.TaskID, "tool": in.Tool, "pending_approval_id": id,
+		})
+		return sqlcgen.ApprovalToken{}, sql.ErrNoRows
+	}
+	return row, nil
 }
 
 // PendingApprovalDecision (B-1) reports whether id has been decided and how

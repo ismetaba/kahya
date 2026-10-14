@@ -752,8 +752,12 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
    surface, B-11). `Engine.Approve` persists a single-use **grant**
    (`approval_tokens.grant_kind='approval'`); the engine's decided hook
    wakes the parked call at once (a 2 s DB probe is the fallback).
-4. The same call re-checks (`NoMintPending`: never a second pending row).
-   `Engine.Check` **redeems** the grant — burned atomically, ledgered
+4. The same call re-checks **bound to its own pending id**
+   (`RedeemPendingApprovalID` + `NoMintPending`: never a second pending
+   row). `Engine.Check` **redeems** that id's grant and no other — never a
+   sibling call's grant for the same task and bytes, never a ladder
+   auto-allow (a level raised while the call waited does not count) —
+   burned atomically, ledgered
    `approval_grant_redeemed` — and answers `allow` with a fresh
    `grant_kind='exchanged'` token the tool consumes through the unchanged
    `ConsumeToken` (WYSIWYE hash check included). The tool executes exactly
@@ -762,7 +766,7 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
 
 Other outcomes (`approval_wait_ended.outcome`): `denied` (a denial or a
 halt's `InvalidateApprovalsForTask` — the model reads `"❌ Kullanıcı bu
-eylemi reddetti; …"`), `timeout` (nobody decided; the id stays live and the
+eylemi reddetti; …"`; final: no re-check runs, so nothing executes), `timeout` (nobody decided; the id stays live and the
 model is told to retry the identical call after an approval — that retry
 redeems the grant), `canceled` (the bridge connection closed — worker
 killed by `task_timeout_min` or a halt — or kahyad is shutting down:

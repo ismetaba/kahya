@@ -9,8 +9,10 @@
 // tools/call inside kahyad (approval_wait_seconds) until the human answers
 // on any approval surface (`kahya approve`, Hammerspoon, Telegram for a
 // reversible tool); the same call then re-checks, Engine.Check redeems the
-// single-use grant Engine.Approve persisted, and the tool executes exactly
-// the bytes the human saw - they never pass back through the model. The
+// single-use grant Engine.Approve persisted for THAT call's own pending
+// approval (never a sibling's, never a ladder auto-allow; a denial or halt
+// of it is final), and the tool executes exactly the bytes the human saw -
+// they never pass back through the model. The
 // worker's can_use_tool is only a preflight (HANDOFF S5: not a security
 // boundary): it defers every needs_approval for a kahyad MCP tool to this
 // gate.
@@ -223,10 +225,13 @@ type requestDoneKey struct{}
 
 // checkWithApprovalWait (B-1) is THE tool-side binding check every
 // in-process gate uses (see this file's package comment). needs_approval
-// parks the call (SetApprovalWait > 0), then re-checks with NoMintPending:
-// an approval is redeemed (policy.Engine redeemApprovedGrant), a denial,
-// timeout or halt never mints a second pending row, and a call whose
-// client disconnected (or a kahyad shutdown) never redeems at all.
+// parks the call (SetApprovalWait > 0). A denial or halt of the call's own
+// pending approval ends it as a deny with no re-check at all; an approval
+// (or a timeout) re-checks bound to that pending id
+// (CheckInput.RedeemPendingApprovalID + NoMintPending): only the call's own
+// grant is redeemed (policy.Engine redeemApprovedGrant), nothing mints a
+// second pending row, and a call whose client disconnected (or a kahyad
+// shutdown) never redeems at all.
 func (s *Server) checkWithApprovalWait(ctx context.Context, in policy.CheckInput) (policy.Decision, error) {
 	if s.policyEngine == nil {
 		// Fail-closed: never rely on wiring order.
@@ -289,19 +294,43 @@ func (s *Server) checkWithApprovalWait(ctx context.Context, in policy.CheckInput
 		}, nil
 	}
 
+	if outcome == waitDenied {
+		// The human denied - or a halt invalidated - THIS call's own pending
+		// approval: final, so nothing re-checks. A re-check could still
+		// answer ALLOW (the ladder level raised while the call waited - Deny
+		// demotes by only one step and a halt not at all - or another
+		// approved grant for the same task and bytes) and run what the human
+		// just refused.
+		return policy.Decision{
+			Result: policy.ResultDeny, Reason: MsgApprovalDenied, Rule: policy.RuleLadderV1,
+			Class: d.Class, Scope: d.Scope, Level: d.Level, PendingApprovalID: id,
+		}, nil
+	}
+
+	// approved, or timeout (an approval may have landed right at the
+	// deadline): re-check bound to this call's own pending id. The engine
+	// redeems that id's grant and nothing else - never a sibling's grant,
+	// never a ladder auto-allow - and mints no second pending row.
 	in.NoMintPending = true
-	d2, err := s.policyEngine.Check(ctx, in) // redeems the grant when approved
+	in.RedeemPendingApprovalID = id
+	d2, err := s.policyEngine.Check(ctx, in)
 	if d2.Result == policy.ResultAllow {
+		if d2.RedeemedPendingApprovalID != id {
+			// Engine contract broken (an allow that is not this call's own
+			// approval): fail-closed.
+			return policy.Decision{
+				Result: policy.ResultDeny, Reason: policy.ReasonPolicyStateError, Rule: policy.RuleLadderV1,
+				Class: d.Class, Scope: d.Scope, PendingApprovalID: id,
+			}, err
+		}
 		return d2, err
 	}
-	if d2.Result == policy.ResultDeny && outcome != waitDenied {
+	if d2.Result == policy.ResultDeny {
 		// A deny of the engine's own (the session turned tainted while the
 		// human decided, a policy state error) is the truer answer.
 		return d2, err
 	}
 	switch outcome {
-	case waitDenied:
-		d2.Result, d2.Reason = policy.ResultDeny, MsgApprovalDenied
 	case waitApproved:
 		d2.Result, d2.Reason = policy.ResultDeny, fmt.Sprintf(MsgApprovalNotRedeemableFmt, id)
 	default: // timeout: the id is still live, so the result stays needs_approval
