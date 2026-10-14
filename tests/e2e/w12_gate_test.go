@@ -241,6 +241,14 @@ func TestW12Acceptance(t *testing.T) {
 		}
 	})
 
+	// FIX-I-11 (review): the pinned CLI sends its own Accept-Encoding
+	// ("gzip, deflate, br, zstd"); the proxy must ask the upstream for an
+	// uncompressed body, or the usage parser would bill a compressed reply
+	// as zero tokens.
+	t.Run("upstream_identity_encoding", func(t *testing.T) {
+		assertUpstreamIdentityEncoding(t, mock.Requests())
+	})
+
 	// FIX-I-10 (owner decisions G11-3/G11-4): every call the real worker
 	// CLI made was allowlisted and priced - a CLI auxiliary call on a dated
 	// or unknown model, or an endpoint outside /v1/messages(+count_tokens),
@@ -943,6 +951,22 @@ func assertNoLocalTokenUpstream(t *testing.T, reqs []mockanthropic.RecordedReque
 					t.Errorf("request %d (%s): upstream header %s carries the local per-task token", i, req.Path, name)
 				}
 			}
+		}
+	}
+}
+
+// assertUpstreamIdentityEncoding (FIX-I-11 review) fails if any request
+// the mock upstream recorded asked for anything but an uncompressed body:
+// the proxy's usage parser reads plain JSON/SSE only, so the worker CLI's
+// own Accept-Encoding must never be forwarded.
+func assertUpstreamIdentityEncoding(t *testing.T, reqs []mockanthropic.RecordedRequest) {
+	t.Helper()
+	if len(reqs) == 0 {
+		t.Fatal("the mock upstream recorded no request at all")
+	}
+	for i, req := range reqs {
+		if got := req.Header.Values("Accept-Encoding"); len(got) != 1 || got[0] != "identity" {
+			t.Errorf("request %d (%s): upstream Accept-Encoding = %q, want exactly [identity]", i, req.Path, got)
 		}
 	}
 }

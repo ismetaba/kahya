@@ -554,3 +554,47 @@ func TestEstimateUsesMaxRateForUnpricedModel(t *testing.T) {
 		t.Errorf("Message = %q, want %q", check.Message, MsgDailyBudgetBlock)
 	}
 }
+
+// TestFailClosedUsageIsTheReservedEstimate (FIX-I-11 review): a call whose
+// usage cannot be read is billed the exact estimate CheckBeforeForward
+// reserved for it - a Usage whose cost is the reserved USD and whose
+// ceiling tokens are the reserved tokens - and, with no reservation to
+// read, the fixed fallback estimate. Never zero.
+func TestFailClosedUsageIsTheReservedEstimate(t *testing.T) {
+	g := NewGovernor(Limits{DailyBudgetUSD: 1000, MonthlyBudgetUSD: 10000, TaskTokenCeiling: 5_000_000}, nil, nil)
+	body := []byte(`{"model":"claude-sonnet-5","max_tokens":4000,"messages":[]}`)
+	check := g.CheckBeforeForward("t_fc", "claude-sonnet-5", body)
+	if !check.Allowed {
+		t.Fatalf("CheckBeforeForward blocked: %q", check.Message)
+	}
+	g.mu.Lock()
+	reserved := g.reservations[check.Reservation]
+	g.mu.Unlock()
+
+	u, usd := g.FailClosedUsage(check.Reservation, "claude-sonnet-5")
+	if usd <= 0 || usd != reserved.usd {
+		t.Errorf("FailClosedUsage usd = %v, want the reserved %v", usd, reserved.usd)
+	}
+	if got := u.BillableCeilingTokens(); got != reserved.tokens {
+		t.Errorf("FailClosedUsage ceiling tokens = %d, want the reserved %d", got, reserved.tokens)
+	}
+	row, err := PriceFor("claude-sonnet-5", time.Now())
+	if err != nil {
+		t.Fatalf("PriceFor: %v", err)
+	}
+	if got := u.CostUSD(row); got != usd {
+		t.Errorf("FailClosedUsage Usage costs %v at the model's row, want %v (the ledgered tokens must explain the billed USD)", got, usd)
+	}
+	if u.OutputTokens != 4000 || u.CacheCreationInputTokens != int64(len(body))/estRequestBytesPerToken || u.InputTokens != 0 {
+		t.Errorf("FailClosedUsage split = %+v, want output=max_tokens, cache_creation=len(body)/%d", u, estRequestBytesPerToken)
+	}
+
+	g.ReleaseReservation(check.Reservation)
+	u, usd = g.FailClosedUsage(check.Reservation, "claude-sonnet-5")
+	if u.OutputTokens != defaultEstRequestTokens || usd <= 0 {
+		t.Errorf("FailClosedUsage without a reservation = %+v / %v, want the %d-token fallback at the output rate", u, usd, defaultEstRequestTokens)
+	}
+	if _, usd := g.FailClosedUsage(0, "claude-mystery-1"); usd != (Usage{OutputTokens: defaultEstRequestTokens}).CostUSD(MaxPriceRow(time.Now())) {
+		t.Errorf("FailClosedUsage for an unpriceable model = %v, want the fallback at MaxPriceRow", usd)
+	}
+}

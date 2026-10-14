@@ -267,6 +267,21 @@ one row per call either way (a clean EOF still records `ok` once; the
 later `Close` is a no-op); the governor's reservation is still released by
 `ServeHTTP`'s defer. The stream is never drained on the worker's behalf.
 
+The usage parser reads the reply as plain JSON/SSE, so the proxy's Director
+replaces the worker's `Accept-Encoding` (the pinned CLI sends
+`gzip, deflate, br, zstd`) with `identity` in both credential modes: a
+compressed reply would otherwise be ledgered as `model_call` with zero
+tokens and `usd=0` (`TestProxyBillsRealUsageWhenWorkerAcceptsCompression`;
+the hermetic gate's `upstream_identity_encoding` subtests pin it for the
+real CLI). A successful (`< 400`) reply that still arrives with a
+non-identity `Content-Encoding` is forwarded unchanged but billed
+fail-closed at the governor's reservation estimate
+(`Governor.FailClosedUsage`: body bytes / 3 as 1h cache-write tokens +
+`max_tokens` as output tokens, or `est_request_tokens` at the output rate)
+and ledgered `proxy.encoded_body`
+`{task_id, model, content_encoding, billed_usd}`. An error status carries
+no usage and keeps `usd=0`.
+
 **Post-review addition (BLOCKER 2 fix)** — `Governor.CheckBeforeForward`
 is now an atomic check-and-reserve, not a plain check-then-act: it
 reserves a conservative (fail-closed = over-, never under-estimated)

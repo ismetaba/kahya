@@ -109,6 +109,10 @@ func TestW12PassthroughCloudAuth(t *testing.T) {
 		assertNoLocalTokenUpstream(t, mock.Requests())
 	})
 
+	t.Run("upstream_identity_encoding", func(t *testing.T) {
+		assertUpstreamIdentityEncoding(t, mock.Requests())
+	})
+
 	t.Run("ledger", func(t *testing.T) {
 		kinds := eventKindsForTrace(t, dbPath, traceID)
 		for _, want := range []string{"model_call", "task_done"} {

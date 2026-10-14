@@ -145,6 +145,12 @@ const (
 	// EventPriceUnknown: a forwarded call's model had no pricing row; it
 	// was billed at MaxPriceRow (payload task_id, model, billed_as).
 	EventPriceUnknown = "proxy.price_unknown"
+	// EventEncodedBody (FIX-I-11 review): a successful upstream reply
+	// arrived content-encoded although the proxy asked for identity, so
+	// its usage could not be read; the call was billed fail-closed at the
+	// governor's reservation estimate (payload task_id, model,
+	// content_encoding, billed_usd).
+	EventEncodedBody = "proxy.encoded_body"
 )
 
 // MsgModelNotAllowed / MsgPathNotAllowed are the Anthropic-shaped error
@@ -401,6 +407,17 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 			req.URL.Scheme = upstream.Scheme
 			req.URL.Host = upstream.Host
 			req.Host = upstream.Host
+			// FIX-I-11 (review): usageCapturingBody parses the reply as
+			// plain JSON/SSE. The worker CLI's own Accept-Encoding (the
+			// pinned CLI sends "gzip, deflate, br, zstd") must never reach
+			// the upstream: a compressed reply would be ledgered as zero
+			// usage and the cost governor would go blind. Asking for
+			// identity also keeps SSE unbuffered (no decompressor between
+			// the upstream and the worker) and, because the header is set,
+			// net/http neither adds gzip nor decompresses on its own. A
+			// reply that is encoded anyway is billed fail-closed
+			// (wrapResponseBody, EventEncodedBody).
+			req.Header.Set("Accept-Encoding", "identity")
 			switch p.cfg.CredentialMode {
 			case CredentialModeKeychain:
 				stripTokenHeader(req.Header, p.cfg.Token)
@@ -935,6 +952,10 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 	// The outbound request's context is derived from the INBOUND (worker)
 	// request's: it ends when the worker hangs up.
 	inboundCtx := resp.Request.Context()
+	// FIX-I-11 (review): a body the usage parser cannot read (see the
+	// Director's Accept-Encoding: identity). It is still forwarded to the
+	// worker unchanged.
+	encoding := undecodedContentEncoding(resp)
 
 	wrapped := &usageCapturingBody{ReadCloser: resp.Body, isSSE: isSSE}
 	wrapped.onDone = func(u Usage, bodyErr error) {
@@ -973,6 +994,19 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 			}
 		}
 		usd := u.CostUSD(row)
+		if encoding != "" && status < 400 {
+			// FIX-I-11 (review), fail-closed: whatever the parser saw was
+			// compressed bytes, not usage. Bill the governor's
+			// conservative reservation estimate instead of $0 and leave a
+			// ledger trail. (An error status carries no usage and is not
+			// billed by Anthropic, so it keeps the parsed zero.)
+			u, usd = p.cfg.Governor.FailClosedUsage(data.Reservation, data.Model)
+			if p.cfg.EventLedger != nil {
+				_ = p.cfg.EventLedger.LogEvent(context.Background(), p.cfg.TraceID, EventEncodedBody, map[string]any{
+					"task_id": p.cfg.TaskID, "model": data.Model, "content_encoding": encoding, "billed_usd": usd,
+				})
+			}
+		}
 
 		// context.Background(): the inbound request's own context may
 		// already be cancelled by the time the body finishes draining
@@ -998,6 +1032,21 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 	}
 	resp.Body = wrapped
 	return nil
+}
+
+// undecodedContentEncoding returns resp's Content-Encoding when the body
+// that reaches usageCapturingBody is still encoded (FIX-I-11 review), or
+// "" for a plain body: no header, "identity", or a body net/http already
+// decompressed (resp.Uncompressed).
+func undecodedContentEncoding(resp *http.Response) string {
+	if resp.Uncompressed {
+		return ""
+	}
+	ce := strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ","))
+	if ce == "" || strings.EqualFold(ce, "identity") {
+		return ""
+	}
+	return ce
 }
 
 // handleUpstreamError is httputil.ReverseProxy's ErrorHandler: it fires

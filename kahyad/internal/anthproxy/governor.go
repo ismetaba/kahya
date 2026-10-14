@@ -151,9 +151,14 @@ type ReservationID uint64
 // straddle a UTC day/month boundary between CheckBeforeForward and its
 // eventual release.
 type reservation struct {
-	taskID     string
-	tokens     int64
-	usd        float64
+	taskID string
+	tokens int64
+	usd    float64
+	// est is the estimate's token split (input side as cache-creation
+	// tokens, output side as output tokens; est.CostUSD at the reserving
+	// row == usd). FailClosedUsage bills it for a call whose real usage
+	// cannot be read (FIX-I-11 review).
+	est        Usage
 	day, month string
 }
 
@@ -331,7 +336,8 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	estTokens, estUSD := g.estimateRequestLocked(model, body)
+	est, estUSD := g.estimateRequestLocked(model, body)
+	estTokens := est.BillableCeilingTokens()
 
 	if g.limits.TaskTokenCeiling > 0 {
 		projected := g.perTask[taskID] + g.perTaskReservedTok[taskID] + estTokens
@@ -358,7 +364,7 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 		}
 	}
 
-	id := g.reserveLocked(taskID, estTokens, estUSD, today, month)
+	id := g.reserveLocked(taskID, est, estUSD, today, month)
 	return CheckResult{Allowed: true, Reservation: id}
 }
 
@@ -395,7 +401,14 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 // budget checks too, never slipped past them with a $0 estimate. (The
 // proxy's model allowlist already refuses such a request before it gets
 // here; this keeps the governor fail-closed on its own.)
-func (g *Governor) estimateRequestLocked(model string, body []byte) (tokens int64, usd float64) {
+//
+// The estimate is returned as a Usage shaped so that est.CostUSD(row) is
+// exactly usd: the input side as CacheCreationInputTokens (CostUSD prices
+// those at the 1h cache-write rate), the output side as OutputTokens, and
+// est.BillableCeilingTokens() as the token count reserved against the
+// per-task ceiling. FailClosedUsage bills this same Usage when a call's
+// real usage cannot be read.
+func (g *Governor) estimateRequestLocked(model string, body []byte) (est Usage, usd float64) {
 	row, priceErr := PriceFor(model, g.now())
 	if priceErr != nil {
 		row = MaxPriceRow(g.now())
@@ -414,15 +427,29 @@ func (g *Governor) estimateRequestLocked(model string, body []byte) (tokens int6
 		if inTokens <= 0 {
 			inTokens = 1
 		}
-		tokens = inTokens + outTokens
-		usd = float64(inTokens)*row.USDPerMTokCacheWrite1h/1_000_000 +
-			float64(outTokens)*row.USDPerMTokOut/1_000_000
-		return tokens, usd
+		est = Usage{CacheCreationInputTokens: inTokens, OutputTokens: outTokens}
+		return est, est.CostUSD(row)
 	}
 
-	tokens = fallbackTokens
-	usd = float64(tokens) * row.USDPerMTokOut / 1_000_000
-	return tokens, usd
+	est = Usage{OutputTokens: fallbackTokens}
+	return est, est.CostUSD(row)
+}
+
+// FailClosedUsage returns the usage and USD to bill for a forwarded call
+// whose real usage cannot be read from the upstream response (FIX-I-11
+// review: a compressed body the proxy's usage parser cannot decode). It is
+// the conservative estimate CheckBeforeForward reserved under id - never
+// $0 - or, when id holds no reservation (zero, or already released), the
+// fixed fallback estimate for model (est_request_tokens at the output rate;
+// MaxPriceRow when model is unpriceable). Call it before RecordUsage
+// releases id.
+func (g *Governor) FailClosedUsage(id ReservationID, model string) (Usage, float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if r, ok := g.reservations[id]; ok {
+		return r.est, r.usd
+	}
+	return g.estimateRequestLocked(model, nil)
 }
 
 // estimateProbe is the subset of a /v1/messages request body
@@ -460,10 +487,11 @@ func parseEstimateProbe(body []byte) (estimateProbe, bool) {
 // reservation pool CheckBeforeForward itself consults (per-task tokens,
 // daily USD, monthly USD) so the very next call sees it. Must be called
 // with g.mu held.
-func (g *Governor) reserveLocked(taskID string, tokens int64, usd float64, day, month string) ReservationID {
+func (g *Governor) reserveLocked(taskID string, est Usage, usd float64, day, month string) ReservationID {
+	tokens := est.BillableCeilingTokens()
 	g.nextReservationID++
 	id := ReservationID(g.nextReservationID)
-	g.reservations[id] = reservation{taskID: taskID, tokens: tokens, usd: usd, day: day, month: month}
+	g.reservations[id] = reservation{taskID: taskID, tokens: tokens, usd: usd, est: est, day: day, month: month}
 	g.perTaskReservedTok[taskID] += tokens
 	g.dailyReservedUSD[day] += usd
 	g.monthlyReservedUSD[month] += usd
