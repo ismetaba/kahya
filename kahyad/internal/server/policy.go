@@ -175,14 +175,13 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// W3-03 + B-8: execute each triggered operation's undo recipe
-		// (Trash restore / git-checkpoint restore), newest first, now that
-		// every window is durably "triggered" and the ladder state already
-		// demoted - see fs.go's dispatchFSUndo doc comment for why this is
-		// a SEPARATE step from TriggerUndo's own bookkeeping. This route's
+		// (Trash restore / git-checkpoint restore), newest first, as one
+		// fail-closed chain, now that every window is durably "triggered"
+		// and the ladder state already demoted - see fs.go's
+		// dispatchUndoRows/dispatchFSUndo doc comments for why this is a
+		// SEPARATE step from TriggerUndo's own bookkeeping. This route's
 		// response carries no per-op detail (POST /policy/undo does).
-		for _, row := range rows {
-			s.dispatchFSUndo(r.Context(), traceID, row)
-		}
+		s.dispatchUndoRows(r.Context(), traceID, rows)
 		writeJSON(w, http.StatusOK, policyFeedbackResponse{OK: true})
 	default:
 		writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: "kind must be approve, deny, or undo"})
@@ -308,9 +307,11 @@ type policyUndoResponse struct {
 // PolicyUndo): Engine.TriggerUndo flips every still-open undo window of
 // trace_id (or only the newest, with last) to triggered, newest first,
 // demoting each (tool, scope) once; then each triggered operation's owning
-// recipe runs in that same LIFO order (W3-03: mcp/fs.Server.UndoOp) - see
-// dispatchFSUndo's doc comment (fs.go) for why that is a separate step
-// from TriggerUndo's own window/demotion bookkeeping. 404 +
+// recipe runs in that same LIFO order as one fail-closed chain (W3-03:
+// mcp/fs.UndoChain.UndoOp; a recipe that fails on a path blocks every
+// older op on that path) - see dispatchUndoRows/dispatchFSUndo's doc
+// comments (fs.go) for why that is a separate step from TriggerUndo's own
+// window/demotion bookkeeping. 404 +
 // ErrNoOpenUndoWindow's text when nothing was open.
 func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, policyCheckMaxBody)
@@ -337,9 +338,7 @@ func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// TriggerUndo returns err == nil only with at least one triggered row.
-	ops := make([]policyUndoOp, 0, len(rows))
-	for _, row := range rows { // newest first - LIFO, exactly TriggerUndo's order
-		ops = append(ops, s.dispatchFSUndo(r.Context(), req.TraceID, row))
-	}
+	// Newest first - LIFO, exactly TriggerUndo's order, one fail-closed chain.
+	ops := s.dispatchUndoRows(r.Context(), req.TraceID, rows)
 	writeJSON(w, http.StatusOK, policyUndoResponse{OK: true, Tool: rows[0].Tool, TaskID: rows[0].TaskID, Ops: ops})
 }

@@ -143,7 +143,7 @@ type Server struct {
 	// registered onto the SAME shared /v1/mcp server as mcp/memory's tools
 	// (buildMCPHandler) and consulted by handlePolicyUndo/
 	// handlePolicyFeedback (policy.go) to execute each triggered
-	// operation's recipe (mcp/fs.Server.UndoOp, B-8) once
+	// operation's recipe (mcp/fs.UndoChain.UndoOp, B-8) once
 	// kahyad/internal/policy.Engine.TriggerUndo has flipped the windows and
 	// demoted the ladder state. nil until SetFSTool is called - see fs.go.
 	fsServer *mcpfs.Server

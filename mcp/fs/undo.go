@@ -2,8 +2,11 @@
 // `kahya undo --trace <id>` fires inside the open W1 5-minute window
 // (HANDOFF §4 ladder): fs_write's pre-op git-checkpoint-or-fallback-copy
 // restore, and fs_delete's Trash-restore. Both are single-use (the
-// registry entry is removed once executed) and both ledger
-// undo_executed.
+// registry entry is removed once executed), both ledger undo_executed,
+// and both refuse - touching nothing - a target that is no longer in the
+// state the operation left it (ErrTargetChanged); UndoChain keeps one
+// undo call's LIFO sequence fail-closed across operations on one path
+// (ErrUndoBlocked).
 //
 // The undo record itself is kept IN-MEMORY on this package's Server,
 // keyed by op_id (kahyad's approval_tokens.token_hash for the consumed
@@ -29,11 +32,16 @@ package fs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 )
 
 // undoRecord is one pending (not-yet-undone, not-yet-expired) undo entry,
@@ -57,8 +65,14 @@ type undoRecord struct {
 	TraceID     string
 
 	// fs_write fields.
-	HadPrev     bool   // false => the target did not exist before this write
-	PreHash     string // sha256(hex) of the pre-image (hash of empty bytes when !HadPrev)
+	HadPrev bool   // false => the target did not exist before this write
+	PreHash string // sha256(hex) of the pre-image (hash of empty bytes when !HadPrev)
+	// PostHash is sha256(hex) of the bytes this write left at the target
+	// (B-8 review): UndoWrite runs its recipe only while the target still
+	// holds exactly these bytes (verifyPostImage), never over anything
+	// else. fs_delete's post-state ("absent") needs no field - its restore
+	// is O_EXCL.
+	PostHash    string
 	GitRepoRoot string // set iff checkpointed via `git hash-object -w`
 	GitBlobSHA  string
 	CopyPath    string // set iff copied to UndoDir instead (non-git fallback)
@@ -121,6 +135,65 @@ func (r *undoRegistry) countForTrace(traceID string) int {
 // write, or the record was already consumed by an earlier undo/purge).
 var ErrNoUndoRecord = errors.New("fs: no undo record for this operation")
 
+// ErrTargetChanged is returned (wrapped) by UndoWrite/UndoDelete when the
+// target is no longer in the state the operation left it (B-8 review,
+// fail-closed): an fs_write's bytes were edited, replaced or removed since,
+// or a file deleted by fs_delete exists again. The recipe then writes,
+// moves and restores nothing - an undo never destroys bytes the operation
+// did not produce (an editor's re-save, a sync client, the user, or a newer
+// operation that was itself not undone). The pre-image stays where it is
+// (git blob / fallback copy / Trash entry) for a manual restore.
+var ErrTargetChanged = errors.New("target changed since this operation")
+
+// ErrUndoBlocked is returned (wrapped) by UndoChain.UndoOp for an operation
+// it did NOT attempt because a newer operation on the same path failed to
+// undo earlier in the same chain (B-8 review): LIFO means an older
+// operation is only ever reverted after every newer one on that path was.
+var ErrUndoBlocked = errors.New("not attempted: a newer operation on the same path could not be undone")
+
+// UndoChain executes ONE `kahya undo` call's recipes in the order kahyad
+// hands them over - Engine.TriggerUndo's, newest first - and keeps that
+// LIFO chain fail-closed (B-8 review): once an operation's recipe fails on
+// a path, every older operation on that same path in this chain is
+// reported ErrUndoBlocked without being attempted, even when its own
+// post-state check would pass (ErrTargetChanged guards each recipe on its
+// own; this rule additionally never reverts an older operation underneath
+// a newer one that is still in effect). Operations on other paths are
+// unaffected. A newer operation reported ErrNoUndoRecord blocks nothing
+// (its path is unknown - its write never completed, or its record was
+// lost); each older recipe's own post-state check still applies. Not safe
+// for concurrent use: one chain per undo call.
+type UndoChain struct {
+	s *Server
+	// failed holds the case-folded canonical paths a newer operation in
+	// this chain could not undo. Folded because APFS is case-insensitive by
+	// default: over-blocking a distinct case-variant file on a
+	// case-sensitive volume is the fail-closed direction.
+	failed map[string]bool
+}
+
+// NewUndoChain starts one undo call's chain (kahyad/internal/server's
+// dispatch for POST /policy/undo and /policy/feedback kind=undo).
+func (s *Server) NewUndoChain() *UndoChain {
+	return &UndoChain{s: s, failed: make(map[string]bool)}
+}
+
+func undoPathKey(canonicalPath string) string { return strings.ToLower(canonicalPath) }
+
+// UndoOp is Server.UndoOp under the chain rule above. A blocked operation's
+// record is left in place (nothing ran).
+func (c *UndoChain) UndoOp(ctx context.Context, traceID, opID string) (UndoResult, error) {
+	if rec, ok := c.s.registry.Get(opID); ok && (traceID == "" || rec.TraceID == traceID) && c.failed[undoPathKey(rec.CanonicalPath)] {
+		return UndoResult{OpID: opID, Tool: rec.Tool, CanonicalPath: rec.CanonicalPath},
+			fmt.Errorf("fs undo: %w: %s%s", ErrUndoBlocked, rec.CanonicalPath, recoveryHint(rec))
+	}
+	res, err := c.s.UndoOp(ctx, traceID, opID)
+	if err != nil && !errors.Is(err, ErrNoUndoRecord) && res.CanonicalPath != "" {
+		c.failed[undoPathKey(res.CanonicalPath)] = true
+	}
+	return res, err
+}
+
 // UndoResult is UndoOp's success payload (what `kahya undo` prints).
 type UndoResult struct {
 	OpID          string
@@ -171,10 +244,19 @@ func (s *Server) UndoOp(ctx context.Context, traceID, opID string) (UndoResult, 
 // mismatch means something is wrong with the stored pre-image, and
 // writing back unverified bytes could do more damage than refusing), and
 // then written back atomically.
+//
+// Either way the recipe first verifies the target still holds exactly the
+// bytes this write left there (B-8 review, verifyPostImage): anything else
+// - edited, replaced, removed, or a newer operation's bytes that were not
+// undone - is ErrTargetChanged and nothing is touched.
 func (s *Server) UndoWrite(ctx context.Context, opID string) error {
 	rec, ok := s.registry.Get(opID)
 	if !ok || rec.Tool != "fs_write" {
 		return ErrNoUndoRecord
+	}
+
+	if err := verifyPostImage(rec); err != nil {
+		return fmt.Errorf("fs undo_write: %w", err)
 	}
 
 	if !rec.HadPrev {
@@ -228,14 +310,113 @@ func (s *Server) UndoDelete(ctx context.Context, opID string) error {
 	}
 
 	// BLOCKER fix: destination confined to rec.AncestorDir, exactly like
-	// a fresh write — see restoreFromTrashConfined's doc comment.
+	// a fresh write — see restoreFromTrashConfined's doc comment. The
+	// restore is O_EXCL: something at the path again means the target is
+	// no longer in the state this delete left it (B-8 review) - nothing is
+	// clobbered, the Trash entry stays.
 	if err := restoreFromTrashConfined(rec.TrashPath, rec.AncestorDir, rec.Rel); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("fs undo_delete: %w: %s exists again%s", ErrTargetChanged, rec.CanonicalPath, recoveryHint(rec))
+		}
 		return fmt.Errorf("fs undo_delete: restore from trash: %w", err)
 	}
 
 	s.ledgerUndoExecuted(ctx, rec.TraceID, "fs_delete", rec.CanonicalPath, opID)
 	s.registry.Delete(opID)
 	return nil
+}
+
+// verifyPostImage is UndoWrite's post-state check (B-8 review): nil only
+// when rec's target - resolved through the same os.Root confinement as
+// every other step of the recipe - is still a regular file holding exactly
+// rec.PostHash. Missing, not a regular file (a symlink, directory, FIFO
+// ...), or different bytes all wrap ErrTargetChanged; any other read
+// failure is returned as is - the recipe refuses either way (fail-closed).
+// A change landing in the short gap between this check and the recipe's
+// own atomic rename is not detected (POSIX has no compare-and-swap rename);
+// the check closes the 5-minute window between the operation and the undo.
+func verifyPostImage(rec undoRecord) error {
+	if rec.PostHash == "" {
+		return errors.New("fs: no recorded post-image for this operation")
+	}
+	got, err := rootHashFileConfined(rec.AncestorDir, rec.Rel)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("%w: %s no longer exists%s", ErrTargetChanged, rec.CanonicalPath, recoveryHint(rec))
+	case errors.Is(err, errNotRegularFile):
+		return fmt.Errorf("%w: %s is no longer a regular file%s", ErrTargetChanged, rec.CanonicalPath, recoveryHint(rec))
+	case err != nil:
+		return fmt.Errorf("read current state (confined) %s: %w", rec.CanonicalPath, err)
+	case got != rec.PostHash:
+		return fmt.Errorf("%w: %s holds other bytes (sha256 %s, this operation wrote %s)%s", ErrTargetChanged, rec.CanonicalPath, got, rec.PostHash, recoveryHint(rec))
+	}
+	return nil
+}
+
+// recoveryHint names where a refused or blocked recipe left the
+// operation's own saved bytes (B-8 review), so `kahya undo`'s failure line
+// tells the user what to restore by hand: fs_delete's Trash entry, or
+// fs_write's fallback copy / git blob. "" for a write that created the file
+// (there was nothing before it). The window is already "triggered", so the
+// expiry sweep never purges that copy - it stays for exactly this restore.
+func recoveryHint(rec undoRecord) string {
+	switch {
+	case rec.Tool == "fs_delete" && rec.TrashPath != "":
+		return " (deleted bytes kept at " + rec.TrashPath + ")"
+	case rec.CopyPath != "":
+		return " (pre-image kept at " + rec.CopyPath + ")"
+	case rec.GitBlobSHA != "":
+		return " (pre-image kept as git blob " + rec.GitBlobSHA + " in " + rec.GitRepoRoot + ")"
+	}
+	return ""
+}
+
+var errNotRegularFile = errors.New("not a regular file")
+
+// rootHashFileConfined streams rel's content - read-only descent through an
+// os.Root on ancestorDir, exactly like rootReadFileConfined - into sha256
+// and returns the hex digest (sha256Hex's encoding) without loading the
+// file into memory. The leaf is opened O_NONBLOCK and must fstat as a
+// regular file (errNotRegularFile otherwise), so a FIFO planted at the
+// path can never hang the undo call. Wraps os.ErrNotExist when rel is
+// absent.
+func rootHashFileConfined(ancestorDir, rel string) (string, error) {
+	root, err := os.OpenRoot(ancestorDir)
+	if err != nil {
+		return "", fmt.Errorf("confine read to %s: %w", ancestorDir, err)
+	}
+	defer root.Close()
+
+	leafRoot, leaf, err := descendConfinedReadOnly(root, rel)
+	if err != nil {
+		return "", err
+	}
+	if leafRoot != root {
+		defer leafRoot.Close()
+	}
+	info, err := leafRoot.Lstat(leaf)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errNotRegularFile
+	}
+	f, err := leafRoot.OpenFile(leaf, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if info, err = f.Stat(); err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errNotRegularFile
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // ledgerUndoExecuted writes the undo_executed ledger event both

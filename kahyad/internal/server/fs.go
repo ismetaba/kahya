@@ -246,24 +246,48 @@ const (
 	undoRecipeUnsupported = "unsupported" // tool has no undo recipe (memory_write/memory_forget today) - the ladder demotion still applied
 )
 
-// dispatchFSUndo executes the owning recipe (mcp/fs.Server.UndoOp) for ONE
-// triggered undo_windows row (B-8: one call per row Engine.TriggerUndo
-// returned, newest first), AFTER TriggerUndo has already flipped it to
-// "triggered" and demoted the ladder state (W3-03's ambiguity-decision
-// note: demotion/window bookkeeping and recipe EXECUTION are two separate
-// steps). A tool this package has no recipe for (memory_write, whose own
-// undo recipe is a future task) or a nil fsServer reports "unsupported" -
-// the demotion already happened regardless, which is the safety-relevant
-// half of `kahya undo`. A missing record is "no_record" and is never
-// guessed at (fail-closed: nothing is restored). Never returns an error:
-// the window/demotion half is what /policy/undo answers ok on; the recipe
-// outcome is surfaced per op in the response and logged under traceID.
-func (s *Server) dispatchFSUndo(ctx context.Context, traceID string, row sqlcgen.UndoWindow) policyUndoOp {
+// dispatchUndoRows executes the owning recipe of every row
+// Engine.TriggerUndo triggered, in exactly that order (newest first - B-8
+// LIFO), as ONE fail-closed chain (B-8 review, mcp/fs.UndoChain): once an
+// fs operation's recipe fails on a path, no older operation on that path
+// runs in this call - it is reported failed (mcp/fs.ErrUndoBlocked) and the
+// CLI exits 1 (G05-3) - so a refused newer recipe can never be bypassed by
+// an older one writing its pre-image over bytes it did not produce. Every
+// fs recipe additionally checks the target is still exactly what its own
+// operation left (mcp/fs.ErrTargetChanged), which also covers a newer row
+// TriggerUndo could not flip (it is not in rows at all). POST /policy/undo
+// and POST /policy/feedback kind=undo both dispatch through here.
+func (s *Server) dispatchUndoRows(ctx context.Context, traceID string, rows []sqlcgen.UndoWindow) []policyUndoOp {
+	var chain *mcpfs.UndoChain
+	if fsSrv := s.fsServer; fsSrv != nil {
+		chain = fsSrv.NewUndoChain()
+	}
+	ops := make([]policyUndoOp, 0, len(rows))
+	for _, row := range rows {
+		ops = append(ops, s.dispatchFSUndo(ctx, traceID, row, chain))
+	}
+	return ops
+}
+
+// dispatchFSUndo executes the owning recipe (mcp/fs.UndoChain.UndoOp) for
+// ONE triggered undo_windows row (B-8: one call per row Engine.TriggerUndo
+// returned, newest first, all through dispatchUndoRows' one chain), AFTER
+// TriggerUndo has already flipped it to "triggered" and demoted the ladder
+// state (W3-03's ambiguity-decision note: demotion/window bookkeeping and
+// recipe EXECUTION are two separate steps). A tool this package has no
+// recipe for (memory_write, whose own undo recipe is a future task) or a
+// nil fs tool (chain) reports "unsupported" - the demotion already happened
+// regardless, which is the safety-relevant half of `kahya undo`. A missing
+// record is "no_record" and is never guessed at (fail-closed: nothing is
+// restored). Never returns an error: the window/demotion half is what
+// /policy/undo answers ok on; the recipe outcome is surfaced per op in the
+// response and logged under traceID.
+func (s *Server) dispatchFSUndo(ctx context.Context, traceID string, row sqlcgen.UndoWindow, chain *mcpfs.UndoChain) policyUndoOp {
 	op := policyUndoOp{OpID: row.OpID, Tool: row.Tool, TaskID: row.TaskID, Recipe: undoRecipeUnsupported}
-	if s.fsServer == nil || (row.Tool != "fs_write" && row.Tool != "fs_delete") {
+	if chain == nil || (row.Tool != "fs_write" && row.Tool != "fs_delete") {
 		return op
 	}
-	res, err := s.fsServer.UndoOp(ctx, traceID, row.OpID)
+	res, err := chain.UndoOp(ctx, traceID, row.OpID)
 	switch {
 	case errors.Is(err, mcpfs.ErrNoUndoRecord):
 		op.Recipe, op.Error = undoRecipeNoRecord, err.Error()
@@ -271,7 +295,8 @@ func (s *Server) dispatchFSUndo(ctx context.Context, traceID string, row sqlcgen
 	case err != nil:
 		op.Recipe, op.Error = undoRecipeFailed, err.Error()
 		op.Path = res.CanonicalPath
-		s.log.With(traceID).Error("fs_undo_recipe_failed", "tool", row.Tool, "op_id", row.OpID, "task_id", row.TaskID, "err", err.Error())
+		s.log.With(traceID).Error("fs_undo_recipe_failed", "tool", row.Tool, "op_id", row.OpID, "task_id", row.TaskID,
+			"blocked", errors.Is(err, mcpfs.ErrUndoBlocked), "target_changed", errors.Is(err, mcpfs.ErrTargetChanged), "err", err.Error())
 	default:
 		op.Recipe, op.Path = undoRecipeExecuted, res.CanonicalPath
 	}

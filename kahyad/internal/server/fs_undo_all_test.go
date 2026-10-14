@@ -30,6 +30,14 @@ type fsUndoFixture struct {
 
 func newFSUndoFixture(t *testing.T) fsUndoFixture {
 	t.Helper()
+	return newFSUndoFixtureWith(t, testPolicyDoc(), nil)
+}
+
+// newFSUndoFixtureWith is newFSUndoFixture with an explicit policy document
+// and an optional wrapper around the engine's store (fault injection); nil
+// wrapStore = the plain store.
+func newFSUndoFixtureWith(t *testing.T, pol policy.Policy, wrapStore func(policy.Store) policy.Store) fsUndoFixture {
+	t.Helper()
 	home := t.TempDir()
 	dataDir := t.TempDir()
 	cfg := config.Config{
@@ -43,7 +51,11 @@ func newFSUndoFixture(t *testing.T) fsUndoFixture {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	engine := policy.NewEngine(testPolicyDoc(), st.Queries, st)
+	var engineStore policy.Store = st.Queries
+	if wrapStore != nil {
+		engineStore = wrapStore(engineStore)
+	}
+	engine := policy.NewEngine(pol, engineStore, st)
 	seedAutonomyState(t, st, "fs_write", "W1", "global", policy.L2)
 	seedAutonomyState(t, st, "memory_write", "W1", "global", policy.L2)
 
@@ -201,7 +213,7 @@ func TestPolicyUndoReportsNoRecordAfterRegistryLoss(t *testing.T) {
 	op := f.write(t, trace, task, "a.txt", "A-new")
 
 	fresh := mcpfs.New(f.home, nil, nil, f.undo, NewFSPolicyClient(f.engine, func() bool { return false }), f.store, NewFSLogger(testLogger(t)), nil)
-	f.srv.SetFSTool(fresh) // no request is in flight; dispatchFSUndo reads s.fsServer per request
+	f.srv.SetFSTool(fresh) // no request is in flight; dispatchUndoRows reads s.fsServer per request
 
 	var resp policyUndoResponse
 	r := postJSON(t, f.client, "/policy/undo", map[string]any{"trace_id": trace}, &resp)

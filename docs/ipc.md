@@ -1335,7 +1335,14 @@ first boot). `{}` disables it.
   order (`mcp/fs.Server.UndoOp`, records keyed by `op_id`, pre-image copies
   at `undo/<task_id>/<op_id>`); the response and the CLI report one line
   per op — `executed | failed | no_record | unsupported` — and the CLI
-  exits 1 only when a recipe failed.
+  exits 1 only when a recipe failed. The chain is fail-closed (B-8
+  review, `mcp/fs.UndoChain`): an fs recipe runs only while its target
+  still holds exactly what that operation left (fs_write: the bytes it
+  wrote; fs_delete: nothing at the path - the Trash restore is O_EXCL),
+  otherwise it fails with `target changed since this operation` and
+  touches nothing; and once a recipe fails on a path, every older op of
+  the same call on that path fails with `not attempted: a newer operation
+  on the same path could not be undone` instead of running.
 - **Session resume, receipts, retries, outbox dispatch** — landed in
   W4-02 as `kahyad/internal/task` (state machine `machine.go`, receipt/
   idempotent-replay lifecycle `receipts.go`, resume-scan `resume.go`) and

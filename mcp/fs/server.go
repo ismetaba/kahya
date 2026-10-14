@@ -675,7 +675,8 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 		}
 
 		postHash := sha256Hex(content)
-		s.registry.Put(rec) // B-8: keyed by rec.OpID, never overwrites an earlier op
+		rec.PostHash = postHash // B-8 review: the undo recipe runs only while the target still holds these bytes
+		s.registry.Put(rec)     // B-8: keyed by rec.OpID, never overwrites an earlier op
 
 		s.logAndLedger(ctx, traceID, "fs_write", map[string]any{
 			"event": "fs_write", "canonical_path": cp.Match, "task_id": taskID, "op_id": opID,
