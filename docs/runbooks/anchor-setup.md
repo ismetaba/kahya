@@ -172,6 +172,60 @@ next tick and never blocks the remote push. kahyad never reads this file
 remote. The fallback needs `anchor_remote`: with no remote configured
 kahyad anchors nothing and writes nothing here.
 
+## 6 · What `kahya ledger verify` checks, and recovery
+
+Since FIX-P-3 the remote is the authority. `kahya ledger verify` clones the
+anchor remote into a throwaway directory next to `anchor-repo`, reads
+`anchors.log` from the remote's `main` ref, and treats every line as a
+checkpoint: the running digest recomputed from the local `events` must
+match each anchored digest. The local `anchor_log` table and
+`ledger_digest_state` are only secondary consistency checks. Outcomes:
+
+- `Defter doğrulandı: kurcalama tespit edilmedi.`, exit 0. When
+  `anchor_remote` is unset, stderr adds `Uyarı: anchor_remote ayarlı
+  değil — …`: only local self-consistency was checked, the external anchor
+  was NOT.
+- `DEFTER UYARISI: …`, exit 1, plus an `anchor.mismatch` ledger event
+  whose `reason` is one of `digest_mismatch`, `remote_ahead`,
+  `local_anchor_log_inconsistent`, `digest_state_mismatch`,
+  `remote_non_monotonic` or `checkpoint_not_recomputable`.
+- Exit 2 (`Defter doğrulaması çalıştırılamadı: …`) when the remote cannot
+  be read. That means "could not verify", never "verified".
+
+**Legacy events.** A brain.db that already held events before the ledger
+digest existed (migration 0010) has a range of events that were never
+digested or anchored. Migration 0023 records the last such id once
+(`ledger_chain_base`); verify recomputes from the event after it and
+prints `Not: defter özeti başlamadan önce yazılmış N eski olay …` on
+stderr. Those events cannot be verified by any anchor. An anchor at or
+below that id is reported as `checkpoint_not_recomputable`, so moving the
+base cannot hide anchored history.
+
+**Restore from a backup.** If brain.db is restored from a W4-06 backup,
+verify turns red with `remote_ahead`. This is by design: a truncated
+ledger and an older restored copy look the same from the remote. The
+recovery is to rotate the anchor repo:
+
+1. Create a new, empty anchor repository (§1) and point `anchor_remote`
+   at it (§3). The deploy key can be reused or rotated.
+2. Keep the old repository read-only as an archive of the old anchors.
+   Never delete it.
+3. Restart kahyad. The next push anchors the current ledger to the new
+   repo. Rows pushed to the old repo stay valid local checkpoints; they are
+   not expected on the new remote.
+
+**One anchor repo belongs to exactly one brain.db.** A second machine
+needs a second repository. Two ledgers pushing into one repo make it
+non-monotonic or conflicting (`remote_non_monotonic` / `digest_mismatch`),
+and kahyad refuses to push on top of a remote that is ahead of it.
+
+**What may be deleted.** `~/Library/Application Support/Kahya/anchor-repo`
+is only a cache: kahyad resets it to the remote tip before every push, so
+it can be deleted at any time. A leftover `kahya-anchor-verify-*`
+directory next to it (from a verify killed mid-run) can be deleted too.
+The `anchor_log` table must NOT be deleted: verify reports
+`local_anchor_log_inconsistent` without it.
+
 ## Alternative backend: S3 Object Lock (documented, not implemented)
 
 HANDOFF §5 safety #4 also names S3 Object Lock (WORM mode) as a valid

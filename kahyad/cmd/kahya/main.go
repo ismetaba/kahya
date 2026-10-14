@@ -1501,9 +1501,12 @@ func runLedger(client *Client, args []string, stdout, stderr io.Writer) int {
 
 // runLedgerVerify implements `kahya ledger verify` (W4-05 task spec step
 // 6): POST /v1/ledger/verify, then either print the success line (exit 0)
-// or the exact Turkish AlarmMismatch string kahyad returned (exit 1) - a
+// or the exact Turkish alarm string kahyad returned (exit 1) - a
 // mismatch's message is already fully formed server-side, never re-wrapped
-// or re-translated here.
+// or re-translated here. A remote that could not be read is a kahyad error
+// (exit 2, never the success line). On success, stderr also says when the
+// external anchor was NOT checked (no anchor_remote, FIX-P-3) and when
+// pre-0010 legacy events fall outside the check (G07-2); exit stays 0.
 func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
 	result, err := client.LedgerVerify(context.Background(), traceid.New())
 	if err != nil {
@@ -1513,6 +1516,12 @@ func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
 	if !result.OK {
 		fmt.Fprintln(stderr, result.Message)
 		return 1
+	}
+	if !result.RemoteChecked {
+		fmt.Fprintln(stderr, MsgLedgerVerifyNoRemote)
+	}
+	if result.LegacyEvents > 0 {
+		fmt.Fprintf(stderr, MsgLedgerVerifyLegacyFmt+"\n", result.LegacyEvents, result.ChainBaseEventID)
 	}
 	fmt.Fprintln(stdout, MsgLedgerVerifyOK)
 	return 0

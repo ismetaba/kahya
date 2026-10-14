@@ -110,11 +110,12 @@ func TestVerifyDetectsLocalTamperAfterTwoAnchors(t *testing.T) {
 }
 
 // TestVerifyDetectsRemoteMismatch proves the second, independent leg (task
-// spec step 6: "also pull the remote and compare its last line vs local
-// anchor_log"): if the remote's anchors.log disagrees with the local
-// anchor_log table (simulated here by pushing a bogus line directly to the
-// remote, bypassing Pusher entirely), Verify() reports a mismatch even
-// though the local from-genesis recompute alone is internally consistent.
+// spec step 6: "also pull the remote and compare ... vs local anchor_log"):
+// if the remote's anchors.log disagrees with the local ledger (simulated
+// here by pushing a bogus event-999 line directly to the remote, bypassing
+// Pusher entirely), Verify() reports a mismatch even though the local
+// from-genesis recompute alone is internally consistent - since FIX-P-3 as
+// ReasonRemoteAhead (the remote anchored an event the ledger never reached).
 func TestVerifyDetectsRemoteMismatch(t *testing.T) {
 	st := newTestStore(t)
 	remote := newBareRemote(t)
@@ -154,6 +155,9 @@ func TestVerifyDetectsRemoteMismatch(t *testing.T) {
 	}
 	if len(notifier.calls()) != 1 {
 		t.Errorf("alarm calls = %d, want 1", len(notifier.calls()))
+	}
+	if result.Reason != ReasonRemoteAhead || result.MismatchEventID != 999 {
+		t.Errorf("result = %+v, want Reason %q at event 999", result, ReasonRemoteAhead)
 	}
 }
 

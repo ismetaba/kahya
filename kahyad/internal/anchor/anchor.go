@@ -15,10 +15,12 @@
 // cache of the remote), appends the row's one `anchors.log` line unless the
 // remote already holds it, commits, and pushes - idempotent per anchor_log
 // row, and never on top of a remote that is ahead of the local ledger. verify.go is the read side (`kahya ledger verify`):
-// it recomputes the digest from event 1 forward and, at every point the
-// local anchor_log table recorded a checkpoint, compares the recomputed
-// digest against what was anchored - any mismatch means the local ledger
-// was rewritten after being anchored (tampering), and is reported loudly.
+// it recomputes the digest from genesis and, at every checkpoint the REMOTE
+// anchors.log holds (authoritative; read from a throwaway clone's remote
+// ref) plus the local anchor_log rows, compares the recomputed digest
+// against what was anchored; anchor_log and ledger_digest_state are
+// secondary consistency checks - any mismatch means the local ledger was
+// rewritten after being anchored (tampering), and is reported loudly.
 //
 // HANDOFF §8 explicitly defers "hash-zincir tiyatrosu" (Merkle trees,
 // transparency logs) - this package deliberately builds nothing fancier
@@ -85,6 +87,13 @@ const (
 	// strictly increasing (a second brain.db pushed into this repo, or a
 	// rewritten remote).
 	ReasonRemoteNonMonotonic = "remote_non_monotonic"
+	// ReasonCheckpointNotRecomputable (FIX-P-3): an anchored checkpoint
+	// (remote line or local anchor_log row) names an event the recompute
+	// never reaches - the event was deleted from the middle of the ledger,
+	// a local row lies beyond the last local event, or the checkpoint sits
+	// at or below the legacy chain base (ledger_chain_base, G07-2). Never a
+	// silently skipped comparison.
+	ReasonCheckpointNotRecomputable = "checkpoint_not_recomputable"
 )
 
 // Ledger is the append-only events ledger sink both push.go and verify.go

@@ -29,11 +29,19 @@ func (s *Server) SetLedgerVerifier(v LedgerVerifier) {
 	s.ledgerVerifier = v
 }
 
-// ledgerVerifyResponse is POST /v1/ledger/verify's JSON body.
+// ledgerVerifyResponse is POST /v1/ledger/verify's JSON body. reason is
+// present only when ok is false (one of anchor.Reason*); remote_checked is
+// always present (false = anchor_remote unset, only local self-consistency
+// was checked - FIX-P-3); legacy_events/chain_base_event_id appear only for
+// a ledger with pre-0010 events the external anchor never covered (G07-2).
 type ledgerVerifyResponse struct {
-	OK              bool   `json:"ok"`
-	MismatchEventID int64  `json:"mismatch_event_id,omitempty"`
-	Message         string `json:"message,omitempty"`
+	OK               bool   `json:"ok"`
+	Reason           string `json:"reason,omitempty"`
+	MismatchEventID  int64  `json:"mismatch_event_id,omitempty"`
+	Message          string `json:"message,omitempty"`
+	RemoteChecked    bool   `json:"remote_checked"`
+	LegacyEvents     int64  `json:"legacy_events,omitempty"`
+	ChainBaseEventID int64  `json:"chain_base_event_id,omitempty"`
 }
 
 // handleLedgerVerify implements POST /v1/ledger/verify: runs the full
@@ -62,6 +70,7 @@ func (s *Server) handleLedgerVerify(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ledgerVerifyResponse{
-		OK: result.OK, MismatchEventID: result.MismatchEventID, Message: result.Message,
+		OK: result.OK, Reason: result.Reason, MismatchEventID: result.MismatchEventID, Message: result.Message,
+		RemoteChecked: result.RemoteChecked, LegacyEvents: result.LegacyEvents, ChainBaseEventID: result.ChainBaseEventID,
 	})
 }

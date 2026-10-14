@@ -160,6 +160,12 @@ type Querier interface {
 	// in-flight 'pending' row to retry (offline case, task spec step 5) before
 	// ever considering a new one.
 	GetLatestAnchorLog(ctx context.Context) (AnchorLog, error)
+	// G07-2 (FIX-P-3): the last legacy event id - events with id <=
+	// base_event_id predate 0010's running digest and were never folded into
+	// it. Written once by migrations/0023_anchor_local_fallback.sql, never by
+	// Go code; kahyad/internal/anchor/verify.go recomputes from genesis over
+	// the events after it.
+	GetLedgerChainBase(ctx context.Context) (int64, error)
 	// W4-05 (ledger external anchor + tamper detection) queries below. See
 	// migrations/0010_ledger_anchor.sql for the schema.
 	//

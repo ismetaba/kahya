@@ -4,6 +4,7 @@ package w4gate
 
 import (
 	"database/sql"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -73,11 +74,18 @@ func TestScenarioC_TamperDetectedAgainstRemoteAnchor(t *testing.T) {
 
 // initBareGitRemote creates a fresh --bare git repository under a temp dir
 // and returns its absolute path (for a "file://<path>" anchor.remote -
-// task spec step 5's own "local file:// bare anchor remote").
+// task spec step 5's own "local file:// bare anchor remote"). Its HEAD
+// deliberately names "master", a branch kahyad never pushes (it always
+// pushes "main"): the shape a plain `git init --bare` produces without an
+// init.defaultBranch config, pinned explicitly so the host's git config
+// (Xcode's sets init.defaultBranch=main) cannot hide it. A fresh clone of
+// such a remote has an EMPTY working tree, so this gate proves `kahya ledger
+// verify` reads the remote-tracking ref, not a checkout (FIX-P-3).
 func initBareGitRemote(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "anchor-remote.git")
-	cmd := exec.Command("git", "init", "--bare", "-q", dir)
+	cmd := exec.Command("git", "init", "--bare", "-q", "-b", "master", dir)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare %s: %v\n%s", dir, err, out)
 	}

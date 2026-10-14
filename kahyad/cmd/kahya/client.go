@@ -669,12 +669,19 @@ func (c *Client) TaskResolve(ctx context.Context, traceID, taskID, action string
 
 // ledgerVerifyResult mirrors kahyad's POST /v1/ledger/verify JSON body
 // (kahyad/internal/server.ledgerVerifyResponse, W4-05). Message (only set
-// when OK is false) is already the exact Turkish AlarmMismatch string -
-// `kahya ledger verify` prints it verbatim, never re-wrapped.
+// when OK is false) is already the exact Turkish alarm string -
+// `kahya ledger verify` prints it verbatim, never re-wrapped. Reason is
+// the English mismatch code; RemoteChecked=false means anchor_remote is
+// unset (FIX-P-3); LegacyEvents/ChainBaseEventID describe pre-0010 events
+// outside the anchor's coverage (G07-2).
 type ledgerVerifyResult struct {
-	OK              bool   `json:"ok"`
-	MismatchEventID int64  `json:"mismatch_event_id,omitempty"`
-	Message         string `json:"message,omitempty"`
+	OK               bool   `json:"ok"`
+	Reason           string `json:"reason,omitempty"`
+	MismatchEventID  int64  `json:"mismatch_event_id,omitempty"`
+	Message          string `json:"message,omitempty"`
+	RemoteChecked    bool   `json:"remote_checked"`
+	LegacyEvents     int64  `json:"legacy_events,omitempty"`
+	ChainBaseEventID int64  `json:"chain_base_event_id,omitempty"`
 }
 
 // LedgerVerify calls POST /v1/ledger/verify (`kahya ledger verify`, W4-05):

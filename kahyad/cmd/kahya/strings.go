@@ -229,6 +229,20 @@ const (
 	// too) - no tampering detected. Exit 0.
 	MsgLedgerVerifyOK = "Defter doğrulandı: kurcalama tespit edilmedi."
 
+	// MsgLedgerVerifyNoRemote is printed to stderr (exit code unchanged, 0)
+	// when kahyad reports remote_checked=false (FIX-P-3): anchor_remote is
+	// unset, so only local self-consistency was verified - the external
+	// anchor (HANDOFF §5 #4) was NOT checked. anchor_remote is the real
+	// config.yaml key.
+	MsgLedgerVerifyNoRemote = "Uyarı: anchor_remote ayarlı değil — yalnız yerel tutarlılık denetlendi, dış çapa doğrulanmadı."
+
+	// MsgLedgerVerifyLegacyFmt is printed to stderr (exit code unchanged)
+	// when kahyad reports legacy_events > 0 (G07-2): events written before
+	// the running digest existed (migration 0010) were never digested or
+	// anchored, so verify cannot cover them. %d/%d = how many, the last
+	// such event id.
+	MsgLedgerVerifyLegacyFmt = "Not: defter özeti başlamadan önce yazılmış %d eski olay (event %d ve öncesi) doğrulamanın kapsamı dışında; yalnız sonraki olaylar denetlendi."
+
 	// ---- W5-01: kahya job run <name> (extends the W4-01 kahya-trigger
 	// mechanism with a subcommand on the main CLI) ----
 

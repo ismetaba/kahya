@@ -725,6 +725,22 @@ func (q *Queries) GetLatestAnchorLog(ctx context.Context) (AnchorLog, error) {
 	return i, err
 }
 
+const getLedgerChainBase = `-- name: GetLedgerChainBase :one
+SELECT base_event_id FROM ledger_chain_base WHERE id = 1
+`
+
+// G07-2 (FIX-P-3): the last legacy event id - events with id <=
+// base_event_id predate 0010's running digest and were never folded into
+// it. Written once by migrations/0023_anchor_local_fallback.sql, never by
+// Go code; kahyad/internal/anchor/verify.go recomputes from genesis over
+// the events after it.
+func (q *Queries) GetLedgerChainBase(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getLedgerChainBase)
+	var base_event_id int64
+	err := row.Scan(&base_event_id)
+	return base_event_id, err
+}
+
 const getLedgerDigestState = `-- name: GetLedgerDigestState :one
 
 SELECT id, last_event_id, digest FROM ledger_digest_state WHERE id = 1

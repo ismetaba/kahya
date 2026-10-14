@@ -4,8 +4,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"kahya/kahyad/internal/anchor"
@@ -124,5 +127,57 @@ func TestHandleLedgerVerifyRejectsGET(t *testing.T) {
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestHandleLedgerVerifyEchoesReasonAndRemoteChecked (FIX-P-3): the
+// mismatch reason and whether the remote was actually checked reach the
+// CLI; remote_checked is present even when false, reason only on a
+// mismatch.
+func TestHandleLedgerVerifyEchoesReasonAndRemoteChecked(t *testing.T) {
+	post := func(t *testing.T, result anchor.VerifyResult) string {
+		t.Helper()
+		client := newLedgerTestServer(t, fakeLedgerVerifier{result: result})
+		resp, err := client.Post("http://kahyad/v1/ledger/verify", "application/json", nil)
+		if err != nil {
+			t.Fatalf("POST /v1/ledger/verify: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+
+	raw := post(t, anchor.VerifyResult{
+		OK: false, Reason: anchor.ReasonDigestMismatch, MismatchEventID: 7,
+		Message: fmt.Sprintf(anchor.AlarmMismatch, int64(7)), RemoteChecked: true,
+	})
+	var body ledgerVerifyResponse
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	if body.Reason != anchor.ReasonDigestMismatch || !body.RemoteChecked || body.MismatchEventID != 7 {
+		t.Errorf("mismatch body = %+v, want reason %q, remote_checked true, event 7", body, anchor.ReasonDigestMismatch)
+	}
+
+	raw = post(t, anchor.VerifyResult{OK: true, RemoteChecked: false})
+	if !strings.Contains(raw, `"remote_checked":false`) {
+		t.Errorf("OK body %q lacks \"remote_checked\":false (must never be omitted)", raw)
+	}
+	if strings.Contains(raw, `"reason"`) {
+		t.Errorf("OK body %q carries a reason key, want none on success", raw)
+	}
+
+	raw = post(t, anchor.VerifyResult{OK: true, RemoteChecked: true, LegacyEvents: 54, ChainBaseEventID: 54})
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode %q: %v", raw, err)
+	}
+	if body.LegacyEvents != 54 || body.ChainBaseEventID != 54 {
+		t.Errorf("legacy body = %+v, want legacy_events 54, chain_base_event_id 54", body)
 	}
 }

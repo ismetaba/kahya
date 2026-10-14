@@ -210,6 +210,20 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | local ledger tamper detected vs external anchor | `kahyad/internal/anchor/TestVerifyDetectsLocalTamperAfterTwoAnchors` | W4-05 | ci-hermetic |
 | Safety #4 | remote-anchor mismatch detected | `kahyad/internal/anchor/TestVerifyDetectsRemoteMismatch` | W4-05 | ci-hermetic |
 | Safety #4 | anchor ledger is append-only (first line unchanged on 2nd anchor) | `kahyad/internal/anchor/TestPusherRunSecondAnchorAppendsAndFirstLineUnchanged` | W4-05 | ci-hermetic |
+| Safety #4 | tamper is caught by the remote anchor even after `DELETE FROM anchor_log` and a recomputed `ledger_digest_state` (remote lines are the authority) | `kahyad/internal/anchor/TestVerifyDetectsTamperWhenLocalAnchorLogDeleted` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a truncated ledger (remote anchored a later event) is reported `remote_ahead` | `kahyad/internal/anchor/TestVerifyDetectsLedgerTruncationAgainstRemote` | FIX-P-3 | ci-hermetic |
+| Safety #4 | verify reads the real remote, never Pusher's (forgeable) working clone | `kahyad/internal/anchor/TestVerifyReadsRealRemoteNotPusherWorkingClone` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a reset `ledger_digest_state` is reported `digest_state_mismatch` | `kahyad/internal/anchor/TestVerifyDetectsLedgerDigestStateDrift` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a wiped local `anchor_log` is reported against the remote lines | `kahyad/internal/anchor/TestVerifyFlagsMissingLocalAnchorLogEvenWhenEventsIntact` | FIX-P-3 | ci-hermetic |
+| Safety #4 | deleting an anchored event and recomputing the state is caught (`checkpoint_not_recomputable`), never a skipped comparison | `kahyad/internal/anchor/TestVerifyDetectsDeletedCheckpointedEvent` | FIX-P-3 | ci-hermetic |
+| Safety #4 | an anchor remote whose HEAD names an unborn branch is read through its remote ref (empty fresh-clone checkout) | `kahyad/internal/anchor/TestVerifyReadsRemoteBranchWhenRemoteHEADIsUnborn` | FIX-P-3 | ci-hermetic |
+| Safety #4 | an unreadable anchor remote is an error (exit 2), never OK | `kahyad/internal/anchor/TestVerifyRemoteUnreachableIsErrorNotOK` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a pending (offline) anchor and a rotated anchor repo are not reported as tampering | `kahyad/internal/anchor/TestVerifyOKWithUnpushedPendingAnchor` | FIX-P-3 | ci-hermetic |
+| Safety #4 | concurrent ledger appends and anchor pushes during a verify are not reported as tampering | `kahyad/internal/anchor/TestVerifyToleratesConcurrentLedgerWrites` | FIX-P-3 | ci-hermetic |
+| Safety #4 | pre-0010 legacy events do not trip verify; tampering with a chained event still does | `kahyad/internal/anchor/TestVerifyOKWithPre0010LegacyEvents` | FIX-P-3 | ci-hermetic |
+| Safety #4 | raising the legacy chain base over anchored events is caught (remote line, local row, digest state) | `kahyad/internal/anchor/TestVerifyLegacyChainBaseCannotHideAnchoredTamper` | FIX-P-3 | ci-hermetic |
+| Safety #4 | `kahya ledger verify` with no `anchor_remote` says on stderr that the external anchor was not checked | `kahyad/cmd/kahya/TestLedgerVerifyNoRemotePrintsWarningAndExits0` | FIX-P-3 | ci-hermetic |
+| Safety #4 | `POST /v1/ledger/verify` carries `reason` on a mismatch and always `remote_checked` | `kahyad/internal/server/TestHandleLedgerVerifyEchoesReasonAndRemoteChecked` | FIX-P-3 | ci-hermetic |
 | Safety #4 | anchor push retry never duplicates a remote line: a failed push is retried as the same row-derived line, exactly once | `kahyad/internal/anchor/TestPusherRetryAfterFailedPushDoesNotDuplicateLine` | FIX-P-13 | ci-hermetic |
 | Safety #4 | a failed first push to a brand-new (unborn-branch) anchor remote recovers on the next tick instead of staying pending forever | `kahyad/internal/anchor/TestPusherRecoversWhenFirstPushToEmptyRemoteFails` | FIX-P-13 | ci-hermetic |
 | Safety #4 | a push that landed before its bookkeeping failed is not appended again on retry | `kahyad/internal/anchor/TestPusherSkipsAppendWhenRemoteAlreadyHasLine` | FIX-P-13 | ci-hermetic |

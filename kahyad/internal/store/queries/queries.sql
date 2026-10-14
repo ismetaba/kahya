@@ -809,6 +809,14 @@ VALUES (?, 'tainted', ?, ?);
 -- name: GetLedgerDigestState :one
 SELECT id, last_event_id, digest FROM ledger_digest_state WHERE id = 1;
 
+-- name: GetLedgerChainBase :one
+-- G07-2 (FIX-P-3): the last legacy event id - events with id <=
+-- base_event_id predate 0010's running digest and were never folded into
+-- it. Written once by migrations/0023_anchor_local_fallback.sql, never by
+-- Go code; kahyad/internal/anchor/verify.go recomputes from genesis over
+-- the events after it.
+SELECT base_event_id FROM ledger_chain_base WHERE id = 1;
+
 -- name: AdvanceLedgerDigestState :exec
 -- Called ONLY from inside InsertEventWithDigest's own transaction,
 -- immediately after that same transaction's InsertEvent - both writes

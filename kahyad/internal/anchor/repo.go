@@ -155,6 +155,69 @@ func ensureClone(ctx context.Context, runner GitRunner, remote, repoDir string, 
 	return false, nil
 }
 
+// readRemoteAnchorLines clones remote into a throwaway directory under
+// parentDir and returns anchors.log AS THE REMOTE HOLDS IT (`git show
+// <remoteBranchRef>:anchors.log`) - never a working tree, which (a) stays
+// empty when the remote HEAD names an unborn branch (a bare repo created
+// without `-b main`, tests/acceptance/w4's initBareGitRemote shape) and (b)
+// is writable by anyone with this uid. haveBranch=false means the remote has
+// no anchorBranch yet (never anchored) - not an error. The clone directory
+// is removed before returning (a verify killed mid-run can leave a
+// kahya-anchor-verify-* directory behind; it is safe to delete).
+func readRemoteAnchorLines(ctx context.Context, runner GitRunner, remote, parentDir string, env []string) (lines []anchorLine, haveBranch bool, err error) {
+	if parentDir == "" {
+		parentDir = os.TempDir()
+	}
+	if err := os.MkdirAll(parentDir, 0o700); err != nil {
+		return nil, false, fmt.Errorf("anchor: mkdir %s: %w", parentDir, err)
+	}
+	tmp, err := os.MkdirTemp(parentDir, "kahya-anchor-verify-*")
+	if err != nil {
+		return nil, false, fmt.Errorf("anchor: create verify clone dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	dir := filepath.Join(tmp, "clone") // GitRunner.Clone: dir must not exist yet
+	if _, stderr, err := runner.Clone(ctx, remote, dir, env); err != nil {
+		return nil, false, fmt.Errorf("anchor: git clone (verify): %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if _, _, err := runner.Run(ctx, dir, env, "rev-parse", "--verify", "-q", remoteBranchRef); err != nil {
+		return nil, false, nil // the remote exists but has no anchor branch yet
+	}
+	stdout, stderr, err := runner.Run(ctx, dir, env, "show", remoteBranchRef+":"+anchorLogFileName)
+	if err != nil {
+		return nil, true, fmt.Errorf("anchor: git show %s:%s: %w: %s", remoteBranchRef, anchorLogFileName, err, strings.TrimSpace(stderr))
+	}
+	lines, err = parseAnchorLines(stdout)
+	if err != nil {
+		return nil, true, err
+	}
+	return lines, true, nil
+}
+
+// parseAnchorLines parses every non-blank anchors.log line in order. A
+// malformed line is an error (fail-closed: a remote the verifier cannot
+// read exactly is never "fine").
+func parseAnchorLines(content string) ([]anchorLine, error) {
+	var out []anchorLine
+	sc := bufio.NewScanner(strings.NewReader(content))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		t := strings.TrimSpace(sc.Text())
+		if t == "" {
+			continue
+		}
+		l, err := parseAnchorLine(t)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("anchor: scan anchors.log: %w", err)
+	}
+	return out, nil
+}
+
 // appendAnchorLine appends one already-newline-terminated anchor line to
 // path, creating the file if it does not exist (task spec: "ALSO append
 // every anchor line there with O_APPEND" for the local fallback path;
