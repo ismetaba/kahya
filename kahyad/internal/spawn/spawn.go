@@ -342,12 +342,26 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 		cb.OnStart(cmd.Process.Pid)
 	}
 
-	// Best-effort: a worker that never reads its full envelope (e.g. one
-	// that errors out immediately) must not hang this write forever, but a
-	// broken pipe here is not itself fatal - the process's own exit
-	// code/terminal stdout line, observed below, is still authoritative.
-	_, _ = stdin.Write(payload)
-	_ = stdin.Close()
+	// The envelope is written from its own goroutine (G10 / I-15): a worker
+	// that is alive but never reads its envelope (stuck before its first
+	// read - a Python import hang, a process waiting on a lock) must not pin
+	// Run inside Write once the payload exceeds the pipe buffer (64 KiB on
+	// macOS/Linux; POST /v1/task accepts prompts up to taskBodyMaxBytes).
+	// The select below - the only place ctx's deadline and the halt/timeout
+	// process-group kill live - must stay reachable; that kill also unblocks
+	// this Write with EPIPE, and cmd.Wait closes the parent's write end
+	// (os/exec closes its parent-side pipes once the process is reaped), so
+	// the goroutine always ends shortly after the process does. A broken
+	// pipe is not itself fatal - the process's own exit code/terminal stdout
+	// line, observed below, is still authoritative - but it is relayed as a
+	// diagnostics line by reportStdinWriteErr from Run's own goroutine, so
+	// cb.OnStderr is never called concurrently with Run's return.
+	stdinErrCh := make(chan error, 1)
+	go func() {
+		_, werr := stdin.Write(payload)
+		_ = stdin.Close()
+		stdinErrCh <- werr
+	}()
 
 	var outcome Outcome
 	sawTerminal := false
@@ -431,7 +445,9 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 		// still holds a pipe write-end open. awaitExitBounded gives that
 		// natural path drainGrace to happen on its own before forcing it,
 		// so Run always returns bounded regardless.
-		return awaitExitBounded(stdout, stderr, waitErrCh, &outcome, &sawTerminal), nil
+		o := awaitExitBounded(stdout, stderr, waitErrCh, &outcome, &sawTerminal)
+		reportStdinWriteErr(stdinErrCh, stderrDone, cb)
+		return o, nil
 	case <-waitErrCh:
 		// The worker exited on its own. Reap its process group before
 		// returning (G03 / B-14 robust review): the direct child is already
@@ -452,7 +468,40 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 		// ANY exit without one, per this package's fail-closed posture -
 		// see StatusError's doc comment) when no terminal line was ever
 		// observed.
+		reportStdinWriteErr(stdinErrCh, stderrDone, cb)
 		return finalizeOutcome(outcome, sawTerminal, StatusError), nil
+	}
+}
+
+// stdinReportGrace bounds how long Run waits, after the process is gone, for
+// the envelope-writer goroutine (I-15) to report. By then cmd.Wait has
+// normally closed the parent's write end (which ends a pending Write at
+// once), so this only matters on awaitExitBounded's give-up path.
+const stdinReportGrace = 100 * time.Millisecond
+
+// reportStdinWriteErr relays the envelope stdin write error, if any, to
+// cb.OnStderr as a diagnostics line (G10 / I-15). It runs on Run's own
+// goroutine after the select, so OnStderr is never invoked after Run has
+// returned, and only once the stderr scanner has finished (stderrDone), so
+// the two never call OnStderr concurrently. A writer that has not finished
+// within stdinReportGrace is left to end on its own (its pipe is closed
+// with the process) and reports nothing.
+func reportStdinWriteErr(ch <-chan error, stderrDone <-chan struct{}, cb Callbacks) {
+	timer := time.NewTimer(stdinReportGrace)
+	defer timer.Stop()
+	select {
+	case werr := <-ch:
+		if werr == nil || cb.OnStderr == nil {
+			return
+		}
+		select {
+		case <-stderrDone:
+			cb.OnStderr("spawn: envelope stdin write: " + werr.Error())
+		default:
+			// awaitExitBounded gave up on a scanner that is still running:
+			// drop the diagnostic rather than race it.
+		}
+	case <-timer.C:
 	}
 }
 

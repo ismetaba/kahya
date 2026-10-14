@@ -601,7 +601,12 @@ the proxy pauses, ledgers `task_paused_budget` and alarms once per dispatch
 terminal line, kahyad kills the whole process group and ends the stream
 with `event: error`, message
 `"Görev zaman aşımına uğradı (%d dk)."` (minutes substituted in);
-`tasks.state` → `error`; ledger `task_timeout`.
+`tasks.state` → `error`; ledger `task_timeout`. This holds for a worker that
+never reads its envelope too (FIX-I-15): `spawn.Run` writes the envelope
+to stdin from its own goroutine, so a payload larger than the pipe buffer
+(64 KiB) can no longer pin `Run` in that write before the timeout/halt kill
+is armed; the kill unblocks the write (EPIPE), and a failed envelope write
+is relayed as one `spawn: envelope stdin write: …` stderr diagnostics line.
 
 **A killed worker is never a cloud failure (FIX-I-6):** when the worker
 dies or is killed (task timeout, halt, shutdown) while one of its model
