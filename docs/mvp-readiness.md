@@ -58,7 +58,7 @@ kod-testli (CI'da yeşil)."*
 | §9 kriteri | Kapı sınıfı | Görev | Kanıt (komut / test) | `readiness` alanı |
 | --- | --- | --- | --- | --- |
 | 2 hafta kesintisiz günlük kullanım | kullanım | W78-06 | `kahya readiness --phase=complete` (≥14 gün kayıtlı komut etkinliği); `docs/dogfood.md` doldurulmuş | `usage_gates.window_ok` |
-| ≥10 komut/gün (sürdürülebilir) | kullanım | W78-04 | `kahya readiness --phase=complete` / `kahya metrics` (pencere ort. ≥10 **ve** ≥14 ayrı gün ≥10) | `usage_gates.commands_per_day_ok` |
+| ≥10 komut/gün (sürdürülebilir) | kullanım | W78-04 | `kahya readiness --phase=complete` / `kahya metrics` (pencere ort. ≥10 **ve** ≥14 ayrı gün ≥10; günler `timezone` config dilimine göre, FIX-P-22) | `usage_gates.commands_per_day_ok` |
 | haftada ≥5 "hatırladı" anı | kullanım | W78-04 (W5-03 işaretleme akışı) | `kahya readiness --phase=complete` (hafta başına ort. ≥5) | `usage_gates.remembered_ok` |
 | sıfır veri-kaybı olayı | kullanım | W78-06 | `kahya readiness --phase=complete` `docs/dogfood.md` olay sütununu ayrıştırır — hiç `type: data-loss` satırı yok | `usage_gates.data_loss_ok` |
 | yedekten geri-dönüş bir kez tatbik edildi | inşa | W78-05 | son `restore.drill.result` `ok=true`; `make restore-drill` | `build_gates.restore_drill` |

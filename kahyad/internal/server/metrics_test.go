@@ -30,10 +30,20 @@ func (f *fakeMetricsReader) Compute(_ context.Context, since, until time.Time) (
 
 func newMetricsTestServer(t *testing.T, reader MetricsReader) *http.Client {
 	t.Helper()
+	return newMetricsTestServerIn(t, reader, nil)
+}
+
+// newMetricsTestServerIn is newMetricsTestServer with a calendar zone wired
+// via SetLocation (nil = unset, time.Local).
+func newMetricsTestServerIn(t *testing.T, reader MetricsReader, loc *time.Location) *http.Client {
+	t.Helper()
 	cfg := config.Config{Socket: filepath.Join(shortSocketDir(t), "k.sock")}
 	srv := New(cfg, testLogger(t), "v-metrics-test", healthyDB)
 	if reader != nil {
 		srv.SetMetricsReader(reader)
+	}
+	if loc != nil {
+		srv.SetLocation(loc)
 	}
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -168,7 +178,7 @@ func TestParseSince(t *testing.T) {
 		{"garbage", time.Time{}, true},
 	}
 	for _, c := range cases {
-		got, err := parseSince(c.in, now)
+		got, err := parseSince(c.in, now, time.UTC)
 		if c.wantErr {
 			if err == nil {
 				t.Errorf("parseSince(%q) err = nil, want error", c.in)
@@ -182,5 +192,52 @@ func TestParseSince(t *testing.T) {
 		if !got.Equal(c.want) {
 			t.Errorf("parseSince(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestParseSinceAbsoluteDateIsMidnightInLocation (FIX-P-22): an absolute
+// --since date is midnight in the configured calendar zone, the same zone
+// the metrics day buckets use - "since 2026-07-01" in Istanbul starts at
+// 2026-06-30T21:00Z, never at UTC midnight (which dropped the first three
+// local hours of that day). Relative forms are zone-free.
+func TestParseSinceAbsoluteDateIsMidnightInLocation(t *testing.T) {
+	ist := time.FixedZone("UTC+3", 3*3600)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	got, err := parseSince("2026-07-01", now, ist)
+	if err != nil {
+		t.Fatalf("parseSince: %v", err)
+	}
+	if want := time.Date(2026, 6, 30, 21, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("parseSince(2026-07-01, Istanbul) = %v, want %v", got.UTC(), want)
+	}
+	if got, _ := parseSince("14d", now, ist); !got.Equal(now.Add(-14 * 24 * time.Hour)) {
+		t.Errorf("parseSince(14d, Istanbul) = %v, want now-14d (zone-free)", got)
+	}
+}
+
+// TestHandleMetricsAbsoluteSinceUsesConfiguredLocation (FIX-P-22): GET
+// /metrics reads an absolute since in the zone wired by SetLocation, and
+// passes the reader's timezone through in the JSON body.
+func TestHandleMetricsAbsoluteSinceUsesConfiguredLocation(t *testing.T) {
+	ist := time.FixedZone("UTC+3", 3*3600)
+	reader := &fakeMetricsReader{out: metrics.Metrics{Timezone: "UTC+3"}}
+	client := newMetricsTestServerIn(t, reader, ist)
+	resp, err := client.Get("http://kahyad/metrics?since=2026-07-01")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if want := time.Date(2026, 6, 30, 21, 0, 0, 0, time.UTC); !reader.since.Equal(want) {
+		t.Errorf("reader since = %v, want %v (Istanbul midnight)", reader.since.UTC(), want)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(raw["timezone"]) != `"UTC+3"` {
+		t.Errorf("timezone = %s, want \"UTC+3\"", raw["timezone"])
 	}
 }

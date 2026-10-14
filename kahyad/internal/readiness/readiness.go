@@ -145,7 +145,7 @@ type UsageGates struct {
 	RememberedOK     bool    `json:"remembered_ok"`
 	RememberedPerWk  float64 `json:"remembered_per_week"` // reported
 	WindowOK         bool    `json:"window_ok"`
-	WindowDays       int     `json:"window_days"` // days of recorded activity, reported
+	WindowDays       int     `json:"window_days"` // distinct calendar-zone days with >=1 command, reported
 	DataLossOK       *bool   `json:"data_loss_ok"`
 	DataLossReason   string  `json:"data_loss_reason,omitempty"`
 }
@@ -341,6 +341,10 @@ func ageOf(row EventRow, now time.Time) (*float64, bool) {
 //   - window_ok: >=14 days of recorded command activity present (the "2 hafta
 //     kesintisiz günlük kullanım" window - a day with no command is not a day
 //     of daily use).
+//
+// CommandsPerDay days are the daemon's calendar-zone days (the
+// metrics.Reader location = config timezone, FIX-P-22), so "a day" here is
+// the user's local day, never a date in UTC.
 func EvaluateUsageGates(v MetricsView) UsageGates {
 	var ug UsageGates
 

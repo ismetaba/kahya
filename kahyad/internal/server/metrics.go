@@ -41,8 +41,26 @@ func (s *Server) SetMetricsReader(reader MetricsReader) {
 	s.metricsReader = reader
 }
 
+// SetLocation sets the calendar zone GET /metrics and GET /readiness read an
+// absolute `since` date in (FIX-P-22) - main.go passes cfg.Location(), the
+// same zone the metrics.Reader buckets days in. nil = time.Local. Call
+// before Run.
+func (s *Server) SetLocation(loc *time.Location) {
+	s.calendarLoc = loc
+}
+
+// location is the configured calendar zone (SetLocation), time.Local when
+// unset - the default config.Config.Location() itself has.
+func (s *Server) location() *time.Location {
+	if s.calendarLoc != nil {
+		return s.calendarLoc
+	}
+	return time.Local
+}
+
 // handleMetrics answers GET /metrics?since=<duration|date>. `since` accepts a
-// duration ("14d", "36h", "90m") or an absolute UTC date ("2026-07-01");
+// duration ("14d", "36h", "90m") or an absolute date ("2026-07-01", midnight
+// in the configured calendar zone - FIX-P-22);
 // empty/absent defaults to DefaultMetricsSince. The window's upper bound is
 // "now". The body is the metrics.Metrics JSON with stable keys (veri-yok
 // metrics serialize as JSON null).
@@ -57,7 +75,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	since, err := parseSince(strings.TrimSpace(r.URL.Query().Get("since")), now)
+	since, err := parseSince(strings.TrimSpace(r.URL.Query().Get("since")), now, s.location())
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -79,10 +97,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 //   - "" (empty)                -> now - DefaultMetricsSince
 //   - "<n>d"                    -> now - n*24h  (Go's ParseDuration lacks "d")
 //   - a Go duration ("36h","90m","1h30m") -> now - that duration
-//   - an absolute date "YYYY-MM-DD" (UTC midnight)
+//   - an absolute date "YYYY-MM-DD" (midnight in loc - the configured
+//     calendar zone the metrics day buckets use, FIX-P-22)
 //
 // A negative/zero duration or an unparseable value is a 400-worthy error.
-func parseSince(v string, now time.Time) (time.Time, error) {
+func parseSince(v string, now time.Time, loc *time.Location) (time.Time, error) {
 	if v == "" {
 		return now.Add(-DefaultMetricsSince), nil
 	}
@@ -101,7 +120,7 @@ func parseSince(v string, now time.Time) (time.Time, error) {
 	}
 
 	// Absolute date form.
-	if t, err := time.Parse("2006-01-02", v); err == nil {
+	if t, err := time.ParseInLocation("2006-01-02", v, loc); err == nil {
 		return t, nil
 	}
 

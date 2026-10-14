@@ -10,7 +10,9 @@
 // Metric -> event kind map (verified against the emitters in
 // kahyad/internal/server/task.go, kahyad/internal/anthproxy/governor.go,
 // and kahyad/internal/remembered/remembered.go):
-//   - commands/day        = count(kind='task_spawned') grouped by UTC day
+//   - commands/day        = count(kind='task_spawned') grouped by the
+//     configured calendar day (Reader's location: config timezone via
+//     config.Config.Location(), FIX-P-22)
 //   - clarification rate   = distinct task_spawned traces that ALSO have a
 //     clarification-turn event / distinct task_spawned traces. Since W78-07
 //     kahyad emits kind="clarification_turn" (server/task.go's
@@ -23,8 +25,12 @@
 //   - remembered moments   = count(kind='remembered_moment') in the window.
 //   - cache-hit rate       = sum(cache_read_input_tokens) /
 //     (sum(input_tokens) + sum(cache_read_input_tokens)) over model_call.
-//   - daily spend          = sum(payload.usd) grouped by UTC day, plus a
-//     window total, over model_call.
+//   - daily spend          = sum(payload.usd) grouped by the configured
+//     calendar day, plus a window total, over model_call.
+//
+// Day buckets are computed in Go from the UTC events.ts instants, never via
+// SQLite's local-time date() modifier (which follows whatever TZ the process
+// runs under), so every kahyad "which day is it" decision shares one zone.
 package metrics
 
 import (
@@ -75,13 +81,13 @@ var clarificationKinds = []string{"clarification", "clarification_turn", "acikla
 
 // DayCount is one calendar day's command count (commands/day).
 type DayCount struct {
-	Day   string `json:"day"`   // UTC calendar day, "YYYY-MM-DD"
+	Day   string `json:"day"`   // calendar day in Metrics.Timezone, "YYYY-MM-DD"
 	Count int    `json:"count"` // task_spawned events on that day
 }
 
 // DaySpend is one calendar day's model spend in USD (daily spend).
 type DaySpend struct {
-	Day string  `json:"day"` // UTC calendar day, "YYYY-MM-DD"
+	Day string  `json:"day"` // calendar day in Metrics.Timezone, "YYYY-MM-DD"
 	USD float64 `json:"usd"` // sum(payload.usd) for model_call on that day
 }
 
@@ -91,6 +97,10 @@ type DaySpend struct {
 type Metrics struct {
 	Since time.Time `json:"since"`
 	Until time.Time `json:"until"`
+
+	// Timezone is the zone the day buckets were computed in (the Reader's
+	// location, FIX-P-22) - the CLI renders its date labels in it.
+	Timezone string `json:"timezone"`
 
 	CommandsPerDay []DayCount `json:"commands_per_day"`
 	CommandsTotal  int        `json:"commands_total"`
@@ -118,13 +128,22 @@ type Metrics struct {
 // one with New over a handle from OpenReadOnly; it is safe for concurrent use
 // (every method only SELECTs).
 type Reader struct {
-	db *sql.DB
+	db  *sql.DB
+	loc *time.Location // calendar zone of every day bucket (FIX-P-22)
 }
 
+// dayLayout is the calendar-day bucket key format.
+const dayLayout = "2006-01-02"
+
 // New wraps an already-open read-only *sql.DB (see OpenReadOnly). The caller
-// owns db's lifecycle (main.go closes it on shutdown).
-func New(db *sql.DB) *Reader {
-	return &Reader{db: db}
+// owns db's lifecycle (main.go closes it on shutdown). loc is the calendar
+// zone day buckets are computed in - main.go passes cfg.Location(), the
+// one kahyad-wide calendar zone; nil = time.Local (Location's own default).
+func New(db *sql.DB, loc *time.Location) *Reader {
+	if loc == nil {
+		loc = time.Local
+	}
+	return &Reader{db: db, loc: loc}
 }
 
 // OpenReadOnly opens a DEDICATED connection to the brain.db at dbPath with
@@ -148,7 +167,7 @@ func OpenReadOnly(dbPath string) (*sql.DB, error) {
 // RFC3339Nano) via SQLite's julianday(), which parses the ISO-8601 'Z' form
 // robustly (sqlite >= 3.45, asserted at store boot).
 func (r *Reader) Compute(ctx context.Context, since, until time.Time) (Metrics, error) {
-	m := Metrics{Since: since, Until: until}
+	m := Metrics{Since: since, Until: until, Timezone: r.loc.String()}
 
 	sinceS := since.UTC().Format(time.RFC3339Nano)
 	untilS := until.UTC().Format(time.RFC3339Nano)
@@ -199,34 +218,63 @@ func (r *Reader) Compute(ctx context.Context, since, until time.Time) (Metrics, 
 // RFC3339Nano string compare (fractional-second digits vary).
 const windowClause = `julianday(ts) >= julianday(?) AND julianday(ts) <= julianday(?)`
 
-// commandsPerDay counts task_spawned events grouped by the daemon-local calendar day, plus
-// the window total.
+// commandsPerDay counts task_spawned events grouped by the calendar day
+// in r.loc (config timezone; default the daemon's time.Local), plus the
+// window total. Bucketing happens in Go, never via SQLite's local-time
+// date() modifier, so the zone is the ONE kahyad-wide calendar zone
+// (config.Config.Location()) rather than whatever TZ the process happens
+// to run under (FIX-P-22).
 func (r *Reader) commandsPerDay(ctx context.Context, since, until string) ([]DayCount, int, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT date(ts, 'localtime') AS day, count(*) AS c
-		 FROM events
-		 WHERE kind = ? AND `+windowClause+`
-		 GROUP BY day ORDER BY day`,
+		`SELECT ts FROM events WHERE kind = ? AND `+windowClause+` ORDER BY ts`,
 		kindTaskSpawned, since, until)
 	if err != nil {
 		return nil, 0, fmt.Errorf("metrics: commands/day: %w", err)
 	}
 	defer rows.Close()
 
-	var out []DayCount
+	counts := map[string]int{}
 	total := 0
 	for rows.Next() {
-		var d DayCount
-		if err := rows.Scan(&d.Day, &d.Count); err != nil {
+		var tsS string
+		if err := rows.Scan(&tsS); err != nil {
 			return nil, 0, err
 		}
-		total += d.Count
-		out = append(out, d)
+		day, ok := r.dayOf(tsS)
+		if !ok {
+			continue // unparseable ts: skip the row, never fail the metric (same posture as paletteToFirstTokenP50Ms)
+		}
+		counts[day]++
+		total++
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
+	var out []DayCount
+	for _, day := range sortedKeys(counts) {
+		out = append(out, DayCount{Day: day, Count: counts[day]})
+	}
 	return out, total, nil
+}
+
+// dayOf maps one events.ts (UTC RFC3339Nano) to its calendar day in r.loc.
+func (r *Reader) dayOf(ts string) (string, bool) {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return "", false
+	}
+	return t.In(r.loc).Format(dayLayout), true
+}
+
+// sortedKeys returns m's keys in ascending order ("YYYY-MM-DD" sorts
+// chronologically).
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // clarificationTurnRate = distinct task_spawned traces that ALSO carry a
@@ -402,32 +450,43 @@ func (r *Reader) cacheHitRate(ctx context.Context, since, until string) (*float6
 	return &rate, nil
 }
 
-// dailySpend sums payload.usd over model_call events grouped by daemon-local calendar
-// day, plus the window total.
+// dailySpend sums payload.usd over model_call events grouped by the
+// calendar day in r.loc (bucketed in Go, like commandsPerDay - FIX-P-22),
+// plus the window total. CAST keeps SUM's numeric coercion of the payload
+// value for the per-row read.
 func (r *Reader) dailySpend(ctx context.Context, since, until string) ([]DaySpend, float64, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT date(ts, 'localtime') AS day, COALESCE(SUM(json_extract(payload, '$.usd')), 0) AS usd
+		`SELECT ts, CAST(COALESCE(json_extract(payload, '$.usd'), 0) AS REAL) AS usd
 		 FROM events
 		 WHERE kind = ? AND `+windowClause+`
-		 GROUP BY day ORDER BY day`,
+		 ORDER BY ts`,
 		kindModelCall, since, until)
 	if err != nil {
 		return nil, 0, fmt.Errorf("metrics: daily spend: %w", err)
 	}
 	defer rows.Close()
 
-	var out []DaySpend
+	sums := map[string]float64{}
 	total := 0.0
 	for rows.Next() {
-		var d DaySpend
-		if err := rows.Scan(&d.Day, &d.USD); err != nil {
+		var tsS string
+		var usd float64
+		if err := rows.Scan(&tsS, &usd); err != nil {
 			return nil, 0, err
 		}
-		total += d.USD
-		out = append(out, d)
+		day, ok := r.dayOf(tsS)
+		if !ok {
+			continue // unparseable ts: skip the row, never fail the metric
+		}
+		sums[day] += usd
+		total += usd
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
+	}
+	var out []DaySpend
+	for _, day := range sortedKeys(sums) {
+		out = append(out, DaySpend{Day: day, USD: sums[day]})
 	}
 	return out, total, nil
 }

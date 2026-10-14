@@ -60,7 +60,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	since, err := parseSince(strings.TrimSpace(r.URL.Query().Get("since")), now)
+	since, err := parseSince(strings.TrimSpace(r.URL.Query().Get("since")), now, s.location())
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return

@@ -333,6 +333,11 @@ type Server struct {
 	readinessEvidence ReadinessEvidenceReader
 	readinessMetrics  MetricsReader
 
+	// calendarLoc is the calendar zone GET /metrics and GET /readiness read
+	// an absolute --since date in (FIX-P-22): cfg.Location() via
+	// SetLocation; nil = time.Local (see location()).
+	calendarLoc *time.Location
+
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before
 	// Prepare) when policy.yaml failed to load/validate at boot. Both
 	// /policy/check (task.go's handlePolicyCheck) and /v1/mcp's

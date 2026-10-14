@@ -50,7 +50,7 @@ func newReader(t *testing.T, dbPath string) *Reader {
 		t.Fatalf("OpenReadOnly: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(db, time.UTC)
 }
 
 func compute(t *testing.T, r *Reader) Metrics {
@@ -62,10 +62,9 @@ func compute(t *testing.T, r *Reader) Metrics {
 	return m
 }
 
-// TestCommandsPerDay proves task_spawned counts group per UTC calendar day and
-// sum to the window total.
+// TestCommandsPerDay proves task_spawned counts group per reader-location
+// calendar day (UTC here) and sum to the window total.
 func TestCommandsPerDay(t *testing.T) {
-	t.Setenv("TZ", "UTC") // deterministic local-day bucketing regardless of the runner's timezone
 	dbPath, st := testEnv(t)
 	day1 := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	day2 := time.Date(2026, 7, 11, 15, 0, 0, 0, time.UTC)
@@ -174,9 +173,9 @@ func TestCacheHitRate(t *testing.T) {
 	}
 }
 
-// TestDailySpend proves usd is summed per UTC day and across the window.
+// TestDailySpend proves usd is summed per reader-location day (UTC here) and
+// across the window.
 func TestDailySpend(t *testing.T) {
-	t.Setenv("TZ", "UTC") // deterministic local-day bucketing regardless of the runner's timezone
 	dbPath, st := testEnv(t)
 	day1 := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	day2 := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
@@ -280,7 +279,7 @@ func TestQueryOnlyRejectsWrite(t *testing.T) {
 	}
 
 	before := eventCount(t, db)
-	r := New(db)
+	r := New(db, time.UTC)
 	if _, err := r.Compute(context.Background(), windowSince(), windowNow); err != nil {
 		t.Fatalf("Compute: %v", err)
 	}
@@ -297,4 +296,85 @@ func eventCount(t *testing.T, db *sql.DB) int {
 		t.Fatalf("count events: %v", err)
 	}
 	return n
+}
+
+// istanbul is Europe/Istanbul as a fixed +03:00 zone (no DST since 2016;
+// time.LoadLocation would need tzdata).
+func istanbul() *time.Location { return time.FixedZone("UTC+3", 3*3600) }
+
+// newReaderIn is newReader with an explicit calendar zone.
+func newReaderIn(t *testing.T, dbPath string, loc *time.Location) *Reader {
+	t.Helper()
+	db, err := OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return New(db, loc)
+}
+
+// TestCommandsPerDayBucketsByReaderLocation (FIX-P-22): day buckets follow
+// the Reader's configured zone, not the process TZ. 22:30Z on 07-10 and
+// 02:00Z on 07-11 are the same Istanbul day (07-11) but fall on two
+// different dates in UTC.
+func TestCommandsPerDayBucketsByReaderLocation(t *testing.T) {
+	dbPath, st := testEnv(t)
+	seed(t, st, "a", kindTaskSpawned, time.Date(2026, 7, 10, 22, 30, 0, 0, time.UTC), `{}`)
+	seed(t, st, "b", kindTaskSpawned, time.Date(2026, 7, 11, 2, 0, 0, 0, time.UTC), `{}`)
+
+	for _, tc := range []struct {
+		loc  *time.Location
+		tz   string
+		want []DayCount
+	}{
+		{istanbul(), "UTC+3", []DayCount{{Day: "2026-07-11", Count: 2}}},
+		{time.UTC, "UTC", []DayCount{{Day: "2026-07-10", Count: 1}, {Day: "2026-07-11", Count: 1}}},
+	} {
+		m := compute(t, newReaderIn(t, dbPath, tc.loc))
+		if m.CommandsTotal != 2 {
+			t.Errorf("[%s] CommandsTotal = %d, want 2", tc.tz, m.CommandsTotal)
+		}
+		if m.Timezone != tc.tz {
+			t.Errorf("[%s] Timezone = %q, want %q", tc.tz, m.Timezone, tc.tz)
+		}
+		if len(m.CommandsPerDay) != len(tc.want) {
+			t.Fatalf("[%s] CommandsPerDay = %v, want %v", tc.tz, m.CommandsPerDay, tc.want)
+		}
+		for i, d := range tc.want {
+			if m.CommandsPerDay[i] != d {
+				t.Errorf("[%s] CommandsPerDay = %v, want %v", tc.tz, m.CommandsPerDay, tc.want)
+				break
+			}
+		}
+	}
+}
+
+// TestDailySpendBucketsByReaderLocation (FIX-P-22): the same zone rule for
+// model_call spend.
+func TestDailySpendBucketsByReaderLocation(t *testing.T) {
+	dbPath, st := testEnv(t)
+	seed(t, st, "a", kindModelCall, time.Date(2026, 7, 10, 22, 30, 0, 0, time.UTC), `{"usd":1.25}`)
+	seed(t, st, "b", kindModelCall, time.Date(2026, 7, 11, 2, 0, 0, 0, time.UTC), `{"usd":0.75}`)
+
+	m := compute(t, newReaderIn(t, dbPath, istanbul()))
+	if len(m.DailySpendUSD) != 1 || m.DailySpendUSD[0].Day != "2026-07-11" ||
+		m.DailySpendUSD[0].USD < 1.999 || m.DailySpendUSD[0].USD > 2.001 {
+		t.Fatalf("DailySpendUSD = %v, want [{2026-07-11 2.00}]", m.DailySpendUSD)
+	}
+	if m.DailySpendTotalUSD < 1.999 || m.DailySpendTotalUSD > 2.001 {
+		t.Errorf("DailySpendTotalUSD = %v, want 2.00", m.DailySpendTotalUSD)
+	}
+
+	m = compute(t, newReaderIn(t, dbPath, time.UTC))
+	if len(m.DailySpendUSD) != 2 || m.DailySpendUSD[0].Day != "2026-07-10" || m.DailySpendUSD[1].Day != "2026-07-11" {
+		t.Fatalf("UTC DailySpendUSD = %v, want 2026-07-10 and 2026-07-11", m.DailySpendUSD)
+	}
+}
+
+// TestNewNilLocationIsLocal (FIX-P-22): a nil zone means time.Local - the
+// same default config.Config.Location() has - never UTC.
+func TestNewNilLocationIsLocal(t *testing.T) {
+	if r := New(nil, nil); r.loc != time.Local {
+		t.Fatalf("New(db, nil).loc = %v, want time.Local", r.loc)
+	}
 }

@@ -1106,8 +1106,11 @@ func run() int {
 		log.Warn("metrics_reader_unavailable", "err", mErr.Error())
 	} else {
 		defer metricsDB.Close()
-		metricsReader := metrics.New(metricsDB)
+		// FIX-P-22: day buckets and absolute --since dates use the one
+		// configured calendar zone (config timezone), never the process TZ.
+		metricsReader := metrics.New(metricsDB, cfg.Location())
 		srv.SetMetricsReader(metricsReader)
+		srv.SetLocation(cfg.Location())
 		// W78-06: GET /readiness (`kahya readiness`) - the dogfood-readiness
 		// readout. It reuses the SAME read-only metrics.Reader for the §9
 		// usage gates and reads the recorded build-gate evidence rows via

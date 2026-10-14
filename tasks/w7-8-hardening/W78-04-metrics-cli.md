@@ -25,7 +25,7 @@ Binding HANDOFF items (verbatim):
 > ⚑ **Maliyet valisi (somut):** … Cache-hit oranı ve günlük harcama **alarm verir** …
 
 Data sources (all in `events`, brain.db, single writer kahyad):
-- **commands/day**: count of task-entry events per calendar day.
+- **commands/day**: count of task-entry events per calendar day. (G08/P-22: "calendar day" is the day in the `timezone` config key - `cfg.Location()`, default the daemon's system zone - bucketed in Go, never SQLite `'localtime'`; an absolute `--since YYYY-MM-DD` is midnight in that zone, the `/metrics` JSON carries `timezone`, and the CLI header renders its dates in it. Daily spend uses the same day.)
 - **clarification-turn rate**: fraction of commands where ≥1 clarification-turn event occurred before an action (açıklama-turu, defined above). North star wants this LOW (≥60% complete WITHOUT a clarification turn ⇒ clarification-turn rate ≤40%).
 - **palette-open→first-token p50**: from W6-04 the palette-open and first-token timestamps are logged to events; compute median delta.
 - **"it remembered" moments**: user-marked via W5-03's marking flow (`🌟 Hatırladı` Telegram button + `kahya remembered --trace <id>`); count events with `kind='remembered_moment'` in the window.

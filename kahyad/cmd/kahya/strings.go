@@ -467,7 +467,7 @@ const (
 	MsgMetricsVeriYok = "— (veri yok)"
 
 	// MsgMetricsHeader is the summary table's first line (%s / %s = the
-	// window's since/until UTC dates).
+	// window bounds as dates in the daemon's calendar zone, FIX-P-22).
 	MsgMetricsHeader = "Metrikler (%s → %s)"
 
 	// MsgMetricsCommandsPerDay is the commands/day row: %s = the average

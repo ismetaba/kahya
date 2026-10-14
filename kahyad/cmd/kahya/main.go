@@ -769,7 +769,7 @@ func runMetrics(client *Client, args []string, stdout, stderr io.Writer) int {
 // renderMetricsTable prints the default Turkish metrics summary with each
 // north-star metric annotated by its target and a ✓/✗ verdict.
 func renderMetricsTable(m metricsResult, stdout io.Writer) {
-	fmt.Fprintf(stdout, MsgMetricsHeader+"\n", metricsDayLabel(m.Since), metricsDayLabel(m.Until))
+	fmt.Fprintf(stdout, MsgMetricsHeader+"\n", metricsDayLabel(m.Since, m.Timezone), metricsDayLabel(m.Until, m.Timezone))
 
 	// commands/day: north-star target is >=10/day, evaluated against the
 	// window's average (total commands / number of days in the window).
@@ -820,12 +820,21 @@ func metricsAvgPerDay(m metricsResult) float64 {
 	return float64(m.CommandsTotal) / days
 }
 
-// metricsDayLabel renders a window bound as a bare UTC date for the header.
-func metricsDayLabel(t time.Time) string {
+// metricsDayLabel renders a window bound as a bare date in the daemon's
+// reported calendar zone (metrics.Metrics.Timezone, FIX-P-22) - the zone
+// its day buckets use - falling back to this process's time.Local when the
+// daemon reported none or a name this machine cannot load.
+func metricsDayLabel(t time.Time, tz string) string {
 	if t.IsZero() {
 		return "?"
 	}
-	return t.UTC().Format("2006-01-02")
+	loc := time.Local
+	if tz != "" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
+		}
+	}
+	return t.In(loc).Format("2006-01-02")
 }
 
 // northStarMark maps a target-met boolean to the ✓/✗ marker.

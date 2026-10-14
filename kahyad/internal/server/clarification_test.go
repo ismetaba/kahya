@@ -119,7 +119,7 @@ func TestClarificationTurnRateComputesFromEmittedEvent(t *testing.T) {
 	// A wall-clock window straddling now (events are stamped at write time).
 	since := time.Now().Add(-time.Hour)
 	until := time.Now().Add(time.Hour)
-	m, err := metrics.New(f.store.DB()).Compute(ctx, since, until)
+	m, err := metrics.New(f.store.DB(), time.UTC).Compute(ctx, since, until)
 	if err != nil {
 		t.Fatalf("metrics.Compute: %v", err)
 	}

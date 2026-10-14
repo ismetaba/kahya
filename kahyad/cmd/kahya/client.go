@@ -1158,8 +1158,11 @@ type metricsDaySpend struct {
 }
 
 type metricsResult struct {
-	Since                    time.Time         `json:"since"`
-	Until                    time.Time         `json:"until"`
+	Since time.Time `json:"since"`
+	Until time.Time `json:"until"`
+	// Timezone is the calendar zone the daemon bucketed days in
+	// (metrics.Metrics.Timezone, FIX-P-22); the header labels use it.
+	Timezone                 string            `json:"timezone"`
 	CommandsPerDay           []metricsDayCount `json:"commands_per_day"`
 	CommandsTotal            int               `json:"commands_total"`
 	ClarificationTurnRate    *float64          `json:"clarification_turn_rate"`
