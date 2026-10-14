@@ -163,8 +163,10 @@ func (b *Bot) sendRedactedNotice(ctx context.Context, info policy.PendingApprova
 // Onayla/Reddet keyboard to ONLY the final chunk (task spec step 3). The
 // final chunk's sent *tele.Message identity is remembered (b.cards) so a
 // later callback/expiry can edit that SAME message rather than send a new
-// one.
+// one. The entry is bounded (FIX-P-19): every send sweeps first, see
+// sweepCards.
 func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalInfo) {
+	b.sweepCards(b.clock()) // FIX-P-19: bounded even with no sweep loop running
 	// FIX-P-5: while Telegram is unreachable a multi-chunk card would get
 	// one telegram_offline local line PER CHUNK from send - one line for
 	// the whole card instead (the pending_approvals row and `kahya
@@ -206,7 +208,7 @@ func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalI
 	b.mu.Lock()
 	b.cards[info.ID] = &cardState{
 		ChatID: lastMsg.Chat.ID, MessageID: lastMsg.ID,
-		Text: lastText, TraceID: info.TraceID,
+		Text: lastText, TraceID: info.TraceID, sentAt: b.clock(),
 	}
 	b.mu.Unlock()
 }
@@ -311,11 +313,15 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	return nil
 }
 
+// markResolved marks id's card resolved (at b.clock(), FIX-P-19) and edits
+// it; a no-op for an id with no tracked card - never sent, or already
+// evicted by sweepCards (the engine has decided the tap either way).
 func (b *Bot) markResolved(id, suffix string) {
 	b.mu.Lock()
 	card, ok := b.cards[id]
 	if ok {
 		card.resolved = true
+		card.resolvedAt = b.clock()
 	}
 	b.mu.Unlock()
 	if !ok {
@@ -380,6 +386,7 @@ func (b *Bot) OnApprovalInvalidated(ctx context.Context, info policy.PendingAppr
 	card, ok := b.cards[info.ID]
 	if ok {
 		card.resolved = true
+		card.resolvedAt = b.clock() // FIX-P-19: evicted cardResolvedRetention later
 	}
 	b.mu.Unlock()
 	if !ok {

@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -164,13 +165,28 @@ const longPollTimeout = 10 * time.Second
 // the SAME message (task spec gotcha: "so a stale phone screen can't
 // mislead"), never send a new one. Text is the ORIGINAL final chunk's
 // text, so editing appends a status suffix rather than losing content.
+// sentAt/resolvedAt (FIX-P-19, read off b.clock()) bound how long an entry
+// is kept - see sweepCards.
 type cardState struct {
-	ChatID    int64
-	MessageID int
-	Text      string
-	TraceID   string
-	resolved  bool
+	ChatID     int64
+	MessageID  int
+	Text       string
+	TraceID    string
+	resolved   bool
+	sentAt     time.Time
+	resolvedAt time.Time
 }
+
+// Card-map bounds (FIX-P-19). A card entry exists only so a late or
+// duplicate tap edits the SAME message and answers "Zaten işlendi."; the
+// engine's own pending-approval TTL is 10 minutes, so after cardMaxAge a
+// tap gets the engine's expired answer anyway.
+const (
+	cardResolvedRetention = 1 * time.Hour // late/duplicate taps still answer "Zaten işlendi."
+	cardMaxAge            = 2 * time.Hour // any card, resolved or not
+	maxTrackedCards       = 500           // hard cap: oldest sentAt evicted first
+	cardSweepInterval     = 5 * time.Minute
+)
 
 // Bot is kahyad's W3-07 Telegram approval/alarm surface — one per kahyad
 // process, wired from main.go alongside every other subsystem.
@@ -204,6 +220,9 @@ type Bot struct {
 	// probeBackoff is waitOnline's delay before getMe retry #attempt+1;
 	// nil means defaultProbeBackoff (tests build Bot literals without New).
 	probeBackoff func(attempt int) time.Duration
+	// now is the card-bookkeeping clock (FIX-P-19); nil means time.Now.
+	// Always read through clock(), never called directly.
+	now func() time.Time
 
 	mu    sync.Mutex
 	cards map[string]*cardState
@@ -247,6 +266,7 @@ func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, en
 		home: home, secretLaneGlobs: secretLaneGlobs, log: log,
 		cards:        map[string]*cardState{},
 		probeBackoff: defaultProbeBackoff,
+		now:          time.Now,
 	}
 	if !cfg.Enabled() {
 		b.logDisabled("telegram.chat_id/telegram.user_id not configured")
@@ -365,6 +385,63 @@ func (b *Bot) getMeCtx(ctx context.Context) (*tele.User, error) {
 		return nil, ctx.Err()
 	case r := <-ch:
 		return r.me, r.err
+	}
+}
+
+// clock is the nil-safe reading of b.now (tests build Bot literals
+// without New, leaving now nil).
+func (b *Bot) clock() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+	return b.now()
+}
+
+// sweepCards evicts resolved cards past cardResolvedRetention and any card
+// past cardMaxAge, then enforces maxTrackedCards (oldest sentAt first),
+// and returns how many it evicted (FIX-P-19). Eviction is UX-only and
+// fail-closed: a tap on an evicted card finds no entry, so the engine
+// decides (an expired/consumed id answers "Onay süresi doldu" instead of
+// "Zaten işlendi." - acceptable), and there is no card left to edit.
+func (b *Bot) sweepCards(now time.Time) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	evicted := 0
+	for id, c := range b.cards {
+		if (c.resolved && now.Sub(c.resolvedAt) >= cardResolvedRetention) || now.Sub(c.sentAt) >= cardMaxAge {
+			delete(b.cards, id)
+			evicted++
+		}
+	}
+	if over := len(b.cards) - maxTrackedCards; over > 0 {
+		ids := make([]string, 0, len(b.cards))
+		for id := range b.cards {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return b.cards[ids[i]].sentAt.Before(b.cards[ids[j]].sentAt) })
+		for _, id := range ids[:over] {
+			delete(b.cards, id)
+			evicted++
+		}
+	}
+	if evicted > 0 && b.log != nil {
+		b.log.Info("telegram_cards_swept", "evicted", evicted, "remaining", len(b.cards))
+	}
+	return evicted
+}
+
+// sweepCardsLoop runs sweepCards every interval until ctx ends (Start
+// runs it with cardSweepInterval under the daemon's lifecycle ctx).
+func (b *Bot) sweepCardsLoop(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			b.sweepCards(b.clock())
+		}
 	}
 }
 
@@ -494,7 +571,8 @@ func (b *Bot) ledgerUnauthorized(chatID, userID int64) {
 // the undo-window sweeper already use. FIX-P-5: it first retries getMe
 // with backoff (waitOnline) until Telegram is reachable, so a daemon that
 // booted offline recovers by itself; a cancel during that wait returns at
-// once. No-op on a disabled Bot.
+// once. FIX-P-19: it also runs the periodic card sweep (sweepCardsLoop)
+// until ctx ends. No-op on a disabled Bot.
 func (b *Bot) Start(ctx context.Context) {
 	if !b.Enabled() {
 		return
@@ -502,6 +580,7 @@ func (b *Bot) Start(ctx context.Context) {
 	if !b.waitOnline(ctx) {
 		return
 	}
+	go b.sweepCardsLoop(ctx, cardSweepInterval) // FIX-P-19
 	go func() {
 		<-ctx.Done()
 		b.tb.Stop()

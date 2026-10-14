@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/policy"
 )
@@ -374,4 +376,241 @@ func TestForgedIrreversibleW2CallbackRejectedAtEngine(t *testing.T) {
 	if _, err := fix.Engine.Approve(context.Background(), d.PendingApprovalID, "local", ""); err != nil {
 		t.Fatalf("Approve(surface=local) after the refused Telegram attempt: %v", err)
 	}
+}
+
+// ---- FIX-P-19: the approval-card map is bounded ----
+
+// cardClock is a settable fake clock for b.now (and, where a test needs
+// the engine to agree, policy.Engine.SetClock).
+type cardClock struct{ t time.Time }
+
+func (c *cardClock) now() time.Time          { return c.t }
+func (c *cardClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func newCardClock() *cardClock               { return &cardClock{t: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)} }
+
+// sendTestCard mints a real W2 fs_write pending approval through the
+// engine and delivers its card; returns the pending approval info.
+func sendTestCard(t *testing.T, b *Bot, fix policyFixture, name string) policy.PendingApprovalInfo {
+	t.Helper()
+	toolInput := fsWriteInput(t, name, "icerik "+name)
+	trace := "trace-card-" + name
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "fs_write", TaskID: "task-card-" + name, TraceID: trace, ToolInput: toolInput,
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check(%s) = %+v, %v", name, d, err)
+	}
+	info := policy.PendingApprovalInfo{ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: trace}
+	b.OnPendingApproval(context.Background(), info)
+	b.mu.Lock()
+	_, tracked := b.cards[info.ID]
+	b.mu.Unlock()
+	if !tracked {
+		t.Fatalf("card for %s was not tracked after a successful send", name)
+	}
+	return info
+}
+
+func tapCard(t *testing.T, b *Bot, action byte, id string) {
+	t.Helper()
+	data, err := encodeCallbackData(action, id)
+	if err != nil {
+		t.Fatalf("encodeCallbackData: %v", err)
+	}
+	b.tb.ProcessUpdate(callbackUpdate(testChatID, testUserID, data))
+}
+
+func cardCount(b *Bot) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.cards)
+}
+
+// TestCardsEvictedAfterResolutionRetention (FIX-P-19): a resolved card is
+// kept for cardResolvedRetention (late/duplicate taps still answer "Zaten
+// işlendi.") and then evicted; the sweep is a telegram_cards_swept line.
+func TestCardsEvictedAfterResolutionRetention(t *testing.T) {
+	sender := &fakeSender{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), fix.Engine, nil)
+	clock := newCardClock()
+	b.now = clock.now
+	log, lines := newJSONLTestLogger(t)
+	b.log = log
+
+	info := sendTestCard(t, b, fix, "retention.md")
+	tapCard(t, b, cbActionApprove, info.ID)
+	if len(sender.responded) != 1 || sender.responded[0] != toastApproved {
+		t.Fatalf("responded = %v, want [%q]", sender.responded, toastApproved)
+	}
+
+	clock.advance(cardResolvedRetention - time.Minute)
+	if n := b.sweepCards(clock.now()); n != 0 || cardCount(b) != 1 {
+		t.Fatalf("sweep at retention-1m evicted %d (left %d), want 0 (left 1)", n, cardCount(b))
+	}
+	tapCard(t, b, cbActionApprove, info.ID) // still inside retention
+	if got := sender.responded[len(sender.responded)-1]; got != msgAlreadyHandled {
+		t.Fatalf("tap inside retention answered %q, want %q", got, msgAlreadyHandled)
+	}
+
+	clock.advance(2 * time.Minute)
+	if n := b.sweepCards(clock.now()); n != 1 || cardCount(b) != 0 {
+		t.Fatalf("sweep past retention evicted %d (left %d), want 1 (left 0)", n, cardCount(b))
+	}
+	swept := eventsNamed(lines(), "telegram_cards_swept")
+	if len(swept) != 1 || swept[0]["evicted"] != float64(1) || swept[0]["remaining"] != float64(0) || swept[0]["trace_id"] != testBootTrace {
+		t.Fatalf("telegram_cards_swept lines = %v, want one {evicted:1, remaining:0} with the boot trace_id", swept)
+	}
+}
+
+// TestUnresolvedCardsEvictedAfterMaxAge (FIX-P-19): a card nobody ever
+// tapped is evicted cardMaxAge after it was sent (the engine's own 10-min
+// pending TTL expired long before).
+func TestUnresolvedCardsEvictedAfterMaxAge(t *testing.T) {
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), &fakeSender{}, nil, newAllowGate(t), fix.Engine, nil)
+	clock := newCardClock()
+	b.now = clock.now
+
+	sendTestCard(t, b, fix, "never-tapped.md")
+	clock.advance(cardMaxAge - time.Second)
+	if n := b.sweepCards(clock.now()); n != 0 {
+		t.Fatalf("sweep before cardMaxAge evicted %d, want 0", n)
+	}
+	clock.advance(time.Second)
+	if n := b.sweepCards(clock.now()); n != 1 || cardCount(b) != 0 {
+		t.Fatalf("sweep at cardMaxAge evicted %d (left %d), want 1 (left 0)", n, cardCount(b))
+	}
+}
+
+// TestCardsHardCapEvictsOldest (FIX-P-19): beyond maxTrackedCards live
+// cards, the oldest-sent ones go first.
+func TestCardsHardCapEvictsOldest(t *testing.T) {
+	b := newTestBot(t, testConfig(), &fakeSender{}, nil, newAllowGate(t), nil, nil)
+	base := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	total := maxTrackedCards + 10
+	for i := 0; i < total; i++ {
+		b.cards[fmt.Sprintf("card-%04d", i)] = &cardState{sentAt: base.Add(time.Duration(i) * time.Second)}
+	}
+	now := base.Add(time.Duration(total) * time.Second)
+	if n := b.sweepCards(now); n != 10 {
+		t.Fatalf("sweep evicted %d, want 10", n)
+	}
+	if got := cardCount(b); got != maxTrackedCards {
+		t.Fatalf("cards left = %d, want %d", got, maxTrackedCards)
+	}
+	for i := 0; i < total; i++ {
+		_, ok := b.cards[fmt.Sprintf("card-%04d", i)]
+		if want := i >= 10; ok != want {
+			t.Fatalf("card-%04d present=%v, want %v (the 10 oldest evicted)", i, ok, want)
+		}
+	}
+}
+
+// TestTapOnEvictedCardAnswersExpiredSafely (FIX-P-19): a tap on a card
+// that was already swept is decided by the ENGINE (here: the pending
+// approval expired), answered with the generic expired toast, approves
+// nothing and edits nothing - never a panic.
+func TestTapOnEvictedCardAnswersExpiredSafely(t *testing.T) {
+	sender := &fakeSender{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), fix.Engine, nil)
+	clock := newCardClock()
+	b.now = clock.now
+	fix.Engine.SetClock(clock.now)
+
+	info := sendTestCard(t, b, fix, "evicted.md")
+	clock.advance(cardMaxAge)
+	if n := b.sweepCards(clock.now()); n != 1 {
+		t.Fatalf("sweep evicted %d, want 1", n)
+	}
+	tapCard(t, b, cbActionApprove, info.ID)
+
+	if len(sender.responded) != 1 || sender.responded[0] != msgExpired {
+		t.Fatalf("responded = %v, want [%q] (the engine refuses the expired id)", sender.responded, msgExpired)
+	}
+	if len(sender.edited) != 0 {
+		t.Fatalf("edited = %+v, want none (no tracked card left to edit)", sender.edited)
+	}
+	if n := countLedgerRows(t, fix, "policy_feedback_approved"); n != 0 {
+		t.Fatalf("policy_feedback_approved rows = %d, want 0", n)
+	}
+	if cardCount(b) != 0 {
+		t.Fatalf("cards = %d after the stale tap, want 0 (markResolved on an unknown id is a no-op)", cardCount(b))
+	}
+}
+
+// TestOnApprovalInvalidatedSetsResolvedAt (FIX-P-19): a halt-invalidated
+// card is edited to the byte-exact halt text, marked resolved at the bot's
+// clock, and evicted cardResolvedRetention later.
+func TestOnApprovalInvalidatedSetsResolvedAt(t *testing.T) {
+	sender := &fakeSender{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), fix.Engine, nil)
+	clock := newCardClock()
+	b.now = clock.now
+
+	info := sendTestCard(t, b, fix, "halted.md")
+	clock.advance(3 * time.Minute)
+	b.OnApprovalInvalidated(context.Background(), info)
+
+	b.mu.Lock()
+	card := b.cards[info.ID]
+	resolved, resolvedAt := card.resolved, card.resolvedAt
+	b.mu.Unlock()
+	if !resolved || !resolvedAt.Equal(clock.now()) {
+		t.Fatalf("card resolved=%v resolvedAt=%v, want true at %v", resolved, resolvedAt, clock.now())
+	}
+	if len(sender.edited) != 1 || sender.edited[0].Text != "⛔ Onay geçersiz — görev kullanıcı tarafından durduruldu." {
+		t.Fatalf("edited = %+v, want one edit to the byte-exact halt text", sender.edited)
+	}
+	clock.advance(cardResolvedRetention)
+	if n := b.sweepCards(clock.now()); n != 1 {
+		t.Fatalf("sweep at resolvedAt+retention evicted %d, want 1", n)
+	}
+}
+
+// TestSendApprovalCardSweepsOpportunistically (FIX-P-19): every new card
+// send sweeps first, so the map stays bounded even with no sweep loop
+// running (and in goroutine-free tests).
+func TestSendApprovalCardSweepsOpportunistically(t *testing.T) {
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), &fakeSender{}, nil, newAllowGate(t), fix.Engine, nil)
+	clock := newCardClock()
+	b.now = clock.now
+
+	old := sendTestCard(t, b, fix, "old.md")
+	tapCard(t, b, cbActionDeny, old.ID)
+	clock.advance(cardMaxAge)
+	fresh := sendTestCard(t, b, fix, "fresh.md")
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.cards) != 1 || b.cards[fresh.ID] == nil {
+		t.Fatalf("cards = %v, want only the fresh card", b.cards)
+	}
+	if got := b.cards[fresh.ID].sentAt; !got.Equal(clock.now()) {
+		t.Fatalf("fresh card sentAt = %v, want the bot clock %v", got, clock.now())
+	}
+}
+
+// TestSweepCardsLoopEvictsAndStopsWithContext (FIX-P-19): the periodic
+// sweep (started by Start) evicts stale cards on its own and returns when
+// the daemon's ctx ends.
+func TestSweepCardsLoopEvictsAndStopsWithContext(t *testing.T) {
+	b := newTestBot(t, testConfig(), &fakeSender{}, nil, newAllowGate(t), nil, nil)
+	b.now = time.Now
+	b.mu.Lock()
+	b.cards["stale"] = &cardState{sentAt: time.Now().Add(-cardMaxAge)}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.sweepCardsLoop(ctx, 5*time.Millisecond)
+	}()
+	waitFor(t, 2*time.Second, "the loop to evict the stale card", func() bool { return cardCount(b) == 0 })
+	cancel()
+	waitReturned(t, done, time.Second, "sweepCardsLoop after cancel")
 }
