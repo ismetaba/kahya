@@ -174,6 +174,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | #0 | a worker-plane caller cannot self-approve a W3 pending approval via /approvals/{id}/decision | `kahyad/internal/server/TestApprovalsDecisionRequiresControlSecret` | FIX-B-3 | ci-hermetic |
 | #0 | `can_use_tool` is preflight only: a worker-side /policy/check never mints a pending approval, token or undo window | `kahyad/internal/policy/TestCheckPreflightNeverMintsPendingOrToken` | FIX-B-1 | ci-hermetic |
 | #0 | approval routes (/policy/feedback, /approvals/{id}/decision) never hand out the raw grant token | `kahyad/internal/server/TestPolicyFeedbackAndDecisionResponsesOmitRawToken` | FIX-B-1 | ci-hermetic |
+| #0 | the worker's real CLI session defines no Claude Code built-in tool (only the kahya_memory MCP tools), so no tool runs outside kahyad's gate (`subtest builtin_tools_absent`; options pinned by worker/tests/test_main.py TestBuildOptionsBuiltinToolsDisabled) | `tests/e2e/TestW12Acceptance` | FIX-B-15 | local-integration |
 | Safety #1 | allowlist-external egress hard-blocked after sensitive read, session-lifetime | `kahyad/internal/egress/TestCheck_SensitiveReadBlocksNonAllowlistedHost` | W3-05 | ci-hermetic |
 | Safety #1 | sensitive-read flag only rises, never clears | `kahyad/internal/egress/TestSensitiveTracker_RisesOnlyNeverClears` | W3-05 | ci-hermetic |
 | Safety #1 | sensitive-read mark survives kahyad restart + resume (persisted row, same trace_id) | `kahyad/internal/egress/TestSensitiveTracker_PersistsAcrossRestart` | FIX-B-7 | ci-hermetic |

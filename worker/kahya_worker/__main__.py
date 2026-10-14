@@ -134,6 +134,50 @@ ALLOWED_TOOLS = [
     "mcp__kahya_memory__memory_forget",
 ]
 
+# B-15 fix: Claude Code's BUILT-IN tools are never exposed to this worker's
+# model. `tools=[]` in _build_options removes every built-in from the session
+# outright (the SDK passes `--tools ""` to the CLI, which turns every name in
+# its built-in set into a deny rule; MCP tools are not in that set); this
+# list is the belt-and-braces `--disallowedTools` layer on top, so that even
+# a CLI version that re-introduces a built-in by default still refuses it.
+# The pinned CLI never routes the read-only built-ins (Read/Glob/Grep/LS
+# inside cwd) through can_use_tool at all - its own permission model
+# auto-allows them - so omission + policy gate was NOT enough: the only tools
+# this session may ever call are the kahya_memory MCP tools, every one of
+# which goes through kahyad's /policy/check (HANDOFF §5 ⚑). Never add an
+# mcp__ name here. A future need for a WebFetch-like capability is a
+# kahyad-owned MCP tool (taint + egress gate), never a removal from this list.
+#
+# The names from "CronCreate" on are further built-ins of the pinned bundled
+# CLI: before this fix it defined them (and most of the names above) in the
+# worker session, as recorded from the real CLI by tests/e2e
+# TestW12Acceptance/builtin_tools_absent.
+BUILTIN_TOOLS_DISALLOWED = [
+    "Bash", "BashOutput", "KillShell", "KillBash",
+    "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead",
+    "Glob", "Grep", "LS",
+    "WebFetch", "WebSearch",
+    "Task", "Agent", "Skill",
+    "TodoWrite", "TodoRead",
+    "ExitPlanMode", "EnterPlanMode", "AskUserQuestion",
+    "CronCreate", "CronDelete", "CronList",
+    "EnterWorktree", "ExitWorktree",
+    "ReportFindings", "ScheduleWakeup", "SendMessage",
+    "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+    "Workflow", "ToolSearch",
+]
+
+# B-15 fix: no filesystem settings source is ever loaded by the worker's CLI.
+# In the pinned SDK (claude-agent-sdk 0.2.111) setting_sources=None means
+# "load every source" (the CLI default: ~/.claude/settings.json, the cwd's
+# project .claude/settings.json + settings.local.json and CLAUDE.md files),
+# which would hand the worker session the developer's hooks (shell commands
+# run by the CLI), permission allow rules (which auto-allow a tool before
+# can_use_tool fires) and CLAUDE.md. [] is the SDK's isolation mode: it
+# passes `--setting-sources=` (empty) to the CLI. The CLI's own login
+# (passthrough credential mode) is not a settings source and is unaffected.
+WORKER_SETTING_SOURCES: tuple[str, ...] = ()
+
 # --- OWNER AUTH DECISION (docs/ipc.md's W12-08 note; this task's spec) ---
 #
 # HANDOFF §4 assumes kahyad injects a real Anthropic API key read from the
@@ -394,6 +438,13 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
         model=envelope.model,
         resume=envelope.session_id if envelope.resume else None,
         system_prompt=SYSTEM_PROMPT,
+        # B-15 fix: no built-in tools at all (see BUILTIN_TOOLS_DISALLOWED).
+        # MCP tools (mcp_servers below) are unaffected by `tools` - it only
+        # selects the CLI's built-in set ("" = none).
+        tools=[],
+        disallowed_tools=list(BUILTIN_TOOLS_DISALLOWED),
+        # B-15 fix: no settings.json / CLAUDE.md (see WORKER_SETTING_SOURCES).
+        setting_sources=list(WORKER_SETTING_SOURCES),
         mcp_servers={
             "kahya_memory": {
                 "type": "stdio",
@@ -414,15 +465,16 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
         # event=tool_gate logging it drives - HANDOFF §5 ⚑) dead code for
         # exactly the 3 tools this worker actually calls. Deliberately left
         # EMPTY (the SDK default) instead: with permission_mode="default"
-        # below, every tool call - the 3 memory tools AND any SDK built-in
-        # file/exec tool the model might attempt - is routed through
-        # can_use_tool, which denies anything that is not memory_search per
-        # kahyad's interim /policy/check table. Built-in tools are
-        # therefore still effectively unavailable, just enforced by the
-        # policy gate rather than by omission from allowed_tools. See
-        # worker/tests/test_main.py::TestBuildOptions for the regression
-        # that proves types._get_can_use_tool_shadowed_warning returns
-        # falsy for these exact options (i.e. can_use_tool truly fires).
+        # below, every MCP tool call the model attempts is routed through
+        # can_use_tool and kahyad's /policy/check. Built-in tools are
+        # removed outright via `tools=[]` + `disallowed_tools` (B-15): the
+        # CLI auto-allows its read-only built-ins inside cwd without ever
+        # consulting can_use_tool, so the policy gate alone never covered
+        # them. `allowed_tools` stays EMPTY so can_use_tool keeps firing
+        # for every MCP call. See worker/tests/test_main.py::TestBuildOptions
+        # for the regression that proves
+        # types._get_can_use_tool_shadowed_warning returns falsy for these
+        # exact options (i.e. can_use_tool truly fires).
         allowed_tools=[],
         # Default permission_mode so can_use_tool actually fires (task
         # spec step 2) - never "bypassPermissions"/"acceptEdits", which
@@ -572,6 +624,11 @@ def _build_reader_options(envelope: Envelope) -> ClaudeAgentOptions:
         model=envelope.model,
         system_prompt="",
         tools=[],
+        # B-15: same belt-and-braces built-in denial and settings isolation
+        # as the Actor session (no user/project hooks, permission rules or
+        # CLAUDE.md reach the Reader either).
+        disallowed_tools=list(BUILTIN_TOOLS_DISALLOWED),
+        setting_sources=list(WORKER_SETTING_SOURCES),
         mcp_servers={},
         allowed_tools=[],
         permission_mode="default",

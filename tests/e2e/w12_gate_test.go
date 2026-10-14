@@ -196,6 +196,38 @@ func TestW12Acceptance(t *testing.T) {
 		}
 	})
 
+	// B-15: the real bundled CLI, started by the real worker with
+	// tools=[] + disallowed_tools + setting_sources=[], must define NO
+	// Claude Code built-in tool in any model call, while the kahya_memory
+	// MCP tools stay defined on the main (hafiza-carrying) call - the
+	// hermetic proof that --tools "" removes only the built-in set.
+	t.Run("builtin_tools_absent", func(t *testing.T) {
+		if hafizaReqBody == nil {
+			t.Skip("injection_into_model_call did not find the main model call; nothing to verify")
+		}
+		for i, req := range mock.Requests() {
+			if !strings.HasPrefix(req.Path, "/v1/messages") {
+				continue
+			}
+			for _, name := range requestToolNames(t, req.Body) {
+				if !strings.HasPrefix(name, "mcp__") {
+					t.Errorf("request %d (%s) defines non-MCP tool %q: Claude Code built-in tools must be removed from the worker session (B-15)", i, req.Path, name)
+				}
+			}
+		}
+		names := requestToolNames(t, hafizaReqBody)
+		t.Logf("main model call tools = %v", names)
+		hasMemory := false
+		for _, name := range names {
+			if strings.HasPrefix(name, "mcp__kahya_memory__") {
+				hasMemory = true
+			}
+		}
+		if !hasMemory {
+			t.Errorf("main model call defines no mcp__kahya_memory__ tool (got %v): disabling built-ins must not remove the MCP tools", names)
+		}
+	})
+
 	t.Run("answer", func(t *testing.T) {
 		if stdout == "" {
 			t.Fatal("cli stdout is empty")
@@ -836,4 +868,24 @@ func hafizaInjectedPayload(t *testing.T, dbPath, traceID string) map[string]any 
 		t.Fatalf("decode hafiza_injected payload: %v: %s", err, payloads[0])
 	}
 	return m
+}
+
+// requestToolNames returns the "name" of every entry in a recorded
+// /v1/messages request body's top-level "tools" array (empty when the body
+// carries none, e.g. /v1/messages/count_tokens or an auxiliary call).
+func requestToolNames(t *testing.T, body []byte) []string {
+	t.Helper()
+	var req struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("recorded request body is not JSON: %v", err)
+	}
+	names := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
 }

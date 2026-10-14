@@ -702,7 +702,17 @@ declared ids honored.
 `mcp__<server>__<tool>` prefix (e.g.
 `mcp__kahya_memory__memory_search`) is stripped down to the bare tool name
 (`memory_search`) — built-in tools arrive bare already
-(`kahyad/internal/policy.Canonicalize`). `scope` is optional (defaults to
+(`kahyad/internal/policy.Canonicalize`). The Actor worker starts the CLI
+with `--tools ""`, `--disallowedTools …` and `--setting-sources=` (B-15:
+`tools=[]`, `disallowed_tools=BUILTIN_TOOLS_DISALLOWED`,
+`setting_sources=[]` in `kahya_worker.__main__._build_options`; the Reader
+gets the same three), so no Claude Code built-in tool is defined in the
+session and no `settings.json` hook, permission allow rule or `CLAUDE.md`
+is loaded; the CLI auto-allowed its read-only built-ins (Read/Glob/Grep
+inside cwd) without ever calling `can_use_tool`, which is why omission plus
+this gate was not enough. A built-in tool name reaching `/policy/check` is
+therefore only ever a defense-in-depth event, denied as an unknown tool.
+`scope` is optional (defaults to
 `"global"`) — the ladder's third key dimension alongside `tool`; `class`
 is never accepted from the caller, only ever resolved from the loaded
 `policy.yaml`.

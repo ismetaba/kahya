@@ -495,6 +495,98 @@ class TestBuildOptions(unittest.TestCase):
         self.assertFalse(warning, f"can_use_tool is shadowed and would never fire: {warning!r}")
 
 
+# B-15: the built-in names every Actor session must refuse (a subset of
+# worker_main.BUILTIN_TOOLS_DISALLOWED - the list may grow, never shrink).
+B15_REQUIRED_DISALLOWED = {
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS",
+    "WebFetch", "WebSearch", "Task", "NotebookEdit",
+}
+
+
+def _cli_command_for(options):
+    """Formats (never spawns) the pinned SDK's own CLI argv for options.
+
+    SubprocessCLITransport takes no cli_path kwarg in claude-agent-sdk
+    0.2.111: _build_command reads options.cli_path and raises
+    CLINotFoundError while it is None, so it is set first. /bin/true is
+    never executed - _build_command only formats argv."""
+    import dataclasses
+
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    opts = dataclasses.replace(options, cli_path="/bin/true")
+    return SubprocessCLITransport(prompt="x", options=opts)._build_command()
+
+
+class TestBuildOptionsBuiltinToolsDisabled(unittest.TestCase):
+    """B-15: Claude Code's built-in tools (Read/Glob/Grep/LS run inside cwd
+    without ever reaching can_use_tool) are removed from the Actor session
+    outright - tools=[] (CLI --tools "") plus a --disallowedTools layer -
+    and no filesystem settings (user/project/local settings.json, their
+    hooks and permission allow rules, CLAUDE.md) are loaded."""
+
+    def _options(self, **overrides):
+        from kahya_worker.envelope import parse_envelope
+
+        d = dict(VALID_ENVELOPE)
+        d.update(overrides)
+        env = parse_envelope(json.dumps(d).encode("utf-8"))
+        return worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+
+    def _assert_builtins_disabled(self, options) -> None:
+        self.assertEqual(options.tools, [])
+        self.assertTrue(
+            set(options.disallowed_tools) >= B15_REQUIRED_DISALLOWED,
+            f"missing from disallowed_tools: {B15_REQUIRED_DISALLOWED - set(options.disallowed_tools)}",
+        )
+        self.assertEqual(set(options.disallowed_tools), set(worker_main.BUILTIN_TOOLS_DISALLOWED))
+        self.assertFalse(
+            any(t.startswith("mcp__") for t in options.disallowed_tools),
+            "the kahya_memory MCP tools must never be disallowed",
+        )
+        self.assertEqual(options.allowed_tools, [])
+        self.assertEqual(options.permission_mode, "default")
+        # Deviation from the handbook recipe (which expected None): in the
+        # pinned SDK None means "load every settings source" (the CLI
+        # default); [] is the SDK's isolation mode.
+        self.assertEqual(options.setting_sources, [])
+        self.assertIn("kahya_memory", options.mcp_servers)
+        self.assertIsNotNone(options.can_use_tool)
+
+    def test_builtin_tools_disabled_tools_empty_and_disallowed(self) -> None:
+        self._assert_builtins_disabled(self._options())
+
+    def test_builtin_tools_disabled_on_resume(self) -> None:
+        options = self._options(resume=True, session_id="sess-1")
+        self.assertEqual(options.resume, "sess-1")
+        self._assert_builtins_disabled(options)
+
+    def test_can_use_tool_still_not_shadowed_with_tools_disabled(self) -> None:
+        from claude_agent_sdk.types import _get_can_use_tool_shadowed_warning
+
+        options = self._options()
+        warning = _get_can_use_tool_shadowed_warning(options.permission_mode, options.allowed_tools)
+        self.assertFalse(warning, f"can_use_tool is shadowed and would never fire: {warning!r}")
+
+    def test_cli_command_disables_builtin_tools(self) -> None:
+        try:
+            cmd = _cli_command_for(self._options())
+        except (ImportError, AttributeError, TypeError) as e:  # pragma: no cover - SDK internals moved
+            self.skipTest(f"SDK internals changed (requirements.lock pins claude-agent-sdk): {e}")
+        i = cmd.index("--tools")
+        self.assertEqual(cmd[i + 1], "")
+        j = cmd.index("--disallowedTools")
+        self.assertTrue(set(cmd[j + 1].split(",")) >= B15_REQUIRED_DISALLOWED)
+        # No filesystem settings at all: exactly one empty --setting-sources=.
+        self.assertEqual([c for c in cmd if c.startswith("--setting-sources")], ["--setting-sources="])
+        self.assertNotIn("--allowedTools", cmd)
+        self.assertNotIn("--dangerously-skip-permissions", cmd)
+        k = cmd.index("--permission-mode")
+        self.assertEqual(cmd[k + 1], "default")
+        m = cmd.index("--mcp-config")
+        self.assertIn("kahya_memory", json.loads(cmd[m + 1])["mcpServers"])
+
+
 class TestBuildOptionsApprovalWait(unittest.TestCase):
     """B-1: the bridge's tools/call budget (set by kahyad when an approval
     wait is configured) reaches the kahya-mcp stdio server explicitly."""
@@ -664,6 +756,24 @@ class TestReaderMode(unittest.TestCase):
         self.assertEqual(options.system_prompt, "")
         self.assertEqual(options.permission_mode, "default")
         self.assertIs(options.can_use_tool, worker_main._reader_deny_all_tools)
+
+    def test_build_reader_options_loads_no_filesystem_settings(self) -> None:
+        """B-15: the toolless Reader loads no settings.json (no user/project
+        hooks or permission rules, no CLAUDE.md) and refuses the built-ins
+        by name too, on top of tools=[]."""
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(self.READER_ENVELOPE).encode("utf-8"))
+        options = worker_main._build_reader_options(env)
+        self.assertEqual(options.setting_sources, [])
+        self.assertEqual(set(options.disallowed_tools), set(worker_main.BUILTIN_TOOLS_DISALLOWED))
+        try:
+            cmd = _cli_command_for(options)
+        except (ImportError, AttributeError, TypeError) as e:  # pragma: no cover - SDK internals moved
+            self.skipTest(f"SDK internals changed (requirements.lock pins claude-agent-sdk): {e}")
+        self.assertEqual([c for c in cmd if c.startswith("--setting-sources")], ["--setting-sources="])
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertNotIn("--mcp-config", cmd)
 
     def test_reader_deny_all_tools_denies_everything(self) -> None:
         import asyncio
