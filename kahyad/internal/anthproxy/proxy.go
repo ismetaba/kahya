@@ -839,7 +839,10 @@ type usageCapturingBody struct {
 	partial []byte // trailing partial SSE line, carried across Read calls
 	jsonBuf bytes.Buffer
 
-	onDone func(u Usage, bodyErr error) // called exactly once, on the first error/EOF Read observes
+	// onDone is called exactly once: on the first error/EOF Read observes,
+	// or - if the body is closed before that - by Close with
+	// errClientDisconnected (FIX-I-11).
+	onDone func(u Usage, bodyErr error)
 	done   bool
 }
 
@@ -871,6 +874,41 @@ func (b *usageCapturingBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// errClientDisconnected marks a usageCapturingBody that was closed by
+// httputil.ReverseProxy BEFORE the upstream reached EOF: the worker's HTTP
+// client went away mid-stream (CLI killed, task halted, worker crashed) and
+// ReverseProxy's copy loop stopped on the failed client write and closed the
+// upstream body instead of reading it to an error. The tokens the upstream
+// already generated are still billed by Anthropic, so they are recorded with
+// whatever usage had been observed so far (FIX-I-11).
+var errClientDisconnected = errors.New("anthproxy: client disconnected before upstream EOF")
+
+// Close records the call if Read never observed an error/EOF (FIX-I-11).
+// ReverseProxy calls Read and Close from the same handler goroutine (the
+// copy loop, then its deferred/explicit res.Body.Close), so the done flag
+// needs no lock: whichever of the two sees the end first records, exactly
+// once, and the other is a no-op.
+func (b *usageCapturingBody) Close() error {
+	err := b.ReadCloser.Close()
+	if b.done {
+		return err
+	}
+	b.done = true
+	if b.isSSE {
+		if len(b.partial) > 0 {
+			// A final "data:" line that arrived without its trailing
+			// newline: feed it so its usage is not lost.
+			b.sse.Feed(string(b.partial))
+			b.partial = nil
+		}
+		b.onDone(b.sse.Usage(), errClientDisconnected)
+		return err
+	}
+	u, _ := ParseNonStreamUsage(b.jsonBuf.Bytes())
+	b.onDone(u, errClientDisconnected)
+	return err
+}
+
 func (b *usageCapturingBody) feedSSE(chunk []byte) {
 	b.partial = append(b.partial, chunk...)
 	for {
@@ -894,14 +932,30 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 	}
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 	status := resp.StatusCode
+	// The outbound request's context is derived from the INBOUND (worker)
+	// request's: it ends when the worker hangs up.
+	inboundCtx := resp.Request.Context()
 
 	wrapped := &usageCapturingBody{ReadCloser: resp.Body, isSSE: isSSE}
 	wrapped.onDone = func(u Usage, bodyErr error) {
 		durationMs := time.Since(data.Start).Milliseconds()
+		// FIX-I-11: "aborted" = the worker went away mid-stream; the usage
+		// observed so far (a lower bound - message_delta may not have
+		// arrived) is still recorded. Two shapes reach here: ReverseProxy
+		// closed the body after a failed client write (Close ->
+		// errClientDisconnected), or the upstream Read was cut by the
+		// cancelled inbound context. The aborted branch stays FIRST among
+		// the body-error branches (G00 C-8: before any later
+		// context.Canceled classification).
 		statusStr := "ok"
-		if status >= 400 {
+		switch {
+		case status >= 400:
 			statusStr = "error"
-		} else if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {
+		case errors.Is(bodyErr, errClientDisconnected):
+			statusStr = "aborted"
+		case bodyErr != nil && !errors.Is(bodyErr, io.EOF) && inboundCtx.Err() != nil:
+			statusStr = "aborted"
+		case bodyErr != nil && !errors.Is(bodyErr, io.EOF):
 			statusStr = "error"
 		}
 

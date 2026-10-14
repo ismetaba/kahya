@@ -210,6 +210,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | anchor ledger is append-only (first line unchanged on 2nd anchor) | `kahyad/internal/anchor/TestPusherRunSecondAnchorAppendsAndFirstLineUnchanged` | W4-05 | ci-hermetic |
 | Safety #4 | every `<hafiza>` injection block logged with `block_sha256` | `kahyad/internal/server/TestMemorySearchForInjectionLedgersHafizaInjected` | W12-05 | ci-hermetic |
 | Safety #4 | e2e `hafiza_injected` + sha256 over real bins | `tests/e2e/TestW12Acceptance` | W12-10 | local-integration |
+| Safety #4 | every model call is ledgered once even when the worker hangs up mid-stream: the proxy's body Close records the usage observed so far (`model_call` status `aborted`), a later upstream EOF never records twice | `kahyad/internal/anthproxy/TestUsageCapturingBodyCloseBeforeEOFRecordsOnce` | FIX-I-11 | ci-hermetic |
+| Safety #4 | through the real reverse proxy: a failed client write mid-stream still yields exactly one `model_call` row (`aborted`, observed input tokens billed) | `kahyad/internal/anthproxy/TestProxyRecordsUsageWhenClientWriteFailsMidStream` | FIX-I-11 | ci-hermetic |
 | Safety #5 | homoglyph host normalized/rejected (WYSIWYE) | `kahyad/internal/canon/TestNormalize_HomoglyphHost` | W3-06 | ci-hermetic |
 | Safety #5 | bidi-override filename normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_BidiFilename` | W3-06 | ci-hermetic |
 | Safety #5 | zero-width URL normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_ZeroWidthURL` | W3-06 | ci-hermetic |

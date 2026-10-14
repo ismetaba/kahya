@@ -255,6 +255,18 @@ model allowlist 400 → governor 503 → keychain 503 → upstream):
   three ledger kinds; with the pinned CLI they see only the main
   `POST /v1/messages` call.
 
+**FIX-I-11 — a client that disconnects mid-stream is still billed.** A
+client that disconnects mid-stream still produces a `model_call` row
+(`status=aborted`) with the usage observed so far (a lower bound: the
+`message_delta` carrying `output_tokens` may not have arrived). Two shapes
+reach it: `httputil.ReverseProxy` stops on a failed client write and
+*closes* the upstream body (`usageCapturingBody.Close` records with
+`errClientDisconnected`, flushing a trailing partial SSE line), or the
+upstream read is cut by the worker's cancelled inbound context. Exactly
+one row per call either way (a clean EOF still records `ok` once; the
+later `Close` is a no-op); the governor's reservation is still released by
+`ServeHTTP`'s defer. The stream is never drained on the worker's behalf.
+
 **Post-review addition (BLOCKER 2 fix)** — `Governor.CheckBeforeForward`
 is now an atomic check-and-reserve, not a plain check-then-act: it
 reserves a conservative (fail-closed = over-, never under-estimated)
