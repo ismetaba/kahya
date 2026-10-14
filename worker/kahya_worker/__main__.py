@@ -547,6 +547,10 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
     # against the turn's complete answer, not just its last fragment.
     any_tool_use = False
     answer_text: list[str] = []
+    # FIX-I-17: whether the turn actually concluded with a ResultMessage -
+    # tracked explicitly, never inferred from the loop ending (see the check
+    # after the try block).
+    saw_result = False
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -583,6 +587,7 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
                             # soru sorduğu tur" (§6). Latched, never reset.
                             any_tool_use = True
                 elif isinstance(message, ResultMessage):
+                    saw_result = True
                     if message.is_error:
                         result_text = str(message.result)
                         if _is_cloud_unreachable_text(result_text):
@@ -612,6 +617,20 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
             _print_protocol_line({"event": "cloud_unreachable"})
             return _EXIT_CLOUD_UNREACHABLE
         wlog.log("error", "sdk_error", error=str(e))
+        _print_protocol_line(
+            {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
+        )
+        return 1
+
+    if not saw_result:
+        # FIX-I-17: claude_agent_sdk's receive_response() ends SILENTLY when
+        # the CLI transport sends its {"type":"end"} sentinel - a CLI that
+        # exited 0 without ever delivering a ResultMessage (a non-zero exit
+        # raises ProcessError into the except branch above instead). Never
+        # report success for a turn that never concluded (fail-closed):
+        # kahyad treats this explicit error line as terminal (FIX-I-2), so
+        # the task fails instead of being recorded 'done'.
+        wlog.log("error", "model_stream_ended_without_result", task_id=envelope.task_id)
         _print_protocol_line(
             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
         )
@@ -688,6 +707,7 @@ async def _run_reader_session(envelope: Envelope) -> int:
     _run_session uses, so kahyad/internal/spawn.Run needs no Reader-
     specific parsing of its own."""
     options = _build_reader_options(envelope)
+    saw_result = False  # FIX-I-17: same explicit tracking as _run_session.
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -699,6 +719,7 @@ async def _run_reader_session(envelope: Envelope) -> int:
                         if isinstance(block, TextBlock):
                             _print_protocol_line({"type": "delta", "text": block.text})
                 elif isinstance(message, ResultMessage):
+                    saw_result = True
                     if message.is_error:
                         result_text = str(message.result)
                         if _is_cloud_unreachable_text(result_text):
@@ -719,6 +740,16 @@ async def _run_reader_session(envelope: Envelope) -> int:
             _print_protocol_line({"event": "cloud_unreachable"})
             return _EXIT_CLOUD_UNREACHABLE
         wlog.log("error", "reader_sdk_error", error=str(e))
+        _print_protocol_line(
+            {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
+        )
+        return 1
+
+    if not saw_result:
+        # FIX-I-17: the stream ended without a ResultMessage - see the same
+        # check in _run_session. A half-streamed Reader JSON object must never
+        # be reported as a finished result.
+        wlog.log("error", "reader_stream_ended_without_result", task_id=envelope.task_id)
         _print_protocol_line(
             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
         )

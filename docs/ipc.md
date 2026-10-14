@@ -575,6 +575,17 @@ treats this as `task_error` with the generic Turkish message
 trace_id substituted in). This also covers the case where kahyad could not
 even manage the process at all (e.g. `worker_cmd` misconfigured).
 
+**The worker never fakes a result (FIX-I-17):** `claude_agent_sdk`'s
+`receive_response()` ends silently when the CLI transport sends its
+`{"type":"end"}` sentinel — a CLI that exited 0 without ever delivering a
+`ResultMessage`. The worker tracks whether a `ResultMessage` arrived; a
+stream that ends without one is reported as `error` (exit 1, the usual
+`"Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace %s"` message,
+JSONL `model_stream_ended_without_result`, or
+`reader_stream_ended_without_result` in reader mode), never `result ok` —
+so kahyad fails the task (FIX-I-2) instead of recording an unconcluded turn
+as `done`.
+
 **`tasks.status` after the worker exits (W4-02/FIX-I-2):** a terminal
 `error` line moves `tasks.status` to `failed` (the worker itself said the
 task is over — nothing is left to resume), and so does a run kahyad could

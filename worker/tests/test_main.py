@@ -1087,5 +1087,63 @@ class TestSttMode(unittest.TestCase):
             )
 
 
+class TestStreamWithoutResult(unittest.TestCase):
+    """FIX-I-17: claude_agent_sdk's receive_response() ends silently when the
+    CLI transport sends its {"type":"end"} sentinel - a CLI that exits 0
+    without ever delivering a ResultMessage. The worker used to fall through
+    to an unconditional {"type":"result","status":"ok"} + exit 0, which
+    kahyad records as 'done' for a turn that never concluded. A stream that
+    ends without a ResultMessage is now an error (fail-closed)."""
+
+    def test_stream_ending_without_result_message_is_error_not_fake_ok(self) -> None:
+        msgs = [AssistantMessage(content=[TextBlock(text="yarım?")], model="claude-sonnet-5", session_id="sess-half")]
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=msgs)
+            )
+            events = [r["event"] for r in read_jsonl(os.path.join(log_dir, "worker.jsonl"))]
+
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            lines[-1],
+            {"type": "error", "message": worker_main.MSG_MODEL_CALL_FAILED_FMT.format(trace_id=VALID_ENVELOPE["trace_id"])},
+        )
+        self.assertFalse(any(l.get("type") == "result" for l in lines), lines)
+        # The unconcluded turn signals nothing else either: its partial text
+        # ends in "?" but no clarification_turn event may follow.
+        self.assertFalse(any(l.get("event") == "clarification_turn" for l in lines), lines)
+        self.assertIn("model_stream_ended_without_result", events)
+        self.assertNotIn("task_done", events)
+
+    def test_empty_stream_is_error_not_fake_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=[])
+            )
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 1)
+        self.assertEqual(lines[-1]["type"], "error")
+        self.assertFalse(any(l.get("type") == "result" for l in lines), lines)
+
+    def test_reader_stream_ending_without_result_is_error(self) -> None:
+        msgs = [AssistantMessage(content=[TextBlock(text='{"summary":')], model="claude-haiku-4-5")]
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(TestReaderMode.READER_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=msgs)
+            )
+            events = [r["event"] for r in read_jsonl(os.path.join(log_dir, "worker.jsonl"))]
+
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            lines[-1],
+            {"type": "error", "message": worker_main.MSG_MODEL_CALL_FAILED_FMT.format(trace_id=VALID_ENVELOPE["trace_id"])},
+        )
+        self.assertFalse(any(l.get("type") == "result" for l in lines), lines)
+        self.assertIn("reader_stream_ended_without_result", events)
+        self.assertNotIn("reader_task_done", events)
+
+
 if __name__ == "__main__":
     unittest.main()
