@@ -877,3 +877,38 @@ func TestStdoutLineFieldNamesMatchIPCContract(t *testing.T) {
 		t.Errorf("stdoutLine decoded wrong: %+v", sl)
 	}
 }
+
+// TestBuildEnvSetsMCPTimeoutsOnlyWhenApprovalWaitSet (B-1): a positive
+// approval wait widens the kahya-mcp bridge's tools/call budget (wait+60 s)
+// and the bundled CLI's per-MCP-call hard limit ((wait+90) s in ms) - the
+// last value wins even over a parent shell's own MCP_TOOL_TIMEOUT; 0 adds
+// neither.
+func TestBuildEnvSetsMCPTimeoutsOnlyWhenApprovalWaitSet(t *testing.T) {
+	lastValue := func(env []string, key string) (string, bool) {
+		val, ok := "", false
+		for _, kv := range env {
+			if strings.HasPrefix(kv, key+"=") {
+				val, ok = strings.TrimPrefix(kv, key+"="), true
+			}
+		}
+		return val, ok
+	}
+	t.Setenv("MCP_TOOL_TIMEOUT", "1000") // a parent-shell value must not shorten the call
+
+	got := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs", ApprovalWaitSeconds: 300}, Envelope{TaskID: "t", TraceID: "tr"})
+	if v, _ := lastValue(got, "KAHYA_MCP_TOOLCALL_TIMEOUT_S"); v != "360" {
+		t.Errorf("KAHYA_MCP_TOOLCALL_TIMEOUT_S = %q, want 360", v)
+	}
+	if v, _ := lastValue(got, "MCP_TOOL_TIMEOUT"); v != "390000" {
+		t.Errorf("MCP_TOOL_TIMEOUT (last value) = %q, want 390000", v)
+	}
+
+	t.Setenv("MCP_TOOL_TIMEOUT", "")
+	none := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs"}, Envelope{TaskID: "t", TraceID: "tr"})
+	if v, ok := lastValue(none, "KAHYA_MCP_TOOLCALL_TIMEOUT_S"); ok {
+		t.Errorf("KAHYA_MCP_TOOLCALL_TIMEOUT_S = %q with no approval wait, want absent", v)
+	}
+	if v, ok := lastValue(none, "MCP_TOOL_TIMEOUT"); ok && v != "" {
+		t.Errorf("MCP_TOOL_TIMEOUT = %q with no approval wait, want absent/empty", v)
+	}
+}

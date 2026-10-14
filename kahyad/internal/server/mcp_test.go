@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -50,6 +51,10 @@ type mcpTestFixture struct {
 	memoryDir string
 	repoRoot  string
 	store     *store.Store
+	// engine is the fixture's policy engine, its approval-decided hook
+	// wired to srv.ApprovalDecided exactly as main.go wires it (B-1).
+	engine *policy.Engine
+	sock   string
 }
 
 func newMCPTestFixture(t *testing.T) mcpTestFixture {
@@ -77,7 +82,9 @@ func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	srv.SetSearcher(searcher)
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(memDir, idx)
-	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
+	engine := policy.NewEngine(testPolicyDoc(), st.Queries, st)
+	engine.SetApprovalDecidedHook(srv.ApprovalDecided)
+	srv.SetPolicyEngine(engine)
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -87,6 +94,7 @@ func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	return mcpTestFixture{
 		srv: srv, client: unixHTTPClient(socketPath),
 		memoryDir: memDir, repoRoot: repoRoot, store: st,
+		engine: engine, sock: socketPath,
 	}
 }
 
@@ -239,7 +247,14 @@ func TestMCPGateDeniesMemoryWriteWithTurkishReasonAndLedgers(t *testing.T) {
 	if !parsed.Result.IsError {
 		t.Fatalf("result.isError = false, want true (needs approval); body=%s", body)
 	}
-	wantReason := policy.ReasonNeedsApproval
+	// B-1: with approval waiting disabled (this fixture never calls
+	// SetApprovalWait), the binding gate answers at once with the pending
+	// id the human can approve and the instruction for the model.
+	var pendingID string
+	if err := f.store.DB().QueryRow(`SELECT id FROM pending_approvals WHERE tool = 'memory_write'`).Scan(&pendingID); err != nil {
+		t.Fatalf("read pending approval id: %v", err)
+	}
+	wantReason := fmt.Sprintf(MsgApprovalPendingFmt, pendingID)
 	if len(parsed.Result.Content) == 0 || parsed.Result.Content[0].Text != wantReason {
 		t.Fatalf("deny message = %+v, want %q", parsed.Result.Content, wantReason)
 	}

@@ -332,6 +332,9 @@ func writeConfigYAML(t *testing.T, homeDir string, opts daemonOpts) {
 	}
 	var b strings.Builder
 	b.WriteString("task_timeout_min: 2\n")
+	// B-1: hermetic gates never park a needs_approval tool call for the
+	// 300s default approval wait - it answers at once with its pending id.
+	b.WriteString("approval_wait_seconds: 0\n")
 	b.WriteString("embed_cmd: []\n")
 	fmt.Fprintf(&b, "egress_port: %d\n", freeTCPPort(t))
 

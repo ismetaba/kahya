@@ -89,28 +89,15 @@ func waitForSentMessages(t *testing.T, fake *faketelegram.Server, want int, time
 // Reddet keyboard, and naming a Turkish filename fixture byte-exact.
 // Approving it (surface="telegram", the exact server-side call a real
 // button tap makes - kahyad/internal/telegram/approvals.go's
-// handleCallback) is then followed by an execution: this test promotes
-// fs_write/W2/global to auto-allow (the ONLY sanctioned way to raise a
-// ladder level, `kahya autonomy promote` - HANDOFF S4) and re-issues the
-// IDENTICAL fs_write call, which now auto-executes end to end through the
-// real mcp/fs.Server.HandleWrite (Check -> ConsumeToken -> write ->
-// ledger, all in one call) — see the note below this doc comment for why
-// this two-step "approve, then separately promote" shape is what actually
-// proves execution using ONLY landed code.
-//
-// NOTE on why promotion, not a token replay: kahyad/internal/policy.
-// Engine.Approve mints a fresh one-time token when a pending approval is
-// approved, but nothing in the CURRENTLY LANDED system ever hands that
-// token back to the ORIGINAL tool call for a resumed retry — mcp/fs's
-// HandleWrite always performs its own fresh Check (never accepts a
-// pre-approved token as an argument), and a fresh Check for the SAME
-// (tool,class,scope) triple is governed by the LADDER LEVEL, not by
-// whether some earlier pending id was separately approved. This is a real
-// (if narrow) gap in the approve -> execute wiring; it does not undermine
-// any safety invariant (the action still can't execute without SOME valid
-// decision + a freshly consumed token), so it is noted here rather than
-// patched under this commit (see this task's own report for the
-// suggestion to wire a resume path in a follow-up task).
+// handleCallback; fs_write is W2 + reversible: true in this suite's
+// fixture, the only kind of tool Telegram may approve since B-11) is then
+// followed by an execution with NO ladder promotion (B-1): the model's
+// identical fs_write retry reaches the real mcp/fs.Server.HandleWrite,
+// whose binding Engine.Check redeems the single-use approval grant into a
+// fresh token it consumes, and the write happens exactly once. A third
+// identical call needs approval again (the grant is single-use). This
+// suite runs with approval_wait_seconds: 0 (the first call answers at
+// once); TestGate1c proves the parked-call variant of the same loop.
 func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 	fake := faketelegram.New()
 	t.Cleanup(fake.Close)
@@ -154,17 +141,14 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 		t.Fatalf("Telegram card text is NOT byte-exact to the canonical rendering.\n--- telegram ---\n%s\n--- canonical (GET /policy/approvals?id=) ---\n%s", card.Text, rendered)
 	}
 
-	// Approve — see this test's own doc comment for why this is driven via
-	// POST /policy/feedback directly (surface="telegram") rather than
-	// through the fake transport's callback delivery: this is the EXACT
-	// call kahyad/internal/telegram/approvals.go's handleCallback makes on
-	// a real inline-button tap, and doing it this way recovers the
-	// freshly-minted token this test needs. Gate 2's forged-callback
-	// subtest independently drives a REAL callback through this SAME fake
-	// transport end to end.
-	ok, token, errMsg := d.policyFeedback(t, "approve", id, "telegram")
-	if !ok || token == "" {
-		t.Fatalf("approve(surface=telegram) failed: ok=%v token=%q err=%q", ok, token, errMsg)
+	// Approve — driven via POST /policy/feedback directly
+	// (surface="telegram"): this is the EXACT call kahyad/internal/
+	// telegram/approvals.go's handleCallback makes on a real inline-button
+	// tap. Gate 2's forged-callback subtest independently drives a REAL
+	// callback through this SAME fake transport end to end.
+	ok, errMsg := d.policyFeedback(t, "approve", id, "telegram")
+	if !ok {
+		t.Fatalf("approve(surface=telegram) failed: ok=%v err=%q", ok, errMsg)
 	}
 
 	db := d.openDB(t)
@@ -179,14 +163,12 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 		t.Fatalf("policy_feedback_approved payload = %v, want it to contain remote:true", approvedPayloads)
 	}
 
-	// Promote to auto-allow, then re-issue the IDENTICAL fs_write call -
-	// this time it Checks ALLOW, consumes a fresh token, and actually
-	// writes, all inside mcp/fs.Server.HandleWrite.
-	d.promoteToAutoAllow(t, "fs_write", "W2", "global")
-
+	// B-1: NO promotion - the IDENTICAL fs_write retry redeems the
+	// approval grant inside mcp/fs.Server.HandleWrite's own binding Check
+	// (Check -> redeem -> ConsumeToken -> write -> ledger, in one call).
 	res2 := d.mcpCall(t, traceID, taskID, "fs_write", args)
 	if res2.IsError {
-		t.Fatalf("fs_write after promotion = %+v, want success", res2)
+		t.Fatalf("fs_write after the Telegram approval = %+v, want success (grant redeemed)", res2)
 	}
 
 	writtenPath := filepath.Join(d.homeDir, "Kahya-w3-gate", "evlerimizden-tatil-notlarim.md")
@@ -205,11 +187,102 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 		t.Fatalf("fs_write ledger events for this trace_id = %d, want exactly 1 (execution happened exactly once)", n)
 	}
 
+	if !waitForEvent(t, db, traceID, "approval_grant_redeemed", 3*time.Second) {
+		t.Fatal("no approval_grant_redeemed ledger event for this trace_id")
+	}
+	if n := countEventsMatching(t, db, traceID, "approval_grant_redeemed"); n != 1 {
+		t.Fatalf("approval_grant_redeemed for this trace_id = %d, want exactly 1", n)
+	}
+
 	// A second attempt to consume the ALREADY-consumed approval id is
 	// rejected (single-use) - the one manual approval could not, on its
 	// own, be replayed into a second execution.
-	if ok2, _, _ := d.policyFeedback(t, "approve", id, "telegram"); ok2 {
+	if ok2, _ := d.policyFeedback(t, "approve", id, "telegram"); ok2 {
 		t.Fatal("re-approving the same (already-consumed) pending_approval_id must fail")
+	}
+
+	// And the redeemed grant is single-use too: a THIRD identical call is
+	// back to needs_approval, with a fresh pending approval for the human.
+	beforeThird := d.existingApprovalIDs(t, "fs_write")
+	res3 := d.mcpCall(t, traceID, taskID, "fs_write", args)
+	if !res3.IsError {
+		t.Fatalf("third identical fs_write = %+v, want needs_approval (the grant is single-use)", res3)
+	}
+	if fresh := d.newPendingID(t, "fs_write", beforeThird); fresh == id {
+		t.Fatalf("third call reused the consumed pending id %s", id)
+	}
+	if n := countEventsMatching(t, db, traceID, "fs_write"); n != 1 {
+		t.Fatalf("fs_write ledger events after the third call = %d, want still exactly 1", n)
+	}
+}
+
+// TestGate1c_ApprovalWaitParksCallThenExecutes is B-1's end-to-end gate
+// over the real kahyad binary: with approval_wait_seconds > 0 a fresh (L0)
+// fs_write PARKS inside kahyad instead of failing; a Telegram approval
+// (reversible W2 in this suite's fixture) wakes it, and the SAME in-flight
+// call executes the approved bytes exactly once - the model never has to
+// retry, and the bytes never pass back through it.
+func TestGate1c_ApprovalWaitParksCallThenExecutes(t *testing.T) {
+	fake := faketelegram.New()
+	t.Cleanup(fake.Close)
+	d := bootKahyad(t, daemonOpts{
+		telegramURL: fake.URL(), telegramChatID: gateTelegramChatID, telegramUserID: gateTelegramUserID,
+		approvalWaitSeconds: 30,
+	})
+
+	const traceID = "trace-gate1c-wait-0001"
+	const taskID = "task-gate1c"
+	const path = "~/Kahya-w3-gate/evlerimizden-bekleyen-not.md"
+	content := []byte("Onay bekleyen yazı: evlerimizden çıkınca vapura bindik.")
+	args := map[string]any{"path": path, "content_base64": base64.StdEncoding.EncodeToString(content)}
+
+	before := d.existingApprovalIDs(t, "fs_write")
+	d.seedResolvableSession(t, taskID, traceID)
+	type callOutcome struct {
+		res mcpResult
+		err error
+	}
+	ch := make(chan callOutcome, 1)
+	go func() {
+		r, err := d.mcpCallResult(traceID, taskID, "fs_write", args)
+		ch <- callOutcome{r, err}
+	}()
+
+	id := d.newPendingID(t, "fs_write", before)
+	select {
+	case o := <-ch:
+		t.Fatalf("fs_write answered before any decision (%+v, %v), want it parked", o.res, o.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if ok, errMsg := d.policyFeedback(t, "approve", id, "telegram"); !ok {
+		t.Fatalf("approve(surface=telegram) failed: %q", errMsg)
+	}
+	var o callOutcome
+	select {
+	case o = <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("parked fs_write did not finish within 10s of the approval")
+	}
+	if o.err != nil || o.res.IsError {
+		t.Fatalf("parked fs_write after approval = %+v, %v; want success", o.res, o.err)
+	}
+	written, err := os.ReadFile(filepath.Join(d.homeDir, "Kahya-w3-gate", "evlerimizden-bekleyen-not.md"))
+	if err != nil || string(written) != string(content) {
+		t.Fatalf("written file = %q, %v; want %q byte-exact", written, err, content)
+	}
+
+	db := d.openDB(t)
+	if !waitForEvent(t, db, traceID, "fs_write", 3*time.Second) {
+		t.Fatal("no fs_write (execution) ledger event")
+	}
+	for _, kind := range []string{"approval_wait_started", "approval_wait_ended", "approval_grant_redeemed", "fs_write"} {
+		if n := countEventsMatching(t, db, traceID, kind); n != 1 {
+			t.Errorf("%s ledger events for this trace_id = %d, want exactly 1", kind, n)
+		}
+	}
+	ended := eventPayloads(t, db, traceID, "approval_wait_ended")
+	if len(ended) != 1 || !strings.Contains(ended[0], `"outcome":"approved"`) {
+		t.Fatalf("approval_wait_ended payloads = %v, want one with outcome approved", ended)
 	}
 }
 

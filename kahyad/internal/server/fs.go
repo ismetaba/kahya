@@ -55,15 +55,34 @@ func (s *Server) SetFSTool(fsSrv *mcpfs.Server) {
 type enginePolicyClient struct {
 	engine  *policy.Engine
 	denyAll func() bool
+	// check (B-1) is Server.checkWithApprovalWait when built via
+	// Server.FSPolicyClient (production): a needs_approval parks the tool
+	// call until the human decides and an approval is redeemed. nil
+	// (NewFSPolicyClient - tests) means a direct engine.Check, no waiting.
+	check func(ctx context.Context, in policy.CheckInput) (policy.Decision, error)
+}
+
+// FSPolicyClient (B-1) is the production mcp/fs.PolicyClient (also reused
+// by mcp/shell and mcp/osascript): the SAME adapter NewFSPolicyClient
+// builds, routed through checkWithApprovalWait so an fs/shell/osascript
+// call that needs approval waits for it and then executes exactly the
+// approved bytes. Call after SetPolicyEngine.
+func (s *Server) FSPolicyClient() mcpfs.PolicyClient {
+	return enginePolicyClient{engine: s.policyEngine, denyAll: s.DenyAll, check: s.checkWithApprovalWait}
 }
 
 func (a enginePolicyClient) Check(ctx context.Context, tool, scope, taskID, traceID string, toolInput []byte) (mcpfs.PolicyDecision, error) {
 	if a.denyAll() {
 		return mcpfs.PolicyDecision{Result: mcpfs.PolicyResultDeny, Reason: policy.ReasonDenyAll}, nil
 	}
-	d, err := a.engine.Check(ctx, policy.CheckInput{
-		Tool: tool, Scope: scope, TaskID: taskID, TraceID: traceID, ToolInput: toolInput,
-	})
+	in := policy.CheckInput{Tool: tool, Scope: scope, TaskID: taskID, TraceID: traceID, ToolInput: toolInput}
+	var d policy.Decision
+	var err error
+	if a.check != nil {
+		d, err = a.check(ctx, in)
+	} else {
+		d, err = a.engine.Check(ctx, in)
+	}
 	return mcpfs.PolicyDecision{
 		Result: d.Result, Reason: d.Reason, Class: string(d.Class),
 		Token: d.Token, PendingApprovalID: d.PendingApprovalID,
@@ -77,9 +96,10 @@ func (a enginePolicyClient) ConsumeToken(ctx context.Context, token, tool, class
 	})
 }
 
-// NewFSPolicyClient constructs the mcp/fs.PolicyClient adapter main.go
-// wires mcp/fs.New with. engine must not be nil; denyAll is typically
-// srv.DenyAll (a *Server already in scope at wiring time).
+// NewFSPolicyClient constructs the plain (non-waiting) mcp/fs.PolicyClient
+// adapter - tests use it; production wires Server.FSPolicyClient (B-1),
+// which adds the approval wait. engine must not be nil; denyAll is
+// typically srv.DenyAll.
 func NewFSPolicyClient(engine *policy.Engine, denyAll func() bool) mcpfs.PolicyClient {
 	return enginePolicyClient{engine: engine, denyAll: denyAll}
 }

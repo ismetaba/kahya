@@ -119,9 +119,12 @@ type policyFeedbackRequest struct {
 	TraceID string `json:"trace_id,omitempty"` // required for kind="undo"
 }
 
+// policyFeedbackResponse never carries the approval's raw token (B-1):
+// the grant is redeemed server-side by the parked tool call's own binding
+// Engine.Check, so a raw value on the wire would only be something another
+// process could try to present to /policy/consume-token.
 type policyFeedbackResponse struct {
 	OK    bool   `json:"ok"`
-	Token string `json:"token,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -141,12 +144,11 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Kind {
 	case "approve":
-		result, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, req.Surface, req.Typed)
-		if err != nil {
+		if _, err := s.policyEngine.Approve(r.Context(), req.PendingApprovalID, req.Surface, req.Typed); err != nil {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, policyFeedbackResponse{OK: true, Token: result.Token})
+		writeJSON(w, http.StatusOK, policyFeedbackResponse{OK: true})
 	case "deny":
 		if err := s.policyEngine.Deny(r.Context(), req.PendingApprovalID); err != nil {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: err.Error()})

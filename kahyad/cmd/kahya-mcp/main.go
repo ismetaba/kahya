@@ -35,8 +35,12 @@
 // bridge's side. That is what "the bridge is a dumb pipe; no logic, no
 // state" (task spec) means concretely: every incoming line is forwarded
 // completely independently of every other line, with no MCP protocol
-// awareness in this binary at all - it never parses a tool name, a
-// method, or a result; it only frames lines and relays bytes.
+// awareness in this binary at all - it never parses a tool name or a
+// result; it only frames lines and relays bytes. The one field it peeks
+// at is the JSON-RPC "method", and only to pick a timeout: a tools/call
+// may be parked by kahyad for a human approval (B-1,
+// KAHYA_MCP_TOOLCALL_TIMEOUT_S), every other method keeps the fast
+// dead-daemon budget.
 //
 // No logic/state beyond that framing: this binary performs no tool
 // dispatch, no policy decisions, no ledgering. Diagnostics go to stderr
@@ -100,6 +104,46 @@ func resolveRequestTimeout() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// toolCallTimeoutEnvVar (B-1) widens the per-request budget ONLY for
+// tools/call messages: kahyad may legitimately park a side-effectful call
+// for approval_wait_seconds waiting for a human approval
+// (kahyad/internal/spawn.BuildEnv sets this to approval_wait_seconds+60).
+// Every other JSON-RPC method (initialize, tools/list, ...) keeps the
+// "dead daemon detected fast" budget, and the dial itself is always
+// bounded by resolveRequestTimeout - a stopped kahyad is still reported
+// within 5s on any method.
+const toolCallTimeoutEnvVar = "KAHYA_MCP_TOOLCALL_TIMEOUT_S"
+
+// resolveToolCallTimeout returns the tools/call budget: toolCallTimeoutEnvVar
+// when it is a valid positive number of seconds at least as long as the
+// ordinary budget, else resolveRequestTimeout (never shorter than it).
+func resolveToolCallTimeout() time.Duration {
+	base := resolveRequestTimeout()
+	v := os.Getenv(toolCallTimeoutEnvVar)
+	if v == "" {
+		return base
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds <= 0 || time.Duration(seconds)*time.Second < base {
+		return base
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// requestMethod best-effort parses a JSON-RPC line's "method" ("" when the
+// line is not a JSON object or has none - such a line gets the ordinary
+// budget). The bridge still never interprets anything else: this only
+// picks a timeout.
+func requestMethod(line string) string {
+	var probe struct {
+		Method string `json:"method"`
+	}
+	if json.Unmarshal([]byte(line), &probe) != nil {
+		return ""
+	}
+	return probe.Method
+}
+
 // mcpEndpoint is kahyad's fixed MCP route. The host part is a fake
 // hostname (never resolved - the Transport's DialContext always dials the
 // UDS socket instead), matching the "http://kahyad/..." convention every
@@ -135,11 +179,14 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	logLine(stderr, traceID, "info", "bridge_start", "socket="+sock)
 
+	// No client-wide Timeout: relay bounds each request by its own
+	// context (tools/call may wait for an approval - B-1), while the dial
+	// is always bounded by the ordinary budget.
+	dialTimeout := resolveRequestTimeout()
 	client := &http.Client{
-		Timeout: resolveRequestTimeout(),
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
+				d := net.Dialer{Timeout: dialTimeout}
 				return d.DialContext(ctx, "unix", sock)
 			},
 		},
@@ -184,8 +231,18 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 // of silence. Any OTHER response (including a non-2xx HTTP status from
 // kahyad) is relayed to out verbatim - this binary has no opinion on MCP
 // semantics, per the package doc.
+//
+// Each request is bounded by its own deadline: resolveToolCallTimeout for a
+// tools/call (B-1: kahyad may park it for a human approval),
+// resolveRequestTimeout for everything else.
 func relay(client *http.Client, traceID, taskID, line string, out io.Writer, stderr io.Writer) int {
-	req, err := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewBufferString(line))
+	budget := resolveRequestTimeout()
+	if requestMethod(line) == "tools/call" {
+		budget = resolveToolCallTimeout()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpEndpoint, bytes.NewBufferString(line))
 	if err != nil {
 		writeTransportError(out, line, err)
 		logLine(stderr, traceID, "error", "request_build_failed", err.Error())

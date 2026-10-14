@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1363,5 +1364,79 @@ func TestReadControlSecret(t *testing.T) {
 	}
 	if s, err := ReadControlSecret(sock); err == nil || s != "" {
 		t.Errorf("directory at secret path: ReadControlSecret = %q, %v; want an error", s, err)
+	}
+}
+
+// TestLoadApprovalWaitSecondsValidation (B-1): a negative
+// approval_wait_seconds fails Load closed; an explicitly written one must be
+// below task_timeout_min*60; 0 (waiting disabled) is valid; the DEFAULT 300
+// is never checked against a lowered task_timeout_min.
+func TestLoadApprovalWaitSecondsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		yaml    string
+		wantErr bool
+		want    int
+	}{
+		{"explicit_not_below_task_timeout", "task_timeout_min: 30\napproval_wait_seconds: 1800\n", true, 0},
+		{"negative", "approval_wait_seconds: -1\n", true, 0},
+		{"zero_disables", "task_timeout_min: 2\napproval_wait_seconds: 0\n", false, 0},
+		{"explicit_below_task_timeout", "task_timeout_min: 30\napproval_wait_seconds: 1799\n", false, 1799},
+		{"default_unchecked_against_short_task_timeout", "task_timeout_min: 2\n", false, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() error = nil, want a rejection for %q", tc.yaml)
+				}
+				if !strings.Contains(err.Error(), "approval_wait_seconds") {
+					t.Fatalf("Load() error = %v, want it to name approval_wait_seconds", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v, want success for %q", err, tc.yaml)
+			}
+			if cfg.ApprovalWaitSeconds != tc.want {
+				t.Fatalf("ApprovalWaitSeconds = %d, want %d", cfg.ApprovalWaitSeconds, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadAutonomyBootstrapLevels (B-1, owner decision G01-2 option A): the
+// default seeds memory_search/R/global at L1; config.yaml can replace the
+// map or disable it with {}.
+func TestLoadAutonomyBootstrapLevels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want map[string]int
+	}{
+		{"default", "", map[string]int{"memory_search/R/global": 1}},
+		{"disabled", "autonomy_bootstrap_levels: {}\n", map[string]int{}},
+		{"replaced", "autonomy_bootstrap_levels:\n  fs_read/R/global: 1\n", map[string]int{"fs_read/R/global": 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !reflect.DeepEqual(cfg.AutonomyBootstrapLevels, tc.want) {
+				t.Fatalf("AutonomyBootstrapLevels = %v, want %v", cfg.AutonomyBootstrapLevels, tc.want)
+			}
+		})
 	}
 }

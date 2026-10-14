@@ -92,7 +92,8 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 
 In addition to inheriting kahyad's own process environment (`PATH`, `HOME`,
 etc. — W1-2's worker is a plain subprocess, not a network-isolated
-container), kahyad sets exactly eight variables (`spawn.BuildEnv`):
+container), kahyad sets these variables (`spawn.BuildEnv`; the two B-1
+MCP timeouts only when an approval wait is configured):
 
 | Variable | Value |
 |---|---|
@@ -104,6 +105,8 @@ container), kahyad sets exactly eight variables (`spawn.BuildEnv`):
 | `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
+| `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. |
+| `MCP_TOOL_TIMEOUT` | Since B-1, only when `approval_wait_seconds > 0`: `(approval_wait_seconds + 90) * 1000` (ms) — the bundled `claude` CLI's own hard per-MCP-call limit, set explicitly because its default is unknown. Set after the inherited environment, so a parent shell's value never shortens it. |
 | `KAHYA_TMP_DIR` | Since W6-02: `config.Config.TmpDir()` (`<data_dir>/tmp`, e.g. `~/Library/Application Support/Kahya/tmp` — created 0700 at kahyad startup). `mode=="stt"` sessions read this to decide whether `input_audio_path` is safe to delete after transcription (`kahya_worker.__main__._maybe_delete_audio`): a file is deleted **iff** its resolved parent directory equals this exact value — never a repo fixture, never any other path. Empty/unset is a fail-CLOSED no-op (never delete). |
 
 `KAHYA_SOCKET` alone reaches only the four **worker routes** (see §5a);
@@ -623,9 +626,18 @@ Request:
   "task_id": "t_9f2c1a4b5e6d7f8091a2b3c4d5e6f708",
   "session_id": null,
   "tool_name": "Read",
-  "tool_input": {}
+  "tool_input": {},
+  "preflight": true
 }
 ```
+
+`preflight` (since B-1): kahyad decides and ledgers the decision (payload
+`preflight:true`) but **mints nothing** — no `pending_approvals` row, no
+token, no undo window — so the response never carries
+`pending_approval_id` or `token`. The binding decision, and the only
+pending approval a human is ever asked about, comes from the tool-side
+gate on `/v1/mcp` (§6a). A non-preflight call (a script with the control
+secret) keeps the original behavior below.
 
 `task_id`/`trace_id` stay in the body (backward compatibility), but for a
 call from a live worker kahyad spawned the **authority is the UDS peer's
@@ -700,10 +712,70 @@ never whatever the request body itself claims.
 
 **Ledger:** every decision writes exactly one `kind='policy_decision'`
 event, payload includes `event`, `tool`, `class`, `scope`, `level`,
-`decision`, `task_id` (and `reason` when not `allow`) — under the
-request's own `trace_id`. See `kahyad/internal/policy/README.md` for the
-full wire schema of `/policy/consume-token`, `/policy/feedback`,
-`/policy/state`, `/policy/promote`, and `/policy/undo`.
+`decision`, `task_id` (and `reason` when not `allow`; `preflight:true` for
+a worker preflight; `redeemed_pending_approval_id` when an `allow` came
+from redeeming a human approval, §6a) — under the request's own
+`trace_id`. See `kahyad/internal/policy/README.md` for the full wire
+schema of `/policy/consume-token`, `/policy/feedback`, `/policy/state`,
+`/policy/promote`, and `/policy/undo`.
+
+## 6a · Approval loop: needs_approval → human → exactly the approved bytes (B-1)
+
+Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
+(`memory_*`, the dev stub) and the fs/shell/osascript tools' own
+`Server.FSPolicyClient` — calls `checkWithApprovalWait`
+(`kahyad/internal/server/approval_wait.go`):
+
+1. `Engine.Check` answers `needs_approval` and mints ONE `pending_approvals`
+   row (bound to task, tool, scope and the sha256 of the canonical tool
+   bytes); the approval card goes out (Telegram for a reversible tool,
+   Hammerspoon, `kahya approvals`).
+2. The in-flight `tools/call` **parks inside kahyad** for
+   `approval_wait_seconds` (config, default 300; `0` = never park — the
+   call answers at once with `"⏳ Yerel onay bekleniyor (onay kimliği:
+   <id>). …"`). Ledger `approval_wait_started`. A `kahya ask` stream of the
+   same task gets the delta line `"⏳ Onay bekleniyor (onay kimliği: <id>)
+   — başka bir terminalde 'kahya approve <id>' çalıştır."` and an SSE
+   comment keepalive (`: keepalive`) every 10 s while it waits (the CLI
+   drops a stream idle for 30 s).
+3. The human answers (`kahya approve <id>` / `kahya approvals decide`,
+   Hammerspoon, or a Telegram tap for a `reversible: true` tool —
+   `Engine.Approve` refuses an irreversible tool from any non-local
+   surface, B-11). `Engine.Approve` persists a single-use **grant**
+   (`approval_tokens.grant_kind='approval'`); the engine's decided hook
+   wakes the parked call at once (a 2 s DB probe is the fallback).
+4. The same call re-checks (`NoMintPending`: never a second pending row).
+   `Engine.Check` **redeems** the grant — burned atomically, ledgered
+   `approval_grant_redeemed` — and answers `allow` with a fresh
+   `grant_kind='exchanged'` token the tool consumes through the unchanged
+   `ConsumeToken` (WYSIWYE hash check included). The tool executes exactly
+   the approved bytes, once; they never pass back through the model.
+   Ledger `approval_wait_ended{outcome:"approved"}`.
+
+Other outcomes (`approval_wait_ended.outcome`): `denied` (a denial or a
+halt's `InvalidateApprovalsForTask` — the model reads `"❌ Kullanıcı bu
+eylemi reddetti; …"`), `timeout` (nobody decided; the id stays live and the
+model is told to retry the identical call after an approval — that retry
+redeems the grant), `canceled` (the bridge connection closed — worker
+killed by `task_timeout_min` or a halt — or kahyad is shutting down:
+**never redeemed**, so a late approval executes nothing without a live,
+client-attached call). The go-sdk handler context never cancels on a
+client disconnect, so the server binds the wait to the HTTP request's own
+`Done()` channel (`requestDoneKey`). An approved grant nobody redeems
+expires after 10 minutes (`approval_grant_expired`); a halt revokes it.
+
+`POST /policy/feedback` and `POST /approvals/{id}/decision` answer
+`{ok, error?}` — **no raw token** any more: the grant is redeemed
+server-side, so a raw value on the wire could only be presented to
+`/policy/consume-token` by some other process.
+
+**First-run autonomy (`autonomy_bootstrap_levels`):** at boot kahyad seeds
+the configured `"tool/class/scope": level` rows (default
+`{"memory_search/R/global": 1}` — the assistant may read its own memory on
+a fresh install) **only where no `autonomy_state` row exists yet**, ledgered
+`autonomy_bootstrapped`; an existing row — a demotion back to L0 included —
+is never touched (equivalent to one `kahya autonomy promote` per key on
+first boot). `{}` disables it.
 
 ## 7 · Cross-references
 
@@ -799,8 +871,8 @@ full wire schema of `/policy/consume-token`, `/policy/feedback`,
   byte-exact WYSIWYE diff, Hammerspoon cards) — W3-06/W3-07/W6-01. W3-02
   only exposes the engine API those surfaces call
   (`POST /policy/feedback`'s `approve`/`deny`, and the `pending_approval_id`
-  a decision returns); until then, an approval can only be driven by hand
-  (`curl`/tests) or via `kahya autonomy promote`.
+  a decision returns). Since B-1 an approval actually executes the parked
+  tool call (§6a).
 - **Undo recipe implementations** (Trash restore, git checkpoint restore,
   ...) — W3-03. `kahya undo --trace <id>` / `POST /policy/undo` only
   trigger the window + demotion; executing the actual recipe is the owning

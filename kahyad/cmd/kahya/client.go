@@ -465,8 +465,10 @@ func (c *Client) GetApproval(ctx context.Context, traceID, id string) (approvalD
 // a W3 approval's confirmation prompt, forwarded so kahyad can verify it
 // server-side (byte-exact "onayla" after NFC normalization) - the
 // authoritative check; ignored server-side for a non-W3 approval, so
-// callers may always pass "" for W1/W2/deny. Returns the minted token on
-// a successful approve ("" for deny).
+// callers may always pass "" for W1/W2/deny. The returned string is the
+// response's legacy token field: since B-1 kahyad never sends one (the
+// approval grant is redeemed server-side by the parked tool call), so it
+// is always "" - kept only so the signature (and older daemons) still fit.
 func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingApprovalID, surface, typed string) (string, error) {
 	body, err := json.Marshal(map[string]string{
 		"kind": kind, "pending_approval_id": pendingApprovalID, "surface": surface, "typed": typed, "trace_id": traceID,
@@ -506,8 +508,8 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 // hammerspoon/kahya.lua's approval cards. No surface field is ever sent -
 // kahyad itself stamps surface="local" from the UDS channel (see
 // kahyad/internal/server's handleApprovalsDecision doc comment); there is
-// no wire field on this route for a caller to forge one through. Returns
-// the minted token on a successful approve ("" on reject).
+// no wire field on this route for a caller to forge one through. Like
+// PolicyFeedback, the returned legacy token string is always "" since B-1.
 func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, approve bool, typed string) (string, error) {
 	body, err := json.Marshal(map[string]any{"approve": approve, "typed": typed})
 	if err != nil {

@@ -386,6 +386,22 @@ func run() int {
 	// SetUndoWindowDuration call) now actually takes effect end-to-end.
 	policyEngine.SetUndoWindowDuration(time.Duration(cfg.UndoWindowSeconds) * time.Second)
 	srv.SetPolicyEngine(policyEngine)
+	// B-1 approval loop (owner decision G01-1 option 1): a tool call that
+	// needs approval parks in kahyad for approval_wait_seconds; the engine's
+	// decided hook wakes it the moment a human answers on any surface, and
+	// its re-check redeems the grant so exactly the approved bytes execute
+	// (kahyad/internal/server/approval_wait.go).
+	srv.SetApprovalWait(time.Duration(cfg.ApprovalWaitSeconds) * time.Second)
+	policyEngine.SetApprovalDecidedHook(srv.ApprovalDecided)
+	// B-1, owner decision G01-2 option A: config autonomy_bootstrap_levels
+	// (default memory_search/R/global -> L1) seeds autonomy_state rows only
+	// where none exist yet - a first-run promotion, ledgered as
+	// autonomy_bootstrapped, never an override of an earned/demoted level.
+	// Skipped in deny-all mode (nothing may be decided from a policy that
+	// failed to load).
+	if !srv.DenyAll() {
+		policyEngine.BootstrapLevels(context.Background(), bootTraceID, cfg.AutonomyBootstrapLevels)
+	}
 
 	// W3-03: fs_read/fs_write/fs_delete, registered onto the SAME shared
 	// /v1/mcp server as the memory tools (server.SetFSTool's doc
@@ -490,7 +506,10 @@ func run() int {
 	// doc comment.
 	egressTokens := egress.NewProxySessionRegistry()
 
-	fsPolicyClient := server.NewFSPolicyClient(policyEngine, srv.DenyAll)
+	// B-1: srv.FSPolicyClient is NewFSPolicyClient's adapter routed through
+	// the server's approval wait, so fs/shell/osascript calls that need
+	// approval park for the human decision too.
+	fsPolicyClient := srv.FSPolicyClient()
 	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
 	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
@@ -1064,6 +1083,9 @@ func run() int {
 		Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
 		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
 		TmpDir: cfg.TmpDir(),
+		// B-1: a redispatched worker's MCP timeouts must outlast an
+		// approval wait too.
+		ApprovalWaitSeconds: cfg.ApprovalWaitSeconds,
 	}
 	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, taskLive, cfg.TaskRetryW1MaxAuto)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)

@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -117,6 +118,20 @@ type Server struct {
 	// once s.denyAll itself is not already overriding the decision. See
 	// SetPolicyEngine's doc comment (mcp.go).
 	policyEngine *policy.Engine
+
+	// approvalWait / approvalWaiter / approvalNotices / approvalKeepalive
+	// are the B-1 approval loop's server half (approval_wait.go):
+	// approvalWait is config approval_wait_seconds (SetApprovalWait; 0 =
+	// never park); approvalWaiter parks a tool-side binding gate on a fresh
+	// pending_approval_id until the Engine's decided hook (ApprovalDecided)
+	// or its own DB probe fires; approvalNotices maps a task_id to its live
+	// `kahya ask` SSE stream (approvalNoticeSink) for the "waiting for
+	// approval" line + keepalives; approvalKeepalive overrides
+	// approvalKeepaliveInterval (tests only; 0 = default).
+	approvalWait      time.Duration
+	approvalWaiter    *approvalWaiter
+	approvalNotices   sync.Map
+	approvalKeepalive time.Duration
 
 	// fsServer is the W3-03 fs MCP tool set (fs_read/fs_write/fs_delete),
 	// registered onto the SAME shared /v1/mcp server as mcp/memory's tools
@@ -327,7 +342,9 @@ type Server struct {
 // /health. Call Prepare (or Run, which calls Prepare for you) to actually
 // bind the listener.
 func New(cfg config.Config, log *logx.Logger, version string, db DBHealth) *Server {
-	return &Server{cfg: cfg, log: log, version: version, db: db}
+	s := &Server{cfg: cfg, log: log, version: version, db: db}
+	s.approvalWaiter = newApprovalWaiter(s.probeApprovalDecision)
+	return s
 }
 
 // AdoptStartupLock hands the Server a startup flock already acquired via
@@ -520,6 +537,13 @@ func (s *Server) Serve() error {
 func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	// B-1: release every tool call parked on an approval FIRST (outcome
+	// canceled - nothing parked ever redeems once shutdown began), so
+	// http.Shutdown below is not left waiting on up to
+	// approval_wait_seconds of idle parked requests.
+	if s.approvalWaiter != nil {
+		s.approvalWaiter.Close()
+	}
 	err := s.http.Shutdown(ctx)
 
 	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled

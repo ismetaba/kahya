@@ -97,6 +97,13 @@ type daemonOpts struct {
 	qwenPort      int
 
 	extraEnv []string
+
+	// approvalWaitSeconds is config approval_wait_seconds (B-1), ALWAYS
+	// written: the zero value disables the tool-side approval wait so a
+	// needs_approval call answers at once with its pending id (otherwise
+	// every L0 call would park for the 300s default, past d.client's 20s
+	// timeout). TestGate1c sets it to exercise the real park-and-resume.
+	approvalWaitSeconds int
 }
 
 type daemon struct {
@@ -280,6 +287,7 @@ func writeConfigYAML(t *testing.T, homeDir string, opts daemonOpts) {
 	}
 	var b strings.Builder
 	b.WriteString("task_timeout_min: 2\n")
+	fmt.Fprintf(&b, "approval_wait_seconds: %d\n", opts.approvalWaitSeconds)
 	b.WriteString("embed_cmd: []\n")
 	// A fixed default (3128) egress port would collide across concurrently
 	// running test BINARIES (`go test ./...` runs different packages in
@@ -594,15 +602,17 @@ type policyCheckResp struct {
 	Token             string `json:"token,omitempty"`
 }
 
-func (d *daemon) policyFeedback(t *testing.T, kind, id, surface string) (ok bool, token, errMsg string) {
+// policyFeedback drives POST /policy/feedback. Since B-1 the response
+// never carries the approval's raw token (the grant is redeemed
+// server-side by the tool call's own binding re-check).
+func (d *daemon) policyFeedback(t *testing.T, kind, id, surface string) (ok bool, errMsg string) {
 	t.Helper()
 	var resp struct {
 		OK    bool   `json:"ok"`
-		Token string `json:"token,omitempty"`
 		Error string `json:"error,omitempty"`
 	}
 	d.postJSON(t, "/policy/feedback", map[string]any{"kind": kind, "pending_approval_id": id, "surface": surface}, &resp)
-	return resp.OK, resp.Token, resp.Error
+	return resp.OK, resp.Error
 }
 
 func (d *daemon) policyPromote(t *testing.T, tool, class, scope string) int {
@@ -762,17 +772,29 @@ func (d *daemon) seedResolvableSession(t *testing.T, taskID, traceID string) {
 func (d *daemon) mcpCall(t *testing.T, traceID, taskID, name string, args map[string]any) mcpResult {
 	t.Helper()
 	d.seedResolvableSession(t, taskID, traceID)
+	res, err := d.mcpCallResult(traceID, taskID, name, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// mcpCallResult is mcpCall's error-returning core, safe to run off the
+// test goroutine (testing forbids t.Fatalf there) - TestGate1c parks one
+// call on an approval while the test goroutine approves it. Callers seed
+// the session (seedResolvableSession) on the test goroutine first.
+func (d *daemon) mcpCallResult(traceID, taskID, name string, args map[string]any) (mcpResult, error) {
 	reqBody := map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{"name": name, "arguments": args},
 	}
 	b, err := json.Marshal(reqBody)
 	if err != nil {
-		t.Fatalf("marshal mcp request: %v", err)
+		return mcpResult{}, fmt.Errorf("marshal mcp request: %v", err)
 	}
 	req, err := http.NewRequest(http.MethodPost, "http://kahyad/v1/mcp", bytes.NewReader(b))
 	if err != nil {
-		t.Fatalf("build mcp request: %v", err)
+		return mcpResult{}, fmt.Errorf("build mcp request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -782,7 +804,7 @@ func (d *daemon) mcpCall(t *testing.T, traceID, taskID, name string, args map[st
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		t.Fatalf("POST /v1/mcp (%s): %v", name, err)
+		return mcpResult{}, fmt.Errorf("POST /v1/mcp (%s): %v", name, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -799,16 +821,16 @@ func (d *daemon) mcpCall(t *testing.T, traceID, taskID, name string, args map[st
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		t.Fatalf("decode mcp response for %s: %v\nbody=%s", name, err, body)
+		return mcpResult{}, fmt.Errorf("decode mcp response for %s: %v\nbody=%s", name, err, body)
 	}
 	if parsed.Error != nil {
-		t.Fatalf("mcp tools/call %s: JSON-RPC error: %s\nbody=%s", name, parsed.Error.Message, body)
+		return mcpResult{}, fmt.Errorf("mcp tools/call %s: JSON-RPC error: %s\nbody=%s", name, parsed.Error.Message, body)
 	}
 	var texts []string
 	for _, c := range parsed.Result.Content {
 		texts = append(texts, c.Text)
 	}
-	return mcpResult{IsError: parsed.Result.IsError, Text: strings.Join(texts, "\n")}
+	return mcpResult{IsError: parsed.Result.IsError, Text: strings.Join(texts, "\n")}, nil
 }
 
 // ---- /v1/task (SSE) ----

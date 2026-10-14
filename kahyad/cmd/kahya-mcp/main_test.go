@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -233,4 +234,77 @@ func TestRelayNeverSendsControlSecretHeader(t *testing.T) {
 	if len(sawSecret) != 0 {
 		t.Fatalf("bridge sent X-Kahya-Control-Secret %q; a worker-plane process must never send it", sawSecret)
 	}
+}
+
+// TestRelayToolsCallUsesLongTimeoutOthersKeepFourSeconds (B-1): only a
+// tools/call gets KAHYA_MCP_TOOLCALL_TIMEOUT_S (kahyad may park it for a
+// human approval); without it - and for every other method - the ordinary
+// fast budget still reports a slow kahyad as unreachable.
+func TestRelayToolsCallUsesLongTimeoutOthersKeepFourSeconds(t *testing.T) {
+	const callDelay = 2 * time.Second
+	sock := startFakeKahyad(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var msg struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(b, &msg)
+		if msg.Method == "tools/call" {
+			time.Sleep(callDelay)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":{"method":%q}}`, msg.ID, msg.Method)
+	})
+	t.Setenv("KAHYA_SOCKET", sock)
+	t.Setenv("KAHYA_TRACE_ID", "trace-toolcall-timeout")
+	t.Setenv("KAHYA_MCP_REQUEST_TIMEOUT_S", "1")
+	const toolsCall = `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs_write","arguments":{}}}`
+	const toolsList = `{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}`
+
+	t.Run("tools_call_with_long_budget_is_relayed", func(t *testing.T) {
+		t.Setenv(toolCallTimeoutEnvVar, "4")
+		var out, errOut bytes.Buffer
+		if code := run(strings.NewReader(toolsCall+"\n"), &out, &errOut); code != 0 {
+			t.Fatalf("run() = %d, want 0 (tools/call must outlast the 1s ordinary budget); stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), `"method":"tools/call"`) {
+			t.Fatalf("stdout = %q, want kahyad's tools/call response", out.String())
+		}
+	})
+	t.Run("tools_call_without_long_budget_times_out_fast", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		start := time.Now()
+		code := run(strings.NewReader(toolsCall+"\n"), &out, &errOut)
+		if code != 1 || !strings.Contains(errOut.String(), "kahyad_unreachable") {
+			t.Fatalf("run() = %d stderr=%s, want 1 with kahyad_unreachable", code, errOut.String())
+		}
+		if elapsed := time.Since(start); elapsed >= callDelay {
+			t.Fatalf("unreachable reported after %v, want within the 1s ordinary budget", elapsed)
+		}
+	})
+	t.Run("tools_list_keeps_the_ordinary_budget", func(t *testing.T) {
+		for _, toolcall := range []string{"", "4"} {
+			t.Setenv(toolCallTimeoutEnvVar, toolcall)
+			var out, errOut bytes.Buffer
+			if code := run(strings.NewReader(toolsList+"\n"), &out, &errOut); code != 0 {
+				t.Fatalf("tools/list (toolcall budget %q) run() = %d, want 0; stderr=%s", toolcall, code, errOut.String())
+			}
+			if !strings.Contains(out.String(), `"method":"tools/list"`) {
+				t.Fatalf("stdout = %q, want kahyad's tools/list response", out.String())
+			}
+		}
+	})
+	t.Run("toolcall_budget_never_shorter_than_ordinary", func(t *testing.T) {
+		t.Setenv("KAHYA_MCP_REQUEST_TIMEOUT_S", "10")
+		for _, v := range []string{"", "abc", "-3", "0", "5"} {
+			t.Setenv(toolCallTimeoutEnvVar, v)
+			if got := resolveToolCallTimeout(); got != 10*time.Second {
+				t.Errorf("resolveToolCallTimeout(%q) = %v, want the 10s ordinary budget", v, got)
+			}
+		}
+		t.Setenv(toolCallTimeoutEnvVar, "360")
+		if got := resolveToolCallTimeout(); got != 360*time.Second {
+			t.Errorf("resolveToolCallTimeout(360) = %v, want 360s", got)
+		}
+	})
 }

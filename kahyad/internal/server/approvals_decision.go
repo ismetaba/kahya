@@ -50,9 +50,10 @@ type approvalDecisionRequest struct {
 	Typed   string `json:"typed,omitempty"`
 }
 
+// approvalDecisionResponse never carries the raw token (B-1) - see
+// policyFeedbackResponse's doc comment (policy.go).
 type approvalDecisionResponse struct {
 	OK    bool   `json:"ok"`
-	Token string `json:"token,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -104,12 +105,11 @@ func (s *Server) handleApprovalsDecision(w http.ResponseWriter, r *http.Request)
 	// approvalsDecisionSurface, NEVER req.<anything> — see this file's own
 	// package doc comment and the type's own field list (there is no
 	// Surface field to read one from in the first place).
-	result, err := s.policyEngine.Approve(r.Context(), id, approvalsDecisionSurface, req.Typed)
-	if err != nil {
+	if _, err := s.policyEngine.Approve(r.Context(), id, approvalsDecisionSurface, req.Typed); err != nil {
 		writeJSON(w, http.StatusBadRequest, approvalDecisionResponse{OK: false, Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true, Token: result.Token})
+	writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true})
 }
 
 // ---- POST /debug/emit-approval ----

@@ -166,6 +166,25 @@ type Config struct {
 	// wait.
 	UndoWindowSeconds int `yaml:"undo_window_seconds"`
 
+	// ApprovalWaitSeconds is config key `approval_wait_seconds` (B-1): how
+	// long a tool-side binding gate (POST /v1/mcp tools/call ->
+	// Engine.Check -> needs_approval) parks the in-flight tool call waiting
+	// for the human decision before answering the model. 0 disables
+	// waiting (the call fails at once with the pending id; the hermetic
+	// gate suites use this). Default 300. Must be >= 0, and - when written
+	// explicitly in config.yaml - less than task_timeout_min*60 (Load).
+	ApprovalWaitSeconds int `yaml:"approval_wait_seconds"`
+	// AutonomyBootstrapLevels is config key `autonomy_bootstrap_levels`
+	// (B-1, owner decision G01-2 option A): "tool/class/scope" -> level
+	// rows seeded into autonomy_state at boot ONLY when no row exists yet
+	// (kahyad/internal/policy.Engine.BootstrapLevels - equivalent to the
+	// user running `kahya autonomy promote` once per key on first boot,
+	// ledgered as autonomy_bootstrapped; an existing row, a demotion to L0
+	// included, is never overridden). Default
+	// {"memory_search/R/global": 1} so the assistant can read its own
+	// memory on a fresh install; set to {} to disable.
+	AutonomyBootstrapLevels map[string]int `yaml:"autonomy_bootstrap_levels"`
+
 	// --- W12-08 cost governor (HANDOFF S4 flag, verbatim defaults) ---
 
 	// DailyBudgetUSD / MonthlyBudgetUSD are kahyad/internal/anthproxy's
@@ -547,72 +566,74 @@ type CalendarSpec struct {
 // fileConfig mirrors Config for YAML unmarshalling, using pointers so we
 // can distinguish "key absent" (nil) from "key present with zero value".
 type fileConfig struct {
-	DataDir                       *string      `yaml:"data_dir"`
-	Socket                        *string      `yaml:"socket"`
-	LogDir                        *string      `yaml:"log_dir"`
-	DBPath                        *string      `yaml:"db_path"`
-	MemoryDir                     *string      `yaml:"memory_dir"`
-	AnthropicUpstreamURL          *string      `yaml:"anthropic_upstream_url"`
-	EmbedPort                     *int         `yaml:"embed_port"`
-	DefaultModel                  *string      `yaml:"default_model"`
-	TaskTimeoutMin                *int         `yaml:"task_timeout_min"`
-	ActiveEmbedModelVer           *string      `yaml:"active_embed_model_ver"`
-	LogLevel                      *string      `yaml:"log_level"`
-	UndoWindowSeconds             *int         `yaml:"undo_window_seconds"`
-	WorkerCmd                     *[]string    `yaml:"worker_cmd"`
-	EmbedCmd                      *[]string    `yaml:"embed_cmd"`
-	MCPBridgePath                 *string      `yaml:"mcp_bridge_path"`
-	PolicyPath                    *string      `yaml:"policy_path"`
-	EvalMiniBaselinePath          *string      `yaml:"eval_mini_baseline_path"`
-	EvalRetrievalDatasetPath      *string      `yaml:"eval_retrieval_dataset_path"`
-	EgressPort                    *int         `yaml:"egress_port"`
-	DockerImageTag                *string      `yaml:"docker_image_tag"`
-	DockerImageDigestPath         *string      `yaml:"docker_image_digest_path"`
-	EgressSidecarDigestPath       *string      `yaml:"egress_sidecar_digest_path"`
-	ShellWorkdirRoots             *[]string    `yaml:"shell_workdir_roots"`
-	DailyBudgetUSD                *float64     `yaml:"daily_budget_usd"`
-	MonthlyBudgetUSD              *float64     `yaml:"monthly_budget_usd"`
-	TaskTokenCeiling              *int64       `yaml:"task_token_ceiling"`
-	DowngradeAtRatio              *float64     `yaml:"downgrade_at_ratio"`
-	CacheHitAlarmThreshold        *float64     `yaml:"cache_hit_alarm_threshold"`
-	CredentialMode                *string      `yaml:"credential_mode"`
-	EstRequestTokens              *int64       `yaml:"est_request_tokens"`
-	TelegramChatID                *int64       `yaml:"telegram_chat_id"`
-	TelegramUserID                *int64       `yaml:"telegram_user_id"`
-	TelegramAPIURL                *string      `yaml:"telegram_api_url"`
-	QwenCmd                       *[]string    `yaml:"qwen_cmd"`
-	QwenModelPath                 *string      `yaml:"qwen_model_path"`
-	QwenModelName                 *string      `yaml:"qwen_model_name"`
-	QwenPort                      *int         `yaml:"qwen_port"`
-	QwenIdleTTLSeconds            *int         `yaml:"qwen_idle_ttl_seconds"`
-	Jobs                          *[]JobConfig `yaml:"jobs"`
-	TriggerBinPath                *string      `yaml:"trigger_bin_path"`
-	TaskRetryW1MaxAuto            *int         `yaml:"task_retry_w1_max_auto"`
-	CloudRetryMaxInline           *int         `yaml:"cloud_retry_max_inline"`
-	CloudRetryTaskSchedule        *[]string    `yaml:"cloud_retry_task_schedule"`
-	CloudRetryGiveUpAfter         *string      `yaml:"cloud_retry_give_up_after"`
-	KahyaDir                      *string      `yaml:"kahya_dir"`
-	BackupDir                     *string      `yaml:"backup_dir"`
-	AnchorRemote                  *string      `yaml:"anchor_remote"`
-	AnchorIntervalHours           *int         `yaml:"anchor_interval_hours"`
-	AnchorLocalFallbackPath       *string      `yaml:"anchor_local_fallback_path"`
-	ResumeScanIntervalSeconds     *int         `yaml:"resume_scan_interval_seconds"`
-	OutboxDispatchIntervalSeconds *int         `yaml:"outbox_dispatch_interval_seconds"`
-	BriefingHour                  *int         `yaml:"briefing_hour"`
-	BriefingMinute                *int         `yaml:"briefing_minute"`
-	BriefingGHRepos               *[]string    `yaml:"briefing_gh_repos"`
-	BriefingFileGlobs             *[]string    `yaml:"briefing_file_globs"`
-	BriefingCalendarNames         *[]string    `yaml:"briefing_calendar_names"`
-	ConsolidationAutoCommit       *bool        `yaml:"consolidation_auto_commit"`
-	RitualWeeklyWeekday           *int         `yaml:"ritual_weekly_weekday"`
-	RitualWeeklyHour              *int         `yaml:"ritual_weekly_hour"`
-	RitualWeeklyMinute            *int         `yaml:"ritual_weekly_minute"`
-	HsCliPath                     *string      `yaml:"ui_hs_cli"`
-	TTSEnabled                    *bool        `yaml:"tts_enabled"`
-	TTSVoice                      *string      `yaml:"tts_voice"`
-	TTSSayBin                     *string      `yaml:"tts_say_bin"`
-	TTSMaxChars                   *int         `yaml:"tts_max_chars"`
-	TTSSpeakSecretLane            *bool        `yaml:"tts_speak_secret_lane"`
+	DataDir                       *string         `yaml:"data_dir"`
+	Socket                        *string         `yaml:"socket"`
+	LogDir                        *string         `yaml:"log_dir"`
+	DBPath                        *string         `yaml:"db_path"`
+	MemoryDir                     *string         `yaml:"memory_dir"`
+	AnthropicUpstreamURL          *string         `yaml:"anthropic_upstream_url"`
+	EmbedPort                     *int            `yaml:"embed_port"`
+	DefaultModel                  *string         `yaml:"default_model"`
+	TaskTimeoutMin                *int            `yaml:"task_timeout_min"`
+	ActiveEmbedModelVer           *string         `yaml:"active_embed_model_ver"`
+	LogLevel                      *string         `yaml:"log_level"`
+	UndoWindowSeconds             *int            `yaml:"undo_window_seconds"`
+	ApprovalWaitSeconds           *int            `yaml:"approval_wait_seconds"`
+	AutonomyBootstrapLevels       *map[string]int `yaml:"autonomy_bootstrap_levels"`
+	WorkerCmd                     *[]string       `yaml:"worker_cmd"`
+	EmbedCmd                      *[]string       `yaml:"embed_cmd"`
+	MCPBridgePath                 *string         `yaml:"mcp_bridge_path"`
+	PolicyPath                    *string         `yaml:"policy_path"`
+	EvalMiniBaselinePath          *string         `yaml:"eval_mini_baseline_path"`
+	EvalRetrievalDatasetPath      *string         `yaml:"eval_retrieval_dataset_path"`
+	EgressPort                    *int            `yaml:"egress_port"`
+	DockerImageTag                *string         `yaml:"docker_image_tag"`
+	DockerImageDigestPath         *string         `yaml:"docker_image_digest_path"`
+	EgressSidecarDigestPath       *string         `yaml:"egress_sidecar_digest_path"`
+	ShellWorkdirRoots             *[]string       `yaml:"shell_workdir_roots"`
+	DailyBudgetUSD                *float64        `yaml:"daily_budget_usd"`
+	MonthlyBudgetUSD              *float64        `yaml:"monthly_budget_usd"`
+	TaskTokenCeiling              *int64          `yaml:"task_token_ceiling"`
+	DowngradeAtRatio              *float64        `yaml:"downgrade_at_ratio"`
+	CacheHitAlarmThreshold        *float64        `yaml:"cache_hit_alarm_threshold"`
+	CredentialMode                *string         `yaml:"credential_mode"`
+	EstRequestTokens              *int64          `yaml:"est_request_tokens"`
+	TelegramChatID                *int64          `yaml:"telegram_chat_id"`
+	TelegramUserID                *int64          `yaml:"telegram_user_id"`
+	TelegramAPIURL                *string         `yaml:"telegram_api_url"`
+	QwenCmd                       *[]string       `yaml:"qwen_cmd"`
+	QwenModelPath                 *string         `yaml:"qwen_model_path"`
+	QwenModelName                 *string         `yaml:"qwen_model_name"`
+	QwenPort                      *int            `yaml:"qwen_port"`
+	QwenIdleTTLSeconds            *int            `yaml:"qwen_idle_ttl_seconds"`
+	Jobs                          *[]JobConfig    `yaml:"jobs"`
+	TriggerBinPath                *string         `yaml:"trigger_bin_path"`
+	TaskRetryW1MaxAuto            *int            `yaml:"task_retry_w1_max_auto"`
+	CloudRetryMaxInline           *int            `yaml:"cloud_retry_max_inline"`
+	CloudRetryTaskSchedule        *[]string       `yaml:"cloud_retry_task_schedule"`
+	CloudRetryGiveUpAfter         *string         `yaml:"cloud_retry_give_up_after"`
+	KahyaDir                      *string         `yaml:"kahya_dir"`
+	BackupDir                     *string         `yaml:"backup_dir"`
+	AnchorRemote                  *string         `yaml:"anchor_remote"`
+	AnchorIntervalHours           *int            `yaml:"anchor_interval_hours"`
+	AnchorLocalFallbackPath       *string         `yaml:"anchor_local_fallback_path"`
+	ResumeScanIntervalSeconds     *int            `yaml:"resume_scan_interval_seconds"`
+	OutboxDispatchIntervalSeconds *int            `yaml:"outbox_dispatch_interval_seconds"`
+	BriefingHour                  *int            `yaml:"briefing_hour"`
+	BriefingMinute                *int            `yaml:"briefing_minute"`
+	BriefingGHRepos               *[]string       `yaml:"briefing_gh_repos"`
+	BriefingFileGlobs             *[]string       `yaml:"briefing_file_globs"`
+	BriefingCalendarNames         *[]string       `yaml:"briefing_calendar_names"`
+	ConsolidationAutoCommit       *bool           `yaml:"consolidation_auto_commit"`
+	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
+	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
+	RitualWeeklyMinute            *int            `yaml:"ritual_weekly_minute"`
+	HsCliPath                     *string         `yaml:"ui_hs_cli"`
+	TTSEnabled                    *bool           `yaml:"tts_enabled"`
+	TTSVoice                      *string         `yaml:"tts_voice"`
+	TTSSayBin                     *string         `yaml:"tts_say_bin"`
+	TTSMaxChars                   *int            `yaml:"tts_max_chars"`
+	TTSSpeakSecretLane            *bool           `yaml:"tts_speak_secret_lane"`
 }
 
 // Load resolves Config from defaults, an optional config.yaml, and
@@ -659,11 +680,17 @@ func Load() (Config, error) {
 	fileCfgPath := filepath.Join(defaults(home, EnvProd).DataDir, "config.yaml")
 
 	var explicitSocket, explicitLogDir, explicitDBPath bool
+	// explicitApprovalWait (B-1): approval_wait_seconds' upper bound
+	// (< task_timeout_min*60) is enforced only when config.yaml writes the
+	// key - the default 300 must never fail boot for a config that merely
+	// lowers task_timeout_min (a hermetic harness writes 2).
+	var explicitApprovalWait bool
 
 	if fc, ok, err := loadFile(fileCfgPath); err != nil {
 		return Config{}, err
 	} else if ok {
 		applyFile(&cfg, fc, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
+		explicitApprovalWait = fc.ApprovalWaitSeconds != nil
 	}
 
 	applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
@@ -698,6 +725,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateTickIntervals(cfg.ResumeScanIntervalSeconds, cfg.OutboxDispatchIntervalSeconds); err != nil {
+		return Config{}, err
+	}
+	if err := validateApprovalWait(cfg.ApprovalWaitSeconds, cfg.TaskTimeoutMin, explicitApprovalWait); err != nil {
 		return Config{}, err
 	}
 
@@ -850,6 +880,24 @@ const (
 	defaultOutboxDispatchIntervalSeconds = 5
 )
 
+// validateApprovalWait fails Load closed (B-1) on a negative
+// approval_wait_seconds, and - only when config.yaml wrote the key
+// explicitly - on one that is not below task_timeout_min*60: a wait the
+// task timeout always cuts short is a misconfiguration, not a choice. The
+// DEFAULT (300) is never checked against task_timeout_min: a task that
+// times out first kills its worker, the bridge connection closes, and the
+// parked call ends as canceled without executing (kahyad/internal/server
+// requestDoneKey).
+func validateApprovalWait(waitSeconds, taskTimeoutMin int, explicit bool) error {
+	if waitSeconds < 0 {
+		return fmt.Errorf("config: approval_wait_seconds must be >= 0 (got %d)", waitSeconds)
+	}
+	if explicit && waitSeconds >= taskTimeoutMin*60 {
+		return fmt.Errorf("config: approval_wait_seconds (%d) must be less than task_timeout_min*60 (%d)", waitSeconds, taskTimeoutMin*60)
+	}
+	return nil
+}
+
 // validateTickIntervals fails Load closed (same posture as every other
 // validate* function above) on a non-positive tick interval - main.go
 // renders these straight into a cron.ParseStandard "@every <n>s" spec,
@@ -901,16 +949,19 @@ func defaults(home, env string) Config {
 		ActiveEmbedModelVer:      "qwen3-embedding-0.6b:512:v1",
 		LogLevel:                 "info",
 		UndoWindowSeconds:        300,
-		Env:                      env,
-		WorkerCmd:                defaultWorkerCmd(),
-		EmbedCmd:                 defaultEmbedCmd(),
-		MCPBridgePath:            defaultMCPBridgePath(),
-		PolicyPath:               defaultPolicyPath(),
-		EvalMiniBaselinePath:     defaultEvalMiniBaselinePath(),
-		EgressPort:               3128,
-		DockerImageTag:           "kahya-sandbox:0.1.0",
-		DockerImageDigestPath:    defaultDockerImageDigestPath(),
-		EgressSidecarDigestPath:  defaultEgressSidecarDigestPath(),
+		// B-1 approval loop defaults (config.Config's own doc comments).
+		ApprovalWaitSeconds:     300,
+		AutonomyBootstrapLevels: map[string]int{"memory_search/R/global": 1},
+		Env:                     env,
+		WorkerCmd:               defaultWorkerCmd(),
+		EmbedCmd:                defaultEmbedCmd(),
+		MCPBridgePath:           defaultMCPBridgePath(),
+		PolicyPath:              defaultPolicyPath(),
+		EvalMiniBaselinePath:    defaultEvalMiniBaselinePath(),
+		EgressPort:              3128,
+		DockerImageTag:          "kahya-sandbox:0.1.0",
+		DockerImageDigestPath:   defaultDockerImageDigestPath(),
+		EgressSidecarDigestPath: defaultEgressSidecarDigestPath(),
 
 		// W12-08 cost governor defaults (HANDOFF S4 flag, verbatim).
 		DailyBudgetUSD:         10,
@@ -1277,6 +1328,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.UndoWindowSeconds != nil {
 		cfg.UndoWindowSeconds = *fc.UndoWindowSeconds
+	}
+	if fc.ApprovalWaitSeconds != nil {
+		cfg.ApprovalWaitSeconds = *fc.ApprovalWaitSeconds
+	}
+	if fc.AutonomyBootstrapLevels != nil {
+		cfg.AutonomyBootstrapLevels = *fc.AutonomyBootstrapLevels
 	}
 	if fc.WorkerCmd != nil {
 		cfg.WorkerCmd = *fc.WorkerCmd

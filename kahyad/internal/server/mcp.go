@@ -182,12 +182,17 @@ func (s *Server) buildMCPHandler() http.Handler {
 // header the MCP SDK's RequestExtra.Header exposes to
 // mcp/memory.traceIDFromRequest and this file's policyGateMiddleware -
 // one trace_id per request, never two independently-minted ones.
+//
+// B-1: it also stashes the HTTP request's own Done() channel under
+// requestDoneKey (approval_wait.go) - the MCP SDK's handler context never
+// cancels on a client disconnect, so this is how a tool call parked on an
+// approval learns its bridge (and worker) went away.
 func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get(traceHeader) == "" {
 			r.Header.Set(traceHeader, traceIDFromContext(r))
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestDoneKey{}, r.Context().Done())))
 	})
 }
 
@@ -367,7 +372,11 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			if callReq.Params.Arguments != nil {
 				argBytes = []byte(callReq.Params.Arguments)
 			}
-			decision, _ := s.policyEngine.Check(ctx, policy.CheckInput{
+			// B-1: checkWithApprovalWait (approval_wait.go) parks a
+			// needs_approval call until the human decides, then re-checks -
+			// an approval is redeemed into a fresh token, consumed below,
+			// so exactly the approved arguments execute.
+			decision, _ := s.checkWithApprovalWait(ctx, policy.CheckInput{
 				Tool: rawName, TraceID: traceID, TaskID: taskID, ToolInput: argBytes,
 			})
 			if decision.Result != policy.ResultAllow {

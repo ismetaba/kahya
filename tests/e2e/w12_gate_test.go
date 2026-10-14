@@ -362,7 +362,10 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 		// depend on whatever mlx/embed/.venv happens to exist on the
 		// machine running `make test` (HANDOFF §6 timing note: W1-2
 		// acceptance is FTS5-only by design).
-		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\nembed_cmd: []\n",
+		// approval_wait_seconds: 0 (B-1): a needs_approval tool call answers
+		// at once with its pending id instead of parking for the default
+		// 300s approval wait.
+		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\napproval_wait_seconds: 0\nembed_cmd: []\n",
 		upstreamURL,
 	)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {

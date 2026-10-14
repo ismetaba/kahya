@@ -108,8 +108,8 @@ func TestPolicyApprovalsListAndDetail_FSWrite(t *testing.T) {
 	postJSON(t, f.client, "/policy/feedback", map[string]any{
 		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local",
 	}, &feedbackResp)
-	if !feedbackResp.OK || feedbackResp.Token == "" {
-		t.Fatalf("approve = %+v, want ok with a token", feedbackResp)
+	if !feedbackResp.OK {
+		t.Fatalf("approve = %+v, want ok", feedbackResp)
 	}
 
 	var listAfter policyApprovalsListResponse
@@ -156,8 +156,8 @@ func TestPolicyFeedback_W3RefusesNonLocalSurface(t *testing.T) {
 		// sufficient.
 		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
 	}, &approved)
-	if !approved.OK || approved.Token == "" {
-		t.Fatalf("approve(surface=local, typed=onayla) = %+v, want ok with a token", approved)
+	if !approved.OK {
+		t.Fatalf("approve(surface=local, typed=onayla) = %+v, want ok", approved)
 	}
 }
 

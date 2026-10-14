@@ -275,7 +275,7 @@ func mlxWriteConfigYAML(t *testing.T, homeDir string, embedPort int) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir config dir: %v", err)
 	}
-	content := fmt.Sprintf("embed_port: %d\ntask_timeout_min: 2\n", embedPort)
+	content := fmt.Sprintf("embed_port: %d\ntask_timeout_min: 2\napproval_wait_seconds: 0\n", embedPort)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
 	}

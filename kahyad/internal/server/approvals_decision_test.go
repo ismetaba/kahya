@@ -100,14 +100,14 @@ func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 		resp = postJSON(t, c.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 			"approve": true, "typed": "onayla",
 		}, &self)
-		if resp.StatusCode != http.StatusForbidden || self.OK || self.Token != "" || self.Error != MsgControlSecretRejected {
+		if resp.StatusCode != http.StatusForbidden || self.OK || self.Error != MsgControlSecretRejected {
 			t.Fatalf("worker self-approve via /approvals/{id}/decision (%s) = %d %+v, want 403 %q", c.name, resp.StatusCode, self, MsgControlSecretRejected)
 		}
 		var feedback policyFeedbackResponse
 		resp = postJSON(t, c.client, "/policy/feedback", map[string]any{
 			"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local", "typed": "onayla",
 		}, &feedback)
-		if resp.StatusCode != http.StatusForbidden || feedback.OK || feedback.Token != "" {
+		if resp.StatusCode != http.StatusForbidden || feedback.OK {
 			t.Fatalf("worker self-approve via /policy/feedback (%s) = %d %+v, want 403", c.name, resp.StatusCode, feedback)
 		}
 	}
@@ -142,8 +142,8 @@ func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 	resp = postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla",
 	}, &decision)
-	if resp.StatusCode != http.StatusOK || !decision.OK || decision.Token == "" {
-		t.Fatalf("local approve with the control secret = %d %+v, want ok with a token (the approval must not have been burned)", resp.StatusCode, decision)
+	if resp.StatusCode != http.StatusOK || !decision.OK {
+		t.Fatalf("local approve with the control secret = %d %+v, want ok (the approval must not have been burned)", resp.StatusCode, decision)
 	}
 }
 
@@ -169,8 +169,8 @@ func TestApprovalsDecisionSurfaceForgeryIgnored(t *testing.T) {
 	resp := postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla", "surface": "remote",
 	}, &decision)
-	if resp.StatusCode != 200 || !decision.OK || decision.Token == "" {
-		t.Fatalf("POST /approvals/{id}/decision (smuggled surface=remote) = status %d body %+v, want ok with a token", resp.StatusCode, decision)
+	if resp.StatusCode != 200 || !decision.OK {
+		t.Fatalf("POST /approvals/{id}/decision (smuggled surface=remote) = status %d body %+v, want ok", resp.StatusCode, decision)
 	}
 
 	var payload string
@@ -215,8 +215,8 @@ func TestApprovalsDecisionW3RequiresTyped(t *testing.T) {
 	postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
 		"approve": true, "typed": "onayla",
 	}, &approved)
-	if !approved.OK || approved.Token == "" {
-		t.Fatalf("decision(typed=onayla) = %+v, want ok with a token", approved)
+	if !approved.OK {
+		t.Fatalf("decision(typed=onayla) = %+v, want ok", approved)
 	}
 }
 

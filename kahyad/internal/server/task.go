@@ -865,6 +865,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// B-1: from here on a SECOND goroutine may write to this stream - a
+	// tool call of this task parked on an approval (approval_wait.go)
+	// reports "waiting for approval <id>" and keeps the stream alive past
+	// the CLI's 30s idle-read limit - so every write is serialized, and
+	// none happens once this handler has returned.
+	sse := newTaskSSE(w, flusher, writeSSE)
+	writeSSE = sse.write
+	defer sse.close()
+	defer s.registerApprovalNotice(taskID, sse)()
+
 	// W4-08: an explicit "derin düşün" opt-in is NOT itself a router
 	// choice subject to downgrade (router.RouteDecision.DerinDuringDowngrade
 	// is only ever true here, on the cloud/claude-fable-5 path - never on
@@ -899,6 +909,8 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		// startup env assertions apply (see kahya_worker.__main__).
 		MCPBridgePath:  s.cfg.MCPBridgePath,
 		CredentialMode: s.cfg.CredentialMode,
+		// B-1: the bridge/CLI MCP timeouts must outlast an approval wait.
+		ApprovalWaitSeconds: int(s.approvalWait / time.Second),
 	}
 
 	// W4-02: register this task's worker pid with the live registry (if
@@ -1387,14 +1399,23 @@ type policyCheckRequest struct {
 	ToolName  string          `json:"tool_name"`
 	ToolInput json.RawMessage `json:"tool_input"`
 	Scope     string          `json:"scope,omitempty"`
+	// Preflight (B-1): set by the worker's can_use_tool on every call. The
+	// decision is ledgered (policy_decision payload preflight:true) but
+	// NOTHING is minted - no pending approval, token or undo window: the
+	// tool-side gate on /v1/mcp is the binding one and the only one a
+	// human is ever asked to approve (HANDOFF S5: can_use_tool is not a
+	// security boundary).
+	Preflight bool `json:"preflight,omitempty"`
 }
 
 // policyCheckResponse is POST /policy/check's response body (W3-02 adds
 // pending_approval_id/token). Reason/PendingApprovalID/Token are omitted
 // (not just empty) whenever they don't apply to the returned decision:
-// PendingApprovalID only appears on "needs_approval"; Token only appears
-// on "allow" for a side-effectful (non-R) class, so the calling tool can
-// present it to POST /policy/consume-token before executing.
+// PendingApprovalID only appears on a non-preflight "needs_approval";
+// Token only appears on a non-preflight "allow" for a side-effectful
+// (non-R) class, so the calling tool can present it to POST
+// /policy/consume-token before executing. A preflight request (B-1) gets
+// neither.
 type policyCheckResponse struct {
 	Decision          string `json:"decision"`
 	Reason            string `json:"reason,omitempty"`
@@ -1508,7 +1529,7 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	decision, err := s.policyEngine.Check(r.Context(), policy.CheckInput{
 		Tool: req.ToolName, Scope: req.Scope, TaskID: taskID, TraceID: traceID,
-		SessionID: sessionID, ToolInput: req.ToolInput,
+		SessionID: sessionID, ToolInput: req.ToolInput, Preflight: req.Preflight,
 	})
 	if err != nil {
 		// Engine.Check already returned a fail-closed Deny decision AND

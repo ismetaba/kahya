@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -128,6 +129,14 @@ type Config struct {
 	// _maybe_delete_audio treats an unset KAHYA_TMP_DIR as "never delete
 	// anything" (fail CLOSED towards not deleting).
 	TmpDir string
+	// ApprovalWaitSeconds is config approval_wait_seconds (B-1): how long
+	// kahyad may legitimately park one of this worker's MCP tools/call
+	// requests waiting for a human approval. When > 0, BuildEnv widens the
+	// kahya-mcp bridge's per-tools/call budget (KAHYA_MCP_TOOLCALL_TIMEOUT_S
+	// = wait+60) and the bundled CLI's own per-MCP-call hard limit
+	// (MCP_TOOL_TIMEOUT, ms = (wait+90)*1000) so neither gives up before
+	// kahyad answers. 0 adds neither (today's 4s bridge budget).
+	ApprovalWaitSeconds int
 }
 
 // Outcome is Run's terminal result. See StatusOK/StatusError/StatusTimeout
@@ -646,6 +655,16 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_BUG_COMMAND=1",
+	}
+	if cfg.ApprovalWaitSeconds > 0 {
+		extra = append(extra,
+			// B-1: the bridge's per-tools/call budget and the bundled CLI's
+			// own per-MCP-call hard limit (ms) must both outlast an approval
+			// wait, in that order (bridge first, so a wedged kahyad is still
+			// reported as a bridge transport error, not a CLI timeout).
+			"KAHYA_MCP_TOOLCALL_TIMEOUT_S="+strconv.Itoa(cfg.ApprovalWaitSeconds+60),
+			"MCP_TOOL_TIMEOUT="+strconv.Itoa((cfg.ApprovalWaitSeconds+90)*1000),
+		)
 	}
 	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
 		pythonPath := wd

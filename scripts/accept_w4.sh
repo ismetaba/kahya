@@ -301,6 +301,7 @@ run_scenario_a() {
 
 	if ! start_daemon scenario-a "$(cat <<EOF
 task_timeout_min: $(( (SCENARIO_A_TIMEOUT_S/60) + 2 ))
+approval_wait_seconds: 0
 embed_cmd: []
 egress_port: $(free_port)
 worker_cmd: ["$PYTHON3", "$FIXTURES_DIR/w2_worker.py"]
@@ -384,6 +385,7 @@ run_scenario_b() {
 
 	prepare_daemon scenario-b "$(cat <<EOF
 task_timeout_min: 2
+approval_wait_seconds: 0
 embed_cmd: []
 egress_port: $(free_port)
 worker_cmd: ["$PYTHON3", "$FIXTURES_DIR/cloud_worker.py"]
@@ -469,6 +471,7 @@ run_scenario_c() {
 	local cfg
 	cfg="$(cat <<EOF
 task_timeout_min: 2
+approval_wait_seconds: 0
 embed_cmd: []
 egress_port: $(free_port)
 anchor_remote: "file://$bare_remote"
