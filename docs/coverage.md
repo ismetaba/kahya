@@ -218,6 +218,9 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | deleting an anchored event and recomputing the state is caught (`checkpoint_not_recomputable`), never a skipped comparison | `kahyad/internal/anchor/TestVerifyDetectsDeletedCheckpointedEvent` | FIX-P-3 | ci-hermetic |
 | Safety #4 | an anchor remote whose HEAD names an unborn branch is read through its remote ref (empty fresh-clone checkout) | `kahyad/internal/anchor/TestVerifyReadsRemoteBranchWhenRemoteHEADIsUnborn` | FIX-P-3 | ci-hermetic |
 | Safety #4 | an unreadable anchor remote is an error (exit 2), never OK | `kahyad/internal/anchor/TestVerifyRemoteUnreachableIsErrorNotOK` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a failing remote-branch probe in the verify clone is an error, never "never anchored" (zero checkpoints) | `kahyad/internal/anchor/TestVerifyRemoteBranchProbeErrorIsError` | FIX-P-3 | ci-hermetic |
+| Safety #4 | "the remote has no anchor branch" is believed only when the remote itself confirms it (ls-remote) | `kahyad/internal/anchor/TestVerifyRefusesNeverAnchoredWhenRemoteHoldsBranch` | FIX-P-3 | ci-hermetic |
+| Safety #4 | a `clone.defaultRemoteName` in the git config cannot hide a tamper from verify (clones always name the remote origin) | `kahyad/internal/anchor/TestVerifyIgnoresGlobalCloneDefaultRemoteName` | FIX-P-3 | ci-hermetic |
 | Safety #4 | a pending (offline) anchor and a rotated anchor repo are not reported as tampering | `kahyad/internal/anchor/TestVerifyOKWithUnpushedPendingAnchor` | FIX-P-3 | ci-hermetic |
 | Safety #4 | concurrent ledger appends and anchor pushes during a verify are not reported as tampering | `kahyad/internal/anchor/TestVerifyToleratesConcurrentLedgerWrites` | FIX-P-3 | ci-hermetic |
 | Safety #4 | pre-0010 legacy events do not trip verify; tampering with a chained event still does | `kahyad/internal/anchor/TestVerifyOKWithPre0010LegacyEvents` | FIX-P-3 | ci-hermetic |

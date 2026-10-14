@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,8 +65,14 @@ type execGitRunner struct{}
 // NewExecGitRunner returns the GitRunner production code should use.
 func NewExecGitRunner() GitRunner { return execGitRunner{} }
 
+// Clone always names the clone's remote "origin" (--origin), whatever
+// clone.defaultRemoteName the user's git config sets: every later read
+// (remoteBranchRef) and write (`push origin`, `remote set-url origin`)
+// depends on that name, and a renamed remote must never make a populated
+// anchor repo look "never anchored" (FIX-P-3 review round 1). "--" keeps a
+// configured remote value from ever being parsed as an option.
 func (execGitRunner) Clone(ctx context.Context, remote, dir string, env []string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, "git", "clone", remote, dir)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--origin", "origin", "--", remote, dir)
 	return runCmd(cmd, env)
 }
 
@@ -87,6 +94,56 @@ func runCmd(cmd *exec.Cmd, env []string) (string, string, error) {
 // remoteBranchRef is the fetched remote-tracking ref every read of "what
 // the remote actually holds" goes through - never a local branch.
 const remoteBranchRef = "refs/remotes/origin/" + anchorBranch
+
+// gitExitStatus reports whether err is git itself exiting with status code
+// - the only way a caller may read a git failure as an ANSWER ("no such
+// ref", "no matching remote ref"). Anything else (git missing, a signal, a
+// canceled context, an injected runner error) is a failure the caller must
+// surface: fail-closed, never "absent".
+func gitExitStatus(err error, code int) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == code
+}
+
+// probeRemoteBranch reports whether the clone at dir holds remoteBranchRef.
+// present=false only on `git rev-parse --verify -q`'s own "no such ref"
+// answer (exit status 1); every other failure is an error - a probe that
+// could not run never means "the remote has no anchor branch".
+func probeRemoteBranch(ctx context.Context, runner GitRunner, dir string, env []string) (present bool, err error) {
+	_, stderr, err := runner.Run(ctx, dir, env, "rev-parse", "--verify", "-q", remoteBranchRef)
+	switch {
+	case err == nil:
+		return true, nil
+	case gitExitStatus(err, 1):
+		return false, nil
+	default:
+		return false, fmt.Errorf("anchor: git rev-parse --verify %s: %w: %s", remoteBranchRef, err, strings.TrimSpace(stderr))
+	}
+}
+
+// confirmRemoteBranchAbsent asks the remote itself (`git ls-remote
+// --exit-code <remote> refs/heads/<anchorBranch>`, by URL - independent of
+// the clone's own remote config) whether it really has no anchorBranch.
+// nil only on ls-remote's own "no matching refs" answer (exit status 2) or
+// a listing without that exact ref; a remote that does hold the branch (a
+// clone that hides it, or the very first anchor landing mid-verify - rerun)
+// or a failed ls-remote is an error.
+func confirmRemoteBranchAbsent(ctx context.Context, runner GitRunner, dir, remote string, env []string) error {
+	const headRef = "refs/heads/" + anchorBranch
+	stdout, stderr, err := runner.Run(ctx, dir, env, "ls-remote", "--exit-code", "--", remote, headRef)
+	if gitExitStatus(err, 2) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("anchor: git ls-remote %s: %w: %s", headRef, err, strings.TrimSpace(stderr))
+	}
+	for _, l := range strings.Split(stdout, "\n") {
+		if f := strings.Fields(l); len(f) == 2 && f[1] == headRef {
+			return fmt.Errorf("anchor: the remote holds %s but the verify clone has no %s - refusing to read it as never anchored", headRef, remoteBranchRef)
+		}
+	}
+	return nil
+}
 
 // ensureClone makes repoDir an exact mirror of the remote's anchorBranch
 // (FIX-P-13): the working clone is a CACHE of the remote, never state -
@@ -134,15 +191,22 @@ func ensureClone(ctx context.Context, runner GitRunner, remote, repoDir string, 
 	if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("anchor: reset %s: %w", logPath, err)
 	}
-	if _, _, err := runner.Run(ctx, repoDir, env, "rev-parse", "--verify", "-q", remoteBranchRef); err == nil {
+	present, err := probeRemoteBranch(ctx, runner, repoDir, env)
+	if err != nil {
+		return false, err
+	}
+	if present {
 		if _, stderr, err := runner.Run(ctx, repoDir, env, "checkout", "--quiet", "--force", "-B", anchorBranch, remoteBranchRef); err != nil {
 			return false, fmt.Errorf("anchor: git checkout -B %s %s: %w: %s", anchorBranch, remoteBranchRef, err, strings.TrimSpace(stderr))
 		}
 		return true, nil
 	}
 	// Unborn remote branch (git clone warned "cloned an empty repository"
-	// or "remote HEAD refers to nonexistent ref"): mirror that locally -
-	// HEAD on an unborn anchorBranch, no local commits, nothing staged.
+	// or "remote HEAD refers to nonexistent ref", and the probe above got
+	// git's own "no such ref" answer - never a failed probe): mirror that
+	// locally - HEAD on an unborn anchorBranch, no local commits, nothing
+	// staged. Even a wrong guess here cannot rewrite the remote: the later
+	// push is never forced, so it is rejected as a non-fast-forward.
 	if _, stderr, err := runner.Run(ctx, repoDir, env, "symbolic-ref", "HEAD", "refs/heads/"+anchorBranch); err != nil {
 		return false, fmt.Errorf("anchor: git symbolic-ref HEAD: %w: %s", err, strings.TrimSpace(stderr))
 	}
@@ -161,7 +225,10 @@ func ensureClone(ctx context.Context, runner GitRunner, remote, repoDir string, 
 // empty when the remote HEAD names an unborn branch (a bare repo created
 // without `-b main`, tests/acceptance/w4's initBareGitRemote shape) and (b)
 // is writable by anyone with this uid. haveBranch=false means the remote has
-// no anchorBranch yet (never anchored) - not an error. The clone directory
+// no anchorBranch yet (never anchored) - not an error, but only when that
+// absence was positively observed (git's own "no such ref" in the clone,
+// confirmed by the remote's own ls-remote); any probe that fails is an
+// error, never zero checkpoints (fail-closed). The clone directory
 // is removed before returning (a verify killed mid-run can leave a
 // kahya-anchor-verify-* directory behind; it is safe to delete).
 func readRemoteAnchorLines(ctx context.Context, runner GitRunner, remote, parentDir string, env []string) (lines []anchorLine, haveBranch bool, err error) {
@@ -180,7 +247,16 @@ func readRemoteAnchorLines(ctx context.Context, runner GitRunner, remote, parent
 	if _, stderr, err := runner.Clone(ctx, remote, dir, env); err != nil {
 		return nil, false, fmt.Errorf("anchor: git clone (verify): %w: %s", err, strings.TrimSpace(stderr))
 	}
-	if _, _, err := runner.Run(ctx, dir, env, "rev-parse", "--verify", "-q", remoteBranchRef); err != nil {
+	present, err := probeRemoteBranch(ctx, runner, dir, env)
+	if err != nil {
+		return nil, false, err
+	}
+	if !present {
+		// Zero authoritative checkpoints: believe it only once the remote
+		// itself confirms it has no anchor branch (FIX-P-3 review round 1).
+		if err := confirmRemoteBranchAbsent(ctx, runner, dir, remote, env); err != nil {
+			return nil, false, err
+		}
 		return nil, false, nil // the remote exists but has no anchor branch yet
 	}
 	stdout, stderr, err := runner.Run(ctx, dir, env, "show", remoteBranchRef+":"+anchorLogFileName)
