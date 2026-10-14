@@ -187,7 +187,7 @@ func factText(f sqlcgen.Fact) string {
 // NULL, exactly as if it had never been sent) and is still ledgered, but
 // does not count toward the returned total.
 func (e *Engine) Run(ctx context.Context, traceID string) (asked int, err error) {
-	facts, err := e.sampler.Select(ctx)
+	facts, err := e.sampler.Select(ctx, traceID)
 	if err != nil {
 		return 0, err
 	}

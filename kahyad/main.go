@@ -650,6 +650,13 @@ func run() int {
 	// into this exact Engine, so a Telegram tap and `kahya job run
 	// truth-ritual` drive the identical code path.
 	ritualSampler := ritual.NewSampler(st.Queries, cfg.MemoryDir, pol.SecretLaneGlobs, nil)
+	// FIX-P-17: the sampler content-classifies each fact's TEXT (the exact
+	// question body sent to Telegram) with the deterministic secret-lane
+	// pre-pass on top of its path-glob check, and ledgers every excluded
+	// fact under the run's trace_id. Deterministic-only by owner decision
+	// G02-4 (no SetFactClassifier: memory pressure on the local model must
+	// never empty the weekly ritual).
+	ritualSampler.SetLedger(st)
 	ritualEngine := ritual.New(ritualSampler, st.Queries, factEngine, taintTracker, st, tgBot)
 	tgBot.SetRitualAnswerer(ritualEngine)
 

@@ -209,6 +209,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | executed≠approved bytes ⇒ reject | `kahyad/internal/policy/TestTokenBytesHashMismatchFails` | W3-02 | ci-hermetic |
 | Safety #5 | red-team homoglyph-approval-bypass scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |
 | Safety #5 | secret-lane diff never to Telegram (redacted title only) | `kahyad/internal/telegram/TestSecretLaneRedactedOnlyTitleSent` | W3-07 | ci-hermetic |
+| Safety #5 | ritual never sends secret-lane fact TEXT to Telegram (content-classified, fail-closed) | `kahyad/internal/ritual/TestRunNeverDeliversSecretLaneFactText` | FIX-P-17 | ci-hermetic |
+| Safety #5 | a ritual fact classifier error excludes the fact (fail-closed), ledgered `classify_failed` | `kahyad/internal/ritual/TestSelectExcludesFactWhenFactClassifierErrors` | FIX-P-17 | ci-hermetic |
 | Safety #5 | Telegram chat_id/user_id allowlist enforced Go-side (mismatch dropped) | `kahyad/internal/telegram/TestAllowlistMiddlewareDropsMismatch` | W3-07 | ci-hermetic |
 | Safety #5 | W3 approval local-only over real bins (not via Telegram / CLI onayla) | `tests/w3/TestGate2_W3NeverApprovedViaTelegramOnlyLocalOnayla` | W3-10 | local-integration |
 | Safety #5 | approved WYSIWYE bytes execute exactly once (approve -> same-task binding re-check redeems the grant once) | `kahyad/internal/policy/TestApprovedGrantRedeemedByBindingRecheck` | FIX-B-1 | ci-hermetic |

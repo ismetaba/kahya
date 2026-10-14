@@ -8,15 +8,28 @@
 // Telegram bullet, verbatim: "gizli-serit etiketli tek bir bayt Telegram'a
 // gonderilmez"): Select NEVER returns a secret-lane-tagged fact, and -
 // fail-closed - NEVER returns a fact this package cannot positively
-// classify as NOT secret-lane either. A fact's classification is derived
-// from the SAME path-glob mechanism kahyad/internal/consolidation's own
-// PartitionByLane already uses for memory files (policy.yaml's
-// secret_lane_globs are FILE-PATH globs ONLY, HANDOFF S4 ordering
-// invariant): walk every evidence row citing this fact back to the
-// episode it came from, and check that episode's source_path. A fact with
-// NO evidence row citing a resolvable episode path has NO classification
-// record at all and is excluded on that basis alone - "no classification
-// => treat as secret-lane => exclude" (task spec, verbatim).
+// classify as NOT secret-lane either. A fact is classified on BOTH halves
+// of HANDOFF S4's ordering invariant:
+//
+//   - PATH: the SAME path-glob mechanism kahyad/internal/consolidation's
+//     own PartitionByLane already uses for memory files (policy.yaml's
+//     secret_lane_globs are FILE-PATH globs ONLY): walk every evidence row
+//     citing this fact back to the episode it came from, and check that
+//     episode's source_path. A fact with NO evidence row citing a
+//     resolvable episode path has NO classification record at all and is
+//     excluded on that basis alone - "no classification => treat as
+//     secret-lane => exclude" (task spec, verbatim).
+//   - CONTENT (FIX-P-17): the exact text Run would send to Telegram
+//     (factText) is classified locally - always by the deterministic
+//     pre-pass (secretlane.ClassifyDeterministic: IBAN/TCKN/card/CVV and
+//     the finans/saglik/kimlik lexicon), plus an optional FactClassifier
+//     on top (fail-closed: any error excludes). Facts are path-independent
+//     (an IBAN can sit in a note under an ordinary path), so the path
+//     check alone let such a fact's text reach Telegram.
+//
+// Every excluded fact is ledgered (EventFactExcludedSecretLane, with the
+// run's trace_id) when a ledger is wired, so a silently short ritual is
+// explainable from the events table.
 package ritual
 
 import (
@@ -30,6 +43,7 @@ import (
 
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -64,14 +78,47 @@ func (PolicyGlobMatcher) Match(pattern, path string) (bool, error) {
 	return policy.MatchGlob(pattern, path)
 }
 
+// FactClassifier is the FIX-P-17 content seam on top of the deterministic
+// pre-pass: it decides whether the text that WOULD be sent to Telegram
+// (factText) is finans/saglik/kimlik content. Optional - nil means
+// "deterministic pre-pass only", never "skip classification". kahyad wires
+// none (owner decision G02-4: deterministic-only, so memory pressure on
+// the local model can never empty a ritual); a wired one must be local-only
+// and is fail-closed: an error excludes the fact.
+type FactClassifier interface {
+	ClassifySecretLane(ctx context.Context, text string) (secret bool, err error)
+}
+
+// EventFactExcludedSecretLane is ledgered once per fact Select excludes on
+// secret-lane grounds (payload: fact_id, reason), under the run's trace_id.
+const EventFactExcludedSecretLane = "ritual.fact_excluded_secret_lane"
+
+// Exclusion reasons (EventFactExcludedSecretLane payload "reason").
+const (
+	ExcludeReasonPathGlob             = "path_glob"
+	ExcludeReasonNoClassification     = "no_classification_record"
+	ExcludeReasonContentDeterministic = "content_deterministic"
+	ExcludeReasonContentClassifier    = "content_classifier"
+	ExcludeReasonClassifyFailed       = "classify_failed"
+)
+
 // Sampler implements the sampling policy described in this file's own
 // doc comment. Construct one with NewSampler per kahyad process.
 type Sampler struct {
-	store       SamplerStore
-	memoryDir   string
-	secretGlobs []string
-	matcher     GlobMatcher
+	store          SamplerStore
+	memoryDir      string
+	secretGlobs    []string
+	matcher        GlobMatcher
+	factClassifier FactClassifier // nil => deterministic pre-pass only
+	ledger         Ledger         // nil => exclusions are not ledgered
 }
+
+// SetFactClassifier wires an optional content classifier on top of the
+// deterministic pre-pass (see FactClassifier). Production wires none.
+func (s *Sampler) SetFactClassifier(c FactClassifier) { s.factClassifier = c }
+
+// SetLedger wires the exclusion ledger (*store.Store in production).
+func (s *Sampler) SetLedger(l Ledger) { s.ledger = l }
 
 // NewSampler constructs a Sampler. matcher defaults to PolicyGlobMatcher{}
 // when nil (production callers never need to pass one explicitly).
@@ -98,8 +145,9 @@ type scoredFact struct {
 // one tier equally) is broken by fact.ID ascending, so the result is
 // FULLY deterministic for a given brain.db snapshot - re-running Select
 // against unchanged data always returns the identical sample, never a
-// randomized one.
-func (s *Sampler) Select(ctx context.Context) ([]sqlcgen.Fact, error) {
+// randomized one. traceID is the run's trace_id: every exclusion ledger row
+// carries it.
+func (s *Sampler) Select(ctx context.Context, traceID string) ([]sqlcgen.Fact, error) {
 	facts, err := s.store.ListActiveFacts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("ritual: list active facts: %w", err)
@@ -112,7 +160,7 @@ func (s *Sampler) Select(ctx context.Context) ([]sqlcgen.Fact, error) {
 
 	candidates := make([]scoredFact, 0, len(facts))
 	for _, f := range facts {
-		eligible, err := s.classify(ctx, f.ID)
+		eligible, err := s.classify(ctx, traceID, f)
 		if err != nil {
 			return nil, err
 		}
@@ -171,12 +219,14 @@ func (s *Sampler) lastAskedByFact(ctx context.Context) (map[int64]string, error)
 }
 
 // classify implements the fail-closed secret-lane exclusion described in
-// this file's own package doc comment: factID is eligible iff it has at
-// least one evidence row citing an episode with a resolvable, non-secret
-// source_path, AND none of its cited episodes' paths match a secret-lane
-// glob. Zero resolvable episode citations at all == no classification
-// record == excluded.
-func (s *Sampler) classify(ctx context.Context, factID int64) (eligible bool, err error) {
+// this file's own package doc comment: f is eligible iff it has at least
+// one evidence row citing an episode with a resolvable, non-secret
+// source_path, NONE of its cited episodes' paths match a secret-lane glob,
+// AND its text (factText - exactly what Run sends) is not secret-lane
+// content. Zero resolvable episode citations at all == no classification
+// record == excluded. Every exclusion is ledgered (ledgerExcluded).
+func (s *Sampler) classify(ctx context.Context, traceID string, f sqlcgen.Fact) (eligible bool, err error) {
+	factID := f.ID
 	rows, err := s.store.ListEvidenceByFact(ctx, factID)
 	if err != nil {
 		return false, fmt.Errorf("ritual: list evidence for fact %d: %w", factID, err)
@@ -200,13 +250,47 @@ func (s *Sampler) classify(ctx context.Context, factID int64) (eligible bool, er
 		classified = true
 		absPath := filepath.Join(s.memoryDir, filepath.FromSlash(ep.SourcePath.String))
 		if s.matchesAnySecretGlob(absPath) {
-			return false, nil // secret-lane tagged -> excluded, regardless of any OTHER evidence row
+			// secret-lane tagged -> excluded, regardless of any OTHER evidence row
+			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonPathGlob)
+			return false, nil
 		}
 	}
 	if !classified {
-		return false, nil // no classification record at all -> fail-closed exclude
+		// no classification record at all -> fail-closed exclude
+		s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonNoClassification)
+		return false, nil
+	}
+
+	// FIX-P-17: the path check above is HANDOFF's file-path rule; this is
+	// the content half, applied to the EXACT text Run would send. The
+	// deterministic pre-pass always runs (no model needed); an optional
+	// FactClassifier runs on top, fail-closed on any error.
+	text := factText(f)
+	if secretlane.ClassifyDeterministic(text).SecretLane {
+		s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonContentDeterministic)
+		return false, nil
+	}
+	if s.factClassifier != nil {
+		secret, cerr := s.factClassifier.ClassifySecretLane(ctx, text)
+		if cerr != nil {
+			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonClassifyFailed)
+			return false, nil
+		}
+		if secret {
+			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonContentClassifier)
+			return false, nil
+		}
 	}
 	return true, nil
+}
+
+// ledgerExcluded records one EventFactExcludedSecretLane row (best-effort:
+// the exclusion itself never depends on the ledger write).
+func (s *Sampler) ledgerExcluded(ctx context.Context, traceID string, factID int64, reason string) {
+	if s.ledger == nil {
+		return
+	}
+	_ = s.ledger.LogEvent(ctx, traceID, EventFactExcludedSecretLane, map[string]any{"fact_id": factID, "reason": reason})
 }
 
 // matchesAnySecretGlob reports whether absPath matches any entry in

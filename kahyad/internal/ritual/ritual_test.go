@@ -327,3 +327,37 @@ func containsSubstr(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestRunNeverDeliversSecretLaneFactText (FIX-P-17): a fact whose evidence
+// sits under an ORDINARY path but whose TEXT carries an IBAN is never sent
+// to Telegram, opens no eval_labels row, and its exclusion is ledgered
+// (content_deterministic) under the run's trace_id.
+func TestRunNeverDeliversSecretLaneFactText(t *testing.T) {
+	st := newTestStore(t)
+	ep := seedEpisode(t, st, "notlar/genel.md") // outside testSecretGlobs
+	f := seedFact(t, st, "Ahmet'in IBAN'i", "su", "TR33 0006 1005 1978 6457 8413 26", "user_asserted", 1.0, false)
+	seedClassifyingEvidence(t, st, f.ID, ep)
+	delivery := &fakeDelivery{sendResult: true}
+	engine := newTestEngine(t, st, delivery)
+	engine.sampler.SetLedger(st)
+
+	const traceID = "run-trace-p17-00000000000000000001"
+	asked, err := engine.Run(context.Background(), traceID)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if asked != 0 || len(delivery.calls) != 0 {
+		t.Fatalf("Run() asked = %d, deliveries = %+v; want 0 and none (secret-lane fact text)", asked, delivery.calls)
+	}
+	rows, err := st.Queries.ListEvalLabelsByTrace(context.Background(), traceID)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("eval_labels rows = %d (err %v), want 0", len(rows), err)
+	}
+	if got := countEventsOfKind(t, st, EventFactExcludedSecretLane); got != 1 {
+		t.Fatalf("%s events = %d, want 1", EventFactExcludedSecretLane, got)
+	}
+	ex := excludedRows(t, st)
+	if len(ex) != 1 || ex[0].reason != ExcludeReasonContentDeterministic || ex[0].traceID != traceID || ex[0].factID != f.ID {
+		t.Fatalf("exclusion rows = %+v, want one {fact %d, %s, %s}", ex, f.ID, ExcludeReasonContentDeterministic, traceID)
+	}
+}
