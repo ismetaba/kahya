@@ -96,7 +96,8 @@ func (s *Server) transcribeAudioLocally(ctx context.Context, log *logx.Logger, t
 		TmpDir:           s.cfg.TmpDir(),
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, defaultSTTTimeout)
+	// FIX-I-5: the STT worker ends with the daemon too (boundTaskContext).
+	callCtx, cancel := s.boundTaskContext(ctx, defaultSTTTimeout)
 	defer cancel()
 
 	var mu sync.Mutex

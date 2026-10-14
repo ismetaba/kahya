@@ -90,6 +90,12 @@ const (
 	healthCheckTimeout     = 1 * time.Second
 	readHeaderTimeout      = 5 * time.Second
 	shutdownTimeout        = 5 * time.Second
+	// inflightDrainTimeout bounds how long Shutdown waits for in-flight
+	// worker runs to return after cancelling them (FIX-I-5, owner decision
+	// G10-5: 15s - a launchd KeepAlive restart is never held up longer).
+	// spawn.Run returns within ~2*drainGrace of its context ending; the
+	// rest covers the post-spawn bookkeeping that records the outcome.
+	inflightDrainTimeout = 15 * time.Second
 )
 
 // Server is kahyad's HTTP-over-UDS control-plane server.
@@ -348,6 +354,76 @@ type Server struct {
 	lock *os.File
 
 	started time.Time
+
+	// lifecycle is the daemon-lifetime context (FIX-I-5): every worker run
+	// handleTask/handleSecretLaneTask start derives its context from it as
+	// well as from the request (boundTaskContext), and Shutdown cancels it
+	// FIRST - http.Server.Shutdown never cancels an active request's
+	// context, so without it a worker (its own session and process group)
+	// outlived kahyad as an orphan. inflight counts those runs so Shutdown
+	// can wait (bounded) for them to return and record their outcome.
+	lifecycle       context.Context
+	lifecycleCancel context.CancelFunc
+	inflight        inflightGate
+}
+
+// inflightGate is a WaitGroup that refuses new members once closed
+// (FIX-I-5): Shutdown closes it and waits, and a run that would begin
+// after that is refused instead of racing Wait (sync.WaitGroup forbids an
+// Add from zero concurrent with Wait). The zero value is open.
+type inflightGate struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// begin registers one in-flight run; false once the gate is closed (the
+// daemon is shutting down - start nothing new).
+func (g *inflightGate) begin() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	g.wg.Add(1)
+	return true
+}
+
+// end marks one begun run finished.
+func (g *inflightGate) end() { g.wg.Done() }
+
+// closeAndWait closes the gate and waits up to d for every begun run to
+// end; false means d elapsed first. Safe to call repeatedly.
+func (g *inflightGate) closeAndWait(d time.Duration) bool {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		g.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// boundTaskContext derives a worker-run context from the request context
+// (a client disconnect still kills the worker, as before) with deadline d
+// that is ALSO cancelled when the daemon shuts down (FIX-I-5):
+// http.Server.Shutdown never cancels an active request's context, so
+// without this a worker would outlive kahyad as an orphan in its own
+// process group.
+func (s *Server) boundTaskContext(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, d)
+	if s.lifecycle == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(s.lifecycle, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 // New constructs a Server bound to cfg.Socket, reporting db's health at
@@ -356,6 +432,7 @@ type Server struct {
 func New(cfg config.Config, log *logx.Logger, version string, db DBHealth) *Server {
 	s := &Server{cfg: cfg, log: log, version: version, db: db}
 	s.approvalWaiter = newApprovalWaiter(s.probeApprovalDecision)
+	s.lifecycle, s.lifecycleCancel = context.WithCancel(context.Background())
 	return s
 }
 
@@ -541,21 +618,36 @@ func (s *Server) Serve() error {
 	return nil
 }
 
-// Shutdown gracefully stops the HTTP server (5s budget) and unlinks the
-// socket file and, last, the per-boot control secret file (G03 / B-3) -
-// both while the startup flock is still held. It does not log shutdown_complete — the caller (main.go)
+// Shutdown stops every in-flight worker run (FIX-I-5), gracefully stops the
+// HTTP server (5s budget) and unlinks the socket file and, last, the
+// per-boot control secret file (G03 / B-3) - both while the startup flock
+// is still held. It does not log shutdown_complete — the caller (main.go)
 // logs that on its boot-scoped logger after Shutdown returns, since it is
-// not tied to any single request.
+// not tied to any single request. Idempotent (test fixtures call it from
+// t.Cleanup after a test already did).
 func (s *Server) Shutdown() error {
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	// B-1: release every tool call parked on an approval FIRST (outcome
-	// canceled - nothing parked ever redeems once shutdown began), so
-	// http.Shutdown below is not left waiting on up to
-	// approval_wait_seconds of idle parked requests.
+	// FIX-I-5: stop every in-flight worker FIRST - spawn.Run observes its
+	// (boundTaskContext) context ending, SIGKILLs the worker's process
+	// group and returns within ~2*drainGrace. The tasks stay 'executing'
+	// (never done, never halted) for the next boot's resume scan.
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+	}
+	// B-1: release every tool call parked on an approval (outcome canceled
+	// - nothing parked ever redeems once shutdown began), so http.Shutdown
+	// below is not left waiting on up to approval_wait_seconds of idle
+	// parked requests. Stays before http.Shutdown (G00 C-5).
 	if s.approvalWaiter != nil {
 		s.approvalWaiter.Close()
 	}
+	// FIX-I-5: wait (bounded) for the cancelled runs to return and record
+	// their outcome (task_timeout, tasks.state) while brain.db is still
+	// open; no new run may begin from here on.
+	if !s.inflight.closeAndWait(inflightDrainTimeout) {
+		s.log.Warn("shutdown_inflight_timeout", "timeout_s", int(inflightDrainTimeout/time.Second))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
 	err := s.http.Shutdown(ctx)
 
 	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled

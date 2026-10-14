@@ -791,6 +791,35 @@ uncanceled resume row for the task exists. `kahya task resolve <id>
 --retry` cancels every pending row of the task (the park's future one
 included), clears `next_retry_at` and writes one fresh row.
 
+**Shutdown kills in-flight workers; boot kills recorded orphans (FIX-I-5):**
+`http.Server.Shutdown` never cancels an active request, so a worker (its
+own session and process group) used to outlive a stopping kahyad, and the
+restarted daemon's boot scan then started a second worker on the same
+session. Every worker run kahyad starts — `POST /v1/task`'s cloud worker,
+its STT worker, a secret-lane local answer — now runs under a context bound
+to the request, the task deadline **and** the daemon's lifecycle
+(`Server.boundTaskContext`). `Server.Shutdown` first cancels that
+lifecycle, releases parked approval waits, then waits up to 15 s
+(`inflightDrainTimeout`, owner decision G10-5; JSONL
+`shutdown_inflight_timeout` past it) for the in-flight `/v1/task`
+requests to kill their workers and record the outcome (`task_timeout`,
+`tasks.state` `error`); a `/v1/task` arriving meanwhile gets 503. Only
+then the HTTP server, Docker containers, socket and control secret go,
+the startup flock last. The outbox dispatcher gets the same lifecycle
+(`SetBaseContext`): it claims nothing once shutdown began and a running
+redispatch is killed (`outbox.redispatch_timed_out` with `shutdown: true`);
+main.go stops the tick scheduler right after `srv.Run` returns. Fail-
+closed: an interrupted task is never `done` and never halted — it stays
+`executing`, and each restart costs it one `crash_resumes`. At boot,
+before the startup resume scan and before the socket is bound,
+`halt.Executor.KillOrphanedWorkersAtBoot` SIGKILLs every process group
+still recorded in `tasks.worker_pgid` (a previous kahyad died before
+`spawn.Run` returned) whose leader passes the worker identity check
+(JSONL `halt.orphan_worker_killed`, ledger `task.orphan_worker_killed`
+under the task's trace), clears every visited record, and logs
+`orphan_sweep_done{killed}` (`orphan_sweep_failed` on error; without an
+identity check it refuses and kills nothing).
+
 All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a
 timeout — which cancels the timeout context by design — never prevents

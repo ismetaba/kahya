@@ -489,6 +489,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "anthropic forward-proxy not available")
 		return
 	}
+	// FIX-I-5: the whole request is one in-flight run of the daemon - the
+	// worker it spawns (cloud or STT) or the local answer it computes, plus
+	// the bookkeeping that records the outcome. Shutdown cancels it through
+	// boundTaskContext and waits (bounded) for it to return; once shutdown
+	// began, nothing new starts.
+	if !s.inflight.begin() {
+		writeJSONError(w, http.StatusServiceUnavailable, "kahyad is shutting down")
+		return
+	}
+	defer s.inflight.end()
 
 	// BLOCKER 3: cap the body BEFORE decoding - this happens before the SSE
 	// response even starts (headers are written further below), so an
@@ -965,7 +975,9 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	timeoutMin := s.cfg.TaskTimeoutMin
-	taskCtx, cancel := context.WithTimeout(dbCtx, s.taskDeadline())
+	// FIX-I-5: bound to the request (a client disconnect still kills the
+	// worker), the task deadline AND the daemon's lifecycle (Shutdown).
+	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
 	defer cancel()
 
 	spawnCfg := spawn.Config{
@@ -1350,8 +1362,10 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 		}
 	}
 
-	timeoutMin := s.cfg.TaskTimeoutMin
-	taskCtx, cancel := context.WithTimeout(dbCtx, time.Duration(timeoutMin)*time.Minute)
+	// FIX-I-5: the local answer ends with the daemon too (boundTaskContext);
+	// the task stays 'executing' and the restarted kahyad's dispatcher fails
+	// it (a local answer is never handed to a worker).
+	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
 	defer cancel()
 
 	if s.secretLaneAnswerer == nil {

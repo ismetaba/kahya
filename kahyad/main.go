@@ -204,6 +204,18 @@ func run() int {
 		"pid", os.Getpid(),
 	)
 
+	// FIX-I-5 (G00 C-5): the daemon's ONE lifecycle context, created first,
+	// before anything else this function starts, so every component wired
+	// below - the outbox dispatcher, the tick closures, the boot reindex
+	// goroutine, the undo sweeper, the Telegram bot, srv.Run and any block a
+	// later package adds - inherits the same SIGINT/SIGTERM cancellation
+	// instead of running on an unrelated context.Background() that shutdown
+	// can never reach (BLOCKER 2's original reason for moving it up). A
+	// signal during boot is fine: srv.Run sees the context already done and
+	// shuts down cleanly right after binding.
+	lifecycleCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
 	// Fail-LOUD on a non-prod profile: KAHYA_ENV=<name> resolution is generic
 	// (W78-02: any well-formed name gets its own isolated ~/Library/Application
 	// Support/Kahya-<name>/ tree, so W78-05's restore profile works too), which
@@ -1144,6 +1156,9 @@ func run() int {
 	// POST /v1/task gives a first spawn - one hung resumed worker can no
 	// longer stall every later redelivery.
 	taskDispatcher.SetTaskTimeout(time.Duration(cfg.TaskTimeoutMin) * time.Minute)
+	// FIX-I-5: daemon shutdown claims nothing new and kills a redispatched
+	// worker still running (the tick context below never ends on its own).
+	taskDispatcher.SetBaseContext(lifecycleCtx)
 	// W4-04: a redispatched cloud-lane task needs its OWN fresh Anthropic
 	// forward-proxy listener to make any model call at all - srv.
 	// NewTaskProxy is the EXACT SAME construction handleTask uses at first
@@ -1153,22 +1168,43 @@ func run() int {
 		return srv.NewTaskProxy(taskID, traceID)
 	})
 
+	// ctx below is the TICK's own context (scheduler.runTickRecovered: a
+	// context.Background() derivative); FIX-I-5: both closures also check
+	// the daemon's lifecycleCtx and do nothing once shutdown began.
 	runResumeScan := func(ctx context.Context) {
+		if lifecycleCtx.Err() != nil {
+			return
+		}
 		if _, err := taskResume.Scan(ctx); err != nil {
 			log.Error("task_resume_scan_failed", "err", err.Error())
 		}
 	}
 	runOutboxDispatch := func(ctx context.Context) {
+		if lifecycleCtx.Err() != nil {
+			return
+		}
 		if _, err := taskDispatcher.ClaimAndDispatch(ctx); err != nil {
 			log.Error("outbox_dispatch_failed", "err", err.Error())
 		}
+	}
+	// FIX-I-5: before the startup scan (and before the socket is bound),
+	// kill every worker a previous kahyad process recorded and never
+	// cleared (tasks.worker_pgid) - an orphan of a crash/SIGKILL/launchd
+	// kickstart keeps running in its own session (macOS has no PDEATHSIG).
+	// Identity-checked (FIX-I-13): a pgid that no longer looks like our
+	// worker is only cleared. Otherwise the scan below would hand a still
+	// running orphan's task to a SECOND worker on the same session.
+	if n, err := haltExecutor.KillOrphanedWorkersAtBoot(context.Background()); err != nil {
+		log.Error("orphan_sweep_failed", "err", err.Error())
+	} else {
+		log.Info("orphan_sweep_done", "killed", n)
 	}
 	// Startup scan: every task.go's own comment on "no live worker PID"
 	// applies in its strongest form here - taskLive is still EMPTY (no
 	// spawn has registered into it yet this process), so every
 	// tasks.status='executing' row left over from a previous kahyad
 	// process (crash, SIGKILL, machine restart) is correctly treated as
-	// interrupted.
+	// interrupted - and since FIX-I-5 its worker is really gone.
 	runResumeScan(context.Background())
 	// W4-07: the tick intervals themselves are now cfg-driven (default 30s/
 	// 5s, unchanged from the literal specs this replaced) so a hermetic
@@ -1241,14 +1277,6 @@ func run() int {
 		log.Error("job_sync_failed", "err", err.Error())
 	}
 
-	// ctx is created here (BEFORE the boot reindex goroutine below is
-	// spawned, not after) so that goroutine can share the SAME
-	// signal-cancelled context srv.Run uses, instead of running on an
-	// unrelated context.Background() that shutdown could never reach
-	// (BLOCKER 2).
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	// Incremental reindex on every boot, after migrations (W12-04 step:
 	// "Startup hook in main.go"). Async: the memory corpus can be large
 	// enough that blocking Serve on it would delay every other request
@@ -1262,7 +1290,7 @@ func run() int {
 	// this goroutine and it ran on context.Background(), so a shutdown
 	// signal could let st.Close() close brain.db while this goroutine was
 	// still mid-reindex, producing spurious "database is closed" file
-	// errors; now shutdown cancels ctx (idx.Reindex checks ctx.Err()
+	// errors; now shutdown cancels lifecycleCtx (idx.Reindex checks ctx.Err()
 	// between files and stops early) and then actually waits for it to
 	// finish before the DB is allowed to close.
 	var reindexDone sync.WaitGroup
@@ -1277,7 +1305,7 @@ func run() int {
 		// is nothing left to log a second time on success. full=false,
 		// reEmbed=false: an ordinary boot-time incremental reindex, not a
 		// forced full rechunk or a version-switch re-embed.
-		if _, err := reindexBackfiller.Reindex(ctx, bootTraceID, false, false); err != nil {
+		if _, err := reindexBackfiller.Reindex(lifecycleCtx, bootTraceID, false, false); err != nil {
 			log.With(bootTraceID).Error("reindex_failed", "err", err.Error())
 		}
 	}()
@@ -1291,7 +1319,7 @@ func run() int {
 	undoSweepDone.Add(1)
 	go func() {
 		defer undoSweepDone.Done()
-		policyEngine.RunUndoSweeper(ctx, 30*time.Second)
+		policyEngine.RunUndoSweeper(lifecycleCtx, 30*time.Second)
 	}()
 
 	// W3-07: the Telegram bot's long-polling loop - Start blocks internally
@@ -1302,18 +1330,24 @@ func run() int {
 	telegramDone.Add(1)
 	go func() {
 		defer telegramDone.Done()
-		tgBot.Start(ctx)
+		tgBot.Start(lifecycleCtx)
 	}()
 
-	runErr := srv.Run(ctx)
+	runErr := srv.Run(lifecycleCtx)
 
-	// Cancel ctx explicitly (a no-op if a shutdown signal already fired
-	// it) and WAIT for the boot reindex goroutine (and the undo-window
+	// Cancel lifecycleCtx explicitly (a no-op if a shutdown signal already
+	// fired it). FIX-I-5: then stop the tick scheduler BEFORE anything else
+	// - robfig's Stop waits for a running tick to finish, and a running
+	// outbox_dispatch tick's redispatched worker was just cancelled through
+	// the dispatcher's base context, so this returns within spawn.Run's
+	// bounded kill-and-reap (the deferred StopTicks below is then a no-op).
+	// Then WAIT for the boot reindex goroutine (and the undo-window
 	// sweeper, and the Telegram bot's long-poll loop) to observe the
 	// cancellation and finish any in-flight work, before this function
 	// returns - so this always completes strictly before the deferred
 	// st.Close() call above (BLOCKER 2).
-	stop()
+	stopSignals()
+	sched.StopTicks()
 	reindexDone.Wait()
 	undoSweepDone.Wait()
 	telegramDone.Wait()

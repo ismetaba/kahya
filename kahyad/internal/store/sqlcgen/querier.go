@@ -521,6 +521,13 @@ type Querier interface {
 	// the CLI prints to stdout for MANUAL curation into the private ~/Kahya
 	// retrieval dataset. Read-only; adds no columns, so no migration is needed.
 	ListRitualLabeledFactsForEval(ctx context.Context) ([]ListRitualLabeledFactsForEvalRow, error)
+	// I-5: the boot orphan sweep's candidate set (kahyad/internal/halt.
+	// Executor.KillOrphanedWorkersAtBoot), run before anything is spawned in
+	// this process: every task row whose worker_pgid is still recorded - the
+	// worker of a PREVIOUS kahyad process that died before spawn.Run returned
+	// (crash, SIGKILL), in any status (a callback may have parked/failed the
+	// task mid-run). Column list = tasks' physical order (reuses Task).
+	ListTasksWithWorkerPGID(ctx context.Context) ([]Task, error)
 	// `kahya task show <id>`'s tool_calls listing, oldest attempt first.
 	ListToolCallsByTask(ctx context.Context, taskID string) ([]ToolCall, error)
 	// W3-06 `kahya approvals`: every not-yet-consumed row, oldest first.

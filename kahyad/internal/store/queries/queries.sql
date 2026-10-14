@@ -436,6 +436,18 @@ UPDATE tasks
 SET worker_pgid = NULL, updated_at = ?
 WHERE id = ? AND worker_pgid = ?;
 
+-- name: ListTasksWithWorkerPGID :many
+-- I-5: the boot orphan sweep's candidate set (kahyad/internal/halt.
+-- Executor.KillOrphanedWorkersAtBoot), run before anything is spawned in
+-- this process: every task row whose worker_pgid is still recorded - the
+-- worker of a PREVIOUS kahyad process that died before spawn.Run returned
+-- (crash, SIGKILL), in any status (a callback may have parked/failed the
+-- task mid-run). Column list = tasks' physical order (reuses Task).
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+FROM tasks
+WHERE worker_pgid IS NOT NULL
+ORDER BY updated_at ASC;
+
 -- name: SetTaskHaltedAt :exec
 -- W6-03: stamped by the halt executor in the SAME step that transitions
 -- tasks.status to 'user_halted' (kahyad/internal/task.Machine.Transition,

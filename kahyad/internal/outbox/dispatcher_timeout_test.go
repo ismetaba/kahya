@@ -162,3 +162,73 @@ func TestSetTaskTimeoutZeroRestoresDefault(t *testing.T) {
 		}
 	}
 }
+
+// TestClaimAndDispatchStopsWhenBaseContextDone (FIX-I-5): once the daemon's
+// lifecycle context ended, a tick claims nothing - the row stays due for
+// the next boot.
+func TestClaimAndDispatchStopsWhenBaseContextDone(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	row := enqueueResumeRow(t, st, "t1")
+	m := task.NewMachine(st.Queries, st)
+	marker := t.TempDir() + "/spawned"
+	d := newTestDispatcher(st, m, markerWorker(marker))
+	base, cancel := context.WithCancel(context.Background())
+	d.SetBaseContext(base)
+	cancel()
+
+	if n, err := d.ClaimAndDispatch(context.Background()); n != 0 || err != nil {
+		t.Fatalf("ClaimAndDispatch() = %d, %v; want 0, nil after shutdown began", n, err)
+	}
+	assertNoWorkerSpawned(t, marker)
+	var attempts int64
+	if err := st.DB().QueryRow(`SELECT attempts FROM outbox WHERE id = ?`, row.ID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || rowAcked(t, st, row.ID) {
+		t.Errorf("row attempts = %d, acked = %v; want an untouched, unclaimed row", attempts, rowAcked(t, st, row.ID))
+	}
+}
+
+// TestProcessResumeCancelsWorkerWhenBaseContextDone (FIX-I-5): a
+// redispatched worker that is still running when the daemon shuts down is
+// killed (the scheduler's tick context never ends on its own), the row is
+// acked as an interrupted run and the task stays 'executing'.
+func TestProcessResumeCancelsWorkerWhenBaseContextDone(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	row := enqueueResumeRow(t, st, "t1")
+	m := task.NewMachine(st.Queries, st)
+	live := task.NewLiveRegistry()
+	d := hangDispatcher(st, m, live) // default 30m per-row deadline
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.SetBaseContext(base)
+
+	done := runClaimAndDispatch(d, context.Background())
+	pid := waitForLivePID(t, live, "t1")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClaimAndDispatch never returned after the base context ended")
+	}
+	waitForGroupEmpty(t, pid)
+	if !rowAcked(t, st, row.ID) {
+		t.Error("the interrupted redispatch row must be acked")
+	}
+	if got := taskStatusOfStore(t, st, "t1"); got != task.StatusExecuting {
+		t.Errorf("status = %q, want %q", got, task.StatusExecuting)
+	}
+	var payload string
+	if err := st.DB().QueryRow(`SELECT payload FROM events WHERE kind = ?`, EventRedispatchTimedOut).Scan(&payload); err != nil {
+		t.Fatalf("read %s: %v", EventRedispatchTimedOut, err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["shutdown"] != true {
+		t.Errorf("payload = %v, want shutdown: true", p)
+	}
+}

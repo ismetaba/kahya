@@ -39,6 +39,15 @@ import (
 	mcpshell "kahya/mcp/shell"
 )
 
+// EventTaskOrphanWorkerKilled is the ledger event kind
+// KillOrphanedWorkersAtBoot appends (under the task's own trace_id) once
+// per orphaned worker process group it kills (FIX-I-5).
+const EventTaskOrphanWorkerKilled = "task.orphan_worker_killed"
+
+// ErrNoWorkerIdentity is KillOrphanedWorkersAtBoot's refusal to run without
+// SetWorkerIdentity: a recorded pgid is never killed unverified.
+var ErrNoWorkerIdentity = errors.New("halt: orphan sweep needs a worker identity check (SetWorkerIdentity)")
+
 // EventTaskUserHalted is the ledger event kind HaltTask appends once per
 // task it actually halts (W6-03 deliverable, verbatim: "Ledger event
 // kinds: task.user_halted, approval.invalidated" - the second kind,
@@ -59,6 +68,9 @@ type Store interface {
 	// CancelOutboxRowsByTask is task spec step 3.4 ("cancel the task's
 	// undelivered outbox rows").
 	CancelOutboxRowsByTask(ctx context.Context, arg sqlcgen.CancelOutboxRowsByTaskParams) (int64, error)
+	// ListTasksWithWorkerPGID (FIX-I-5) is the boot orphan sweep's
+	// candidate set: every task row whose worker_pgid is still recorded.
+	ListTasksWithWorkerPGID(ctx context.Context) ([]sqlcgen.Task, error)
 	// ClearTaskWorkerPGID (FIX-I-13) NULLs a persisted worker_pgid
 	// (compare-and-set on the recorded value) once the DB-sourced pgid was
 	// killed or found to no longer be our worker.
@@ -383,6 +395,50 @@ func (x *Executor) HaltAll(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// KillOrphanedWorkersAtBoot (FIX-I-5) kills, at kahyad startup, every
+// worker process group a PREVIOUS kahyad process recorded in
+// tasks.worker_pgid and never cleared - the orphan a SIGKILLed/crashed
+// daemon leaves behind (spawn.Run starts each worker as its own session
+// leader and macOS has no PDEATHSIG, migrations/0015's own doc comment).
+// Run it BEFORE the startup resume scan and before the socket is bound, so
+// that scan can never spawn a second worker next to a live orphan and the
+// orphan's bridge can never reach this daemon. Every recorded row is a
+// candidate whatever its status (a callback may have parked or failed the
+// task mid-run). Identity-checked (FIX-I-13): a pgid that no longer looks
+// like our worker is only cleared, never killed; without a wired identity
+// check the sweep refuses (ErrNoWorkerIdentity) and kills nothing. Every
+// visited record is cleared. The task's status is left alone: the resume
+// scan decides an 'executing' one (counted against task_max_crash_resumes).
+func (x *Executor) KillOrphanedWorkersAtBoot(ctx context.Context) (killed int, err error) {
+	if x.workerIdentity == nil {
+		return 0, ErrNoWorkerIdentity
+	}
+	tasks, err := x.store.ListTasksWithWorkerPGID(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("halt: list tasks with a recorded worker pgid: %w", err)
+	}
+	for _, t := range tasks {
+		pgid := int(t.WorkerPgid.Int64)
+		if !t.WorkerPgid.Valid || pgid <= 1 || !x.workerIdentity(pgid) {
+			x.logJSONL(t.TraceID, "halt.stale_pgid_skipped", t.ID, fmt.Sprintf("%d", pgid))
+			x.clearPGID(t.TraceID, t.ID, pgid)
+			continue
+		}
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			x.logJSONLErr(t.TraceID, "halt.orphan_worker_kill_failed", t.ID, err)
+			x.clearPGID(t.TraceID, t.ID, pgid)
+			continue
+		}
+		killed++
+		x.logJSONL(t.TraceID, "halt.orphan_worker_killed", t.ID, fmt.Sprintf("%d", pgid))
+		x.ledgerRaw(ctx, t.TraceID, EventTaskOrphanWorkerKilled, map[string]any{
+			"event": EventTaskOrphanWorkerKilled, "task_id": t.ID, "pgid": pgid, "status": t.Status,
+		})
+		x.clearPGID(t.TraceID, t.ID, pgid)
+	}
+	return killed, nil
 }
 
 // killProcessGroup implements task spec step 3.1: SIGKILL the worker's

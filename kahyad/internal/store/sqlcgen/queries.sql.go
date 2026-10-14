@@ -2982,6 +2982,59 @@ func (q *Queries) ListRitualLabeledFactsForEval(ctx context.Context) ([]ListRitu
 	return items, nil
 }
 
+const listTasksWithWorkerPGID = `-- name: ListTasksWithWorkerPGID :many
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+FROM tasks
+WHERE worker_pgid IS NOT NULL
+ORDER BY updated_at ASC
+`
+
+// I-5: the boot orphan sweep's candidate set (kahyad/internal/halt.
+// Executor.KillOrphanedWorkersAtBoot), run before anything is spawned in
+// this process: every task row whose worker_pgid is still recorded - the
+// worker of a PREVIOUS kahyad process that died before spawn.Run returned
+// (crash, SIGKILL), in any status (a callback may have parked/failed the
+// task mid-run). Column list = tasks' physical order (reuses Task).
+func (q *Queries) ListTasksWithWorkerPGID(ctx context.Context) ([]Task, error) {
+	rows, err := q.db.QueryContext(ctx, listTasksWithWorkerPGID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Task{}
+	for rows.Next() {
+		var i Task
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.SessionID,
+			&i.State,
+			&i.Model,
+			&i.Envelope,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.Lane,
+			&i.SecretCategory,
+			&i.Status,
+			&i.NextRetryAt,
+			&i.Attempts,
+			&i.WorkerPgid,
+			&i.HaltedAt,
+			&i.CrashResumes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listToolCallsByTask = `-- name: ListToolCallsByTask :many
 SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
 FROM tool_calls

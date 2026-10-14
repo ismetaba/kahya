@@ -207,7 +207,10 @@ type Dispatcher struct {
 	// taskTimeout bounds ONE redispatched worker's run (FIX-I-3) - see
 	// SetTaskTimeout.
 	taskTimeout time.Duration
-	now         func() time.Time
+	// baseCtx is the daemon's lifecycle context (FIX-I-5) - see
+	// SetBaseContext. nil = never cancelled from outside.
+	baseCtx context.Context
+	now     func() time.Time
 
 	// inFlight is BLOCKER 2(c)'s overlap guard: true for the entire
 	// duration of a ClaimAndDispatch call THIS Dispatcher instance is
@@ -256,6 +259,20 @@ func (d *Dispatcher) SetTaskTimeout(t time.Duration) {
 	d.taskTimeout = t
 }
 
+// SetBaseContext wires the daemon's lifecycle context (FIX-I-5; main.go
+// passes its SIGINT/SIGTERM context): once it ends, ClaimAndDispatch claims
+// nothing more, and a redispatched worker still running is cancelled
+// (spawn.Run SIGKILLs its process group) - the scheduler's tick context is a
+// fresh context.Background() derivative that shutdown never reaches, so
+// without this a redispatched worker outlived kahyad as an orphan. Its row
+// is acked like any interrupted run (outbox.redispatch_timed_out, with
+// "shutdown": true) and the task stays 'executing' for the next boot's
+// resume scan. Call before the first tick.
+func (d *Dispatcher) SetBaseContext(ctx context.Context) { d.baseCtx = ctx }
+
+// shuttingDown reports whether the base (lifecycle) context ended.
+func (d *Dispatcher) shuttingDown() bool { return d.baseCtx != nil && d.baseCtx.Err() != nil }
+
 // SetAnthproxyOpener wires opener - see AnthproxyOpener's own doc
 // comment. Safe to leave unset (nil is the pre-W4-04 default posture).
 func (d *Dispatcher) SetAnthproxyOpener(opener AnthproxyOpener) { d.anthproxyOpener = opener }
@@ -282,6 +299,10 @@ func (d *Dispatcher) ClaimAndDispatch(ctx context.Context) (claimed int, err err
 		return 0, nil
 	}
 	defer d.inFlight.Store(false)
+	// FIX-I-5: the daemon is shutting down - claim nothing new.
+	if d.shuttingDown() {
+		return 0, nil
+	}
 
 	// FixedNanoRFC3339, NOT nowRFC3339: available_at/lease_until are
 	// compared with a plain SQL TEXT `<=`/`<` (ListDueOutboxRows/
@@ -299,6 +320,11 @@ func (d *Dispatcher) ClaimAndDispatch(ctx context.Context) (claimed int, err err
 	}
 
 	for _, row := range rows {
+		if d.shuttingDown() {
+			// FIX-I-5: stop between rows too - a row claimed now would only
+			// be spawned and killed at once.
+			break
+		}
 		leaseUntil := task.FixedNanoRFC3339(d.now().Add(d.leaseDuration))
 		affected, cerr := d.store.ClaimOutboxRow(ctx, sqlcgen.ClaimOutboxRowParams{
 			LeaseUntil: sql.NullString{String: leaseUntil, Valid: true}, ID: row.ID,
@@ -510,6 +536,11 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// process group once it passes (StatusTimeout, no terminal line).
 	runCtx, cancelRun := context.WithTimeout(ctx, d.taskTimeout)
 	defer cancelRun()
+	// FIX-I-5: ...and the daemon's shutdown ends it too.
+	if d.baseCtx != nil {
+		stop := context.AfterFunc(d.baseCtx, cancelRun)
+		defer stop()
+	}
 
 	// workerPID is the pid OnStart persisted as tasks.worker_pgid; it is
 	// cleared again once spawn.Run returned (FIX-I-13).
@@ -635,6 +666,7 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	}
 	d.ledgerRaw(recordCtx, t.TraceID, kind, map[string]any{
 		"event": kind, "task_id": t.ID, "outbox_id": row.ID, "status": outcome.Status, "run_err": runErrText,
+		"shutdown": d.shuttingDown(),
 	})
 	d.markDelivered(recordCtx, row.ID)
 }

@@ -128,7 +128,9 @@ func (s *Server) SetTaskCloudRetry(machine *task.Machine, cloudRetry *task.Cloud
 func (s *Server) SetTaskTimeoutForTests(d time.Duration) { s.taskTimeoutOverride = d }
 
 // taskDeadline is the deadline handleTask/handleSecretLaneTask give one
-// task run: cfg.TaskTimeoutMin minutes unless a test override is set.
+// task run: cfg.TaskTimeoutMin minutes unless a test override is set. Both
+// apply it through boundTaskContext, which also ends the run when the
+// daemon shuts down (FIX-I-5).
 func (s *Server) taskDeadline() time.Duration {
 	if s.taskTimeoutOverride > 0 {
 		return s.taskTimeoutOverride

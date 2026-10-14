@@ -25,32 +25,125 @@ func mainSource(t *testing.T) (*token.FileSet, *ast.File, []byte) {
 	return fset, f, src
 }
 
-// mainCalls returns every call in main.go whose callee reads recv.method,
-// with the source text of its arguments.
+// mainCall is one call site in main.go: its byte offset and the source
+// text of its arguments.
+type mainCall struct {
+	offset int
+	args   string
+}
+
+// mainCalls returns the argument text of every call in main.go whose callee
+// reads recv.method, in source order.
 func mainCalls(t *testing.T, recv, method string) []string {
 	t.Helper()
-	fset, f, src := mainSource(t)
 	var out []string
+	for _, c := range mainCallSites(t, recv, method) {
+		out = append(out, c.args)
+	}
+	return out
+}
+
+// calleeIs reports whether fun is recv.method, or the plain identifier
+// method when recv is "".
+func calleeIs(fun ast.Expr, recv, method string) bool {
+	if recv == "" {
+		id, ok := fun.(*ast.Ident)
+		return ok && id.Name == method
+	}
+	sel, ok := fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != method {
+		return false
+	}
+	x, ok := sel.X.(*ast.Ident)
+	return ok && x.Name == recv
+}
+
+// mainCallSites is mainCalls with each call's offset.
+func mainCallSites(t *testing.T, recv, method string) []mainCall {
+	t.Helper()
+	fset, f, src := mainSource(t)
+	var out []mainCall
 	ast.Inspect(f, func(n ast.Node) bool {
 		c, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		sel, ok := c.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != method {
-			return true
-		}
-		if x, ok := sel.X.(*ast.Ident); !ok || x.Name != recv {
+		if !calleeIs(c.Fun, recv, method) {
 			return true
 		}
 		var args []string
 		for _, a := range c.Args {
 			args = append(args, string(src[fset.Position(a.Pos()).Offset:fset.Position(a.End()).Offset]))
 		}
-		out = append(out, strings.Join(args, ", "))
+		out = append(out, mainCall{offset: fset.Position(c.Pos()).Offset, args: strings.Join(args, ", ")})
 		return true
 	})
 	return out
+}
+
+// onlyCallSite fails unless main.go calls recv.method exactly once, with
+// exactly wantArgs (when non-empty), and returns that site.
+func onlyCallSite(t *testing.T, recv, method, wantArgs string) mainCall {
+	t.Helper()
+	sites := mainCallSites(t, recv, method)
+	if len(sites) != 1 {
+		t.Fatalf("%s.%s calls = %d (%+v), want exactly 1", recv, method, len(sites), sites)
+	}
+	if wantArgs != "" && sites[0].args != wantArgs {
+		t.Fatalf("%s.%s(%s), want %s.%s(%s)", recv, method, sites[0].args, recv, method, wantArgs)
+	}
+	return sites[0]
+}
+
+// TestLifecycleContextWiring (FIX-I-5, G00 C-5): main.go creates ONE
+// SIGINT/SIGTERM lifecycle context at the very top of run() - before the
+// startup lock and the DB, so every later block inherits it - and hands it
+// to the outbox dispatcher and srv.Run; the boot orphan sweep runs before
+// the startup resume scan; the tick scheduler is stopped explicitly right
+// after srv.Run returns (its running dispatch tick ends with the
+// dispatcher's base context).
+func TestLifecycleContextWiring(t *testing.T) {
+	_, _, src := mainSource(t)
+	notify := onlyCallSite(t, "signal", "NotifyContext", "context.Background(), syscall.SIGINT, syscall.SIGTERM")
+	if !strings.Contains(string(src[:notify.offset]), "lifecycleCtx, stopSignals := ") {
+		t.Error("signal.NotifyContext's result must be lifecycleCtx, stopSignals")
+	}
+	for _, later := range [][2]string{{"server", "AcquireStartupLock"}, {"store", "Open"}} {
+		for _, c := range mainCallSites(t, later[0], later[1]) {
+			if c.offset < notify.offset {
+				t.Errorf("%s.%s runs before the lifecycle context exists (want NotifyContext at the top of run())", later[0], later[1])
+			}
+		}
+	}
+	onlyCallSite(t, "taskDispatcher", "SetBaseContext", "lifecycleCtx")
+	run := onlyCallSite(t, "srv", "Run", "lifecycleCtx")
+
+	identity := onlyCallSite(t, "haltExecutor", "SetWorkerIdentity", "")
+	sweep := onlyCallSite(t, "haltExecutor", "KillOrphanedWorkersAtBoot", "context.Background()")
+	if sweep.offset < identity.offset {
+		t.Error("the orphan sweep runs before the halt executor's identity check is wired")
+	}
+	bootScan := -1
+	for _, c := range mainCallSites(t, "", "runResumeScan") {
+		if c.args == "context.Background()" {
+			bootScan = c.offset
+		}
+	}
+	if bootScan < 0 || sweep.offset > bootScan {
+		t.Errorf("the boot orphan sweep (offset %d) must run before the startup resume scan (offset %d)", sweep.offset, bootScan)
+	}
+	if sweep.offset > run.offset {
+		t.Error("the orphan sweep must run before srv.Run binds the socket")
+	}
+	stopAfterRun := false
+	for _, c := range mainCallSites(t, "sched", "StopTicks") {
+		if c.offset > run.offset {
+			stopAfterRun = true
+		}
+	}
+	if !stopAfterRun {
+		t.Error("sched.StopTicks() must be called explicitly after srv.Run returns")
+	}
 }
 
 // TestDispatcherTaskTimeoutWiredFromConfig (FIX-I-3): main.go must hand the
