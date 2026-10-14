@@ -10,7 +10,21 @@
 // denied argv can never mint an approval — the same principle as W3-03's
 // deny-glob-before-approval ordering. shell_host is W2: a VALID argv still
 // requires the full gate chain (Policy.Check → Policy.ConsumeToken)
-// before HostExec.Handle ever calls Exec.Run.
+// before HostExec.Handle ever calls Exec.RunEnv.
+//
+// git is hardened on top of the narrow argv (B-4 fix): git runs programs
+// named in its config (core.fsmonitor, diff.external, filter.<d>.clean,
+// diff.<d>.textconv, ...), so a harmless-looking `git status` would run
+// whatever an earlier fs_write or container planted in a git config file.
+// Every git call therefore (1) runs under a CLOSED, scrubbed environment
+// (gitScrubbedEnv: no system/global config, no inherited GIT_* / PAGER /
+// HOME, no transport), (2) carries fixed `-c` neutralizers before the
+// subcommand (gitHardeningArgs) plus --no-ext-diff/--no-textconv and
+// --ignore-submodules=all where the subcommand accepts them, and (3) is
+// refused outright when the repo's own config (every scope git reads:
+// .git/config, config.worktree, included files) holds a program-running
+// key (gitRepoConfigSafe) — filter.<d>.clean runs even under
+// --no-ext-diff --no-textconv, so no flag can neutralize it.
 package shell
 
 import (
@@ -18,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	mcpfs "kahya/mcp/fs"
@@ -30,6 +45,24 @@ import (
 // built, no policy decision is ever consulted.
 var errHostExecDenied = errors.New("shell_host reddedildi: komut/argüman izin verilen dar sete uymuyor (git status|log|diff|show, ls, stat).")
 
+// errGitRepoConfigUnsafe / errGitRepoConfigUnreadable are gitRepoConfigSafe's
+// two refusals (Turkish, byte-exact): the repo's own git config names a
+// program, or it could not be read at all (not a repository, or corrupt).
+// Two texts, because "a key that runs a program" would mislead for a
+// repo_path that is simply not a repository.
+var (
+	errGitRepoConfigUnsafe     = errors.New("shell_host reddedildi: repo yerel git yapılandırması (.git/config) program çalıştıran bir anahtar içeriyor; önce bu anahtarı temizleyin.")
+	errGitRepoConfigUnreadable = errors.New("shell_host reddedildi: repo yerel git yapılandırması okunamadı (git deposu değil ya da bozuk).")
+)
+
+// hostexec_denied ledger reasons (English, machine-readable). A
+// dangerous-key denial's reason is reasonGitDangerousConfigPrefix + key.
+const (
+	reasonHostExecArgvRejected     = "argv_rejected"
+	reasonGitConfigScanFailed      = "git_config_scan_failed"
+	reasonGitDangerousConfigPrefix = "dangerous_git_config:"
+)
+
 // allowedGitSubcommands is shell_host's ENTIRE git surface (this task's
 // spec step 6, verbatim: "status|log|diff|show ONLY").
 var allowedGitSubcommands = map[string]bool{
@@ -38,6 +71,97 @@ var allowedGitSubcommands = map[string]bool{
 	"diff":   true,
 	"show":   true,
 }
+
+// gitHardeningArgs are the fixed `-c key=value` flags shell_host PREPENDS to
+// every git invocation (B-4 fix), neutralizing every config key git uses to
+// run an external program. They sit BEFORE the subcommand, exactly where a
+// real `-c` lives; the model can never supply its own (validateGitArgs
+// rejects any leading "-"), so these are unambiguously OURS. A command-line
+// `-c` also beats any GIT_CONFIG_PARAMETERS value, a second layer behind
+// gitScrubbedEnv not forwarding that variable at all. core.fsmonitor must
+// be false/empty (never a path).
+var gitHardeningArgs = []string{
+	"-c", "core.fsmonitor=false",
+	"-c", "core.fsmonitorhookversion=0",
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.pager=cat",
+	"-c", "core.editor=false",
+	"-c", "core.askPass=",
+	"-c", "core.sshCommand=false",
+	"-c", "core.alternateRefsCommand=",
+	"-c", "diff.external=",
+	"-c", "log.showSignature=false",
+	"-c", "gpg.program=false",
+	"-c", "gpg.ssh.program=false",
+	"-c", "credential.helper=",
+	"-c", "uploadpack.packObjectsHook=",
+	"-c", "status.submoduleSummary=false",
+	"-c", "protocol.ext.allow=never",
+}
+
+// gitNoProgramDiffFlags are appended after log/diff/show (NOT status: it
+// rejects both flags as unknown options) so a .gitattributes-driven
+// textconv/external-diff program is not run for the diff output itself.
+var gitNoProgramDiffFlags = []string{"--no-ext-diff", "--no-textconv"}
+
+// gitNoSubmoduleRecursionFlag is appended after status and diff — the two
+// subcommands that compare against a work tree: without it git recurses
+// into every submodule's work tree, where the submodule's OWN config
+// (.git/modules/<name>/config — invisible to the superproject's
+// gitRepoConfigSafe scan) can run a filter.<d>.clean program. log/show are
+// tree-to-tree only and never enter a submodule work tree.
+const gitNoSubmoduleRecursionFlag = "--ignore-submodules=all"
+
+// gitScrubbedEnv is the CLOSED environment shell_host's git runs under
+// (B-4 fix): nothing is inherited from kahyad. GIT_CONFIG_NOSYSTEM/
+// GIT_CONFIG_SYSTEM/GIT_CONFIG_GLOBAL disable /etc/gitconfig, ~/.gitconfig
+// and ~/.config/git/config; GIT_CONFIG_PARAMETERS (which could undo the -c
+// flags), GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, GIT_DIR and friends are absent
+// by construction. HOME=/var/empty (exists, empty, on macOS) so any
+// leftover $HOME lookup resolves nowhere. GIT_ALLOW_PROTOCOL=none allows NO
+// transport (a list naming no real protocol; it overrides every
+// protocol.* config key) and GIT_NO_LAZY_FETCH=1 stops a partial clone's
+// lazy fetch: the four read-only subcommands never need the network, and
+// a lazy fetch would run remote.<name>.uploadpack (a program) and leave the
+// host outside the egress gate. PATH only governs what git itself execs
+// (exec.LookPath resolves "git" against kahyad's own PATH), so it stays a
+// short system list plus Homebrew.
+func gitScrubbedEnv() []string {
+	return []string{
+		"PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+		"HOME=/var/empty",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ATTR_NOSYSTEM=1",
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_PAGER=cat",
+		"PAGER=cat",
+		"GIT_ALLOW_PROTOCOL=none",
+		"GIT_NO_LAZY_FETCH=1",
+		"LC_ALL=C",
+	}
+}
+
+// dangerousGitConfigRe matches every repo config key (any scope git reads:
+// local, worktree, included files) that makes git run a program, or that
+// points git at another config file. Keys come from a program-free
+// `git config -z --list --show-scope` read; a match => deny (the -c
+// neutralizers cannot override filter.<d>.*). Subsection names may contain
+// dots ([filter "a.b"] => filter.a.b.clean), so the subsection part is `.+`,
+// never `[^.]+`. pager.<cmd> and core.pager never run here (git output is a
+// pipe, not a TTY) and are denied anyway: a clean repo config never needs
+// them. Matching is case-insensitive (git lowercases section/key names, not
+// subsections).
+var dangerousGitConfigRe = regexp.MustCompile(`(?i)^(` +
+	`core\.(fsmonitor|hookspath|pager|sshcommand|editor|askpass|alternaterefscommand|gitproxy)|` +
+	`diff\.external|diff\..+\.(command|textconv)|` +
+	`filter\..+\.(clean|smudge|process)|` +
+	`gpg\.(.+\.)?program|credential\.(.+\.)?helper|` +
+	`alias\.|include\.path|includeif\.|pager\.|` +
+	`merge\..+\.driver|uploadpack\.|protocol\.ext\.|` +
+	`remote\..+\.(uploadpack|receivepack|vcs))`)
 
 // HostExecArgs is shell_host's input (also its MCP wire argument type —
 // server.go registers it directly). Command selects the narrow set;
@@ -91,22 +215,25 @@ func NewHostExec(home string, policy PolicyClient, ledger Ledger, log Logger, ex
 
 // Handle implements shell_host end to end: validate (BEFORE any policy
 // decision — see this file's package doc comment) → Policy.Check →
-// Policy.ConsumeToken → Exec.Run → ledger hostexec_exec. A validator
-// failure ledgers hostexec_denied and returns immediately, never reaching
-// the policy gate at all — this task's acceptance criterion: "shell_host
-// with git -c ... or tar --checkpoint-action=... is denied and a
-// hostexec_denied ledger event exists".
+// Policy.ConsumeToken → (git only) gitRepoConfigSafe → Exec.RunEnv →
+// ledger hostexec_exec. A validator failure ledgers hostexec_denied and
+// returns immediately, never reaching the policy gate at all — this task's
+// acceptance criterion: "shell_host with git -c ... or tar
+// --checkpoint-action=... is denied and a hostexec_denied ledger event
+// exists".
 func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostExecArgs) (HostExecOutput, error) {
-	argv, canonRepo, err := h.validate(in)
+	plan, err := h.validate(in)
 	if err != nil {
 		logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_denied", map[string]any{
 			"event": "hostexec_denied", "tool": "shell_host", "command": in.Command,
 			"repo_path": in.RepoPath, "args": in.Args, "task_id": taskID,
+			"reason": reasonHostExecArgvRejected,
 		})
 		return HostExecOutput{}, err
 	}
+	argv := plan.argv
 
-	toolInput := buildHostExecToolInput(in.Command, canonRepo, in.Args)
+	toolInput := buildHostExecToolInput(in.Command, plan.canonRepo, in.Args)
 	decision, err := h.Policy.Check(ctx, "shell_host", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: %w", err)
@@ -122,7 +249,23 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 		return HostExecOutput{}, fmt.Errorf("shell_host: onay jetonu tüketilemedi: %w", err)
 	}
 
-	res, err := h.Exec.Run(ctx, argv[0], argv[1:], nil)
+	// B-4: the repo-config scan is itself an Executor call, so it runs
+	// only AFTER ConsumeToken — a valid argv without a consumed token
+	// still reaches the executor ZERO times (W3-04 acceptance). The cost
+	// of this order: a dangerous config burns the approval token; the
+	// model sees the Turkish refusal and must ask again once the config
+	// is clean (fail-closed). G05/G10 reshape this tail later (C-3).
+	if in.Command == "git" {
+		if reason, derr := h.gitRepoConfigSafe(ctx, plan.repoOp); derr != nil {
+			logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_denied", map[string]any{
+				"event": "hostexec_denied", "tool": "shell_host", "command": "git",
+				"repo_path": in.RepoPath, "args": in.Args, "task_id": taskID, "reason": reason,
+			})
+			return HostExecOutput{}, derr
+		}
+	}
+
+	res, err := h.Exec.RunEnv(ctx, argv[0], argv[1:], nil, plan.env)
 	if err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: %w", err)
 	}
@@ -135,43 +278,145 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	return HostExecOutput{ExitCode: res.ExitCode, Stdout: string(res.Stdout), Stderr: string(res.Stderr), Argv: argv}, nil
 }
 
-// validate is shell_host's ENTIRE security boundary for argv shape: it
-// returns the FIXED argv to actually exec (never derived from anything
-// but this function's own explicit construction) and, for git, the
-// canonicalized repo path (used only to build the WYSIWYE tool-input
-// hash). Any error is errHostExecDenied — callers never see a more
-// specific reason, so nothing about WHY a request was denied leaks
-// through a channel other than the ledger.
-func (h *HostExec) validate(in HostExecArgs) (argv []string, canonRepo string, err error) {
+// hostExecPlan is validate's result: everything Handle needs to execute
+// exactly one validated command.
+type hostExecPlan struct {
+	// argv is the FIXED argv to exec (never derived from anything but
+	// validate's own explicit construction).
+	argv []string
+	// canonRepo is git's canonicalized repo path in Match form, used only
+	// to build the WYSIWYE tool-input hash ("" for ls/stat).
+	canonRepo string
+	// repoOp is the same repo path in OS-ready Op form — the exact `-C`
+	// value in argv, which gitRepoConfigSafe scans ("" for ls/stat).
+	repoOp string
+	// env is the child's environment: gitScrubbedEnv() for git, nil
+	// (inherited, unchanged behavior) for ls/stat, which run no config.
+	env []string
+}
+
+// validate is shell_host's ENTIRE security boundary for argv shape. Any
+// error is errHostExecDenied — callers never see a more specific reason,
+// so nothing about WHY a request was denied leaks through a channel other
+// than the ledger.
+//
+// git argv order (B-4): git, gitHardeningArgs, -C <repo>, <subcommand>,
+// then our per-subcommand flags (--no-ext-diff --no-textconv for
+// log/diff/show; --ignore-submodules=all for status/diff), then the
+// model's own trailing args LAST — those can never start with "-"
+// (validateGitArgs), so they can never be read as one of our flags.
+func (h *HostExec) validate(in HostExecArgs) (hostExecPlan, error) {
 	switch in.Command {
 	case "git":
 		if err := validateGitArgs(in.Args); err != nil {
-			return nil, "", err
+			return hostExecPlan{}, err
 		}
 		cp, cerr := mcpfs.Canonicalize(h.Home, in.RepoPath)
 		if cerr != nil {
-			return nil, "", errHostExecDenied
+			return hostExecPlan{}, errHostExecDenied
 		}
-		argv = append([]string{"git", "-C", cp.Op}, in.Args...)
-		return argv, cp.Match, nil
+		sub := in.Args[0]
+		argv := append([]string{"git"}, gitHardeningArgs...)
+		argv = append(argv, "-C", cp.Op, sub)
+		if sub != "status" {
+			argv = append(argv, gitNoProgramDiffFlags...) // log|diff|show
+		}
+		if sub == "status" || sub == "diff" {
+			argv = append(argv, gitNoSubmoduleRecursionFlag)
+		}
+		argv = append(argv, in.Args[1:]...)
+		return hostExecPlan{argv: argv, canonRepo: cp.Match, repoOp: cp.Op, env: gitScrubbedEnv()}, nil
 
 	case "ls", "stat":
 		if err := validatePlainPaths(in.Args); err != nil {
-			return nil, "", err
+			return hostExecPlan{}, err
 		}
 		canonArgs := make([]string, 0, len(in.Args))
 		for _, a := range in.Args {
 			cp, cerr := mcpfs.Canonicalize(h.Home, a)
 			if cerr != nil {
-				return nil, "", errHostExecDenied
+				return hostExecPlan{}, errHostExecDenied
 			}
 			canonArgs = append(canonArgs, cp.Op)
 		}
-		return append([]string{in.Command}, canonArgs...), "", nil
+		return hostExecPlan{argv: append([]string{in.Command}, canonArgs...)}, nil
 
 	default:
-		return nil, "", errHostExecDenied
+		return hostExecPlan{}, errHostExecDenied
 	}
+}
+
+// gitConfigEntry is one `git config -z --list --show-scope` record.
+type gitConfigEntry struct {
+	scope string
+	key   string
+}
+
+// parseGitConfigList parses `git config -z --list --show-scope` output:
+// records of "<scope> NUL <key>[ LF <value>] NUL" (a valueless key has no
+// LF; a value may itself contain LFs, so only the FIRST LF splits). ok is
+// false for anything malformed, which the caller treats as unreadable
+// (fail-closed).
+func parseGitConfigList(out []byte) (entries []gitConfigEntry, ok bool) {
+	s := string(out)
+	if s == "" {
+		return nil, true
+	}
+	if !strings.HasSuffix(s, "\x00") {
+		return nil, false
+	}
+	toks := strings.Split(strings.TrimSuffix(s, "\x00"), "\x00")
+	if len(toks)%2 != 0 {
+		return nil, false
+	}
+	for i := 0; i < len(toks); i += 2 {
+		key, _, _ := strings.Cut(toks[i+1], "\n")
+		if toks[i] == "" || key == "" {
+			return nil, false
+		}
+		entries = append(entries, gitConfigEntry{scope: toks[i], key: key})
+	}
+	return entries, true
+}
+
+// gitRepoConfigSafe is decision G04-1 option A: before shell_host's git
+// runs, read every config scope git itself would read for repoOp — under
+// the same scrubbed env, so system/global are off — with `git config -z
+// --list --show-scope`, which runs no program (verified with
+// core.fsmonitor set: config never reads the index). Unlike `--local`,
+// listing every scope also covers .git/config.worktree
+// (extensions.worktreeConfig) and follows include.path / includeIf files.
+// It returns ("", nil) when the repo is safe to run git in, or a ledger
+// reason plus one of the two Turkish refusals:
+//   - the scan fails, its output is malformed, or no "local" scope entry
+//     exists (not a repository: git exits 0 with an empty list outside
+//     one, since system/global are disabled) → errGitRepoConfigUnreadable;
+//   - any entry matches dangerousGitConfigRe → errGitRepoConfigUnsafe.
+//
+// "config" is deliberately NOT in allowedGitSubcommands: this call is
+// kahyad's own, never model input.
+func (h *HostExec) gitRepoConfigSafe(ctx context.Context, repoOp string) (string, error) {
+	res, err := h.Exec.RunEnv(ctx, "git", []string{"-C", repoOp, "config", "-z", "--list", "--show-scope"}, nil, gitScrubbedEnv())
+	if err != nil || res.ExitCode != 0 {
+		return reasonGitConfigScanFailed, errGitRepoConfigUnreadable
+	}
+	entries, ok := parseGitConfigList(res.Stdout)
+	if !ok {
+		return reasonGitConfigScanFailed, errGitRepoConfigUnreadable
+	}
+	local := 0
+	for _, e := range entries {
+		if e.scope == "local" {
+			local++
+		}
+		if dangerousGitConfigRe.MatchString(e.key) {
+			return reasonGitDangerousConfigPrefix + e.key, errGitRepoConfigUnsafe
+		}
+	}
+	if local == 0 {
+		return reasonGitConfigScanFailed, errGitRepoConfigUnreadable
+	}
+	return "", nil
 }
 
 // validateGitArgs enforces this task's spec step 6 for git: Args[0] MUST

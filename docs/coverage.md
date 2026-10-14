@@ -245,6 +245,10 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #6 | shell_docker workdir: OS temp root itself never mountable (strict descendants only) | `mcp/shell/TestValidateWorkdir_OSTempRootItselfRejected` | FIX-B-10 | ci-hermetic |
 | Safety #6 | shell_docker workdir: a `$TMPDIR` sibling under /var/folders is not carved out (system_dir) | `mcp/shell/TestValidateWorkdir_TempDirSiblingNotCarvedOut` | FIX-B-10 | ci-hermetic |
 | Safety #6 | shell_docker workdir: an ancestor of a system deny dir or temp root (macOS /private) is never mountable (system_dir) | `mcp/shell/TestValidateWorkdir_AncestorOfDeniedDirRejected` | FIX-B-10 | ci-hermetic |
+| Safety #6 | shell_host git runs under a closed, scrubbed env + fixed `-c` config neutralizers (no inherited GIT_*/PAGER/HOME, no transport) | `mcp/shell/TestHandle_GitNeutralizedEnvAndArgv` | FIX-B-4 | ci-hermetic |
+| Safety #6 | shell_host git refuses a repo whose config (local, config.worktree, included file) names a program; real git never runs it | `mcp/shell/TestHandle_GitRealLocalConfigProgramDenied` | FIX-B-4 | ci-hermetic |
+| Safety #6 | shell_host git never runs a program from kahyad's inherited ~/.gitconfig, GIT_CONFIG_PARAMETERS or GIT_EXTERNAL_DIFF (real git) | `mcp/shell/TestHandle_GitRealInheritedConfigProgramsNeverRun` | FIX-B-4 | ci-hermetic |
+| Safety #6 | shell_host git status/diff never recurse into a submodule work tree, whose own config the scan cannot see (real git) | `mcp/shell/TestHandle_GitRealSubmoduleConfigNeverRuns` | FIX-B-4 | ci-hermetic |
 | Memory #1 | source-trust lattice: agent_derived quarantined until confirmed | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W5-04 | ci-hermetic |
 | Memory #1 | extractor-claimed user_asserted downgraded to agent_derived + ledgered | `kahyad/internal/factengine/TestExtractorClaimedUserAssertedStoredAsAgentDerivedAndLedgered` | W12-05 | ci-hermetic |
 | Memory #2 | namesakes never auto-merge on name similarity | `kahyad/internal/factengine/TestNamesakeFixtureYieldsTwoDistinctEntitiesNoAutoMerge` | W5-04 | ci-hermetic |

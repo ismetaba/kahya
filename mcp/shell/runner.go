@@ -177,6 +177,13 @@ type Executor interface {
 	// it and returns ctx.Err() alongside whatever partial Result was
 	// captured.
 	Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error)
+	// RunEnv is Run with an EXPLICIT environment: when env is non-nil the
+	// child process sees EXACTLY env (never os.Environ()); nil keeps
+	// Run's inherited-environment behavior. shell_host's git invocation
+	// (B-4 fix) passes a scrubbed, closed env so no inherited GIT_* /
+	// PAGER / HOME variable can redirect git at a program. The docker
+	// paths keep calling Run.
+	RunEnv(ctx context.Context, name string, args []string, stdin []byte, env []string) (Result, error)
 }
 
 // processExecutor is the production Executor: os/exec, fixed argv only —
@@ -185,8 +192,20 @@ type Executor interface {
 // invokes docker/git/ls/stat: no interpolation, ever).
 type processExecutor struct{}
 
-func (processExecutor) Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error) {
+func (p processExecutor) Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error) {
+	return p.RunEnv(ctx, name, args, stdin, nil)
+}
+
+func (processExecutor) RunEnv(ctx context.Context, name string, args []string, stdin []byte, env []string) (Result, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if env != nil {
+		// An explicit env REPLACES the inherited one entirely (os/exec:
+		// a non-nil Env, even an empty one, is the child's whole
+		// environment). name itself is still resolved against kahyad's
+		// own PATH by exec.LookPath; env's PATH only governs what the
+		// child execs.
+		cmd.Env = env
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

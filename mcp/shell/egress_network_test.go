@@ -63,6 +63,12 @@ func (s *scriptedExecutor) Run(_ context.Context, name string, args []string, st
 	return Result{ExitCode: 0}, nil
 }
 
+// RunEnv satisfies Executor; the egress network code only ever calls Run,
+// so the env is not recorded.
+func (s *scriptedExecutor) RunEnv(ctx context.Context, name string, args []string, stdin []byte, _ []string) (Result, error) {
+	return s.Run(ctx, name, args, stdin)
+}
+
 func (s *scriptedExecutor) callsWithPrefix(prefix string) []execCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()

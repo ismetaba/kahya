@@ -157,6 +157,8 @@ type execCall struct {
 	name  string
 	args  []string
 	stdin []byte
+	// env is what RunEnv was handed (nil for Run / an inherited env).
+	env []string
 }
 
 // fakeExecutor is the unit-test stand-in for Executor: never shells out,
@@ -186,12 +188,49 @@ type fakeExecutor struct {
 
 	// psOutput answers "docker ps -q --filter label=kahya.task_id".
 	psOutput string
+
+	// gitConfigList answers shell_host's repo-config scan (a "git ...
+	// config ..." call, B-4 gitRepoConfigSafe). nil => a minimal, safe
+	// repo config (defaultGitConfigList), so tests that do not care about
+	// the scan pass it untouched.
+	gitConfigList    *Result
+	gitConfigListErr error
+
+	// lastEnv is the env of the most recent RunEnv call (nil for Run).
+	lastEnv []string
 }
 
+// defaultGitConfigList is the scan answer for an ordinary repo: one local
+// scope entry, nothing program-running (`git config -z --list
+// --show-scope` format: scope NUL key LF value NUL).
+var defaultGitConfigList = Result{ExitCode: 0, Stdout: []byte("local\x00core.bare\nfalse\x00")}
+
 func (f *fakeExecutor) Run(ctx context.Context, name string, args []string, stdin []byte) (Result, error) {
+	return f.RunEnv(ctx, name, args, stdin, nil)
+}
+
+func (f *fakeExecutor) RunEnv(ctx context.Context, name string, args []string, stdin []byte, env []string) (Result, error) {
+	var envCopy []string
+	if env != nil {
+		envCopy = append(make([]string, 0, len(env)), env...)
+	}
 	f.mu.Lock()
-	f.calls = append(f.calls, execCall{name: name, args: append([]string(nil), args...), stdin: stdin})
+	f.calls = append(f.calls, execCall{name: name, args: append([]string(nil), args...), stdin: stdin, env: envCopy})
+	f.lastEnv = envCopy
 	f.mu.Unlock()
+
+	// hostexec's git argv starts with "-c" (gitHardeningArgs), so the
+	// docker-oriented args[0] switch below cannot tell its calls apart;
+	// the repo-config scan is recognized by its "config" subcommand.
+	if name == "git" && containsArg(args, "config") {
+		f.mu.Lock()
+		res, err := defaultGitConfigList, f.gitConfigListErr
+		if f.gitConfigList != nil {
+			res = *f.gitConfigList
+		}
+		f.mu.Unlock()
+		return res, err
+	}
 
 	if len(args) == 0 {
 		return Result{}, nil
@@ -271,6 +310,19 @@ func (f *fakeExecutor) callsFor(argsPrefix string) []execCall {
 	var out []execCall
 	for _, c := range f.calls {
 		if len(c.args) > 0 && c.args[0] == argsPrefix {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// callsNamed returns every recorded invocation whose program is name.
+func (f *fakeExecutor) callsNamed(name string) []execCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []execCall
+	for _, c := range f.calls {
+		if c.name == name {
 			out = append(out, c)
 		}
 	}
