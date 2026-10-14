@@ -20,8 +20,10 @@
 // Its next attempt comes only from
 // kahyad/internal/task.Resume's scan, the one path that counts
 // tasks.crash_resumes against task_max_crash_resumes; a lease-expiry
-// re-claim would bypass that cap. A worker's own terminal error line fails
-// the task (FIX-I-2's first-spawn rule, server.decidePostSpawn).
+// re-claim would bypass that cap. A row that can never be dispatched - an
+// undecodable payload, a task row that does not exist - is acked as well.
+// A worker's own terminal error line fails the task (FIX-I-2's first-spawn
+// rule, server.decidePostSpawn).
 //
 // This package depends on kahyad/internal/task (for the status enum,
 // Machine, and the outbox payload shape), never the other way around -
@@ -376,6 +378,12 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		d.ledgerRaw(ctx, row.TraceID, "outbox.payload_invalid", map[string]any{
 			"event": "outbox.payload_invalid", "outbox_id": row.ID, "err": err.Error(),
 		})
+		// G10-E1: an undecodable row can never be dispatched. Left unacked it
+		// was re-claimed every lease period forever and - still carrying its
+		// task back-link (outbox.task_id) - counted as pending in the resume
+		// scan's enqueue dedupe (FIX-I-8), locking the task out of the one
+		// counted path for good. Ack it; the scan writes a well-formed row.
+		d.markDelivered(ctx, row.ID)
 		return
 	}
 
@@ -384,6 +392,13 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		d.ledgerRaw(ctx, row.TraceID, "outbox.task_load_failed", map[string]any{
 			"event": "outbox.task_load_failed", "outbox_id": row.ID, "task_id": payload.TaskID, "err": err.Error(),
 		})
+		// G10-E1: a row whose task does not exist can never be dispatched -
+		// ack it rather than re-claim it every lease period forever. Any other
+		// load error may be transient: the row stays for lease-expiry
+		// re-claim (fail toward retry; nothing was spawned).
+		if errors.Is(err, sql.ErrNoRows) {
+			d.markDelivered(ctx, row.ID)
+		}
 		return
 	}
 

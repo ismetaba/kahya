@@ -793,10 +793,17 @@ ledgered `outbox.redispatch_crashed` with `"spawned": false`; only a task
 still parked keeps its (the park's) row for re-claim. The task's next
 attempt comes only from the resume scan, the one path that counts
 `tasks.crash_resumes` against `task_max_crash_resumes` (a lease-expiry
-re-claim would bypass that cap). A resumed worker's own terminal `error`
+re-claim would bypass that cap). A row the dispatcher can never dispatch
+— an undecodable payload (`outbox.payload_invalid`) or a task row that does
+not exist (`outbox.task_load_failed`) — is acked as well, so it can neither
+loop on lease expiry nor hold the task's pending slot in the resume scan's
+dedupe. A resumed worker's own terminal `error`
 line fails the task (`outbox.redispatch_worker_error`), the same rule
 `handleTask` applies at first spawn (FIX-I-2). A row's lease now only
-matters when kahyad itself dies while dispatching it.
+matters when kahyad itself dies while dispatching it. End to end, a task
+whose worker crashes on every attempt is redispatched exactly
+`task_max_crash_resumes` times and then moves to `blocked_user` (on its
+4th crash with the default 3).
 
 **The backoff schedule holds; one pending resume per task (FIX-I-8):** a
 parked task's next attempt belongs to the row `CloudRetry.park` enqueued
