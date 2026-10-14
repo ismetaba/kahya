@@ -17,12 +17,13 @@ type FileScanState struct {
 	Path string
 }
 
-// Load returns the persisted cutoff, or the zero time.Time (meaning
-// "collect everything - no prior run recorded yet") when Path does not
-// exist, is empty, or fails to parse as RFC3339 - a corrupt/foreign state
-// file degrades to "no prior run" rather than failing the whole
-// collector closed (this value's only consequence is which ALREADY-
-// non-secret files get reported as "changed", never a security decision).
+// Load returns the persisted cutoff, or the zero time.Time (meaning "first
+// run - no prior run recorded yet"; Run substitutes now-24h, never the
+// epoch - FIX-P-23) when Path does not exist, is empty, or fails to parse
+// as RFC3339 - a corrupt/foreign state file degrades to "no prior run"
+// rather than failing the whole collector closed (this value's only
+// consequence is which files get reported as "changed" - every one of
+// them still passes the gate - never a security decision).
 func (s FileScanState) Load() (time.Time, error) {
 	if s.Path == "" {
 		return time.Time{}, nil

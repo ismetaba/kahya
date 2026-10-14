@@ -71,3 +71,15 @@ func TestBriefingClassifierWarmupWiring(t *testing.T) {
 		t.Errorf("mlx.Config.ClassifyWarmBudget = %q, want %q", sup["ClassifyWarmBudget"], want)
 	}
 }
+
+// TestBriefingFileCollectorCapWiring (FIX-P-23): the briefing's changed-
+// file collector is capped by cfg.briefing_max_file_items.
+func TestBriefingFileCollectorCapWiring(t *testing.T) {
+	files := onlyCompositeLit(t, "briefing", "FileGlobCollector")
+	if files["MaxItems"] != "cfg.BriefingMaxFileItems" {
+		t.Errorf("briefing.FileGlobCollector.MaxItems = %q, want cfg.BriefingMaxFileItems", files["MaxItems"])
+	}
+	if files["Globs"] != "cfg.BriefingFileGlobs" {
+		t.Errorf("briefing.FileGlobCollector.Globs = %q, want cfg.BriefingFileGlobs", files["Globs"])
+	}
+}

@@ -12,7 +12,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS"} {
 		t.Setenv(k, "")
 	}
 }
@@ -1559,6 +1559,66 @@ func TestLoadFailsClosedOnInvalidQwenClassifyBudget(t *testing.T) {
 			}
 			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "qwen_classify_budget_ms") {
 				t.Fatalf("Load() error = %v, want a qwen_classify_budget_ms validation error", err)
+			}
+		})
+	}
+}
+
+// TestLoadBriefingMaxFileItemsDefaultFileAndEnv (FIX-P-23): the changed-
+// file cap defaults to 50, is a real config.yaml key, and the env var
+// overrides the file.
+func TestLoadBriefingMaxFileItemsDefaultFileAndEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env string
+		want            int
+	}{
+		{"default", "", "", 50},
+		{"file", "briefing_max_file_items: 10\n", "", 10},
+		{"env_over_file", "briefing_max_file_items: 10\n", "5", 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			if tc.env != "" {
+				t.Setenv("KAHYA_BRIEFING_MAX_FILE_ITEMS", tc.env)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.BriefingMaxFileItems != tc.want {
+				t.Errorf("BriefingMaxFileItems = %d, want %d", cfg.BriefingMaxFileItems, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadFailsClosedOnInvalidBriefingMaxFileItems (FIX-P-23): a cap < 1
+// fails Load closed instead of being silently treated as the default.
+func TestLoadFailsClosedOnInvalidBriefingMaxFileItems(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env string
+	}{
+		{"file_zero", "briefing_max_file_items: 0\n", ""},
+		{"file_negative", "briefing_max_file_items: -3\n", ""},
+		{"env_zero", "", "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			if tc.env != "" {
+				t.Setenv("KAHYA_BRIEFING_MAX_FILE_ITEMS", tc.env)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "briefing_max_file_items") {
+				t.Fatalf("Load() error = %v, want a briefing_max_file_items validation error", err)
 			}
 		})
 	}

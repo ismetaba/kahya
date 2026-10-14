@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/taint"
@@ -378,5 +380,107 @@ func TestRunRegistersUntrustedTaintBeforeSpawn(t *testing.T) {
 	}
 	if tier != taint.TierTainted {
 		t.Fatalf("tier = %q, want %q (untrusted by design)", tier, taint.TierTainted)
+	}
+}
+
+// fileItemCalls counts the classifier calls that classified a file item
+// (fileItems' "<basename> (<mtime>)" text); the redaction call classifies
+// the summary line and never matches.
+func fileItemCalls(c *fakeClassifier) []string {
+	var out []string
+	for _, txt := range c.Calls {
+		if strings.Contains(txt, ".md (") {
+			out = append(out, txt)
+		}
+	}
+	return out
+}
+
+// TestRunFirstRunUsesLookbackNotEpoch (FIX-P-23): with no scan-state file
+// yet, Run reports files changed in the last 24h - never every file the
+// glob matches since the epoch. A file untouched for 72h is neither gated
+// nor sent to the summarizer.
+func TestRunFirstRunUsesLookbackNotEpoch(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeFileAt(t, filepath.Join(dir, "old.md"), now.Add(-72*time.Hour))
+	writeFileAt(t, filepath.Join(dir, "new.md"), now.Add(-time.Hour))
+
+	c := &fakeClassifier{}
+	spawner := &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`}
+	o := &Orchestrator{
+		Classifier: c,
+		Files:      FileGlobCollector{Globs: []string{filepath.Join(dir, "*.md")}},
+		FileState:  FileScanState{Path: filepath.Join(dir, "state.txt")},
+		Spawner:    spawner,
+		Delivery:   &fakeDelivery{Sent: true},
+		Now:        fixedNow(now),
+	}
+	if _, err := o.Run(context.Background(), "trace-p23-first-run"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	prompt := spawner.Envs[0].Prompt
+	if !strings.Contains(prompt, "new.md") {
+		t.Errorf("prompt lacks the file changed 1h ago:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "old.md") {
+		t.Errorf("prompt reports a file unchanged for 72h (first run used the epoch):\n%s", prompt)
+	}
+	for _, txt := range c.Calls {
+		if strings.Contains(txt, "old.md") {
+			t.Errorf("old.md was gated (%q) - the first-run lookback must exclude it", txt)
+		}
+	}
+}
+
+// TestRunFileItemsCappedAndLoggedTruncated (FIX-P-23): only MaxItems file
+// items reach the gate; the cap is reported in the briefing_collected
+// JSONL line (files, files_truncated, files_first_run), never as a
+// secret-lane drop.
+func TestRunFileItemsCappedAndLoggedTruncated(t *testing.T) {
+	logDir := t.TempDir()
+	log, err := logx.New(logDir, "boot-p23-cap")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	t.Cleanup(func() { log.Close() })
+
+	dir := t.TempDir()
+	now := time.Now()
+	for i := 1; i <= 5; i++ {
+		writeFileAt(t, filepath.Join(dir, fmt.Sprintf("f%d.md", i)), now.Add(-time.Duration(i)*time.Minute))
+	}
+	c := &fakeClassifier{}
+	ledger := &fakeLedger{}
+	o := &Orchestrator{
+		Classifier: c,
+		Files:      FileGlobCollector{Globs: []string{filepath.Join(dir, "*.md")}, MaxItems: 2},
+		Spawner:    &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:   &fakeDelivery{Sent: true},
+		Ledger:     ledger,
+		Log:        log,
+		Now:        fixedNow(now),
+	}
+	const traceID = "trace-p23-cap"
+	if _, err := o.Run(context.Background(), traceID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := fileItemCalls(c); len(got) != 2 {
+		t.Fatalf("file items gated = %d (%v), want 2", len(got), got)
+	}
+	if n := ledger.count(EventItemDropped); n != 0 {
+		t.Errorf("%s events = %d, want 0 (truncation is not a secret-lane drop)", EventItemDropped, n)
+	}
+	var collected map[string]any
+	for _, l := range readJSONLLinesForTrace(t, logDir, traceID) {
+		if l["event"] == "briefing_collected" {
+			collected = l
+		}
+	}
+	if collected == nil {
+		t.Fatal("no briefing_collected JSONL line")
+	}
+	if collected["files"] != float64(2) || collected["files_truncated"] != float64(3) || collected["files_first_run"] != true {
+		t.Errorf("briefing_collected = %v, want files=2 files_truncated=3 files_first_run=true", collected)
 	}
 }

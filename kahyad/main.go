@@ -975,7 +975,7 @@ func run() int {
 			Repos:  cfg.BriefingGHRepos,
 		},
 		Calendar:  briefing.ExecCalendarRunner{},
-		Files:     briefing.FileGlobCollector{Globs: cfg.BriefingFileGlobs},
+		Files:     briefing.FileGlobCollector{Globs: cfg.BriefingFileGlobs, MaxItems: cfg.BriefingMaxFileItems},
 		FileState: briefing.FileScanState{Path: filepath.Join(cfg.DataDir, "briefing_file_scan_state.txt")},
 		Taint:     taintTracker,
 		Spawner: briefing.ProcessSpawner{

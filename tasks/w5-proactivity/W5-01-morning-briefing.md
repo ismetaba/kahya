@@ -33,7 +33,7 @@ An 08:30 wall-clock briefing job exists: kahyad collects GitHub/file/local-calen
 - `kahyad/internal/briefing/collect_gh.go`, `collect_calendar.go`, `collect_files.go` — collectors returning typed structs (never raw free text passed unbounded; free-text fields length-capped).
 - Scheduler registration: a `morning-briefing` job at 08:30 via the W4-01 mechanism (launchd `StartCalendarInterval` plist under `~/Library/LaunchAgents/`, W4-01 label convention).
 - Worker: briefing session profile in `worker/` — session spawned with taint tier `untrusted` **at creation**, R-class tools only, Turkish summarization prompt.
-- Config keys in kahyad config: briefing hour/minute, `gh` repo list (seed with the user's active repos, e.g. gold-token), watched file globs, calendar names.
+- Config keys in kahyad config: briefing hour/minute, `gh` repo list (seed with the user's active repos, e.g. gold-token), watched file globs, calendar names, `briefing_max_file_items` (G08/P-23: default 50, newest mtime first; a first run without a scan-state file looks back 24h, never to the epoch).
 - CLI manual trigger: `kahya job run morning-briefing` (extend W12-06 CLI if W4-01 did not already provide it).
 - Tests: `kahyad/internal/briefing/briefing_test.go` (collector struct validation, redaction, once-per-day dedupe) + integration test asserting `/policy/check` DENIES a W1 tool call from the briefing session.
 

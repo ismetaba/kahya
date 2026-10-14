@@ -459,6 +459,11 @@ type Config struct {
 	// calendar the Automation grant can see" - kahyad/internal/briefing's
 	// own JXA snippet treats an empty list as "no name filter".
 	BriefingCalendarNames []string `yaml:"briefing_calendar_names"`
+	// BriefingMaxFileItems is cfg.briefing.max_file_items (FIX-P-23): at
+	// most this many changed files (newest first) are reported by one
+	// briefing. Default 50; each item costs one local classification call
+	// and one prompt line. Values < 1 fail Load.
+	BriefingMaxFileItems int `yaml:"briefing_max_file_items"`
 
 	// --- W5-02 nightly consolidation ---
 
@@ -839,6 +844,7 @@ type fileConfig struct {
 	BriefingGHRepos               *[]string       `yaml:"briefing_gh_repos"`
 	BriefingFileGlobs             *[]string       `yaml:"briefing_file_globs"`
 	BriefingCalendarNames         *[]string       `yaml:"briefing_calendar_names"`
+	BriefingMaxFileItems          *int            `yaml:"briefing_max_file_items"`
 	ConsolidationAutoCommit       *bool           `yaml:"consolidation_auto_commit"`
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
@@ -949,6 +955,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateQwenClassifyBudgetMS(cfg.QwenClassifyBudgetMS); err != nil {
+		return Config{}, err
+	}
+	if err := validateBriefingMaxFileItems(cfg.BriefingMaxFileItems); err != nil {
 		return Config{}, err
 	}
 
@@ -1159,6 +1168,17 @@ func validateQwenClassifyBudgetMS(ms int) error {
 	return nil
 }
 
+// validateBriefingMaxFileItems fails Load closed on
+// briefing_max_file_items < 1 (FIX-P-23): the collector treats a
+// non-positive cap as "use the default", so a 0 written on purpose would
+// otherwise be silently ignored.
+func validateBriefingMaxFileItems(n int) error {
+	if n < 1 {
+		return fmt.Errorf("config: briefing_max_file_items must be >= 1, got %d", n)
+	}
+	return nil
+}
+
 // defaults returns Config's built-in defaults for env ("prod", "dev", or
 // any other validateEnv-accepted profile name - Load always passes a value
 // validateEnv would accept; defaults itself does not re-validate it).
@@ -1302,6 +1322,8 @@ func defaults(home, env string) Config {
 		// an error - see each field's own doc comment).
 		BriefingHour:   defaultBriefingHour,
 		BriefingMinute: defaultBriefingMinute,
+		// FIX-P-23: changed-file cap per briefing.
+		BriefingMaxFileItems: 50,
 
 		// W5-02 nightly consolidation: suggestion mode is the ONLY mode for
 		// the first 2 weeks, unconditionally (HANDOFF §6 W5 ⚑) - kahyad
@@ -1723,6 +1745,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.BriefingCalendarNames != nil {
 		cfg.BriefingCalendarNames = *fc.BriefingCalendarNames
 	}
+	if fc.BriefingMaxFileItems != nil {
+		cfg.BriefingMaxFileItems = *fc.BriefingMaxFileItems
+	}
 	if fc.ConsolidationAutoCommit != nil {
 		cfg.ConsolidationAutoCommit = *fc.ConsolidationAutoCommit
 	}
@@ -1835,6 +1860,11 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_QWEN_CLASSIFY_BUDGET_MS"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil {
 			cfg.QwenClassifyBudgetMS = ms
+		}
+	}
+	if v := os.Getenv("KAHYA_BRIEFING_MAX_FILE_ITEMS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.BriefingMaxFileItems = n
 		}
 	}
 	if v := os.Getenv("KAHYA_ANCHOR_REMOTE"); v != "" {

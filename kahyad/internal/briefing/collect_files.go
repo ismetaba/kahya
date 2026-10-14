@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -25,12 +26,23 @@ import (
 // paragraph.
 const filePathMaxLen = 300
 
+// defaultMaxFileItems caps how many changed files ONE briefing reports
+// (newest mtime first) - cfg.briefing_max_file_items (FIX-P-23). Every
+// file item costs one local classification call in the gate loop and a
+// prompt line in the cloud summarizer; an uncapped first run over a large
+// glob spent minutes in the gate and bloated the prompt.
+const defaultMaxFileItems = 50
+
 // ChangedFile is one collected, already length/charclass-capped watched-
 // file signal: its canonical path and the RFC3339 modification time that
 // made it "changed" relative to the collector's own since cutoff.
 type ChangedFile struct {
 	Path       string
 	ModifiedAt string
+
+	// modTime is the full-precision mtime Collect sorts by (newest first);
+	// ModifiedAt is its second-resolution display form.
+	modTime time.Time
 }
 
 // FileGlobCollector mtime-diffs Globs (doublestar patterns, `~`-expanded
@@ -38,17 +50,28 @@ type ChangedFile struct {
 // config.Load's own expandHomeEach) since a since cutoff.
 type FileGlobCollector struct {
 	Globs []string
+	// MaxItems caps the returned slice (<= 0 = defaultMaxFileItems).
+	MaxItems int
+}
+
+func (c FileGlobCollector) maxItems() int {
+	if c.MaxItems > 0 {
+		return c.MaxItems
+	}
+	return defaultMaxFileItems
 }
 
 // Collect returns every regular file matched by any configured glob whose
-// mtime is strictly after since. An empty Globs list is a documented
-// no-op (nil, nil) - the files section simply has zero items until one is
-// configured. A glob-expansion or stat failure for one entry/file is
-// NON-FATAL (skipped, matching every other collector's own tolerance of a
-// single-item failure never aborting the whole briefing).
-func (c FileGlobCollector) Collect(since time.Time) ([]ChangedFile, error) {
+// mtime is strictly after since, NEWEST FIRST, capped at maxItems();
+// truncated reports how many matching files the cap dropped (FIX-P-23).
+// An empty Globs list is a documented no-op (nil, 0, nil) - the files
+// section simply has zero items until one is configured. A glob-expansion
+// or stat failure for one entry/file is NON-FATAL (skipped, matching every
+// other collector's own tolerance of a single-item failure never aborting
+// the whole briefing).
+func (c FileGlobCollector) Collect(since time.Time) (files []ChangedFile, truncated int, err error) {
 	if len(c.Globs) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	var out []ChangedFile
 	seen := make(map[string]bool)
@@ -67,11 +90,16 @@ func (c FileGlobCollector) Collect(since time.Time) ([]ChangedFile, error) {
 			}
 			if fi.ModTime().After(since) {
 				seen[m] = true
-				out = append(out, ChangedFile{Path: m, ModifiedAt: fi.ModTime().UTC().Format(time.RFC3339)})
+				out = append(out, ChangedFile{Path: m, ModifiedAt: fi.ModTime().UTC().Format(time.RFC3339), modTime: fi.ModTime()})
 			}
 		}
 	}
-	return out, nil
+	sort.SliceStable(out, func(i, j int) bool { return out[i].modTime.After(out[j].modTime) })
+	if n := c.maxItems(); len(out) > n {
+		truncated = len(out) - n
+		out = out[:n]
+	}
+	return out, truncated, nil
 }
 
 // fileItems adapts a []ChangedFile into []CollectedItem (gate.go),

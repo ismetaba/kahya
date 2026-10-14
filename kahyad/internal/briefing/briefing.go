@@ -89,6 +89,13 @@ const briefingUntrustedReason = "briefing:untrusted_by_design"
 // sub-second; this is purely a hang backstop.
 const calendarCollectBudget = 20 * time.Second
 
+// firstRunFileLookback is the file collector's cutoff on a FIRST run (no
+// scan-state file yet, or an unreadable one): "changed in the last 24h",
+// never "every file the glob matches since the epoch" (FIX-P-23). The
+// state file only advances after a delivered briefing, so every failed run
+// before the first delivery is also a first run.
+const firstRunFileLookback = 24 * time.Hour
+
 // Config is this package's own run-time configuration - a narrower,
 // already-`~`-expanded projection of config.Config's own
 // BriefingGHRepos/BriefingFileGlobs/BriefingCalendarNames fields (main.go
@@ -375,7 +382,15 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	}
 
 	since, _ := o.FileState.Load()
-	files, _ := o.Files.Collect(since)
+	filesFirstRun := since.IsZero()
+	if filesFirstRun {
+		since = now.Add(-firstRunFileLookback)
+	}
+	// The cap applies BEFORE the gate and only chooses which files are
+	// reported; every chosen file still passes the gate. Truncation is a
+	// capacity note (JSONL below), never a secret-lane drop - no
+	// briefing.item_dropped row for it.
+	files, filesTruncated, _ := o.Files.Collect(since)
 	items = append(items, fileItems(files)...)
 
 	// Collector JSONL line (HANDOFF §4 ⚑ logging invariant / this task's
@@ -383,6 +398,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// worker, and delivery lines all under one trace_id").
 	o.jsonlInfo(traceID, "briefing_collected",
 		"gh_prs", len(prs), "gh_runs", len(runs), "calendar_events", calendarEventCount, "files", len(files),
+		"files_first_run", filesFirstRun, "files_truncated", filesTruncated,
 	)
 
 	// --- FIX-P-4: warm the local classifier ONCE, with a cold-load

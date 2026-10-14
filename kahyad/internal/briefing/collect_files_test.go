@@ -1,6 +1,7 @@
 package briefing
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,7 +28,7 @@ func TestFileGlobCollectorFindsChangedFilesSinceCutoff(t *testing.T) {
 	}
 
 	c := FileGlobCollector{Globs: []string{filepath.Join(dir, "*.md")}}
-	files, err := c.Collect(cutoff)
+	files, _, err := c.Collect(cutoff)
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
@@ -37,7 +38,7 @@ func TestFileGlobCollectorFindsChangedFilesSinceCutoff(t *testing.T) {
 }
 
 func TestFileGlobCollectorEmptyGlobsIsNoop(t *testing.T) {
-	files, err := (FileGlobCollector{}).Collect(time.Now())
+	files, _, err := (FileGlobCollector{}).Collect(time.Now())
 	if err != nil || files != nil {
 		t.Fatalf("Collect(no globs) = %v, %v, want nil, nil", files, err)
 	}
@@ -65,5 +66,52 @@ func TestFileScanStateRoundTrips(t *testing.T) {
 	}
 	if !loaded.Equal(now) {
 		t.Fatalf("Load after Save = %v, want %v", loaded, now)
+	}
+}
+
+// writeFileAt writes path and backdates its mtime to at.
+func writeFileAt(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFileGlobCollectorCapsToMaxItemsNewestFirst (FIX-P-23): Collect
+// returns at most MaxItems files, newest mtime first, and reports how many
+// matching files the cap dropped.
+func TestFileGlobCollectorCapsToMaxItemsNewestFirst(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	for i := 1; i <= 7; i++ {
+		writeFileAt(t, filepath.Join(dir, fmt.Sprintf("f%d.md", i)), now.Add(-time.Duration(i)*time.Hour))
+	}
+	c := FileGlobCollector{Globs: []string{filepath.Join(dir, "*.md")}, MaxItems: 3}
+	files, truncated, err := c.Collect(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(files) != 3 || truncated != 4 {
+		t.Fatalf("Collect = %d files, truncated %d; want 3, 4", len(files), truncated)
+	}
+	for i, want := range []string{"f1.md", "f2.md", "f3.md"} {
+		if got := filepath.Base(files[i].Path); got != want {
+			t.Errorf("files[%d] = %s, want %s (newest first)", i, got, want)
+		}
+	}
+
+	// Default cap (MaxItems unset) is defaultMaxFileItems, never unbounded.
+	for i := 0; i < defaultMaxFileItems+5; i++ {
+		writeFileAt(t, filepath.Join(dir, fmt.Sprintf("bulk%03d.txt", i)), now.Add(-time.Minute))
+	}
+	all, truncated, err := (FileGlobCollector{Globs: []string{filepath.Join(dir, "*.txt")}}).Collect(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(all) != defaultMaxFileItems || truncated != 5 {
+		t.Errorf("default cap: %d files, truncated %d; want %d, 5", len(all), truncated, defaultMaxFileItems)
 	}
 }
