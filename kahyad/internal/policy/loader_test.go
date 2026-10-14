@@ -227,6 +227,20 @@ func TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies(t *testing.T) {
 		"App Support/Kahya": {
 			filepath.Join(home, "Library", "Application Support", "Kahya", "**"),
 		},
+		// B-4 families. expandHome leaves "**/..." entries untouched.
+		"git config": {
+			filepath.Join(home, ".gitconfig"),
+			filepath.Join(home, ".config", "git", "**"),
+			"**/.git/**",
+		},
+		"ssh/gpg": {
+			filepath.Join(home, ".ssh", "**"),
+			filepath.Join(home, ".gnupg", "**"),
+		},
+		"docker":         {filepath.Join(home, ".docker", "**")},
+		"claude":         {filepath.Join(home, ".claude", "**"), filepath.Join(home, ".claude.json")},
+		"memory repo":    {filepath.Join(home, "Kahya", "**")},
+		"python startup": {"**/sitecustomize.py", "**/usercustomize.py", "**/*.pth"},
 	}
 
 	for family, wantGlobs := range families {

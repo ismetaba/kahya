@@ -847,3 +847,62 @@ func TestLoadPinnedDigest(t *testing.T) {
 		}
 	})
 }
+
+// TestRun_WorkdirInB4DenyFamiliesRejected: the B-4 fs_write_deny_globs
+// families (as policy.Load normalizes them) also refuse a matching
+// shell_docker workdir — a repo's .git directory or the ~/Kahya memory
+// repo is never bind-mounted rw — while the repo's own root (which merely
+// CONTAINS a .git) stays mountable.
+func TestRun_WorkdirInB4DenyFamiliesRejected(t *testing.T) {
+	home, _ := baseFixture(t)
+	deny := []string{
+		filepath.Join(home, ".gitconfig"),
+		filepath.Join(home, ".config", "git", "**"),
+		"**/.git/**",
+		filepath.Join(home, ".docker", "**"),
+		filepath.Join(home, ".claude", "**"),
+		filepath.Join(home, "Kahya", "**"),
+		"**/*.pth",
+	}
+	for _, d := range []string{
+		filepath.Join(home, "code", "x", ".git", "hooks"),
+		filepath.Join(home, "Kahya", "memory"),
+		filepath.Join(home, ".docker"),
+		filepath.Join(home, ".claude"),
+	} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, wd := range []string{"~/code/x/.git", "~/code/x/.git/hooks", "~/Kahya", "~/Kahya/memory", "~/.docker", "~/.claude"} {
+		t.Run("rejected "+wd, func(t *testing.T) {
+			exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+			ledger := &fakeLedger{}
+			pc := &fakePolicyClient{decision: allowDecision("tok")}
+			r := newTestRunner(home, deny, pc, ledger, newFakeLogger(), exec,
+				&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+			_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: wd})
+			if err == nil || err.Error() != reasonWorkdirDenyGlob {
+				t.Fatalf("workdir %s: err = %v, want the deny-glob refusal", wd, err)
+			}
+			if exec.totalCalls() != 0 || pc.checkCalls != 0 {
+				t.Fatalf("workdir %s: executor calls=%d checkCalls=%d, want 0/0", wd, exec.totalCalls(), pc.checkCalls)
+			}
+			if len(ledger.find("shell_deny_glob_hit")) != 1 {
+				t.Fatalf("workdir %s: expected one shell_deny_glob_hit", wd)
+			}
+		})
+	}
+	t.Run("repo root itself stays mountable", func(t *testing.T) {
+		exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+		ledger := &fakeLedger{}
+		r := newTestRunner(home, deny, &fakePolicyClient{decision: allowDecision("tok")}, ledger, newFakeLogger(), exec,
+			&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+		if _, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: "~/code/x"}); err != nil {
+			t.Fatalf("workdir ~/code/x: unexpected error: %v", err)
+		}
+		if exec.callCount("run") != 1 || len(ledger.find("shell_deny_glob_hit")) != 0 {
+			t.Fatalf("workdir ~/code/x must reach docker run (run calls=%d, deny hits=%d)", exec.callCount("run"), len(ledger.find("shell_deny_glob_hit")))
+		}
+	})
+}

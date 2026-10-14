@@ -89,11 +89,15 @@ secret_lane_globs:
   - "~/Documents/saglik/**"
   - "~/Documents/kimlik/**"
 
-# Day-1 invariants (HANDOFF §5 safety #6 [flag]). The loader hard-rejects
-# any policy.yaml whose fs_write_deny_globs is missing ANY one of these,
-# verbatim — they exist so a compromised/over-eager agent can never
-# rewrite your shell startup files, LaunchAgents, Hammerspoon config, or
-# kahyad's own ledger/DB directory.
+# Day-1 invariants (HANDOFF §5 safety #6 [flag]) plus the B-4 families
+# (kahyad/internal/policy.MandatoryFSWriteDenyGlobs). The loader
+# hard-rejects any policy.yaml whose fs_write_deny_globs is missing ANY one
+# of these, verbatim — they exist so a compromised/over-eager agent can
+# never rewrite your shell startup files, LaunchAgents, Hammerspoon config,
+# kahyad's own ledger/DB directory, a git config, SSH/GPG/Docker/Claude CLI
+# config, the ~/Kahya memory repo, or a Python startup file. The same list
+# also refuses a matching shell_docker workdir. kahyad adds profile-aware
+# self-protect globs at boot (config.SelfProtectDenyGlobs).
 fs_write_deny_globs:
   - "~/.zshrc"
   - "~/.zprofile"
@@ -104,6 +108,26 @@ fs_write_deny_globs:
   - "~/Library/LaunchAgents/**"
   - "~/.hammerspoon/**"
   - "~/Library/Application Support/Kahya/**"
+  # B-4 families (also mandatory). Git config: a program named in any of
+  # these runs on a later shell_host `git status`; "**/.git/**" covers
+  # every repo's own .git/config and hooks, wherever the repo lives.
+  - "~/.gitconfig"
+  - "~/.config/git/**"
+  - "**/.git/**"
+  # Credentials and agent configs an fs_write could poison to run code or
+  # exfiltrate on the next tool use (SSH, GPG, Docker, the Claude CLI).
+  - "~/.ssh/**"
+  - "~/.gnupg/**"
+  - "~/.docker/**"
+  - "~/.claude/**"
+  - "~/.claude.json"
+  # The memory repo (memory, backups, its .git): only memory_write - run
+  # inside kahyad, not through fs_write - writes here (HANDOFF §5 memory #1).
+  - "~/Kahya/**"
+  # Python startup files a Python process (the worker included) runs.
+  - "**/sitecustomize.py"
+  - "**/usercustomize.py"
+  - "**/*.pth"
 
 # egress.allowlist entries below all omit `ports:`, which now defaults to
 # 443 (HTTPS) ONLY (egress-security review, MINOR G fix —

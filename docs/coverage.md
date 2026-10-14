@@ -59,7 +59,7 @@
 | Safety #5 · Telegram auth: fixed chat_id/user_id Go-side, silent drop + ledger, long-polling, `remote` label | W3-07 | covered |
 | Safety #6: model shell in Docker by default (workdir-only rw, no net); binary allowlist not a boundary; narrow arg-validated host set | W3-04 | covered |
 | Safety #6 · osascript/JXA/Shortcuts ≥W2, WYSIWYE-diffed, `do shell script` rejected/rerouted | W3-09 (↔ slidable; must land before W7–8) | covered |
-| Safety #6 · fs write-deny globs (shell rc, LaunchAgents, .hammerspoon, App Support/Kahya) | W3-01 (globs), W3-03 (enforcement + canonicalization) | covered |
+| Safety #6 · fs write-deny globs (shell rc, LaunchAgents, .hammerspoon, App Support/Kahya; FIX-B-4: git config, .git, SSH/GPG, Docker, Claude CLI, ~/Kahya, Python startup files, profile-aware self-protect) | W3-01 (globs), W3-03 (enforcement + canonicalization), FIX-B-4 | covered |
 | Memory #1: source-trust lattice; agent_derived quarantined until user confirms | W5-04, W12-05, W12-04/W0-01 (seed = user_asserted) | covered |
 | Memory #2: evidence-gated entity merge; split op; merge_ledger; provisional namesakes | W5-04 | covered |
 | Memory #3: negative evidence + log-odds; same-session dedupe; <0.3 out of injection; retraction | W5-04, W5-03 (ritual answers) | covered |
@@ -235,6 +235,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | a Telegram approve callback for an irreversible W2 is refused by the engine backstop (nothing approved) | `kahyad/internal/telegram/TestForgedIrreversibleW2CallbackRejectedAtEngine` | FIX-B-11 | ci-hermetic |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
+| Safety #6 | git config / .git / ssh / gpg / docker / claude / memory-repo / python-startup paths are mandatory fs write-deny globs | `kahyad/internal/policy/TestMandatoryDenyGlobsIncludeGitAndMemoryFamilies` | FIX-B-4 | ci-hermetic |
+| Safety #6 | both committed policy files (prod + dev) deny the B-4 paths through the enforcement matcher, ordinary repo files stay writable | `kahyad/internal/policy/TestCommittedPolicyDenyGlobsDenyB4Paths` | FIX-B-4 | ci-hermetic |
+| Safety #6 | every policy fixture carries the full mandatory deny-glob list (fixture drift guard) | `kahyad/internal/policy/TestPolicyFixturesCarryEveryMandatoryDenyGlob` | FIX-B-4 | ci-hermetic |
+| Safety #6 | fs_write refuses git config / .git / ssh / memory-repo / python-startup paths before any policy check | `mcp/fs/TestHandleWriteDeniesGitConfigFamilies` | FIX-B-4 | ci-hermetic |
+| Safety #6 | a repo's .git or the ~/Kahya memory repo is never a shell_docker workdir; the repo root stays mountable | `mcp/shell/TestRun_WorkdirInB4DenyFamiliesRejected` | FIX-B-4 | ci-hermetic |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
 | Safety #6 | `do shell script` in osascript rejected (not a reroute) | `mcp/osascript/TestScanRejectsDoShellScript` | W3-09 | ci-hermetic |
 | Safety #6 | Terminal/iTerm/ObjC-bridge/code-loader osascript bodies rejected (not only do shell script) | `mcp/osascript/TestScanRejectsTerminalAndITermAutomation` | FIX-B-9 | ci-hermetic |

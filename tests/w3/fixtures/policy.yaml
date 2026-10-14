@@ -72,6 +72,18 @@ fs_write_deny_globs:
   - "~/Library/LaunchAgents/**"
   - "~/.hammerspoon/**"
   - "~/Library/Application Support/Kahya/**"
+  - "~/.gitconfig"
+  - "~/.config/git/**"
+  - "**/.git/**"
+  - "~/.ssh/**"
+  - "~/.gnupg/**"
+  - "~/.docker/**"
+  - "~/.claude/**"
+  - "~/.claude.json"
+  - "~/Kahya/**"
+  - "**/sitecustomize.py"
+  - "**/usercustomize.py"
+  - "**/*.pth"
 
 egress:
   allowlist:

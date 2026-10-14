@@ -115,8 +115,13 @@ type Document struct {
 // MandatoryFSWriteDenyGlobs is the Day-1 invariant set (HANDOFF §5 safety
 // #6 [flag]: shell rc/profile files, LaunchAgents, Hammerspoon config, and
 // kahyad's own App Support directory - "defter/DB'nin kendi kendini
-// kurcalamasina karsi"). loader.go's Load hard-rejects any policy.yaml
-// whose fs_write_deny_globs is missing any one of these, verbatim.
+// kurcalamasina karsi") plus the B-4 families. loader.go's Load
+// hard-rejects any policy.yaml whose fs_write_deny_globs is missing any one
+// of these, verbatim (before `~` expansion; "**/..." entries stay as they
+// are). The Day-1 nine stay FIRST and in order: validateMandatoryDenyGlobs
+// reports the first missing entry, and the invalid_missing_deny_glob.yaml
+// fixture (which omits App Support) relies on that. Every policy fixture
+// carries the whole list (TestPolicyFixturesCarryEveryMandatoryDenyGlob).
 var MandatoryFSWriteDenyGlobs = []string{
 	"~/.zshrc",
 	"~/.zprofile",
@@ -127,6 +132,31 @@ var MandatoryFSWriteDenyGlobs = []string{
 	"~/Library/LaunchAgents/**",
 	"~/.hammerspoon/**",
 	"~/Library/Application Support/Kahya/**",
+	// B-4: git config files - a program named in any of these runs on a
+	// later shell_host `git status`. "**/.git/**" covers every repo's own
+	// config and hooks wherever the repo lives (it matches the .git
+	// directory itself and everything under it, never .gitignore).
+	"~/.gitconfig",
+	"~/.config/git/**",
+	"**/.git/**",
+	// B-4: credentials and agent configs an fs_write could poison to run
+	// code or exfiltrate on the next tool use.
+	"~/.ssh/**",
+	"~/.gnupg/**",
+	"~/.docker/**",
+	"~/.claude/**",
+	"~/.claude.json",
+	// B-4: the memory source of truth (memory, backups, its .git). Only
+	// memory_write - which kahyad performs in-process, never through
+	// fs_write - writes here, so the ledger and the user_edit trust tier
+	// stay intact (HANDOFF §5 memory #1). The dev profile's ~/Kahya-dev is
+	// covered by config.SelfProtectDenyGlobs at boot.
+	"~/Kahya/**",
+	// B-4: Python startup files a Python process (the worker included)
+	// executes on start.
+	"**/sitecustomize.py",
+	"**/usercustomize.py",
+	"**/*.pth",
 }
 
 // Policy is the fully validated, normalized policy.yaml document -
