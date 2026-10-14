@@ -3,6 +3,7 @@ package briefing
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -58,5 +59,40 @@ func TestCollectCalendarNilRunnerIsNoop(t *testing.T) {
 	events, err := CollectCalendar(context.Background(), nil, nil)
 	if err != nil || events != nil {
 		t.Fatalf("CollectCalendar(nil runner) = %v, %v, want nil, nil", events, err)
+	}
+}
+
+// TestCalendarJXAUsesWhoseFilterAndBatchReads (FIX-P-9): the fixed calendar
+// snippet filters today's events inside Calendar.app (events.whose on
+// startDate) and reads summary/startDate in one batched Apple Event per
+// calendar - never a JS loop over every event with a per-event property
+// read. It stays read-only and free of every escape body
+// mcp/osascript/scan.go rejects for model-authored scripts.
+func TestCalendarJXAUsesWhoseFilterAndBatchReads(t *testing.T) {
+	for _, want := range []string{
+		"events.whose(",
+		"_greaterThanEquals",
+		"_lessThanEquals",
+		"todays.summary()",
+		"todays.startDate()",
+	} {
+		if !strings.Contains(calendarJXA, want) {
+			t.Errorf("calendarJXA lacks %q", want)
+		}
+	}
+	for _, banned := range []string{
+		"cal.events()",   // every event of the calendar, resolved in JS
+		"ev.startDate()", // one Apple Event per event
+		"do shell script",
+		"doShellScript",
+		"NSTask",
+		"NSAppleScript",
+		"ObjC.import",
+		"ObjC",
+		"$.", // the JXA ObjC bridge shorthand
+	} {
+		if strings.Contains(calendarJXA, banned) {
+			t.Errorf("calendarJXA contains %q", banned)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -50,16 +51,19 @@ func (hangingCalendarRunner) Run(ctx context.Context) ([]byte, error) {
 // W5-05-review-flagged W5-01 bug: the osascript calendar collector had no
 // timeout of its own and the scheduler passes context.Background(), so an
 // undecided TCC grant hung the whole nightly briefing forever. The
-// calendarCollectBudget now bounds it and a timeout degrades to the
-// "Takvim erisimi yok" no-access path - the briefing still delivers.
+// calendarCollectBudget now bounds it - the briefing still delivers. Since
+// FIX-P-9 the timeout gets its own line (MsgCalendarTimeout), never the
+// no-access line: a timeout does not prove a grant is missing.
 func TestHangingCalendarDoesNotWedgeBriefing(t *testing.T) {
 	delivery := &fakeDelivery{Sent: true}
+	ledger := &fakeLedger{}
 	o := &Orchestrator{
 		Classifier:     permissiveClassifier(),
 		Calendar:       hangingCalendarRunner{},
 		Cfg:            Config{CalendarNames: []string{"Home"}},
 		Spawner:        &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
 		Delivery:       delivery,
+		Ledger:         ledger,
 		Now:            time.Now,
 		CalendarBudget: 200 * time.Millisecond, // fast, not the 20s production budget
 	}
@@ -78,8 +82,75 @@ func TestHangingCalendarDoesNotWedgeBriefing(t *testing.T) {
 	if len(delivery.Calls) != 1 {
 		t.Fatalf("delivery calls = %d, want 1 (briefing must still deliver despite the hung calendar)", len(delivery.Calls))
 	}
-	if !strings.Contains(delivery.Calls[0], "Takvim erişimi yok") {
-		t.Errorf("delivered text lacks the no-access line after a calendar timeout: %q", delivery.Calls[0])
+	if !strings.Contains(delivery.Calls[0], MsgCalendarTimeout) {
+		t.Errorf("delivered text lacks the timeout line %q after a calendar timeout: %q", MsgCalendarTimeout, delivery.Calls[0])
+	}
+	if strings.Contains(delivery.Calls[0], MsgCalendarNoAccess) {
+		t.Errorf("delivered text claims a missing grant (%q) after a mere timeout: %q", MsgCalendarNoAccess, delivery.Calls[0])
+	}
+	if got := calendarUnavailableReasons(ledger); len(got) != 1 || got[0] != "timeout" {
+		t.Errorf("%s reasons = %v, want [timeout]", EventCalendarUnavailable, got)
+	}
+}
+
+// calendarUnavailableReasons returns the payload reason of every
+// briefing.calendar_unavailable row, in order.
+func calendarUnavailableReasons(l *fakeLedger) []string {
+	var out []string
+	for _, e := range l.events {
+		if e.kind == EventCalendarUnavailable {
+			r, _ := e.payload["reason"].(string)
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestRunCalendarTimeoutResultFlagAndLedgerReason (FIX-P-9): a calendar
+// collector that runs out of budget sets Result.CalendarTimeout (never
+// CalendarNoAccess), ledgers briefing.calendar_unavailable{reason:timeout}
+// and writes the briefing_calendar_timeout JSONL line under the run's
+// trace.
+func TestRunCalendarTimeoutResultFlagAndLedgerReason(t *testing.T) {
+	logDir := t.TempDir()
+	log, err := logx.New(logDir, "boot-p9-timeout")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	t.Cleanup(func() { log.Close() })
+	ledger := &fakeLedger{}
+	o := &Orchestrator{
+		Classifier:     permissiveClassifier(),
+		Calendar:       hangingCalendarRunner{},
+		Spawner:        &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:       &fakeDelivery{Sent: true},
+		Ledger:         ledger,
+		Log:            log,
+		Now:            time.Now,
+		CalendarBudget: 100 * time.Millisecond,
+	}
+	const traceID = "trace-p9-timeout"
+	result, err := o.Run(context.Background(), traceID)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.CalendarTimeout || result.CalendarNoAccess {
+		t.Fatalf("result = %+v, want CalendarTimeout=true CalendarNoAccess=false", result)
+	}
+	if got := calendarUnavailableReasons(ledger); len(got) != 1 || got[0] != "timeout" {
+		t.Errorf("%s reasons = %v, want [timeout]", EventCalendarUnavailable, got)
+	}
+	var sawTimeoutLine bool
+	for _, l := range readJSONLLinesForTrace(t, logDir, traceID) {
+		if l["event"] == "briefing_calendar_timeout" {
+			sawTimeoutLine = true
+			if ms, _ := l["budget_ms"].(float64); ms != 100 {
+				t.Errorf("briefing_calendar_timeout budget_ms = %v, want 100", l["budget_ms"])
+			}
+		}
+	}
+	if !sawTimeoutLine {
+		t.Error("no briefing_calendar_timeout JSONL line under the run's trace")
 	}
 }
 

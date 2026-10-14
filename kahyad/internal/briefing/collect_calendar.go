@@ -17,6 +17,9 @@
 // CollectCalendar returns ErrCalendarNoAccess, which Orchestrator.Run
 // (briefing.go) turns into the section-level, byte-exact
 // "Takvim erişimi yok" line - never a fatal error for the whole briefing.
+// A collector that runs out of calendarCollectBudget instead yields its own
+// line, MsgCalendarTimeout (FIX-P-9): a timeout does not mean a grant is
+// missing, so the user is never told to grant one.
 package briefing
 
 import (
@@ -27,13 +30,22 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
-// calendarJXA is read-only (only ever calls `.calendars()`/`.events()`
-// accessors - no `do shell script`, no write-shaped method anywhere in
-// this string) and returns today's events (local wall-clock midnight to
-// midnight) as a JSON array of {title, time, calendar} objects - title and
-// (HH:MM) time only, per the task spec ("title+time only").
+// calendarJXA is read-only (only ever calls `.calendars()`, `.name()`,
+// the `events.whose(...)` filter and the batched `.summary()`/
+// `.startDate()` property reads - no `do shell script`, no ObjC bridge, no
+// write-shaped method anywhere in this string) and returns today's events
+// (local wall-clock midnight to midnight) as a JSON array of {title, time,
+// calendar} objects - title and (HH:MM) time only, per the task spec
+// ("title+time only").
+//
+// FIX-P-9: whose() filter + batched summary()/startDate() reads - O(calendars)
+// Apple Events instead of O(events). The date filter runs inside
+// Calendar.app (one Apple Event per calendar), never a JS loop over every
+// event a calendar has ever held, which on a large synced calendar could
+// take longer than calendarCollectBudget. The JSON shape is unchanged.
 const calendarJXA = `(function () {
   var Calendar = Application('Calendar');
   var now = new Date();
@@ -43,15 +55,18 @@ const calendarJXA = `(function () {
   var cals = Calendar.calendars();
   for (var i = 0; i < cals.length; i++) {
     var cal = cals[i];
-    var events = cal.events();
-    for (var j = 0; j < events.length; j++) {
-      var ev = events[j];
-      var sd = ev.startDate();
-      if (sd >= start && sd <= end) {
-        var hh = ('0' + sd.getHours()).slice(-2);
-        var mm = ('0' + sd.getMinutes()).slice(-2);
-        out.push({title: String(ev.summary()), time: hh + ':' + mm, calendar: String(cal.name())});
-      }
+    var calName = String(cal.name());
+    var todays = cal.events.whose({_and: [
+      {startDate: {_greaterThanEquals: start}},
+      {startDate: {_lessThanEquals: end}}
+    ]});
+    var titles = todays.summary();
+    var starts = todays.startDate();
+    for (var j = 0; j < titles.length; j++) {
+      var sd = starts[j];
+      var hh = ('0' + sd.getHours()).slice(-2);
+      var mm = ('0' + sd.getMinutes()).slice(-2);
+      out.push({title: String(titles[j]), time: hh + ':' + mm, calendar: calName});
     }
   }
   return JSON.stringify(out);
@@ -79,11 +94,18 @@ type CalendarRunner interface {
 // JavaScript -e <calendarJXA>`.
 type ExecCalendarRunner struct{}
 
+// calendarKillWaitDelay bounds how long Run waits for osascript's output
+// pipes after its ctx killed it (exec.Cmd.WaitDelay) - the same backstop
+// the gh collector uses (FIX-P-8's ghKillWaitDelay), so a pipe held open by
+// anything osascript left behind can never stretch the calendar budget.
+const calendarKillWaitDelay = 2 * time.Second
+
 var _ CalendarRunner = ExecCalendarRunner{}
 
 // Run implements CalendarRunner.
 func (ExecCalendarRunner) Run(ctx context.Context) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "osascript", "-l", "JavaScript", "-e", calendarJXA)
+	cmd.WaitDelay = calendarKillWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -54,6 +54,11 @@ const (
 	// missing/revoked (collect_calendar.go's ErrCalendarNoAccess) - the
 	// briefing still delivers; only this one section is skipped.
 	MsgCalendarNoAccess = "Takvim erişimi yok"
+	// MsgCalendarTimeout is substituted for the calendar section when the
+	// osascript collector exceeded calendarCollectBudget (FIX-P-9, owner
+	// decision G08-3) - distinct from MsgCalendarNoAccess, which names a TCC
+	// grant the user must give; a timeout asks nothing of the user.
+	MsgCalendarTimeout = "Takvim okunamadı (zaman aşımı)"
 	// MsgClassifierUnavailable is delivered INSTEAD of a briefing body when
 	// the local secret-lane classifier could not be brought up (memory
 	// pressure / spawn failure - FIX-P-4): HANDOFF S4 fail-closed - nothing
@@ -195,6 +200,10 @@ type Result struct {
 	// CalendarNoAccess is true iff the calendar section was skipped
 	// because the Automation TCC grant is missing/revoked.
 	CalendarNoAccess bool
+	// CalendarTimeout is true iff the calendar section was skipped because
+	// the collector exceeded its budget (FIX-P-9) - never set together with
+	// CalendarNoAccess.
+	CalendarTimeout bool
 	// ClassifierUnavailable is true iff the Warmer failed and the run
 	// delivered MsgClassifierUnavailable instead of a summary (FIX-P-4).
 	ClassifierUnavailable bool
@@ -357,7 +366,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	o.ledgerRaw(ctx, traceID, EventStarted, map[string]any{"date": date})
 
 	var items []CollectedItem
-	var calendarNoAccess bool
+	var calendarNoAccess, calendarTimeout bool
 	var calendarEventCount int
 
 	// --- Collect (each source is independently best-effort: one
@@ -384,9 +393,10 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		// Automation TCC grant is still undecided (the permission dialog
 		// cannot appear under launchd) - without this timeout a single
 		// undecided grant wedges the entire nightly briefing forever. A
-		// timeout is treated identically to a missing grant (surfaced as the
-		// "Takvim erisimi yok" line), since a blocked-on-the-TCC-dialog hang
-		// IS effectively "no access".
+		// timeout is reported as its OWN line (MsgCalendarTimeout, FIX-P-9):
+		// an undecided TCC dialog under launchd still manifests as a timeout,
+		// but so does a very large calendar; the user-facing text must not
+		// claim a grant is missing when it may not be.
 		calCtx, cancel := context.WithTimeout(ctx, o.calendarBudget())
 		events, err := CollectCalendar(calCtx, o.Calendar, o.Cfg.CalendarNames)
 		// calCtx.Err() (not errors.Is on the returned error): a
@@ -396,13 +406,18 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		timedOut := calCtx.Err() == context.DeadlineExceeded
 		cancel()
 		switch {
-		case errors.Is(err, ErrCalendarNoAccess) || timedOut:
+		case errors.Is(err, ErrCalendarNoAccess):
 			calendarNoAccess = true
-			o.ledgerRaw(ctx, traceID, EventCalendarUnavailable, nil)
+			o.ledgerRaw(ctx, traceID, EventCalendarUnavailable, map[string]any{"reason": "no_access"})
+		case timedOut:
+			calendarTimeout = true
+			o.jsonlWarn(traceID, "briefing_calendar_timeout", "budget_ms", o.calendarBudget().Milliseconds())
+			o.ledgerRaw(ctx, traceID, EventCalendarUnavailable, map[string]any{"reason": "timeout"})
 		case err != nil:
-			// Any other calendar failure: skip the section silently, same
-			// tolerance every other collector gets - never fail the whole
-			// briefing over one source.
+			// Any other calendar failure: skip the section, same tolerance
+			// every other collector gets - never fail the whole briefing over
+			// one source - but never silently (JSONL).
+			o.jsonlWarn(traceID, "briefing_calendar_error", "err", err.Error())
 		default:
 			calendarEventCount = len(events)
 			items = append(items, calendarItems(events)...)
@@ -469,10 +484,12 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	}
 	o.jsonlInfo(traceID, "briefing_gated", "items", len(items), "dropped", droppedCount, "max_classify_ms", maxClassifyMS)
 
+	calendarLine := calendarSectionLine(calendarNoAccess, calendarTimeout)
+
 	if !classifierReady {
 		// Nothing was classified, so nothing may reach the cloud
 		// summarizer: no task row, no worker, one notice (FIX-P-4).
-		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarNoAccess, Result{CalendarNoAccess: calendarNoAccess})
+		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarLine, Result{CalendarNoAccess: calendarNoAccess, CalendarTimeout: calendarTimeout})
 	}
 
 	prompt := buildPrompt(bySection)
@@ -481,7 +498,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// call (HANDOFF §5 safety #2). ---
 	sessionID := newBriefingSessionID()
 	taskID := spawn.NewTaskID()
-	result := Result{TaskID: taskID, SessionID: sessionID, CalendarNoAccess: calendarNoAccess}
+	result := Result{TaskID: taskID, SessionID: sessionID, CalendarNoAccess: calendarNoAccess, CalendarTimeout: calendarTimeout}
 
 	if o.Taint != nil {
 		if err := o.Taint.InsertUntrusted(ctx, traceID, sessionID, briefingUntrustedReason); err != nil {
@@ -557,7 +574,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// at once. If it cannot come up the summary is withheld, never
 	// delivered unredacted. ---
 	if err := o.warmClassifier(ctx, traceID, "redaction"); err != nil {
-		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarNoAccess, result)
+		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarLine, result)
 	}
 	redacted := make([]string, len(validated.Lines))
 	for i, l := range validated.Lines {
@@ -585,7 +602,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// merely contingent on the summarizer model choosing, on its own, to
 	// mention that something was omitted (task spec: "represented in the
 	// delivered briefing only by the placeholder line").
-	fullText := renderDeliveryText(traceID, redacted, calendarNoAccess, anyDropped, "")
+	fullText := renderDeliveryText(traceID, redacted, calendarLine, anyDropped, "")
 
 	sent := o.Delivery.SendNotification(ctx, traceID, fullText)
 	if !sent {
@@ -639,10 +656,11 @@ func (o *Orchestrator) warmClassifier(ctx context.Context, traceID, phase string
 // trace_id, and NO briefing.delivered row is written - so a later manual
 // `kahya job run morning-briefing` (after freeing memory) still delivers
 // the real briefing for this day. base carries what the run already knows
-// (TaskID/SessionID at the redaction phase). Run returns an error so the
-// scheduler ledgers job_failed.
-func (o *Orchestrator) deliverClassifierUnavailable(ctx context.Context, traceID, date string, calendarNoAccess bool, base Result) (Result, error) {
-	text := renderDeliveryText(traceID, nil, calendarNoAccess, false, MsgClassifierUnavailable)
+// (TaskID/SessionID at the redaction phase). calendarLine is
+// calendarSectionLine's result ("" when the calendar section was read).
+// Run returns an error so the scheduler ledgers job_failed.
+func (o *Orchestrator) deliverClassifierUnavailable(ctx context.Context, traceID, date, calendarLine string, base Result) (Result, error) {
+	text := renderDeliveryText(traceID, nil, calendarLine, false, MsgClassifierUnavailable)
 	sent := o.Delivery.SendNotification(ctx, traceID, text)
 	o.jsonlWarn(traceID, "briefing_classifier_unavailable", "date", date, "notice_sent", sent)
 	o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "classifier_unavailable", "notice_sent": sent})
@@ -773,9 +791,10 @@ func buildPrompt(bySection map[string][]string) string {
 // own control flow, never merely contingent on the summarizer model
 // choosing to mention it), a non-empty notice line (FIX-P-4:
 // MsgClassifierUnavailable instead of a summary), and - deterministically,
-// Go-side, never model-dependent - MsgCalendarNoAccess whenever the
-// calendar section was skipped for a missing TCC grant.
-func renderDeliveryText(traceID string, lines []string, calendarNoAccess, anyItemDropped bool, notice string) string {
+// Go-side, never model-dependent - a non-empty calendarLine
+// (calendarSectionLine: MsgCalendarNoAccess for a missing TCC grant,
+// MsgCalendarTimeout for a collector timeout - FIX-P-9).
+func renderDeliveryText(traceID string, lines []string, calendarLine string, anyItemDropped bool, notice string) string {
 	var b strings.Builder
 	b.WriteString(TelegramTitle + "\n")
 	b.WriteString("trace_id: " + traceID + "\n\n")
@@ -788,8 +807,22 @@ func renderDeliveryText(traceID string, lines []string, calendarNoAccess, anyIte
 	if notice != "" {
 		b.WriteString("\n" + notice + "\n")
 	}
-	if calendarNoAccess {
-		b.WriteString("\n" + MsgCalendarNoAccess + "\n")
+	if calendarLine != "" {
+		b.WriteString("\n" + calendarLine + "\n")
 	}
 	return b.String()
+}
+
+// calendarSectionLine is the line that stands in for a skipped calendar
+// section (FIX-P-9): MsgCalendarNoAccess for a missing TCC grant,
+// MsgCalendarTimeout for a collector that ran out of budget, "" when the
+// section was read (or skipped for any other error).
+func calendarSectionLine(noAccess, timedOut bool) string {
+	switch {
+	case noAccess:
+		return MsgCalendarNoAccess
+	case timedOut:
+		return MsgCalendarTimeout
+	}
+	return ""
 }

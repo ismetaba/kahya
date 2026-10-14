@@ -346,6 +346,16 @@ func TestRunCalendarMissingGrantStillDeliversWithNoAccessLine(t *testing.T) {
 	if n := ledger.count(EventCalendarUnavailable); n != 1 {
 		t.Errorf("%s events = %d, want 1", EventCalendarUnavailable, n)
 	}
+	// FIX-P-9: the ledger tells a missing grant apart from a timeout.
+	if got := calendarUnavailableReasons(ledger); len(got) != 1 || got[0] != "no_access" {
+		t.Errorf("%s reasons = %v, want [no_access]", EventCalendarUnavailable, got)
+	}
+	if result.CalendarTimeout {
+		t.Error("CalendarTimeout = true for a missing grant, want false")
+	}
+	if strings.Contains(delivered, MsgCalendarTimeout) {
+		t.Errorf("delivered text = %q, carries the timeout line for a missing grant", delivered)
+	}
 }
 
 // TestRunRegistersUntrustedTaintBeforeSpawn proves the briefing session's
