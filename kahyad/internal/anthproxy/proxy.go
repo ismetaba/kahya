@@ -796,24 +796,29 @@ func readAndRestoreBody(r *http.Request) ([]byte, error) {
 
 // probeRequest extracts the /v1/messages request's "model" field and the
 // sha256 hex of its "system[0]" block (task spec step 4) without altering
-// what gets forwarded. A malformed body yields ("", "") - metering must
-// never be the reason a request fails.
+// what gets forwarded. Both are read by their EXACT member names, the way
+// the upstream reads them (topLevelFields, FIX-I-10 review). A malformed
+// or ambiguous body (member names colliding under case folding, exact
+// duplicates included), or one whose "model" is not a JSON string, yields
+// model "" - which the model allowlist in ServeHTTP then refuses.
 func probeRequest(body []byte) (model string, systemHashHex string) {
-	var probe struct {
-		Model  string          `json:"model"`
-		System json.RawMessage `json:"system"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil {
+	fields, ok := topLevelFields(body)
+	if !ok {
 		return "", ""
 	}
-	model = probe.Model
-	if len(probe.System) == 0 {
+	if raw, present := fields["model"]; present {
+		if err := json.Unmarshal(raw, &model); err != nil {
+			model = ""
+		}
+	}
+	system := fields["system"]
+	if len(system) == 0 {
 		return model, ""
 	}
 
 	var blocks []json.RawMessage
-	zero := probe.System
-	if err := json.Unmarshal(probe.System, &blocks); err == nil && len(blocks) > 0 {
+	zero := system
+	if err := json.Unmarshal(system, &blocks); err == nil && len(blocks) > 0 {
 		zero = blocks[0]
 	}
 	sum := sha256.Sum256(zero)

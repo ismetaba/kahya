@@ -232,6 +232,18 @@ model allowlist 400 → governor 503 → keychain 503 → upstream):
   `"Izin verilmeyen model kimligi - istek reddedildi."` and ledger
   `proxy.model_rejected` `{task_id, model}`, before any budget
   reservation. A rejection does not fail the task by itself.
+- **One exact-key body parser (review fix):** every body-derived decision
+  (model allowlist + pricing, Fable-5 shaping, the governor's
+  `max_tokens` estimate) reads the top-level object through
+  `anthproxy.topLevelFields`: exact, case-sensitive member names, as the
+  upstream reads them. A body that is not exactly one well-formed object,
+  or whose top-level member names collide under encoding/json's case
+  folding (`"model"` twice, `"model"` + `"MODEL"`, a lone `"Model"`, or any
+  other colliding pair such as `"max_tokens"` + `"MAX_TOKENS"`), yields no
+  model and gets the same `400` + `proxy.model_rejected` (`model: ""`).
+  Without this, encoding/json's case-insensitive, last-match-wins struct
+  decoding let a body be allowlisted and priced as one model while the
+  upstream ran another (`TestProxyRejectsCaseVariantOrDuplicateModelKey`).
 - **Pricing:** a forwarded call whose model has no pricing row is billed
   at `anthproxy.MaxPriceRow` (the costliest row valid now) with ledger
   `proxy.price_unknown` `{task_id, model, billed_as}`, and the governor's

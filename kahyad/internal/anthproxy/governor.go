@@ -435,14 +435,23 @@ type estimateProbe struct {
 
 // parseEstimateProbe reports ok=false for an empty or non-JSON body -
 // exactly the signal estimateRequestLocked uses to fall back to the
-// configured default instead of a body-derived estimate.
+// configured default instead of a body-derived estimate. FIX-I-10
+// (review): "max_tokens" is read by its exact member name through
+// topLevelFields (the proxy's one body parser), never by encoding/json's
+// case-insensitive struct matching; an ambiguous body is ok=false.
 func parseEstimateProbe(body []byte) (estimateProbe, bool) {
 	if len(body) == 0 {
 		return estimateProbe{}, false
 	}
-	var p estimateProbe
-	if err := json.Unmarshal(body, &p); err != nil {
+	fields, ok := topLevelFields(body)
+	if !ok {
 		return estimateProbe{}, false
+	}
+	var p estimateProbe
+	if raw, present := fields["max_tokens"]; present {
+		if err := json.Unmarshal(raw, &p.MaxTokens); err != nil {
+			return estimateProbe{}, false
+		}
 	}
 	return p, true
 }

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/router"
 )
 
 // FIX-I-10: the proxy forwards only allowlisted models to allowlisted
@@ -245,5 +247,94 @@ func TestProxyNilAllowedModelsDefaultsToPricedSet(t *testing.T) {
 	}
 	if len(p2.cfg.AllowedModels) != 0 {
 		t.Errorf("an explicit empty allowlist was replaced: %v", p2.cfg.AllowedModels)
+	}
+}
+
+// TestProxyRejectsCaseVariantOrDuplicateModelKey (FIX-I-10, review): the
+// proxy reads the body's model exactly as the upstream does - the exact,
+// case-sensitive "model" member. Before this fix probeRequest used
+// encoding/json's case-insensitive, last-match-wins struct decoding, so
+// {"model":<not allowlisted>,"MODEL":<allowlisted>} was allowlisted and
+// priced as the second model while the upstream ran the first one. A body
+// whose top-level member names collide under case folding (exact
+// duplicates included) is now refused before any reservation, with zero
+// upstream bytes - and Fable-5 shaping never "launders" it into a clean
+// single-model body first.
+func TestProxyRejectsCaseVariantOrDuplicateModelKey(t *testing.T) {
+	allowed := router.ModelHaiku
+	for _, tc := range []struct{ name, body string }{
+		{"case_variant_key", `{"model":"` + unknownModelID + `","MODEL":"` + allowed + `","max_tokens":1}`},
+		{"case_variant_key_first", `{"MODEL":"` + allowed + `","model":"` + unknownModelID + `","max_tokens":1}`},
+		{"duplicate_exact_key", `{"model":"` + unknownModelID + `","model":"` + allowed + `","max_tokens":1}`},
+		{"lone_case_variant_key", `{"Model":"` + allowed + `","max_tokens":1}`},
+		{"duplicate_key_ending_in_fable", `{"model":"` + allowed + `","model":"` + fable5Model + `","max_tokens":1}`},
+		{"other_member_collision", `{"model":"` + allowed + `","max_tokens":1,"MAX_TOKENS":64000}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newJSONUpstream(t, 200, `{"usage":{"input_tokens":1000,"output_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`)
+			ledger := &fakeLedger{}
+			cfg := testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil)
+			baseURL, p := startTestProxy(t, cfg)
+
+			status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages", tc.body))
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (ambiguous body); body %s", status, body)
+			}
+			if !strings.Contains(body, MsgModelNotAllowed) {
+				t.Errorf("body = %s, want it to contain %q", body, MsgModelNotAllowed)
+			}
+			if upstream.hits() != 0 {
+				t.Fatalf("upstream hits = %d, want 0; forwarded body %s", upstream.hits(), upstream.last().body)
+			}
+			if got := ledger.countKind(EventModelRejected); got != 1 {
+				t.Errorf("%s ledgered %d times, want 1", EventModelRejected, got)
+			}
+			if got := ledger.countKind(EventFable5Shaped) + ledger.countKind(EventModelCall); got != 0 {
+				t.Errorf("fable5_shaped/model_call ledgered %d times, want 0", got)
+			}
+			g := p.cfg.Governor
+			g.mu.Lock()
+			reserved := g.nextReservationID
+			g.mu.Unlock()
+			if reserved != 0 {
+				t.Errorf("governor made %d reservation(s) for an ambiguous body, want 0", reserved)
+			}
+		})
+	}
+}
+
+// TestTopLevelFieldsReadsExactKeysAndRefusesAmbiguity pins the one body
+// parser every proxy decision uses: exact member names (escapes decoded,
+// as any JSON parser does), and ok=false for anything but exactly one
+// well-formed object with fold-distinct member names - folded the way
+// encoding/json folds them (the Kelvin sign and the long s collide too).
+func TestTopLevelFieldsReadsExactKeysAndRefusesAmbiguity(t *testing.T) {
+	fields, ok := topLevelFields([]byte(`{"model":"m","system":[{"text":"s"}],"Other":1}`))
+	if !ok {
+		t.Fatal("a well-formed, unambiguous object was refused")
+	}
+	if string(fields["model"]) != `"m"` || string(fields["Other"]) != `1` || len(fields) != 3 {
+		t.Errorf("fields = %v, want exact keys model/system/Other", fields)
+	}
+	if _, folded := fields["other"]; folded {
+		t.Error("a member was returned under a case-folded name")
+	}
+	for _, body := range []string{
+		``,
+		`not json`,
+		`[]`,
+		`"model"`,
+		`null`,
+		`{"model":"a","model":"b"}`,
+		`{"model":"a","MODEL":"b"}`,
+		`{"a":1,"A":2}`,
+		`{"k":1,"K":2}`,
+		`{"s":1,"ſ":2}`,
+		`{"model":"a"} {"model":"b"}`,
+		`{"model":"a"}}`,
+	} {
+		if _, ok := topLevelFields([]byte(body)); ok {
+			t.Errorf("topLevelFields(%q) ok = true, want false", body)
+		}
 	}
 }

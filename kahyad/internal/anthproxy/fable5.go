@@ -34,10 +34,14 @@ type fable5Fallback struct {
 // A malformed/non-JSON body, or one naming any OTHER model, is returned
 // completely unchanged (shaped=false) - this function never invents a
 // model field, and never upgrades a non-Fable-5 request into one (HANDOFF
-// §4: "Fable 5 asla varsayılan değil").
+// §4: "Fable 5 asla varsayılan değil"). FIX-I-10 (review): the body is
+// read through topLevelFields, so an ambiguous one (duplicate or
+// case-variant member names) is never re-marshaled into a clean
+// single-model body here - it stays unchanged and the model allowlist
+// refuses it.
 func shapeFable5Body(body []byte) (out []byte, shaped bool) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
+	doc, ok := topLevelFields(body)
+	if !ok {
 		return body, false
 	}
 
