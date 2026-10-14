@@ -38,6 +38,7 @@ import (
 	"strings"
 
 	mcpfs "kahya/mcp/fs"
+	"kahya/mcp/internal/gitsafe"
 )
 
 // errHostExecDenied is returned (Turkish, CLAUDE.md language policy) for
@@ -75,39 +76,13 @@ var allowedGitSubcommands = map[string]bool{
 }
 
 // gitHardeningArgs are the fixed `-c key=value` flags shell_host PREPENDS to
-// every git invocation (B-4 fix), neutralizing every config key git uses to
-// run an external program. They sit BEFORE the subcommand, exactly where a
-// real `-c` lives; the model can never supply its own (validateGitArgs
-// rejects any leading "-"), so these are unambiguously OURS. A command-line
-// `-c` also beats any GIT_CONFIG_PARAMETERS value, a second layer behind
-// gitScrubbedEnv not forwarding that variable at all. core.fsmonitor must
-// be false/empty (never a path).
-var gitHardeningArgs = []string{
-	"-c", "core.fsmonitor=false",
-	"-c", "core.fsmonitorhookversion=0",
-	"-c", "core.hooksPath=/dev/null",
-	"-c", "core.pager=cat",
-	"-c", "core.editor=false",
-	"-c", "core.askPass=",
-	"-c", "core.sshCommand=false",
-	"-c", "core.alternateRefsCommand=",
-	"-c", "diff.external=",
-	"-c", "log.showSignature=false",
-	"-c", "gpg.program=false",
-	"-c", "gpg.ssh.program=false",
-	"-c", "credential.helper=",
-	"-c", "uploadpack.packObjectsHook=",
-	"-c", "status.submoduleSummary=false",
-	// diff.submodule=diff (a superproject setting with no program in it,
-	// so the scan passes it) makes log -p/show/diff <rev> spawn a CHILD
-	// `git diff` inside the submodule work tree; the child reads the
-	// submodule's own config (.git/modules/<name>/config, never scanned)
-	// and does not inherit --no-ext-diff/--no-textconv, so a
-	// diff.<d>.command there ran on the host (B-4 review, Apple Git 2.54).
-	// "short" renders a submodule change in-process, with no child.
-	"-c", "diff.submodule=short",
-	"-c", "protocol.ext.allow=never",
-}
+// every git invocation (B-4 fix): gitsafe.HardeningArgs, the one list shared
+// with fs_write's checkpoint git (mcp/fs), neutralizing every config key git
+// uses to run an external program (see that package for each entry's
+// rationale). They sit BEFORE the subcommand, exactly where a real `-c`
+// lives; the model can never supply its own (validateGitArgs rejects any
+// leading "-"), so these are unambiguously OURS.
+var gitHardeningArgs = gitsafe.HardeningArgs()
 
 // gitNoProgramDiffFlags are appended after log/diff/show (NOT status: it
 // rejects both flags as unknown options) so a .gitattributes-driven
@@ -126,37 +101,12 @@ var gitNoProgramDiffFlags = []string{"--no-ext-diff", "--no-textconv"}
 // independent layers (B-4 review).
 const gitNoSubmoduleRecursionFlag = "--ignore-submodules=all"
 
-// gitScrubbedEnv is the CLOSED environment shell_host's git runs under
-// (B-4 fix): nothing is inherited from kahyad. GIT_CONFIG_NOSYSTEM/
-// GIT_CONFIG_SYSTEM/GIT_CONFIG_GLOBAL disable /etc/gitconfig, ~/.gitconfig
-// and ~/.config/git/config; GIT_CONFIG_PARAMETERS (which could undo the -c
-// flags), GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, GIT_DIR and friends are absent
-// by construction. HOME=/var/empty (exists, empty, on macOS) so any
-// leftover $HOME lookup resolves nowhere. GIT_ALLOW_PROTOCOL=none allows NO
-// transport (a list naming no real protocol; it overrides every
-// protocol.* config key) and GIT_NO_LAZY_FETCH=1 stops a partial clone's
-// lazy fetch: the four read-only subcommands never need the network, and
-// a lazy fetch would run remote.<name>.uploadpack (a program) and leave the
-// host outside the egress gate. PATH only governs what git itself execs
-// (exec.LookPath resolves "git" against kahyad's own PATH), so it stays a
-// short system list plus Homebrew.
-func gitScrubbedEnv() []string {
-	return []string{
-		"PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
-		"HOME=/var/empty",
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ATTR_NOSYSTEM=1",
-		"GIT_OPTIONAL_LOCKS=0",
-		"GIT_PAGER=cat",
-		"PAGER=cat",
-		"GIT_ALLOW_PROTOCOL=none",
-		"GIT_NO_LAZY_FETCH=1",
-		"LC_ALL=C",
-	}
-}
+// gitScrubbedEnv is the CLOSED environment shell_host's git (and its repo
+// config scan) runs under (B-4 fix): gitsafe.Env, shared with fs_write's
+// checkpoint git — nothing inherited from kahyad, no system/global config,
+// no GIT_CONFIG_PARAMETERS / GIT_EXTERNAL_DIFF / PAGER / HOME leak, no
+// transport and no lazy fetch.
+func gitScrubbedEnv() []string { return gitsafe.Env() }
 
 // dangerousGitConfigRe matches every repo config key (any scope git reads:
 // local, worktree, included files) that makes git run a program, or that

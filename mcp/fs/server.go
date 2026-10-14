@@ -61,6 +61,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"kahya/mcp/internal/gitsafe"
 )
 
 // traceHeader/taskHeader are the HTTP headers kahyad's /v1/mcp wiring
@@ -1063,12 +1065,27 @@ func taskDirName(taskID string) string {
 	return taskID
 }
 
+// gitCheckpointCmd builds every git command this package runs (B-4
+// review): `git <gitsafe.HardeningArgs> -C dir <args>` under the CLOSED
+// gitsafe.Env. The checkpoint runs inside whatever repository the fs_write
+// target lives in — a repo whose .git/config and .gitattributes an earlier
+// shell_docker container may have written (a repo root is a mountable rw
+// workdir) — so, exactly like shell_host's git, it inherits nothing from
+// kahyad (no GIT_DIR / GIT_CONFIG_PARAMETERS / ~/.gitconfig), never
+// fetches, and carries the fixed -c program neutralizers.
+func gitCheckpointCmd(dir string, args ...string) *exec.Cmd {
+	full := append(gitsafe.HardeningArgs(), "-C", dir)
+	cmd := exec.Command("git", append(full, args...)...)
+	cmd.Env = gitsafe.Env()
+	return cmd
+}
+
 // gitRepoRootFor resolves dir's enclosing git work tree root, reporting
 // ok=false for any failure (not a git repository, git not installed,
 // ...) rather than an error — the caller's only decision is "checkpoint
 // via git, or fall back to a copy", and any git failure means fall back.
 func gitRepoRootFor(dir string) (string, bool) {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	out, err := gitCheckpointCmd(dir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return "", false
 	}
@@ -1077,9 +1094,13 @@ func gitRepoRootFor(dir string) (string, bool) {
 
 // gitHashObjectW checkpoints absPath's CURRENT bytes into repoRoot's
 // object database (`git hash-object -w`) — no working-tree or index side
-// effects — returning the resulting blob SHA.
+// effects — returning the resulting blob SHA. --no-filters (B-4 review):
+// git would otherwise run the attribute-selected filter.<d>.clean /
+// .process program from the repo's own config on the host, and apply
+// eol/working-tree-encoding conversion, so the stored blob would not even
+// be the raw pre-image undo_write must restore byte-exact.
 func gitHashObjectW(repoRoot, absPath string) (string, error) {
-	out, err := exec.Command("git", "-C", repoRoot, "hash-object", "-w", "--", absPath).Output()
+	out, err := gitCheckpointCmd(repoRoot, "hash-object", "-w", "--no-filters", "--", absPath).Output()
 	if err != nil {
 		return "", describeExitErr(err)
 	}
@@ -1087,9 +1108,10 @@ func gitHashObjectW(repoRoot, absPath string) (string, error) {
 }
 
 // gitCatFileBlob reads blob sha back out of repoRoot's object database
-// (undo_write's git-recipe restore path).
+// (undo_write's git-recipe restore path). `cat-file blob` emits the raw
+// object (no smudge/textconv), under the same hardened command.
 func gitCatFileBlob(repoRoot, sha string) ([]byte, error) {
-	out, err := exec.Command("git", "-C", repoRoot, "cat-file", "blob", sha).Output()
+	out, err := gitCheckpointCmd(repoRoot, "cat-file", "blob", sha).Output()
 	if err != nil {
 		return nil, describeExitErr(err)
 	}
