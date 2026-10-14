@@ -9,6 +9,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -28,7 +29,16 @@ const (
 	toastRitualRecorded = "Kaydedildi. Teşekkürler."
 	toastRitualExpired  = "Bu sorunun süresi doldu."
 	toastRitualFailed   = "Kaydedilemedi, tekrar deneyin."
+	// toastRitualAlreadyAnswered (FIX-P-16): the first answer binds; a
+	// different later tap is rejected by kahyad/internal/ritual.
+	toastRitualAlreadyAnswered = "Bu soru zaten cevaplandı."
 )
+
+// alreadyAnswerer is the structural shape of kahyad/internal/ritual.
+// AlreadyAnsweredError (this package never imports ritual).
+type alreadyAnswerer interface {
+	AlreadyAnswered() (previous string, ok bool)
+}
 
 // cbActionRitualTrue/False/Unsure are the leading callback_data byte for
 // each ritual answer button - distinct from cbActionApprove/cbActionDeny
@@ -103,7 +113,9 @@ func ritualMarkup(evalLabelID int64, traceID string) *tele.ReplyMarkup {
 type RitualAnswerer interface {
 	// Answer processes one ritual-question button tap. Returns the run's
 	// own trace_id (this toast's egress SessionInfo key) and whether the
-	// 72h expiry window had already elapsed.
+	// 72h expiry window had already elapsed. An error with an
+	// AlreadyAnswered() (string, bool) method (ritual.AlreadyAnsweredError,
+	// FIX-P-16) means the question was already answered differently.
 	Answer(ctx context.Context, evalLabelID int64, label string) (traceID string, expired bool, err error)
 }
 
@@ -139,6 +151,11 @@ func (b *Bot) handleRitualCallback(cb *tele.Callback) error {
 		return nil
 	}
 	traceID, expired, err := b.ritual.Answer(context.Background(), evalLabelID, label)
+	var aa alreadyAnswerer
+	if errors.As(err, &aa) {
+		b.respond(cb, traceID, toastRitualAlreadyAnswered)
+		return nil
+	}
 	if err != nil {
 		if b.log != nil {
 			b.log.With(traceID).Warn("telegram_ritual_answer_failed", "err", err.Error())

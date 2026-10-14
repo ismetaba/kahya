@@ -12,9 +12,10 @@
 // Delivery-interface posture).
 //
 // Engine.Answer is the callback-side handler a Telegram button tap
-// drives: it EDITS the eval_labels row in place (never a second row for
-// the same question - HANDOFF S5 memory #3: "ayni-oturum tekrari tek
-// kanit sayilir"), and applies the log-odds update THROUGH
+// drives: the FIRST answer to a question binds (FIX-P-16, decision G09-4):
+// it claims the eval_labels row in SQL (never a second row for the same
+// question, never a second answer - HANDOFF S5 memory #3: "ayni-oturum
+// tekrari tek kanit sayilir"), and applies the log-odds update THROUGH
 // kahyad/internal/factengine - the single fact-write path (HANDOFF S4:
 // kahyad is brain.db's only writer) - never a private, duplicated
 // log-odds implementation:
@@ -74,7 +75,24 @@ const (
 	EventAsked         = "ritual.asked"
 	EventAnswered      = "ritual.answered"
 	EventExpiredAnswer = "ritual.expired_answer"
+	// EventAnswerConflict (FIX-P-16): a tap with a DIFFERENT label on an
+	// already-answered question, rejected.
+	EventAnswerConflict = "ritual.answer_conflict"
 )
+
+// AlreadyAnsweredError is returned by Answer when the question was already
+// answered with a DIFFERENT label (FIX-P-16). kahyad/internal/telegram
+// detects it structurally (interface{ AlreadyAnswered() (string, bool) })
+// without importing this package - the same no-cross-import posture as
+// RitualAnswerer.
+type AlreadyAnsweredError struct{ Previous, Attempted string }
+
+func (e AlreadyAnsweredError) Error() string {
+	return fmt.Sprintf("ritual: already answered %q, attempted %q", e.Previous, e.Attempted)
+}
+
+// AlreadyAnswered reports the binding (previous) label.
+func (e AlreadyAnsweredError) AlreadyAnswered() (previous string, ok bool) { return e.Previous, true }
 
 // FactEngine is the narrow kahyad/internal/factengine.Engine surface
 // Answer drives - *factengine.Engine satisfies it directly, with no
@@ -90,11 +108,14 @@ var _ FactEngine = (*factengine.Engine)(nil)
 
 // EvalLabelStore is the narrow eval_labels read/write surface this
 // package needs. *sqlcgen.Queries (via *store.Store) satisfies it
-// directly, with no adapter.
+// directly, with no adapter. ClaimEvalLabelAnswer is the atomic
+// first-answer-wins write; ResetEvalLabelAnswer undoes a claim whose
+// evidence write failed (FIX-P-16).
 type EvalLabelStore interface {
 	InsertEvalLabel(ctx context.Context, arg sqlcgen.InsertEvalLabelParams) (sqlcgen.EvalLabel, error)
 	GetEvalLabel(ctx context.Context, id int64) (sqlcgen.EvalLabel, error)
-	UpdateEvalLabelAnswer(ctx context.Context, arg sqlcgen.UpdateEvalLabelAnswerParams) error
+	ClaimEvalLabelAnswer(ctx context.Context, arg sqlcgen.ClaimEvalLabelAnswerParams) (int64, error)
+	ResetEvalLabelAnswer(ctx context.Context, id int64) error
 }
 
 var _ EvalLabelStore = (*sqlcgen.Queries)(nil)
@@ -252,6 +273,14 @@ func (e *Engine) Run(ctx context.Context, traceID string) (asked int, err error)
 // function runs: no label/answered_at update, no evidence row, no
 // confidence change, only a ritual.expired_answer ledger line (task spec
 // deliverable, verbatim).
+//
+// The first answer wins (FIX-P-16, decision G09-4): a repeat of the SAME
+// label is an idempotent no-op (nil, nothing written); a DIFFERENT label
+// on an answered question is rejected with AlreadyAnsweredError +
+// ritual.answer_conflict and writes nothing. The claim happens in SQL
+// (ClaimEvalLabelAnswer) BEFORE any evidence write, so two concurrent taps
+// can never both write evidence; if the evidence write then fails, the
+// claim is reset so the user can tap again.
 func (e *Engine) Answer(ctx context.Context, evalLabelID int64, label string) (traceID string, expired bool, err error) {
 	if label != LabelTrue && label != LabelFalse && label != LabelUnsure {
 		return "", false, fmt.Errorf("ritual: unknown label %q", label)
@@ -271,32 +300,76 @@ func (e *Engine) Answer(ctx context.Context, evalLabelID int64, label string) (t
 		return traceID, true, nil
 	}
 
-	switch label {
-	case LabelTrue:
-		if err := e.recordTrue(ctx, traceID, row); err != nil {
-			return traceID, false, err
+	if row.AnsweredAt.Valid {
+		return traceID, false, e.alreadyAnswered(ctx, traceID, row, label, false)
+	}
+	n, err := e.store.ClaimEvalLabelAnswer(ctx, sqlcgen.ClaimEvalLabelAnswerParams{
+		Label:      sql.NullString{String: label, Valid: true},
+		AnsweredAt: sql.NullString{String: e.nowRFC3339(), Valid: true},
+		ID:         evalLabelID,
+	})
+	if err != nil {
+		return traceID, false, fmt.Errorf("ritual: claim eval_label %d: %w", evalLabelID, err)
+	}
+	if n == 0 {
+		// Lost a concurrent race: another tap claimed the row between the
+		// read above and the claim. Read the winner back.
+		again, gerr := e.store.GetEvalLabel(ctx, evalLabelID)
+		if gerr != nil {
+			return traceID, false, fmt.Errorf("ritual: re-read eval_label %d: %w", evalLabelID, gerr)
 		}
-	case LabelFalse:
-		if err := e.fact.DenyFact(ctx, traceID, row.FactID, traceID); err != nil {
-			return traceID, false, fmt.Errorf("ritual: deny fact %d: %w", row.FactID, err)
+		if !again.AnsweredAt.Valid {
+			// The winner's evidence write failed and reset its claim in
+			// between: nothing is answered, so this is a plain failure
+			// (the user taps again), never "already answered".
+			return traceID, false, fmt.Errorf("ritual: eval_label %d claim was reset concurrently", evalLabelID)
 		}
-	case LabelUnsure:
-		// No evidence write at all - the label alone is recorded below.
+		return traceID, false, e.alreadyAnswered(ctx, traceID, again, label, true)
 	}
 
-	answeredAt := e.nowRFC3339()
-	if err := e.store.UpdateEvalLabelAnswer(ctx, sqlcgen.UpdateEvalLabelAnswerParams{
-		Label:      sql.NullString{String: label, Valid: true},
-		AnsweredAt: sql.NullString{String: answeredAt, Valid: true},
-		ID:         evalLabelID,
-	}); err != nil {
-		return traceID, false, fmt.Errorf("ritual: update eval_label %d: %w", evalLabelID, err)
+	var evErr error
+	switch label {
+	case LabelTrue:
+		evErr = e.recordTrue(ctx, traceID, row)
+	case LabelFalse:
+		if err := e.fact.DenyFact(ctx, traceID, row.FactID, traceID); err != nil {
+			evErr = fmt.Errorf("ritual: deny fact %d: %w", row.FactID, err)
+		}
+	case LabelUnsure:
+		// No evidence write at all - the claimed label is the whole answer.
+	}
+	if evErr != nil {
+		// Let the user retry instead of leaving the question "answered"
+		// with no evidence. A retry is safe: factengine dedupes evidence
+		// on (fact_id, session_id, polarity).
+		if rerr := e.store.ResetEvalLabelAnswer(ctx, evalLabelID); rerr != nil {
+			return traceID, false, errors.Join(evErr, fmt.Errorf("ritual: reset eval_label %d: %w", evalLabelID, rerr))
+		}
+		return traceID, false, evErr
 	}
 
 	e.ledgerEvent(ctx, traceID, EventAnswered, map[string]any{
 		"fact_id": row.FactID, "eval_label_id": evalLabelID, "label": label, "channel": ChannelRemote,
 	})
 	return traceID, false, nil
+}
+
+// alreadyAnswered decides a tap on an answered question (row is the
+// current row): the SAME label is an idempotent no-op (nil); a different
+// one ledgers ritual.answer_conflict and returns AlreadyAnsweredError.
+// race marks the case where the row was claimed by a concurrent tap.
+func (e *Engine) alreadyAnswered(ctx context.Context, traceID string, row sqlcgen.EvalLabel, label string, race bool) error {
+	if row.Label.Valid && row.Label.String == label {
+		return nil
+	}
+	payload := map[string]any{
+		"fact_id": row.FactID, "eval_label_id": row.ID, "previous": row.Label.String, "attempted": label,
+	}
+	if race {
+		payload["race"] = true
+	}
+	e.ledgerEvent(ctx, traceID, EventAnswerConflict, payload)
+	return AlreadyAnsweredError{Previous: row.Label.String, Attempted: label}
 }
 
 // recordTrue implements the Dogru half of Answer (package doc comment):

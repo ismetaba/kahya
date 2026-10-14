@@ -56,6 +56,30 @@ func (q *Queries) CancelOutboxRowsByTask(ctx context.Context, arg CancelOutboxRo
 	return result.RowsAffected()
 }
 
+const claimEvalLabelAnswer = `-- name: ClaimEvalLabelAnswer :execrows
+UPDATE eval_labels
+SET label = ?, answered_at = ?
+WHERE id = ? AND answered_at IS NULL
+`
+
+type ClaimEvalLabelAnswerParams struct {
+	Label      sql.NullString `json:"label"`
+	AnsweredAt sql.NullString `json:"answered_at"`
+	ID         int64          `json:"id"`
+}
+
+// First-answer-wins claim for one ritual question: succeeds (1 row) only
+// while the row is still unanswered. Two concurrent taps race here in SQL,
+// not in Go - exactly one claims; the loser sees 0 rows and reads the
+// winner's label back (kahyad/internal/ritual.Engine.Answer).
+func (q *Queries) ClaimEvalLabelAnswer(ctx context.Context, arg ClaimEvalLabelAnswerParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimEvalLabelAnswer, arg.Label, arg.AnsweredAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const claimOutboxRow = `-- name: ClaimOutboxRow :execrows
 UPDATE outbox
 SET lease_until = ?, attempts = attempts + 1
@@ -1444,8 +1468,9 @@ type InsertEvalLabelParams struct {
 
 // One row per fact ASKED about in a single ritual run (W5-03 task spec
 // step 4) - label/answered_at start NULL, filled in by
-// UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
-// the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+// ClaimEvalLabelAnswer once (and if) the first Telegram callback arrives
+// inside the 72h expiry window kahyad/internal/ritual.Engine.Answer
+// enforces.
 func (q *Queries) InsertEvalLabel(ctx context.Context, arg InsertEvalLabelParams) (EvalLabel, error) {
 	row := q.db.QueryRowContext(ctx, insertEvalLabel,
 		arg.FactID,
@@ -3517,6 +3542,19 @@ func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeasePara
 	return err
 }
 
+const resetEvalLabelAnswer = `-- name: ResetEvalLabelAnswer :exec
+UPDATE eval_labels
+SET label = NULL, answered_at = NULL
+WHERE id = ?
+`
+
+// Undoes a ClaimEvalLabelAnswer whose evidence write then failed, so the
+// user can tap again instead of being stuck "answered" with no evidence.
+func (q *Queries) ResetEvalLabelAnswer(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, resetEvalLabelAnswer, id)
+	return err
+}
+
 const resetTaskCrashResumes = `-- name: ResetTaskCrashResumes :exec
 UPDATE tasks
 SET crash_resumes = 0, updated_at = ?
@@ -3852,11 +3890,9 @@ type UpdateEvalLabelAnswerParams struct {
 	ID         int64          `json:"id"`
 }
 
-// Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
-// the same question edit the label, they do not append evidence rows") -
-// called again on a later, possibly-different-button tap for the SAME
-// question; this never creates a second eval_labels row for one asked
-// fact.
+// Unconditionally overwrites label/answered_at of one row. No longer on
+// the ritual answer path (FIX-P-16: the first answer binds, see
+// ClaimEvalLabelAnswer); kept for maintenance use.
 func (q *Queries) UpdateEvalLabelAnswer(ctx context.Context, arg UpdateEvalLabelAnswerParams) error {
 	_, err := q.db.ExecContext(ctx, updateEvalLabelAnswer, arg.Label, arg.AnsweredAt, arg.ID)
 	return err

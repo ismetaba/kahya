@@ -2,12 +2,15 @@ package ritual
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 func newTestEngine(t *testing.T, st *store.Store, delivery Delivery) *Engine {
@@ -219,7 +222,7 @@ func TestAnswerDogruOnQuarantinedAgentDerivedLiftsInjectionEligibility(t *testin
 // TestAnswerDoubleTapSameButtonYieldsOneEvidenceRow: tapping the SAME
 // button twice on the same question inserts exactly one evidence row for
 // that fact+ritual run (HANDOFF S5 memory #3: "ayni-oturum tekrari tek
-// kanit sayilir") - the label is still updated (edited) both times.
+// kanit sayilir") - the repeat of the SAME label is a no-op (FIX-P-16).
 func TestAnswerDoubleTapSameButtonYieldsOneEvidenceRow(t *testing.T) {
 	st := newTestStore(t)
 	ep := seedEpisode(t, st, "notlar/gunluk.md")
@@ -359,5 +362,209 @@ func TestRunNeverDeliversSecretLaneFactText(t *testing.T) {
 	ex := excludedRows(t, st)
 	if len(ex) != 1 || ex[0].reason != ExcludeReasonContentDeterministic || ex[0].traceID != traceID || ex[0].factID != f.ID {
 		t.Fatalf("exclusion rows = %+v, want one {fact %d, %s, %s}", ex, f.ID, ExcludeReasonContentDeterministic, traceID)
+	}
+}
+
+// ---- FIX-P-16: the first answer binds (decision G09-4) ----
+
+// runOneQuestion seeds one eligible fact at confidence, runs engine under
+// traceID and returns the fact id and the single eval_labels row id.
+func runOneQuestion(t *testing.T, st *store.Store, engine *Engine, traceID string, confidence float64) (factID, evalLabelID int64) {
+	t.Helper()
+	ep := seedEpisode(t, st, "notlar/gunluk.md")
+	fact := seedFact(t, st, "Emre", "sever", "kahve", "user_asserted", confidence, false)
+	seedClassifyingEvidence(t, st, fact.ID, ep)
+	if _, err := engine.Run(context.Background(), traceID); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	rows, err := st.Queries.ListEvalLabelsByTrace(context.Background(), traceID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListEvalLabelsByTrace: rows=%v err=%v", rows, err)
+	}
+	return fact.ID, rows[0].ID
+}
+
+func evalLabel(t *testing.T, st *store.Store, id int64) sqlcgen.EvalLabel {
+	t.Helper()
+	row, err := st.Queries.GetEvalLabel(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetEvalLabel(%d): %v", id, err)
+	}
+	return row
+}
+
+// TestAnswerDogruThenYanlisRejectedWritesNoNegativeEvidence (FIX-P-16): a
+// Yanlis tap after a Dogru answer on the same question is rejected with
+// AlreadyAnsweredError and ledgered as ritual.answer_conflict - no
+// negative evidence row, no confidence change, the label stays "true".
+func TestAnswerDogruThenYanlisRejectedWritesNoNegativeEvidence(t *testing.T) {
+	st := newTestStore(t)
+	engine := newTestEngine(t, st, &fakeDelivery{sendResult: true})
+	factID, evalLabelID := runOneQuestion(t, st, engine, "run-trace-p16-00000000000000000001", 0.5)
+
+	if _, expired, err := engine.Answer(context.Background(), evalLabelID, LabelTrue); err != nil || expired {
+		t.Fatalf("first Answer(Dogru): err=%v expired=%v", err, expired)
+	}
+	before := countEvidenceRows(t, st, factID)
+	conf := getFact(t, st, factID).Confidence
+
+	_, expired, err := engine.Answer(context.Background(), evalLabelID, LabelFalse)
+	var aa AlreadyAnsweredError
+	if !errors.As(err, &aa) {
+		t.Fatalf("second Answer(Yanlis) err = %v, want AlreadyAnsweredError", err)
+	}
+	if aa.Previous != LabelTrue || aa.Attempted != LabelFalse {
+		t.Fatalf("AlreadyAnsweredError = %+v, want Previous=true Attempted=false", aa)
+	}
+	if expired {
+		t.Fatal("second Answer reported expired on a fresh question")
+	}
+	if n := countEvidenceRows(t, st, factID); n != before {
+		t.Fatalf("evidence rows after the rejected Yanlis = %d, want unchanged %d", n, before)
+	}
+	if got := getFact(t, st, factID).Confidence; got != conf {
+		t.Fatalf("confidence changed by the rejected Yanlis: %v -> %v", conf, got)
+	}
+	if row := evalLabel(t, st, evalLabelID); !row.Label.Valid || row.Label.String != LabelTrue {
+		t.Fatalf("eval_label label = %+v, want still %q", row.Label, LabelTrue)
+	}
+	if got := countEventsOfKind(t, st, EventAnswerConflict); got != 1 {
+		t.Fatalf("%s events = %d, want 1", EventAnswerConflict, got)
+	}
+	if got := countEventsOfKind(t, st, EventAnswered); got != 1 {
+		t.Fatalf("%s events = %d, want 1", EventAnswered, got)
+	}
+}
+
+// TestAnswerUnsureThenDogruAlsoRejected (FIX-P-16): "Emin degilim" is an
+// answer too - a later Dogru is rejected and writes no evidence.
+func TestAnswerUnsureThenDogruAlsoRejected(t *testing.T) {
+	st := newTestStore(t)
+	engine := newTestEngine(t, st, &fakeDelivery{sendResult: true})
+	factID, evalLabelID := runOneQuestion(t, st, engine, "run-trace-p16-00000000000000000002", 0.5)
+	before := countEvidenceRows(t, st, factID)
+
+	if _, _, err := engine.Answer(context.Background(), evalLabelID, LabelUnsure); err != nil {
+		t.Fatalf("Answer(Unsure): %v", err)
+	}
+	_, _, err := engine.Answer(context.Background(), evalLabelID, LabelTrue)
+	var aa AlreadyAnsweredError
+	if !errors.As(err, &aa) || aa.Previous != LabelUnsure {
+		t.Fatalf("Answer(Dogru) after Unsure err = %v, want AlreadyAnsweredError{Previous: unsure}", err)
+	}
+	if n := countEvidenceRows(t, st, factID); n != before {
+		t.Fatalf("evidence rows = %d, want unchanged %d (unsure writes none, the rejected Dogru none)", n, before)
+	}
+	if row := evalLabel(t, st, evalLabelID); row.Label.String != LabelUnsure {
+		t.Fatalf("label = %q, want %q", row.Label.String, LabelUnsure)
+	}
+}
+
+// TestAnswerSameLabelRepeatIsIdempotentNoop (FIX-P-16): repeating the SAME
+// answer is a no-op - nil error, one evidence row, one ritual.answered.
+func TestAnswerSameLabelRepeatIsIdempotentNoop(t *testing.T) {
+	st := newTestStore(t)
+	engine := newTestEngine(t, st, &fakeDelivery{sendResult: true})
+	factID, evalLabelID := runOneQuestion(t, st, engine, "run-trace-p16-00000000000000000003", 0.5)
+	before := countEvidenceRows(t, st, factID)
+
+	for i := 0; i < 2; i++ {
+		if _, expired, err := engine.Answer(context.Background(), evalLabelID, LabelTrue); err != nil || expired {
+			t.Fatalf("Answer(Dogru) #%d: err=%v expired=%v", i+1, err, expired)
+		}
+	}
+	if n := countEvidenceRows(t, st, factID); n != before+1 {
+		t.Fatalf("evidence rows = %d, want %d", n, before+1)
+	}
+	if got := countEventsOfKind(t, st, EventAnswered); got != 1 {
+		t.Fatalf("%s events = %d, want 1 (the repeat is a no-op)", EventAnswered, got)
+	}
+	if got := countEventsOfKind(t, st, EventAnswerConflict); got != 0 {
+		t.Fatalf("%s events = %d, want 0", EventAnswerConflict, got)
+	}
+}
+
+// TestAnswerConcurrentOppositeTapsExactlyOneWins (FIX-P-16): concurrent
+// opposite taps race in SQL (ClaimEvalLabelAnswer), not in Go - exactly
+// one answer is recorded with exactly one evidence row.
+func TestAnswerConcurrentOppositeTapsExactlyOneWins(t *testing.T) {
+	st := newTestStore(t)
+	engine := newTestEngine(t, st, &fakeDelivery{sendResult: true})
+	factID, evalLabelID := runOneQuestion(t, st, engine, "run-trace-p16-00000000000000000004", 0.5)
+	before := countEvidenceRows(t, st, factID)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes := 0
+	for i := 0; i < 16; i++ {
+		label := LabelTrue
+		if i%2 == 1 {
+			label = LabelFalse
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := engine.Answer(context.Background(), evalLabelID, label); err == nil {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successes < 1 {
+		t.Fatal("no tap succeeded")
+	}
+	if got := countEventsOfKind(t, st, EventAnswered); got != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", EventAnswered, got)
+	}
+	if n := countEvidenceRows(t, st, factID); n != before+1 {
+		t.Fatalf("evidence rows = %d, want %d (one winner, one evidence row)", n, before+1)
+	}
+	row := evalLabel(t, st, evalLabelID)
+	if !row.AnsweredAt.Valid || (row.Label.String != LabelTrue && row.Label.String != LabelFalse) {
+		t.Fatalf("eval_label = %+v, want answered with the winner's label", row)
+	}
+}
+
+// failingDeny is a FactEngine whose DenyFact always fails.
+type failingDeny struct{ FactEngine }
+
+func (failingDeny) DenyFact(context.Context, string, int64, string) error {
+	return errors.New("deny: injected failure")
+}
+
+// TestAnswerEvidenceFailureResetsClaim (FIX-P-16): when the evidence write
+// fails after the claim, the claim is undone so the user can tap again.
+func TestAnswerEvidenceFailureResetsClaim(t *testing.T) {
+	st := newTestStore(t)
+	real := factengine.New(st.Queries, newTestTaint(st), st)
+	eng := New(NewSampler(st.Queries, testMemoryDir, testSecretGlobs, nil), st.Queries, failingDeny{FactEngine: real}, newTestTaint(st), st, &fakeDelivery{sendResult: true})
+	factID, evalLabelID := runOneQuestion(t, st, eng, "run-trace-p16-00000000000000000005", 0.5)
+
+	if _, _, err := eng.Answer(context.Background(), evalLabelID, LabelFalse); err == nil {
+		t.Fatal("Answer(Yanlis) with a failing DenyFact returned nil, want the evidence error")
+	}
+	if row := evalLabel(t, st, evalLabelID); row.AnsweredAt.Valid || row.Label.Valid {
+		t.Fatalf("eval_label after the failed evidence write = %+v, want unanswered (claim reset)", row)
+	}
+	if got := countEventsOfKind(t, st, EventAnswered); got != 0 {
+		t.Fatalf("%s events = %d, want 0", EventAnswered, got)
+	}
+
+	retry := newTestEngine(t, st, &fakeDelivery{sendResult: true})
+	if _, _, err := retry.Answer(context.Background(), evalLabelID, LabelFalse); err != nil {
+		t.Fatalf("retried Answer(Yanlis): %v", err)
+	}
+	var negRows int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM evidence WHERE fact_id = ? AND polarity = -1`, factID).Scan(&negRows); err != nil {
+		t.Fatal(err)
+	}
+	if negRows != 1 {
+		t.Fatalf("negative evidence rows after the retry = %d, want 1", negRows)
+	}
+	if row := evalLabel(t, st, evalLabelID); row.Label.String != LabelFalse {
+		t.Fatalf("label after the retry = %q, want %q", row.Label.String, LabelFalse)
 	}
 }

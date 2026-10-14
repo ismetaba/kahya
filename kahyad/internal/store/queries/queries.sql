@@ -1143,8 +1143,9 @@ WHERE id = ?;
 -- name: InsertEvalLabel :one
 -- One row per fact ASKED about in a single ritual run (W5-03 task spec
 -- step 4) - label/answered_at start NULL, filled in by
--- UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
--- the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+-- ClaimEvalLabelAnswer once (and if) the first Telegram callback arrives
+-- inside the 72h expiry window kahyad/internal/ritual.Engine.Answer
+-- enforces.
 INSERT INTO eval_labels (fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at)
 VALUES (?, ?, NULL, ?, NULL, ?, ?, ?)
 RETURNING id, fact_id, question_text, label, asked_at, answered_at, channel, trace_id, created_at;
@@ -1155,13 +1156,27 @@ FROM eval_labels
 WHERE id = ?;
 
 -- name: UpdateEvalLabelAnswer :exec
--- Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
--- the same question edit the label, they do not append evidence rows") -
--- called again on a later, possibly-different-button tap for the SAME
--- question; this never creates a second eval_labels row for one asked
--- fact.
+-- Unconditionally overwrites label/answered_at of one row. No longer on
+-- the ritual answer path (FIX-P-16: the first answer binds, see
+-- ClaimEvalLabelAnswer); kept for maintenance use.
 UPDATE eval_labels
 SET label = ?, answered_at = ?
+WHERE id = ?;
+
+-- name: ClaimEvalLabelAnswer :execrows
+-- First-answer-wins claim for one ritual question: succeeds (1 row) only
+-- while the row is still unanswered. Two concurrent taps race here in SQL,
+-- not in Go - exactly one claims; the loser sees 0 rows and reads the
+-- winner's label back (kahyad/internal/ritual.Engine.Answer).
+UPDATE eval_labels
+SET label = ?, answered_at = ?
+WHERE id = ? AND answered_at IS NULL;
+
+-- name: ResetEvalLabelAnswer :exec
+-- Undoes a ClaimEvalLabelAnswer whose evidence write then failed, so the
+-- user can tap again instead of being stuck "answered" with no evidence.
+UPDATE eval_labels
+SET label = NULL, answered_at = NULL
 WHERE id = ?;
 
 -- name: ListEvalLabelsByTrace :many

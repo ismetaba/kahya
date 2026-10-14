@@ -23,6 +23,11 @@ type Querier interface {
 	// call against an already-halted task affects 0 rows here, never
 	// re-stamps canceled_at with a later timestamp.
 	CancelOutboxRowsByTask(ctx context.Context, arg CancelOutboxRowsByTaskParams) (int64, error)
+	// First-answer-wins claim for one ritual question: succeeds (1 row) only
+	// while the row is still unanswered. Two concurrent taps race here in SQL,
+	// not in Go - exactly one claims; the loser sees 0 rows and reads the
+	// winner's label back (kahyad/internal/ritual.Engine.Answer).
+	ClaimEvalLabelAnswer(ctx context.Context, arg ClaimEvalLabelAnswerParams) (int64, error)
 	// The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
 	// ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"
 	// pattern elsewhere in this file): only the FIRST dispatcher to run this
@@ -277,8 +282,9 @@ type Querier interface {
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
 	// One row per fact ASKED about in a single ritual run (W5-03 task spec
 	// step 4) - label/answered_at start NULL, filled in by
-	// UpdateEvalLabelAnswer once (and if) a Telegram callback arrives inside
-	// the 72h expiry window kahyad/internal/ritual.Engine.Answer enforces.
+	// ClaimEvalLabelAnswer once (and if) the first Telegram callback arrives
+	// inside the 72h expiry window kahyad/internal/ritual.Engine.Answer
+	// enforces.
 	InsertEvalLabel(ctx context.Context, arg InsertEvalLabelParams) (EvalLabel, error)
 	// Starter query set for W12-02 (HANDOFF S4: Go + sqlc-generated queries).
 	// Later tasks add more queries to this file as they need them; sqlc
@@ -615,6 +621,9 @@ type Querier interface {
 	// already marked delivered (or that somehow no longer exists) must never
 	// have its lease resurrected.
 	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
+	// Undoes a ClaimEvalLabelAnswer whose evidence write then failed, so the
+	// user can tap again instead of being stuck "answered" with no evidence.
+	ResetEvalLabelAnswer(ctx context.Context, id int64) error
 	// I-2: `kahya task resolve <id> --retry` (kahyad/internal/task.Resolver.
 	// Retry) starts a fresh crash budget.
 	ResetTaskCrashResumes(ctx context.Context, arg ResetTaskCrashResumesParams) error
@@ -702,11 +711,9 @@ type Querier interface {
 	// new/changed content: same id, fresh hash/tier, status forced back to
 	// 'active' (covers the resurrect-a-deleted-file case, not just plain edits).
 	UpdateEpisodeContent(ctx context.Context, arg UpdateEpisodeContentParams) error
-	// Edits label/answered_at IN PLACE (W5-03 task spec: "multiple taps on
-	// the same question edit the label, they do not append evidence rows") -
-	// called again on a later, possibly-different-button tap for the SAME
-	// question; this never creates a second eval_labels row for one asked
-	// fact.
+	// Unconditionally overwrites label/answered_at of one row. No longer on
+	// the ritual answer path (FIX-P-16: the first answer binds, see
+	// ClaimEvalLabelAnswer); kept for maintenance use.
 	UpdateEvalLabelAnswer(ctx context.Context, arg UpdateEvalLabelAnswerParams) error
 	// The engine recomputes confidence from the fact's own evidence rows
 	// (sum of weights, deduped by (session_id, polarity), clamped to the

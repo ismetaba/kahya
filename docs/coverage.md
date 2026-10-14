@@ -358,6 +358,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #3 | same-session repeat = one evidence, different session raises log-odds | `kahyad/internal/factengine/TestSameSessionDedupeThenDifferentSessionRaisesLogOdds` | W5-04 | ci-hermetic |
 | Memory #3 | user denial drops fact below injection threshold (negative evidence) | `kahyad/internal/factengine/TestUserDenialDropsFactBelowInjectionThreshold` | W5-04 | ci-hermetic |
 | Memory #3 | retraction closes fact and excludes it from injection | `kahyad/internal/factengine/TestRetractionFixtureClosesFactAndExcludesFromInjection` | W5-04 | ci-hermetic |
+| Memory #3 | ritual: a second, opposite answer never writes a second evidence row | `kahyad/internal/ritual/TestAnswerDogruThenYanlisRejectedWritesNoNegativeEvidence` | FIX-P-16 | ci-hermetic |
+| Memory #3 | ritual: concurrent opposite taps race in SQL - exactly one answer and one evidence row | `kahyad/internal/ritual/TestAnswerConcurrentOppositeTapsExactlyOneWins` | FIX-P-16 | ci-hermetic |
+| Memory #3 | ritual: a repeat of the same answer is a no-op (one ritual.answered, one evidence row) | `kahyad/internal/ritual/TestAnswerSameLabelRepeatIsIdempotentNoop` | FIX-P-16 | ci-hermetic |
+| Memory #3 | ritual: a failed evidence write resets the claim so the question can be answered again | `kahyad/internal/ritual/TestAnswerEvidenceFailureResetsClaim` | FIX-P-16 | ci-hermetic |
+| Memory #3 | ritual: Telegram answers an already-answered question with the byte-exact "Bu soru zaten cevaplandı." toast | `kahyad/internal/telegram/TestRitualCallbackAlreadyAnsweredAnswersToast` | FIX-P-16 | ci-hermetic |
 | Memory #4 | summary rejected as evidence; only raw evidence promotes | `kahyad/internal/consolidation/TestValidateSummaryEvidenceRejectsSummary` | W5-02 | ci-hermetic |
 | Memory #4 | detail-atom promotion before cooling | `kahyad/internal/consolidation/TestPromoteHotWindowPromotesBeforeCooling` | W5-02 | ci-hermetic |
 | Memory #4 | ≥90-day hot window: fresh episode not yet promoted | `kahyad/internal/consolidation/TestPromoteHotWindowSkipsFreshEpisode` | W5-02 | ci-hermetic |

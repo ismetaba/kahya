@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"kahya/kahyad/internal/egress"
@@ -192,4 +193,27 @@ func ledgeredKinds(l *fakeLedger) []string {
 		out[i] = e.Kind
 	}
 	return out
+}
+
+// alreadyAnsweredErr mimics kahyad/internal/ritual.AlreadyAnsweredError
+// structurally (this package never imports ritual).
+type alreadyAnsweredErr struct{ previous string }
+
+func (e alreadyAnsweredErr) Error() string                   { return "already answered " + e.previous }
+func (e alreadyAnsweredErr) AlreadyAnswered() (string, bool) { return e.previous, true }
+
+// TestRitualCallbackAlreadyAnsweredAnswersToast (FIX-P-16): a tap the
+// ritual engine rejects as already answered gets the byte-exact "Bu soru
+// zaten cevaplandı." toast, never the "try again" failure toast.
+func TestRitualCallbackAlreadyAnsweredAnswersToast(t *testing.T) {
+	sender := &fakeSender{}
+	answerer := &fakeRitualAnswerer{traceID: "trace-ritual-p16", err: fmt.Errorf("ritual: %w", alreadyAnsweredErr{previous: "true"})}
+	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), nil, nil)
+	b.SetRitualAnswerer(answerer)
+
+	b.tb.ProcessUpdate(callbackUpdate(testChatID, testUserID, encodeRitualCallback(cbActionRitualFalse, 9)))
+
+	if len(sender.responded) != 1 || sender.responded[0] != "Bu soru zaten cevaplandı." {
+		t.Fatalf("responded = %q, want [%q]", sender.responded, "Bu soru zaten cevaplandı.")
+	}
 }
