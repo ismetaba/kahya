@@ -54,9 +54,16 @@ import (
 func (e *Engine) redeemApprovedGrant(ctx context.Context, in CheckInput, class ActionClass, scope, hash string, level int) (Decision, bool) {
 	var row sqlcgen.ApprovalToken
 	var err error
-	if in.RedeemPendingApprovalID != "" {
+	switch {
+	case in.RedeemPendingApprovalID != "":
 		row, err = e.lookupOwnGrant(ctx, in, scope, hash)
-	} else {
+	case in.TaskID == "":
+		// Fail-closed backstop: with no task id a hash match would bind the
+		// grant to nobody - any other task-less caller of the same bytes
+		// (or a tool that forgot to forward its task id) could redeem it.
+		// Such a grant is redeemable only by its own parked call above.
+		return Decision{}, false
+	default:
 		row, err = e.store.GetRedeemableApprovalGrant(ctx, sqlcgen.GetRedeemableApprovalGrantParams{
 			TaskID: in.TaskID, Tool: in.Tool, Scope: scope, ApprovedBytesHash: hash,
 		})

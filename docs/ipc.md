@@ -775,6 +775,11 @@ client-attached call). The go-sdk handler context never cancels on a
 client disconnect, so the server binds the wait to the HTTP request's own
 `Done()` channel (`requestDoneKey`). An approved grant nobody redeems
 expires after 10 minutes (`approval_grant_expired`); a halt revokes it.
+Every tool-side gate passes the calling task's id to `Engine.Check`
+(`fs_read` included: `mcp/fs.HandleReadForTask`), so the pending row, the
+grant, a halt's sweep and the `kahya ask` notice are keyed on the real
+task; a grant for a call that carried no task id is redeemable only by
+that call's own parked re-check, never by a hash-matched retry.
 
 `POST /policy/feedback` and `POST /approvals/{id}/decision` answer
 `{ok, error?}` — **no raw token** any more: the grant is redeemed

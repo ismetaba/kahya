@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -57,6 +58,8 @@ type fakePolicyClient struct {
 	consumedTokens map[string]bool
 	checkCalls     int
 	consumeCalls   int
+	// checkTaskIDs records the taskID of every Check call, in order.
+	checkTaskIDs []string
 	// onCheck, if set, runs once per Check call, standing in for the
 	// wall-clock window a REAL PolicyClient.Check (a DB round trip) plus
 	// the ConsumeToken call and checkpointPreImage's own git exec that
@@ -67,10 +70,11 @@ type fakePolicyClient struct {
 	onCheck func()
 }
 
-func (f *fakePolicyClient) Check(_ context.Context, tool, _ /* scope */, _ /* taskID */, _ /* traceID */ string, _ []byte) (PolicyDecision, error) {
+func (f *fakePolicyClient) Check(_ context.Context, tool, _ /* scope */, taskID, _ /* traceID */ string, _ []byte) (PolicyDecision, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkCalls++
+	f.checkTaskIDs = append(f.checkTaskIDs, taskID)
 	if f.onCheck != nil {
 		f.onCheck()
 	}
@@ -161,6 +165,27 @@ func TestHandleReadReturnsContentAndMetadata(t *testing.T) {
 	}
 	if len(led.find("fs_read")) != 1 {
 		t.Errorf("fs_read ledger events = %d, want 1", len(led.find("fs_read")))
+	}
+}
+
+// TestHandleReadForTaskPassesTaskIDToPolicyCheck: fs_read's binding check
+// carries the calling task (B-1: the pending approval, its grant, a halt
+// and the approval notice are keyed on it); the task-less HandleRead keeps
+// passing "".
+func TestHandleReadForTaskPassesTaskIDToPolicyCheck(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "notes", "a.md"), "merhaba dunya")
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
+
+	if _, err := s.HandleReadForTask(context.Background(), "trace-1", "task-1", FsReadArgs{Path: "~/notes/a.md"}); err != nil {
+		t.Fatalf("HandleReadForTask: %v", err)
+	}
+	if _, err := s.HandleRead(context.Background(), "trace-2", FsReadArgs{Path: "~/notes/a.md"}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if want := []string{"task-1", ""}; !reflect.DeepEqual(pc.checkTaskIDs, want) {
+		t.Fatalf("Policy.Check task ids = %q, want %q", pc.checkTaskIDs, want)
 	}
 }
 

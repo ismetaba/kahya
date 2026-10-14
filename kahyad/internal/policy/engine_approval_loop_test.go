@@ -401,6 +401,36 @@ func TestPostWaitRecheckNeverLadderAllows(t *testing.T) {
 	}
 }
 
+// TestTasklessGrantNeverRedeemedByHashMatch: a grant approved for a call
+// that carried no task id is redeemable only by that call's own bound
+// re-check - never by hash match, which would hand it to ANY other
+// task-less caller of the same bytes (fail-closed backstop for a tool that
+// forgets to forward its task id).
+func TestTasklessGrantNeverRedeemedByHashMatch(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	in := CheckInput{Tool: "fs_write", TraceID: "trace-notask", ToolInput: []byte(`{"path":"~/notask.md"}`)}
+	d, err := e.Check(ctx, in)
+	if err != nil || d.Result != ResultNeedsApproval || d.PendingApprovalID == "" {
+		t.Fatalf("first Check = %+v, %v", d, err)
+	}
+	if _, err := e.Approve(ctx, d.PendingApprovalID, "local", ""); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	fresh, _ := e.Check(ctx, in)
+	if fresh.Result != ResultNeedsApproval || fresh.PendingApprovalID == "" || fresh.PendingApprovalID == d.PendingApprovalID {
+		t.Fatalf("task-less fresh Check after approval = %+v, want needs_approval with a NEW pending id", fresh)
+	}
+	if n := countEvents(t, st, "approval_grant_redeemed"); n != 0 {
+		t.Fatalf("approval_grant_redeemed = %d after a task-less fresh Check, want 0", n)
+	}
+	bound := in
+	bound.NoMintPending, bound.RedeemPendingApprovalID = true, d.PendingApprovalID
+	if got, err := e.Check(ctx, bound); err != nil || got.Result != ResultAllow || got.RedeemedPendingApprovalID != d.PendingApprovalID {
+		t.Fatalf("the approved call's own bound re-check = %+v, %v; want allow redeeming %s", got, err, d.PendingApprovalID)
+	}
+}
+
 // TestRedeemedRClassApprovalMintsNoToken: R needs no consume step, so its
 // redeemed approval is an ALLOW without a token (Decision.Token contract).
 func TestRedeemedRClassApprovalMintsNoToken(t *testing.T) {

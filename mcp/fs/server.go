@@ -402,16 +402,31 @@ func buildToolInput(path string, content []byte) []byte {
 	return b
 }
 
-// HandleRead implements fs_read (class R). Exported so tests — and
-// kahyad's own gate wiring — can invoke it directly, "below the MCP
-// transport", matching mcp/memory.Server.HandleSearch's convention.
+// HandleRead implements fs_read (class R) for a caller with no task id - a
+// direct Go caller or test. Exported so tests can invoke it directly,
+// "below the MCP transport", matching mcp/memory.Server.HandleSearch's
+// convention. The MCP tool (RegisterTools) uses HandleReadForTask.
 func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs) (FsReadOutput, error) {
+	return s.HandleReadForTask(ctx, traceID, "", args)
+}
+
+// HandleReadForTask implements fs_read (class R) for the calling task.
+// B-1: taskID reaches the binding Policy.Check, so a needs_approval read's
+// pending approval, the grant a human approves, a halt's sweep
+// (InvalidateApprovalsForTask) and the parked call's `kahya ask` notice and
+// keepalive are all keyed on the REAL task - with "" an approved read of
+// one task was redeemable by any other task's read of the same path, a
+// halt never reached it, and the waiting `kahya ask` stream was never told
+// (and dropped after 30s idle). Safe for the session/taint lookup: the
+// resolver falls back to trace_id when the task row has no session, and
+// fs_read is R, which the taint gate never applies to.
+func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, args FsReadArgs) (FsReadOutput, error) {
 	cp, err := s.canonicalize(args.Path)
 	if err != nil {
 		return FsReadOutput{}, fmt.Errorf("fs_read: %w", err)
 	}
 
-	decision, err := s.Policy.Check(ctx, "fs_read", defaultScope, "", traceID, buildToolInput(cp.Match, nil))
+	decision, err := s.Policy.Check(ctx, "fs_read", defaultScope, taskID, traceID, buildToolInput(cp.Match, nil))
 	if err != nil {
 		return FsReadOutput{}, fmt.Errorf("fs_read: %w", err)
 	}
@@ -615,7 +630,7 @@ func (s *Server) RegisterTools(srv *mcp.Server) {
 		Name:        "fs_read",
 		Description: "Dosya sisteminden bir dosya okur; kanonik yol, boyut ve gizli-şerit etiketiyle döner.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args FsReadArgs) (*mcp.CallToolResult, FsReadOutput, error) {
-		out, err := s.HandleRead(ctx, traceIDFromRequest(req), args)
+		out, err := s.HandleReadForTask(ctx, traceIDFromRequest(req), taskIDFromRequest(req), args)
 		return nil, out, err
 	})
 

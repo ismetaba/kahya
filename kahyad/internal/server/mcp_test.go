@@ -59,6 +59,14 @@ type mcpTestFixture struct {
 
 func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	t.Helper()
+	return newMCPTestFixtureWith(t, testPolicyDoc(), nil)
+}
+
+// newMCPTestFixtureWith is newMCPTestFixture with its own policy document
+// and a hook that wires extra tools (SetFSTool, ...) after SetPolicyEngine
+// and before Prepare - the order main.go uses.
+func newMCPTestFixtureWith(t *testing.T, doc policy.Policy, beforePrepare func(srv *Server, st *store.Store)) mcpTestFixture {
+	t.Helper()
 	repoRoot := t.TempDir()
 	memDir := filepath.Join(repoRoot, "memory")
 	if err := os.MkdirAll(memDir, 0o700); err != nil {
@@ -82,9 +90,12 @@ func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	srv.SetSearcher(searcher)
 	srv.SetEventLogger(st)
 	srv.SetMCPMemory(memDir, idx)
-	engine := policy.NewEngine(testPolicyDoc(), st.Queries, st)
+	engine := policy.NewEngine(doc, st.Queries, st)
 	engine.SetApprovalDecidedHook(srv.ApprovalDecided)
 	srv.SetPolicyEngine(engine)
+	if beforePrepare != nil {
+		beforePrepare(srv, st)
+	}
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}

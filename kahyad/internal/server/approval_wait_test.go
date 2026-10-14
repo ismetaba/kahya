@@ -252,8 +252,12 @@ func TestMCPGateWaitCanceledWhenClientDisconnects(t *testing.T) {
 func TestMCPGateWaitTimeoutReturnsTurkishTimeoutMessage(t *testing.T) {
 	f := newMCPTestFixture(t)
 	f.srv.SetApprovalWait(300 * time.Millisecond)
+	// A real call always carries its task (withControlAuth pins it); the
+	// identical retry below redeems the grant only for that same task - a
+	// task-less grant is never redeemed by hash match.
+	headers := map[string]string{taskHeader: "task-timeout"}
 
-	o := awaitOutcome(t, goPostMCP(longClient(f.sock), memoryWriteCall, nil), 5*time.Second)
+	o := awaitOutcome(t, goPostMCP(longClient(f.sock), memoryWriteCall, headers), 5*time.Second)
 	id := waitPendingID(t, f.store, "memory_write")
 	if o.err != nil || !o.parsed.Result.IsError || resultText(o) != fmt.Sprintf(MsgApprovalWaitTimeoutFmt, id) {
 		t.Fatalf("timed-out memory_write = %+v (body %s), want isError with %q", o.err, o.body, fmt.Sprintf(MsgApprovalWaitTimeoutFmt, id))
@@ -274,7 +278,7 @@ func TestMCPGateWaitTimeoutReturnsTurkishTimeoutMessage(t *testing.T) {
 	if _, err := f.engine.Approve(context.Background(), id, "local", ""); err != nil {
 		t.Fatalf("Approve after the wait timed out: %v", err)
 	}
-	retry := awaitOutcome(t, goPostMCP(longClient(f.sock), memoryWriteCall, nil), 5*time.Second)
+	retry := awaitOutcome(t, goPostMCP(longClient(f.sock), memoryWriteCall, headers), 5*time.Second)
 	if retry.err != nil || retry.parsed.Result.IsError {
 		t.Fatalf("identical retry after a late approval = %+v (body %s), want success", retry.err, retry.body)
 	}

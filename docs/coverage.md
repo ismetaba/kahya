@@ -218,6 +218,10 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | a parked call's post-wait re-check redeems only its own pending approval's grant | `kahyad/internal/server/TestParkedCallRecheckRedeemsOnlyItsOwnGrant` | FIX-B-1 | ci-hermetic |
 | Safety #5 | the bound re-check redeems only its own pending id's grant, never a mismatched binding | `kahyad/internal/policy/TestPostWaitRecheckRedeemsOnlyItsOwnPendingGrant` | FIX-B-1 | ci-hermetic |
 | Safety #5 | the bound re-check never ladder-allows and mints nothing (no pending row, no token) | `kahyad/internal/policy/TestPostWaitRecheckNeverLadderAllows` | FIX-B-1 | ci-hermetic |
+| Safety #5 | an fs_read approval is bound to its task — another task's read of the same path never redeems it | `kahyad/internal/server/TestFSReadApprovalGrantBoundToItsTask` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a parked fs_read notifies and keeps alive its own task's stream; halting that task wakes it as a denial | `kahyad/internal/server/TestFSReadParkedCallNotifiesItsTaskAndHaltWakesIt` | FIX-B-1 | ci-hermetic |
+| Safety #5 | fs_read's binding check carries the calling task id | `mcp/fs/TestHandleReadForTaskPassesTaskIDToPolicyCheck` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a grant for a task-less call is never redeemed by hash match (only by its own parked call) | `kahyad/internal/policy/TestTasklessGrantNeverRedeemedByHashMatch` | FIX-B-1 | ci-hermetic |
 | Safety #5 | approve → the parked fs_write executes the approved bytes once over real bins (no ladder promotion) | `tests/w3/TestGate1c_ApprovalWaitParksCallThenExecutes` | FIX-B-1 | local-integration |
 | Safety #5 | a non-local surface (Telegram) can approve only reversible tools — irreversible/unknown tools refused Go-side, id stays usable locally | `kahyad/internal/policy/TestApproveNonLocalIrreversibleRejected` | FIX-B-11 | ci-hermetic |
 | Safety #5 | a Telegram approve callback for an irreversible W2 is refused by the engine backstop (nothing approved) | `kahyad/internal/telegram/TestForgedIrreversibleW2CallbackRejectedAtEngine` | FIX-B-11 | ci-hermetic |
