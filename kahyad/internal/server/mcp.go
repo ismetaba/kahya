@@ -132,6 +132,9 @@ func (s *Server) buildMCPHandler() http.Handler {
 	}
 
 	memSrv := memory.New(s.mcpMemoryDir, mcpSearchAdapter{s.search}, s.mcpIndexer, s.eventLogger, s.log)
+	// FIX-U-1: the default inbox day file follows the configured calendar
+	// zone (SetLocation, cfg.Location()).
+	memSrv.Location = s.location()
 	mcpServer := memSrv.MCPServer(nil)
 	// W3-03: fs_read/fs_write/fs_delete, registered onto this SAME shared
 	// server (one MCP session/tool surface for the worker) - see

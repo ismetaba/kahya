@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ---- fakes ----
@@ -767,5 +768,58 @@ func TestStripLeadingFrontMatterNoFrontMatter(t *testing.T) {
 	in := "Just a normal note.\n"
 	if got := stripLeadingFrontMatter(in); got != in {
 		t.Errorf("stripLeadingFrontMatter(no front matter) = %q, want unchanged %q", got, in)
+	}
+}
+
+// zoneWithOtherDate returns a fixed zone (UTC-12..UTC+14) whose calendar
+// date right now differs from the date in ref, so a day key computed in it
+// is distinguishable from one computed in ref. The offsets span 26 hours,
+// so one always exists.
+func zoneWithOtherDate(ref *time.Location) *time.Location {
+	now := time.Now()
+	refDate := now.In(ref).Format("2006-01-02")
+	for _, h := range []int{14, -12, 13, -11, 12, -10} {
+		loc := time.FixedZone(fmt.Sprintf("UTC%+d", h), h*3600)
+		if now.In(loc).Format("2006-01-02") != refDate {
+			return loc
+		}
+	}
+	panic("no fixed zone with a different date")
+}
+
+// TestDefaultInboxFileUsesConfiguredLocation (FIX-U-1): the default inbox
+// day file is the user's calendar day in the configured zone - 22:30Z on
+// 10 July is 11 July in Istanbul - never the UTC date; nil = time.Local.
+func TestDefaultInboxFileUsesConfiguredLocation(t *testing.T) {
+	at := time.Date(2026, 7, 10, 22, 30, 0, 0, time.UTC)
+	if got := defaultInboxFile(at, time.FixedZone("UTC+3", 3*3600)); got != "inbox/2026-07-11.md" {
+		t.Errorf("defaultInboxFile(Istanbul) = %q, want inbox/2026-07-11.md", got)
+	}
+	if got := defaultInboxFile(at, time.UTC); got != "inbox/2026-07-10.md" {
+		t.Errorf("defaultInboxFile(UTC) = %q, want inbox/2026-07-10.md", got)
+	}
+	if got, want := defaultInboxFile(at, nil), "inbox/"+at.In(time.Local).Format("2006-01-02")+".md"; got != want {
+		t.Errorf("defaultInboxFile(nil) = %q, want %q (time.Local)", got, want)
+	}
+}
+
+// TestHandleWriteDefaultFileUsesServerLocation (FIX-U-1): HandleWrite names
+// the default inbox file in Server.Location.
+func TestHandleWriteDefaultFileUsesServerLocation(t *testing.T) {
+	_, memDir := newFixtureRepo(t)
+	s := newTestServer(memDir, &fakeSearcher{}, &fakeIndexer{}, &fakeLedger{})
+	// A zone whose date differs from time.Local's (the nil default), so the
+	// test proves Server.Location is used.
+	loc := zoneWithOtherDate(time.Local)
+	s.Location = loc
+
+	before := "inbox/" + time.Now().In(loc).Format("2006-01-02") + ".md"
+	out, err := s.HandleWrite(context.Background(), "tid-tz", MemoryWriteArgs{Content: "yerel gun notu"})
+	after := "inbox/" + time.Now().In(loc).Format("2006-01-02") + ".md"
+	if err != nil {
+		t.Fatalf("HandleWrite: %v", err)
+	}
+	if out.File != before && out.File != after {
+		t.Errorf("default File = %q, want %q (the %s day)", out.File, before, loc)
 	}
 }

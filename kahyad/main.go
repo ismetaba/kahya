@@ -1098,6 +1098,12 @@ func run() int {
 	ritualExporter := &eval.RitualExporter{Reader: eval.StoreRitualLabelReader{Q: st.Queries}}
 	srv.SetEvalRetrievalRunner(retrievalRunner, ritualExporter)
 
+	// FIX-P-22/FIX-U-1: the server's calendar zone - /metrics and
+	// /readiness absolute --since dates, memory_write's default inbox day -
+	// is the one configured zone. Unconditional (not tied to the metrics
+	// handle below); before srv.Run, which builds the MCP handler.
+	srv.SetLocation(cfg.Location())
+
 	// W78-04: GET /metrics (`kahya metrics`) - read-only reporting over the
 	// events ledger. A SEPARATE, DEDICATED brain.db handle opened with PRAGMA
 	// query_only=ON (a second read-only *sql.DB to the same WAL file is safe
@@ -1113,7 +1119,6 @@ func run() int {
 		// configured calendar zone (config timezone), never the process TZ.
 		metricsReader := metrics.New(metricsDB, cfg.Location())
 		srv.SetMetricsReader(metricsReader)
-		srv.SetLocation(cfg.Location())
 		// W78-06: GET /readiness (`kahya readiness`) - the dogfood-readiness
 		// readout. It reuses the SAME read-only metrics.Reader for the §9
 		// usage gates and reads the recorded build-gate evidence rows via

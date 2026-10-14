@@ -333,9 +333,10 @@ type Server struct {
 	readinessEvidence ReadinessEvidenceReader
 	readinessMetrics  MetricsReader
 
-	// calendarLoc is the calendar zone GET /metrics and GET /readiness read
-	// an absolute --since date in (FIX-P-22): cfg.Location() via
-	// SetLocation; nil = time.Local (see location()).
+	// calendarLoc is the server's calendar zone - GET /metrics and GET
+	// /readiness absolute --since dates (FIX-P-22), memory_write's default
+	// inbox day (FIX-U-1): cfg.Location() via SetLocation; nil = time.Local
+	// (see location()).
 	calendarLoc *time.Location
 
 	// denyAll is W3-01's deny-all-mode flag: set (via SetDenyAll, before

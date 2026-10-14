@@ -41,10 +41,12 @@ func (s *Server) SetMetricsReader(reader MetricsReader) {
 	s.metricsReader = reader
 }
 
-// SetLocation sets the calendar zone GET /metrics and GET /readiness read an
-// absolute `since` date in (FIX-P-22) - main.go passes cfg.Location(), the
-// same zone the metrics.Reader buckets days in. nil = time.Local. Call
-// before Run.
+// SetLocation sets the server's calendar zone (main.go passes
+// cfg.Location(), the same zone the metrics.Reader buckets days in): GET
+// /metrics and GET /readiness read an absolute `since` date in it
+// (FIX-P-22), and memory_write names its default inbox day file in it
+// (FIX-U-1). nil = time.Local. Call before Run (Prepare builds the MCP
+// handler).
 func (s *Server) SetLocation(loc *time.Location) {
 	s.calendarLoc = loc
 }

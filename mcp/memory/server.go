@@ -77,6 +77,10 @@ type Server struct {
 	Index     Indexer
 	Ledger    Ledger
 	Log       Logger
+	// Location is the calendar zone memory_write's default inbox day file
+	// is named in (inbox/YYYY-MM-DD.md): kahyad passes cfg.Location(), the
+	// one configured calendar zone (FIX-U-1, G00 C-22); nil = time.Local.
+	Location *time.Location
 
 	// mu serializes the ENTIRE mutate sequence of HandleWrite/HandleForget
 	// (path validation through file write, git add/mv, git commit,
@@ -201,7 +205,7 @@ func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWri
 
 	relPath := filepath.ToSlash(strings.TrimSpace(args.File))
 	if relPath == "" {
-		relPath = defaultInboxFile(time.Now())
+		relPath = defaultInboxFile(time.Now(), s.Location)
 	}
 
 	abs, err := resolveMemoryPath(s.MemoryDir, relPath)
@@ -411,11 +415,15 @@ func traceIDFromRequest(req *mcp.CallToolRequest) string {
 }
 
 // defaultInboxFile is memory_write's default target when args.File is
-// empty (W12-05 step 4: "default inbox/YYYY-MM-DD.md"). now is UTC so the
-// date boundary matches how every other timestamp in this codebase is
-// recorded (RFC3339 UTC).
-func defaultInboxFile(now time.Time) string {
-	return "inbox/" + now.UTC().Format("2006-01-02") + ".md"
+// empty (W12-05 step 4: "default inbox/YYYY-MM-DD.md"). The date is the
+// user's calendar day in loc (the configured timezone; nil = time.Local) -
+// FIX-U-1: a note written at 01:00 Istanbul belongs in that day's inbox,
+// not the previous UTC day's. Stored timestamps elsewhere stay UTC.
+func defaultInboxFile(now time.Time, loc *time.Location) string {
+	if loc == nil {
+		loc = time.Local
+	}
+	return "inbox/" + now.In(loc).Format("2006-01-02") + ".md"
 }
 
 // resolveMemoryPath validates and resolves rel (a caller-supplied,
