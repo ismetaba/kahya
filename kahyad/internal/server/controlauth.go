@@ -87,12 +87,19 @@
 //     longer maps to a live worker. So spawn.Run SIGKILLs the worker's
 //     process group when the task ends - on the normal-exit path as well as
 //     on a timeout - and no descendant still in that group outlives the
-//     task. Residual (same-uid limit, owner decisions G03-1/2/3): a forked
-//     child that leaves the worker's group BEFORE that reap - setpgid(0, 0)
-//     (a new group in the same session) or setsid() (a new session); the
-//     sanctioned worker does neither - outlives the task and is then
-//     unattributable, so it is refused on the worker routes without the
-//     secret but served on control routes if it ALSO read the secret file.
+//     task. Residuals (same-uid limit, owner decisions G03-1/2/3; the
+//     sanctioned worker does neither), each needing a read of
+//     <socket>.secret to matter:
+//     (a) a forked child that calls setsid() gets a fresh session no
+//     worker is registered under, so it is unattributable AT ONCE - also
+//     while its worker's task is still running. Without the secret it is
+//     refused everywhere but /health; WITH the secret it reaches the
+//     control routes and has its declared ids honored on worker routes.
+//     (b) a forked child that calls setpgid(0, 0) stays in the worker's
+//     session, so while the task runs it is pinned on worker routes and
+//     refused on control routes; but it escapes the group reap, and once
+//     it outlives the task (the worker is unregistered) it is
+//     unattributable, with the same consequences as (a).
 package server
 
 import (

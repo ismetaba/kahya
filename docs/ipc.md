@@ -593,11 +593,16 @@ secret.
 files as the user can read `<socket>.secret`; this gate closes the path for
 everything that only uses what a worker is *given* (its env, its tools, a
 prompt-injected model), and B-14 refuses the secret on control routes from
-anywhere inside a live worker's session. The residual is a forked worker
-child that **both** escapes the process-group reap (`setpgid(0, 0)` or
-`setsid()`) and outlives the task **and** reads the secret file: once the
-worker is unregistered it is unattributable, so with the secret it reaches
-the control routes. Sandboxing the worker (`sandbox-exec`), a Keychain-ACL'd
+anywhere inside a live worker's session. Two residuals remain, each
+requiring a read of the secret file: **(a)** a forked worker child that
+calls `setsid()` lands in a fresh, unregistered session, so it is
+unattributable **immediately** — including while its worker's task is still
+running — and with the secret it reaches the control routes and has its
+declared ids honored on worker routes; **(b)** a forked child that calls
+`setpgid(0, 0)` stays in the worker's session (pinned on worker routes,
+refused on control routes while the task runs) but escapes the group reap,
+so once it outlives the task it is unattributable with the same
+consequences as (a). Sandboxing the worker (`sandbox-exec`), a Keychain-ACL'd
 secret, or a separate uid would close even that, and were considered and
 declined for now (owner decisions G03-1/2/3).
 

@@ -3,8 +3,10 @@
 // JSON envelope written to its stdin then stdin closed, trace_id/task_id
 // propagated via the environment, its JSONL stdout protocol relayed live,
 // and its whole process GROUP (it is started as its own session and
-// group leader, Setsid) killed on timeout so nothing is ever left
-// orphaned. This file (envelope.go) is the envelope struct and
+// group leader, Setsid) killed when the worker exits or times out, so no
+// descendant that stayed in the group is left orphaned (a child that
+// leaves the group with setpgid/setsid escapes that reap - see
+// docs/ipc.md section 5a). This file (envelope.go) is the envelope struct and
 // its validation; spawn.go is the process lifecycle itself.
 //
 // The full contract (envelope shape, worker env, stdout protocol) is
