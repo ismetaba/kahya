@@ -943,20 +943,41 @@ func waitForTaskID(t *testing.T, d *daemon, traceID string, timeout time.Duratio
 }
 
 // setTaskLaneSecret directly UPDATEs tasks.lane/secret_category for
-// taskID - simulating what kahyad/internal/secretlane.Escalate would do
-// once it has a wired caller (it does not yet - router.go's own doc
-// comment: "not read by handleTask today"). Writing directly to brain.db
-// from a second process is ordinarily forbidden (kahyad is brain.db's
-// only writer, tasks/README.md) - justified here ONLY as a way to
-// reach the exact server-side STATE the W3-08 proxy backstop's own
-// defense-in-depth is meant to react to, without needing kahyad/internal/
-// secretlane import access (forbidden - see this file's own package doc
-// comment) to drive it through the real function.
+// taskID - simulating a lane escalation from an ingestion point the test
+// does not drive (fs_read's real escalation, FIX-B-6, is exercised by
+// TestGate5_FsReadSecretContentEscalatesAndBlocksCloud instead). Writing
+// directly to brain.db from a second process is ordinarily forbidden
+// (kahyad is brain.db's only writer, tasks/README.md) - justified here ONLY
+// as a way to reach the exact server-side STATE the W3-08 proxy backstop's
+// own defense-in-depth is meant to react to, without needing kahyad/
+// internal/secretlane import access (forbidden - see this file's own
+// package doc comment) to drive it through the real function.
 func setTaskLaneSecret(t *testing.T, d *daemon, taskID, category string) {
 	t.Helper()
 	db := d.openDB(t)
 	if _, err := db.Exec(`UPDATE tasks SET lane = 'secret', secret_category = ? WHERE id = ?`, category, taskID); err != nil {
 		t.Fatalf("UPDATE tasks SET lane='secret' (id=%s): %v", taskID, err)
+	}
+}
+
+// waitForWorkerRegistered polls until taskID's worker has started:
+// handleTask's spawn OnStart registers the worker in kahyad's live
+// registry (caller attribution, G03 / B-14) and then persists its process
+// group as tasks.worker_pgid, so a non-NULL worker_pgid means the worker's
+// own UDS calls are attributed to taskID from here on.
+func waitForWorkerRegistered(t *testing.T, d *daemon, taskID string, timeout time.Duration) {
+	t.Helper()
+	db := d.openDB(t)
+	deadline := time.Now().Add(timeout)
+	for {
+		var pgid sql.NullInt64
+		if err := db.QueryRow(`SELECT worker_pgid FROM tasks WHERE id = ?`, taskID).Scan(&pgid); err == nil && pgid.Valid {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %s worker never registered (tasks.worker_pgid still NULL) within %v", taskID, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

@@ -49,9 +49,12 @@ func (a *SecretLaneStoreAdapter) SetTaskLane(ctx context.Context, taskID, lane, 
 // kahyad/internal/secretlane.LaneLookup. found=false (no error) means
 // taskID has no tasks row at all yet - never treated as an error, but also
 // never treated as "known normal" by a caller that cares about the
-// distinction (kahyad/internal/secretlane.Escalate does; the proxy
-// backstop hook treats "not found" as "not secret", since there is no
-// task there to protect - see NewProxyBackstopHook's own doc comment).
+// distinction (kahyad/internal/secretlane.EscalateVerdict does, and the fs
+// lane escalator - fs.go, FIX-B-6 - refuses a live worker's read when its
+// row is missing; the proxy backstop hook treats "not found" as "not
+// secret", since there is no task there to protect - see
+// NewProxyBackstopHook's own doc comment). A read error is returned as-is
+// and every caller fails closed on it.
 func (a *SecretLaneStoreAdapter) GetTaskLane(ctx context.Context, taskID string) (lane, category string, found bool, err error) {
 	row, err := a.q.GetTaskLane(ctx, taskID)
 	if err != nil {

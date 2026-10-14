@@ -138,6 +138,36 @@ func (f *fakeSensitiveMarker) callCount() int {
 	return len(f.calls)
 }
 
+// fakeLaneEscalator is a spy LaneEscalator (FIX-B-6).
+type fakeLaneEscalator struct {
+	mu    sync.Mutex
+	calls []escalateCall
+	err   error
+}
+
+type escalateCall struct{ taskID, traceID, category string }
+
+func (f *fakeLaneEscalator) EscalateSecretLane(_ context.Context, taskID, traceID, category string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, escalateCall{taskID, traceID, category})
+	return f.err
+}
+
+func (f *fakeLaneEscalator) snapshot() []escalateCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]escalateCall(nil), f.calls...)
+}
+
+// fakeContentClassifier is a fixed-verdict ContentClassifier.
+type fakeContentClassifier struct {
+	secret   bool
+	category string
+}
+
+func (f fakeContentClassifier) ClassifySecretLane(string) (bool, string) { return f.secret, f.category }
+
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 // ---- fs_read ----
@@ -316,6 +346,8 @@ func TestHandleReadSecretLaneSensitiveMarkFailureRefusesRead(t *testing.T) {
 	led := &fakeLedger{}
 	marker := &fakeSensitiveMarker{err: errors.New("disk")}
 	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
+	esc := &fakeLaneEscalator{}
+	s.LaneEscalator = esc
 
 	out, err := s.HandleReadForTask(context.Background(), "trace-markfail", "task-markfail", FsReadArgs{
 		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
@@ -338,6 +370,137 @@ func TestHandleReadSecretLaneSensitiveMarkFailureRefusesRead(t *testing.T) {
 	}
 	if n := len(led.find("fs_read")); n != 0 {
 		t.Errorf("fs_read ledger rows = %d, want 0 (nothing was read out)", n)
+	}
+	if calls := esc.snapshot(); len(calls) != 0 {
+		t.Errorf("LaneEscalator calls after a failed mark = %+v, want none (the read was already refused)", calls)
+	}
+}
+
+// ---- FIX-B-6: a secret-lane fs_read escalates the calling task's lane ----
+
+const ibanContent = "IBAN TR33 0006 1005 1978 6457 8413 26 için ödeme talimatı"
+
+// TestHandleReadForTaskSecretContentEscalatesLaneBeforeReturningBytes: a
+// content hit on an ordinary path escalates the calling task (with the
+// classifier's category) before the bytes are returned, and the ledger
+// rows carry the task id and category.
+func TestHandleReadForTaskSecretContentEscalatesLaneBeforeReturningBytes(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "notlar", "siradan.md"), ibanContent)
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	led := &fakeLedger{}
+	marker := &fakeSensitiveMarker{}
+	s := New(home, nil, nil, filepath.Join(home, "undo"), pc, led, nil, marker)
+	s.ContentClassifier = fakeContentClassifier{secret: true, category: "finans"}
+	esc := &fakeLaneEscalator{}
+	s.LaneEscalator = esc
+
+	out, err := s.HandleReadForTask(context.Background(), "trace-esc", "task-esc", FsReadArgs{Path: "~/notlar/siradan.md"})
+	if err != nil {
+		t.Fatalf("HandleReadForTask: %v", err)
+	}
+	if !out.SecretLane || out.ContentBase64 != b64(ibanContent) {
+		t.Fatalf("output = %+v, want secret_lane with the file content", out)
+	}
+	if calls := esc.snapshot(); !reflect.DeepEqual(calls, []escalateCall{{"task-esc", "trace-esc", "finans"}}) {
+		t.Fatalf("LaneEscalator calls = %+v, want exactly [{task-esc trace-esc finans}]", calls)
+	}
+	if marker.callCount() != 1 {
+		t.Fatalf("MarkSensitiveRead calls = %d, want 1 (mark, then escalate)", marker.callCount())
+	}
+	reads := led.find("secret_lane_read")
+	if len(reads) != 1 || reads[0].payload["task_id"] != "task-esc" || reads[0].payload["category"] != "finans" {
+		t.Fatalf("secret_lane_read rows = %+v, want one carrying task_id task-esc and category finans", reads)
+	}
+	if rows := led.find("fs_read"); len(rows) != 1 || rows[0].payload["task_id"] != "task-esc" {
+		t.Fatalf("fs_read rows = %+v, want one carrying task_id task-esc", rows)
+	}
+}
+
+// TestHandleReadSecretLaneEscalateFailureRefusesRead: a lane that cannot
+// be escalated refuses the read - no byte reaches a task whose lane still
+// says normal.
+func TestHandleReadSecretLaneEscalateFailureRefusesRead(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "notlar", "siradan.md"), ibanContent)
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	led := &fakeLedger{}
+	s := New(home, nil, nil, filepath.Join(home, "undo"), pc, led, nil, &fakeSensitiveMarker{})
+	s.ContentClassifier = fakeContentClassifier{secret: true, category: "finans"}
+	s.LaneEscalator = &fakeLaneEscalator{err: errors.New("db down")}
+
+	out, err := s.HandleReadForTask(context.Background(), "trace-escfail", "task-escfail", FsReadArgs{Path: "~/notlar/siradan.md"})
+	if err == nil || err.Error() != MsgSecretLaneReadRefused {
+		t.Fatalf("HandleReadForTask error = %v, want %q", err, MsgSecretLaneReadRefused)
+	}
+	if out.ContentBase64 != "" || out.Size != 0 {
+		t.Fatalf("refused read returned content %q (size %d), want none", out.ContentBase64, out.Size)
+	}
+	refused := led.find("secret_lane_read_refused")
+	if len(refused) != 1 || refused[0].payload["reason"] != "lane_escalate_failed" || refused[0].payload["task_id"] != "task-escfail" {
+		t.Fatalf("secret_lane_read_refused rows = %+v, want one with reason lane_escalate_failed, task_id task-escfail", refused)
+	}
+	if n := len(led.find("fs_read")); n != 0 {
+		t.Fatalf("fs_read ledger rows = %d, want 0 (nothing was read out)", n)
+	}
+}
+
+// TestHandleReadPathGlobHitEscalatesWithEmptyCategory: a path-glob hit
+// escalates too, with no category (the content classifier is not run).
+func TestHandleReadPathGlobHitEscalatesWithEmptyCategory(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "Documents", "saglik", "tahlil.md"), "sonuclar")
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	s := New(home, nil, []string{filepath.Join(home, "Documents", "saglik", "**")}, filepath.Join(home, "undo"), pc, &fakeLedger{}, nil, &fakeSensitiveMarker{})
+	esc := &fakeLaneEscalator{}
+	s.LaneEscalator = esc
+
+	if _, err := s.HandleReadForTask(context.Background(), "trace-glob", "task-glob", FsReadArgs{Path: "~/Documents/saglik/tahlil.md"}); err != nil {
+		t.Fatalf("HandleReadForTask: %v", err)
+	}
+	if calls := esc.snapshot(); !reflect.DeepEqual(calls, []escalateCall{{"task-glob", "trace-glob", ""}}) {
+		t.Fatalf("LaneEscalator calls = %+v, want exactly [{task-glob trace-glob \"\"}]", calls)
+	}
+}
+
+// TestHandleReadWithoutTaskIDStillCallsEscalator: the task-less HandleRead
+// still hands a secret-lane hit to the escalator (with taskID ""), which
+// resolves the task from the caller's attribution on kahyad's side - the
+// seam is never skipped for want of a declared id.
+func TestHandleReadWithoutTaskIDStillCallsEscalator(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "notlar", "siradan.md"), ibanContent)
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	s := New(home, nil, nil, filepath.Join(home, "undo"), pc, &fakeLedger{}, nil, &fakeSensitiveMarker{})
+	s.ContentClassifier = fakeContentClassifier{secret: true, category: "finans"}
+	esc := &fakeLaneEscalator{}
+	s.LaneEscalator = esc
+
+	if _, err := s.HandleRead(context.Background(), "trace-only", FsReadArgs{Path: "~/notlar/siradan.md"}); err != nil {
+		t.Fatalf("HandleRead: %v", err)
+	}
+	if calls := esc.snapshot(); !reflect.DeepEqual(calls, []escalateCall{{"", "trace-only", "finans"}}) {
+		t.Fatalf("LaneEscalator calls = %+v, want exactly [{\"\" trace-only finans}]", calls)
+	}
+}
+
+// TestHandleReadNonSecretNeverEscalates: an ordinary read never touches
+// the escalator or the sensitive marker.
+func TestHandleReadNonSecretNeverEscalates(t *testing.T) {
+	home := testHome(t)
+	mustWriteFile(t, filepath.Join(home, "notlar", "a.md"), "yapılacaklar listesi")
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	marker := &fakeSensitiveMarker{}
+	s := New(home, nil, nil, filepath.Join(home, "undo"), pc, &fakeLedger{}, nil, marker)
+	s.ContentClassifier = fakeContentClassifier{secret: false}
+	esc := &fakeLaneEscalator{}
+	s.LaneEscalator = esc
+
+	if _, err := s.HandleReadForTask(context.Background(), "trace-n", "task-n", FsReadArgs{Path: "~/notlar/a.md"}); err != nil {
+		t.Fatalf("HandleReadForTask: %v", err)
+	}
+	if calls := esc.snapshot(); len(calls) != 0 || marker.callCount() != 0 {
+		t.Fatalf("ordinary read: escalator calls %+v, marks %d; want none", calls, marker.callCount())
 	}
 }
 

@@ -534,6 +534,18 @@ func TestGate3_SecretLaneContentRoutesToLocalApprovalOnly(t *testing.T) {
 	if !waitForEvent(t, db, traceID, "sensitive_read_marked", 3*time.Second) {
 		t.Fatal("the session's sensitive-read flag was never set (no sensitive_read_marked ledger event)")
 	}
+	// FIX-B-6: the read also stickily escalated the calling task's own
+	// persisted lane (the proxy backstop's input) before the bytes left.
+	if !waitForEvent(t, db, traceID, "secret_lane_escalated", 3*time.Second) {
+		t.Fatal("no secret_lane_escalated ledger event for the secret-content fs_read")
+	}
+	var lane, category string
+	if err := db.QueryRow(`SELECT lane, coalesce(secret_category, '') FROM tasks WHERE id = ?`, taskID).Scan(&lane, &category); err != nil {
+		t.Fatalf("read tasks.lane for %s: %v", taskID, err)
+	}
+	if lane != "secret" || category != "finans" {
+		t.Fatalf("tasks.lane/secret_category after a secret-content fs_read = %q/%q, want secret/finans", lane, category)
+	}
 }
 
 // ============================================================
@@ -780,7 +792,8 @@ func TestGate5_SecretLaneCannotReachCloud(t *testing.T) {
 	// typed chat prompt is never routed through the full/Qwen-fallback
 	// classifier — only the three W4-03 ingestion points — memory_write,
 	// fs reads flagged for model consumption, mail/web Reader input — are
-	// meant to, and none of those are wired to a live caller yet). There
+	// meant to; fs_read is wired since FIX-B-6, deterministic-only, see
+	// TestGate5_FsReadSecretContentEscalatesAndBlocksCloud). There
 	// is consequently NO currently-wired HTTP-reachable call site where
 	// "classification is hanging on Qwen" is an observable state at all —
 	// confirmed empirically: forcing a non-deterministic prompt through
@@ -842,4 +855,133 @@ func TestGate5_SecretLaneCannotReachCloud(t *testing.T) {
 			t.Fatal("task_done fired during the wait window - the local answer step did not actually hang as this fixture requires")
 		}
 	})
+}
+
+// TestGate5_FsReadSecretContentEscalatesAndBlocksCloud is FIX-B-6 end to
+// end over the real bins: a NORMAL-lane task's worker (gate5_worker.py,
+// spawned by kahyad with a per-task proxy) reads an ordinary-named file
+// whose CONTENT is finans (IBAN) through fs_read itself - over kahyad's
+// UDS, without the control secret, declaring a FORGED X-Kahya-Task-Id.
+// kahyad attributes the call to the worker's own task by its UDS peer
+// session (G03 / B-14, G00 C-9), durably marks the session, stickily
+// escalates THAT task's lane to secret before the bytes are returned, and
+// every later model call of the task is refused at the proxy backstop (403
+// permission_error + secretlane_cloud_blocked, one per call) with a single
+// secretlane_cloud_blocked_notice - zero requests reach the upstream.
+func TestGate5_FsReadSecretContentEscalatesAndBlocksCloud(t *testing.T) {
+	root := repoRoot(t)
+	mock := mockanthropic.New()
+	t.Cleanup(mock.Close)
+
+	scratch := t.TempDir()
+	signalFile := filepath.Join(scratch, "gate5.signal")
+	outFile := filepath.Join(scratch, "gate5.out")
+	readOutFile := filepath.Join(scratch, "gate5.read.out")
+	const forgedTaskID = "task-gate5-forged"
+	const readPath = "~/Kahya-w3-gate/sıradan-not.md"
+
+	d := bootKahyad(t, daemonOpts{
+		anthropicUpstreamURL: mock.URL(),
+		workerCmd:            []string{"python3", filepath.Join(root, "tests", "w3", "fixtures", "gate5_worker.py")},
+		extraEnv: []string{
+			"KAHYA_GATE5_SIGNAL_FILE=" + signalFile,
+			"KAHYA_GATE5_OUT_FILE=" + outFile,
+			"KAHYA_GATE5_FS_READ_PATH=" + readPath,
+			"KAHYA_GATE5_FS_READ_OUT_FILE=" + readOutFile,
+			"KAHYA_GATE5_FORGED_TASK_ID=" + forgedTaskID,
+			"KAHYA_GATE5_CLOUD_CALLS=2",
+		},
+	})
+	// The child kahyad runs with HOME=d.homeDir, so "~" resolves there.
+	gateDir := filepath.Join(d.homeDir, "Kahya-w3-gate")
+	if err := os.MkdirAll(gateDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", gateDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(gateDir, "sıradan-not.md"), []byte("IBAN TR33 0006 1005 1978 6457 8413 26 için ödeme talimatı"), 0o600); err != nil {
+		t.Fatalf("write secret-content fixture: %v", err)
+	}
+	d.promoteToAutoAllow(t, "fs_read", "R", "global")
+
+	const traceID = "trace-gate5-fsread-0001"
+	resp := d.postTask(t, traceID, "Yarın hava nasıl olacak, dışarı çıkabilir miyim?")
+	drainSSEAsync(resp)
+	taskID := waitForTaskID(t, d, traceID, 5*time.Second)
+	waitForWorkerRegistered(t, d, taskID, 5*time.Second)
+
+	db := d.openDB(t)
+	var lane string
+	if err := db.QueryRow(`SELECT lane FROM tasks WHERE id = ?`, taskID).Scan(&lane); err != nil || lane != "normal" {
+		t.Fatalf("task %s lane before the read = %q (err %v), want normal", taskID, lane, err)
+	}
+
+	if err := os.WriteFile(signalFile, []byte("go"), 0o600); err != nil {
+		t.Fatalf("write signal file: %v", err)
+	}
+
+	readOut := waitForFileContent(t, readOutFile, 15*time.Second)
+	if !strings.HasPrefix(readOut, "STATUS:200") || !strings.Contains(strings.ReplaceAll(readOut, `\"`, `"`), `"secret_lane":true`) {
+		t.Fatalf("worker's own fs_read = %q, want STATUS:200 with secret_lane:true", readOut)
+	}
+
+	outBody := waitForFileContent(t, outFile, 15*time.Second)
+	if !strings.HasPrefix(outBody, "STATUS:403") || strings.Count(outBody, "STATUS:403") != 2 {
+		t.Fatalf("worker's two model calls after the read = %q, want both STATUS:403", outBody)
+	}
+	if !strings.Contains(outBody, "gizli şerit") {
+		t.Errorf("blocked response body = %q, want the Turkish secretlane_cloud_blocked message", outBody)
+	}
+	if got := len(mock.Requests()); got != 0 {
+		t.Fatalf("mock Anthropic upstream recorded %d requests after the secret-content read, want 0", got)
+	}
+
+	var category string
+	if err := db.QueryRow(`SELECT lane, coalesce(secret_category, '') FROM tasks WHERE id = ?`, taskID).Scan(&lane, &category); err != nil {
+		t.Fatalf("read tasks.lane for %s: %v", taskID, err)
+	}
+	if lane != "secret" || category != "finans" {
+		t.Fatalf("task %s lane/category after the read = %q/%q, want secret/finans", taskID, lane, category)
+	}
+	var forgedRows int
+	if err := db.QueryRow(`SELECT count(*) FROM tasks WHERE id = ?`, forgedTaskID).Scan(&forgedRows); err != nil || forgedRows != 0 {
+		t.Fatalf("tasks rows for the forged id = %d (err %v), want 0", forgedRows, err)
+	}
+
+	escalated := eventPayloads(t, db, traceID, "secret_lane_escalated")
+	if len(escalated) != 1 || !strings.Contains(escalated[0], `"task_id":"`+taskID+`"`) {
+		t.Fatalf("secret_lane_escalated rows = %v, want exactly one for task %s", escalated, taskID)
+	}
+	if !waitForEvent(t, db, traceID, "worker_identity_override", 3*time.Second) {
+		t.Fatal("the forged X-Kahya-Task-Id was not ledgered as worker_identity_override")
+	}
+	if n := countEventsMatching(t, db, traceID, "secretlane_cloud_blocked"); n != 2 {
+		t.Fatalf("secretlane_cloud_blocked rows = %d, want 2 (one per refused model call)", n)
+	}
+	notices := eventPayloads(t, db, traceID, "secretlane_cloud_blocked_notice")
+	if len(notices) != 1 || !strings.Contains(notices[0], "bulut modeline devam edilemez") {
+		t.Fatalf("secretlane_cloud_blocked_notice rows = %v, want exactly one carrying the Turkish notice", notices)
+	}
+	if n := countJSONLEvents(t, filepath.Join(d.homeDir, "kahyad.stderr.log"), traceID, "secretlane_cloud_blocked_notice"); n != 1 {
+		t.Fatalf("kahyad JSONL secretlane_cloud_blocked_notice lines for %s = %d, want 1", traceID, n)
+	}
+}
+
+// countJSONLEvents counts the JSONL lines in path whose event and trace_id
+// fields are kind and traceID (kahyad logs JSONL to stderr).
+func countJSONLEvents(t *testing.T, path, traceID, kind string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(b), "\n") {
+		var rec struct {
+			Event   string `json:"event"`
+			TraceID string `json:"trace_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Event == kind && rec.TraceID == traceID {
+			n++
+		}
+	}
+	return n
 }

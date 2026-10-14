@@ -138,10 +138,25 @@ type SensitiveReadMarker interface {
 	MarkSensitiveRead(ctx context.Context, sessionID, traceID string) error
 }
 
+// LaneEscalator is the FIX-B-6 seam HandleReadForTask calls SYNCHRONOUSLY
+// on a secret-lane hit, after the durable sensitive-read mark and BEFORE
+// any file byte is returned: it stickily persists tasks.lane='secret' for
+// the calling task, so kahyad's proxy backstop (kahyad/internal/secretlane.
+// NewProxyBackstopHook) refuses every later cloud call of that task - the
+// worker now holds secret-lane bytes, and none of them may leave through a
+// model call. kahyad wires an in-process adapter (kahyad/internal/server.
+// NewFSLaneEscalator) that resolves the task from the caller's UDS peer
+// attribution, never from taskID's word alone; nil = no escalation (tests
+// only - production always wires it). category is "" for a path-glob hit
+// (category unknown).
+type LaneEscalator interface {
+	EscalateSecretLane(ctx context.Context, taskID, traceID, category string) error
+}
+
 // MsgSecretLaneReadRefused is the Turkish tool error fs_read returns when
-// a secret-lane hit could not be durably marked (fail-closed: bytes are
-// never released on an unrecorded read - FIX-B-7; FIX-B-6 adds the
-// sticky lane escalation to the same refusal).
+// a secret-lane hit could not be durably marked (FIX-B-7) or the calling
+// task's lane could not be escalated (FIX-B-6) - fail-closed: bytes are
+// never released on an unrecorded read.
 const MsgSecretLaneReadRefused = "Gizli-şerit okuma kaydedilemedi; dosya içeriği güvenlik gereği döndürülmedi (fail-closed)."
 
 // Logger is the JSONL logging surface this package needs. Unlike
@@ -204,10 +219,17 @@ type Server struct {
 	// SensitiveMarker is the W3-05 seam (may be nil — a nil marker simply
 	// means no session gets flagged, matching this package's usual
 	// "unwired dependency is a no-op, never a crash" posture; kahyad's
-	// real wiring always sets it). HandleRead calls it whenever a read
-	// matches SecretLaneGlobs AND the caller supplied a non-empty
-	// SessionID (there is nothing to attribute the read to without one).
+	// real wiring always sets it). HandleReadForTask calls it on every
+	// secret-lane hit (path glob or content), keyed on the request's own
+	// trace_id (see FsReadArgs' doc comment), and refuses the read when the
+	// mark cannot be persisted (FIX-B-7).
 	SensitiveMarker SensitiveReadMarker
+
+	// LaneEscalator is the FIX-B-6 seam (see the LaneEscalator type): on a
+	// secret-lane hit, after SensitiveMarker, it escalates the calling
+	// task's persisted lane to secret; a failure refuses the read. nil = no
+	// escalation (tests only).
+	LaneEscalator LaneEscalator
 
 	// ContentClassifier is the OPTIONAL W3-08 content-based secret-lane
 	// seam (nil by default — every pre-W3-10 caller/test is unaffected,
@@ -233,9 +255,10 @@ type Server struct {
 // ContentClassifier is HandleRead's optional content-based secret-lane
 // check (Server.ContentClassifier's own doc comment). ClassifySecretLane
 // reports whether text itself (not its path) is finans/sağlık/kimlik
-// content.
+// content, and which category ("" when unknown) - the category travels to
+// LaneEscalator and the secret_lane_read ledger row (FIX-B-6).
 type ContentClassifier interface {
-	ClassifySecretLane(text string) bool
+	ClassifySecretLane(text string) (secret bool, category string)
 }
 
 // New constructs a Server. home is the real (or, in tests, fake) user
@@ -426,6 +449,12 @@ func (s *Server) HandleRead(ctx context.Context, traceID string, args FsReadArgs
 // (and dropped after 30s idle). Safe for the session/taint lookup: the
 // resolver falls back to trace_id when the task row has no session, and
 // fs_read is R, which the taint gate never applies to.
+//
+// On a secret-lane hit (path glob OR content) the ORDER is fixed (FIX-B-7 /
+// FIX-B-6): secret_lane_read ledger row, durable sensitive-read mark, sticky
+// lane escalation of the calling task - and only when BOTH persisted are the
+// bytes returned; either failure refuses the read with
+// MsgSecretLaneReadRefused (ledger secret_lane_read_refused).
 func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, args FsReadArgs) (FsReadOutput, error) {
 	cp, err := s.canonicalize(args.Path)
 	if err != nil {
@@ -457,8 +486,9 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 	// Server.ContentClassifier's own doc comment) — a path-glob miss does
 	// not short-circuit it, since the two checks are independent OR'd
 	// signals, not an either/or.
+	category := ""
 	if !secretLane && s.ContentClassifier != nil {
-		secretLane = s.ContentClassifier.ClassifySecretLane(string(data))
+		secretLane, category = s.ContentClassifier.ClassifySecretLane(string(data))
 	}
 	if secretLane {
 		// Always attempted (not routed through the best-effort
@@ -470,6 +500,7 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 		// actual mark always agree on which identity was tainted.
 		s.logAndLedger(ctx, traceID, "secret_lane_read", map[string]any{
 			"event": "secret_lane_read", "canonical_path": cp.Match, "session_id": traceID,
+			"task_id": taskID, "category": category,
 		})
 
 		// BLOCKER A fix: taint is now keyed on the request's own
@@ -499,10 +530,26 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 				return FsReadOutput{}, errors.New(MsgSecretLaneReadRefused)
 			}
 		}
+
+		// FIX-B-6: the bytes are about to enter the worker, and every
+		// model call of the task carries the worker's context - so the
+		// task's persisted lane is escalated to secret first (sticky; the
+		// proxy backstop then refuses each later cloud call). A failure
+		// refuses the read: bytes are never released into a task whose
+		// lane still says normal.
+		if s.LaneEscalator != nil {
+			if err := s.LaneEscalator.EscalateSecretLane(ctx, taskID, traceID, category); err != nil {
+				s.logAndLedger(ctx, traceID, "secret_lane_read_refused", map[string]any{
+					"event": "secret_lane_read_refused", "canonical_path": cp.Match, "task_id": taskID,
+					"reason": "lane_escalate_failed", "err": err.Error(),
+				})
+				return FsReadOutput{}, errors.New(MsgSecretLaneReadRefused)
+			}
+		}
 	}
 
 	s.logAndLedger(ctx, traceID, "fs_read", map[string]any{
-		"event": "fs_read", "canonical_path": cp.Match, "size": len(data), "secret_lane": secretLane,
+		"event": "fs_read", "canonical_path": cp.Match, "size": len(data), "secret_lane": secretLane, "task_id": taskID,
 	})
 
 	return FsReadOutput{

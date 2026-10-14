@@ -2,6 +2,7 @@ package secretlane
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -16,6 +17,10 @@ import (
 type fakeTaskLaneStore struct {
 	mu   sync.Mutex
 	rows map[string][2]string // taskID -> [lane, category]
+	// getErr, when set, is GetTaskLane's error (a transient read failure);
+	// setCalls counts SetTaskLane calls (FIX-B-6 never-downgrade tests).
+	getErr   error
+	setCalls int
 }
 
 func newFakeTaskLaneStore() *fakeTaskLaneStore {
@@ -25,6 +30,7 @@ func newFakeTaskLaneStore() *fakeTaskLaneStore {
 func (f *fakeTaskLaneStore) SetTaskLane(ctx context.Context, taskID, lane, category string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setCalls++
 	f.rows[taskID] = [2]string{lane, category}
 	return nil
 }
@@ -32,6 +38,9 @@ func (f *fakeTaskLaneStore) SetTaskLane(ctx context.Context, taskID, lane, categ
 func (f *fakeTaskLaneStore) GetTaskLane(ctx context.Context, taskID string) (lane, category string, found bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return "", "", false, f.getErr
+	}
 	row, ok := f.rows[taskID]
 	if !ok {
 		return "", "", false, nil
@@ -169,6 +178,29 @@ func TestEscalateWidensFromNormalToSecret(t *testing.T) {
 	}
 	if lane != LaneSecret || category != CategoryFinans {
 		t.Fatalf("Escalate() second call = (%q,%q), want (secret,finans)", lane, category)
+	}
+}
+
+// TestEscalateStoreReadErrorNeverDowngrades (FIX-B-6): a GetTaskLane read
+// ERROR is not "no row yet". Before the fix Escalate treated it as not
+// found and, with a non-secret verdict, wrote lane=normal over whatever the
+// row held - a silent downgrade of a secret task on a transient DB error.
+func TestEscalateStoreReadErrorNeverDowngrades(t *testing.T) {
+	classifier := NewClassifier(QwenClassifierFunc(func(ctx context.Context, text string) (Verdict, error) {
+		return Verdict{SecretLane: false, Category: CategoryNone}, nil
+	}))
+	store := newFakeTaskLaneStore()
+	store.rows["t_err"] = [2]string{LaneSecret, CategoryFinans}
+	store.getErr = errors.New("database is locked")
+
+	if _, _, err := Escalate(context.Background(), classifier, store, "t_err", "trace-err", "bugün hava çok güzel", nil); err == nil {
+		t.Fatal("Escalate() error = nil on a lane read error, want the read error")
+	}
+	if store.setCalls != 0 {
+		t.Fatalf("SetTaskLane calls = %d after a lane read error, want 0 (never write over an unread row)", store.setCalls)
+	}
+	if got := store.rows["t_err"]; got[0] != LaneSecret || got[1] != CategoryFinans {
+		t.Fatalf("persisted lane = %v, want [secret finans] untouched", got)
 	}
 }
 
@@ -310,5 +342,157 @@ func TestOrderingInvariantHangingClassifierProducesZeroProxyBytes(t *testing.T) 
 
 	if got := atomic.LoadInt64(&proxyHits); got != 1 {
 		t.Errorf("proxy hits after classification completed = %d, want exactly 1", got)
+	}
+}
+
+// --- FIX-B-6: EscalateVerdict, backstop sentinels, one-per-task notice ---
+
+func TestEscalateVerdictPersistsSecretAndIsSticky(t *testing.T) {
+	store := newFakeTaskLaneStore()
+	ctx := context.Background()
+
+	lane, category, err := EscalateVerdict(ctx, store, "t_3", "trace-3", Verdict{SecretLane: true, Category: CategoryFinans}, nil)
+	if err != nil || lane != LaneSecret || category != CategoryFinans {
+		t.Fatalf("EscalateVerdict(secret, finans) = (%q, %q, %v), want (secret, finans, nil)", lane, category, err)
+	}
+	lane, category, err = EscalateVerdict(ctx, store, "t_3", "trace-3", Verdict{SecretLane: false}, nil)
+	if err != nil || lane != LaneSecret || category != CategoryFinans {
+		t.Fatalf("EscalateVerdict(normal) on a secret task = (%q, %q, %v), want (secret, finans, nil) - sticky", lane, category, err)
+	}
+	// A path-glob hit carries no category: the lane widens, the known
+	// category is kept.
+	lane, category, err = EscalateVerdict(ctx, store, "t_3", "trace-3", Verdict{SecretLane: true}, nil)
+	if err != nil || lane != LaneSecret || category != CategoryFinans {
+		t.Fatalf("EscalateVerdict(secret, no category) = (%q, %q, %v), want (secret, finans, nil)", lane, category, err)
+	}
+	if got := store.rows["t_3"]; got != [2]string{LaneSecret, CategoryFinans} {
+		t.Fatalf("persisted row = %v, want [secret finans]", got)
+	}
+}
+
+func TestEscalateVerdictStoreReadErrorNeverDowngrades(t *testing.T) {
+	store := newFakeTaskLaneStore()
+	store.rows["t_4"] = [2]string{LaneSecret, CategorySaglik}
+	store.getErr = errors.New("database is locked")
+	marked := 0
+	mark := func(context.Context, string, string) error { marked++; return nil }
+
+	for _, v := range []Verdict{{SecretLane: false}, {SecretLane: true, Category: CategoryFinans}} {
+		if _, _, err := EscalateVerdict(context.Background(), store, "t_4", "trace-4", v, mark); err == nil {
+			t.Fatalf("EscalateVerdict(%+v) on a lane read error = nil error, want the read error", v)
+		}
+	}
+	if store.setCalls != 0 || marked != 0 {
+		t.Fatalf("after lane read errors: SetTaskLane calls = %d, marks = %d; want 0, 0", store.setCalls, marked)
+	}
+	if got := store.rows["t_4"]; got != [2]string{LaneSecret, CategorySaglik} {
+		t.Fatalf("persisted row = %v, want [secret saglik] untouched", got)
+	}
+}
+
+func TestProxyBackstopHookReturnsErrCloudBlockedSentinel(t *testing.T) {
+	store := newFakeTaskLaneStore()
+	_ = store.SetTaskLane(context.Background(), "t_s", LaneSecret, CategoryKimlik)
+	hook := NewProxyBackstopHook(store, &fakeLedger{})("t_s", "trace-s")
+	err := hook(httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/messages", nil))
+	if !errors.Is(err, ErrCloudBlocked) || err.Error() != MsgSecretLaneCloudBlocked {
+		t.Fatalf("hook(secret task) = %v, want ErrCloudBlocked with body %q", err, MsgSecretLaneCloudBlocked)
+	}
+}
+
+// TestProxyBackstopHookLookupErrorIsNotTheSecretLaneSentinel: a lane read
+// error still refuses with the same 403 body, but is not ErrCloudBlocked -
+// it is no evidence of secret-lane content (no notice, not task-ending).
+func TestProxyBackstopHookLookupErrorIsNotTheSecretLaneSentinel(t *testing.T) {
+	failing := lookupFunc(func(context.Context, string) (string, string, bool, error) {
+		return "", "", false, errors.New("database is locked")
+	})
+	hook := NewProxyBackstopHook(failing, &fakeLedger{})("t_x", "trace-x")
+	err := hook(httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/messages", nil))
+	if err == nil || err.Error() != MsgSecretLaneCloudBlocked {
+		t.Fatalf("hook(lookup error) = %v, want a refusal with body %q", err, MsgSecretLaneCloudBlocked)
+	}
+	if errors.Is(err, ErrCloudBlocked) || !errors.Is(err, ErrCloudBlockedLookupFailed) {
+		t.Fatalf("hook(lookup error) = %v, want ErrCloudBlockedLookupFailed and not ErrCloudBlocked", err)
+	}
+}
+
+// fakeAlarmer records every Alarm call.
+type fakeAlarmer struct {
+	mu    sync.Mutex
+	calls []struct{ traceID, kind, message string }
+	err   error
+}
+
+func (f *fakeAlarmer) Alarm(_ context.Context, traceID, kind, message string, _ map[string]any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, struct{ traceID, kind, message string }{traceID, kind, message})
+	return f.err
+}
+
+func (f *fakeAlarmer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// TestCloudBlockedNoticesOncePerTask: the backstop refuses every model
+// call of an escalated task (one secretlane_cloud_blocked row each), but
+// the user notice is raised once per task - also across a second worker
+// spawn of the same task (a fresh per-task hook) - and a lookup failure
+// never raises it.
+func TestCloudBlockedNoticesOncePerTask(t *testing.T) {
+	store := newFakeTaskLaneStore()
+	_ = store.SetTaskLane(context.Background(), "t_a", LaneSecret, CategoryFinans)
+	_ = store.SetTaskLane(context.Background(), "t_b", LaneSecret, CategorySaglik)
+	ledger := &fakeLedger{}
+	alarm := &fakeAlarmer{}
+	notices := NewCloudBlockedNotices(alarm)
+	nextCalls := 0
+	next := func(string, string) func(*http.Request) error {
+		return func(*http.Request) error { nextCalls++; return nil }
+	}
+	gate := ChainEgressGates(NewProxyBackstopHook(store, ledger), next, notices)
+
+	req := func() *http.Request { return httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1/messages", nil) }
+	for _, hook := range []func(*http.Request) error{gate("t_a", "trace-a"), gate("t_a", "trace-a")} { // two spawns
+		for i := 0; i < 2; i++ {
+			if err := hook(req()); !errors.Is(err, ErrCloudBlocked) {
+				t.Fatalf("gate(t_a) = %v, want ErrCloudBlocked", err)
+			}
+		}
+	}
+	if err := gate("t_b", "trace-b")(req()); !errors.Is(err, ErrCloudBlocked) {
+		t.Fatalf("gate(t_b) = %v, want ErrCloudBlocked", err)
+	}
+	if got := ledger.count(EventSecretLaneCloudBlocked); got != 5 {
+		t.Fatalf("%s rows = %d, want 5 (one per refused call)", EventSecretLaneCloudBlocked, got)
+	}
+	if alarm.count() != 2 {
+		t.Fatalf("notices raised = %d, want 2 (one per task)", alarm.count())
+	}
+	for _, c := range alarm.calls {
+		if c.kind != EventSecretLaneCloudBlockedNotice || c.message != MsgSecretLaneCloudBlockedNotice {
+			t.Fatalf("notice = %+v, want kind %q with the Turkish notice text", c, EventSecretLaneCloudBlockedNotice)
+		}
+	}
+	if nextCalls != 0 {
+		t.Fatalf("the allowlist gate ran %d times after a backstop refusal, want 0", nextCalls)
+	}
+
+	if err := gate("t_unknown", "trace-u")(req()); err != nil || nextCalls != 1 {
+		t.Fatalf("gate(normal task) = %v with next calls %d, want nil and the allowlist gate consulted once", err, nextCalls)
+	}
+
+	failing := lookupFunc(func(context.Context, string) (string, string, bool, error) {
+		return "", "", false, errors.New("database is locked")
+	})
+	failGate := ChainEgressGates(NewProxyBackstopHook(failing, ledger), next, notices)
+	if err := failGate("t_c", "trace-c")(req()); err == nil {
+		t.Fatal("gate(lookup error) = nil, want a fail-closed refusal")
+	}
+	if alarm.count() != 2 {
+		t.Fatalf("notices raised after a lookup failure = %d, want still 2", alarm.count())
 	}
 }

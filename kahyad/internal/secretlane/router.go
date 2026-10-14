@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 )
 
 // Lane values persisted on the tasks row (task spec step 4: "extend the
@@ -60,6 +61,35 @@ const EventSecretLaneCloudBlocked = "secretlane_cloud_blocked"
 // hook returns as the "permission_error" message body).
 const MsgSecretLaneCloudBlocked = "Bu görev gizli şerit (finans/sağlık/kimlik) olarak etiketlendi; bulut modele erişemez."
 
+// ErrCloudBlocked is the sentinel NewProxyBackstopHook returns when it
+// refuses a model call because the task's persisted lane IS secret
+// (FIX-B-6). Error() == MsgSecretLaneCloudBlocked, so the proxy's 403 body
+// is unchanged; kahyad/main.go's combined egress hook uses errors.Is on it
+// to raise MsgSecretLaneCloudBlockedNotice once per task (CloudBlockedNotices).
+var ErrCloudBlocked = errors.New(MsgSecretLaneCloudBlocked)
+
+// ErrCloudBlockedLookupFailed is the backstop's fail-closed refusal when the
+// task's lane could not be READ at all (a transient brain.db error). Same
+// Turkish 403 body, but deliberately NOT ErrCloudBlocked: nothing says the
+// task touched secret-lane content, so no "gizli-şerit içeriğe dokundu"
+// notice is raised, and a caller that ends the task on ErrCloudBlocked
+// (G00 U-4) does not end it on a transient read error.
+var ErrCloudBlockedLookupFailed = errors.New(MsgSecretLaneCloudBlocked)
+
+// MsgSecretLaneCloudBlockedNotice is the user notification raised the first
+// time the proxy backstop refuses a task's model call because the task was
+// escalated to the secret lane (FIX-B-6) - once per task, never per call
+// (CloudBlockedNotices).
+const MsgSecretLaneCloudBlockedNotice = "Görev gizli-şerit (finans/sağlık/kimlik) içeriğe dokundu; bulut modeline devam edilemez."
+
+// EventSecretLaneCloudBlockedNotice is the ledger/JSONL kind of that
+// one-shot notice. Distinct from EventSecretLaneCloudBlocked on purpose:
+// notify.JSONLNotifier.Alarm ledgers under the kind it is given, so reusing
+// EventSecretLaneCloudBlocked would write a second secretlane_cloud_blocked
+// row for the first block and make "one secretlane_cloud_blocked row per
+// refused call" ambiguous.
+const EventSecretLaneCloudBlockedNotice = "secretlane_cloud_blocked_notice"
+
 // ClassifyForNewTask runs classifier against text and reports the Verdict
 // - the caller (kahyad/internal/server's POST /v1/task handler) uses this
 // BEFORE a tasks row exists at all, to decide the brand-new task's OWN
@@ -90,12 +120,27 @@ func ClassifyForNewTask(ctx context.Context, classifier *Classifier, sessionKey,
 // persisted lane to secret when warranted - it NEVER downgrades an
 // already-secret task back to normal (task spec gotcha: "once a task is
 // lane: secret, it stays secret for its lifetime, including resume").
-// Returns the FINAL (post-widen) lane/category actually persisted.
+// Returns the FINAL (post-widen) lane/category actually persisted. The
+// persistence half is EscalateVerdict.
 func Escalate(ctx context.Context, classifier *Classifier, store TaskLaneStore, taskID, traceID, text string, markSensitiveRead func(ctx context.Context, sessionKey, traceID string) error) (lane, category string, err error) {
 	verdict, _ := classifier.Classify(ctx, text)
+	return EscalateVerdict(ctx, store, taskID, traceID, verdict, markSensitiveRead)
+}
 
+// EscalateVerdict is Escalate's persistence half (FIX-B-6): given an
+// ALREADY-DECIDED verdict (fs_read's deterministic content check or path
+// glob, a Reader verdict, ...), stickily widen taskID's persisted lane. A
+// GetTaskLane read ERROR is returned as-is and nothing is written: it is
+// never "no row yet" - before FIX-B-6 a transient read failure plus a
+// non-secret verdict wrote lane=normal over an existing secret row, a
+// silent downgrade. found=false (no row, no error) is still written as a
+// plain SetTaskLane - a brand-new task's first verdict.
+func EscalateVerdict(ctx context.Context, store TaskLaneStore, taskID, traceID string, verdict Verdict, markSensitiveRead func(ctx context.Context, sessionKey, traceID string) error) (lane, category string, err error) {
 	existingLane, existingCategory, found, storeErr := store.GetTaskLane(ctx, taskID)
-	if storeErr != nil || !found {
+	if storeErr != nil {
+		return "", "", fmt.Errorf("secretlane: read lane for task %s: %w", taskID, storeErr)
+	}
+	if !found {
 		existingLane = ""
 		existingCategory = ""
 	}
@@ -146,9 +191,13 @@ type LaneLookup interface {
 // taskID/traceID are captured ONCE per task (the same per-task-closure
 // pattern kahyad/internal/egress.NewAnthproxyEgressGateHook already uses)
 // - the worker cannot influence its own task's lane by any means (it
-// never chooses it - router.go's ClassifyForNewTask/Escalate are the ONLY
-// writers, both entirely kahyad-side), so this check is unbypassable from
-// inside the worker process, unlike a client-suppliable header would be.
+// never chooses it - router.go's ClassifyForNewTask/Escalate/EscalateVerdict
+// are the ONLY writers, all entirely kahyad-side), so this check is
+// unbypassable from inside the worker process, unlike a client-suppliable
+// header would be. No caching: a lane escalated mid-task (fs_read, FIX-B-6)
+// takes effect on the very next request. It returns ErrCloudBlocked for a
+// secret-lane task and ErrCloudBlockedLookupFailed when the lane cannot be
+// read (fail-closed); both render as the same 403 body.
 func NewProxyBackstopHook(lookup LaneLookup, ledger EventLedger) func(taskID, traceID string) func(*http.Request) error {
 	return func(taskID, traceID string) func(*http.Request) error {
 		return func(r *http.Request) error {
@@ -159,15 +208,64 @@ func NewProxyBackstopHook(lookup LaneLookup, ledger EventLedger) func(taskID, tr
 				// this is the same posture as every other policy/permission
 				// check in this codebase.
 				logSecretLaneBlocked(ledger, r.Context(), traceID, taskID, "lookup_error")
-				return errors.New(MsgSecretLaneCloudBlocked)
+				return ErrCloudBlockedLookupFailed
 			}
 			if !found || lane != LaneSecret {
 				return nil
 			}
 			logSecretLaneBlocked(ledger, r.Context(), traceID, taskID, "secret_lane")
-			return errors.New(MsgSecretLaneCloudBlocked)
+			return ErrCloudBlocked
 		}
 	}
+}
+
+// Alarmer is the narrow notification surface CloudBlockedNotices needs -
+// kahyad/internal/notify.Notifier's Alarm method (JSONL warn line + ledger
+// row under the given kind).
+type Alarmer interface {
+	Alarm(ctx context.Context, traceID, kind, message string, payload map[string]any) error
+}
+
+// CloudBlockedNotices raises MsgSecretLaneCloudBlockedNotice (ledger kind
+// EventSecretLaneCloudBlockedNotice) the FIRST time the proxy backstop
+// refuses a task's model call with ErrCloudBlocked - once per task id for
+// the life of the kahyad process, however many calls (or worker spawns of
+// the same task, e.g. a resume) are refused afterwards (FIX-B-6). One
+// instance is shared by every per-task proxy hook (kahyad/main.go).
+type CloudBlockedNotices struct {
+	alarm Alarmer
+
+	mu   sync.Mutex
+	sent map[string]bool
+}
+
+// NewCloudBlockedNotices constructs a CloudBlockedNotices over alarm (nil =
+// never notify).
+func NewCloudBlockedNotices(alarm Alarmer) *CloudBlockedNotices {
+	return &CloudBlockedNotices{alarm: alarm, sent: make(map[string]bool)}
+}
+
+// Observe is called with every error the backstop hook returned for
+// (taskID, traceID). Only ErrCloudBlocked counts (a lookup failure is not
+// evidence of secret-lane content); the first one per task raises the
+// notice. sent reports whether this call raised it; err is the notifier's
+// error (the task id is marked notified either way - "once" means once,
+// and the JSONL half has already been written when only the ledger fails).
+// The notice is written under a context detached from cancellation: the
+// refused request's own context may be canceled the moment the 403 lands.
+func (n *CloudBlockedNotices) Observe(ctx context.Context, taskID, traceID string, blockErr error) (sent bool, err error) {
+	if n == nil || n.alarm == nil || !errors.Is(blockErr, ErrCloudBlocked) {
+		return false, nil
+	}
+	n.mu.Lock()
+	if n.sent[taskID] {
+		n.mu.Unlock()
+		return false, nil
+	}
+	n.sent[taskID] = true
+	n.mu.Unlock()
+	return true, n.alarm.Alarm(context.WithoutCancel(ctx), traceID, EventSecretLaneCloudBlockedNotice,
+		MsgSecretLaneCloudBlockedNotice, map[string]any{"task_id": taskID})
 }
 
 func logSecretLaneBlocked(ledger EventLedger, ctx context.Context, traceID, taskID, reason string) {
@@ -178,4 +276,25 @@ func logSecretLaneBlocked(ledger EventLedger, ctx context.Context, traceID, task
 		"task_id": taskID,
 		"reason":  reason,
 	})
+}
+
+// ChainEgressGates composes the per-task anthproxy EgressGate factory
+// kahyad/main.go wires (kahyad/internal/server.SetAnthproxy): backstop
+// (NewProxyBackstopHook - the persisted lane, read on every request) runs
+// FIRST and a refusal ends the request there; next (the egress allowlist/
+// budget/sensitive-read gate) runs only when the backstop allowed. Every
+// backstop refusal is shown to notices (nil = no notice), which raises the
+// one-per-task MsgSecretLaneCloudBlockedNotice.
+func ChainEgressGates(backstop, next func(taskID, traceID string) func(*http.Request) error, notices *CloudBlockedNotices) func(taskID, traceID string) func(*http.Request) error {
+	return func(taskID, traceID string) func(*http.Request) error {
+		secretHook := backstop(taskID, traceID)
+		nextHook := next(taskID, traceID)
+		return func(r *http.Request) error {
+			if err := secretHook(r); err != nil {
+				_, _ = notices.Observe(r.Context(), taskID, traceID, err)
+				return err
+			}
+			return nextHook(r)
+		}
+	}
 }

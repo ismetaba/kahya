@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
@@ -125,14 +126,98 @@ func NewFSLogger(l *logx.Logger) mcpfs.Logger {
 // call, which uses the exact same function.
 type fsContentClassifier struct{}
 
-func (fsContentClassifier) ClassifySecretLane(text string) bool {
-	return secretlane.ClassifyDeterministic(text).SecretLane
+func (fsContentClassifier) ClassifySecretLane(text string) (bool, string) {
+	v := secretlane.ClassifyDeterministic(text)
+	return v.SecretLane, v.Category
 }
 
 // NewFSContentClassifier constructs the mcp/fs.ContentClassifier adapter
 // main.go wires fsTool.ContentClassifier with.
 func NewFSContentClassifier() mcpfs.ContentClassifier {
 	return fsContentClassifier{}
+}
+
+// Ledger kinds the fs lane escalator writes (FIX-B-6; English, internal).
+// EventSecretLaneEscalated: a task's persisted lane was (re)written secret
+// because its fs_read hit secret-lane content. EventSecretLaneEscalateNoTask:
+// a secret-lane fs_read with no task to escalate - only an unattributed
+// caller (the CLI, a script, a test harness - never a spawned worker) can
+// produce it, and the sensitive-read mark has already landed.
+const (
+	EventSecretLaneEscalated      = "secret_lane_escalated"
+	EventSecretLaneEscalateNoTask = "secret_lane_escalate_no_task"
+)
+
+// fsLaneEscalator adapts kahyad/internal/secretlane.EscalateVerdict to
+// mcp/fs.LaneEscalator (FIX-B-6).
+type fsLaneEscalator struct {
+	lanes  *SecretLaneStoreAdapter
+	ledger EventLogger // may be nil
+}
+
+// NewFSLaneEscalator constructs the mcp/fs.LaneEscalator adapter main.go
+// wires fsTool.LaneEscalator with: q is *store.Store.Queries, ledger the
+// store itself.
+func NewFSLaneEscalator(q TaskLaneQueries, ledger EventLogger) mcpfs.LaneEscalator {
+	return fsLaneEscalator{lanes: NewSecretLaneStoreAdapter(q), ledger: ledger}
+}
+
+// EscalateSecretLane escalates the CALLING task's persisted lane to secret.
+// Which task that is comes from the caller's UDS peer attribution (G03 /
+// B-14, G00 C-9 - callerAttributionFromContext, the same identity
+// pinBodyIdentity pins body ids to), never from a declaration: for a live
+// worker taskID is already the pinned header, and should a direct in-process
+// caller hand in anything else, the attributed task still wins. Only an
+// unattributed caller - which withControlAuth serves on /v1/mcp only with
+// the control secret - keeps its declared taskID (no trace_id lookup: a
+// spawned worker is always attributable, so there is nothing to guess).
+//
+// Fail-closed: an attributed live worker whose tasks row cannot be found,
+// or any read/write error, is an error - mcp/fs then refuses the read. An
+// unattributed caller with no task id, or one naming a task that does not
+// exist, has no task proxy for the bytes to leave through: ledgered as
+// EventSecretLaneEscalateNoTask, nil.
+func (e fsLaneEscalator) EscalateSecretLane(ctx context.Context, taskID, traceID, category string) error {
+	attribution := "declared"
+	if att, ok := callerAttributionFromContext(ctx); ok && att.TaskID != "" {
+		taskID, attribution = att.TaskID, "live_worker"
+	}
+	if taskID == "" {
+		e.ledgerRaw(ctx, traceID, EventSecretLaneEscalateNoTask, map[string]any{
+			"event": EventSecretLaneEscalateNoTask, "category": category, "reason": "no_task_id", "source": "fs_read",
+		})
+		return nil
+	}
+	_, _, found, err := e.lanes.GetTaskLane(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("fs lane escalate: read lane for task %s: %w", taskID, err)
+	}
+	if !found {
+		if attribution == "live_worker" {
+			return fmt.Errorf("fs lane escalate: live worker's task %s has no tasks row", taskID)
+		}
+		e.ledgerRaw(ctx, traceID, EventSecretLaneEscalateNoTask, map[string]any{
+			"event": EventSecretLaneEscalateNoTask, "task_id": taskID, "category": category, "reason": "no_task_row", "source": "fs_read",
+		})
+		return nil
+	}
+	lane, cat, err := secretlane.EscalateVerdict(ctx, e.lanes, taskID, traceID,
+		secretlane.Verdict{SecretLane: true, Category: category, Reason: "fs_read"}, nil)
+	if err != nil {
+		return err
+	}
+	e.ledgerRaw(ctx, traceID, EventSecretLaneEscalated, map[string]any{
+		"event": EventSecretLaneEscalated, "task_id": taskID, "lane": lane, "category": cat,
+		"source": "fs_read", "attribution": attribution,
+	})
+	return nil
+}
+
+func (e fsLaneEscalator) ledgerRaw(ctx context.Context, traceID, kind string, payload map[string]any) {
+	if e.ledger == nil {
+		return
+	}
+	_ = e.ledger.LogEvent(ctx, traceID, kind, payload)
 }
 
 func (a fsLoggerAdapter) With(traceID string) mcpfs.Logger {

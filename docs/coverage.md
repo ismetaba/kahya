@@ -261,5 +261,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product C | local-model unavailable (memory pressure) ⇒ fail-closed, zero cloud requests | `kahyad/internal/reader/TestNoCloudFallbackLocalUnavailableNeverHitsProxy` | W4-03 | ci-hermetic |
 | Product C | finans/sağlık/kimlik lexicon keeps every suffixed true positive (word-start prefix match, fail-closed) | `kahyad/internal/secretlane/TestClassifyDeterministicLexiconSuffixedTruePositives` | FIX-B-2 | ci-hermetic |
 | Product C | every lexicon entry matches only at a word start, never inside another word ("yapılacak" ≠ ilaç, "defter" ≠ eft) | `kahyad/internal/secretlane/TestClassifyDeterministicLexiconEveryEntryWordStartOnly` | FIX-B-2 | ci-hermetic |
+| Product C | a secret-lane `fs_read` (content or path glob) escalates the calling task's lane to secret before any byte is returned | `mcp/fs/TestHandleReadForTaskSecretContentEscalatesLaneBeforeReturningBytes` | FIX-B-6 | ci-hermetic |
+| Product C | a secret-lane `fs_read` whose lane escalation cannot be persisted is refused — no byte released | `mcp/fs/TestHandleReadSecretLaneEscalateFailureRefusesRead` | FIX-B-6 | ci-hermetic |
+| Product C | `fs_read` escalation hits the live worker's OWN task (UDS peer attribution), never a task id it declared | `kahyad/internal/server/TestMCPFSReadSecretContentEscalatesAttributedWorkersOwnTask` | FIX-B-6 | ci-hermetic |
+| Product C | a lane read error during escalation writes nothing (a secret task is never downgraded) | `kahyad/internal/secretlane/TestEscalateVerdictStoreReadErrorNeverDowngrades` | FIX-B-6 | ci-hermetic |
+| Product C | an escalated task's every model call is refused at the proxy backstop; one user notice per task | `kahyad/internal/secretlane/TestCloudBlockedNoticesOncePerTask` | FIX-B-6 | ci-hermetic |
+| Product C | real bins: a worker's secret-content `fs_read` escalates its task; its model calls get 403, zero upstream requests | `tests/w3/TestGate5_FsReadSecretContentEscalatesAndBlocksCloud` | FIX-B-6 | local-integration |
 | Product C | CLI prints "🔒 yerel işlendi" badge on local processing | `kahyad/cmd/kahya/TestOneShotProcessedLocallyPrintsBadge` | W3-08 | ci-hermetic |
 | Product D | memory content can never lower a permission / raise autonomy | `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | W78-03 | ci-hermetic |

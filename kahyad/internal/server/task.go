@@ -249,8 +249,11 @@ func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Noti
 // trace_id" convention kahyad/internal/egress.NewAnthproxyEgressGateHook
 // already uses; may be nil (best-effort, matching every other optional
 // hook in this file). classifier itself is stored for a future ingestion
-// point (memory_write/fs-read/mail-web Reader, W4-03) to consult via
+// point (memory_write, G13 / G00 U-3) to consult via
 // kahyad/internal/secretlane.Escalate - not read by handleTask today.
+// fs_read's escalation does not need it: since FIX-B-6 its deterministic
+// content hit (or path glob) lands via NewFSLaneEscalator
+// (secretlane.EscalateVerdict).
 func (s *Server) SetSecretLane(classifier *secretlane.Classifier, answerer secretlane.Answerer, markSensitiveRead func(ctx context.Context, sessionKey, traceID string) error) {
 	s.secretLaneClassifier = classifier
 	s.secretLaneAnswerer = answerer
@@ -603,10 +606,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// behavior differs (see ClassifyDeterministic's own doc comment).
 	// s.secretLaneClassifier (deterministic + Qwen fallback, fully wired to
 	// the real local server in main.go) remains available for those THREE
-	// named ingestion points once W4-03 lands them; a later Escalate call
-	// (kahyad/internal/secretlane.Escalate) would STICKILY widen this exact
+	// named ingestion points; a later escalation STICKILY widens this exact
 	// task's lane to secret if any of them find something the chat prompt
-	// itself did not.
+	// itself did not - fs_read does since FIX-B-6 (NewFSLaneEscalator,
+	// secretlane.EscalateVerdict; deterministic, no Qwen), and the proxy
+	// backstop then refuses the task's every later model call.
 	//
 	// SCOPE DECISION (post-review, explicit and deliberate - not a gap):
 	// HANDOFF §4's ordering invariant reads "policy.yaml globları yalnız

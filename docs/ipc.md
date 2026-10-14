@@ -174,9 +174,11 @@ a cloud model, without changing anything in §2-§6 above:
   Qwen dependency at all** — deliberately narrower than the full
   `secretlane.Classifier` (deterministic pre-pass + Qwen3-30B-A3B
   fallback, `kahyad/internal/mlx.Supervisor`-backed, fully implemented and
-  unit/live-tested) that `kahyad/internal/secretlane.Escalate` will wire
-  into memory_write/fs-read/mail-web-Reader ingestion once W4-03 lands
-  those — see that package's own doc comments for the full rationale.
+  unit/live-tested) that `kahyad/internal/secretlane.Escalate` exists for
+  at the memory_write / mail-web-Reader ingestion points — see that
+  package's own doc comments for the full rationale. `fs_read` is an
+  ingestion point too and escalates deterministically since FIX-B-6 (see
+  "Mid-task escalation" below).
 - **A `lane:"secret"` task is answered ENTIRELY on-device — the worker is
   never spawned at all.** `kahyad/internal/server`'s `handleSecretLaneTask`
   calls `secretlane.Answerer` (backed by the same local Qwen3-30B-A3B
@@ -209,9 +211,46 @@ a cloud model, without changing anything in §2-§6 above:
 - **Sticky, persisted lane:** `tasks.lane`/`tasks.secret_category`
   (`kahyad/migrations/0006_secret_lane.sql`) are set on `InsertTask` (the
   classification above already ran) and only ever WIDEN thereafter
-  (`secretlane.Escalate`, enforced in Go, not SQL) — once a task is
-  `lane="secret"` it stays secret for its lifetime, including a future
-  W4-02 resume.
+  (`secretlane.Escalate` / `secretlane.EscalateVerdict`, enforced in Go,
+  not SQL) — once a task is `lane="secret"` it stays secret for its
+  lifetime, including a W4-02 resume. A lane READ error during an
+  escalation is returned and nothing is written (FIX-B-6: it used to count
+  as "no row yet" and could write `normal` over a secret row).
+- **Mid-task escalation at `fs_read` (FIX-B-6).** A NORMAL-lane task whose
+  worker reads a file that is secret-lane by path glob OR by content
+  (`secretlane.ClassifyDeterministic`, no Qwen) is escalated before a
+  single byte is returned, in this fixed order: `secret_lane_read` ledger
+  row (`task_id`, `category`), durable sensitive-read mark (FIX-B-7),
+  sticky `tasks.lane='secret'` via `mcp/fs.LaneEscalator` →
+  `kahyad/internal/server.NewFSLaneEscalator` (ledger
+  `secret_lane_escalated{task_id, lane, category, source:"fs_read",
+  attribution}`). Either persistence failure refuses the read
+  (`mcp/fs.MsgSecretLaneReadRefused`, ledger `secret_lane_read_refused`
+  with `reason` `sensitive_mark_failed` / `lane_escalate_failed`). The
+  escalated task is the CALLER's: for a live worker it comes from the UDS
+  peer attribution (G03 / B-14; `attribution:"live_worker"`), never from
+  the `X-Kahya-Task-Id` it declared; only an unattributed, control-secret
+  caller (CLI/script/test harness) keeps its declared id
+  (`attribution:"declared"`), and one with no task id or an unknown one
+  is ledgered `secret_lane_escalate_no_task` (it has no task proxy to cut
+  off). A live worker whose tasks row is missing fails closed. The worker
+  does hold the bytes after a successful read (owner decision G02-2: the
+  task is escalated, not refused); every later model call of the task is
+  then refused by layer 2 below — `403 permission_error` with
+  `MsgSecretLaneCloudBlocked`, one `secretlane_cloud_blocked` row per
+  refused call — and the FIRST secret-lane refusal of a task raises one
+  Turkish notice,
+  `"Görev gizli-şerit (finans/sağlık/kimlik) içeriğe dokundu; bulut modeline devam edilemez."`
+  (ledger + JSONL kind
+  `secretlane_cloud_blocked_notice`; once per task per kahyad process,
+  `secretlane.CloudBlockedNotices`). A lane lookup ERROR at the backstop
+  still refuses with the same 403 body but is a distinct sentinel
+  (`secretlane.ErrCloudBlockedLookupFailed`, not `ErrCloudBlocked`) and
+  raises no notice. Known limit until G10 (G00 U-4): a refused task is
+  not yet ended terminally — the real worker exits non-zero on the 403, the
+  task is left non-terminal, and a resume respawns it; every respawn is
+  refused the same way (zero bytes upstream) and the notice is still
+  raised only once per kahyad process.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
@@ -857,7 +896,11 @@ first boot). `{}` disables it.
     restart + resume (a resumed task keeps its `trace_id`), and a mark that
     cannot be persisted makes `fs_read` refuse the read
     (`mcp/fs.MsgSecretLaneReadRefused`, ledger `secret_lane_read_refused`)
-    instead of returning the bytes.
+    instead of returning the bytes. Since FIX-B-6 the same read also
+    escalates the calling task's persisted lane to secret (same refusal on
+    failure), so the allowlisted model call itself is cut off at the proxy
+    backstop - the sensitive-read mark alone never blocked it, because
+    `api.anthropic.com` is on the allowlist.
   - **`needs_network:true` container egress is attributed via a
     per-task Proxy-Authorization credential.** `mcp/shell`'s
     `EgressTokenRegistrar` seam (`kahyad/internal/server.
@@ -920,8 +963,9 @@ first boot). `{}` disables it.
   not a static `cfg.default_model`.
 - **Secret-lane classifier wired into memory_write/fs-read/mail-web
   Reader ingestion** — W4-03 wires the W4-03 Reader path (see that
-  package's own doc comment); memory_write/fs-read escalation remains
-  future work. W3-08 (see its own note above) exposes the full
+  package's own doc comment); fs_read escalates the calling task's lane
+  since FIX-B-6 (see the W3-08 note above); memory_write escalation
+  remains future work (G13, G00 U-3). W3-08 (see its own note above) exposes the full
   `secretlane.Classifier` (deterministic + Qwen fallback, now also
   returning `intent`, W4-08) and `secretlane.Escalate` (sticky lane
   widening) for those tasks to call; `POST /v1/task`'s own classification

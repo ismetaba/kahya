@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -524,6 +523,13 @@ func run() int {
 	// marks the session sensitive (see mcp/fs.Server.ContentClassifier's
 	// own doc comment).
 	fsTool.ContentClassifier = server.NewFSContentClassifier()
+	// FIX-B-6: a secret-lane fs_read (path glob or content) also stickily
+	// escalates the CALLING task's persisted lane to secret before a byte is
+	// returned (mcp/fs.LaneEscalator.EscalateSecretLane ->
+	// secretlane.EscalateVerdict; the task is resolved from the caller's UDS
+	// peer attribution, G03 / B-14) - the proxy backstop below then refuses
+	// every later model call of that task.
+	fsTool.LaneEscalator = server.NewFSLaneEscalator(st.Queries, st)
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
 
@@ -808,21 +814,18 @@ func run() int {
 	// secret-lane task through the worker after all), this consults the
 	// tasks-row lane by task_id on EVERY forwarded request and refuses with
 	// 403 + ledger secretlane_cloud_blocked - "gizli-şerit içerik bulut
-	// çağrısına çıkamıyor" (§6 W3 gate). Composed with (runs BEFORE) the
+	// çağrısına çıkamıyor" (§6 W3 gate). Since FIX-B-6 this is also how a
+	// task that was escalated MID-RUN (its fs_read hit secret-lane content,
+	// see fsTool.LaneEscalator above) is cut off from the cloud: the lane is
+	// read on every request, never cached. Composed with (runs BEFORE) the
 	// existing allowlist/budget/sensitive-read gate above - one combined
-	// factory, still exactly one anthEgressGateFactory field.
+	// factory, still exactly one anthEgressGateFactory field. The first
+	// secret-lane refusal of a task raises one Turkish notice
+	// (secretlane_cloud_blocked_notice) - once per task, not per call.
 	secretLaneLookup := server.NewSecretLaneStoreAdapter(st.Queries)
 	secretLaneBackstopFactory := secretlane.NewProxyBackstopHook(secretLaneLookup, st)
-	combinedEgressGateFactory := func(taskID, traceID string) func(*http.Request) error {
-		secretHook := secretLaneBackstopFactory(taskID, traceID)
-		allowlistHook := egressGateFactory(taskID, traceID)
-		return func(r *http.Request) error {
-			if err := secretHook(r); err != nil {
-				return err
-			}
-			return allowlistHook(r)
-		}
-	}
+	cloudBlockedNotices := secretlane.NewCloudBlockedNotices(notifier)
+	combinedEgressGateFactory := secretlane.ChainEgressGates(secretLaneBackstopFactory, egressGateFactory, cloudBlockedNotices)
 	srv.SetAnthproxy(governor, governorNotifier, credential, combinedEgressGateFactory)
 
 	// W3-05: the egress proxy itself - the ONLY route out of the
