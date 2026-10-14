@@ -389,7 +389,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 22 // 0001-0022; bump alongside each new migration file
+	const latestVersion = 23 // 0001-0023; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}
@@ -402,7 +402,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 
 	got = tableNames(t, s.DB())
-	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget", "tool_calls", "session_taint", "ledger_digest_state", "anchor_log"} {
+	for _, name := range []string{"chunks_fts_tri", "chunks_fts_uni", "chunk_vec", "autonomy_state", "approval_tokens", "undo_windows", "egress_budget", "tool_calls", "session_taint", "ledger_digest_state", "anchor_log", "ledger_chain_base"} {
 		if !got[name] {
 			t.Errorf("table %q missing after v1->latest upgrade; tables = %v", name, got)
 		}

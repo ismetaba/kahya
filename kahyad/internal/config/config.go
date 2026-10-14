@@ -396,7 +396,12 @@ type Config struct {
 	// step 5, optional): when set, every anchor line is ALSO appended
 	// there with O_APPEND - the different-uid, kernel-enforced
 	// append-only file the docs/runbooks/anchor-setup.md offline-fallback
-	// block describes (`chflags sappnd`). Default "" (disabled).
+	// block describes (`chflags sappnd`). The line is appended BEFORE the
+	// remote push is attempted, once per anchor_log row (retried next tick
+	// on failure; FIX-P-15) - the offline leg of HANDOFF §5 safety #4.
+	// Requires anchor_remote: with no remote configured Pusher.Run stays a
+	// no-op and nothing is written here (decision G07-1). Default ""
+	// (disabled).
 	AnchorLocalFallbackPath string `yaml:"anchor_local_fallback_path"`
 
 	// --- W4-07 acceptance gate: tick-interval knobs ---

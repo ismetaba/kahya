@@ -82,6 +82,11 @@ sql:
       # InsertUndoWindow/ListOpenUndoWindowsByTrace reference, so it MUST be
       # here for sqlc to regenerate the UndoWindow model with them.
       - "kahyad/migrations/0022_undo_windows_per_op.sql"
+      # 0023 (G07: P-15 + P-3/G07-2) is a plain ALTER TABLE ADD COLUMN
+      # (anchor_log.local_fallback_at, which every anchor_log query below
+      # selects) plus a plain CREATE TABLE (ledger_chain_base) and two data
+      # statements - same reasoning as 0010/0016.
+      - "kahyad/migrations/0023_anchor_local_fallback.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

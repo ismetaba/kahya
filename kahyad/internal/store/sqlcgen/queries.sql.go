@@ -700,7 +700,7 @@ func (q *Queries) GetFact(ctx context.Context, id int64) (Fact, error) {
 }
 
 const getLatestAnchorLog = `-- name: GetLatestAnchorLog :one
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 ORDER BY id DESC
 LIMIT 1
@@ -720,6 +720,7 @@ func (q *Queries) GetLatestAnchorLog(ctx context.Context) (AnchorLog, error) {
 		&i.AnchoredAt,
 		&i.RemoteRef,
 		&i.Status,
+		&i.LocalFallbackAt,
 	)
 	return i, err
 }
@@ -1111,7 +1112,7 @@ const insertAnchorLog = `-- name: InsertAnchorLog :one
 
 INSERT INTO anchor_log (event_id, digest_hex, anchored_at, remote_ref, status)
 VALUES (?, ?, ?, ?, ?)
-RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status
+RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 `
 
 type InsertAnchorLogParams struct {
@@ -1123,7 +1124,8 @@ type InsertAnchorLogParams struct {
 }
 
 // anchor_log queries: kahyad/internal/anchor/push.go is the only writer
-// (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+// (InsertAnchorLog/MarkAnchorPushed/MarkAnchorLocalFallback); push.go and
+// verify.go both read.
 // status is always 'pending' at insert time (task spec step 3: "insert
 // anchor_log row pending" BEFORE the git push is even attempted) - the
 // caller passes the literal string, never a variable, so this file has
@@ -1144,6 +1146,7 @@ func (q *Queries) InsertAnchorLog(ctx context.Context, arg InsertAnchorLogParams
 		&i.AnchoredAt,
 		&i.RemoteRef,
 		&i.Status,
+		&i.LocalFallbackAt,
 	)
 	return i, err
 }
@@ -2126,7 +2129,7 @@ func (q *Queries) ListAllEvents(ctx context.Context) ([]Event, error) {
 }
 
 const listAnchorLogs = `-- name: ListAnchorLogs :many
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 ORDER BY event_id ASC
 `
@@ -2151,6 +2154,48 @@ func (q *Queries) ListAnchorLogs(ctx context.Context) ([]AnchorLog, error) {
 			&i.AnchoredAt,
 			&i.RemoteRef,
 			&i.Status,
+			&i.LocalFallbackAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAnchorLogsMissingLocalFallback = `-- name: ListAnchorLogsMissingLocalFallback :many
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
+FROM anchor_log
+WHERE local_fallback_at IS NULL
+ORDER BY id ASC
+`
+
+// G07 / P-15: rows whose anchor line has not been appended to
+// anchor.local_fallback_path yet, oldest first - Pusher.Run writes them in
+// order before attempting any remote push.
+func (q *Queries) ListAnchorLogsMissingLocalFallback(ctx context.Context) ([]AnchorLog, error) {
+	rows, err := q.db.QueryContext(ctx, listAnchorLogsMissingLocalFallback)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AnchorLog{}
+	for rows.Next() {
+		var i AnchorLog
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventID,
+			&i.DigestHex,
+			&i.AnchoredAt,
+			&i.RemoteRef,
+			&i.Status,
+			&i.LocalFallbackAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2840,7 +2885,7 @@ func (q *Queries) ListOpenUndoWindowsByTrace(ctx context.Context, traceID string
 }
 
 const listPendingAnchorLogs = `-- name: ListPendingAnchorLogs :many
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 WHERE status = 'pending'
 ORDER BY id ASC
@@ -2865,6 +2910,7 @@ func (q *Queries) ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error
 			&i.AnchoredAt,
 			&i.RemoteRef,
 			&i.Status,
+			&i.LocalFallbackAt,
 		); err != nil {
 			return nil, err
 		}
@@ -3230,6 +3276,24 @@ func (q *Queries) ListUncooledEpisodesOlderThan(ctx context.Context, createdAt s
 		return nil, err
 	}
 	return items, nil
+}
+
+const markAnchorLocalFallback = `-- name: MarkAnchorLocalFallback :exec
+UPDATE anchor_log
+SET local_fallback_at = ?
+WHERE id = ?
+`
+
+type MarkAnchorLocalFallbackParams struct {
+	LocalFallbackAt sql.NullString `json:"local_fallback_at"`
+	ID              int64          `json:"id"`
+}
+
+// The ONLY statement that sets local_fallback_at - called once the
+// O_APPEND write to the fallback file has returned without error.
+func (q *Queries) MarkAnchorLocalFallback(ctx context.Context, arg MarkAnchorLocalFallbackParams) error {
+	_, err := q.db.ExecContext(ctx, markAnchorLocalFallback, arg.LocalFallbackAt, arg.ID)
+	return err
 }
 
 const markAnchorPushed = `-- name: MarkAnchorPushed :exec

@@ -9,12 +9,13 @@ import (
 )
 
 type AnchorLog struct {
-	ID         int64          `json:"id"`
-	EventID    int64          `json:"event_id"`
-	DigestHex  string         `json:"digest_hex"`
-	AnchoredAt string         `json:"anchored_at"`
-	RemoteRef  sql.NullString `json:"remote_ref"`
-	Status     string         `json:"status"`
+	ID              int64          `json:"id"`
+	EventID         int64          `json:"event_id"`
+	DigestHex       string         `json:"digest_hex"`
+	AnchoredAt      string         `json:"anchored_at"`
+	RemoteRef       sql.NullString `json:"remote_ref"`
+	Status          string         `json:"status"`
+	LocalFallbackAt sql.NullString `json:"local_fallback_at"`
 }
 
 type ApprovalToken struct {
@@ -135,6 +136,11 @@ type Fact struct {
 	UpdatedAt     string         `json:"updated_at"`
 	CreatedAt     string         `json:"created_at"`
 	ConfirmedAt   sql.NullString `json:"confirmed_at"`
+}
+
+type LedgerChainBase struct {
+	ID          int64 `json:"id"`
+	BaseEventID int64 `json:"base_event_id"`
 }
 
 type LedgerDigestState struct {

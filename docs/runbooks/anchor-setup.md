@@ -161,9 +161,16 @@ Then set in `config.yaml`:
 anchor_local_fallback_path: /usr/local/var/kahya/anchor.log
 ```
 
-Every anchor line kahyad successfully pushes to the remote is now ALSO
-appended here (`O_APPEND`, best-effort — a failure to write the local
-fallback never blocks or fails an otherwise-successful remote push).
+Every anchor line is now appended here the moment kahyad records the
+anchor — before and independently of the remote push — exactly once per
+anchor (`anchor_log.local_fallback_at`), so an offline period still leaves
+a local append-only record. The line is byte-identical to the one the
+remote gets (its timestamp is the anchor's `anchored_at`, UTC). A failed
+write (`anchor_local_fallback_failed` in the JSONL log) is retried on the
+next tick and never blocks the remote push. kahyad never reads this file
+(it is `0622`, write-only for your uid); `kahya ledger verify` uses the git
+remote. The fallback needs `anchor_remote`: with no remote configured
+kahyad anchors nothing and writes nothing here.
 
 ## Alternative backend: S3 Object Lock (documented, not implemented)
 

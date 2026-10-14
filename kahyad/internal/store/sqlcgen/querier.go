@@ -236,7 +236,8 @@ type Querier interface {
 	// redispatch. Returns the new count.
 	IncrementTaskCrashResumes(ctx context.Context, arg IncrementTaskCrashResumesParams) (int64, error)
 	// anchor_log queries: kahyad/internal/anchor/push.go is the only writer
-	// (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+	// (InsertAnchorLog/MarkAnchorPushed/MarkAnchorLocalFallback); push.go and
+	// verify.go both read.
 	// status is always 'pending' at insert time (task spec step 3: "insert
 	// anchor_log row pending" BEFORE the git push is even attempted) - the
 	// caller passes the literal string, never a variable, so this file has
@@ -403,6 +404,10 @@ type Querier interface {
 	// checkpoint list (task spec step 6: "at each anchor_log/remote anchor
 	// line, compare").
 	ListAnchorLogs(ctx context.Context) ([]AnchorLog, error)
+	// G07 / P-15: rows whose anchor line has not been appended to
+	// anchor.local_fallback_path yet, oldest first - Pusher.Run writes them in
+	// order before attempting any remote push.
+	ListAnchorLogsMissingLocalFallback(ctx context.Context) ([]AnchorLog, error)
 	ListAutonomyState(ctx context.Context) ([]AutonomyState, error)
 	ListChunkIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
 	// W5-02 (nightly consolidation) queries below: hot-window detail-atom
@@ -549,6 +554,9 @@ type Querier interface {
 	// correctly, matching CountEventsByKindAndDate's own date()-free
 	// convention above for the same reason).
 	ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error)
+	// The ONLY statement that sets local_fallback_at - called once the
+	// O_APPEND write to the fallback file has returned without error.
+	MarkAnchorLocalFallback(ctx context.Context, arg MarkAnchorLocalFallbackParams) error
 	// The ONLY statement that ever flips a row from 'pending' to 'pushed' -
 	// called once the git push has actually landed on the remote (task spec
 	// step 3: "On success mark pushed").

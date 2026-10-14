@@ -9,7 +9,9 @@
 // the remote anchors.log line: pushRow is idempotent per row, FIX-P-13),
 // and the oldest
 // pending attempt sitting unpushed for more than 2 x interval_hours fires
-// the exact Turkish AlarmStalePending string.
+// the exact Turkish AlarmStalePending string. The optional local
+// append-only fallback line is written BEFORE the push, once per row
+// (FIX-P-15, anchor_log.local_fallback_at), so it exists while offline.
 package anchor
 
 import (
@@ -41,6 +43,8 @@ type PushStore interface {
 	MarkAnchorPushed(ctx context.Context, arg sqlcgen.MarkAnchorPushedParams) error
 	GetLatestAnchorLog(ctx context.Context) (sqlcgen.AnchorLog, error)
 	ListPendingAnchorLogs(ctx context.Context) ([]sqlcgen.AnchorLog, error)
+	ListAnchorLogsMissingLocalFallback(ctx context.Context) ([]sqlcgen.AnchorLog, error)
+	MarkAnchorLocalFallback(ctx context.Context, arg sqlcgen.MarkAnchorLocalFallbackParams) error
 }
 
 // Pusher is the anchor-push job: kahyad/main.go constructs exactly one and
@@ -114,13 +118,21 @@ func (p *Pusher) SetHostname(hostname func() (string, error)) { p.hostname = hos
 // ledger/notifier regardless.
 func (p *Pusher) SetJSONLLogger(l *logx.Logger) { p.jsonl = l }
 
-// Run executes one anchor-push cycle (task spec step 3): a no-op if no
-// remote is configured (see NewPusher's own doc comment); otherwise it
-// anchors the current running digest if it is not already anchored
-// (claimPendingRow), attempts the git push, and always finishes with the
-// stale-pending check (task spec step 5) regardless of whether this tick's
-// own push attempt succeeded. A push failure is NOT returned as an error -
-// the row is simply left 'pending' for the next tick to retry (offline
+// Run executes one anchor cycle (task spec step 3): a no-op if no remote
+// is configured (see NewPusher's own doc comment - decision G07-1: no
+// local-only fallback mode); otherwise it
+//
+//  1. anchors the current running digest as a 'pending' row if it is not
+//     anchored yet (claimPendingRow);
+//  2. appends every row whose line is not in the local fallback file yet
+//     (writeLocalFallbacks, FIX-P-15: HANDOFF S5 #4's offline leg) - BEFORE
+//     any network, so an offline period still leaves a local append-only
+//     record;
+//  3. attempts the remote push (pushRow);
+//  4. always finishes with the stale-pending check (task spec step 5).
+//
+// A push or fallback failure is NOT returned as an error - the row is
+// simply left 'pending' / unmarked for the next tick to retry (offline
 // behavior); only a store-level failure (reading ledger_digest_state, the
 // initial insert) is returned, since those indicate this call could not
 // even attempt its job.
@@ -134,22 +146,66 @@ func (p *Pusher) Run(ctx context.Context, traceID string) error {
 		return err
 	}
 
+	var row *sqlcgen.AnchorLog
 	if state.LastEventID > 0 {
-		row, err := p.claimPendingRow(ctx, state)
+		row, err = p.claimPendingRow(ctx, state)
 		if err != nil {
 			return fmt.Errorf("anchor: claim pending anchor row: %w", err)
 		}
-		if row != nil {
-			// A push failure here is offline behavior, not a hard error -
-			// leave the row 'pending' for the next tick (task spec step 5).
-			if err := p.pushRow(ctx, traceID, *row); err != nil {
-				p.logWarn(traceID, "anchor_push_failed", "event_id", row.EventID, "err", err.Error())
-			}
+	}
+	p.writeLocalFallbacks(ctx, traceID)
+	if row != nil {
+		// A push failure here is offline behavior, not a hard error -
+		// leave the row 'pending' for the next tick (task spec step 5).
+		if err := p.pushRow(ctx, traceID, *row); err != nil {
+			p.logWarn(traceID, "anchor_push_failed", "event_id", row.EventID, "err", err.Error())
 		}
 	}
 
 	p.checkStalePending(ctx, traceID)
 	return nil
+}
+
+// writeLocalFallbacks appends, oldest first, every anchor_log row whose
+// line is not yet in anchor.local_fallback_path, marking each row
+// (local_fallback_at) as it lands - so each row's line is written exactly
+// once, however many push attempts it takes. The line is the same
+// row-derived line the remote gets (anchorLineForRow). It stops at the
+// first failure (order is preserved) and leaves the rest for the next
+// tick; a failure is logged (JSONL anchor_local_fallback_failed), never
+// returned - the fallback is a safety net, not a gate on the remote push.
+// kahyad never reads the file (it may be write-only for this uid, runbook
+// S5); dedupe relies on the column alone.
+func (p *Pusher) writeLocalFallbacks(ctx context.Context, traceID string) {
+	if p.localFallbackPath == "" {
+		return
+	}
+	rows, err := p.store.ListAnchorLogsMissingLocalFallback(ctx)
+	if err != nil {
+		p.logWarn(traceID, "anchor_local_fallback_list_failed", "err", err.Error())
+		return
+	}
+	host := "unknown"
+	if h, err := p.hostname(); err == nil && h != "" {
+		host = h
+	}
+	for _, row := range rows {
+		if err := appendAnchorLine(p.localFallbackPath, anchorLineForRow(row, host)); err != nil {
+			p.logWarn(traceID, "anchor_local_fallback_failed", "event_id", row.EventID, "path", p.localFallbackPath, "err", err.Error())
+			return
+		}
+		if err := p.store.MarkAnchorLocalFallback(ctx, sqlcgen.MarkAnchorLocalFallbackParams{
+			LocalFallbackAt: sql.NullString{String: p.now().UTC().Format(time.RFC3339Nano), Valid: true},
+			ID:              row.ID,
+		}); err != nil {
+			// The line IS on disk; without the mark the next tick appends it
+			// again. Log loudly and stop - one duplicate line after a store
+			// failure beats silently losing the record.
+			p.logWarn(traceID, "anchor_local_fallback_mark_failed", "event_id", row.EventID, "err", err.Error())
+			return
+		}
+		p.logInfo(traceID, "anchor_local_fallback_written", "event_id", row.EventID)
+	}
 }
 
 // claimPendingRow decides what anchor_log row (if any) this tick should
@@ -274,13 +330,6 @@ func (p *Pusher) pushRow(ctx context.Context, traceID string, row sqlcgen.Anchor
 	// A no-op push ("Everything up-to-date") exits 0 - safe to run always.
 	if _, stderr, err := p.runner.Run(ctx, p.repoDir, env, "push", "--quiet", "origin", anchorBranch); err != nil {
 		return fmt.Errorf("anchor: git push: %w: %s", err, stderr)
-	}
-
-	if p.localFallbackPath != "" {
-		// Best-effort (task spec step 5): the local fallback is a bonus
-		// safety net, not the primary durability mechanism - it must never
-		// turn a successful remote push into a reported failure.
-		_ = appendAnchorLine(p.localFallbackPath, line)
 	}
 
 	if err := p.store.MarkAnchorPushed(ctx, sqlcgen.MarkAnchorPushedParams{

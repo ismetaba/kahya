@@ -820,7 +820,8 @@ SET last_event_id = ?, digest = ?
 WHERE id = 1;
 
 -- anchor_log queries: kahyad/internal/anchor/push.go is the only writer
--- (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
+-- (InsertAnchorLog/MarkAnchorPushed/MarkAnchorLocalFallback); push.go and
+-- verify.go both read.
 
 -- name: InsertAnchorLog :one
 -- status is always 'pending' at insert time (task spec step 3: "insert
@@ -829,7 +830,7 @@ WHERE id = 1;
 -- exactly one place that ever creates a 'pending' row.
 INSERT INTO anchor_log (event_id, digest_hex, anchored_at, remote_ref, status)
 VALUES (?, ?, ?, ?, ?)
-RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status;
+RETURNING id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at;
 
 -- name: MarkAnchorPushed :exec
 -- The ONLY statement that ever flips a row from 'pending' to 'pushed' -
@@ -844,7 +845,7 @@ WHERE id = ?;
 -- claimPendingRow uses this to decide whether there is already an
 -- in-flight 'pending' row to retry (offline case, task spec step 5) before
 -- ever considering a new one.
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 ORDER BY id DESC
 LIMIT 1;
@@ -853,7 +854,7 @@ LIMIT 1;
 -- Every not-yet-pushed anchor_log row, oldest first - push.go's
 -- stale-pending alarm (task spec step 5: "if the oldest pending is older
 -- than 2 x interval_hours, alarm") reads index [0].
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 WHERE status = 'pending'
 ORDER BY id ASC;
@@ -863,9 +864,25 @@ ORDER BY id ASC;
 -- verify.go's own recompute-from-event-1 pass uses this as its ordered
 -- checkpoint list (task spec step 6: "at each anchor_log/remote anchor
 -- line, compare").
-SELECT id, event_id, digest_hex, anchored_at, remote_ref, status
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
 FROM anchor_log
 ORDER BY event_id ASC;
+
+-- name: ListAnchorLogsMissingLocalFallback :many
+-- G07 / P-15: rows whose anchor line has not been appended to
+-- anchor.local_fallback_path yet, oldest first - Pusher.Run writes them in
+-- order before attempting any remote push.
+SELECT id, event_id, digest_hex, anchored_at, remote_ref, status, local_fallback_at
+FROM anchor_log
+WHERE local_fallback_at IS NULL
+ORDER BY id ASC;
+
+-- name: MarkAnchorLocalFallback :exec
+-- The ONLY statement that sets local_fallback_at - called once the
+-- O_APPEND write to the fallback file has returned without error.
+UPDATE anchor_log
+SET local_fallback_at = ?
+WHERE id = ?;
 
 -- name: ListAllEvents :many
 -- Every ledger event ever appended, oldest first - verify.go's own
