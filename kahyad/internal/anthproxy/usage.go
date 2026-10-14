@@ -115,6 +115,71 @@ var pricingTable = []PriceRow{
 	priceRow("claude-fable-5", time.Time{}, time.Time{}, 10, 50),
 }
 
+// DefaultAllowedModels is the set of model ids this proxy forwards when
+// ProxyConfig.AllowedModels is nil (FIX-I-10): exactly the models
+// pricingTable prices, so a model can never be allowlisted without a price.
+// kahyad/internal/server passes spawn.AllowedModels explicitly; the two sets
+// are pinned equal by server's TestSpawnAllowedModelsMatchProxyDefault, so a
+// model-id bump stays a data-only change (pricing row + spawn.AllowedModels).
+func DefaultAllowedModels() map[string]bool {
+	out := make(map[string]bool, len(pricingTable))
+	for _, row := range pricingTable {
+		out[row.Model] = true
+	}
+	return out
+}
+
+// MaxPriceRow returns the costliest row valid at `at` (highest
+// USDPerMTokOut, ties broken by USDPerMTokIn). FIX-I-10 fail-closed
+// fallback: a call or an estimate whose model somehow has no pricing row is
+// billed at THIS rate, never at $0.
+func MaxPriceRow(at time.Time) PriceRow {
+	var best PriceRow
+	for _, row := range pricingTable {
+		if !row.From.IsZero() && at.Before(row.From) {
+			continue
+		}
+		if !row.To.IsZero() && !at.Before(row.To) {
+			continue
+		}
+		if row.USDPerMTokOut > best.USDPerMTokOut ||
+			(row.USDPerMTokOut == best.USDPerMTokOut && row.USDPerMTokIn > best.USDPerMTokIn) {
+			best = row
+		}
+	}
+	return best
+}
+
+// modelAliases maps a DATED snapshot id the bundled claude CLI may still
+// send for its own auxiliary calls onto the pricingTable id it is a
+// snapshot of (owner decision G11-3 (i)). spawn.BuildEnv pins the CLI's
+// auxiliary model (ANTHROPIC_SMALL_FAST_MODEL / ANTHROPIC_DEFAULT_HAIKU_MODEL)
+// to an allowlisted id; this table is the backstop for a CLI that ignores
+// those. An aliased call is allowlisted and priced as its target and
+// forwarded with its body unchanged. Never a new model: every target must
+// itself be priced (TestModelAliasesTargetPricedModels).
+var modelAliases = map[string]string{
+	"claude-haiku-4-5-20251001": "claude-haiku-4-5",
+}
+
+// CanonicalModel returns the id a request's "model" field stands for:
+// its modelAliases target, or the field unchanged.
+func CanonicalModel(model string) string {
+	if target, ok := modelAliases[model]; ok {
+		return target
+	}
+	return model
+}
+
+// ModelAliases returns a copy of the alias table (for cross-package tests).
+func ModelAliases() map[string]string {
+	out := make(map[string]string, len(modelAliases))
+	for k, v := range modelAliases {
+		out[k] = v
+	}
+	return out
+}
+
 // PriceFor returns the pricing row for model whose [From,To) window
 // contains at. An unknown model is an error — the proxy must never price a
 // call at $0 just because it doesn't recognize the model string.

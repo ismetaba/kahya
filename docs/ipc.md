@@ -104,6 +104,7 @@ MCP timeouts only when an approval wait is configured):
 | `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and (since W3-05) the `egressGate` hook — now a real `kahyad/internal/egress.Gate.Check` call, gating `host=<AnthropicUpstreamURL's own host:port>` — are enforced at that proxy, never in this package. |
 | `ANTHROPIC_CUSTOM_HEADERS` | Since FIX-I-1, whenever the spawn has a per-task proxy: exactly one line, `X-Kahya-Task-Token: kahya-task-<hex32>` — the **per-task random token** (`spawn.NewAPIKey`), **NOT a real Anthropic key** (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). The bundled CLI adds it to every model call; the per-task forward-proxy listener validates this header first (constant-time; `401` + ledger `proxy_auth_reject` on a mismatch, so no other local process can spend through kahyad by guessing the port) and strips it in both credential modes — it never reaches the upstream. An inherited value is stripped (`spawn.secretEnvDenylist`). |
 | `ANTHROPIC_API_KEY` | Only in `credential_mode: keychain` (and the legacy empty mode): the same per-task token, the W12-08 carrier (the CLI sends it as `x-api-key`; the proxy still accepts it, strips it, and injects the real Keychain key). **Unset in `passthrough`** (FIX-I-1): the CLI picks exactly one credential source and a set `ANTHROPIC_API_KEY` always wins over its own Claude Code login, so any value there would disable the credential passthrough forwards. An inherited value is always stripped. |
+| `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Since FIX-I-10: both `spawn.CLIAuxiliaryModel` (= `router.ModelHaiku`, a HANDOFF §9 id) — pins the bundled CLI's own auxiliary calls (summaries, titles, compaction) to an allowlisted, priced model instead of the CLI's built-in dated Haiku id. Inherited values of these and of `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_{SONNET,OPUS,FABLE}_MODEL` are stripped (`spawn.secretEnvDenylist`): model choice is Go's, never the parent shell's. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertions apply (`kahya_worker.__main__._check_credential_env`, exit 2 + `worker_env_invalid` on a violation): in `"passthrough"`, `ANTHROPIC_CUSTOM_HEADERS` must carry the `X-Kahya-Task-Token: kahya-task-<hex32>` line **and** `ANTHROPIC_API_KEY` must be unset (FIX-I-1); in `"keychain"` (and any other value), `ANTHROPIC_API_KEY` must match the per-task token shape. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
 | `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. The worker also passes it explicitly in the `kahya_memory` stdio server's own `env` (`_build_options`). |
@@ -192,6 +193,39 @@ one deferred item is a **live** check with the real Claude Code login
 criterion (`model_call status=ok` for the live task's trace; a
 `task.failed` row is a FAIL) — see the W12-08 task file for the deferral
 note.
+
+**FIX-I-10 — model + path allowlist, never $0 pricing.** The worker's
+CLI writes the proxied body, so the proxy re-checks it in Go
+(`ServeHTTP` order, G00 C-8: local auth 401 → path allowlist 404 → egress
+gate 403 → passthrough credential presence 401 → body → Fable-5 shaping →
+model allowlist 400 → governor 503 → keychain 503 → upstream):
+
+- **Paths:** only `/v1/messages` and `/v1/messages/count_tokens` (the URL
+  path; the CLI's `?beta=true` query is fine). Anything else (files,
+  batches, model listing, admin) is `404` with `"Izin verilmeyen uc nokta
+  - istek reddedildi."` and ledger `proxy.path_rejected` `{task_id, path,
+  method}`; widened only after a live `proxy.path_rejected` is reviewed
+  (owner decision G11-4).
+- **Models:** the body's `model`, after resolving a dated CLI snapshot id
+  to its HANDOFF id (`anthproxy.CanonicalModel`; today
+  `claude-haiku-4-5-20251001` → `claude-haiku-4-5`, owner decision G11-3
+  (i); the body is forwarded unchanged), must be in `spawn.AllowedModels`
+  (`ProxyConfig.AllowedModels`; nil = `anthproxy.DefaultAllowedModels()`,
+  exactly the priced set — `TestSpawnAllowedModelsMatchProxyDefault` pins
+  the two equal, so a model-id bump is data-only). Otherwise `400` with
+  `"Izin verilmeyen model kimligi - istek reddedildi."` and ledger
+  `proxy.model_rejected` `{task_id, model}`, before any budget
+  reservation. A rejection does not fail the task by itself.
+- **Pricing:** a forwarded call whose model has no pricing row is billed
+  at `anthproxy.MaxPriceRow` (the costliest row valid now) with ledger
+  `proxy.price_unknown` `{task_id, model, billed_as}`, and the governor's
+  pre-forward estimate uses the same rate — a call is never billed $0.
+- **CLI auxiliary model:** `ANTHROPIC_SMALL_FAST_MODEL` /
+  `ANTHROPIC_DEFAULT_HAIKU_MODEL` = `spawn.CLIAuxiliaryModel` (env table
+  above). The hermetic gate's `no_model_rejected` subtests
+  (`TestW12Acceptance`, `TestW12PassthroughCloudAuth`) fail on any of the
+  three ledger kinds; with the pinned CLI they see only the main
+  `POST /v1/messages` call.
 
 **Post-review addition (BLOCKER 2 fix)** — `Governor.CheckBeforeForward`
 is now an atomic check-and-reserve, not a plain check-then-act: it

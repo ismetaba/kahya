@@ -120,6 +120,10 @@ func TestW12PassthroughCloudAuth(t *testing.T) {
 		}
 	})
 
+	t.Run("no_model_rejected", func(t *testing.T) {
+		assertNoProxyAllowlistRejections(t, dbPath, mock.Requests())
+	})
+
 	t.Run("single_trace_id", func(t *testing.T) {
 		if n := countTraceMatches(t, filepath.Join(logDir, "worker.jsonl"), traceID); n == 0 {
 			t.Errorf("worker.jsonl has no line carrying trace_id=%s", traceID)

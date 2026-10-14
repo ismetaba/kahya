@@ -393,10 +393,15 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 		UpstreamURL:    s.cfg.AnthropicUpstreamURL,
 		CredentialMode: s.cfg.CredentialMode,
 		Credential:     s.anthCredential,
-		Governor:       s.anthGovernor,
-		Notifier:       s.anthNotifier,
-		EventLedger:    s.eventLogger,
-		EgressGate:     egressGate,
+		// FIX-I-10: the same HANDOFF §9 set envelope.Model is validated
+		// against; the worker CLI writes the proxied body, so the proxy
+		// re-checks its "model" (TestSpawnAllowedModelsMatchProxyDefault
+		// pins this set equal to the proxy's priced default).
+		AllowedModels: spawn.AllowedModels,
+		Governor:      s.anthGovernor,
+		Notifier:      s.anthNotifier,
+		EventLedger:   s.eventLogger,
+		EgressGate:    egressGate,
 		// W4-04: cloud-call error taxonomy / retry / task parking.
 		MaxInlineRetries: s.cfg.CloudRetryMaxInline,
 		JSONLLog:         s.log,

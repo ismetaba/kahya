@@ -241,6 +241,14 @@ func TestW12Acceptance(t *testing.T) {
 		}
 	})
 
+	// FIX-I-10 (owner decisions G11-3/G11-4): every call the real worker
+	// CLI made was allowlisted and priced - a CLI auxiliary call on a dated
+	// or unknown model, or an endpoint outside /v1/messages(+count_tokens),
+	// shows up here first, before any live run.
+	t.Run("no_model_rejected", func(t *testing.T) {
+		assertNoProxyAllowlistRejections(t, dbPath, mock.Requests())
+	})
+
 	t.Run("answer", func(t *testing.T) {
 		if stdout == "" {
 			t.Fatal("cli stdout is empty")
@@ -936,5 +944,36 @@ func assertNoLocalTokenUpstream(t *testing.T, reqs []mockanthropic.RecordedReque
 				}
 			}
 		}
+	}
+}
+
+// assertNoProxyAllowlistRejections (FIX-I-10) fails on any
+// proxy.model_rejected / proxy.path_rejected / proxy.price_unknown ledger
+// row (printing its payload), and logs every (path, model) the mock
+// upstream saw so a CLI auxiliary call's model is visible in the test log.
+func assertNoProxyAllowlistRejections(t *testing.T, dbPath string, reqs []mockanthropic.RecordedRequest) {
+	t.Helper()
+	for i, req := range reqs {
+		var probe struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(req.Body, &probe)
+		t.Logf("upstream request %d: %s %s model=%q", i, req.Method, req.Path, probe.Model)
+	}
+	db := openBrainDB(t, dbPath)
+	rows, err := db.Query(`SELECT kind, payload FROM events WHERE kind IN ('proxy.model_rejected','proxy.path_rejected','proxy.price_unknown') ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query allowlist rejection events: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, payload string
+		if err := rows.Scan(&kind, &payload); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		t.Errorf("ledger has %s %s: the worker CLI made a call outside the model/path allowlist or pricing table", kind, payload)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
 	}
 }

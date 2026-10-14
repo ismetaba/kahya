@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"kahya/kahyad/internal/router"
 )
 
 // SchemaVersion is envelope v1's schema_version, frozen in docs/ipc.md.
@@ -52,6 +54,15 @@ var AllowedModels = map[string]bool{
 	"claude-haiku-4-5": true,
 	"claude-fable-5":   true,
 }
+
+// CLIAuxiliaryModel is the model BuildEnv pins the bundled claude CLI's
+// OWN auxiliary calls to (summaries, titles, compaction helpers;
+// ANTHROPIC_SMALL_FAST_MODEL / ANTHROPIC_DEFAULT_HAIKU_MODEL, FIX-I-10).
+// Left alone the CLI picks a DATED Haiku id the proxy's allowlist and
+// pricing table do not list. Derived from the router's own HANDOFF §9
+// Haiku constant (never a new literal); AllowedModels[CLIAuxiliaryModel]
+// is pinned by a test.
+const CLIAuxiliaryModel = router.ModelHaiku
 
 // Envelope is the single JSON object written to a worker's stdin (then
 // stdin is closed) - one per spawned task (HANDOFF §4 IPC ⚑, frozen in

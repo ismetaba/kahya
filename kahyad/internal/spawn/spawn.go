@@ -578,17 +578,28 @@ func killGroup(cmd *exec.Cmd) {
 //     one X-Kahya-Task-Token line; an inherited value would let the parent
 //     shell attach arbitrary headers to every model call (and would survive
 //     on any spawn where BuildEnv sets no token line).
+//   - ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL /
+//     ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS,FABLE}_MODEL (FIX-I-10): model
+//     selection is Go's decision (HANDOFF §4 "karar Go kodunda"), so the
+//     parent shell must not re-route the worker CLI's calls; BuildEnv pins
+//     the auxiliary pair itself (CLIAuxiliaryModel).
 //
 // CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT listed (owner decision
 // G11-1/G11-2): in passthrough it is a legitimate credential source of the
 // worker CLI's own Claude Code login, which is what passthrough forwards.
 var secretEnvDenylist = map[string]bool{
-	"KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
-	"ANTHROPIC_API_KEY":            true,
-	"ANTHROPIC_AUTH_TOKEN":         true,
-	"KAHYA_CONTROL_SECRET":         true,
-	"KAHYA_CONTROL_SECRET_PATH":    true,
-	"ANTHROPIC_CUSTOM_HEADERS":     true,
+	"KAHYA_ANTHROPIC_KEY_OVERRIDE":   true,
+	"ANTHROPIC_API_KEY":              true,
+	"ANTHROPIC_AUTH_TOKEN":           true,
+	"KAHYA_CONTROL_SECRET":           true,
+	"KAHYA_CONTROL_SECRET_PATH":      true,
+	"ANTHROPIC_CUSTOM_HEADERS":       true,
+	"ANTHROPIC_MODEL":                true,
+	"ANTHROPIC_SMALL_FAST_MODEL":     true,
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL":  true,
+	"ANTHROPIC_DEFAULT_SONNET_MODEL": true,
+	"ANTHROPIC_DEFAULT_OPUS_MODEL":   true,
+	"ANTHROPIC_DEFAULT_FABLE_MODEL":  true,
 }
 
 // filterSecretEnv returns a copy of in with every entry whose NAME (the
@@ -683,6 +694,14 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_BUG_COMMAND=1",
+		// FIX-I-10: the bundled CLI's own auxiliary calls (summaries,
+		// titles, compaction helpers) default to a DATED Haiku id the
+		// proxy's allowlist and pricing table do not list. Pin them to an
+		// allowlisted, priced HANDOFF §9 id so every call the worker's CLI
+		// makes is allowlisted AND priced (the proxy's CanonicalModel alias
+		// is the backstop for a CLI that ignores these).
+		"ANTHROPIC_SMALL_FAST_MODEL=" + CLIAuxiliaryModel,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + CLIAuxiliaryModel,
 	}
 	// FIX-I-1: the per-task token travels in its own header so the CLI's
 	// single-credential-source rule never sees it as "the" API key. The

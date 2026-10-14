@@ -3,6 +3,8 @@ package anthproxy
 import (
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/router"
 )
 
 func TestParseNonStreamUsage(t *testing.T) {
@@ -160,5 +162,69 @@ func TestUsageCostUSD(t *testing.T) {
 	want := 5.0 + 25.0 + (5.0 * 0.1) + (5.0 * 2.0) // in + out + cache_read(0.1x) + cache_write_1h(2x)
 	if got != want {
 		t.Errorf("CostUSD() = %v, want %v", got, want)
+	}
+}
+
+// TestAllowedModelsAllPriced (FIX-I-10): every model the default allowlist
+// admits has a pricing row now and a year from now - allowlist ⊆ pricing.
+func TestAllowedModelsAllPriced(t *testing.T) {
+	now := time.Now()
+	allowed := DefaultAllowedModels()
+	if len(allowed) == 0 {
+		t.Fatal("DefaultAllowedModels() is empty")
+	}
+	for m := range allowed {
+		for _, at := range []time.Time{now, now.AddDate(1, 0, 0)} {
+			if _, err := PriceFor(m, at); err != nil {
+				t.Errorf("allowlisted model %q has no price at %s: %v", m, at.Format(time.RFC3339), err)
+			}
+		}
+	}
+}
+
+// TestMaxPriceRowIsCostliestValidRow (FIX-I-10, recipe TestMaxPriceRowIsFable5
+// made id-agnostic so a model bump stays data-only): the fail-closed
+// fallback row dominates every row valid at the query time, and is the
+// HANDOFF "derin düşün" (Fable) tier.
+func TestMaxPriceRowIsCostliestValidRow(t *testing.T) {
+	now := time.Now()
+	maxRow := MaxPriceRow(now)
+	if maxRow.Model == "" || maxRow.USDPerMTokOut <= 0 {
+		t.Fatalf("MaxPriceRow(now) = %+v, want a real priced row", maxRow)
+	}
+	for _, row := range pricingTable {
+		if (!row.From.IsZero() && now.Before(row.From)) || (!row.To.IsZero() && !now.Before(row.To)) {
+			continue
+		}
+		if row.USDPerMTokOut > maxRow.USDPerMTokOut || (row.USDPerMTokOut == maxRow.USDPerMTokOut && row.USDPerMTokIn > maxRow.USDPerMTokIn) {
+			t.Errorf("row %+v is costlier than MaxPriceRow %+v", row, maxRow)
+		}
+	}
+	fable, err := PriceFor(router.ModelFable, now)
+	if err != nil {
+		t.Fatalf("PriceFor(%q): %v", router.ModelFable, err)
+	}
+	if maxRow.USDPerMTokOut != fable.USDPerMTokOut || maxRow.USDPerMTokIn != fable.USDPerMTokIn {
+		t.Errorf("MaxPriceRow = %s $%v/$%v, want the Fable tier $%v/$%v", maxRow.Model, maxRow.USDPerMTokIn, maxRow.USDPerMTokOut, fable.USDPerMTokIn, fable.USDPerMTokOut)
+	}
+}
+
+// TestModelAliasesTargetPricedModels (owner decision G11-3 (i)): an alias
+// is a dated snapshot of a priced HANDOFF id, never a model of its own.
+func TestModelAliasesTargetPricedModels(t *testing.T) {
+	allowed := DefaultAllowedModels()
+	for alias, target := range ModelAliases() {
+		if allowed[alias] {
+			t.Errorf("alias %q is itself a pricing-table id; aliases must only map dated snapshots", alias)
+		}
+		if !allowed[target] {
+			t.Errorf("alias %q -> %q: target is not a priced/allowlisted model", alias, target)
+		}
+		if got := CanonicalModel(alias); got != target {
+			t.Errorf("CanonicalModel(%q) = %q, want %q", alias, got, target)
+		}
+	}
+	if got := CanonicalModel(router.ModelSonnet); got != router.ModelSonnet {
+		t.Errorf("CanonicalModel(%q) = %q, want it unchanged", router.ModelSonnet, got)
 	}
 }

@@ -358,7 +358,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -401,7 +401,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	if _, err := http.DefaultClient.Do(req); err != nil {
 		t.Fatalf("request before Close() failed: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 	}
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	req2 := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
+	req2 := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	if _, err := client.Do(req2); err == nil {
 		t.Fatal("request after Close() succeeded, want connection refused/failed")
 	}
@@ -464,7 +464,7 @@ func TestProxyKeychainUnavailableRespondsAndNotifiesOnce(t *testing.T) {
 	baseURL, _ := startTestProxy(t, cfg)
 
 	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{}`))
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
 		req.Header.Set("x-api-key", testToken)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

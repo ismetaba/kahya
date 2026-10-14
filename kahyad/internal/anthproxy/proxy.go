@@ -133,6 +133,38 @@ const ReasonNoUpstreamCredential = "no_upstream_credential"
 // eksik veya gecersiz.").
 const MsgNoUpstreamCredential = "Bulut kimlik bilgisi yok - worker'in Claude Code oturumu bulunamadi (claude /login) ya da credential_mode: keychain secin."
 
+// FIX-I-10: model + path allowlist and fail-closed pricing.
+const (
+	// EventModelRejected: a request named a model outside
+	// ProxyConfig.AllowedModels (payload task_id, model). 400, never
+	// forwarded, nothing reserved; the task itself is not failed here.
+	EventModelRejected = "proxy.model_rejected"
+	// EventPathRejected: a request targeted an endpoint outside
+	// allowedPaths (payload task_id, path, method). 404, never forwarded.
+	EventPathRejected = "proxy.path_rejected"
+	// EventPriceUnknown: a forwarded call's model had no pricing row; it
+	// was billed at MaxPriceRow (payload task_id, model, billed_as).
+	EventPriceUnknown = "proxy.price_unknown"
+)
+
+// MsgModelNotAllowed / MsgPathNotAllowed are the Anthropic-shaped error
+// bodies for EventModelRejected / EventPathRejected (ASCII-folded Turkish,
+// like this file's other proxy-level bodies).
+const (
+	MsgModelNotAllowed = "Izin verilmeyen model kimligi - istek reddedildi."
+	MsgPathNotAllowed  = "Izin verilmeyen uc nokta - istek reddedildi."
+)
+
+// allowedPaths are the only upstream endpoints a worker may reach through
+// this proxy (owner decision G11-4: widened only after a live
+// proxy.path_rejected is reviewed). Anything else - files, batches, admin,
+// model listing - is 404 + EventPathRejected. Compared against the URL
+// path only (the CLI appends ?beta=true).
+var allowedPaths = map[string]bool{
+	"/v1/messages":              true,
+	"/v1/messages/count_tokens": true,
+}
+
 // CredentialMode values (mirrors kahyad/internal/config's
 // CredentialModeKeychain/CredentialModePassthrough literals — this
 // package intentionally does not import kahyad/internal/config so it has
@@ -241,6 +273,13 @@ type ProxyConfig struct {
 	Notifier    notify.Notifier
 	EventLedger EventLedger
 
+	// AllowedModels is the model allowlist (FIX-I-10; HANDOFF §4 "karar Go
+	// kodunda"): a request whose (alias-resolved, CanonicalModel) "model"
+	// is not a true key is refused with 400 before any reservation. nil
+	// means DefaultAllowedModels(); kahyad/internal/server passes
+	// spawn.AllowedModels. A non-nil empty map refuses every model.
+	AllowedModels map[string]bool
+
 	// PauseBudget is the task-row callback (task spec step 3: "task state
 	// update via a callback into spawn/store, keeping anthproxy
 	// store-agnostic"). May be nil (best-effort).
@@ -340,6 +379,9 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.AllowedModels == nil {
+		cfg.AllowedModels = DefaultAllowedModels()
 	}
 
 	upstream, err := url.Parse(cfg.UpstreamURL)
@@ -470,11 +512,13 @@ type reqData struct {
 const proxyRequestMaxBytes = 16 << 20 // 16 MiB: generous for a /v1/messages body
 
 // ServeHTTP implements the full per-request pipeline (task spec steps
-// 1/3/4, reordered by BLOCKER 2): local-auth check -> egress gate ->
-// (passthrough) upstream-credential presence (FIX-I-1) -> read body ->
-// governor check-and-RESERVE (needs the body/model to size its
-// conservative estimate - see Governor.CheckBeforeForward) -> (in keychain
-// mode) credential resolution -> delegate to the reverse proxy, which
+// 1/3/4, reordered by BLOCKER 2; canonical order per G00 C-8): local-auth
+// check (401) -> path allowlist (404, FIX-I-10) -> egress gate (403) ->
+// (passthrough) upstream-credential presence (401, FIX-I-1) -> read body ->
+// Fable-5 shaping -> model allowlist (400, FIX-I-10) -> governor
+// check-and-RESERVE (503; needs the body/model to size its conservative
+// estimate - see Governor.CheckBeforeForward) -> (in keychain mode)
+// credential resolution (503) -> delegate to the reverse proxy, which
 // streams the response back through wrapResponseBody's usage capture.
 //
 // BLOCKER 2: once CheckBeforeForward grants a reservation, this handler
@@ -496,6 +540,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.ledgerAuthReject(ctx, r)
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error",
 			"Yerel yetkilendirme jetonu eksik veya gecersiz.")
+		return
+	}
+
+	// FIX-I-10: this proxy exists for the model call only (HANDOFF §4 IPC
+	// ⚑); files, batches, admin and every other endpoint are refused before
+	// anything else runs (after local auth, so an unauthenticated caller
+	// learns nothing about the allowlist).
+	if !allowedPaths[r.URL.Path] {
+		if p.cfg.EventLedger != nil {
+			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventPathRejected, map[string]any{
+				"task_id": p.cfg.TaskID, "path": r.URL.Path, "method": r.Method,
+			})
+		}
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", MsgPathNotAllowed)
 		return
 	}
 
@@ -551,7 +609,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return io.NopCloser(bytes.NewReader(replayBody)), nil
 	}
 
-	model, systemHash := probeRequest(bodyBytes)
+	requestedModel, systemHash := probeRequest(bodyBytes)
+
+	// FIX-I-10: the model allowlist (HANDOFF §4 "karar Go kodunda"). The
+	// worker's CLI writes this body, so its "model" is checked here, after
+	// resolving a dated CLI snapshot id to its HANDOFF id (CanonicalModel,
+	// owner decision G11-3 (i)) and BEFORE any budget reservation. A
+	// rejection does not fail the task: an auxiliary CLI call being refused
+	// must not end the main session (a refused main call surfaces as the
+	// CLI's own 400).
+	model := CanonicalModel(requestedModel)
+	if !p.cfg.AllowedModels[model] {
+		if p.cfg.EventLedger != nil {
+			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventModelRejected, map[string]any{
+				"task_id": p.cfg.TaskID, "model": requestedModel,
+			})
+		}
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", MsgModelNotAllowed)
+		return
+	}
 
 	check := p.cfg.Governor.CheckBeforeForward(p.cfg.TaskID, model, bodyBytes)
 	if !check.Allowed {
@@ -824,10 +900,20 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 			statusStr = "error"
 		}
 
-		var usd float64
-		if row, priceErr := PriceFor(data.Model, p.cfg.Now()); priceErr == nil {
-			usd = u.CostUSD(row)
+		row, priceErr := PriceFor(data.Model, p.cfg.Now())
+		if priceErr != nil {
+			// Unreachable while the allowlist holds (DefaultAllowedModels
+			// is the priced set; spawn.AllowedModels is pinned equal to it)
+			// - but never $0: bill at the costliest known rate and leave a
+			// ledger trail (FIX-I-10).
+			row = MaxPriceRow(p.cfg.Now())
+			if p.cfg.EventLedger != nil {
+				_ = p.cfg.EventLedger.LogEvent(context.Background(), p.cfg.TraceID, EventPriceUnknown, map[string]any{
+					"task_id": p.cfg.TaskID, "model": data.Model, "billed_as": row.Model,
+				})
+			}
 		}
+		usd := u.CostUSD(row)
 
 		// context.Background(): the inbound request's own context may
 		// already be cancelled by the time the body finishes draining

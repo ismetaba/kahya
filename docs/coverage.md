@@ -190,6 +190,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #1 | a wrong `X-Kahya-Task-Token` is a local-auth reject in both credential modes, even beside a matching legacy header | `kahyad/internal/anthproxy/TestProxyRejectsWrongTaskTokenHeader` | FIX-I-1 | ci-hermetic |
 | Safety #1 | passthrough worker env carries the token only in `ANTHROPIC_CUSTOM_HEADERS`, never `ANTHROPIC_API_KEY` (no parent value leaks back in) | `kahyad/internal/spawn/TestBuildEnvPassthroughOmitsAPIKeyAndSetsCustomHeader` | FIX-I-1 | ci-hermetic |
 | Safety #1 | real bins, passthrough default: the worker CLI's own credential reaches the upstream, the local token never does | `tests/e2e/TestW12PassthroughCloudAuth` | FIX-I-1 | local-integration |
+| Safety #1 | only `/v1/messages` (+`count_tokens`) reach the upstream through the per-task proxy; files/batches/admin are 404 `proxy.path_rejected`, zero upstream bytes | `kahyad/internal/anthproxy/TestProxyRejectsUnknownPath` | FIX-I-10 | ci-hermetic |
 | Safety #2 | missing taint record ⇒ untrusted (fail-closed) | `kahyad/internal/taint/TestGetMissingRowIsTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint read error ⇒ fail-closed to tainted | `kahyad/internal/taint/TestGetOnReadErrorFailsClosedToTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint only rises (clean-after-tainted rejected) | `kahyad/internal/taint/TestRaiseThenInsertCleanFails` | W4-03 | ci-hermetic |
@@ -297,6 +298,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product B | first-run autonomy (`autonomy_bootstrap_levels`) seeds only missing rows — never overrides an earned or demoted level | `kahyad/internal/policy/TestBootstrapLevelsSeedsOnlyMissingRows` | FIX-B-1 | ci-hermetic |
 | Product B | `POST /policy/check` on a timed-out context ⇒ DENY fail-closed | `kahyad/internal/policy/TestCheckContextTimeoutDeniesFailClosed` | W78-03 | ci-hermetic |
 | Product B | policy state read error ⇒ DENY fail-closed | `kahyad/internal/policy/TestDBErrorPathDeniesFailClosed` | W12-07 | ci-hermetic |
+| Product B | the model is Go's decision: the proxy refuses a CLI-written body whose model is outside the allowlist (400 `proxy.model_rejected`) before any budget reservation | `kahyad/internal/anthproxy/TestProxyRejectsModelOutsideAllowlist` | FIX-I-10 | ci-hermetic |
+| Product B | the production per-task proxy enforces `spawn.AllowedModels`, pinned equal to the priced set (router models + CLI auxiliary model included) | `kahyad/internal/server/TestSpawnAllowedModelsMatchProxyDefault` | FIX-I-10 | ci-hermetic |
+| Product B | a forwarded call is never billed $0: an unpriced model is billed at `MaxPriceRow` and ledgered `proxy.price_unknown` | `kahyad/internal/anthproxy/TestProxyPricesUnpriceableModelAtMaxRate` | FIX-I-10 | ci-hermetic |
+| Product B | the governor's pre-forward estimate of an unpriced model uses the max rate, so the USD budgets still block it | `kahyad/internal/anthproxy/TestEstimateUsesMaxRateForUnpricedModel` | FIX-I-10 | ci-hermetic |
+| Product B | real bins: every call the worker CLI makes is allowlisted and priced (subtest `no_model_rejected`) | `tests/e2e/TestW12Acceptance` | FIX-I-10 | local-integration |
 | Product C | secret-lane fixture ⇒ zero cloud forward-proxy requests | `kahyad/internal/reader/TestNoCloudFallbackSecretLaneFixtureNeverHitsProxy` | W4-03 | ci-hermetic |
 | Product C | local-model unavailable (memory pressure) ⇒ fail-closed, zero cloud requests | `kahyad/internal/reader/TestNoCloudFallbackLocalUnavailableNeverHitsProxy` | W4-03 | ci-hermetic |
 | Product C | finans/sağlık/kimlik lexicon keeps every suffixed true positive (word-start prefix match, fail-closed) | `kahyad/internal/secretlane/TestClassifyDeterministicLexiconSuffixedTruePositives` | FIX-B-2 | ci-hermetic |

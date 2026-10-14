@@ -84,3 +84,37 @@ func TestTaskTokenHeaderNameLiteral(t *testing.T) {
 		t.Fatalf("CredentialModePassthroughLiteral = %q, want passthrough", CredentialModePassthroughLiteral)
 	}
 }
+
+// TestBuildEnvPinsCLIAuxiliaryModel (FIX-I-10): the bundled CLI's own
+// auxiliary calls are pinned to an allowlisted, priced id instead of the
+// CLI's built-in DATED Haiku id, and a parent shell cannot re-route any of
+// the worker CLI's model choices.
+func TestBuildEnvPinsCLIAuxiliaryModel(t *testing.T) {
+	for _, name := range []string{
+		"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+	} {
+		t.Setenv(name, "parent-shell-model-x")
+	}
+	cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "http://127.0.0.1:1", APIKey: "kahya-task-abc", CredentialMode: "passthrough"}
+	got := BuildEnv(cfg, Envelope{TaskID: "t", TraceID: "tr"})
+	resolved, present := resolveEnv(got)
+	for _, name := range []string{"ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"} {
+		if resolved[name] != CLIAuxiliaryModel {
+			t.Errorf("%s = %q, want CLIAuxiliaryModel %q", name, resolved[name], CLIAuxiliaryModel)
+		}
+	}
+	for _, name := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL"} {
+		if present[name] {
+			t.Errorf("worker env carries the parent's %s=%q, want it stripped", name, resolved[name])
+		}
+	}
+	for _, kv := range got {
+		if strings.HasSuffix(kv, "=parent-shell-model-x") {
+			t.Errorf("a parent-shell model override reached the worker: %q", kv)
+		}
+	}
+	if !AllowedModels[CLIAuxiliaryModel] {
+		t.Errorf("CLIAuxiliaryModel %q is not in AllowedModels", CLIAuxiliaryModel)
+	}
+}

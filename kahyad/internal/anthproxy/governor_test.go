@@ -539,3 +539,18 @@ func TestFailedRequestReleaseAllowsLaterCall(t *testing.T) {
 		t.Error("CheckBeforeForward() after releasing the failed request's reservation = blocked, want Allowed (the reservation must not leak)")
 	}
 }
+
+// TestEstimateUsesMaxRateForUnpricedModel (FIX-I-10): a request whose model
+// cannot be priced is estimated at MaxPriceRow, so the USD budgets police it
+// too (before: a $0 estimate slipped past DailyBudgetUSD).
+func TestEstimateUsesMaxRateForUnpricedModel(t *testing.T) {
+	g := NewGovernor(Limits{DailyBudgetUSD: 0.01, MonthlyBudgetUSD: 150, TaskTokenCeiling: 5_000_000}, nil, nil)
+	check := g.CheckBeforeForward("t", "claude-mystery-1", []byte(`{"model":"claude-mystery-1","max_tokens":1000}`))
+	if check.Allowed {
+		g.ReleaseReservation(check.Reservation)
+		t.Fatal("CheckBeforeForward allowed an unpriced model under a $0.01 daily budget; want it estimated at MaxPriceRow and blocked")
+	}
+	if check.Message != MsgDailyBudgetBlock {
+		t.Errorf("Message = %q, want %q", check.Message, MsgDailyBudgetBlock)
+	}
+}

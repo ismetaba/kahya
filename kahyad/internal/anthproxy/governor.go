@@ -390,13 +390,16 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 //     request shape is known.
 //
 // A model this function cannot price (empty/unrecognized/no pricing row
-// for "now") still returns a non-zero TOKEN estimate (so the per-task
-// ceiling reservation is never skipped just because pricing is unknown),
-// but a zero USD estimate (there is no rate to apply) - a request whose
-// model cannot be priced is deliberately policed by the token-ceiling
-// check only, not the USD budget checks.
+// for "now") is estimated at MaxPriceRow, the costliest known rate
+// (FIX-I-10, fail-closed): an unpriceable request is policed by the USD
+// budget checks too, never slipped past them with a $0 estimate. (The
+// proxy's model allowlist already refuses such a request before it gets
+// here; this keeps the governor fail-closed on its own.)
 func (g *Governor) estimateRequestLocked(model string, body []byte) (tokens int64, usd float64) {
 	row, priceErr := PriceFor(model, g.now())
+	if priceErr != nil {
+		row = MaxPriceRow(g.now())
+	}
 	fallbackTokens := g.limits.EstRequestTokens
 	if fallbackTokens <= 0 {
 		fallbackTokens = defaultEstRequestTokens
@@ -412,17 +415,13 @@ func (g *Governor) estimateRequestLocked(model string, body []byte) (tokens int6
 			inTokens = 1
 		}
 		tokens = inTokens + outTokens
-		if priceErr == nil {
-			usd = float64(inTokens)*row.USDPerMTokCacheWrite1h/1_000_000 +
-				float64(outTokens)*row.USDPerMTokOut/1_000_000
-		}
+		usd = float64(inTokens)*row.USDPerMTokCacheWrite1h/1_000_000 +
+			float64(outTokens)*row.USDPerMTokOut/1_000_000
 		return tokens, usd
 	}
 
 	tokens = fallbackTokens
-	if priceErr == nil {
-		usd = float64(tokens) * row.USDPerMTokOut / 1_000_000
-	}
+	usd = float64(tokens) * row.USDPerMTokOut / 1_000_000
 	return tokens, usd
 }
 
