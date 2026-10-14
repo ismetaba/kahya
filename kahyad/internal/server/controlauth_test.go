@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -415,8 +414,8 @@ func identityOverrideCount(t *testing.T, st *store.Store, traceID, path, source,
 
 // TestWorkerIdentityPinnedToLiveWorker is G03 / B-14's core regression
 // test: a TAINTED live worker (this test process, registered under
-// t-dirty by its own process group - exactly how handleTask registers a
-// spawned worker) that names the CLEAN task's ids on /policy/check is
+// t-dirty by its own session id - the key handleTask registers a spawned
+// worker under) that names the CLEAN task's ids on /policy/check is
 // still taint-denied, because kahyad pins the caller to its attributed
 // task; the override is ledgered under the worker's own trace. The same
 // pinning applies to /policy/consume-token (extra finding E-1). Before the
@@ -426,7 +425,7 @@ func TestWorkerIdentityPinnedToLiveWorker(t *testing.T) {
 	reg := task.NewLiveRegistry()
 	f.srv.SetTaskLiveRegistry(reg)
 	seedTaintedAndCleanTasks(t, f.store, f.srv.policyEngine)
-	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), testProcessSID(t))
 	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket) // a worker never has the secret
 
 	fsWrite := func(task, trace string) map[string]any {
@@ -505,7 +504,7 @@ func TestWorkerAttributionIsPerRequest(t *testing.T) {
 	if status, _ := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-pr-1", "", body); status != http.StatusForbidden {
 		t.Fatalf("before registration = %d, want 403", status)
 	}
-	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), testProcessSID(t))
 	if status, _ := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-pr-2", "", body); status != http.StatusOK {
 		t.Fatalf("after registration (same keep-alive client) = %d, want 200", status)
 	}
@@ -519,13 +518,13 @@ func TestWorkerAttributionIsPerRequest(t *testing.T) {
 }
 
 // TestControlRouteRefusesLiveWorkerEvenWithSecret (G03 / B-14): a caller
-// inside a live worker's process group is refused on control routes even
+// inside a live worker's session is refused on control routes even
 // if it read <socket>.secret - reason live_worker_on_control_route.
 func TestControlRouteRefusesLiveWorkerEvenWithSecret(t *testing.T) {
 	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
 	reg := task.NewLiveRegistry()
 	f.srv.SetTaskLiveRegistry(reg)
-	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), testProcessSID(t))
 	secret := readSecretFile(t, f.srv.cfg.Socket)
 	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
 
@@ -553,7 +552,7 @@ func TestAttributedWorkerWithoutTraceFailsClosed(t *testing.T) {
 	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
 	reg := task.NewLiveRegistry()
 	f.srv.SetTaskLiveRegistry(reg)
-	reg.Register("t-legacy", syscall.Getpgrp())
+	reg.Register("t-legacy", testProcessSID(t))
 	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
 
 	status, errBody := doRaw(t, worker, http.MethodPost, "/policy/check", "trace-legacy", "",
@@ -617,7 +616,7 @@ func TestMemorySearchHafizaInjectedPinnedToAttributedWorker(t *testing.T) {
 	}
 	go srv.Serve() //nolint:errcheck
 	defer srv.Shutdown()
-	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), testProcessSID(t))
 
 	resp := postMemorySearch(t, unixHTTPClientNoSecret(socketPath), `{"query":"kadikoy","for_injection":true,"task_id":"task-forged","trace_id":"tid-forged"}`)
 	resp.Body.Close()

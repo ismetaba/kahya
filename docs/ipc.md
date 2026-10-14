@@ -14,10 +14,14 @@ lifecycle), `kahyad/internal/policy` (interim static table),
 ## 1 · Process model
 
 kahyad spawns one worker process **per task** — never a long-lived worker
-pool. The process is started in its **own process group**
-(`setpgid`, new group id = the child's own pid) so a timeout, or a future
-`⌥⎋` halt (W6-03), can kill the whole tree — including any grandchild
-processes the worker itself spawns — with a single `kill(-pgid, SIGKILL)`.
+pool. The process is started as the leader of its **own new session**
+(`setsid`, which also makes it the leader of a new process group: session
+id = group id = the child's own pid) so a timeout, or the `⌥⎋` halt
+(W6-03), can kill the whole tree — including any grandchild processes the
+worker itself spawns — with a single `kill(-pgid, SIGKILL)`, and so kahyad
+can attribute UDS callers to the worker by session (§5a "Caller
+attribution": a session, unlike a process group, cannot be joined from
+outside it).
 
 The worker's stdin receives exactly one JSON object (the envelope, §2
 below), after which **stdin is closed**. The worker's stdout is a JSONL
@@ -499,7 +503,10 @@ answers `403` + `{"error": "Kontrol anahtarı eksik ya da geçersiz
 (fail-closed). Bu uç nokta yalnızca kahya CLI, kahya-trigger ve Hammerspoon
 içindir."}` (`server.MsgControlSecretRejected`, byte-exact) and is ledgered
 as `kind=control_auth_rejected` with `payload.reason` = `missing_secret` |
-`bad_secret` (plus `path`, `method`) under the request's trace id. The outer
+`bad_secret` (plus `path`, `method`, and the peer's `peer_pid`/`peer_pgid`/
+`peer_sid`) under the request's trace id; the caller-attribution reasons
+(`unattributable_worker_route`, `live_worker_on_control_route`,
+`attributed_worker_without_trace`, `unresolved_peer`) are below. The outer
 `event=http_request` JSONL line still records `status=403`.
 
 **Who sends it.** The `kahya` CLI (`Client.newRequest`, every request),
@@ -519,32 +526,55 @@ worker-plane and never reads or sends the secret.
 `X-Kahya-Task-Id` headers on `/v1/mcp`) are no longer trusted. kahyad
 records the OS-level peer pid of every accepted connection
 (`http.Server.ConnContext`: `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on
-Linux) and its process group, and on every request maps that group to a
-live worker it spawned (`task.LiveRegistry.ByPGID` — `spawn.Run` makes each
-worker its own group leader, `handleTask` and the outbox dispatcher register
-it with `RegisterWorker(task_id, trace_id, pid, pgid)`). The `kahya-mcp`
-bridge is the worker CLI's child in the same process group, so it is
-attributed to the same task.
+Linux) and that process's **session id** (`getsid`), once, at accept time,
+and on every request maps that session to a live worker it spawned
+(`task.LiveRegistry.BySID` — `spawn.Run` makes each worker the leader of its
+own session (`setsid`), `handleTask` and the outbox dispatcher register it
+with `RegisterWorker(task_id, trace_id, pid, sid)`, sid == pid). The
+`kahya-mcp` bridge — and every other process the worker's tree spawns —
+inherits the worker's session, so it is attributed to the same task.
+
+The key is the session, **not** the process group, on purpose: `setpgid(2)`
+lets a process join any other process group of its own session or leave its
+group with `setpgid(0, 0)`, so with workers that all shared kahyad's session
+(the original `setpgid`-only spawn) a compromised worker's child could join a
+clean worker's group and be attributed to the clean task (taint laundering
+without naming a foreign id), and a `setpgid(0, 0)` child became
+unattributable. A session cannot be joined from outside it: the cross-worker
+`setpgid` fails with `EPERM`, a `setpgid(0, 0)` child keeps its session (still
+pinned, still refused on control routes), and the only way out — `setsid()`
+in a forked child — yields a fresh session no worker is registered under
+(`TestWorkerSessionAttributionResistsGroupJoin`).
+
+A connection whose peer cannot be resolved to a session — the connecting
+process exited before kahyad accepted (its fd may live on in a forked child;
+macOS keeps reporting the dead pid), or the connection is not a UDS peer —
+is refused on every route except `/health`, **even with the secret**
+(`reason=unresolved_peer`): kahyad cannot rule out a live worker there.
 
 | Caller | Worker route | Control route |
 |---|---|---|
-| attributable to a live worker | served; ids **pinned** to the worker's own task (headers overwritten, body ids overridden); a conflicting declaration is ledgered as `kind=worker_identity_override` (`source` = `header` \| `body`, `claimed_task_id`, `claimed_trace_id`, `peer_pid`, `peer_pgid`) under the worker's own trace | **403** even with the secret (`reason=live_worker_on_control_route`) |
+| attributable to a live worker | served; ids **pinned** to the worker's own task (headers overwritten, body ids overridden); a conflicting declaration is ledgered as `kind=worker_identity_override` (`source` = `header` \| `body`, `claimed_task_id`, `claimed_trace_id`, `peer_pid`, `peer_pgid`, `peer_sid`) under the worker's own trace | **403** even with the secret (`reason=live_worker_on_control_route`) |
 | not attributable (shell script, test harness, CLI) | served only with the secret, declared ids honored; else **403** `reason=unattributable_worker_route` | secret required (above) |
+| unresolved peer (no session) | **403** even with the secret (`reason=unresolved_peer`) | **403** even with the secret (`reason=unresolved_peer`) |
 
 A live entry registered without a trace id (legacy pid-only `Register`)
 fails closed (`reason=attributed_worker_without_trace`). Because pinning
 happens before the handlers run, the outer `event=http_request` JSONL line
 keeps the trace id the caller *declared*, while `policy_decision`,
 `hafiza_injected` and `worker_identity_override` rows carry the pinned one —
-deliberately, so the two traces cross-reference each other. A worker that
-escapes its group (`setsid` + double fork; the sanctioned worker never does)
-is unattributable and therefore refused on worker routes without the secret.
+deliberately, so the two traces cross-reference each other. A forked worker
+child that calls `setsid()` (the sanctioned worker never does) is
+unattributable and therefore refused on worker routes without the secret;
+changing only its process group gains it nothing.
 
 **Same-uid limit.** A worker compromised to the point of reading arbitrary
 files as the user can read `<socket>.secret`; this gate closes the path for
 everything that only uses what a worker is *given* (its env, its tools, a
 prompt-injected model), and B-14 refuses the secret on control routes from
-inside a live worker's process group. Sandboxing the worker (`sandbox-exec`),
+anywhere inside a live worker's session. The one residual is a forked worker
+child that calls `setsid()` *and* reads the secret file: it is
+unattributable, so it reaches the control routes. Sandboxing the worker (`sandbox-exec`),
 a Keychain-ACL'd secret, or a separate uid were considered and declined for
 now (owner decisions G03-1/2/3).
 

@@ -51,12 +51,25 @@
 //
 //   - connContext records the OS-level peer pid of every accepted UDS
 //     connection (peerPIDFromConn: LOCAL_PEERPID on macOS, SO_PEERCRED on
-//     Linux) and its process group (getpgid).
+//     Linux) and that process's SESSION id (getsid; its process group is
+//     recorded too, for the ledger only).
 //   - Per REQUEST (keep-alive connections outlive registry changes),
-//     attributeCaller maps that group to a live worker kahyad itself
-//     spawned (task.LiveRegistry.ByPGID: spawn.Run starts every worker as
-//     its own group leader, and the kahya-mcp bridge the worker's CLI
-//     spawns stays in that group).
+//     attributeCaller maps that session to a live worker kahyad itself
+//     spawned (task.LiveRegistry.BySID): spawn.Run starts every worker as
+//     the leader of its own new session (Setsid), and every process the
+//     worker's tree spawns - the kahya-mcp bridge included - inherits it.
+//     The key is the session, NOT the process group: setpgid(2) lets any
+//     process join another group of its own session (with Setpgid-only
+//     workers all sharing kahyad's session, a compromised worker's child
+//     could join a clean worker's group and borrow its identity) or leave
+//     its group with setpgid(0, 0); it can never join another session.
+//     The only way out of a worker's session is setsid(2) in a forked
+//     child, which yields a fresh session no worker is registered under.
+//   - A connection whose peer cannot be resolved to a session (the peer
+//     exited before kahyad accepted it - the fd may live on in a forked
+//     child - or the conn is not a UDS conn) is refused on every non-open
+//     route, even with the secret (reason unresolved_peer): kahyad cannot
+//     tell a live worker from a CLI there, so it fails closed.
 //   - Worker routes: an attributable caller has its ids PINNED to that
 //     worker's own task_id/trace_id (headers overwritten here, body ids
 //     overridden in the handlers via pinBodyIdentity); a conflicting
@@ -65,11 +78,14 @@
 //     harness, the CLI) is served only with the control secret - else 403
 //     reason unattributable_worker_route.
 //   - Control routes: a caller attributable to a live worker is refused
-//     even WITH the secret (reason live_worker_on_control_route) - a worker
-//     that managed to read <socket>.secret still cannot use it from inside
-//     its own process group (escaping needs setsid + a double fork, which
-//     the sanctioned worker never does; such an escapee is unattributable
-//     and so cannot use the worker routes either).
+//     even WITH the secret (reason live_worker_on_control_route) - a
+//     worker that managed to read <socket>.secret still cannot use it from
+//     anywhere in its own session, however it rearranges its process
+//     groups. Residual (same-uid limit, owner decisions G03-1/2/3): a
+//     forked child that calls setsid() (the sanctioned worker never does)
+//     is unattributable - refused on the worker routes without the
+//     secret, but served on control routes if it ALSO read the secret
+//     file.
 package server
 
 import (
@@ -101,26 +117,34 @@ const (
 	// not a live worker kahyad spawned, without the control secret (B-14).
 	controlRejectUnattributable = "unattributable_worker_route"
 	// controlRejectWorkerOnControl: a control route called from inside a
-	// live worker's process group - refused even with the secret (B-14).
+	// live worker's session - refused even with the secret (B-14).
 	controlRejectWorkerOnControl = "live_worker_on_control_route"
+	// controlRejectUnresolvedPeer: the connection's peer could not be
+	// resolved to a session (gone before accept, or not a UDS peer), so a
+	// live worker cannot be ruled out - refused on every non-open route,
+	// even with the secret (B-14, fail-closed).
+	controlRejectUnresolvedPeer = "unresolved_peer"
 	// controlRejectNoTrace: an attributable live worker registered without
 	// a trace_id cannot be pinned completely - fail closed (B-14).
 	controlRejectNoTrace = "attributed_worker_without_trace"
 )
 
 // workerLookup is the narrow reverse lookup caller attribution needs (G03
-// / B-14) - *kahyad/internal/task.LiveRegistry satisfies it (ByPGID).
+// / B-14) - *kahyad/internal/task.LiveRegistry satisfies it (BySID).
 // SetTaskLiveRegistry (task_durability.go) wires it from the same
 // registry handleTask and the outbox dispatcher register workers into.
 type workerLookup interface {
-	ByPGID(pgid int) (taskID, traceID string, ok bool)
+	BySID(sid int) (taskID, traceID string, ok bool)
 }
 
 // peerKey/peerInfo: what connContext records once per accepted UDS
-// connection (pid/pgid of the peer, 0 when unavailable).
+// connection - the peer's pid, session id (the attribution key) and
+// process group (ledger-only diagnostics: a worker child that moved
+// groups shows pgid != sid). Each is 0 when unavailable; SID == 0 means
+// the peer is unresolved.
 type peerKey struct{}
 
-type peerInfo struct{ PID, PGID int }
+type peerInfo struct{ PID, PGID, SID int }
 
 // callerAttrKey/callerAttribution: what withControlAuth resolves PER
 // REQUEST from peerInfo + the live worker registry, and hands to the
@@ -130,8 +154,9 @@ type callerAttrKey struct{}
 
 type callerAttribution struct {
 	PID     int    // peer pid, 0 if unavailable
-	PGID    int    // peer process group, 0 if unavailable
-	TaskID  string // live worker's task_id if PGID maps to one, else ""
+	PGID    int    // peer process group, 0 if unavailable (diagnostics only)
+	SID     int    // peer session id, 0 if unresolved (fail-closed)
+	TaskID  string // live worker's task_id if SID maps to one, else ""
 	TraceID string // that worker's trace_id, else ""
 }
 
@@ -141,15 +166,21 @@ func callerAttributionFromContext(ctx context.Context) (callerAttribution, bool)
 }
 
 // connContext runs once per accepted UDS connection (http.Server.
-// ConnContext, wired in Prepare) and records ONLY the OS-level peer pid/
-// pgid - never a task id: live-registry membership can change over the
-// life of a kept-alive connection, so that lookup is done per request in
-// attributeCaller. Any failure leaves PID==0 - "unattributable", which the
-// worker-route rule treats fail-closed.
+// ConnContext, wired in Prepare) and records ONLY the OS-level peer pid,
+// session id and process group - never a task id: live-registry
+// membership can change over the life of a kept-alive connection, so that
+// lookup is done per request in attributeCaller. The session is read HERE,
+// at accept time, and kept for the connection's life: a peer that forks
+// and exits cannot later make its connection look like someone else's.
+// Any failure leaves SID == 0 - "unresolved", which withControlAuth
+// refuses on every non-open route (fail-closed).
 func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	info := peerInfo{}
 	if pid, err := peerPIDFromConn(c); err == nil && pid > 0 {
 		info.PID = pid
+		if sid, err := peerSessionID(pid); err == nil && sid > 0 {
+			info.SID = sid
+		}
 		if pgid, err := syscall.Getpgid(pid); err == nil {
 			info.PGID = pgid
 		}
@@ -158,13 +189,14 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 }
 
 // attributeCaller resolves the request's caller: peerInfo from the
-// connection plus, when s.workerLookup is wired and the pgid belongs to a
-// worker kahyad itself spawned, that worker's task_id/trace_id.
+// connection plus, when s.workerLookup is wired and the peer's session
+// belongs to a worker kahyad itself spawned, that worker's task_id/
+// trace_id.
 func (s *Server) attributeCaller(r *http.Request) callerAttribution {
 	info, _ := r.Context().Value(peerKey{}).(peerInfo)
-	att := callerAttribution{PID: info.PID, PGID: info.PGID}
-	if att.PGID > 0 && s.workerLookup != nil {
-		if tid, trace, ok := s.workerLookup.ByPGID(att.PGID); ok {
+	att := callerAttribution{PID: info.PID, PGID: info.PGID, SID: info.SID}
+	if att.SID > 0 && s.workerLookup != nil {
+		if tid, trace, ok := s.workerLookup.BySID(att.SID); ok {
 			att.TaskID, att.TraceID = tid, trace
 		}
 	}
@@ -178,7 +210,7 @@ func (s *Server) attributeCaller(r *http.Request) callerAttribution {
 func (s *Server) ledgerIdentityOverride(r *http.Request, att callerAttribution, source, claimedTask, claimedTrace string) {
 	payload := map[string]any{
 		"event": "worker_identity_override", "path": r.URL.Path, "source": source,
-		"peer_pid": att.PID, "peer_pgid": att.PGID,
+		"peer_pid": att.PID, "peer_pgid": att.PGID, "peer_sid": att.SID,
 		"task_id": att.TaskID, "claimed_task_id": claimedTask, "claimed_trace_id": claimedTrace,
 	}
 	if s.eventLogger != nil {
@@ -314,14 +346,14 @@ func (s *Server) hasValidControlSecret(r *http.Request) bool {
 // kind=control_auth_rejected (reason: one of the controlReject* values)
 // under the request's trace_id (withTraceLogging is the OUTER middleware,
 // so traceIDFromContext is always non-empty here), with the peer's
-// pid/pgid and - when attributable - the live worker's task_id.
+// pid/pgid/sid and - when attributable - the live worker's task_id.
 func (s *Server) rejectControl(w http.ResponseWriter, r *http.Request, reason string) {
 	traceID := traceIDFromContext(r)
 	payload := map[string]any{
 		"event": "control_auth_rejected", "path": r.URL.Path, "method": r.Method, "reason": reason,
 	}
 	if att, ok := callerAttributionFromContext(r.Context()); ok {
-		payload["peer_pid"], payload["peer_pgid"] = att.PID, att.PGID
+		payload["peer_pid"], payload["peer_pgid"], payload["peer_sid"] = att.PID, att.PGID, att.SID
 		if att.TaskID != "" {
 			payload["task_id"] = att.TaskID
 		}
@@ -336,9 +368,10 @@ func (s *Server) rejectControl(w http.ResponseWriter, r *http.Request, reason st
 }
 
 // withControlAuth is the G03 gate in front of the whole mux (see this
-// file's package doc): open routes pass; worker routes pin an attributable
-// live worker's ids or require the secret from anyone else; control
-// routes refuse any live worker and require the secret from everyone else.
+// file's package doc): open routes pass; an unresolved peer is refused
+// everywhere else; worker routes pin an attributable live worker's ids or
+// require the secret from anyone else; control routes refuse any live
+// worker and require the secret from everyone else.
 func (s *Server) withControlAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		class := classifyRoute(r.URL.Path)
@@ -348,6 +381,15 @@ func (s *Server) withControlAuth(next http.Handler) http.Handler {
 		}
 		att := s.attributeCaller(r)
 		r = r.WithContext(context.WithValue(r.Context(), callerAttrKey{}, att))
+
+		if att.SID <= 0 {
+			// No session for this peer: it may be a live worker (e.g. a
+			// child holding the fd of a connection its exited parent
+			// opened), so neither the worker nor the control rule can be
+			// applied - refuse, even with the secret.
+			s.rejectControl(w, r, controlRejectUnresolvedPeer)
+			return
+		}
 
 		if class == routeWorker {
 			if att.TaskID != "" {

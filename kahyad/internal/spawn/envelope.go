@@ -2,8 +2,9 @@
 // (HANDOFF §4 ⚑ IPC contract): one Python worker subprocess per task, a
 // JSON envelope written to its stdin then stdin closed, trace_id/task_id
 // propagated via the environment, its JSONL stdout protocol relayed live,
-// and its whole process GROUP (Setpgid) killed on timeout so nothing is
-// ever left orphaned. This file (envelope.go) is the envelope struct and
+// and its whole process GROUP (it is started as its own session and
+// group leader, Setsid) killed on timeout so nothing is ever left
+// orphaned. This file (envelope.go) is the envelope struct and
 // its validation; spawn.go is the process lifecycle itself.
 //
 // The full contract (envelope shape, worker env, stdout protocol) is

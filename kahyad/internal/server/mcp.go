@@ -247,13 +247,16 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 // whose sound fix needed "an UNFORGEABLE binding between the incoming
 // /v1/mcp request and a specific session". That binding now exists:
 //   - withControlAuth (controlauth.go) takes the OS-level UDS peer pid of
-//     the connection (LOCAL_PEERPID / SO_PEERCRED), maps its process group
-//     to a live worker kahyad itself spawned (task.LiveRegistry.ByPGID -
-//     every worker is its own group leader and the kahya-mcp bridge stays
-//     in that group) and OVERWRITES both headers with that worker's own
+//     the connection (LOCAL_PEERPID / SO_PEERCRED), maps its SESSION to a
+//     live worker kahyad itself spawned (task.LiveRegistry.BySID - every
+//     worker is its own session leader via spawn.Run's Setsid, the
+//     kahya-mcp bridge inherits that session, and no process can join
+//     another session: setpgid(2) tricks do not move a caller between
+//     workers) and OVERWRITES both headers with that worker's own
 //     task_id/trace_id, ledgering worker_identity_override on a conflicting
 //     declaration. The session therefore resolves from the caller's REAL
-//     task, never from its claim.
+//     task, never from its claim; a peer whose session cannot be resolved
+//     is refused outright (403 unresolved_peer).
 //   - A caller NOT attributable to a live worker (a CLI/script/test
 //     harness) is served only with kahyad's per-boot control secret and
 //     keeps its declared ids - that is the legacy no-session path
@@ -271,10 +274,12 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     read the SAME pinned headers; deny-all still fails closed at boot;
 //     every decision is ledgered; an auto-allowed W1 still opens a
 //     5-minute undo window.
-//   - Residual: a worker that escapes its own process group (setsid + a
-//     double fork) is unattributable and therefore refused here outright
-//     (403 unattributable_worker_route) unless it ALSO read the control
-//     secret file - the same-uid limit docs/ipc.md section 5a documents.
+//   - Residual: a forked worker child that calls setsid() (leaving the
+//     worker's session for a fresh one; the sanctioned worker never does)
+//     is unattributable and therefore refused here outright (403
+//     unattributable_worker_route) unless it ALSO read the control secret
+//     file - the same-uid limit docs/ipc.md section 5a documents.
+//     Changing only its process group (setpgid) gains it nothing.
 func (s *Server) policyGateMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {

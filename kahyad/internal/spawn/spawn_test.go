@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // testEnvelope returns a valid envelope with a byte-exact Turkish prompt
@@ -154,6 +156,56 @@ func TestRunKillsProcessGroupOnTimeout(t *testing.T) {
 			t.Fatalf("orphan process(es) still in group %d after timeout kill: %s", pid, out)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestRunStartsWorkerAsSessionLeader (G03 / B-14, robust review): Run
+// starts every worker as the leader of its OWN new session - pid ==
+// process-group id == session id, and not kahyad's session. kahyad's UDS
+// caller attribution keys on that session id because, unlike a process
+// group, a session cannot be joined from another session with setpgid(2);
+// with the old Setpgid-only spawn every worker shared kahyad's session.
+func TestRunStartsWorkerAsSessionLeader(t *testing.T) {
+	env := testEnvelope(t)
+	cfg := testConfig("testdata/session_ids_worker.py")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var started int
+	var ids struct{ PID, PGID, SID int }
+	outcome, err := Run(ctx, cfg, env, Callbacks{
+		OnStart: func(p int) { started = p },
+		OnDelta: func(text string) {
+			var raw struct {
+				PID  int `json:"pid"`
+				PGID int `json:"pgid"`
+				SID  int `json:"sid"`
+			}
+			if err := json.Unmarshal([]byte(text), &raw); err != nil {
+				t.Errorf("undecodable ids line %q: %v", text, err)
+				return
+			}
+			ids.PID, ids.PGID, ids.SID = raw.PID, raw.PGID, raw.SID
+		},
+	})
+	if err != nil || outcome.Status != StatusOK {
+		t.Fatalf("Run() = %+v, %v; want status ok", outcome, err)
+	}
+	if ids.PID == 0 || ids.PID != started {
+		t.Fatalf("worker reported pid %d, OnStart saw %d", ids.PID, started)
+	}
+	if ids.PGID != ids.PID {
+		t.Errorf("worker pgid = %d, want its own pid %d (own process group: kill(-pid) reaches the tree)", ids.PGID, ids.PID)
+	}
+	if ids.SID != ids.PID {
+		t.Errorf("worker sid = %d, want its own pid %d (own session: setsid, not just setpgid)", ids.SID, ids.PID)
+	}
+	own, err := unix.Getsid(0)
+	if err != nil {
+		t.Fatalf("Getsid(0): %v", err)
+	}
+	if ids.SID == own {
+		t.Errorf("worker shares the spawner's session %d, want a new one", own)
 	}
 }
 

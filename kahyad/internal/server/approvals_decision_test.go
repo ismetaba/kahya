@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -73,7 +72,7 @@ func newApprovalsDecisionFixture(t *testing.T, env string) approvalsDecisionFixt
 // approval via /policy/check and then tries to approve it itself as
 // surface="local" with the correct typed word - on BOTH approval routes,
 // first without the secret (B-3), then even WITH a stolen copy of the
-// secret (B-14: a live worker's process group is refused on every control
+// secret (B-14: a live worker's session is refused on every control
 // route). All attempts answer 403 without consuming the approval (no
 // policy_feedback_approved row), and the SAME pending approval is still
 // approvable afterwards by the real, secret-carrying local surface.
@@ -81,7 +80,7 @@ func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 	f := newApprovalsDecisionFixture(t, "prod")
 	reg := task.NewLiveRegistry()
 	f.srv.SetTaskLiveRegistry(reg)
-	reg.RegisterWorker("t-self", "trace-g03-self", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-self", "trace-g03-self", os.Getpid(), testProcessSID(t))
 
 	var checkResp policyCheckResponse
 	resp := postJSON(t, f.noSecret, "/policy/check", map[string]any{
@@ -136,7 +135,7 @@ func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 	}
 
 	// The worker is gone: the human's own local surface (the CLI, with the
-	// secret, from a process group that is no live worker) approves the
+	// secret, from a session that is no live worker's) approves the
 	// still-unburned pending approval.
 	reg.Unregister("t-self")
 	var decision approvalDecisionResponse

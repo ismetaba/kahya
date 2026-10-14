@@ -933,15 +933,17 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		OnStart: func(pid int) {
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
 			if s.taskLiveRegistry != nil {
-				// G03 / B-14: pgid == pid (spawn.Run's Setpgid), plus this
-				// task's trace_id, so this worker's own UDS calls (and its
-				// kahya-mcp bridge child's, same group) are attributed to -
-				// and their correlation ids pinned to - THIS task.
+				// G03 / B-14: sid == pid (spawn.Run's Setsid), plus this
+				// task's trace_id, so this worker's own UDS calls (and every
+				// descendant's - its kahya-mcp bridge included, same
+				// session) are attributed to - and their correlation ids
+				// pinned to - THIS task.
 				s.taskLiveRegistry.RegisterWorker(taskID, traceID, pid, pid)
 			}
 			// W6-03: persist the worker's process-group id (spawn.Run always
-			// starts it as its own new group leader via Setpgid, so pid ==
-			// pgid) ALONGSIDE the in-memory registry above, so the halt
+			// starts it as its own new session and group leader via
+			// Setsid, so pid == pgid) ALONGSIDE the in-memory registry
+			// above, so the halt
 			// executor can still kill this worker's group even after a
 			// daemon crash/restart emptied that in-memory registry (macOS
 			// has no PDEATHSIG - migrations/0015_halt_semantics.sql's own

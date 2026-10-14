@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -332,8 +331,8 @@ func TestMCPGateAllowsMemorySearchThroughHTTP(t *testing.T) {
 
 // TestMCPGateTaintCheckSkippedNoSessionOnThisPath pins the UNATTRIBUTED,
 // control-secret-authenticated caller path on /v1/mcp (a CLI/script, never
-// a live worker - G03 / B-14): no live worker owns this caller's process
-// group, so withControlAuth pins nothing and the request keeps its own
+// a live worker - G03 / B-14): no live worker owns this caller's
+// session, so withControlAuth pins nothing and the request keeps its own
 // (here: absent) trace/task headers; with no SessionResolver wired and no
 // session_id on this route, Engine.Check's legacy no-session branch skips
 // the W4-03 taint gate - a memory_write (W1) call is governed purely by the
@@ -414,8 +413,8 @@ func postMCPWithHeaders(t *testing.T, client *http.Client, body string, headers 
 }
 
 // TestMCPGateTaintCheckUsesAttributedSession (G03 / B-14): a TAINTED live
-// worker (this test process, registered under t-dirty by its process
-// group) calling /v1/mcp with FORGED trace/task headers is pinned to its
+// worker (this test process, registered under t-dirty by its session
+// id) calling /v1/mcp with FORGED trace/task headers is pinned to its
 // own task: the memory_write (W1, ladder-promoted to auto-allow) is
 // taint-denied, no file is written, and the forgery is ledgered as a
 // header worker_identity_override under the worker's own trace. An R-class
@@ -428,7 +427,7 @@ func TestMCPGateTaintCheckUsesAttributedSession(t *testing.T) {
 	seedAutonomyState(t, f.store, "memory_write", "W1", "global", 2)
 	// R auto-allows from L1 (policy.autoLevelFor); a fresh install is L0.
 	seedAutonomyState(t, f.store, "memory_search", "R", "global", 1)
-	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), syscall.Getpgrp())
+	reg.RegisterWorker("t-dirty", "trace-dirty", os.Getpid(), testProcessSID(t))
 	worker := unixHTTPClientNoSecret(f.srv.cfg.Socket)
 	forged := map[string]string{"X-Kahya-Trace-Id": "trace-clean", "X-Kahya-Task-Id": "t-clean"}
 

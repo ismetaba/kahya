@@ -123,13 +123,13 @@ type Ledger interface {
 // mid-run) is skipped rather than given a second, concurrent worker.
 //
 // RegisterWorker (G03 / B-14) replaces the old pid-only Register here: the
-// redispatched worker is recorded with its process group (== pid, Setpgid)
+// redispatched worker is recorded with its session id (== pid, Setsid)
 // AND its task's trace_id, so kahyad's UDS caller attribution
-// (kahyad/internal/server/controlauth.go, task.LiveRegistry.ByPGID) pins
+// (kahyad/internal/server/controlauth.go, task.LiveRegistry.BySID) pins
 // the resumed worker's /policy/check, /v1/memory/search and /v1/mcp calls
 // to this exact task - the same as handleTask does for a first spawn.
 type LiveRegistry interface {
-	RegisterWorker(taskID, traceID string, pid, pgid int)
+	RegisterWorker(taskID, traceID string, pid, sid int)
 	Unregister(taskID string)
 	IsLive(taskID string) bool
 }

@@ -10,9 +10,10 @@
 // This bridge is worker-plane (G03 / B-3): it never reads or sends
 // X-Kahya-Control-Secret (config.ControlSecretHeader) - see
 // TestRelayNeverSendsControlSecretHeader. kahyad attributes its /v1/mcp
-// calls to the worker that spawned it by the UDS peer's process group
-// instead (G03 / B-14): this process must stay in the worker's group
-// (never setsid/detach), or kahyad answers it 403.
+// calls to the worker that spawned it by the UDS peer's SESSION instead
+// (G03 / B-14; spawn.Run makes every worker a session leader): this
+// process must stay in the worker's session (never setsid/detach), or
+// kahyad answers it 403.
 //
 // Deliberate SDK-usage choice (documented per the task spec's escape
 // hatch: "if the SDK's API is unclear, implement a correct minimal
@@ -122,9 +123,9 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	// every relayed request (W4-07; kahyad/internal/server/mcp.go's
 	// taskHeader). Empty is fine (relay simply omits the header). Neither
 	// header is authoritative: kahyad attributes this bridge to the worker
-	// that spawned it by the UDS peer's process group (this process stays
-	// in the worker's group) and overwrites both with that worker's own
-	// ids (G03 / B-14, kahyad/internal/server/controlauth.go).
+	// that spawned it by the UDS peer's session (this process stays in the
+	// worker's session) and overwrites both with that worker's own ids
+	// (G03 / B-14, kahyad/internal/server/controlauth.go).
 	taskID := os.Getenv("KAHYA_TASK_ID")
 
 	sock, err := resolveSocket()

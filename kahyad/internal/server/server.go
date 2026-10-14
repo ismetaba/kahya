@@ -193,7 +193,7 @@ type Server struct {
 	// capabilities (read-only lookup vs. register/unregister).
 	taskLiveRegistry TaskLiveRegistry
 	// workerLookup is G03 / B-14's UDS caller-attribution source: the
-	// same *task.LiveRegistry as taskLiveRegistry, seen through its ByPGID
+	// same *task.LiveRegistry as taskLiveRegistry, seen through its BySID
 	// reverse lookup (SetTaskLiveRegistry wires it). nil means no caller
 	// is ever attributable to a live worker - see controlauth.go.
 	workerLookup workerLookup
@@ -427,7 +427,7 @@ func (s *Server) Prepare() error {
 	s.http = &http.Server{
 		Handler:           s.withTraceLogging(s.withControlAuth(mux)),
 		ReadHeaderTimeout: readHeaderTimeout,
-		// G03 / B-14: record each connection's UDS peer pid/pgid for
+		// G03 / B-14: record each connection's UDS peer pid/session for
 		// caller attribution (controlauth.go connContext).
 		ConnContext: s.connContext,
 	}

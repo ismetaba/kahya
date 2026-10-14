@@ -377,10 +377,10 @@ type countingLiveRegistry struct {
 	regs  int
 	// last is the most recent RegisterWorker call's arguments (G03 /
 	// B-14: the dispatcher must hand the registry the task's trace_id and
-	// the worker's process group, not just its pid).
+	// the worker's session id, not just its pid).
 	last struct {
 		taskID, traceID string
-		pid, pgid       int
+		pid, sid        int
 	}
 }
 
@@ -388,12 +388,12 @@ func newCountingLiveRegistry() *countingLiveRegistry {
 	return &countingLiveRegistry{inner: task.NewLiveRegistry()}
 }
 
-func (c *countingLiveRegistry) RegisterWorker(taskID, traceID string, pid, pgid int) {
+func (c *countingLiveRegistry) RegisterWorker(taskID, traceID string, pid, sid int) {
 	c.mu.Lock()
 	c.regs++
-	c.last.taskID, c.last.traceID, c.last.pid, c.last.pgid = taskID, traceID, pid, pgid
+	c.last.taskID, c.last.traceID, c.last.pid, c.last.sid = taskID, traceID, pid, sid
 	c.mu.Unlock()
-	c.inner.RegisterWorker(taskID, traceID, pid, pgid)
+	c.inner.RegisterWorker(taskID, traceID, pid, sid)
 }
 func (c *countingLiveRegistry) Unregister(taskID string)  { c.inner.Unregister(taskID) }
 func (c *countingLiveRegistry) IsLive(taskID string) bool { return c.inner.IsLive(taskID) }
@@ -466,8 +466,8 @@ func TestLiveWorkerNeverDoubleSpawnedAcrossConcurrentDispatchers(t *testing.T) {
 	live.mu.Lock()
 	last := live.last
 	live.mu.Unlock()
-	if last.taskID != "t1" || last.traceID != "trace-t1" || last.pid <= 0 || last.pgid != last.pid {
-		t.Errorf("RegisterWorker(%+v), want task t1, trace trace-t1, pgid == pid > 0 (G03 / B-14 attribution)", last)
+	if last.taskID != "t1" || last.traceID != "trace-t1" || last.pid <= 0 || last.sid != last.pid {
+		t.Errorf("RegisterWorker(%+v), want task t1, trace trace-t1, sid == pid > 0 (G03 / B-14 attribution: spawn.Run's Setsid)", last)
 	}
 	if n := countRows(t, st, `SELECT count(*) FROM events WHERE kind = ?`, EventResumeDispatched); n != 1 {
 		t.Errorf("outbox.resume_dispatched events = %d, want exactly 1", n)

@@ -146,11 +146,12 @@ type Outcome struct {
 // happens rather than only at the end.
 type Callbacks struct {
 	// OnStart is called once, right after the process has actually
-	// started, with its pid (which - because Run always starts it as its
-	// own new process group leader, see Run's doc comment - is also its
-	// process group id). Optional; callers that need the pid for
-	// diagnostics/halt-semantics use this rather than reaching into the
-	// exec.Cmd, which Run does not expose.
+	// started, with its pid (which - because Run always starts it as the
+	// leader of its own new session and process group, see Run's doc
+	// comment - is also its process group id AND its session id).
+	// Optional; callers that need the pid for diagnostics/halt-semantics
+	// (kill(-pgid)) or UDS caller attribution (the session id) use this
+	// rather than reaching into the exec.Cmd, which Run does not expose.
 	OnStart func(pid int)
 	// OnDelta is called once per {"type":"delta","text":"..."} stdout
 	// line, with that line's text, in arrival order.
@@ -194,10 +195,23 @@ type stdoutLine struct {
 // Run spawns cfg.Cmd as a per-task worker process (HANDOFF §4 IPC ⚑): it
 // writes env's envelope JSON to the process's stdin then closes stdin,
 // sets the KAHYA_*/ANTHROPIC_* environment (BuildEnv), starts the process
-// in its OWN process group (Setpgid, Pgid left 0 so the new group's id
-// equals the child's own pid) so a timeout - or a future W6-03 halt - can
-// kill the whole tree at once, and streams its JSONL stdout protocol to cb
-// as it arrives.
+// as the leader of its OWN new session (Setsid - which also makes it the
+// leader of a new process group, so the session id and the group id both
+// equal the child's own pid) so a timeout - or a W6-03 halt - can kill
+// the whole tree at once, and streams its JSONL stdout protocol to cb as
+// it arrives.
+//
+// Why a session and not just a group (G03 / B-14): kahyad attributes a
+// UDS caller to the live worker whose SESSION it is in
+// (kahyad/internal/server/controlauth.go). With Setpgid alone every worker
+// sat in kahyad's one session, and POSIX lets any process join any other
+// process group of its own session via setpgid(2) - so a compromised
+// worker's child could join another worker's group and borrow its
+// identity. A session cannot be joined: setpgid into a group of another
+// session fails with EPERM, a process that leaves its group with
+// setpgid(0, 0) keeps its session, and the only way out - setsid(2) in a
+// forked child - yields a brand-new session no worker is registered
+// under (unattributable, fail-closed).
 //
 // Run blocks until the process exits on its own or ctx is done, whichever
 // comes first; it has no timeout policy of its own - the caller is
@@ -257,11 +271,15 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {
 		cmd.Dir = wd
 	}
-	// New process group, id == this process's own pid (Pgid left at its
-	// zero value): killGroup below can then target -pid to reach every
-	// process in the group, including any grandchildren the worker itself
-	// spawns (they inherit the same group unless they opt out).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// New session AND new process group, both ids == this process's own
+	// pid (setsid(2) in the child before exec): killGroup below can then
+	// target -pid to reach every process in the group, including any
+	// grandchildren the worker itself spawns (they inherit the same group
+	// unless they opt out), and UDS caller attribution keys on the
+	// session id, which setpgid(2) cannot forge (see Run's doc comment).
+	// Never Setpgid together with Setsid: a session leader cannot
+	// setpgid, so the child would fail to start.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
