@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
@@ -554,5 +555,14 @@ func TestPendingApprovalDecisionReportsApprovedOnlyAfterGrantExists(t *testing.T
 	}
 	if _, _, err := e.PendingApprovalDecision(ctx, strings.Repeat("ab", 32)); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("PendingApprovalDecision(unknown id) err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestMaxApprovalWaitMatchesPendingTTL keeps config's approval_wait_seconds
+// cap equal to the pending approval's own TTL: a longer wait could never be
+// answered (the id expires first).
+func TestMaxApprovalWaitMatchesPendingTTL(t *testing.T) {
+	if got := time.Duration(config.MaxApprovalWaitSeconds) * time.Second; got != pendingApprovalTTL {
+		t.Fatalf("config.MaxApprovalWaitSeconds = %v, want the pending approval TTL %v", got, pendingApprovalTTL)
 	}
 }

@@ -737,7 +737,9 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
    bytes); the approval card goes out (Telegram for a reversible tool,
    Hammerspoon, `kahya approvals`).
 2. The in-flight `tools/call` **parks inside kahyad** for
-   `approval_wait_seconds` (config, default 300; `0` = never park — the
+   `approval_wait_seconds` (config, default 300, at most 600 — the pending
+   approval's own TTL — and, when written explicitly, below
+   `task_timeout_min*60`; `0` = never park — the
    call answers at once with `"⏳ Yerel onay bekleniyor (onay kimliği:
    <id>). …"`). Ledger `approval_wait_started`. A `kahya ask` stream of the
    same task gets the delta line `"⏳ Onay bekleniyor (onay kimliği: <id>)

@@ -1368,9 +1368,10 @@ func TestReadControlSecret(t *testing.T) {
 }
 
 // TestLoadApprovalWaitSecondsValidation (B-1): a negative
-// approval_wait_seconds fails Load closed; an explicitly written one must be
-// below task_timeout_min*60; 0 (waiting disabled) is valid; the DEFAULT 300
-// is never checked against a lowered task_timeout_min.
+// approval_wait_seconds, or one beyond the pending approval's own 600s TTL,
+// fails Load closed; an explicitly written one must be below
+// task_timeout_min*60; 0 (waiting disabled) is valid; the DEFAULT 300 is
+// never checked against a lowered task_timeout_min.
 func TestLoadApprovalWaitSecondsValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1380,8 +1381,11 @@ func TestLoadApprovalWaitSecondsValidation(t *testing.T) {
 	}{
 		{"explicit_not_below_task_timeout", "task_timeout_min: 30\napproval_wait_seconds: 1800\n", true, 0},
 		{"negative", "approval_wait_seconds: -1\n", true, 0},
+		{"beyond_pending_ttl", "task_timeout_min: 60\napproval_wait_seconds: 601\n", true, 0},
+		{"at_pending_ttl", "task_timeout_min: 60\napproval_wait_seconds: 600\n", false, 600},
 		{"zero_disables", "task_timeout_min: 2\napproval_wait_seconds: 0\n", false, 0},
-		{"explicit_below_task_timeout", "task_timeout_min: 30\napproval_wait_seconds: 1799\n", false, 1799},
+		{"explicit_not_below_short_task_timeout", "task_timeout_min: 5\napproval_wait_seconds: 300\n", true, 0},
+		{"explicit_below_task_timeout", "task_timeout_min: 5\napproval_wait_seconds: 299\n", false, 299},
 		{"default_unchecked_against_short_task_timeout", "task_timeout_min: 2\n", false, 300},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

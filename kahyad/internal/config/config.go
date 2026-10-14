@@ -171,8 +171,10 @@ type Config struct {
 	// Engine.Check -> needs_approval) parks the in-flight tool call waiting
 	// for the human decision before answering the model. 0 disables
 	// waiting (the call fails at once with the pending id; the hermetic
-	// gate suites use this). Default 300. Must be >= 0, and - when written
-	// explicitly in config.yaml - less than task_timeout_min*60 (Load).
+	// gate suites use this). Default 300. Must be >= 0 and <=
+	// MaxApprovalWaitSeconds (600, the pending approval's own TTL), and -
+	// when written explicitly in config.yaml - less than task_timeout_min*60
+	// (Load).
 	ApprovalWaitSeconds int `yaml:"approval_wait_seconds"`
 	// AutonomyBootstrapLevels is config key `autonomy_bootstrap_levels`
 	// (B-1, owner decision G01-2 option A): "tool/class/scope" -> level
@@ -880,6 +882,12 @@ const (
 	defaultOutboxDispatchIntervalSeconds = 5
 )
 
+// MaxApprovalWaitSeconds is approval_wait_seconds' upper bound (B-1): the
+// 10-minute pending-approval TTL (kahyad/internal/policy
+// pendingApprovalTTL - kept in sync by TestMaxApprovalWaitMatchesPendingTTL
+// in kahyad/internal/policy).
+const MaxApprovalWaitSeconds = 600
+
 // validateApprovalWait fails Load closed (B-1) on a negative
 // approval_wait_seconds, and - only when config.yaml wrote the key
 // explicitly - on one that is not below task_timeout_min*60: a wait the
@@ -888,9 +896,16 @@ const (
 // times out first kills its worker, the bridge connection closes, and the
 // parked call ends as canceled without executing (kahyad/internal/server
 // requestDoneKey).
+//
+// It is also capped at MaxApprovalWaitSeconds: a pending approval itself
+// expires after 10 minutes (kahyad/internal/policy pendingApprovalTTL), so
+// a longer wait could never be answered - it would only hold the worker.
 func validateApprovalWait(waitSeconds, taskTimeoutMin int, explicit bool) error {
 	if waitSeconds < 0 {
 		return fmt.Errorf("config: approval_wait_seconds must be >= 0 (got %d)", waitSeconds)
+	}
+	if waitSeconds > MaxApprovalWaitSeconds {
+		return fmt.Errorf("config: approval_wait_seconds must be <= %d, the pending approval's own TTL (got %d)", MaxApprovalWaitSeconds, waitSeconds)
 	}
 	if explicit && waitSeconds >= taskTimeoutMin*60 {
 		return fmt.Errorf("config: approval_wait_seconds (%d) must be less than task_timeout_min*60 (%d)", waitSeconds, taskTimeoutMin*60)
