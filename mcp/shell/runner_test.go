@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -905,4 +906,94 @@ func TestRun_WorkdirInB4DenyFamiliesRejected(t *testing.T) {
 			t.Fatalf("workdir ~/code/x must reach docker run (run calls=%d, deny hits=%d)", exec.callCount("run"), len(ledger.find("shell_deny_glob_hit")))
 		}
 	})
+}
+
+// TestRun_WorkdirContainingSelfProtectedPathRejected (B-4 review): the deny
+// globs used to be matched against the workdir path ONLY, so mounting the
+// kahya repo root (or ~/code) rw at /work handed the container every
+// self-protected path below it — bin/kahya-mcp, the worker package and
+// venv, policy.yaml — protected only against fs_write. A workdir that is a
+// strict ancestor of an absolute deny glob's literal root is now refused
+// before any policy decision; a generic repo root (~/code/x, whose .git
+// only the relative "**/.git/**" names) and a kahya repo subdirectory that
+// holds no protected path stay mountable (G04-2).
+func TestRun_WorkdirContainingSelfProtectedPathRejected(t *testing.T) {
+	base, _ := baseFixture(t)
+	// home is reached through a symlink, like macOS /var -> /private/var:
+	// the deny globs name the link form, the workdir canonicalizes to the
+	// resolved one.
+	realHome := filepath.Join(base, "real-home")
+	home := filepath.Join(base, "link-home")
+	if err := os.MkdirAll(realHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realHome, home); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(home, "code", "kahya")
+	for _, d := range []string{
+		filepath.Join(repo, "bin"), filepath.Join(repo, "worker", ".venv", "lib"), filepath.Join(repo, "worker", "kahya_worker"),
+		filepath.Join(repo, ".git"), filepath.Join(repo, "kahyad"), filepath.Join(repo, "docker", "sandbox"),
+		filepath.Join(home, "code", "x", ".git"),
+	} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The shape of config.SelfProtectDenyGlobs()' code-tree entries plus
+	// the mandatory relative .git glob.
+	deny := []string{
+		filepath.Join(repo, "bin", "**"),
+		filepath.Join(repo, "worker", "**"),
+		filepath.Join(repo, "policy.yaml"),
+		filepath.Join(repo, "docker", "sandbox", "IMAGE_DIGEST"),
+		"**/.git/**",
+	}
+	run := func(t *testing.T, wd string) (*fakeExecutor, *fakeLedger, *fakePolicyClient, error) {
+		t.Helper()
+		exec := &fakeExecutor{runResult: Result{ExitCode: 0}}
+		ledger := &fakeLedger{}
+		pc := &fakePolicyClient{decision: allowDecision("tok")}
+		r := newTestRunner(home, deny, pc, ledger, newFakeLogger(), exec,
+			&fakeDigestChecker{digest: "sha256:same"}, &fakeHealthChecker{healthy: true}, "sha256:same")
+		_, err := r.Run(context.Background(), "trace-1", "task-1", RunInput{Script: "echo hi", Workdir: wd})
+		return exec, ledger, pc, err
+	}
+	for _, wd := range []string{"~/code/kahya", "~/code", "~/code/kahya/docker"} {
+		t.Run("rejected "+wd, func(t *testing.T) {
+			exec, ledger, pc, err := run(t, wd)
+			if err == nil || err.Error() != reasonWorkdirContainsDenied {
+				t.Fatalf("workdir %s: err = %v, want the contains-a-protected-path refusal", wd, err)
+			}
+			if exec.totalCalls() != 0 || pc.checkCalls != 0 {
+				t.Fatalf("workdir %s: executor calls=%d checkCalls=%d, want 0/0 (refused before any policy decision)", wd, exec.totalCalls(), pc.checkCalls)
+			}
+			ev := ledger.find("shell_workdir_rejected")
+			if len(ev) != 1 || ev[0].payload["reason"] != "contains_denied_path" {
+				t.Fatalf("workdir %s: shell_workdir_rejected = %+v, want one with reason contains_denied_path", wd, ev)
+			}
+		})
+	}
+	for _, wd := range []string{"~/code/x", "~/code/kahya/kahyad"} {
+		t.Run("allowed "+wd, func(t *testing.T) {
+			exec, _, _, err := run(t, wd)
+			if err != nil {
+				t.Fatalf("workdir %s: unexpected error: %v", wd, err)
+			}
+			if exec.callCount("run") != 1 {
+				t.Fatalf("workdir %s must reach docker run (run calls=%d)", wd, exec.callCount("run"))
+			}
+		})
+	}
+}
+
+func TestDenyGlobLiteralRoots(t *testing.T) {
+	got := denyGlobLiteralRoots([]string{
+		"/a/b/**", "/a/b/c.txt", "/a/*/c", "/a/b{c,d}/e", "/x/y?/z", "/p/[ab]/q", `/e/s\*c/x`,
+		"**/.git/**", "**/*.pth", "/**", "/*.py", "rel/dir/**", "",
+	})
+	want := []string{"/a/b", "/a/b/c.txt", "/a", "/a", "/x", "/p", "/e"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("denyGlobLiteralRoots = %v, want %v", got, want)
+	}
 }

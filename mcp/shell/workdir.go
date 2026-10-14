@@ -17,6 +17,13 @@
 // /private/tmp, os.TempDir(), $TMPDIR) is never mountable; only its STRICT
 // descendants are, and /var/folders is not a temp root at all. A strict
 // ancestor of a temp root or a system deny dir (/private) is never mountable.
+//
+// A workdir that CONTAINS a write-protected path is never mountable either
+// (B-4 review, workdirContainsDeniedPath): the deny globs are matched
+// against the workdir path itself, so without this rule mounting the kahya
+// repo root (or ~/code) rw handed the container bin/, the worker package
+// and venv and policy.yaml, which the self-protect globs guard only
+// against fs_write.
 package shell
 
 import (
@@ -36,6 +43,7 @@ const (
 	reasonWorkdirNotDir         = "shell_docker reddedildi: iş dizini mevcut değil ya da bir dizin değil."
 	reasonWorkdirNotAllowedRoot = "shell_docker reddedildi: iş dizini yapılandırılmış izinli köklerin (shell_workdir_roots) hiçbirinin altında değil; onay bu kuralı geçersiz kılamaz."
 	reasonWorkdirTempRoot       = "shell_docker reddedildi: iş dizini geçici dizin kökünün kendisi (/tmp, $TMPDIR) olamaz; görev için bu kökün altında ayrı bir alt-dizin kullanın. Onay bu kuralı geçersiz kılamaz."
+	reasonWorkdirContainsDenied = "shell_docker reddedildi: iş dizini yazma koruması altındaki bir yolu (fs_write_deny_globs) içeriyor; korunan yolların dışında kalan bir alt-dizin kullanın. Onay bu kuralı geçersiz kılamaz."
 )
 
 // systemDenyDirs are top-level (or /private/-prefixed) system directories a
@@ -262,4 +270,59 @@ func validateWorkdir(cp mcpfs.CanonicalPath, home string, allowedRoots []string)
 		}
 	}
 	return "", nil
+}
+
+// globMetaChars are the characters that make a doublestar path component
+// a pattern rather than a literal name (a backslash escapes the next
+// character, so a component holding one is not a plain literal either).
+const globMetaChars = `*?[{\`
+
+// denyGlobLiteralRoots returns, for every ABSOLUTE deny glob, its literal
+// root: the leading path components before the first one that holds a
+// glob metacharacter — for an all-literal glob (a file such as
+// <repo>/policy.yaml), the path itself. Everything the glob matches lies
+// at or under that root. Relative globs ("**/.git/**", "**/*.pth") and a
+// bare "/" root contribute nothing: they name no fixed place, so a generic
+// repo root stays mountable (the handbook's ~/code/x requirement).
+func denyGlobLiteralRoots(globs []string) []string {
+	var roots []string
+	for _, g := range globs {
+		if !strings.HasPrefix(g, "/") {
+			continue
+		}
+		var lit []string
+		for _, part := range strings.Split(g, "/")[1:] {
+			if strings.ContainsAny(part, globMetaChars) {
+				break
+			}
+			lit = append(lit, part)
+		}
+		root := filepath.Clean("/" + strings.Join(lit, "/"))
+		if root == "/" {
+			continue
+		}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+// workdirContainsDeniedPath reports whether workdir (a canonical
+// CanonicalPath.Match) is a STRICT ancestor of any absolute deny glob's
+// literal root — mounting it would expose that protected path rw at /work
+// (B-4 review). Equality is the deny-glob match's job ("<dir>/**" matches
+// <dir> itself), never this one's. Each root is checked as written and in
+// its canonical (symlink-resolved, NFC) form, the form workdir is in (a
+// "~"-expanded glob may name a symlinked home, e.g. macOS /var ->
+// /private/var). Case-insensitive (APFS), like every other workdir check.
+func workdirContainsDeniedPath(workdir, home string, denyGlobs []string) bool {
+	for _, root := range denyGlobLiteralRoots(denyGlobs) {
+		forms := []string{root}
+		if cp, err := mcpfs.Canonicalize(home, root); err == nil && cp.Match != root {
+			forms = append(forms, cp.Match)
+		}
+		if isStrictAncestorOfAnyCI(workdir, forms) {
+			return true
+		}
+	}
+	return false
 }

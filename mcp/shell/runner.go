@@ -295,10 +295,11 @@ func (noopLogger) Warn(string, ...any)  {}
 func (noopLogger) Error(string, ...any) {}
 
 // Runner implements shell_docker's full lifecycle (this file's package
-// doc comment): canonicalize workdir → deny-glob check → needs_network
-// fail-closed → docker health check → digest pin check → policy gate
-// (Check+ConsumeToken) → docker run with the non-negotiable flags →
-// timeout/kill → ledger shell_exec.
+// doc comment): canonicalize workdir → workdir scope gate → deny-glob
+// check (the workdir itself, then any protected path it contains) →
+// needs_network fail-closed → docker health check → digest pin check →
+// policy gate (Check+ConsumeToken) → docker run with the non-negotiable
+// flags → timeout/kill → ledger shell_exec.
 type Runner struct {
 	// Home is the directory "~" expands against for Workdir
 	// canonicalization (mcp/fs.Canonicalize) — same convention as
@@ -459,6 +460,19 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 			"event": "shell_deny_glob_hit", "tool": "shell_docker", "canonical_workdir": cp.Match, "task_id": taskID,
 		})
 		return RunOutput{}, errors.New(reasonWorkdirDenyGlob)
+	}
+
+	// B-4 review: the glob match above only sees the workdir path itself;
+	// a workdir that CONTAINS a protected path (the kahya repo root holding
+	// bin/, worker/ and policy.yaml; ~/code above it) would mount that path
+	// rw at /work. Same posture: mechanical, pre-policy, never
+	// approval-overridable, and it applies in allowlist mode too.
+	if workdirContainsDeniedPath(cp.Match, r.Home, r.DenyGlobs) {
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_workdir_rejected", map[string]any{
+			"event": "shell_workdir_rejected", "tool": "shell_docker", "canonical_workdir": cp.Match,
+			"reason": "contains_denied_path", "task_id": taskID,
+		})
+		return RunOutput{}, errors.New(reasonWorkdirContainsDenied)
 	}
 
 	// egressToken is the per-task egress-proxy credential this run's
