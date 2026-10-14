@@ -223,12 +223,13 @@ func TestExecuteMarksFailedOnEffectError(t *testing.T) {
 	}
 }
 
-// TestEffectDBWriteCommitsAtomicallyWithReceipt proves an effect that
-// writes to brain.db itself (via the tx Execute hands it) lands in the
-// SAME transaction as the receipt row - both present after Execute
-// returns, matching task spec step 3's "in the same transaction that
-// commits the tool's DB effects".
-func TestEffectDBWriteCommitsAtomicallyWithReceipt(t *testing.T) {
+// TestExecuteInTxEffectDBWriteCommitsAtomicallyWithReceipt proves an
+// effect that writes to brain.db itself (via the tx ExecuteInTx hands it)
+// lands in the SAME transaction as the receipt row - both present after
+// ExecuteInTx returns, matching task spec step 3's "in the same
+// transaction that commits the tool's DB effects". (Before FIX-I-12 this
+// was Execute's contract; Execute now runs external effects with tx nil.)
+func TestExecuteInTxEffectDBWriteCommitsAtomicallyWithReceipt(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
 	r := newReceipts(st)
@@ -244,10 +245,10 @@ func TestEffectDBWriteCommitsAtomicallyWithReceipt(t *testing.T) {
 		return json.Marshal(map[string]bool{"ok": true})
 	}
 
-	if _, _, err := r.Execute(context.Background(), ExecuteInput{
+	if _, _, err := r.ExecuteInTx(context.Background(), ExecuteInput{
 		TaskID: "t1", TraceID: "trace-1", ToolName: "stub_write", Class: ClassW1, ArgsHash: HashArgs([]byte("x")),
 	}, effect); err != nil {
-		t.Fatalf("Execute() error = %v", err)
+		t.Fatalf("ExecuteInTx() error = %v", err)
 	}
 
 	var n int
@@ -339,22 +340,18 @@ func TestConcurrentExecuteSameKeyRunsEffectExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded is the
-// BLOCKER 4 regression test: an effect whose returned result is invalid
-// raw JSON makes the POST-EFFECT receipt-envelope marshal fail
+// TestExecuteInTxRollsBackEffectWriteOnReceiptFailure is the BLOCKER 4
+// regression test for the in-transaction path (FIX-I-12 moved it from
+// Execute to ExecuteInTx): an effect whose returned result is invalid raw
+// JSON makes the POST-EFFECT receipt-envelope marshal fail
 // (encoding/json validates a json.RawMessage sub-document's bytes when
-// marshaling the CONTAINING struct - see receiptEnvelope). Before the
-// fix, this path rolled back the transaction but never marked the
-// tool_calls row 'failed', stranding it at 'executing' forever (the
-// replay guard never engages against it, and no retry is possible either
-// - NextToolCallSeq/InsertToolCallIntent would just add ANOTHER row
-// alongside the permanently stuck one). The row must now end at 'failed',
-// the effect's OWN DB write (which ran inside the SAME transaction as the
-// would-be receipt) must have rolled back with it (not stranded either),
-// and a second, genuinely fresh Execute for the identical key must
-// re-execute cleanly - never replaying a phantom receipt, never refusing
-// as "already in flight".
-func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T) {
+// marshaling the CONTAINING struct - see receiptEnvelope). The row must
+// end at 'failed' (never stranded at 'executing'), the effect's OWN DB
+// write (which ran inside the SAME transaction as the would-be receipt)
+// must have rolled back with it, and a second, genuinely fresh call for
+// the identical key must re-execute cleanly - never replaying a phantom
+// receipt, never refusing as "already in flight".
+func TestExecuteInTxRollsBackEffectWriteOnReceiptFailure(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
 	r := newReceipts(st)
@@ -375,11 +372,11 @@ func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T)
 		return json.RawMessage(`{not valid json`), nil
 	}
 
-	_, replayed, err := r.Execute(ctx, ExecuteInput{
+	_, replayed, err := r.ExecuteInTx(ctx, ExecuteInput{
 		TaskID: "t1", TraceID: "trace-1", ToolName: "stranded_tool", Class: ClassW1, ArgsHash: argsHash,
 	}, badEffect)
 	if err == nil {
-		t.Fatal("Execute() error = nil, want a marshal error")
+		t.Fatal("ExecuteInTx() error = nil, want a marshal error")
 	}
 	if replayed {
 		t.Error("Execute() replayed = true, want false")
@@ -405,7 +402,7 @@ func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T)
 
 	// A second, genuinely fresh attempt for the SAME key must re-execute
 	// cleanly.
-	result, replayed, err := r.Execute(ctx, ExecuteInput{
+	result, replayed, err := r.ExecuteInTx(ctx, ExecuteInput{
 		TaskID: "t1", TraceID: "trace-1", ToolName: "stranded_tool", Class: ClassW1, ArgsHash: argsHash,
 	}, func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
 		return json.Marshal(map[string]string{"result": "succeeded-on-retry"})
@@ -422,5 +419,159 @@ func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T)
 	}
 	if got := countToolCalls(t, st, "t1", CallStatusReceipt); got != 1 {
 		t.Errorf("receipt-status tool_calls after retry = %d, want 1", got)
+	}
+}
+
+// TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded is the
+// BLOCKER 4 regression test for Execute (external effect, tx nil since
+// FIX-I-12): a post-effect receipt-envelope marshal failure must leave the
+// tool_calls row 'failed', never stranded at 'executing', and a fresh
+// attempt for the identical key must re-execute cleanly (no phantom
+// replay, no "already in flight" refusal).
+func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t1")
+	r := newReceipts(st)
+	ctx := context.Background()
+	argsHash := HashArgs([]byte("marshal-fail-args"))
+	in := ExecuteInput{TaskID: "t1", TraceID: "trace-1", ToolName: "stranded_tool", Class: ClassW1, ArgsHash: argsHash}
+
+	_, replayed, err := r.Execute(ctx, in, func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
+		return json.RawMessage(`{not valid json`), nil
+	})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a marshal error")
+	}
+	if replayed {
+		t.Error("Execute() replayed = true, want false")
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusFailed); got != 1 {
+		t.Errorf("failed-status tool_calls = %d, want 1 (must not be stranded at 'executing')", got)
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusExecuting); got != 0 {
+		t.Errorf("executing-status tool_calls = %d, want 0 (row must not be stranded)", got)
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusReceipt); got != 0 {
+		t.Errorf("receipt-status tool_calls = %d, want 0", got)
+	}
+
+	result, replayed, err := r.Execute(ctx, in, func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
+		return json.Marshal(map[string]string{"result": "succeeded-on-retry"})
+	})
+	if err != nil {
+		t.Fatalf("Execute() retry error = %v", err)
+	}
+	if replayed {
+		t.Error("Execute() retry replayed = true, want false (the earlier attempt only failed, no receipt)")
+	}
+	var decoded map[string]string
+	if uerr := json.Unmarshal(result, &decoded); uerr != nil || decoded["result"] != "succeeded-on-retry" {
+		t.Errorf("retry result = %s, unmarshal err = %v", result, uerr)
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusReceipt); got != 1 {
+		t.Errorf("receipt-status tool_calls after retry = %d, want 1", got)
+	}
+}
+
+// TestExecuteInTxReplayAndClassRMatchExecute: the in-transaction entry
+// point shares prepare with Execute - a second call for the same key
+// replays the stored receipt without running the effect, and class R is
+// refused.
+func TestExecuteInTxReplayAndClassRMatchExecute(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t1")
+	r := newReceipts(st)
+	tool := &stubTool{}
+	in := ExecuteInput{TaskID: "t1", TraceID: "trace-1", ToolName: "stub_write", Class: ClassW1, ArgsHash: HashArgs([]byte("intx-replay"))}
+
+	first, replayed, err := r.ExecuteInTx(context.Background(), in, tool.effect("first"))
+	if err != nil || replayed {
+		t.Fatalf("first ExecuteInTx = (%s, %v, %v), want a fresh run", first, replayed, err)
+	}
+	second, replayed, err := r.ExecuteInTx(context.Background(), in, tool.effect("second"))
+	if err != nil {
+		t.Fatalf("second ExecuteInTx: %v", err)
+	}
+	if !replayed || string(second) != string(first) {
+		t.Fatalf("second ExecuteInTx = (%s, replayed=%v), want the stored %s replayed", second, replayed, first)
+	}
+	if tool.Invocations != 1 {
+		t.Fatalf("Invocations = %d, want 1", tool.Invocations)
+	}
+	// Execute sees the same receipt (one lifecycle, two entry points).
+	if _, replayed, err := r.Execute(context.Background(), in, tool.effect("third")); err != nil || !replayed {
+		t.Fatalf("Execute after ExecuteInTx = (replayed=%v, %v), want a replay", replayed, err)
+	}
+	if _, _, err := r.ExecuteInTx(context.Background(), ExecuteInput{TaskID: "t1", ToolName: "r_tool", Class: ClassR, ArgsHash: "x"}, tool.effect("r")); !errors.Is(err, ErrReadOnlyClass) {
+		t.Fatalf("ExecuteInTx(class R) error = %v, want ErrReadOnlyClass", err)
+	}
+}
+
+// TestExecuteDoesNotHoldDBConnectionDuringEffect (FIX-I-12): while an
+// EXTERNAL effect is in flight, an unrelated kahyad write (here: a ledger
+// append - exactly what /policy/check's Engine.Check does) must not wait for
+// the effect to finish. brain.db has ONE pooled connection
+// (store.Open: SetMaxOpenConns(1)); a transaction held across the effect
+// pinned it.
+func TestExecuteDoesNotHoldDBConnectionDuringEffect(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t1")
+	r := newReceipts(st)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	effect := func(ctx context.Context, _ *sql.Tx) (json.RawMessage, error) {
+		close(started)
+		<-release
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := r.Execute(context.Background(), ExecuteInput{
+			TaskID: "t1", TraceID: "trace-1", ToolName: "stub_write", Class: ClassW2, ArgsHash: HashArgs([]byte("a")),
+		}, effect)
+		done <- err
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	logErr := st.LogEvent(ctx, "trace-other", "policy_decision", map[string]any{"probe": true})
+	close(release)
+	if logErr != nil {
+		<-done
+		t.Fatalf("concurrent ledger write during effect = %v, want nil (the effect must not pin the only DB connection)", logErr)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if n := countToolCalls(t, st, "t1", CallStatusReceipt); n != 1 {
+		t.Fatalf("receipt rows = %d, want 1", n)
+	}
+}
+
+// TestExecutePassesNilTxToExternalEffect pins Execute's contract (FIX-I-12):
+// the effect runs outside any transaction; an effect that must write
+// brain.db atomically with its receipt uses ExecuteInTx instead.
+func TestExecutePassesNilTxToExternalEffect(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t1")
+	r := newReceipts(st)
+	var gotTx *sql.Tx
+	called := false
+	if _, _, err := r.Execute(context.Background(), ExecuteInput{
+		TaskID: "t1", TraceID: "trace-1", ToolName: "stub_write", Class: ClassW1, ArgsHash: HashArgs([]byte("nil-tx")),
+	}, func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
+		called, gotTx = true, tx
+		return json.RawMessage(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !called {
+		t.Fatal("effect never ran")
+	}
+	if gotTx != nil {
+		t.Fatal("Execute handed the effect a non-nil *sql.Tx: an external effect must run with no transaction (and no pooled connection) checked out")
+	}
+	if n := countToolCalls(t, st, "t1", CallStatusReceipt); n != 1 {
+		t.Fatalf("receipt rows = %d, want 1", n)
 	}
 }

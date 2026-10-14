@@ -157,6 +157,9 @@ func (s *Server) HandleDevStub(traceID, taskID string, args DevStubArgs) (DevStu
 	}
 	argsHash := task.HashArgs(argBytes)
 
+	// The effect runs outside any DB transaction (FIX-I-12: Execute hands
+	// external effects a nil tx and checks out no brain.db connection), so
+	// this sleep never blocks /policy/check or the ledger.
 	effect := func(_ context.Context, _ *sql.Tx) (json.RawMessage, error) {
 		time.Sleep(duration)
 		if err := appendCounterLine(args.CounterFile); err != nil {

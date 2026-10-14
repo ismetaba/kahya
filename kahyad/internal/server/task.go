@@ -1059,16 +1059,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	//     'executing' for the resume scan to ever look at it at all).
 	//  2. A DB-query-based guard here (an earlier version of this fix
 	//     checked "is any tool_calls row still receipt-less" before
-	//     deciding) does not actually work: kahyad/internal/store opens
-	//     brain.db with a single connection (SetMaxOpenConns(1) - "long
-	//     transactions block everything"), and Receipts.Execute holds
-	//     that ONE connection for the effect's entire duration. A guard
-	//     query issued the instant spawn.Run returns BLOCKS on that same
-	//     connection until the in-flight effect's transaction commits -
-	//     by which time the row is no longer receipt-less (confirmed
-	//     empirically: such a guard query never once observed "in
-	//     flight", it always returned right after the receipt had
-	//     already landed).
+	//     deciding) did not work when written: kahyad/internal/store opens
+	//     brain.db with a single connection (SetMaxOpenConns(1)), and
+	//     Receipts.Execute then held that ONE connection for the effect's
+	//     entire duration, so a guard query issued the instant spawn.Run
+	//     returned BLOCKED until the in-flight effect's transaction
+	//     committed - by which time the row was no longer receipt-less.
+	//     (FIX-I-12: no longer - Execute now runs the effect outside any
+	//     transaction and such a query would answer at once; the
+	//     guard-query approach stays rejected for reason 1: the decision
+	//     belongs to the resume scan, not to this goroutine.)
 	//
 	// The fix that actually holds under that constraint: never decide
 	// "failed" HERE at all - only 'done' (spawn.Run's own StatusOK,

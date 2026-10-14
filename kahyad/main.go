@@ -710,8 +710,13 @@ func run() int {
 	// onto the shared MCP server ONLY under KAHYA_ENV=dev - never
 	// reachable in production regardless of what a (also dev-only)
 	// policy.yaml overlay declares the tool as.
+	//
+	// taskReceipts itself is built unconditionally: the resume scan below
+	// consults it (task.AnyLive) so a tool call still executing inside
+	// kahyad is never mistaken for an interrupted one (FIX-I-12). With no
+	// caller (production today) it simply never reports anything live.
+	taskReceipts := task.NewReceipts(st.DB(), st.Queries, st)
 	if cfg.Env == config.EnvDev {
-		taskReceipts := task.NewReceipts(st.DB(), st.Queries, st)
 		srv.SetDevStub(taskReceipts)
 	}
 
@@ -1115,7 +1120,10 @@ func run() int {
 		// approval wait too.
 		ApprovalWaitSeconds: cfg.ApprovalWaitSeconds,
 	}
-	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, taskLive, cfg.TaskRetryW1MaxAuto)
+	// FIX-I-12: a task is "live" for the resume scan while its worker runs
+	// (taskLive) OR while one of its side effects is still executing inside
+	// kahyad (taskReceipts) - the latter outlives a killed worker.
+	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, task.AnyLive(taskLive, taskReceipts), cfg.TaskRetryW1MaxAuto)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)
 	// W4-04: a redispatched cloud-lane task needs its OWN fresh Anthropic
 	// forward-proxy listener to make any model call at all - srv.

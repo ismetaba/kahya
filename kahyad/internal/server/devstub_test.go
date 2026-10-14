@@ -1,11 +1,17 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/task"
 )
@@ -93,4 +99,83 @@ func TestHandleDevStubUnwiredIsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("HandleDevStub with no SetDevStub call: error = nil, want a rejection")
 	}
+}
+
+// TestPolicyCheckNotBlockedByInFlightDevStubEffect is I-12 at the server
+// level: while a slow w2_slow_stub effect is in flight (Receipts.Execute),
+// the worker's POST /policy/check must still answer promptly. Before
+// FIX-I-12 Execute held brain.db's ONE pooled connection in a transaction
+// for the whole effect, Engine.Check waited on it to ledger its
+// policy_decision, and the worker's 5 s UDS budget turned that into a
+// spurious fail-closed DENY.
+func TestPolicyCheckNotBlockedByInFlightDevStubEffect(t *testing.T) {
+	fx := newTaskTestFixture(t, nil, 1)
+	fx.srv.SetDevStub(task.NewReceipts(fx.store.DB(), fx.store.Queries, fx.store))
+	insertDurabilityTestTask(t, fx.store, "dev-t1")
+	// memory_search is class R; L1 makes it an auto-allow (G01 bootstrap
+	// shape) so the expected answer is a plain allow.
+	seedAutonomyState(t, fx.store, "memory_search", string(policy.ClassR), "global", 1)
+
+	stubDone := make(chan error, 1)
+	go func() {
+		_, err := fx.srv.HandleDevStub("trace-1", "dev-t1", DevStubArgs{DurationMs: 1500, CounterFile: filepath.Join(t.TempDir(), "c.txt")})
+		stubDone <- err
+	}()
+	var stubErr error
+	stubFinished := false
+	waitStub := func() {
+		if !stubFinished {
+			stubErr = <-stubDone
+			stubFinished = true
+		}
+	}
+	t.Cleanup(waitStub) // never leave the effect running past the fixture's own cleanup
+	// Let the effect start (intent + executing rows are short autocommits).
+	time.Sleep(100 * time.Millisecond)
+
+	body, _ := json.Marshal(map[string]any{
+		"trace_id": "trace-1", "task_id": "dev-t1", "session_id": nil,
+		"tool_name": "memory_search", "tool_input": map[string]any{"query": "x"},
+	})
+	client := *fx.client
+	client.Timeout = time.Second
+	start := time.Now()
+	resp, err := client.Post("http://kahyad/policy/check", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /policy/check while the dev-stub effect is in flight: %v (after %v) - the effect must not pin brain.db's only connection", err, time.Since(start))
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/policy/check = %d %s, want 200", resp.StatusCode, raw)
+	}
+	var got policyCheckResponse
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if got.Decision != policy.ResultAllow {
+		t.Fatalf("/policy/check decision = %q (%s), want allow", got.Decision, raw)
+	}
+	select {
+	case err := <-stubDone:
+		stubFinished = true
+		t.Fatalf("dev-stub effect finished (err=%v) before /policy/check answered - the probe did not overlap the effect", err)
+	default:
+	}
+	waitStub()
+	if stubErr != nil {
+		t.Fatalf("HandleDevStub: %v", stubErr)
+	}
+	if n := countToolCallsByStatus(t, fx.store, "dev-t1", task.CallStatusReceipt); n != 1 {
+		t.Fatalf("receipt rows = %d, want 1", n)
+	}
+}
+
+func countToolCallsByStatus(t *testing.T, st *store.Store, taskID, status string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM tool_calls WHERE task_id = ? AND status = ?`, taskID, status).Scan(&n); err != nil {
+		t.Fatalf("count tool_calls: %v", err)
+	}
+	return n
 }

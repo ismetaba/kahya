@@ -76,8 +76,9 @@ var ErrLowerAttempt = errors.New("taint: refusing to insert a clean row over an 
 // *sqlcgen.Queries (via *store.Store, OR a *sql.Tx-scoped Queries via
 // sqlcgen.New(tx)) satisfies this directly, with no adapter - the SAME
 // "pass a tx-scoped Queries value to get transactional behavior" pattern
-// kahyad/internal/task.Receipts.Execute already establishes (see that
-// file's own EffectFunc doc comment). Constructing a fresh Tracker over a
+// kahyad/internal/task.Receipts.ExecuteInTx already establishes (see that
+// file's own EffectFunc doc comment; since FIX-I-12 plain Execute hands
+// external effects no tx at all). Constructing a fresh Tracker over a
 // tx-scoped Store is exactly how kahyad/internal/server's OnSession
 // callback inserts this task's session_taint(tier=clean) row in the SAME
 // transaction as its own UpdateTaskSession call (task spec step 1a).

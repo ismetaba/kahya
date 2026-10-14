@@ -1092,6 +1092,17 @@ first boot). `{}` disables it.
   addition. Cloud-retry taxonomy and `bekliyor-yeniden-deneme`
   *population* remain W4-04; `user_halted` *semantics* remain W6-03 (only
   the enum value + the dispatcher's never-redeliver guard exist so far).
+  FIX-I-12: `Receipts.Execute` runs an (external) effect with no
+  transaction and no brain.db connection checked out (`tx` is nil) and
+  writes the receipt in one short statement afterwards, so a slow effect
+  never blocks `/policy/check` or the ledger on the single pooled
+  connection; `Receipts.ExecuteInTx` keeps the in-transaction semantics
+  for short effects that write brain.db and must commit atomically with
+  their receipt. Because the periodic resume scan now runs while an effect
+  is in flight, `*Receipts` is also a resume-scan `LiveChecker`
+  (`task.AnyLive(liveRegistry, receipts)`): a task whose side effect is
+  still executing inside kahyad (its worker may already be dead — W4-07
+  scenario A) is left alone until the receipt or failure is written.
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — landed in W4-08 (see that
   note above): `model` is now set by `kahyad/internal/router.SelectModel`,

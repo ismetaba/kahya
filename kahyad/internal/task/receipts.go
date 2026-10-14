@@ -31,12 +31,33 @@
 // error, the receipt UPDATE itself failing, or the commit failing - used
 // to return without ever marking the tool_calls row 'failed', leaving it
 // stuck at 'executing' with the replay guard never engaging. Every one of
-// those paths now goes through failAndReturn, which is safe precisely
-// because the effect's own DB writes live in the SAME transaction as the
-// receipt write and have NOT committed at any of those failure points -
-// rolling back (implicit on a failed Commit, explicit otherwise) undoes
-// them cleanly, so marking the row 'failed' afterward can never strand a
-// committed effect with no receipt.
+// those paths now goes through failAndReturn (commitReceipt). For
+// ExecuteInTx that is safe precisely because the effect's own DB writes
+// live in the SAME transaction as the receipt write and have NOT
+// committed at any of those failure points - rolling back (implicit on a
+// failed Commit, explicit otherwise) undoes them cleanly, so marking the
+// row 'failed' afterward can never strand a committed DB effect with no
+// receipt. For Execute (an external effect) the side effect lives outside
+// brain.db and no transaction ever covered it - unchanged by FIX-I-12.
+//
+// FIX-I-12 (single connection pinned across a slow effect): brain.db has
+// ONE pooled connection (store.Open: SetMaxOpenConns(1)). Execute used to
+// BeginTx before running the effect and commit only after it returned, so
+// a slow EXTERNAL effect (filesystem, Docker, AppleScript, the W4-07
+// w2_slow_stub sleep) checked that connection out for its whole duration -
+// /policy/check's Engine.Check (which ledgers every decision), the ledger
+// and every other kahyad DB call queued behind it, and the worker's 5 s
+// UDS budget turned that into a spurious fail-closed DENY. Execute now
+// runs the effect with NO transaction and NO connection checked out (tx is
+// nil) and writes the receipt in its own short statement afterwards
+// (commitReceipt); ExecuteInTx keeps the old in-transaction semantics for
+// SHORT effects that write brain.db and must commit atomically with their
+// receipt. Both share prepare (replay check, intent claim, mark executing)
+// under the same keyed lock, so the BLOCKER 1 guarantees are identical.
+// Crash semantics are unchanged: an effect that finished but whose receipt
+// never committed leaves the row 'executing' and receipt-less, which the
+// resume scan (resolve.go) handles - W1 auto-retry, W2/W3 never (HANDOFF
+// §6 W4 ⚑); the transaction was never durable across a crash anyway.
 package task
 
 import (
@@ -170,18 +191,24 @@ func isUniqueConstraintViolation(err error) bool {
 
 // EffectFunc performs a side-effectful tool's actual execution and
 // returns its result (embedded, as raw JSON, in the durable receipt) or
-// an error. tx is a *sql.Tx already open against the SAME database
-// Receipts itself uses: an effect that ALSO writes to brain.db (e.g.
-// mutating autonomy_state, inserting a memory fact) should perform those
-// writes through tx so they commit in the EXACT SAME transaction as the
-// receipt row (task spec step 3: "in the same transaction that commits
-// the tool's DB effects"). An effect whose side effect lives OUTSIDE
-// brain.db (a filesystem write, an AppleScript run, a Docker exec, ...)
-// simply ignores tx - Execute still commits the receipt IMMEDIATELY once
-// effect returns, which is the closest a single-database transaction can
-// get to atomicity when the side effect itself is not a database write at
-// all (no two-phase commit across brain.db and the filesystem is
-// attempted or claimed here).
+// an error.
+//
+// tx is nil for Execute (FIX-I-12): external effects - a filesystem
+// write, an AppleScript run, a Docker exec, an HTTP call - run with no
+// transaction and no pooled brain.db connection checked out, so a slow
+// effect never blocks /policy/check or the ledger. Execute commits the
+// receipt immediately once effect returns, which is the closest a
+// single-database write can get to atomicity when the side effect itself
+// is not a database write at all (no two-phase commit across brain.db and
+// the filesystem is attempted or claimed here).
+//
+// Use ExecuteInTx for an effect that writes brain.db and must commit
+// atomically with its receipt (task spec step 3: "in the same transaction
+// that commits the tool's DB effects" - e.g. mutating autonomy_state,
+// inserting a memory fact): there tx is a *sql.Tx already open against the
+// SAME database and the effect must perform its writes through it. Such an
+// effect must be short (milliseconds) because it holds the store's only
+// connection for its whole duration.
 type EffectFunc func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error)
 
 // ExecuteInput is Receipts.Execute's input: everything the tool_calls
@@ -295,13 +322,58 @@ type Receipts struct {
 	// locks is Execute's in-process keyed mutex (BLOCKER 1 fix) - see
 	// keyedMutexes' own doc comment.
 	locks *keyedMutexes
+
+	// inflight counts, per task id, the Execute/ExecuteInTx calls currently
+	// between their keyed-lock acquisition and their final receipt/failed
+	// write (FIX-I-12) - see IsLive.
+	inflightMu sync.Mutex
+	inflight   map[string]int
 }
 
-// NewReceipts constructs a Receipts. db is the raw *sql.DB Execute opens
-// its own transaction against (store.Store.DB()); q is the ordinary
+// IsLive reports whether one of taskID's side-effectful tool calls is
+// executing inside THIS kahyad process right now (FIX-I-12). It makes
+// *Receipts a LiveChecker for the resume scan (AnyLive): before FIX-I-12 a
+// periodic scan simply could not run while an effect was in flight -
+// Execute's transaction pinned brain.db's single connection until the
+// receipt committed - so it never saw that call's 'executing',
+// receipt-less row. With the effect now outside any transaction the scan
+// does run, and without this it would mistake an in-process call whose
+// worker died (W4-07 scenario A: kill -9 mid-call; the effect still runs to
+// completion on kahyad's own goroutine) for an interrupted one and block a
+// W2/W3 task (or fail its row) although the receipt is about to land. A
+// kahyad crash empties this map with everything else, so the startup scan
+// still sees every genuinely interrupted call.
+func (r *Receipts) IsLive(taskID string) bool {
+	r.inflightMu.Lock()
+	defer r.inflightMu.Unlock()
+	return r.inflight[taskID] > 0
+}
+
+// beginEffect / endEffect bracket one Execute/ExecuteInTx call for IsLive.
+func (r *Receipts) beginEffect(taskID string) {
+	r.inflightMu.Lock()
+	defer r.inflightMu.Unlock()
+	if r.inflight == nil {
+		r.inflight = make(map[string]int)
+	}
+	r.inflight[taskID]++
+}
+
+func (r *Receipts) endEffect(taskID string) {
+	r.inflightMu.Lock()
+	defer r.inflightMu.Unlock()
+	if r.inflight[taskID] <= 1 {
+		delete(r.inflight, taskID)
+		return
+	}
+	r.inflight[taskID]--
+}
+
+// NewReceipts constructs a Receipts. db is the raw *sql.DB ExecuteInTx
+// opens its transaction against (store.Store.DB()); q is the ordinary
 // (non-tx) *sqlcgen.Queries handle (store.Store.Queries) used for every
-// step OTHER than the final receipt commit, which runs inside Execute's
-// own transaction via q's WithTx-equivalent - see Execute's own comment.
+// step outside that transaction - including Execute's own receipt write
+// (FIX-I-12: Execute holds no transaction at all).
 func NewReceipts(db *sql.DB, q *sqlcgen.Queries, ledger Ledger) *Receipts {
 	return &Receipts{db: db, q: q, ledger: ledger, now: time.Now, locks: newKeyedMutexes()}
 }
@@ -312,10 +384,11 @@ func (r *Receipts) SetClock(now func() time.Time) { r.now = now }
 func (r *Receipts) nowRFC3339() string { return r.now().UTC().Format(time.RFC3339Nano) }
 
 // Execute is the whole W4-02 receipt lifecycle for one side-effectful
-// tool call: idempotent-replay check (step 4) -> insert tool_calls
-// status=intent (step 3) -> mark executing -> run effect inside a fresh
-// transaction -> on success, mark receipt (in that SAME transaction) and
-// commit; on failure, mark failed and return the effect's error.
+// tool call whose effect lives OUTSIDE brain.db: idempotent-replay check
+// (step 4) -> insert tool_calls status=intent (step 3) -> mark executing
+// -> run effect with NO transaction (tx is nil, FIX-I-12) -> on success,
+// write the receipt (commitReceipt); on failure, mark failed and return
+// the effect's error.
 //
 // replayed reports whether result came from an EARLIER completed attempt
 // (effect was NOT invoked this call) - this is the double-execution-safety
@@ -327,6 +400,8 @@ func (r *Receipts) nowRFC3339() string { return r.now().UTC().Format(time.RFC333
 // args_hash) key is serialized, in this process, by locks before the
 // replay check even runs - see keyedMutexes' own doc comment and
 // claimIntent's for the DB-level (cross-process) half of this guarantee.
+// The keyed lock (an in-process mutex, never a DB connection) is still
+// held across the effect.
 // BLOCKER 4 fix: every failure path from the moment the effect has run
 // onward goes through failAndReturn, so a tool_calls row can never again
 // be left stranded at 'executing' with neither a receipt nor a 'failed'
@@ -338,38 +413,69 @@ func (r *Receipts) Execute(ctx context.Context, in ExecuteInput, effect EffectFu
 
 	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
 	defer unlock()
+	// Registered before the intent row exists and released only after the
+	// receipt/failed write: the resume scan never sees this call's row
+	// 'executing' without also seeing the task live (IsLive).
+	r.beginEffect(in.TaskID)
+	defer r.endEffect(in.TaskID)
 
-	// Step 4: idempotent replay - a status='receipt' row for this exact
-	// (task_id, tool_name, args_hash) triple already exists, from ANY
-	// earlier attempt (any seq).
-	if hitResult, seq, hit, cerr := r.checkReplay(ctx, in); cerr != nil {
-		return nil, false, cerr
-	} else if hit {
-		r.ledgerReplayed(ctx, in, seq)
-		return hitResult, true, nil
-	}
-
-	// Step 3: intent (claimIntent also resolves the BLOCKER 1 DB-level
-	// unique-constraint race - see its own doc comment).
-	row, replayResult, replaySeq, wasReplayed, err := r.claimIntent(ctx, in)
+	row, replayResult, wasReplayed, err := r.prepare(ctx, in)
 	if err != nil {
 		return nil, false, err
 	}
 	if wasReplayed {
-		r.ledgerReplayed(ctx, in, replaySeq)
 		return replayResult, true, nil
 	}
 
-	// executing.
-	if err := r.q.MarkToolCallExecuting(ctx, sqlcgen.MarkToolCallExecutingParams{
-		StartedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
-	}); err != nil {
-		return nil, false, fmt.Errorf("task: mark tool_calls executing (id=%d): %w", row.ID, err)
+	// FIX-I-12: the effect runs with NO transaction and NO pooled
+	// connection checked out - a slow external side effect must never pin
+	// brain.db's single connection (store.Open: SetMaxOpenConns(1));
+	// /policy/check, the ledger and every other kahyad write keep flowing
+	// while it runs.
+	effectResult, effErr := effect(ctx, nil)
+	if effErr != nil {
+		return nil, false, r.failAndReturn(ctx, row.ID, effErr)
+	}
+	return r.commitReceipt(ctx, row.ID, in, effectResult, nil)
+}
+
+// ExecuteInTx is Execute for an effect that WRITES brain.db (autonomy_state,
+// facts, ...) and must commit atomically with its receipt: the effect runs
+// inside a fresh transaction it receives as tx, and the receipt row is
+// written in that SAME transaction before the single commit (task spec
+// step 3). The effect MUST be short (milliseconds): it holds the store's
+// only connection (store.Open: SetMaxOpenConns(1)) for its whole duration,
+// so a slow effect here would block /policy/check and the ledger exactly
+// as FIX-I-12 removed from Execute. External (filesystem, Docker,
+// AppleScript, HTTP) effects use Execute. Replay, intent claim and the
+// BLOCKER 1/4 guarantees are identical to Execute's (shared prepare /
+// commitReceipt).
+func (r *Receipts) ExecuteInTx(ctx context.Context, in ExecuteInput, effect EffectFunc) (result json.RawMessage, replayed bool, err error) {
+	if in.Class == ClassR {
+		return nil, false, ErrReadOnlyClass
+	}
+
+	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
+	defer unlock()
+	// Registered before the intent row exists and released only after the
+	// receipt/failed write: the resume scan never sees this call's row
+	// 'executing' without also seeing the task live (IsLive).
+	r.beginEffect(in.TaskID)
+	defer r.endEffect(in.TaskID)
+
+	row, replayResult, wasReplayed, err := r.prepare(ctx, in)
+	if err != nil {
+		return nil, false, err
+	}
+	if wasReplayed {
+		return replayResult, true, nil
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("task: begin tx (task=%s tool=%s): %w", in.TaskID, in.ToolName, err)
+		// The effect never ran: marking the row 'failed' is exactly true
+		// and frees the key for a fresh attempt.
+		return nil, false, r.failAndReturn(ctx, row.ID, fmt.Errorf("task: begin tx (task=%s tool=%s): %w", in.TaskID, in.ToolName, err))
 	}
 
 	effectResult, effErr := effect(ctx, tx)
@@ -377,26 +483,85 @@ func (r *Receipts) Execute(ctx context.Context, in ExecuteInput, effect EffectFu
 		_ = tx.Rollback()
 		return nil, false, r.failAndReturn(ctx, row.ID, effErr)
 	}
+	return r.commitReceipt(ctx, row.ID, in, effectResult, tx)
+}
+
+// prepare is the shared front half of Execute/ExecuteInTx, run with the
+// caller already holding the keyed lock: idempotent replay (step 4) ->
+// intent claim (step 3; claimIntent also resolves the BLOCKER 1 DB-level
+// unique-constraint race) -> mark executing (an autocommit statement, as
+// before). replayed=true means replayResult is a stored receipt's result
+// and EventReplayed has been ledgered; the caller must not run the effect.
+func (r *Receipts) prepare(ctx context.Context, in ExecuteInput) (row sqlcgen.ToolCall, replayResult json.RawMessage, replayed bool, err error) {
+	// Step 4: idempotent replay - a status='receipt' row for this exact
+	// (task_id, tool_name, args_hash) triple already exists, from ANY
+	// earlier attempt (any seq).
+	if hitResult, seq, hit, cerr := r.checkReplay(ctx, in); cerr != nil {
+		return sqlcgen.ToolCall{}, nil, false, cerr
+	} else if hit {
+		r.ledgerReplayed(ctx, in, seq)
+		return sqlcgen.ToolCall{}, hitResult, true, nil
+	}
+
+	// Step 3: intent.
+	row, claimedReplay, replaySeq, wasReplayed, err := r.claimIntent(ctx, in)
+	if err != nil {
+		return sqlcgen.ToolCall{}, nil, false, err
+	}
+	if wasReplayed {
+		r.ledgerReplayed(ctx, in, replaySeq)
+		return sqlcgen.ToolCall{}, claimedReplay, true, nil
+	}
+
+	// executing.
+	if err := r.q.MarkToolCallExecuting(ctx, sqlcgen.MarkToolCallExecutingParams{
+		StartedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
+	}); err != nil {
+		return sqlcgen.ToolCall{}, nil, false, fmt.Errorf("task: mark tool_calls executing (id=%d): %w", row.ID, err)
+	}
+	return row, nil, false, nil
+}
+
+// commitReceipt marshals the receipt envelope and writes the receipt row
+// (BLOCKER 4 semantics preserved: every failure path from here marks the
+// row 'failed'). With tx == nil (Execute) the receipt is ONE short
+// autocommit statement through the ordinary store - no connection is held
+// beyond it; with a tx (ExecuteInTx) it is written in that transaction,
+// which is then committed, so the effect's own DB writes and the receipt
+// land together or not at all.
+func (r *Receipts) commitReceipt(ctx context.Context, id int64, in ExecuteInput, effectResult json.RawMessage, tx *sql.Tx) (json.RawMessage, bool, error) {
+	rollback := func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}
 
 	// BLOCKER 4 fix: marshal BEFORE anything that cannot be rolled back.
-	// tx has not committed at this point (nor at either point below) - a
-	// failure here still cleanly undoes the effect's own writes, so
-	// failAndReturn is always safe to call from here on.
+	// An open tx has not committed at this point (nor at either point
+	// below) - a failure here still cleanly undoes the effect's own DB
+	// writes, so failAndReturn is always safe to call from here on.
 	env := receiptEnvelope{Result: effectResult, ResultHash: HashArgs(effectResult)}
 	envJSON, merr := json.Marshal(env)
 	if merr != nil {
-		_ = tx.Rollback()
-		return nil, false, r.failAndReturn(ctx, row.ID, fmt.Errorf("task: marshal receipt envelope (task=%s tool=%s): %w", in.TaskID, in.ToolName, merr))
+		rollback()
+		return nil, false, r.failAndReturn(ctx, id, fmt.Errorf("task: marshal receipt envelope (task=%s tool=%s): %w", in.TaskID, in.ToolName, merr))
 	}
 
-	txq := sqlcgen.New(tx)
-	if err := txq.MarkToolCallReceipt(ctx, sqlcgen.MarkToolCallReceiptParams{
+	params := sqlcgen.MarkToolCallReceiptParams{
 		ReceiptJson: sql.NullString{String: string(envJSON), Valid: true},
 		FinishedAt:  sql.NullString{String: r.nowRFC3339(), Valid: true},
-		ID:          row.ID,
-	}); err != nil {
-		_ = tx.Rollback()
-		return nil, false, r.failAndReturn(ctx, row.ID, fmt.Errorf("task: mark tool_calls receipt (id=%d): %w", row.ID, err))
+		ID:          id,
+	}
+	if tx == nil {
+		if err := r.q.MarkToolCallReceipt(ctx, params); err != nil {
+			return nil, false, r.failAndReturn(ctx, id, fmt.Errorf("task: mark tool_calls receipt (id=%d): %w", id, err))
+		}
+		return effectResult, false, nil
+	}
+
+	if err := sqlcgen.New(tx).MarkToolCallReceipt(ctx, params); err != nil {
+		rollback()
+		return nil, false, r.failAndReturn(ctx, id, fmt.Errorf("task: mark tool_calls receipt (id=%d): %w", id, err))
 	}
 	if err := tx.Commit(); err != nil {
 		// A failed Commit leaves tx done - database/sql's own contract -
@@ -404,9 +569,8 @@ func (r *Receipts) Execute(ctx context.Context, in ExecuteInput, effect EffectFu
 		// transaction is all-or-nothing: the effect's writes did NOT
 		// durably land, so marking 'failed' is safe (see failAndReturn's
 		// own doc comment).
-		return nil, false, r.failAndReturn(ctx, row.ID, fmt.Errorf("task: commit receipt tx (task=%s tool=%s): %w", in.TaskID, in.ToolName, err))
+		return nil, false, r.failAndReturn(ctx, id, fmt.Errorf("task: commit receipt tx (task=%s tool=%s): %w", in.TaskID, in.ToolName, err))
 	}
-
 	return effectResult, false, nil
 }
 
@@ -504,12 +668,15 @@ func (r *Receipts) claimIntent(ctx context.Context, in ExecuteInput) (row sqlcge
 // on such a row forever - it never becomes receipt-having, and
 // ListReceiptlessToolCalls would keep finding it, but nothing ever moves
 // it out of 'executing' either). This is safe to call from every one of
-// those paths specifically because, by the time failAndReturn runs, the
-// effect's own transaction has already been rolled back (or never
-// committed at all on a failed Commit - database/sql's own contract) -
-// marking 'failed' here can never strand a phantom COMMITTED effect with
-// no receipt, only ever a genuinely rolled-back one that a fresh Execute
-// retry can safely re-attempt from scratch. If marking failed ITSELF
+// those paths specifically because, by the time failAndReturn runs, an
+// ExecuteInTx effect's own transaction has already been rolled back (or
+// never committed at all on a failed Commit - database/sql's own
+// contract) - marking 'failed' here can never strand a phantom COMMITTED
+// DB effect with no receipt, only ever a genuinely rolled-back one that a
+// fresh retry can safely re-attempt from scratch. (An Execute effect's
+// side effect lives outside brain.db and was never covered by a
+// transaction - before or after FIX-I-12; G10 I-4's detached path decides
+// how a receipt-persist failure after a real tool's effect is surfaced.) If marking failed ITSELF
 // errors, that secondary error is wrapped around cause (never silently
 // dropped); otherwise cause is returned completely unwrapped, so a caller
 // checking the effect's own error identity (e.g. errors.Is against a

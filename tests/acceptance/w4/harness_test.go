@@ -705,24 +705,23 @@ func waitForWorkerPID(t *testing.T, d *daemon, taskID string, timeout time.Durat
 // sqlite connection from kahyad's own, opened by this test - d.openDB)
 // until taskID's most recent toolName row shows wantStatus.
 //
-// This is DELIBERATELY not done via GET /v1/task/status: kahyad/internal/
+// This was DELIBERATELY not done via GET /v1/task/status: kahyad/internal/
 // store opens brain.db with SetMaxOpenConns(1) (a single connection, by
-// design - "long transactions block everything"), and
-// kahyad/internal/task.Receipts.Execute holds that ONE connection for a
-// slow effect's ENTIRE duration (BeginTx before calling effect, Commit
-// only once effect returns) - so ANY kahyad-side query needing that same
-// connection (GetTaskByID/ListToolCallsByTask, which GET /v1/task/status
-// depends on) BLOCKS until the slow effect finishes, and only then
-// returns the ALREADY-FINAL ('receipt') state - confirmed empirically
-// while building this gate (an HTTP-based poll here never once observed
-// 'executing' - it silently returned the post-completion state every
-// time, well past this call's own timeout). Because brain.db is opened in
+// design), and before FIX-I-12 kahyad/internal/task.Receipts.Execute held
+// that ONE connection for a slow effect's ENTIRE duration (BeginTx before
+// calling effect, Commit only once effect returned) - so ANY kahyad-side
+// query needing that same connection (GetTaskByID/ListToolCallsByTask,
+// which GET /v1/task/status depends on) BLOCKED until the slow effect
+// finished, and only then returned the ALREADY-FINAL ('receipt') state.
+// FIX-I-12 runs the effect outside any transaction, so the HTTP route
+// would answer now too; the direct read stays because it is independent
+// of kahyad's own connection either way. Because brain.db is opened in
 // WAL mode (dsnPragmas: "_journal_mode=WAL"), a SEPARATE connection - this
 // one - can read the last COMMITTED snapshot at any time without ever
-// waiting on kahyad's own open transaction, and MarkToolCallExecuting
-// itself commits (as its own standalone, non-transactional statement)
-// BEFORE the slow effect's transaction ever begins - so this poll
-// reliably observes 'executing' during the real in-flight window.
+// waiting on kahyad, and MarkToolCallExecuting itself commits (as its
+// own standalone, non-transactional statement) BEFORE the slow effect
+// ever begins - so this poll reliably observes 'executing' during the
+// real in-flight window.
 func waitForToolCallStatusDB(t *testing.T, db *sql.DB, taskID, toolName, wantStatus string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

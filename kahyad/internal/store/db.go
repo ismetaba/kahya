@@ -97,9 +97,15 @@ func Open(cfg config.Config) (*Store, error) {
 	// SQLite (even in WAL mode) allows only one writer at a time, and the
 	// mattn/go-sqlite3 driver hands database/sql's connection pool a
 	// separate OS-level SQLite connection per pool slot. Capping the pool
-	// at 1 connection serializes all access through the busy_timeout logic
-	// above instead of letting Go's pool open a second connection that
-	// SQLITE_BUSYs immediately outside that timeout's protection.
+	// at 1 connection is the "one writer, simple" choice: every kahyad
+	// access is serialized through Go's pool instead of through SQLite's
+	// own lock (busy_timeout, set in the DSN, applies to every connection,
+	// so a second slot would wait rather than SQLITE_BUSY at once - the cap
+	// is a simplicity decision, not a busy_timeout workaround). The cost is
+	// that whoever holds the connection holds ALL of brain.db: never keep a
+	// transaction open across slow work (FIX-I-12 - Receipts.Execute runs
+	// external effects outside any transaction; ExecuteInTx is for short
+	// brain.db-writing effects only).
 	db.SetMaxOpenConns(1)
 
 	if err := migrate(db); err != nil {

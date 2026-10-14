@@ -115,6 +115,32 @@ type LiveChecker interface {
 	IsLive(taskID string) bool
 }
 
+// AnyLive composes LiveCheckers: a task is live when ANY of them reports it
+// live (nil entries are skipped). main.go passes the worker registry
+// (LiveRegistry: a worker process is running) and *Receipts (one of the
+// task's side effects is executing inside kahyad right now, FIX-I-12) - the
+// resume scan must leave a task alone in either case.
+func AnyLive(checkers ...LiveChecker) LiveChecker {
+	var live []LiveChecker
+	for _, c := range checkers {
+		if c != nil {
+			live = append(live, c)
+		}
+	}
+	return anyLive(live)
+}
+
+type anyLive []LiveChecker
+
+func (a anyLive) IsLive(taskID string) bool {
+	for _, c := range a {
+		if c.IsLive(taskID) {
+			return true
+		}
+	}
+	return false
+}
+
 // OutboxEnqueuer is the narrow outbox-table write surface enqueueResume
 // needs. *sqlcgen.Queries satisfies this directly.
 type OutboxEnqueuer interface {

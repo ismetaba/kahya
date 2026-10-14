@@ -46,16 +46,15 @@ def emit(obj):
 def main():
     # Written FIRST, before anything else: kahyad's own brain.db connection
     # pool is a single connection (kahyad/internal/store's own
-    # SetMaxOpenConns(1) - long transactions block everything), and
-    # Receipts.Execute holds that ONE connection for this effect's ENTIRE
-    # duration_ms (BeginTx before calling effect, Commit only after it
-    # returns) - so `GET /v1/task/status`'s own PID lookup would itself
-    # block for the full duration_ms once the effect starts (it needs the
-    # SAME connection). The gate's own "kill -9 the worker pid mid-call"
-    # step therefore reads the pid from THIS file directly, never through
-    # kahyad's HTTP API, so the harness can reliably kill the worker WHILE
-    # the tool call is still genuinely in flight instead of discovering the
-    # pid only after the call (and the kill window) has already passed.
+    # SetMaxOpenConns(1)), and before FIX-I-12 Receipts.Execute held that
+    # ONE connection for this effect's ENTIRE duration_ms (BeginTx before
+    # calling effect, Commit only after it returned) - so
+    # `GET /v1/task/status`'s own PID lookup blocked for the full
+    # duration_ms once the effect started. FIX-I-12 runs the effect outside
+    # any transaction; the gate's own "kill -9 the worker pid mid-call"
+    # step still reads the pid from THIS file directly, never through
+    # kahyad's HTTP API, so the harness kills the worker WHILE the tool
+    # call is still genuinely in flight, independent of kahyad's DB.
     pid_file = os.environ.get("KAHYA_W2_STUB_PID_FILE", "")
     if pid_file:
         with open(pid_file, "w", encoding="utf-8") as f:
