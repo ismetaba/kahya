@@ -382,6 +382,28 @@ class TestStdoutProtocolAndSession(unittest.TestCase):
             },
         )
 
+    def test_result_is_error_carrying_cloud_marker_maps_to_cloud_unreachable_exit_3(self) -> None:
+        """FIX-I-7: the SDK delivers the proxy's exhausted-retries 503 as
+        ResultMessage(is_error=True), not as an exception - the marker in its
+        result text must still map to {"event":"cloud_unreachable"} + exit 3
+        (a marker-less is_error result keeps the generic error line)."""
+        messages = [
+            ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1, is_error=True,
+                num_turns=1, session_id="sess-1",
+                result="API Error: 503 kahya_cloud_unreachable: upstream retries exhausted after inline backoff",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out = run_main_with(
+                dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=messages)
+            )
+
+        self.assertEqual(code, 3)
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(lines[-1], {"event": "cloud_unreachable"})
+        self.assertFalse([l for l in lines if l.get("type") == "error"])
+
     def test_sdk_connect_exception_maps_to_error_line_and_exit_1(self) -> None:
         with tempfile.TemporaryDirectory() as log_dir:
             code, out = run_main_with(
@@ -923,6 +945,21 @@ class TestReaderMode(unittest.TestCase):
         # side keys purely on the accumulated delta content, not a
         # session_id) - but emitting none must not be treated as an error
         # either, which the exit code / result line above already prove.
+
+    def test_run_main_with_mode_reader_cloud_marker_result_maps_to_cloud_unreachable(self) -> None:
+        """FIX-I-7: the Reader session gets the same is_error marker split."""
+        messages = [
+            ResultMessage(subtype="error", duration_ms=1, duration_api_ms=1, is_error=True, num_turns=1, session_id="sess-reader", total_cost_usd=0.0, result="API Error: 503 kahya_cloud_unreachable: retries exhausted"),
+        ]
+        factory = fake_client_factory(messages=messages)
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = base_env(log_dir)
+            code, out = run_main_with(dict(self.READER_ENVELOPE), env, client_factory=factory)
+
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(code, 3)
+        self.assertEqual(lines, [{"event": "cloud_unreachable"}])
 
     def test_run_main_with_mode_reader_error_result_maps_to_error_line(self) -> None:
         messages = [

@@ -298,11 +298,10 @@ def _is_cloud_unreachable(exc: Exception) -> bool:
     """W4-04: true when exc looks like kahyad's own forward-proxy telling
     this worker its inline retry budget is exhausted (or, best-effort, any
     other genuine transport/connectivity failure reaching it) - as opposed
-    to CLINotFoundError (a local install problem, never retried) or an
-    ordinary API-level failure the SDK already surfaces as ResultMessage.
-    is_error (handled by the caller BEFORE this function is ever
-    consulted - see _run_session's ResultMessage.is_error branch, which
-    returns before reaching the except block below).
+    to CLINotFoundError (a local install problem, never retried). An
+    API-level failure the SDK surfaces as ResultMessage.is_error is
+    checked separately, with the same markers, by _is_cloud_unreachable_text
+    (FIX-I-7) - see _run_session's ResultMessage.is_error branch.
 
     See _CLOUD_UNREACHABLE_MARKER's own doc comment for why this is a
     string-content heuristic, not a typed check: this worker has no
@@ -311,10 +310,21 @@ def _is_cloud_unreachable(exc: Exception) -> bool:
     """
     if isinstance(exc, CLINotFoundError):
         return False
-    text = str(exc).lower()
-    if _CLOUD_UNREACHABLE_MARKER in text:
+    return _is_cloud_unreachable_text(str(exc))
+
+
+def _is_cloud_unreachable_text(text: str) -> bool:
+    """FIX-I-7: the string core of _is_cloud_unreachable, shared with the
+    ResultMessage.is_error branches. The SDK delivers an API error (the
+    proxy's own 503 + MsgCloudUnreachableMarker body included) as
+    ResultMessage(is_error=True, result=<text>), not as an exception, so the
+    marker check must run there too. Same marker list as for exceptions.
+    kahyad does not depend on this: when its proxy parked the task it
+    reports the parked state itself, whatever this worker prints."""
+    lowered = text.lower()
+    if _CLOUD_UNREACHABLE_MARKER in lowered:
         return True
-    return any(marker in text for marker in _CLOUD_UNREACHABLE_FALLBACK_MARKERS)
+    return any(marker in lowered for marker in _CLOUD_UNREACHABLE_FALLBACK_MARKERS)
 
 
 def _is_clarification_turn(assistant_text: str, any_tool_use: bool) -> bool:
@@ -574,7 +584,14 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
                             any_tool_use = True
                 elif isinstance(message, ResultMessage):
                     if message.is_error:
-                        wlog.log("error", "model_call_failed", result=str(message.result))
+                        result_text = str(message.result)
+                        if _is_cloud_unreachable_text(result_text):
+                            # FIX-I-7: the proxy's inline retries ran out;
+                            # kahyad already parked the task.
+                            wlog.log("error", "cloud_unreachable", result=result_text)
+                            _print_protocol_line({"event": "cloud_unreachable"})
+                            return _EXIT_CLOUD_UNREACHABLE
+                        wlog.log("error", "model_call_failed", result=result_text)
                         _print_protocol_line(
                             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
                         )
@@ -683,7 +700,13 @@ async def _run_reader_session(envelope: Envelope) -> int:
                             _print_protocol_line({"type": "delta", "text": block.text})
                 elif isinstance(message, ResultMessage):
                     if message.is_error:
-                        wlog.log("error", "reader_model_call_failed", result=str(message.result))
+                        result_text = str(message.result)
+                        if _is_cloud_unreachable_text(result_text):
+                            # FIX-I-7: same split as _run_session.
+                            wlog.log("error", "reader_cloud_unreachable", result=result_text)
+                            _print_protocol_line({"event": "cloud_unreachable"})
+                            return _EXIT_CLOUD_UNREACHABLE
+                        wlog.log("error", "reader_model_call_failed", result=result_text)
                         _print_protocol_line(
                             {"type": "error", "message": MSG_MODEL_CALL_FAILED_FMT.format(trace_id=envelope.trace_id)}
                         )

@@ -95,6 +95,11 @@ const (
 	// while an upstream attempt was in flight. Not an upstream verdict: no
 	// task callback fires; whoever cancelled the worker decides the task.
 	EventInboundCanceled = "proxy.inbound_canceled"
+	// EventCloudUnreachableRepeat (FIX-I-7, JSONL only): a further
+	// inline-retry exhaustion on a Proxy that already reported one (the
+	// worker CLI retries the 503 on its own). The task is already parked;
+	// no second ledger row, callback or notification.
+	EventCloudUnreachableRepeat = "proxy.cloud_unreachable_repeat"
 )
 
 // MsgCloudUnreachableMarker is embedded in the Anthropic-shaped error
@@ -350,6 +355,12 @@ type Proxy struct {
 	// noCredentialOnce gates onNoUpstreamCredential (FIX-I-1): the CLI may
 	// retry a 401 several times; the task must fail, and be ledgered, once.
 	noCredentialOnce sync.Once
+	// cloudUnreachableFired gates onCloudUnreachable (FIX-I-7): the worker
+	// CLI retries the proxy's 503 on its own and every retry is a new
+	// inbound request with its own inline-retry loop, so one outage would
+	// otherwise park the task (outbox row + notification) once per CLI
+	// retry. A redispatch builds a new Proxy, so this is once per dispatch.
+	cloudUnreachableFired atomic.Bool
 
 	// requestCount is a test-only observability hook (W4-03's no-cloud-
 	// fallback regression test - kahyad/internal/reader's own tests spin up
@@ -1128,11 +1139,22 @@ func (p *Proxy) onNonRetryableTransport(r *http.Request) {
 // the outbox enqueue, and the exact Turkish "parked" notification -
 // entirely outside this package, keeping anthproxy store-agnostic per
 // this file's own package doc comment).
+//
+// FIX-I-7: once per Proxy. A further exhaustion on the same Proxy (the
+// worker CLI retrying the 503) only writes the JSONL line
+// proxy.cloud_unreachable_repeat; the 503 + MsgCloudUnreachableMarker body
+// is still written for every request by handleUpstreamError.
 func (p *Proxy) onCloudUnreachable(r *http.Request) {
 	data, _ := r.Context().Value(reqDataCtxKey{}).(*reqData)
 	attempts := 0
 	if data != nil {
 		attempts = data.RetryAttempts
+	}
+	if !p.cloudUnreachableFired.CompareAndSwap(false, true) {
+		if p.cfg.JSONLLog != nil {
+			p.cfg.JSONLLog.With(p.cfg.TraceID).Info(EventCloudUnreachableRepeat, "task_id", p.cfg.TaskID, "attempts", attempts)
+		}
+		return
 	}
 	ctx := context.Background()
 	if p.cfg.EventLedger != nil {

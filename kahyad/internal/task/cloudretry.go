@@ -59,6 +59,11 @@ const (
 	// (a halt won the race, an earlier callback already failed it) - no
 	// transition, no notification; this row records the decision.
 	EventCloudFailureSkipped = "task.cloud_failure_skipped"
+	// EventCloudWaitingRetryDup (FIX-I-7): ParkOrGiveUp was called for a
+	// task that is already parked - one cloud-unreachable episode reported
+	// again. next_retry_at, the outbox row and the notification of the
+	// first park stand; this row records the repeat.
+	EventCloudWaitingRetryDup = "task.waiting_retry_dup"
 )
 
 // defaultCloudRetrySchedule mirrors config.Config's own cloud_retry_task_
@@ -123,6 +128,18 @@ func (c *CloudRetry) ParkOrGiveUp(ctx context.Context, traceID, taskID string) e
 	t, err := c.store.GetTaskByID(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("task: cloudretry load %s: %w", taskID, err)
+	}
+
+	// FIX-I-7: already parked - the same outage reported again (the worker
+	// CLI retries the proxy's 503 on its own). The first park's
+	// next_retry_at, outbox row and notification stand; no give-up decision
+	// either (the next dispatch makes it). A task in any other non-executing
+	// state still falls through to Transition, which refuses it.
+	if t.Status == StatusRetryWait {
+		c.ledgerRaw(ctx, traceID, EventCloudWaitingRetryDup, map[string]any{
+			"task_id": taskID, "next_retry_at": t.NextRetryAt.String,
+		})
+		return nil
 	}
 
 	if c.hasExceededGiveUp(t) {

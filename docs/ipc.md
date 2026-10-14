@@ -582,6 +582,24 @@ leaves a task that can no longer reach `failed` (already `user_halted` or
 `failed`) untouched: no transition attempt, no second notification, one
 `task.cloud_failure_skipped` ledger row.
 
+**One park per outage; kahyad reports it (FIX-I-7):** the worker CLI
+retries the proxy's 503 on its own, and every retry is a new inbound
+request with its own inline-retry loop. The per-task proxy therefore fires
+`OnCloudUnreachable` (and ledgers `proxy.cloud_unreachable`) once per
+`Proxy` — once per dispatch; a redispatch opens a new one — and only logs
+the JSONL line `proxy.cloud_unreachable_repeat` for the repeats (each
+response is still the 503 + marker). `task.CloudRetry.ParkOrGiveUp` on a
+task that is already `bekliyor-yeniden-deneme` changes nothing (the first
+park's `next_retry_at`, outbox row and notification stand) and ledgers
+`task.waiting_retry_dup`. The SDK hands the proxy's 503 to the worker as
+`ResultMessage(is_error=True)`, not as an exception, so the worker checks
+the same markers there (`_is_cloud_unreachable_text`) and prints
+`{"event":"cloud_unreachable"}` + exit 3. kahyad does not rely on that line:
+when the task's status is `bekliyor-yeniden-deneme` after the worker exits,
+`handleTask` answers with `tasks.state` `waiting_retry`, ledger
+`task_waiting_retry` and the SSE `error` message `task.MsgCloudParked`,
+whatever the worker's terminal line said.
+
 **`event`-keyed lines (not `type`-keyed):** a few worker lines carry a
 top-level `"event"` key **instead of** `"type"` — kahyad matches these on
 `spawn.stdoutLine.Event`, never conflated with the `type` switch above.

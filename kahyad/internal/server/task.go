@@ -1010,33 +1010,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	if runErr != nil {
 		log.Error("task_spawn_error", "task_id", taskID, "err", runErr.Error())
 	}
-	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
-
-	if err := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
-		State: m.finalState, UpdatedAt: rfc3339Now(), ID: taskID,
-	}); err != nil {
-		log.Error("task_state_update_failed", "task_id", taskID, "err", err.Error())
-	}
-	if s.eventLogger != nil {
-		if err := s.eventLogger.LogEvent(persistCtx, traceID, m.ledgerKind, map[string]any{
-			"task_id": taskID, "status": outcome.Status,
-		}); err != nil {
-			log.Warn("task_ledger_error", "kind", m.ledgerKind, "err", err.Error())
-		}
-	}
-	log.Info(m.ledgerKind, "task_id", taskID)
-
 	// W4-04: guarded post-spawn status transition. A cloud-retry callback
 	// (NewTaskProxy's OnCloudUnreachable/OnNonRetryableFailure) may ALREADY
 	// have moved this task's status to bekliyor-yeniden-deneme or failed
-	// SYNCHRONOUSLY, mid-spawn.Run, before this point ever runs - re-
-	// fetching the CURRENT status and only transitioning when it is still
-	// 'executing' avoids attempting an illegal/duplicate transition on top
-	// of whatever the callback already decided (Machine.Transition's own
-	// from==to no-op would make a same-status call harmless anyway, but a
-	// task already parked in bekliyor-yeniden-deneme must NOT also be
-	// forced to 'done'/'failed' here - it is correctly still in flight,
-	// waiting for the outbox dispatcher's own later redelivery).
+	// SYNCHRONOUSLY, mid-spawn.Run, before this point ever runs - so the
+	// CURRENT status is re-read and decidePostSpawn (below) never overrides
+	// what a callback or a halt already decided. FIX-I-7: when kahyad parked
+	// the task itself, kahyad's own parked state (tasks.state waiting_retry,
+	// SSE task.MsgCloudParked) is what the user sees, whatever the worker's
+	// terminal line said (the SDK delivers the proxy's 503 as an ordinary
+	// is_error result, so the worker usually prints a generic error).
 	//
 	// W4-07 fix (defect the acceptance gate surfaced): spawn.Run returning
 	// with anything OTHER than a clean StatusOK success no longer forces
@@ -1086,12 +1069,30 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// already covers that case correctly (a genuinely broken worker still
 	// eventually surfaces to the user via blocked_user/W1's retry cap, it
 	// simply takes one more tick to get there).
-	if s.taskMachine != nil && runErr == nil && outcome.Status == spawn.StatusOK {
-		current, gerr := s.taskDurabilityStatus(persistCtx, taskID)
-		if gerr == nil && current == task.StatusExecuting {
-			if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, task.StatusDone); terr != nil {
-				log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", task.StatusDone, "err", terr.Error())
-			}
+	current, _ := s.taskDurabilityStatus(persistCtx, taskID) // "" when unwired or unreadable
+	d := decidePostSpawn(current, runErr, outcome, traceID, taskID, timeoutMin)
+	m := d.mapping
+
+	if err := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+		State: m.finalState, UpdatedAt: rfc3339Now(), ID: taskID,
+	}); err != nil {
+		log.Error("task_state_update_failed", "task_id", taskID, "err", err.Error())
+	}
+	if s.eventLogger != nil {
+		if err := s.eventLogger.LogEvent(persistCtx, traceID, m.ledgerKind, map[string]any{
+			"task_id": taskID, "status": outcome.Status,
+		}); err != nil {
+			log.Warn("task_ledger_error", "kind", m.ledgerKind, "err", err.Error())
+		}
+	}
+	log.Info(m.ledgerKind, "task_id", taskID)
+
+	if s.taskMachine != nil && d.toStatus != "" {
+		// Machine.Transition's compare-and-set settles a race with a halt:
+		// if the halt won, ErrLostTransitionRace is logged here and the
+		// task stays user_halted.
+		if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, d.toStatus); terr != nil {
+			log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", d.toStatus, "err", terr.Error())
 		}
 	}
 
@@ -1397,6 +1398,45 @@ func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string,
 			},
 		}
 	}
+}
+
+// postSpawnDecision is everything handleTask does with tasks.status /
+// tasks.state / the terminal SSE event once spawn.Run has returned.
+// toStatus == "" means "leave tasks.status untouched - the resume scan (or
+// whoever already moved it) decides".
+type postSpawnDecision struct {
+	toStatus string
+	mapping  taskOutcomeMapping
+}
+
+// decidePostSpawn is the pure post-spawn decision (G10). current is the
+// durability status re-read AFTER spawn.Run ("" when it could not be read):
+// a cloud-retry callback or a halt may already have moved it mid-run, and
+// that decision is never overridden. FIX-I-7: a task kahyad parked itself
+// (bekliyor-yeniden-deneme) reports kahyad's parked state whatever the
+// worker's own terminal line said. Otherwise only a clean StatusOK moves
+// the task (to done); every other outcome stays 'executing' for the resume
+// scan (W4-07, see handleTask's comment).
+func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceID, taskID string, timeoutMin int) postSpawnDecision {
+	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
+	switch current {
+	case task.StatusRetryWait:
+		return postSpawnDecision{mapping: taskOutcomeMapping{
+			finalState: "waiting_retry", ledgerKind: "task_waiting_retry",
+			sseEvent: "error", ssePayload: map[string]string{"message": task.MsgCloudParked},
+		}}
+	case task.StatusExecuting, "":
+		// still running as far as the state machine knows: decided below
+	default:
+		// failed / user_halted / done / blocked_user (a callback, a halt or
+		// the resume scan already decided), or intent (the task never
+		// entered the machine): never overridden here.
+		return postSpawnDecision{mapping: m}
+	}
+	if runErr == nil && outcome.Status == spawn.StatusOK {
+		return postSpawnDecision{toStatus: task.StatusDone, mapping: m}
+	}
+	return postSpawnDecision{mapping: m}
 }
 
 // policyCheckRequest is POST /policy/check's request body (HANDOFF §4 IPC
