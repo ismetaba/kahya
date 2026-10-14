@@ -108,7 +108,7 @@ func TestW12Acceptance(t *testing.T) {
 	dbPath := filepath.Join(dataDir, "brain.db")
 
 	seedMemoryFixture(t, root, memDir)
-	writeConfigYAML(t, homeDir, mock.URL())
+	writeConfigYAML(t, homeDir, mock.URL(), "keychain")
 	// W3-05: kahyad/internal/anthproxy's per-task forward-proxy now
 	// routes every call through the SAME egress.Gate as everything else,
 	// which denies loopback/private addresses unless explicitly
@@ -225,6 +225,19 @@ func TestW12Acceptance(t *testing.T) {
 		}
 		if !hasMemory {
 			t.Errorf("main model call defines no mcp__kahya_memory__ tool (got %v): disabling built-ins must not remove the MCP tools", names)
+		}
+	})
+
+	// FIX-I-1: keychain mode - the worker CLI now carries the local token in
+	// BOTH x-api-key (ANTHROPIC_API_KEY) and X-Kahya-Task-Token
+	// (ANTHROPIC_CUSTOM_HEADERS); the proxy strips both and injects the
+	// dev override key, so the mock sees only that.
+	t.Run("local_token_never_upstream", func(t *testing.T) {
+		assertNoLocalTokenUpstream(t, mock.Requests())
+		for i, req := range mock.Requests() {
+			if got := req.Header.Get("x-api-key"); got != "hermetic-dummy" {
+				t.Errorf("request %d (%s): upstream x-api-key = %q, want the injected keychain-mode key", i, req.Path, got)
+			}
 		}
 	})
 
@@ -377,10 +390,12 @@ func runGit(t *testing.T, dir string, args ...string) {
 // comment). credential_mode=keychain + KAHYA_ANTHROPIC_KEY_OVERRIDE (set in
 // the process env, not here) is what lets kahyad/internal/anthproxy inject
 // a dummy credential without ever touching the real Keychain (W12-08's
-// dev-only seam, inert outside KAHYA_ENV=dev by construction).
+// dev-only seam, inert outside KAHYA_ENV=dev by construction);
+// credential_mode=passthrough (FIX-I-1, TestW12PassthroughCloudAuth) instead
+// relies on the worker CLI's own credential (CLAUDE_CODE_OAUTH_TOKEN seam).
 // task_timeout_min is lowered from the 30-minute production default so a
 // genuinely wedged worker fails this test in minutes, not half an hour.
-func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
+func writeConfigYAML(t *testing.T, homeDir, upstreamURL, credentialMode string) {
 	t.Helper()
 	dir := filepath.Join(homeDir, "Library", "Application Support", "Kahya")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -401,8 +416,8 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 		// ui_hs_cli (/opt/homebrew/bin/hs) pops a "Hammerspoon is not running"
 		// dialog on the developer's screen (or, with Hammerspoon running, real
 		// approval cards). /usr/bin/true accepts and ignores every hs -c call.
-		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\napproval_wait_seconds: 0\nui_hs_cli: /usr/bin/true\nembed_cmd: []\n",
-		upstreamURL,
+		"credential_mode: %s\nanthropic_upstream_url: %q\ntask_timeout_min: 2\napproval_wait_seconds: 0\nui_hs_cli: /usr/bin/true\nembed_cmd: []\n",
+		credentialMode, upstreamURL,
 	)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
@@ -475,13 +490,23 @@ func writeHermeticPolicyYAML(t *testing.T, root, homeDir, mockUpstreamURL string
 // per-task proxy values it appends, and having the same env var name
 // twice in a child's environment is exactly the kind of ambiguity a
 // hermetic test must never depend on being resolved "the right way").
-func buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath string) []string {
+//
+// FIX-I-1: CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_CUSTOM_HEADERS are stripped
+// too, so a developer's own Claude Code token can never reach the gate's
+// worker CLI; extra (KEY=VALUE) entries are appended last and replace any
+// inherited value of the same key (TestW12PassthroughCloudAuth's seam).
+func buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath string, extra ...string) []string {
 	strip := map[string]bool{
 		"HOME": true, "KAHYA_DATA_DIR": true, "KAHYA_MEMORY_DIR": true,
 		"KAHYA_SOCKET": true, "KAHYA_DB_PATH": true, "KAHYA_ENV": true,
 		"KAHYA_LOG_LEVEL": true, "KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
 		"ANTHROPIC_BASE_URL": true, "ANTHROPIC_API_KEY": true, "ANTHROPIC_AUTH_TOKEN": true,
+		"ANTHROPIC_CUSTOM_HEADERS": true, "CLAUDE_CODE_OAUTH_TOKEN": true,
 		"KAHYA_POLICY_PATH": true,
+	}
+	for _, kv := range extra {
+		k, _, _ := strings.Cut(kv, "=")
+		strip[k] = true
 	}
 	var out []string
 	for _, kv := range os.Environ() {
@@ -491,6 +516,7 @@ func buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath string) []str
 		}
 		out = append(out, kv)
 	}
+	out = append(out, extra...)
 	return append(out,
 		"HOME="+homeDir,
 		"KAHYA_DATA_DIR="+dataDir,
@@ -888,4 +914,27 @@ func requestToolNames(t *testing.T, body []byte) []string {
 		names = append(names, tool.Name)
 	}
 	return names
+}
+
+// assertNoLocalTokenUpstream (FIX-I-1) fails if any request the mock
+// upstream recorded carries the per-task local token - in its dedicated
+// header or anywhere else (kahya-task-<hex32> is never an Anthropic
+// credential).
+func assertNoLocalTokenUpstream(t *testing.T, reqs []mockanthropic.RecordedRequest) {
+	t.Helper()
+	if len(reqs) == 0 {
+		t.Fatal("the mock upstream recorded no request at all")
+	}
+	for i, req := range reqs {
+		if v := req.Header.Get("X-Kahya-Task-Token"); v != "" {
+			t.Errorf("request %d (%s) reached the upstream with X-Kahya-Task-Token set", i, req.Path)
+		}
+		for name, values := range req.Header {
+			for _, v := range values {
+				if strings.Contains(v, "kahya-task-") {
+					t.Errorf("request %d (%s): upstream header %s carries the local per-task token", i, req.Path, name)
+				}
+			}
+		}
+	}
 }

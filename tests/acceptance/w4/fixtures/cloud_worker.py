@@ -2,8 +2,9 @@
 """cloud_worker.py - W4-07 scenario B fixture: stands in for the real
 claude-agent-sdk worker for exactly one purpose - making ONE direct HTTP
 call to kahyad's own per-task Anthropic forward-proxy listener
-($ANTHROPIC_BASE_URL/v1/messages), exactly mirroring
-tests/w3/fixtures/gate5_worker.py's own established "a direct HTTP call
+($ANTHROPIC_BASE_URL/v1/messages; FIX-I-1 auth shape: X-Kahya-Task-Token
+from $ANTHROPIC_CUSTOM_HEADERS + a placeholder Authorization), exactly
+mirroring tests/w3/fixtures/gate5_worker.py's own established "a direct HTTP call
 standing in for the worker" pattern, so the W4-07 acceptance gate drives
 the REAL kahyad/internal/anthproxy retry/park machinery + task/cloudretry.go
 end to end (not a fake stand-in for it).
@@ -19,6 +20,7 @@ protocol line), any other non-2xx means an ordinary {"type": "error"}, and
 a 2xx means an ordinary successful result.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -31,8 +33,30 @@ def emit(obj):
     sys.stdout.flush()
 
 
+def _task_token():
+    """FIX-I-1: the per-task token travels in ANTHROPIC_CUSTOM_HEADERS
+    ("X-Kahya-Task-Token: kahya-task-<hex32>") in BOTH credential modes;
+    ANTHROPIC_API_KEY is only set in keychain mode (legacy carrier)."""
+    for line in os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "x-kahya-task-token":
+            return value.strip()
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _auth_headers():
+    """Exactly the header pair the real worker's CLI sends in passthrough
+    mode: the local token in its own header + the CLI's own upstream
+    credential (here a fixture placeholder - kahyad never inspects its
+    value, it only checks that one exists)."""
+    return {
+        "Content-Type": "application/json",
+        "X-Kahya-Task-Token": _task_token(),
+        "Authorization": "Bearer fixture-upstream-credential",
+    }
+
+
 def main():
-    import os
     import time
 
     envelope_raw = sys.stdin.buffer.read()
@@ -52,7 +76,6 @@ def main():
     emit({"type": "session", "session_id": session_id})
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     body = json.dumps({
         "model": "claude-sonnet-5",
@@ -66,7 +89,7 @@ def main():
         req = urllib.request.Request(
             base_url.rstrip("/") + "/v1/messages",
             data=body,
-            headers={"Content-Type": "application/json", "x-api-key": api_key},
+            headers=_auth_headers(),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=630) as resp:

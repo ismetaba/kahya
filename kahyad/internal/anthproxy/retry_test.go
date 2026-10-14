@@ -121,8 +121,7 @@ func TestRetrySucceedsAfterTwoRetryableFailures(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, sleeper)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -177,8 +176,7 @@ func TestRetryAttemptsLoggedAsJSONLWithTraceID(t *testing.T) {
 	cfg.TraceID = "trace_jsonl_test"
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -236,8 +234,7 @@ func TestRetryExhaustionInvokesOnCloudUnreachable(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -288,8 +285,7 @@ func TestNonRetryableStatusNeverRetriesAndInvokesCallback(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -329,8 +325,7 @@ func TestRetryAfterHonoredOverBackoff(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, sleeper)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -362,8 +357,7 @@ func TestFable5ShapingInjectsBetaAndFallback(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-fable-5","messages":[]}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -416,8 +410,7 @@ func TestFable5ShapingNeverAppliesToOtherModels(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5","messages":[]}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","messages":[]}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -466,8 +459,7 @@ func TestSecretLaneTaskNeverRetriesIntoCloud(t *testing.T) {
 	cfg.EgressGate = backstop("t_secret_task", "trace_secret")
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)

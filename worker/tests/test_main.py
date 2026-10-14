@@ -182,7 +182,36 @@ class TestStartupEnvAssertions(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
 
-    def test_passthrough_mode_does_not_require_task_token(self) -> None:
+    def _passthrough_env(self, log_dir: str, **overrides: str) -> dict[str, str]:
+        """FIX-I-1: the exact env spawn.BuildEnv produces in passthrough -
+        the token in ANTHROPIC_CUSTOM_HEADERS, ANTHROPIC_API_KEY absent."""
+        fields = {
+            "KAHYA_CREDENTIAL_MODE": "passthrough",
+            "ANTHROPIC_CUSTOM_HEADERS": "X-Kahya-Task-Token: kahya-task-" + "b" * 32,
+        }
+        fields.update(overrides)
+        env = base_env(log_dir, **fields)
+        if "ANTHROPIC_API_KEY" not in overrides:
+            del env["ANTHROPIC_API_KEY"]
+        return env
+
+    def _assert_env_invalid(self, env: dict[str, str], detail_needle: str) -> None:
+        def refuse_real_client(options=None):
+            # A startup-env refusal must exit before any SDK client exists;
+            # never let a regression here spawn the real bundled CLI.
+            raise AssertionError("ClaudeSDKClient constructed despite an invalid worker env")
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = dict(env, KAHYA_LOG_DIR=log_dir)
+            code, out = run_main_with(dict(VALID_ENVELOPE), env, client_factory=refuse_real_client)
+            lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        invalid = [l for l in lines if l.get("event") == "worker_env_invalid"]
+        self.assertEqual(len(invalid), 1, lines)
+        self.assertIn(detail_needle, invalid[0].get("detail", ""))
+
+    def test_passthrough_mode_accepts_header_without_api_key(self) -> None:
         messages = [
             ResultMessage(
                 subtype="success", duration_ms=1, duration_api_ms=1,
@@ -190,14 +219,54 @@ class TestStartupEnvAssertions(unittest.TestCase):
             ),
         ]
         with tempfile.TemporaryDirectory() as log_dir:
-            env = base_env(log_dir, KAHYA_CREDENTIAL_MODE="passthrough", ANTHROPIC_API_KEY="whatever-the-sdk-uses")
+            env = self._passthrough_env(log_dir)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
             code, out = run_main_with(
                 dict(VALID_ENVELOPE), env, client_factory=fake_client_factory(messages=messages)
             )
-        # Env assertions must NOT block passthrough mode just because the
-        # API key isn't shaped like the per-task token - the run should
-        # reach the (mocked) SDK session and succeed.
+        # The production passthrough shape must reach the (mocked) SDK
+        # session and succeed.
         self.assertEqual(code, 0)
+
+    def test_passthrough_mode_requires_task_token_header(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = self._passthrough_env(log_dir)
+        del env["ANTHROPIC_CUSTOM_HEADERS"]
+        self._assert_env_invalid(env, "ANTHROPIC_CUSTOM_HEADERS")
+
+    def test_passthrough_mode_rejects_malformed_task_token_header(self) -> None:
+        for bad in (
+            "X-Kahya-Task-Token: not-a-token",
+            "X-Other: kahya-task-" + "b" * 32,
+            "X-Kahya-Task-Token kahya-task-" + "b" * 32,
+        ):
+            with self.subTest(header=bad):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, ANTHROPIC_CUSTOM_HEADERS=bad)
+                self._assert_env_invalid(env, "ANTHROPIC_CUSTOM_HEADERS")
+
+    def test_passthrough_mode_accepts_token_line_among_other_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = self._passthrough_env(log_dir)
+        env["ANTHROPIC_CUSTOM_HEADERS"] = "X-Debug: 1\n  x-kahya-task-token :  kahya-task-" + "c" * 32 + "  "
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(worker_main._check_credential_env("passthrough", ""))
+
+    def test_passthrough_mode_rejects_set_api_key(self) -> None:
+        # Even the per-task token itself: the CLI would prefer it over its
+        # Claude Code login and send x-api-key instead of Authorization.
+        for value in ("whatever-the-sdk-uses", "kahya-task-" + "a" * 32):
+            with self.subTest(api_key=value):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, ANTHROPIC_API_KEY=value)
+                self._assert_env_invalid(env, "ANTHROPIC_API_KEY must be unset")
+
+    def test_unknown_credential_mode_gets_the_strict_keychain_check(self) -> None:
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1"}, clear=True):
+            self.assertIn(
+                "ANTHROPIC_API_KEY does not match",
+                worker_main._check_credential_env("bogus-mode", "") or "",
+            )
 
     def test_real_key_anywhere_in_env_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as log_dir:

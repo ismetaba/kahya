@@ -82,6 +82,21 @@ const cloudUnreachableEvent = "cloud_unreachable"
 // line.
 const clarificationTurnEvent = "clarification_turn"
 
+// TaskTokenHeaderName is the HTTP header the worker's bundled CLI carries
+// the per-task local token in (FIX-I-1), set through ANTHROPIC_CUSTOM_HEADERS
+// by BuildEnv. It mirrors kahyad/internal/anthproxy.TaskTokenHeader: this
+// package does not import anthproxy (the dependency runs server -> both), so
+// the literal is duplicated and a kahyad/internal/server test pins the two
+// equal.
+const TaskTokenHeaderName = "X-Kahya-Task-Token"
+
+// CredentialModePassthroughLiteral mirrors config.CredentialModePassthrough /
+// anthproxy.CredentialModePassthrough (the same keep-in-sync-by-hand
+// convention as LaneSecret). Every other value - "keychain" and the legacy
+// empty string, which the worker also reads as keychain - keeps the W12-08
+// ANTHROPIC_API_KEY carrier.
+const CredentialModePassthroughLiteral = "passthrough"
+
 // Config bundles everything Run needs to launch and instrument one worker
 // process for one task (HANDOFF §4 IPC ⚑, frozen in docs/ipc.md).
 type Config struct {
@@ -106,9 +121,12 @@ type Config struct {
 	// governor, cache-hit metric, and egress-gate hook all live at that
 	// proxy point, never in this package).
 	AnthropicBaseURL string
-	// APIKey is ANTHROPIC_API_KEY: a per-task random token
-	// (NewAPIKey, "kahya-task-<hex32>"), NOT a real Anthropic key - the
-	// real key never leaves kahyad (HANDOFF §4 IPC ⚑).
+	// APIKey is the per-task random token (NewAPIKey, "kahya-task-<hex32>"),
+	// NOT a real Anthropic key - the real key never leaves kahyad (HANDOFF
+	// §4 IPC ⚑). FIX-I-1: BuildEnv always carries it as the
+	// TaskTokenHeaderName header via ANTHROPIC_CUSTOM_HEADERS, and sets it
+	// as ANTHROPIC_API_KEY only outside passthrough mode (keychain and the
+	// legacy empty value) - see BuildEnv.
 	APIKey string
 	// MCPBridgePath is KAHYA_MCP_BRIDGE (W12-09): the absolute path to the
 	// kahya-mcp stdio<->UDS bridge binary (bin/kahya-mcp, W12-05) the
@@ -556,12 +574,21 @@ func killGroup(cmd *exec.Cmd) {
 //     <socket>.secret and in kahyad's memory, never in any env), but if one
 //     is ever introduced for a CLI/script it must not ride os.Environ()
 //     inheritance into a worker, which must never reach control routes.
+//   - ANTHROPIC_CUSTOM_HEADERS (FIX-I-1): BuildEnv sets it to exactly the
+//     one X-Kahya-Task-Token line; an inherited value would let the parent
+//     shell attach arbitrary headers to every model call (and would survive
+//     on any spawn where BuildEnv sets no token line).
+//
+// CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT listed (owner decision
+// G11-1/G11-2): in passthrough it is a legitimate credential source of the
+// worker CLI's own Claude Code login, which is what passthrough forwards.
 var secretEnvDenylist = map[string]bool{
 	"KAHYA_ANTHROPIC_KEY_OVERRIDE": true,
 	"ANTHROPIC_API_KEY":            true,
 	"ANTHROPIC_AUTH_TOKEN":         true,
 	"KAHYA_CONTROL_SECRET":         true,
 	"KAHYA_CONTROL_SECRET_PATH":    true,
+	"ANTHROPIC_CUSTOM_HEADERS":     true,
 }
 
 // filterSecretEnv returns a copy of in with every entry whose NAME (the
@@ -610,7 +637,9 @@ func pythonWorkerDir(cmd []string) string {
 }
 
 // BuildEnv assembles the worker process's environment (HANDOFF §4 IPC ⚑
-// step 2, docs/ipc.md): the parent's own environment (PATH, HOME, etc. -
+// step 2, docs/ipc.md; FIX-I-1: the local token rides
+// ANTHROPIC_CUSTOM_HEADERS, ANTHROPIC_API_KEY only outside passthrough):
+// the parent's own environment (PATH, HOME, etc. -
 // W1-2's worker is a plain subprocess, not a network-isolated container),
 // FILTERED through filterSecretEnv to strip any kahyad-internal
 // secret-bearing var (BLOCKER 1 fix - see secretEnvDenylist's doc comment),
@@ -635,7 +664,6 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"KAHYA_SOCKET=" + cfg.Socket,
 		"KAHYA_LOG_DIR=" + cfg.LogDir,
 		"ANTHROPIC_BASE_URL=" + cfg.AnthropicBaseURL,
-		"ANTHROPIC_API_KEY=" + cfg.APIKey,
 		"KAHYA_MCP_BRIDGE=" + cfg.MCPBridgePath,
 		"KAHYA_CREDENTIAL_MODE=" + cfg.CredentialMode,
 		"KAHYA_TMP_DIR=" + cfg.TmpDir,
@@ -655,6 +683,23 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_BUG_COMMAND=1",
+	}
+	// FIX-I-1: the per-task token travels in its own header so the CLI's
+	// single-credential-source rule never sees it as "the" API key. The
+	// bundled CLI parses ANTHROPIC_CUSTOM_HEADERS as newline-separated
+	// "Name: value" lines and adds them to every model call. No token (an
+	// stt-mode spawn opens no proxy) means no header line at all.
+	if cfg.APIKey != "" {
+		extra = append(extra, "ANTHROPIC_CUSTOM_HEADERS="+TaskTokenHeaderName+": "+cfg.APIKey)
+	}
+	if cfg.CredentialMode != CredentialModePassthroughLiteral {
+		// keychain (and the legacy empty value, which the worker also reads
+		// as keychain): the W12-08 carrier stays - the CLI sends x-api-key:
+		// <token>, the proxy strips it and injects the real key. In
+		// passthrough the variable is left UNSET: the CLI then authenticates
+		// with its own Claude Code login (Authorization), which the proxy
+		// forwards unchanged.
+		extra = append(extra, "ANTHROPIC_API_KEY="+cfg.APIKey)
 	}
 	if cfg.ApprovalWaitSeconds > 0 {
 		extra = append(extra,

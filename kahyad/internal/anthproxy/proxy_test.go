@@ -92,9 +92,12 @@ func testProxyConfig(t *testing.T, upstreamURL string, governor *Governor, ledge
 		TraceID:     "trace_test",
 		Token:       testToken,
 		UpstreamURL: upstreamURL,
-		Governor:    governor,
-		EventLedger: ledger,
-		Notifier:    notifier,
+		// G00 C-17: set explicitly (New's empty default is passthrough,
+		// spawn/worker read empty as keychain). Keychain tests override it.
+		CredentialMode: CredentialModePassthrough,
+		Governor:       governor,
+		EventLedger:    ledger,
+		Notifier:       notifier,
 	}
 }
 
@@ -244,8 +247,7 @@ func TestProxySSEStreamsUnbufferedAndRecordsUsage(t *testing.T) {
 	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5","stream":true}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","stream":true}`)
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -312,8 +314,7 @@ func TestProxyBlocksAtTaskCeilingBeforeForwarding(t *testing.T) {
 	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -357,8 +358,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -383,41 +383,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 	}
 }
 
-// --- (f) passthrough mode forwards the worker's own auth unchanged ---
-
-func TestProxyPassthroughForwardsWorkerAuthUnchanged(t *testing.T) {
-	upstream := newJSONUpstream(t, 200, `{"usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`)
-	ledger := &fakeLedger{}
-	governor := generousGovernor()
-	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
-	cfg.CredentialMode = CredentialModePassthrough
-	baseURL, _ := startTestProxy(t, cfg)
-
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)                                  // local-loopback proof only
-	req.Header.Set("Authorization", "Bearer worker-own-session-credential") // the worker's real upstream auth
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Do() error = %v", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	got := upstream.last().headers
-	if got.Get("Authorization") != "Bearer worker-own-session-credential" {
-		t.Errorf("upstream Authorization = %q, want the worker's own credential forwarded unchanged", got.Get("Authorization"))
-	}
-	if got.Get("x-api-key") != "" {
-		t.Errorf("upstream x-api-key = %q, want empty - the local token must never reach the upstream", got.Get("x-api-key"))
-	}
-
-	if !waitForCondition(t, time.Second, func() bool { return ledger.countKind(EventModelCall) == 1 }) {
-		t.Fatal("model_call never ledgered in passthrough mode - metering must still happen")
-	}
-}
+// --- (f) passthrough mode: see proxy_tasktoken_test.go (FIX-I-1) ---
 
 // --- (g) per-task listener closes on task end ---
 
@@ -435,8 +401,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
 	if _, err := http.DefaultClient.Do(req); err != nil {
 		t.Fatalf("request before Close() failed: %v", err)
 	}
@@ -446,8 +411,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 	}
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	req2, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{}`))
-	req2.Header.Set("x-api-key", testToken)
+	req2 := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{}`)
 	if _, err := client.Do(req2); err == nil {
 		t.Fatal("request after Close() succeeded, want connection refused/failed")
 	}

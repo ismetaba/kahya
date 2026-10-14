@@ -70,7 +70,10 @@ func TestReparkedTaskRowMarkedDeliveredNotPrematurelyReclaimed(t *testing.T) {
 		token := "kahya-task-" + "cafebabecafebabecafebabecafebab2"
 		p, err := anthproxy.New(anthproxy.ProxyConfig{
 			TaskID: taskID, TraceID: traceID, Token: token,
-			UpstreamURL: deadUpstream.URL, Governor: governor, EventLedger: st,
+			// G00 C-17: explicit (New's empty default is passthrough;
+			// spawn/worker read empty as keychain).
+			CredentialMode: anthproxy.CredentialModePassthrough,
+			UpstreamURL:    deadUpstream.URL, Governor: governor, EventLedger: st,
 			MaxInlineRetries: 1,
 			Sleep:            func(time.Duration) {},
 			// The synchronous exhaustion callback: re-park exactly as the
@@ -89,7 +92,7 @@ func TestReparkedTaskRowMarkedDeliveredNotPrematurelyReclaimed(t *testing.T) {
 		return baseURL, token, p.Close, nil
 	}
 
-	d := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: []string{"python3", "testdata/cloud_call_worker.py"}}, nil)
+	d := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: []string{"python3", "testdata/cloud_call_worker.py"}, CredentialMode: anthproxy.CredentialModePassthrough}, nil)
 	d.SetAnthproxyOpener(opener)
 	d.SetLeaseDuration(2 * time.Minute)
 	d.SetClock(clock)

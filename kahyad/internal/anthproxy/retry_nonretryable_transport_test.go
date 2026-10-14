@@ -119,8 +119,7 @@ func TestNonRetryableTransportFailureInvokesCallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
-	req.Header.Set("x-api-key", testToken)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
 
 	done := make(chan struct{})
 	var resp *http.Response

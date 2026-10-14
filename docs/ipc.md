@@ -102,9 +102,10 @@ MCP timeouts only when an approval wait is configured):
 | `KAHYA_SOCKET` | `cfg.socket` — kahyad's own control socket, so the worker's `can_use_tool` hook (W12-09) can reach `POST /policy/check` over HTTP-over-UDS. |
 | `KAHYA_LOG_DIR` | `cfg.log_dir` — the worker writes its own JSONL logs here (every process logs JSONL with `trace_id` on every line, HANDOFF §4 ⚑). |
 | `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and (since W3-05) the `egressGate` hook — now a real `kahyad/internal/egress.Gate.Check` call, gating `host=<AnthropicUpstreamURL's own host:port>` — are enforced at that proxy, never in this package. |
-| `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
+| `ANTHROPIC_CUSTOM_HEADERS` | Since FIX-I-1, whenever the spawn has a per-task proxy: exactly one line, `X-Kahya-Task-Token: kahya-task-<hex32>` — the **per-task random token** (`spawn.NewAPIKey`), **NOT a real Anthropic key** (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). The bundled CLI adds it to every model call; the per-task forward-proxy listener validates this header first (constant-time; `401` + ledger `proxy_auth_reject` on a mismatch, so no other local process can spend through kahyad by guessing the port) and strips it in both credential modes — it never reaches the upstream. An inherited value is stripped (`spawn.secretEnvDenylist`). |
+| `ANTHROPIC_API_KEY` | Only in `credential_mode: keychain` (and the legacy empty mode): the same per-task token, the W12-08 carrier (the CLI sends it as `x-api-key`; the proxy still accepts it, strips it, and injects the real Keychain key). **Unset in `passthrough`** (FIX-I-1): the CLI picks exactly one credential source and a set `ANTHROPIC_API_KEY` always wins over its own Claude Code login, so any value there would disable the credential passthrough forwards. An inherited value is always stripped. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
-| `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
+| `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertions apply (`kahya_worker.__main__._check_credential_env`, exit 2 + `worker_env_invalid` on a violation): in `"passthrough"`, `ANTHROPIC_CUSTOM_HEADERS` must carry the `X-Kahya-Task-Token: kahya-task-<hex32>` line **and** `ANTHROPIC_API_KEY` must be unset (FIX-I-1); in `"keychain"` (and any other value), `ANTHROPIC_API_KEY` must match the per-task token shape. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
 | `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. The worker also passes it explicitly in the `kahya_memory` stdio server's own `env` (`_build_options`). |
 | `MCP_TOOL_TIMEOUT` | Since B-1, only when `approval_wait_seconds > 0`: `(approval_wait_seconds + 90) * 1000` (ms) — the bundled `claude` CLI's own hard per-MCP-call limit, set explicitly because its default is unknown. Set after the inherited environment, so a parent shell's value never shortens it. |
 | `KAHYA_TMP_DIR` | Since W6-02: `config.Config.TmpDir()` (`<data_dir>/tmp`, e.g. `~/Library/Application Support/Kahya/tmp` — created 0700 at kahyad startup). `mode=="stt"` sessions read this to decide whether `input_audio_path` is safe to delete after transcription (`kahya_worker.__main__._maybe_delete_audio`): a file is deleted **iff** its resolved parent directory equals this exact value — never a repo fixture, never any other path. Empty/unset is a fail-CLOSED no-op (never delete). |
@@ -129,21 +130,68 @@ BOTH modes behind one `CredentialSource` interface, selected by the new
 - `keychain` — the original HANDOFF design, fully implemented and tested
   as a valid fallback: strip every inbound auth header, inject the real
   key read from `kahyad/internal/secrets.Keychain` (never logged).
-- `passthrough` (**default**, the owner-decision mode) — after validating
-  the inbound per-task local token (`ANTHROPIC_API_KEY` above — this still
-  fully upholds "API anahtarı worker'a verilmez": no real Anthropic
-  credential ever reaches the worker either way), strip only the header
-  that carried that local token and forward any OTHER auth header the
-  worker's own HTTP client attached completely unchanged (its Claude Code
-  SDK session credential — the proxy never inspects, replaces, or logs
-  it).
+- `passthrough` (**default**, the owner-decision mode; re-confirmed by the
+  owner for FIX-I-1, decisions G11-1/G11-2) — after validating the inbound
+  per-task local token (`X-Kahya-Task-Token` above — this still fully
+  upholds "API anahtarı worker'a verilmez": kahyad hands the worker no real
+  Anthropic credential in either mode), strip the local token and forward
+  the worker CLI's own `Authorization` header (its Claude Code login)
+  completely unchanged — the proxy never inspects, replaces, or logs it.
+
+**FIX-I-1 — how the local token travels (and why the original passthrough
+never authenticated).** The bundled `claude` CLI picks exactly ONE
+upstream credential source; in its non-interactive (SDK) mode a set
+`ANTHROPIC_API_KEY` always wins over its Claude Code login. The original
+design put the local token in `ANTHROPIC_API_KEY` and assumed the CLI would
+add its login credential in a second header; it never does, so the proxy
+stripped the token and every passthrough call left with **no credential at
+all** (an upstream `401 authentication_error`, task `failed`). Now:
+
+- `spawn.BuildEnv` always sets `ANTHROPIC_CUSTOM_HEADERS=X-Kahya-Task-Token:
+  <token>` (the CLI's documented custom-header variable) and sets
+  `ANTHROPIC_API_KEY=<token>` **only in keychain mode**. In passthrough the
+  CLI therefore authenticates with its own login and sends
+  `Authorization: Bearer <oauth>` (+ the `oauth-2025-04-20` beta) itself.
+- `anthproxy.checkLocalAuth` checks `X-Kahya-Task-Token` first (when present
+  it alone decides), then the legacy `x-api-key`/`Authorization` carriers
+  (keychain mode, the W12-08 manual curl check); comparisons are
+  constant-time. The Director strips the header in both modes.
+- Passthrough refuses, locally, a request that would leave with no
+  upstream credential once the token is stripped (`401` with
+  `"Bulut kimlik bilgisi yok - worker'in Claude Code oturumu bulunamadi
+  (claude /login) ya da credential_mode: keychain secin."`, ledger
+  `proxy.no_upstream_credential` and `OnNonRetryableFailure(reason
+  no_upstream_credential)` exactly once per proxy → task `failed` with
+  `Bulut çağrısı kalıcı hatayla reddedildi (no_upstream_credential). Görev
+  durduruldu.`). Only the header's presence is checked. The egress gate
+  (secret-lane backstop) still runs first, so its `403` always wins.
+- `CLAUDE_CODE_OAUTH_TOKEN` is deliberately **not** stripped from the
+  worker env (owner decision): in passthrough it is a legitimate
+  credential source of the worker CLI's own login.
+
+Hermetic header-capture probe (handbook G11 I-1 Repro A, 2026-10-14,
+pinned `claude-agent-sdk==0.2.111` → bundled CLI **2.1.202**; fresh
+`HOME`/`CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL` = a local 401-ing
+listener, outbound network denied except loopback): `grep -a -c` finds
+`ANTHROPIC_CUSTOM_HEADERS` 23× and `CLAUDE_CODE_OAUTH_TOKEN` 55× in the
+binary. With `ANTHROPIC_API_KEY=kahya-task-…` the CLI sent **only**
+`x-api-key: kahya-task-…` (no `Authorization`) — the bug. With
+`ANTHROPIC_CUSTOM_HEADERS` + `CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy` and no
+API key it sent `x-kahya-task-token: kahya-task-…` + `authorization: Bearer
+<dummy>` and no `x-api-key`; every request went to `POST
+/v1/messages?beta=true`. `tests/e2e` `TestW12PassthroughCloudAuth` runs that
+exact passthrough shape end to end (real kahyad + worker + CLI, mock
+upstream, the same `CLAUDE_CODE_OAUTH_TOKEN` seam); the keychain gate
+`TestW12Acceptance` still passes unchanged.
 
 Everything else this task specifies (cost governor, cache-hit metric,
 egress-gate hook, usage/pricing) is auth-agnostic and built exactly per
 the frozen contract above; only credential injection differs by mode. The
-one deferred item is a live check with a real Keychain credential/session
-(no CI test exercises a real key or session) — see the W12-08 task file
-and its closing commit for the explicit deferral note.
+one deferred item is a **live** check with the real Claude Code login
+(passthrough) or a real Keychain key — `make accept-w12`'s `cloud_auth`
+criterion (`model_call status=ok` for the live task's trace; a
+`task.failed` row is a FAIL) — see the W12-08 task file for the deferral
+note.
 
 **Post-review addition (BLOCKER 2 fix)** — `Governor.CheckBeforeForward`
 is now an atomic check-and-reserve, not a plain check-then-act: it
@@ -1008,6 +1056,12 @@ seed note, one `trace_id` spanning every JSONL log, every injected
    `single_trace_id`, `ledger_forensics`, `derived_index_property` (delete
    `brain.db`, restart, reindex, re-run retrieval — same top hit, proving
    SQLite is genuinely rebuilt from the markdown source of truth).
+   `TestW12PassthroughCloudAuth` (FIX-I-1) runs the default
+   `credential_mode: passthrough` the same way, with the worker CLI's own
+   credential supplied by `CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy` (never
+   the developer's real login; the CLI's other egress is pinned to a dead
+   local proxy): the mock must see `Authorization: Bearer hermetic-dummy`
+   and never the local token.
 
 2. **`make install-agent`** (or, for a quick foreground run instead of a
    launchd-managed one, `make run-daemon` in a separate terminal) — brings
@@ -1021,8 +1075,10 @@ seed note, one `trace_id` spanning every JSONL log, every injected
    contain a seed note containing `'ev'` — the seeded iOS home-design note,
    not this repo's hermetic fixture), the actual
    `bin/kahya "Evlerimizden ne konuşmuştuk?"` call, a trace_id check across
-   `kahyad.jsonl`/`worker.jsonl`, and the `hafiza_injected` ledger
-   sha256 self-consistency check. Prints one `PASS`/`FAIL`/`DEFERRED` line
+   `kahyad.jsonl`/`worker.jsonl`, the `hafiza_injected` ledger
+   sha256 self-consistency check, and `cloud_auth` (FIX-I-1: the live
+   task's trace has a `model_call` row with `status=ok`; a `task.failed`
+   row, e.g. `no_upstream_credential`, is a `FAIL`). Prints one `PASS`/`FAIL`/`DEFERRED` line
    per criterion and a summary; exits nonzero on any `FAIL`. A criterion
    that needs a real Anthropic credential/Claude Code session this
    environment does not have prints `DEFERRED`, not a false `PASS` — see

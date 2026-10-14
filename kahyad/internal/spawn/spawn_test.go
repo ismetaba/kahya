@@ -547,17 +547,21 @@ func TestBuildEnvIncludesAllSixVariables(t *testing.T) {
 		LogDir:           "/logs",
 		AnthropicBaseURL: "https://upstream.invalid",
 		APIKey:           "kahya-task-abc",
+		// Explicit (G00 C-17): keychain keeps ANTHROPIC_API_KEY; passthrough
+		// omits it (TestBuildEnvPassthroughOmitsAPIKeyAndSetsCustomHeader).
+		CredentialMode: "keychain",
 	}
 	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
 
 	got := BuildEnv(cfg, env)
 	want := map[string]string{
-		"KAHYA_TASK_ID":      "t_abc",
-		"KAHYA_TRACE_ID":     "trace-abc",
-		"KAHYA_SOCKET":       "/s.sock",
-		"KAHYA_LOG_DIR":      "/logs",
-		"ANTHROPIC_BASE_URL": "https://upstream.invalid",
-		"ANTHROPIC_API_KEY":  "kahya-task-abc",
+		"KAHYA_TASK_ID":            "t_abc",
+		"KAHYA_TRACE_ID":           "trace-abc",
+		"KAHYA_SOCKET":             "/s.sock",
+		"KAHYA_LOG_DIR":            "/logs",
+		"ANTHROPIC_BASE_URL":       "https://upstream.invalid",
+		"ANTHROPIC_API_KEY":        "kahya-task-abc",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Kahya-Task-Token: kahya-task-abc",
 	}
 	// Mirror how exec.Cmd actually resolves a slice with duplicate keys
 	// ("only the last value ... is used" - os/exec docs): BuildEnv appends
@@ -718,12 +722,15 @@ func TestBuildEnvFiltersSecretBearingParentEnvVars(t *testing.T) {
 	t.Setenv("KAHYA_ANTHROPIC_KEY_OVERRIDE", "sk-ant-LEAKTEST")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-parent-process-should-not-leak")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-auth-token-should-not-leak")
+	// FIX-I-1: an inherited ANTHROPIC_CUSTOM_HEADERS must not ride along.
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Evil: 1")
 
 	cfg := Config{
 		Socket:           "/s.sock",
 		LogDir:           "/logs",
 		AnthropicBaseURL: "https://upstream.invalid",
 		APIKey:           "kahya-task-abcdef0123456789abcdef0123456789",
+		CredentialMode:   "keychain",
 	}
 	env := Envelope{TaskID: "t_abc", TraceID: "trace-abc"}
 
@@ -745,6 +752,14 @@ func TestBuildEnvFiltersSecretBearingParentEnvVars(t *testing.T) {
 	}
 	if got := resolved["ANTHROPIC_API_KEY"]; got != cfg.APIKey {
 		t.Errorf("ANTHROPIC_API_KEY = %q, want exactly the per-task token %q (not any parent-process override)", got, cfg.APIKey)
+	}
+	for _, kv := range got {
+		if kv == "ANTHROPIC_CUSTOM_HEADERS=Evil: 1" {
+			t.Error("BuildEnv passed the parent's ANTHROPIC_CUSTOM_HEADERS through to the worker")
+		}
+	}
+	if want := "X-Kahya-Task-Token: " + cfg.APIKey; resolved["ANTHROPIC_CUSTOM_HEADERS"] != want {
+		t.Errorf("ANTHROPIC_CUSTOM_HEADERS = %q, want exactly BuildEnv's own %q", resolved["ANTHROPIC_CUSTOM_HEADERS"], want)
 	}
 }
 

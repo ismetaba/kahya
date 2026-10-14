@@ -27,12 +27,23 @@
 //     DEFAULT: after validating the inbound per-task local token (the
 //     ONLY thing that ever proves this request came from this task's own
 //     spawned worker — HANDOFF §4 IPC ⚑, "API anahtarı worker'a verilmez"
-//     is still upheld: no REAL Anthropic credential ever reaches the
-//     worker either way), strip only the header that carried that local
-//     token and forward any OTHER auth header the worker's own HTTP
-//     client attached completely unchanged — this is the worker's Claude
-//     Code SDK session credential, which this proxy never inspects,
-//     replaces, or logs.
+//     is still upheld: kahyad hands the worker no REAL Anthropic
+//     credential in either mode), strip the local token and forward the
+//     worker CLI's OWN Authorization header (its Claude Code login)
+//     completely unchanged — this proxy never inspects, replaces, or
+//     logs it; it only checks that one exists (EventNoUpstreamCredential).
+//
+// FIX-I-1 — how the local token travels. The bundled claude CLI picks
+// exactly ONE upstream credential source, and in its non-interactive (SDK)
+// mode a set ANTHROPIC_API_KEY always wins over its Claude Code login. The
+// original design put the local token in ANTHROPIC_API_KEY and assumed the
+// CLI would add its login credential in a second header; it never does, so
+// passthrough could not reach the upstream with any credential. The token
+// therefore travels in its own header, TaskTokenHeader (X-Kahya-Task-Token,
+// set via ANTHROPIC_CUSTOM_HEADERS by spawn.BuildEnv) in BOTH modes;
+// ANTHROPIC_API_KEY is set to the token only in keychain mode (the legacy
+// carrier, still accepted by checkLocalAuth) and is UNSET in passthrough,
+// so the CLI authenticates with its own login and sends Authorization.
 //
 // Every other piece this task specifies — the cost governor, the cache-hit
 // metric, the egress-gate hook, the usage/pricing machinery — is built
@@ -44,6 +55,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -91,6 +103,36 @@ const (
 // independently, synchronously, by ProxyConfig.OnCloudUnreachable.
 const MsgCloudUnreachableMarker = "kahya_cloud_unreachable: upstream retries exhausted after inline backoff"
 
+// TaskTokenHeader carries the per-task local token (spawn.NewAPIKey) from the
+// worker's bundled CLI to this proxy. spawn.BuildEnv sets it through
+// ANTHROPIC_CUSTOM_HEADERS so that ANTHROPIC_API_KEY can stay UNSET in
+// passthrough mode: the CLI picks exactly ONE upstream credential source, and
+// an ANTHROPIC_API_KEY value always wins over its own Claude Code login - which
+// is why the pre-FIX-I-1 design (token in x-api-key, "forward the other auth
+// header") could never reach the upstream with a credential. The header is
+// validated and STRIPPED here in both credential modes; it never reaches the
+// upstream. kahyad/internal/spawn.TaskTokenHeaderName mirrors this literal
+// (spawn does not import this package); a server-package test pins the two.
+const TaskTokenHeader = "X-Kahya-Task-Token"
+
+// EventNoUpstreamCredential fires once per Proxy when, in passthrough mode, a
+// locally authenticated inbound request carries NO upstream credential at all
+// (neither an Authorization header nor an x-api-key that is not the local
+// token): the worker's CLI has no Claude Code login. Failing here, locally,
+// replaces an upstream 401 round trip (a credential-less request leaving the
+// machine) with an actionable message.
+const EventNoUpstreamCredential = "proxy.no_upstream_credential"
+
+// ReasonNoUpstreamCredential is the reason id OnNonRetryableFailure receives
+// for EventNoUpstreamCredential (substituted into task.MsgCloudNonRetryableFmt).
+const ReasonNoUpstreamCredential = "no_upstream_credential"
+
+// MsgNoUpstreamCredential is the Anthropic-shaped error body returned to the
+// worker for EventNoUpstreamCredential (ASCII-folded Turkish, matching this
+// file's other proxy-level error bodies such as "Yerel yetkilendirme jetonu
+// eksik veya gecersiz.").
+const MsgNoUpstreamCredential = "Bulut kimlik bilgisi yok - worker'in Claude Code oturumu bulunamadi (claude /login) ya da credential_mode: keychain secin."
+
 // CredentialMode values (mirrors kahyad/internal/config's
 // CredentialModeKeychain/CredentialModePassthrough literals — this
 // package intentionally does not import kahyad/internal/config so it has
@@ -118,9 +160,9 @@ type CredentialSource interface {
 	// UpstreamAuth returns the header name/value pair to inject on the
 	// outbound request (e.g. "x-api-key", "sk-ant-..."). Returning
 	// ("", "", nil) is the passthroughSource sentinel meaning "inject
-	// nothing — forward whatever auth header the worker's own HTTP
-	// client already attached, unchanged". The proxy's passthrough
-	// Director branch never actually calls this method (it has nothing
+	// nothing — forward the worker CLI's own Authorization header (its
+	// Claude Code login; FIX-I-1, see the package doc), unchanged". The
+	// proxy's passthrough Director branch never actually calls this method (it has nothing
 	// to inject), but passthroughSource still implements it so
 	// credential_mode=passthrough has a concrete CredentialSource value
 	// to hold, keeping the wiring shape uniform across both modes.
@@ -187,7 +229,12 @@ type ProxyConfig struct {
 	Token       string // this task's kahya-task-<hex32> local auth token
 	UpstreamURL string // cfg.anthropic_upstream_url
 
-	CredentialMode string // CredentialModeKeychain | CredentialModePassthrough; defaults to passthrough
+	// CredentialMode is CredentialModeKeychain | CredentialModePassthrough;
+	// empty defaults to passthrough. NOTE (G00 C-17): spawn.BuildEnv and the
+	// worker read an EMPTY mode as keychain, so tests should always set it
+	// explicitly on both sides; production never has an empty value
+	// (config.validateCredentialMode).
+	CredentialMode string
 	Credential     CredentialSource
 
 	Governor    *Governor
@@ -250,6 +297,9 @@ type Proxy struct {
 	rp  *httputil.ReverseProxy
 
 	keychainWarnedOnce sync.Once
+	// noCredentialOnce gates onNoUpstreamCredential (FIX-I-1): the CLI may
+	// retry a 401 several times; the task must fail, and be ledgered, once.
+	noCredentialOnce sync.Once
 
 	// requestCount is a test-only observability hook (W4-03's no-cloud-
 	// fallback regression test - kahyad/internal/reader's own tests spin up
@@ -311,6 +361,7 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 			req.Host = upstream.Host
 			switch p.cfg.CredentialMode {
 			case CredentialModeKeychain:
+				stripTokenHeader(req.Header, p.cfg.Token)
 				req.Header.Del("x-api-key")
 				req.Header.Del("Authorization")
 				if cred, ok := req.Context().Value(credentialCtxKey{}).(injectedCredential); ok && cred.name != "" {
@@ -419,8 +470,9 @@ type reqData struct {
 const proxyRequestMaxBytes = 16 << 20 // 16 MiB: generous for a /v1/messages body
 
 // ServeHTTP implements the full per-request pipeline (task spec steps
-// 1/3/4, reordered by BLOCKER 2): local-auth check -> egress gate -> read
-// body -> governor check-and-RESERVE (needs the body/model to size its
+// 1/3/4, reordered by BLOCKER 2): local-auth check -> egress gate ->
+// (passthrough) upstream-credential presence (FIX-I-1) -> read body ->
+// governor check-and-RESERVE (needs the body/model to size its
 // conservative estimate - see Governor.CheckBeforeForward) -> (in keychain
 // mode) credential resolution -> delegate to the reverse proxy, which
 // streams the response back through wrapResponseBody's usage capture.
@@ -452,6 +504,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeAnthropicError(w, http.StatusForbidden, "permission_error", err.Error())
 			return
 		}
+	}
+
+	// FIX-I-1: in passthrough the upstream credential is the worker CLI's
+	// own login. A request that would leave with NO credential at all once
+	// the local token is stripped is refused here (fail-closed: nothing
+	// credential-less leaves the machine) and fails the task once. Only the
+	// header's presence is checked, never its value. Placed after the
+	// egress gate so the secret-lane backstop's 403 always wins.
+	if p.cfg.CredentialMode == CredentialModePassthrough && !hasUpstreamCredential(r.Header, p.cfg.Token) {
+		p.onNoUpstreamCredential(ctx)
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", MsgNoUpstreamCredential)
+		return
 	}
 
 	bodyBytes, err := readAndRestoreBody(r)
@@ -517,32 +581,78 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // checkLocalAuth implements the task spec's "Reject inbound whose
 // x-api-key/authorization != this task's kahya-task-<hex32> token" — the
 // local token proves this request came from this task's own spawned
-// worker (whichever header the worker's HTTP client happened to carry it
-// in); it does not, on its own, decide what (if anything) is forwarded
-// upstream — applyCredential/Director does that per credential_mode.
+// worker; it does not, on its own, decide what (if anything) is forwarded
+// upstream — the Director does that per credential_mode.
+//
+// FIX-I-1: TaskTokenHeader is checked FIRST and, when present, alone
+// decides (a wrong value is a reject even if a legacy header matches).
+// The legacy carriers stay accepted so keychain mode (ANTHROPIC_API_KEY=
+// <token> -> x-api-key) and the W12-08 manual curl check keep working.
+// Comparisons are constant-time.
 func (p *Proxy) checkLocalAuth(r *http.Request) bool {
 	token := p.cfg.Token
+	if v := r.Header.Get(TaskTokenHeader); v != "" {
+		return constantTimeEqual(v, token)
+	}
 	if v := r.Header.Get("x-api-key"); v != "" {
-		return v == token
+		return constantTimeEqual(v, token)
 	}
 	if v := r.Header.Get("Authorization"); v != "" {
-		return v == token || v == "Bearer "+token
+		return constantTimeEqual(v, token) || constantTimeEqual(v, "Bearer "+token)
 	}
 	return false
 }
 
-// stripTokenHeader removes exactly the header that carried the local
-// per-task token (passthrough mode, task spec: "forward the worker's own
-// upstream auth header unchanged" — the local token is NOT a real
-// Anthropic credential and must never reach the real upstream; any OTHER
-// auth header is left completely untouched).
+func constantTimeEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// stripTokenHeader removes every header that carried the local per-task
+// token - TaskTokenHeader always, and a legacy x-api-key/Authorization
+// only when its value IS the token. The local token is not an Anthropic
+// credential and never reaches the upstream; in passthrough any OTHER
+// auth header (the worker CLI's own Authorization) is left untouched.
 func stripTokenHeader(h http.Header, token string) {
+	h.Del(TaskTokenHeader)
 	if h.Get("x-api-key") == token {
 		h.Del("x-api-key")
 	}
 	if auth := h.Get("Authorization"); auth == token || auth == "Bearer "+token {
 		h.Del("Authorization")
 	}
+}
+
+// hasUpstreamCredential reports whether, once the local token is stripped,
+// ANY credential would still be forwarded (passthrough mode, FIX-I-1). It
+// checks presence only and never reads or logs the value beyond comparing
+// it with the local token.
+func hasUpstreamCredential(h http.Header, token string) bool {
+	if auth := h.Get("Authorization"); auth != "" && auth != token && auth != "Bearer "+token {
+		return true
+	}
+	if k := h.Get("x-api-key"); k != "" && k != token {
+		return true
+	}
+	return false
+}
+
+// onNoUpstreamCredential ledgers EventNoUpstreamCredential and fails the
+// task through OnNonRetryableFailure (reason ReasonNoUpstreamCredential),
+// exactly once per Proxy. Called synchronously from ServeHTTP, the same
+// contract wrapResponseBody's NonRetryable hook already has. The ledger
+// write ignores the inbound request's cancellation: the once is spent
+// either way, so the row must not be lost to a disconnecting client.
+func (p *Proxy) onNoUpstreamCredential(ctx context.Context) {
+	p.noCredentialOnce.Do(func() {
+		if p.cfg.EventLedger != nil {
+			_ = p.cfg.EventLedger.LogEvent(context.WithoutCancel(ctx), p.cfg.TraceID, EventNoUpstreamCredential, map[string]any{
+				"task_id": p.cfg.TaskID,
+			})
+		}
+		if p.cfg.OnNonRetryableFailure != nil {
+			_ = p.cfg.OnNonRetryableFailure(context.Background(), p.cfg.TaskID, ReasonNoUpstreamCredential)
+		}
+	})
 }
 
 func (p *Proxy) ledgerAuthReject(ctx context.Context, r *http.Request) {

@@ -184,27 +184,35 @@ WORKER_SETTING_SOURCES: tuple[str, ...] = ()
 # Keychain at its forward-proxy. The owner decided NOT to provision a
 # separate Anthropic API key for this project: the worker
 # (claude-agent-sdk) instead authenticates through its OWN, already
-# logged-in Claude Code SDK session, forwarded unmodified by kahyad's
-# proxy in "passthrough" mode (the current default - see
-# kahyad/internal/anthproxy's package doc + config.CredentialMode).
+# logged-in Claude Code session, forwarded unmodified by kahyad's proxy in
+# "passthrough" mode (the default - see kahyad/internal/anthproxy's package
+# doc + config.CredentialMode).
 #
-# Concretely, this means the per-task local proxy token
-# (ANTHROPIC_API_KEY="kahya-task-<hex32>") is:
-#   - REQUIRED to match that exact shape in "keychain" mode (the original
-#     HANDOFF design, still fully supported as a fallback) - a worker
-#     misconfigured this way would otherwise silently fail every proxied
-#     call with a 401 much later, so the assertion below catches it at
-#     startup instead.
-#   - NOT enforced as the worker's OWN auth in "passthrough" mode - the
-#     SDK subprocess supplies its own upstream auth header independently,
-#     and kahyad's proxy forwards it unchanged after validating the local
-#     token itself (a proxy-side concern, not this worker's).
+# FIX-I-1 - the real mechanism: the bundled claude CLI uses exactly ONE
+# upstream credential source, and in SDK (non-interactive) mode a set
+# ANTHROPIC_API_KEY always wins over its Claude Code login. So the per-task
+# local proxy token ("kahya-task-<hex32>") travels in its own header,
+# "X-Kahya-Task-Token", which kahyad sets through ANTHROPIC_CUSTOM_HEADERS in
+# both modes; the proxy validates and strips it. Concretely:
+#   - "passthrough": ANTHROPIC_CUSTOM_HEADERS must carry the token line and
+#     ANTHROPIC_API_KEY must be UNSET (any value - even the token - would
+#     make the CLI send x-api-key instead of its own login's Authorization,
+#     and every call would fail upstream).
+#   - "keychain" (the original HANDOFF design, still fully supported):
+#     ANTHROPIC_API_KEY must match the per-task token shape exactly (the
+#     W12-08 carrier; the proxy strips it and injects the real key) - a
+#     misconfigured worker would otherwise fail every proxied call with a
+#     401 much later, so the assertion below catches it at startup.
 #
 # Either way, the "API anahtarı worker'a verilmez" invariant (HANDOFF §4
 # IPC ⚑ - a real Anthropic key must never reach the worker) is checked
 # BELT-AND-BRACES IN BOTH MODES: no environment value may ever contain the
 # "sk-ant-" prefix of a real Anthropic key (see _check_real_key_leak).
 _TASK_TOKEN_RE = re.compile(r"^kahya-task-[0-9a-f]{32}$")
+_TASK_TOKEN_HEADER = "X-Kahya-Task-Token"
+_CUSTOM_HEADER_LINE_RE = re.compile(
+    r"^\s*" + re.escape(_TASK_TOKEN_HEADER) + r"\s*:\s*kahya-task-[0-9a-f]{32}\s*$", re.IGNORECASE
+)
 _REAL_KEY_NEEDLE = "sk-ant-"
 
 _CREDENTIAL_MODE_KEYCHAIN = "keychain"
@@ -236,9 +244,12 @@ def _check_credential_env(credential_mode: str, mode: str) -> str | None:
     invariant (step 6), or None if they all hold. ANTHROPIC_BASE_URL must
     always be set - the worker only ever talks to kahyad's own per-task
     forward-proxy listener, never a real upstream directly, in EITHER
-    mode. In "keychain" mode, ANTHROPIC_API_KEY must additionally match
-    the per-task token shape exactly (see the module's OWNER AUTH
-    DECISION comment for why "passthrough" mode does not enforce this).
+    mode. FIX-I-1 (see the module's OWNER AUTH DECISION comment): in
+    "passthrough" mode ANTHROPIC_CUSTOM_HEADERS must carry the
+    "X-Kahya-Task-Token: kahya-task-<hex32>" line and ANTHROPIC_API_KEY
+    must be unset; in "keychain" mode (and any other value - the stricter
+    posture is the default) ANTHROPIC_API_KEY must match the per-task
+    token shape exactly.
 
     W6-02: mode=="stt" sessions (envelope.Mode == spawn.ModeSTT, Go side)
     never construct a ClaudeAgentOptions/ClaudeSDKClient at all - they only
@@ -254,10 +265,20 @@ def _check_credential_env(credential_mode: str, mode: str) -> str | None:
         return None
     if not os.environ.get("ANTHROPIC_BASE_URL", "").strip():
         return "ANTHROPIC_BASE_URL is not set"
-    if credential_mode == _CREDENTIAL_MODE_KEYCHAIN:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not _TASK_TOKEN_RE.match(api_key):
-            return "ANTHROPIC_API_KEY does not match the per-task token shape ^kahya-task-[0-9a-f]{32}$"
+    if credential_mode == _CREDENTIAL_MODE_PASSTHROUGH:
+        custom = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+        if not any(_CUSTOM_HEADER_LINE_RE.match(line) for line in custom.splitlines()):
+            return "ANTHROPIC_CUSTOM_HEADERS must carry 'X-Kahya-Task-Token: kahya-task-<hex32>' in passthrough mode"
+        if os.environ.get("ANTHROPIC_API_KEY", ""):
+            # The CLI prefers an API key over its Claude Code login; a set
+            # value here would silently disable the very credential
+            # passthrough relies on.
+            return "ANTHROPIC_API_KEY must be unset in passthrough mode (the CLI would prefer it over the Claude Code login)"
+        return None
+    # keychain (and the legacy empty value): the W12-08 contract, unchanged.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not _TASK_TOKEN_RE.match(api_key):
+        return "ANTHROPIC_API_KEY does not match the per-task token shape ^kahya-task-[0-9a-f]{32}$"
     return None
 
 

@@ -64,6 +64,7 @@ else
 	deferred "answer"               "daemon unreachable"
 	deferred "trace"                "daemon unreachable"
 	deferred "ledger-forensics"      "daemon unreachable"
+	deferred "cloud_auth"            "daemon unreachable"
 	echo
 	echo "=== SUMMARY: $FAILS FAIL, $DEFERRED DEFERRED ==="
 	exit 1
@@ -200,6 +201,29 @@ PYEOF
 		else
 			fail "ledger-forensics" "sha256(block)=$GOT_SHA, block_sha256=$WANT_SHA"
 		fi
+	fi
+fi
+
+# --- 4. cloud_auth (FIX-I-1): did the configured credential_mode actually
+# authenticate upstream? A model_call status=ok row for this task's trace is
+# the proof; a task.failed row (e.g. reason=no_upstream_credential or
+# authentication_error) is a hard FAIL - the credential path is broken, not
+# merely unconfigured. ---
+CLOUD_TRACE="$TRACE_ID"
+if [ -z "$CLOUD_TRACE" ]; then
+	CLOUD_TRACE="$(sqlite3 "$DB_PATH" "SELECT trace_id FROM tasks ORDER BY created_at DESC LIMIT 1;" 2>/dev/null)"
+fi
+if [ -z "$CLOUD_TRACE" ]; then
+	deferred "cloud_auth" "no task trace found in $DB_PATH"
+else
+	MC_STATUS="$(sqlite3 "$DB_PATH" "SELECT json_extract(payload,'\$.status') FROM events WHERE kind='model_call' AND trace_id='$CLOUD_TRACE' ORDER BY id DESC LIMIT 1;" 2>/dev/null)"
+	FAIL_REASON="$(sqlite3 "$DB_PATH" "SELECT json_extract(payload,'\$.reason') FROM events WHERE kind='task.failed' AND trace_id='$CLOUD_TRACE' ORDER BY id DESC LIMIT 1;" 2>/dev/null)"
+	if [ "$MC_STATUS" = "ok" ]; then
+		pass "cloud_auth (model_call status=ok, trace_id=$CLOUD_TRACE)"
+	elif [ -n "$FAIL_REASON" ]; then
+		fail "cloud_auth" "task.failed reason=$FAIL_REASON (credential_mode is not authenticating upstream - see docs/ipc.md W12-08 note)"
+	else
+		deferred "cloud_auth" "no model_call row for trace $CLOUD_TRACE"
 	fi
 fi
 

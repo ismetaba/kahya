@@ -28,11 +28,12 @@ sets/inherits - see kahyad/internal/spawn/spawn.go):
     to KAHYA_GATE5_FS_READ_OUT_FILE.
   - once signaled (and after the optional fs_read), POSTs
     KAHYA_GATE5_CLOUD_CALLS (default 1) OpenAI/Anthropic-shaped requests to
-    "$ANTHROPIC_BASE_URL/v1/messages" with header
-    "x-api-key: $ANTHROPIC_API_KEY" (exactly the real worker's own
-    authentication convention, HANDOFF S4 IPC - the API key never leaves
-    kahyad, this per-task local token is the only thing this process
-    ever sees) - a "direct HTTP call standing in for the worker" per this
+    "$ANTHROPIC_BASE_URL/v1/messages" with the per-task local token in
+    "X-Kahya-Task-Token" (read from $ANTHROPIC_CUSTOM_HEADERS, FIX-I-1)
+    plus a placeholder Authorization - exactly the real worker CLI's
+    passthrough shape (HANDOFF S4 IPC - the API key never leaves kahyad,
+    this per-task local token is the only kahyad secret this process ever
+    sees) - a "direct HTTP call standing in for the worker" per this
     task's own spec wording.
   - writes "STATUS:<code>\n<response body>" (one block per call, joined
     by a newline) to KAHYA_GATE5_OUT_FILE so the
@@ -91,13 +92,36 @@ def fs_read_over_uds(path):
         conn.close()
 
 
-def cloud_call(base_url, api_key, body):
+def _task_token():
+    """FIX-I-1: the per-task token travels in ANTHROPIC_CUSTOM_HEADERS
+    ("X-Kahya-Task-Token: kahya-task-<hex32>") in BOTH credential modes;
+    ANTHROPIC_API_KEY is only set in keychain mode (legacy carrier)."""
+    for line in os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "x-kahya-task-token":
+            return value.strip()
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _auth_headers():
+    """Exactly the header pair the real worker's CLI sends in passthrough
+    mode: the local token in its own header + the CLI's own upstream
+    credential (here a fixture placeholder - kahyad never inspects its
+    value, it only checks that one exists)."""
+    return {
+        "Content-Type": "application/json",
+        "X-Kahya-Task-Token": _task_token(),
+        "Authorization": "Bearer fixture-upstream-credential",
+    }
+
+
+def cloud_call(base_url, body):
     """POST one request to the per-task anthproxy; (status, body)."""
     try:
         req = urllib.request.Request(
             base_url.rstrip("/") + "/v1/messages",
             data=body,
-            headers={"Content-Type": "application/json", "x-api-key": api_key},
+            headers=_auth_headers(),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -119,7 +143,6 @@ def main():
     signal_path = os.environ.get("KAHYA_GATE5_SIGNAL_FILE", "")
     out_path = os.environ.get("KAHYA_GATE5_OUT_FILE", "")
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     deadline = time.time() + 20.0
     while signal_path and not os.path.exists(signal_path):
@@ -145,7 +168,7 @@ def main():
     calls = max(1, int(os.environ.get("KAHYA_GATE5_CLOUD_CALLS", "1") or "1"))
     blocks = []
     for _ in range(calls):
-        status, resp_body = cloud_call(base_url, api_key, body)
+        status, resp_body = cloud_call(base_url, body)
         blocks.append("STATUS:%d\n%s" % (status, resp_body))
 
     if out_path:

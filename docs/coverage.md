@@ -17,7 +17,7 @@
 | `POST /policy/check` HTTP-over-UDS, 5s timeout, fail-closed | §4 IPC ⚑ | W12-07, W12-09; test in W78-03 | covered |
 | kahyad supervises MLX processes; `mlx_lm.server` 127.0.0.1, pinned port, health-check | §4 IPC ⚑ | W12-11 (`mlxsup`), W3-08 | covered |
 | `mlx-whisper` as library inside worker (not a server) | §4 IPC ⚑ | W6-02 | covered |
-| API key never to worker; forward-proxy + `ANTHROPIC_BASE_URL`; governor/cache/egress gate at proxy | §4 IPC ⚑ | W12-08 (+W3-08 backstop) | covered |
+| API key never to worker; forward-proxy + `ANTHROPIC_BASE_URL`; governor/cache/egress gate at proxy | §4 IPC ⚑ | W12-08 (+W3-08 backstop; FIX-I-1: local token in `X-Kahya-Task-Token`, owner-approved passthrough default authenticates via the worker CLI's own login) | covered |
 | Notification delivery: `hs.notify` local, Telegram remote, background results carry `trace_id` | §4 IPC ⚑ | W6-01, W3-07 | covered |
 | All processes JSONL with `trace_id` every line | §4 IPC ⚑ | W12-01, W12-09 | covered |
 | Action classes R/W1/W2/W3 as static tool metadata | §4 ⚑ | W3-01 | covered |
@@ -185,6 +185,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #1 | non-allowlisted host denied (allowlist is the gate) | `kahyad/internal/egress/TestCheck_NotInAllowlistDenies` | W3-05 | ci-hermetic |
 | Safety #1 | red-team web-page exfiltration scenario blocked | `kahyad/internal/eval/TestRedteamPerScenarioBlockPoints` | W78-02 | ci-hermetic |
 | Safety #1 | in-container `curl` cannot bypass egress allowlist (real Docker) | `tests/w3/TestGate4_DockerCurlCannotBypassEgressAllowlist` | W3-10 | local-integration |
+| Safety #1 | passthrough: a model call that would leave with no upstream credential is refused locally (401 `proxy.no_upstream_credential`), never forwarded; the task fails exactly once | `kahyad/internal/anthproxy/TestProxyPassthroughRealCLIShapeOnlyAPIKeyHeader` | FIX-I-1 | ci-hermetic |
+| Safety #1 | the per-task local token (`X-Kahya-Task-Token`) is validated and stripped before any byte goes upstream; the worker CLI's own `Authorization` is forwarded unchanged | `kahyad/internal/anthproxy/TestProxyPassthroughForwardsWorkerAuthUnchanged` | FIX-I-1 | ci-hermetic |
+| Safety #1 | a wrong `X-Kahya-Task-Token` is a local-auth reject in both credential modes, even beside a matching legacy header | `kahyad/internal/anthproxy/TestProxyRejectsWrongTaskTokenHeader` | FIX-I-1 | ci-hermetic |
+| Safety #1 | passthrough worker env carries the token only in `ANTHROPIC_CUSTOM_HEADERS`, never `ANTHROPIC_API_KEY` (no parent value leaks back in) | `kahyad/internal/spawn/TestBuildEnvPassthroughOmitsAPIKeyAndSetsCustomHeader` | FIX-I-1 | ci-hermetic |
+| Safety #1 | real bins, passthrough default: the worker CLI's own credential reaches the upstream, the local token never does | `tests/e2e/TestW12PassthroughCloudAuth` | FIX-I-1 | local-integration |
 | Safety #2 | missing taint record ⇒ untrusted (fail-closed) | `kahyad/internal/taint/TestGetMissingRowIsTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint read error ⇒ fail-closed to tainted | `kahyad/internal/taint/TestGetOnReadErrorFailsClosedToTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint only rises (clean-after-tainted rejected) | `kahyad/internal/taint/TestRaiseThenInsertCleanFails` | W4-03 | ci-hermetic |

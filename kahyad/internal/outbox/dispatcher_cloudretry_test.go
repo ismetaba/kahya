@@ -75,7 +75,10 @@ func TestDispatcherRetriesParkedTaskAfterCloudHeals(t *testing.T) {
 		token := "kahya-task-" + "cafebabecafebabecafebabecafebab1"
 		p, err := anthproxy.New(anthproxy.ProxyConfig{
 			TaskID: taskID, TraceID: traceID, Token: token,
-			UpstreamURL: healedUpstream.URL, Governor: governor, EventLedger: st,
+			// G00 C-17: explicit (New's empty default is passthrough;
+			// spawn/worker read empty as keychain).
+			CredentialMode: anthproxy.CredentialModePassthrough,
+			UpstreamURL:    healedUpstream.URL, Governor: governor, EventLedger: st,
 		})
 		if err != nil {
 			return "", "", nil, err
@@ -87,7 +90,7 @@ func TestDispatcherRetriesParkedTaskAfterCloudHeals(t *testing.T) {
 		return baseURL, token, p.Close, nil
 	}
 
-	d := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: []string{"python3", "testdata/cloud_call_worker.py"}}, nil)
+	d := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: []string{"python3", "testdata/cloud_call_worker.py"}, CredentialMode: anthproxy.CredentialModePassthrough}, nil)
 	d.SetAnthproxyOpener(opener)
 	// Fake clock strictly past next_retry_at (~t0+1m) - proves the
 	// dispatcher's OWN due-row check, not a real elapsed sleep, is what

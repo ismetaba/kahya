@@ -157,6 +157,9 @@ func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin
 		DefaultModel:         "claude-sonnet-5",
 		TaskTimeoutMin:       timeoutMin,
 		WorkerCmd:            workerCmd,
+		// G00 C-17: explicit, matching the passthrough CredentialSource
+		// wired below (the production default; FIX-I-1 shape).
+		CredentialMode: config.CredentialModePassthrough,
 	}
 	st, err := store.Open(cfg)
 	if err != nil {

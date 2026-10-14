@@ -216,10 +216,11 @@ type Config struct {
 	// kahyad reads kahya.anthropic from the macOS Keychain and injects
 	// it) or "passthrough" (OWNER AUTH DECISION default - see
 	// kahyad/internal/anthproxy's package doc comment for the full
-	// rationale: the worker authenticates via its own Claude Code SDK
-	// session, so kahyad injects no credential and simply forwards the
-	// worker's own upstream auth header unchanged after validating the
-	// per-task local token).
+	// rationale: the worker authenticates via its own Claude Code login,
+	// so kahyad injects no credential and forwards the worker CLI's own
+	// Authorization header unchanged after validating the per-task local
+	// token; FIX-I-1: that token rides X-Kahya-Task-Token and
+	// ANTHROPIC_API_KEY stays unset in the worker, see spawn.BuildEnv).
 	CredentialMode string `yaml:"credential_mode"`
 
 	// --- W3-07 Telegram approval bot ---
