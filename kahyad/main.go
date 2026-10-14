@@ -427,14 +427,20 @@ func run() int {
 	// byte passes through (HANDOFF §5 safety #1 flag). notifier is built
 	// here (rather than down where W12-08 originally built it) precisely
 	// so BOTH the gate and the anthproxy governor below share the exact
-	// same Notifier instance. sessions is the per-process, session-
-	// lifetime "has this session done a secret-lane read" tracker
-	// (durable cross-restart taint is W4-03) - fsTool's
-	// SensitiveMarker below and every future in-process caller (the
-	// Telegram sender W3-07, the ledger anchor push W4-05) all reach the
-	// SAME egressGate, never a second copy.
+	// same Notifier instance. sessions is the "has this session done a
+	// secret-lane read" tracker - durable since FIX-B-7 (sensitive_reads,
+	// migration 0019): written through before it is cached, read through
+	// on a miss, so a restart + resume (same trace_id) keeps the mark.
+	// fsTool's SensitiveMarker below and every future in-process caller
+	// (the Telegram sender W3-07, the ledger anchor push W4-05) all reach
+	// the SAME egressGate, never a second copy.
 	notifier := notify.New(log, st)
-	sessions := egress.NewSensitiveTracker()
+	sessions := egress.NewDurableSensitiveTracker(st.Queries)
+	if n, err := sessions.Count(context.Background()); err != nil {
+		log.Warn("sensitive_reads_count_failed", "err", err.Error())
+	} else {
+		log.Info("sensitive_reads_loaded", "count", n)
+	}
 	egressBudget := egress.NewSQLBudget(st.Queries)
 	egressGate := egress.NewGate(pol.Egress, sessions, egressBudget, st, notifier, log)
 	srv.SetEgressGate(egressGate)

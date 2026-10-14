@@ -300,6 +300,47 @@ func TestHandleReadSecretLaneAlwaysMarksTaintOnRequestTraceID(t *testing.T) {
 	}
 }
 
+// TestHandleReadSecretLaneSensitiveMarkFailureRefusesRead is FIX-B-7's
+// fail-closed half at the fs_read seam: when the durable sensitive-read
+// mark cannot be persisted, the read is refused with the Turkish
+// MsgSecretLaneReadRefused, no byte is returned, and the refusal is
+// ledgered (reason sensitive_mark_failed) - before the fix the error was
+// only logged and the secret-lane bytes were returned anyway.
+func TestHandleReadSecretLaneSensitiveMarkFailureRefusesRead(t *testing.T) {
+	home := testHome(t)
+	rel := "Documents/saglik/tahlil-sonuçları.pdf"
+	mustWriteFile(t, filepath.Join(home, filepath.FromSlash(rel)), "gizli tahlil verisi")
+
+	secretLaneGlobs := []string{filepath.Join(home, "Documents", "saglik", "**")}
+	pc := &fakePolicyClient{decision: PolicyDecision{Result: PolicyResultAllow, Class: "R"}}
+	led := &fakeLedger{}
+	marker := &fakeSensitiveMarker{err: errors.New("disk")}
+	s := New(home, nil, secretLaneGlobs, filepath.Join(home, "undo"), pc, led, nil, marker)
+
+	out, err := s.HandleReadForTask(context.Background(), "trace-markfail", "task-markfail", FsReadArgs{
+		Path: "~/Documents/saglik/tahlil-sonuçları.pdf",
+	})
+	if err == nil || err.Error() != MsgSecretLaneReadRefused {
+		t.Fatalf("HandleReadForTask error = %v, want %q", err, MsgSecretLaneReadRefused)
+	}
+	if out.ContentBase64 != "" || out.Size != 0 {
+		t.Errorf("refused read returned content %q (size %d), want none", out.ContentBase64, out.Size)
+	}
+	if marker.callCount() != 1 {
+		t.Errorf("MarkSensitiveRead calls = %d, want 1", marker.callCount())
+	}
+	refused := led.find("secret_lane_read_refused")
+	if len(refused) != 1 {
+		t.Fatalf("secret_lane_read_refused ledger rows = %d, want 1", len(refused))
+	}
+	if refused[0].payload["reason"] != "sensitive_mark_failed" || refused[0].payload["task_id"] != "task-markfail" {
+		t.Errorf("secret_lane_read_refused payload = %v, want reason sensitive_mark_failed, task_id task-markfail", refused[0].payload)
+	}
+	if n := len(led.find("fs_read")); n != 0 {
+		t.Errorf("fs_read ledger rows = %d, want 0 (nothing was read out)", n)
+	}
+}
+
 func TestHandleReadFullDiskAccessErrorOnPermissionDenied(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: POSIX permission bits are bypassed, cannot exercise EPERM/EACCES")

@@ -190,6 +190,17 @@ func (q *Queries) CountEventsByKindAndDate(ctx context.Context, arg CountEventsB
 	return count, err
 }
 
+const countSensitiveReads = `-- name: CountSensitiveReads :one
+SELECT count(*) FROM sensitive_reads
+`
+
+func (q *Queries) CountSensitiveReads(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countSensitiveReads)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countToolCallAttempts = `-- name: CountToolCallAttempts :one
 SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?
 `
@@ -883,6 +894,22 @@ func (q *Queries) GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeema
 		&i.RevokedAt,
 		&i.GrantKind,
 		&i.PendingApprovalID,
+	)
+	return i, err
+}
+
+const getSensitiveRead = `-- name: GetSensitiveRead :one
+SELECT session_key, trace_id, reason, marked_at FROM sensitive_reads WHERE session_key = ?
+`
+
+func (q *Queries) GetSensitiveRead(ctx context.Context, sessionKey string) (SensitiveRead, error) {
+	row := q.db.QueryRowContext(ctx, getSensitiveRead, sessionKey)
+	var i SensitiveRead
+	err := row.Scan(
+		&i.SessionKey,
+		&i.TraceID,
+		&i.Reason,
+		&i.MarkedAt,
 	)
 	return i, err
 }
@@ -1715,6 +1742,33 @@ func (q *Queries) InsertPendingApproval(ctx context.Context, arg InsertPendingAp
 		arg.MintedAt,
 		arg.ExpiresAt,
 		arg.ToolInput,
+	)
+	return err
+}
+
+const insertSensitiveRead = `-- name: InsertSensitiveRead :exec
+INSERT INTO sensitive_reads (session_key, trace_id, reason, marked_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (session_key) DO NOTHING
+`
+
+type InsertSensitiveReadParams struct {
+	SessionKey string         `json:"session_key"`
+	TraceID    string         `json:"trace_id"`
+	Reason     sql.NullString `json:"reason"`
+	MarkedAt   string         `json:"marked_at"`
+}
+
+// B-7 (migrations/0019_sensitive_reads.sql): rises only - a second mark for
+// the same session_key is a no-op (the first mark's trace_id/reason/
+// marked_at stay as the record of when the session first became
+// sensitive). kahyad/internal/egress.SensitiveTracker is the only caller.
+func (q *Queries) InsertSensitiveRead(ctx context.Context, arg InsertSensitiveReadParams) error {
+	_, err := q.db.ExecContext(ctx, insertSensitiveRead,
+		arg.SessionKey,
+		arg.TraceID,
+		arg.Reason,
+		arg.MarkedAt,
 	)
 	return err
 }

@@ -176,6 +176,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | #0 | approval routes (/policy/feedback, /approvals/{id}/decision) never hand out the raw grant token | `kahyad/internal/server/TestPolicyFeedbackAndDecisionResponsesOmitRawToken` | FIX-B-1 | ci-hermetic |
 | Safety #1 | allowlist-external egress hard-blocked after sensitive read, session-lifetime | `kahyad/internal/egress/TestCheck_SensitiveReadBlocksNonAllowlistedHost` | W3-05 | ci-hermetic |
 | Safety #1 | sensitive-read flag only rises, never clears | `kahyad/internal/egress/TestSensitiveTracker_RisesOnlyNeverClears` | W3-05 | ci-hermetic |
+| Safety #1 | sensitive-read mark survives kahyad restart + resume (persisted row, same trace_id) | `kahyad/internal/egress/TestSensitiveTracker_PersistsAcrossRestart` | FIX-B-7 | ci-hermetic |
+| Safety #1 | sensitive-read lookup failure fails closed (treated as marked) | `kahyad/internal/egress/TestSensitiveTracker_StoreReadErrorFailsClosed` | FIX-B-7 | ci-hermetic |
+| Safety #1 | a sensitive-read mark that cannot be persisted is an error, never cached as marked | `kahyad/internal/egress/TestSensitiveTracker_StoreWriteErrorReturnsErrorAndDoesNotCache` | FIX-B-7 | ci-hermetic |
+| Safety #1 | a secret-lane fs_read whose sensitive-read mark cannot be persisted is refused — no byte released | `mcp/fs/TestHandleReadSecretLaneSensitiveMarkFailureRefusesRead` | FIX-B-7 | ci-hermetic |
+| Safety #1 | the real kahyad persists a sensitive-read mark and reloads it on the next boot (same brain.db) | `tests/acceptance/w6/TestSensitiveReadMarkSurvivesDaemonRestart` | FIX-B-7 | local-integration |
 | Safety #1 | non-allowlisted host denied (allowlist is the gate) | `kahyad/internal/egress/TestCheck_NotInAllowlistDenies` | W3-05 | ci-hermetic |
 | Safety #1 | red-team web-page exfiltration scenario blocked | `kahyad/internal/eval/TestRedteamPerScenarioBlockPoints` | W78-02 | ci-hermetic |
 | Safety #1 | in-container `curl` cannot bypass egress allowlist (real Docker) | `tests/w3/TestGate4_DockerCurlCannotBypassEgressAllowlist` | W3-10 | local-integration |

@@ -72,6 +72,7 @@ type Querier interface {
 	// fired-on-wake plus the regular 08:30 run can therefore never deliver
 	// two notifications the same date.
 	CountEventsByKindAndDate(ctx context.Context, arg CountEventsByKindAndDateParams) (int64, error)
+	CountSensitiveReads(ctx context.Context) (int64, error)
 	// The per-(task_id, tool_name, args_hash) attempt count the resume scan
 	// compares against task.retry.w1_max_auto (task spec step 6: "at most
 	// w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
@@ -183,6 +184,7 @@ type Querier interface {
 	// ConsumeApprovalToken (WHERE consumed_at IS NULL), so a concurrent
 	// redeemer that read the same row loses that UPDATE and redeems nothing.
 	GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeemableApprovalGrantParams) (ApprovalToken, error)
+	GetSensitiveRead(ctx context.Context, sessionKey string) (SensitiveRead, error)
 	// W4-03 (taint tiers + Reader/Actor split) queries below. See
 	// migrations/0009_session_taint.sql for the schema and
 	// kahyad/internal/taint/taint.go for the only caller (a narrow Store
@@ -317,6 +319,11 @@ type Querier interface {
 	// type directly instead of sqlc emitting a separate "Row" type for a
 	// differently-ordered column list.
 	InsertPendingApproval(ctx context.Context, arg InsertPendingApprovalParams) error
+	// B-7 (migrations/0019_sensitive_reads.sql): rises only - a second mark for
+	// the same session_key is a no-op (the first mark's trace_id/reason/
+	// marked_at stay as the record of when the session first became
+	// sensitive). kahyad/internal/egress.SensitiveTracker is the only caller.
+	InsertSensitiveRead(ctx context.Context, arg InsertSensitiveReadParams) error
 	// The ONLY way a 'clean' row is ever created (task spec step 1): a plain
 	// INSERT, never an upsert - a session_id that already has ANY row (clean
 	// or tainted) makes this fail on the PRIMARY KEY constraint, which

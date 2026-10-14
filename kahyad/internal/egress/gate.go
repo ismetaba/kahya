@@ -17,7 +17,8 @@
 //
 // Decision order (this task's spec, verbatim — checked in exactly this
 // order, first match wins):
-//  1. session.SessionID is marked sensitive (SensitiveTracker) AND host is
+//  1. session.SessionID is marked sensitive (SensitiveTracker, persisted
+//     since FIX-B-7; a store read error counts as marked) AND host is
 //     NOT in the allowlist => DENY egress_blocked_sensitive.
 //  2. host is NOT in the allowlist => DENY egress_blocked_allowlist.
 //  3. the per-host (or default) daily byte budget would be exceeded =>
@@ -107,6 +108,13 @@ const (
 	// alongside the Check-decision kinds since both are part of this
 	// package's one observable event vocabulary).
 	EventSensitiveMarked = "sensitive_read_marked"
+	// EventSensitiveMarkFailed: MarkSensitiveRead could not persist the
+	// mark (FIX-B-7) - the error is returned so the caller fails closed.
+	EventSensitiveMarkFailed = "sensitive_read_mark_failed"
+	// EventSensitiveLookupFailed: Check could not read the persisted mark
+	// (FIX-B-7) - the session is treated as marked (fail-closed), so this
+	// row explains the egress_blocked_sensitive decision that follows.
+	EventSensitiveLookupFailed = "sensitive_read_lookup_failed"
 	// EventMetered is proxy.go's post-hoc CONNECT-tunnel byte-accounting
 	// event — bookkeeping, not a decision (the tunnel already happened by
 	// the time this fires), so it is logged separately from the four
@@ -267,7 +275,17 @@ func (g *Gate) Check(ctx context.Context, target Target, nbytes int64, session S
 		return g.deny(ctx, target.Host, EventBlockedAllowlist, fmt.Sprintf(reasonAllowlistFmt, target.Host), session), nil
 	}
 
-	sensitive := session.SessionID != "" && g.sessions != nil && g.sessions.IsMarked(session.SessionID)
+	sensitive := false
+	if session.SessionID != "" && g.sessions != nil {
+		marked, lerr := g.sessions.IsMarkedCtx(ctx, session.SessionID)
+		if lerr != nil {
+			// FAIL-CLOSED: IsMarkedCtx already reports marked=true on a
+			// store error; record why so the resulting
+			// egress_blocked_sensitive row is explainable.
+			g.record(ctx, session, EventSensitiveLookupFailed, map[string]any{"err": lerr.Error()})
+		}
+		sensitive = marked
+	}
 	matched := g.matchAllowlist(canonical, target.Port)
 
 	if sensitive && !matched {
@@ -349,20 +367,27 @@ func (g *Gate) MeterUsage(ctx context.Context, host string, nbytes int64, sessio
 	g.record(ctx, session, EventMetered, map[string]any{"host": canonical, "bytes": nbytes})
 }
 
-// MarkSensitiveRead flags sessionID sensitive (SensitiveTracker.Mark,
-// rises-only) and ledgers/logs EventSensitiveMarked — this is the Go-level
-// counterpart of POST /session/sensitive-read: kahyad/internal/server/
-// egress.go mounts that HTTP wire endpoint AND wires mcp/fs's fs_read
-// seam to call this method directly, in-process (mcp/fs.
-// SensitiveReadMarker's own doc comment: the same "in-process today, a
-// real HTTP client later" seam PolicyClient already established). An
-// empty sessionID is an error — there is nothing to mark.
+// MarkSensitiveRead flags sessionID sensitive (SensitiveTracker.MarkCtx,
+// rises-only, persisted first when the tracker is durable) and
+// ledgers/logs EventSensitiveMarked — this is the Go-level counterpart of
+// POST /session/sensitive-read: kahyad/internal/server/egress.go mounts
+// that HTTP wire endpoint AND wires mcp/fs's fs_read seam to call this
+// method directly, in-process (mcp/fs.SensitiveReadMarker's own doc
+// comment: the same "in-process today, a real HTTP client later" seam
+// PolicyClient already established). An empty sessionID is an error —
+// there is nothing to mark. A persistence failure (FIX-B-7) is ledgered
+// as EventSensitiveMarkFailed and RETURNED, never swallowed: the caller
+// must fail closed rather than release secret-lane bytes on a mark that
+// would not survive a restart.
 func (g *Gate) MarkSensitiveRead(ctx context.Context, sessionID, traceID string) error {
 	if sessionID == "" {
 		return fmt.Errorf("egress: MarkSensitiveRead: empty session_id")
 	}
 	if g.sessions != nil {
-		g.sessions.Mark(sessionID)
+		if _, err := g.sessions.MarkCtx(ctx, sessionID, traceID, ReasonSecretLaneRead); err != nil {
+			g.record(ctx, SessionInfo{SessionID: sessionID, TraceID: traceID}, EventSensitiveMarkFailed, map[string]any{"err": err.Error()})
+			return err
+		}
 	}
 	g.record(ctx, SessionInfo{SessionID: sessionID, TraceID: traceID}, EventSensitiveMarked, nil)
 	return nil

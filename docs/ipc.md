@@ -852,7 +852,12 @@ first boot). `{}` disables it.
     `kahyad/internal/server.SetAnthproxy`) keys `SessionInfo.SessionID` on
     that SAME `trace_id`, so a secret-lane read anywhere in a task's own
     lifetime hard-blocks that task's later model-call egress the instant
-    it would leave the allowlist.
+    it would leave the allowlist. Since FIX-B-7 the mark is durable
+    (brain.db `sensitive_reads`, migration 0019): it survives a kahyad
+    restart + resume (a resumed task keeps its `trace_id`), and a mark that
+    cannot be persisted makes `fs_read` refuse the read
+    (`mcp/fs.MsgSecretLaneReadRefused`, ledger `secret_lane_read_refused`)
+    instead of returning the bytes.
   - **`needs_network:true` container egress is attributed via a
     per-task Proxy-Authorization credential.** `mcp/shell`'s
     `EgressTokenRegistrar` seam (`kahyad/internal/server.

@@ -138,6 +138,12 @@ type SensitiveReadMarker interface {
 	MarkSensitiveRead(ctx context.Context, sessionID, traceID string) error
 }
 
+// MsgSecretLaneReadRefused is the Turkish tool error fs_read returns when
+// a secret-lane hit could not be durably marked (fail-closed: bytes are
+// never released on an unrecorded read - FIX-B-7; FIX-B-6 adds the
+// sticky lane escalation to the same refusal).
+const MsgSecretLaneReadRefused = "Gizli-şerit okuma kaydedilemedi; dosya içeriği güvenlik gereği döndürülmedi (fail-closed)."
+
 // Logger is the JSONL logging surface this package needs. Unlike
 // mcp/memory.Logger (which logs only error/warn side channels under
 // whatever trace_id the shared boot-scoped logger already carries), every
@@ -479,9 +485,18 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 		// wiring — server.ensureTraceHeader — guarantees the
 		// X-Kahya-Trace-Id header, and therefore traceIDFromRequest, is
 		// never empty).
+		//
+		// FIX-B-7: the mark is durable (brain.db sensitive_reads) and a
+		// persistence failure is returned, not swallowed - the read is
+		// REFUSED, no byte is released on a mark that may not exist (the
+		// egress gate would otherwise see this session as clean).
 		if s.SensitiveMarker != nil && traceID != "" {
 			if err := s.SensitiveMarker.MarkSensitiveRead(ctx, traceID, traceID); err != nil {
-				s.Log.With(traceID).Warn("secret_lane_read_sensitive_mark_failed", "err", err.Error())
+				s.logAndLedger(ctx, traceID, "secret_lane_read_refused", map[string]any{
+					"event": "secret_lane_read_refused", "canonical_path": cp.Match, "task_id": taskID,
+					"reason": "sensitive_mark_failed", "err": err.Error(),
+				})
+				return FsReadOutput{}, errors.New(MsgSecretLaneReadRefused)
 			}
 		}
 	}

@@ -382,6 +382,21 @@ UPDATE egress_budget
 SET bytes = bytes + ?
 WHERE host = ? AND day = ?;
 
+-- name: InsertSensitiveRead :exec
+-- B-7 (migrations/0019_sensitive_reads.sql): rises only - a second mark for
+-- the same session_key is a no-op (the first mark's trace_id/reason/
+-- marked_at stay as the record of when the session first became
+-- sensitive). kahyad/internal/egress.SensitiveTracker is the only caller.
+INSERT INTO sensitive_reads (session_key, trace_id, reason, marked_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (session_key) DO NOTHING;
+
+-- name: GetSensitiveRead :one
+SELECT session_key, trace_id, reason, marked_at FROM sensitive_reads WHERE session_key = ?;
+
+-- name: CountSensitiveReads :one
+SELECT count(*) FROM sensitive_reads;
+
 -- W4-02 (task durability state machine + receipts + outbox redelivery)
 -- queries below. See migrations/0007_task_durability.sql for the schema;
 -- kahyad/internal/task (machine.go/receipts.go/resume.go) and

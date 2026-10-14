@@ -3,7 +3,9 @@ package egress
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // ---- fakes ----
@@ -567,5 +570,226 @@ func TestSQLBudget_PersistsAcrossRestart(t *testing.T) {
 	}
 	if bytes != 500 {
 		t.Fatalf("egress_budget.bytes = %d, want 500", bytes)
+	}
+}
+
+// ---- Sensitive-read mark persistence (FIX-B-7) ----
+
+// fakeSensitiveStore is a SensitiveStore whose miss is the sql.ErrNoRows
+// sentinel itself (what the real sqlc code returns; IsMarkedCtx treats
+// ONLY that as "unmarked" - any other error fails closed to marked).
+type fakeSensitiveStore struct {
+	insertErr, getErr error
+	rows              map[string]sqlcgen.SensitiveRead
+}
+
+func (f *fakeSensitiveStore) InsertSensitiveRead(_ context.Context, arg sqlcgen.InsertSensitiveReadParams) error {
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	if f.rows == nil {
+		f.rows = map[string]sqlcgen.SensitiveRead{}
+	}
+	if _, dup := f.rows[arg.SessionKey]; !dup { // ON CONFLICT DO NOTHING
+		f.rows[arg.SessionKey] = sqlcgen.SensitiveRead{SessionKey: arg.SessionKey, TraceID: arg.TraceID, Reason: arg.Reason, MarkedAt: arg.MarkedAt}
+	}
+	return nil
+}
+
+func (f *fakeSensitiveStore) GetSensitiveRead(_ context.Context, k string) (sqlcgen.SensitiveRead, error) {
+	if f.getErr != nil {
+		return sqlcgen.SensitiveRead{}, f.getErr
+	}
+	r, ok := f.rows[k]
+	if !ok {
+		return sqlcgen.SensitiveRead{}, sql.ErrNoRows
+	}
+	return r, nil
+}
+
+func (f *fakeSensitiveStore) CountSensitiveReads(context.Context) (int64, error) {
+	return int64(len(f.rows)), nil
+}
+
+// TestSensitiveTracker_PersistsAcrossRestart is review finding B-7: the
+// mark written by one kahyad process is still there for the next one
+// (same brain.db file, same trace_id - a resumed task keeps it), so the
+// sensitive-read rule still blocks allowlist-external egress.
+func TestSensitiveTracker_PersistsAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "brain.db")
+	const trace = "trace-restart-1"
+
+	st1, err := store.Open(config.Config{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("store.Open (first): %v", err)
+	}
+	g1 := NewGate(testEgressConfig(), NewDurableSensitiveTracker(st1.Queries), newFakeBudget(), &fakeLedger{}, nil, nil)
+	if err := g1.MarkSensitiveRead(ctx, trace, trace); err != nil {
+		t.Fatalf("MarkSensitiveRead: %v", err)
+	}
+	if err := st1.Close(); err != nil {
+		t.Fatalf("Close (first): %v", err)
+	}
+
+	// Simulate a kahyad restart: reopen the SAME database file with a
+	// fresh tracker and gate (nothing carried over in memory).
+	st2, err := store.Open(config.Config{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("store.Open (second): %v", err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	tr2 := NewDurableSensitiveTracker(st2.Queries)
+	if tr2.IsMarked(trace) {
+		t.Fatal("a fresh tracker's in-memory cache is already marked - the restart was not simulated")
+	}
+	ledger := &fakeLedger{}
+	g2 := NewGate(testEgressConfig(), tr2, newFakeBudget(), ledger, nil, nil)
+	d, err := g2.Check(ctx, Target{Host: "evil.example.com", Port: 443}, 1, SessionInfo{SessionID: trace, TraceID: trace})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Allow || d.Rule != EventBlockedSensitive {
+		t.Fatalf("after restart: Allow=%v Rule=%q, want deny %q", d.Allow, d.Rule, EventBlockedSensitive)
+	}
+	if n := ledger.count(EventSensitiveLookupFailed); n != 0 {
+		t.Errorf("sensitive_read_lookup_failed rows = %d, want 0 (the row was read, not guessed)", n)
+	}
+
+	// The persisted row itself.
+	var reason, traceID string
+	if err := st2.DB().QueryRow(
+		`SELECT reason, trace_id FROM sensitive_reads WHERE session_key = ?`, trace,
+	).Scan(&reason, &traceID); err != nil {
+		t.Fatalf("query sensitive_reads row: %v", err)
+	}
+	if reason != ReasonSecretLaneRead || traceID != trace {
+		t.Errorf("sensitive_reads row = (reason %q, trace_id %q), want (%q, %q)", reason, traceID, ReasonSecretLaneRead, trace)
+	}
+	if n, err := tr2.Count(ctx); err != nil || n != 1 {
+		t.Errorf("Count() = %d, %v; want 1, nil", n, err)
+	}
+}
+
+// TestSensitiveTracker_StoreReadErrorFailsClosed: a store read error is
+// treated as "marked" - the sensitive-read rule blocks - and the reason is
+// ledgered.
+func TestSensitiveTracker_StoreReadErrorFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	tr := NewDurableSensitiveTracker(&fakeSensitiveStore{getErr: errors.New("disk")})
+	marked, err := tr.IsMarkedCtx(ctx, "sess-err")
+	if err == nil || !marked {
+		t.Fatalf("IsMarkedCtx on a store error = (%v, %v), want (true, non-nil)", marked, err)
+	}
+
+	ledger := &fakeLedger{}
+	g := NewGate(testEgressConfig(), tr, newFakeBudget(), ledger, nil, nil)
+	d, err := g.Check(ctx, Target{Host: "evil.example.com", Port: 443}, 1, SessionInfo{SessionID: "sess-err", TraceID: "t-err"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Allow || d.Rule != EventBlockedSensitive {
+		t.Fatalf("Check on a store read error: Allow=%v Rule=%q, want deny %q (fail-closed)", d.Allow, d.Rule, EventBlockedSensitive)
+	}
+	if n := ledger.count(EventSensitiveLookupFailed); n != 1 {
+		t.Errorf("sensitive_read_lookup_failed rows = %d, want 1", n)
+	}
+}
+
+// TestSensitiveTracker_StoreMissIsUnmarked: sql.ErrNoRows (and only it)
+// means "never marked".
+func TestSensitiveTracker_StoreMissIsUnmarked(t *testing.T) {
+	ctx := context.Background()
+	tr := NewDurableSensitiveTracker(&fakeSensitiveStore{})
+	if marked, err := tr.IsMarkedCtx(ctx, "never"); marked || err != nil {
+		t.Fatalf("IsMarkedCtx(never) = (%v, %v), want (false, nil)", marked, err)
+	}
+	if _, err := tr.MarkCtx(ctx, "k", "k", ReasonSecretLaneRead); err != nil {
+		t.Fatalf("MarkCtx: %v", err)
+	}
+	if marked, err := tr.IsMarkedCtx(ctx, "k"); !marked || err != nil {
+		t.Fatalf("IsMarkedCtx(k) after MarkCtx = (%v, %v), want (true, nil)", marked, err)
+	}
+	// The allowlist rule (not the sensitive one) decides an unmarked
+	// session's non-allowlisted host.
+	g := NewGate(testEgressConfig(), tr, newFakeBudget(), &fakeLedger{}, nil, nil)
+	d, err := g.Check(ctx, Target{Host: "evil.example.com", Port: 443}, 1, SessionInfo{SessionID: "never", TraceID: "t"})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if d.Rule != EventBlockedAllowlist {
+		t.Errorf("unmarked session Rule = %q, want %q", d.Rule, EventBlockedAllowlist)
+	}
+}
+
+// TestSensitiveTracker_StoreWriteErrorReturnsErrorAndDoesNotCache: a mark
+// that cannot be persisted is an error the caller must fail closed on; it
+// is ledgered as sensitive_read_mark_failed and never cached as marked.
+func TestSensitiveTracker_StoreWriteErrorReturnsErrorAndDoesNotCache(t *testing.T) {
+	ctx := context.Background()
+	tr := NewDurableSensitiveTracker(&fakeSensitiveStore{insertErr: errors.New("disk")})
+	ledger := &fakeLedger{}
+	g := NewGate(testEgressConfig(), tr, newFakeBudget(), ledger, nil, nil)
+	if err := g.MarkSensitiveRead(ctx, "s", "t"); err == nil {
+		t.Fatal("MarkSensitiveRead on a store write error = nil, want an error")
+	}
+	if tr.IsMarked("s") {
+		t.Error("a mark that failed to persist was cached as marked")
+	}
+	if n := ledger.count(EventSensitiveMarkFailed); n != 1 {
+		t.Errorf("sensitive_read_mark_failed rows = %d, want 1", n)
+	}
+	if n := ledger.count(EventSensitiveMarked); n != 0 {
+		t.Errorf("sensitive_read_marked rows = %d, want 0", n)
+	}
+}
+
+// TestSensitiveTracker_MarkCtxIsIdempotentAcrossRestart: a second mark in
+// the same process changes nothing; after a restart a fresh tracker's
+// MarkCtx still succeeds (the INSERT is a DO NOTHING) and exactly one row
+// exists. changed reports the in-memory cache only, so a fresh tracker
+// reports changed=true.
+func TestSensitiveTracker_MarkCtxIsIdempotentAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "brain.db")
+
+	st1, err := store.Open(config.Config{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("store.Open (first): %v", err)
+	}
+	tr1 := NewDurableSensitiveTracker(st1.Queries)
+	if changed, err := tr1.MarkCtx(ctx, "k", "trace-1", ReasonSecretLaneRead); !changed || err != nil {
+		t.Fatalf("first MarkCtx = (%v, %v), want (true, nil)", changed, err)
+	}
+	if changed, err := tr1.MarkCtx(ctx, "k", "trace-2", ReasonSecretLaneRead); changed || err != nil {
+		t.Fatalf("second MarkCtx = (%v, %v), want (false, nil)", changed, err)
+	}
+	if err := st1.Close(); err != nil {
+		t.Fatalf("Close (first): %v", err)
+	}
+
+	st2, err := store.Open(config.Config{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("store.Open (second): %v", err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	tr2 := NewDurableSensitiveTracker(st2.Queries)
+	if _, err := tr2.MarkCtx(ctx, "k", "trace-3", ReasonSecretLaneRead); err != nil {
+		t.Fatalf("MarkCtx after restart: %v", err)
+	}
+	n, err := st2.Queries.CountSensitiveReads(ctx)
+	if err != nil {
+		t.Fatalf("CountSensitiveReads: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("sensitive_reads rows = %d, want 1", n)
+	}
+	// The first mark is the record (rises only, first mark wins).
+	row, err := st2.Queries.GetSensitiveRead(ctx, "k")
+	if err != nil {
+		t.Fatalf("GetSensitiveRead: %v", err)
+	}
+	if row.TraceID != "trace-1" {
+		t.Errorf("sensitive_reads.trace_id = %q, want the first mark's %q", row.TraceID, "trace-1")
 	}
 }

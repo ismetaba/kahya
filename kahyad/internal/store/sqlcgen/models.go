@@ -182,6 +182,13 @@ type PendingApproval struct {
 	Decision          sql.NullString `json:"decision"`
 }
 
+type SensitiveRead struct {
+	SessionKey string         `json:"session_key"`
+	TraceID    string         `json:"trace_id"`
+	Reason     sql.NullString `json:"reason"`
+	MarkedAt   string         `json:"marked_at"`
+}
+
 type SessionTaint struct {
 	SessionID string         `json:"session_id"`
 	Tier      string         `json:"tier"`

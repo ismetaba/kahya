@@ -55,7 +55,7 @@ Gotchas:
 ## Out of scope
 - Redaction of secret-lane content in Telegram messages — W3-07 (this gate only meters/permits the channel).
 - Content-level secret-lane classification — W3-08.
-- Durable taint persistence across resume — W4-03 (here the flag is session-lifetime, ledgered).
+- Durable taint persistence across resume — W4-03 (here the flag is session-lifetime, ledgered). W4-03 never added it for the sensitive-read flag; it landed in FIX-B-7 (`sensitive_reads`, migration 0019).
 - External ledger anchor push — W4-05 (it will call `egress.Check` when it lands).
 - Clipboard-to-remote and mail egress interception beyond tools built in this phase — enforced as those tools appear (mail tooling is not an MVP W3 deliverable).
 - Endpoint Security network extension / system-wide firewall — deferred (§8); the boundary here is "all Kahya-originated egress", enforced by construction (containers on the internal network, tools built on `egress.Check`).
