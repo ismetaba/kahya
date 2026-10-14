@@ -146,7 +146,9 @@ func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, cl
 
 // ConsumeInput is Engine.ConsumeToken's input: everything a side-effectful
 // MCP tool already knows from its own just-resolved policy decision (tool,
-// class, scope), plus ToolInput, the EXACT bytes it is about to execute
+// class, scope, and the task_id/trace_id it checked under - a token binds
+// task_id, trace_id (G05 E-1) and tool, and a mismatch on any of them is a
+// context_mismatch failure), plus ToolInput, the EXACT bytes it is about to execute
 // with (hashed here and compared against what was approved at mint time -
 // never trust a caller-supplied hash for this comparison, or the whole
 // WYSIWYE point is defeated). Tool/Class/Scope here are ONLY ever used to
@@ -281,7 +283,11 @@ func (e *Engine) ConsumeTokenOp(ctx context.Context, in ConsumeInput) (ConsumeRe
 		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "lookup_error")
 	}
 
-	if row.TaskID != in.TaskID || row.Tool != in.Tool {
+	// G05 E-1: the trace is part of the bound identity too. Since B-8 the
+	// operation's undo window is keyed to the token's own trace while the
+	// owning tool keeps its undo record under the caller's trace, so a
+	// cross-trace consume would execute an op `kahya undo` can never revert.
+	if row.TaskID != in.TaskID || row.Tool != in.Tool || row.TraceID != in.TraceID {
 		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "context_mismatch")
 	}
 	expiresAt, perr := time.Parse(time.RFC3339Nano, row.ExpiresAt)

@@ -1117,8 +1117,8 @@ nothing and every executed write gets its own full window; a W1 token whose
 window cannot be opened is refused, `ErrUndoWindowUnavailable`,
 `undo_window_open_failed`, fail-closed; B-8 — W2 at L3+; **W3 never
 auto-allows, at any level, hard-coded in Go**). `allow` on a non-R class
-mints a one-time approval token (bound to `task_id` + `tool`/`class`/
-`scope` + a sha256 of `tool_input`) the caller must present to
+mints a one-time approval token (bound to `task_id` + `trace_id` (G05
+E-1) + `tool`/`class`/`scope` + a sha256 of `tool_input`) the caller must present to
 `POST /policy/consume-token` before executing; `needs_approval` inserts a
 server-issued, single-use `pending_approvals` row (32 random bytes hex,
 bound to the RESOLVED tool/class/scope/task_id/trace_id/

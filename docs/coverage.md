@@ -167,6 +167,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | #0 | side-effect MCP tool refuses without a valid one-time token, even if `can_use_tool` bypassed | `kahyad/internal/policy/TestTokenSingleUseSecondConsumeFails` | W3-02 | ci-hermetic |
 | #0 | garbage/missing token to `ConsumeToken` ⇒ `ErrTokenInvalid` | `kahyad/internal/policy/TestTokenMalformedFails` | W3-02 | ci-hermetic |
 | #0 | executed≠approved bytes ⇒ token refused (hash mismatch) | `kahyad/internal/policy/TestTokenBytesHashMismatchFails` | W3-02 | ci-hermetic |
+| #0 | a token consumed under another trace than it was minted for ⇒ refused (`context_mismatch`), burned, real triple demoted, no undo window | `kahyad/internal/policy/TestTokenCrossTraceConsumeFails` | FIX-G05-E1 | ci-hermetic |
 | #0 | fs tool called directly (no `can_use_tool`) with no token ⇒ refuse, disk untouched | `mcp/fs/TestHandleWriteNeedsApprovalFailsWithoutToken` | W3-01 | ci-hermetic |
 | #0 | fs tool token replay refused | `mcp/fs/TestHandleWriteTokenReplayFails` | W3-01 | ci-hermetic |
 | #0 | end-to-end binding decision in kahyad (real bins) | `tests/e2e/TestW12Acceptance` | W12-10 | local-integration |

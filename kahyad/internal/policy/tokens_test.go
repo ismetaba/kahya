@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -278,5 +279,71 @@ func TestConsumeTokenDBErrorAfterBurnStillLedgers(t *testing.T) {
 	}
 	if n := countEvents(t, st, "token_verify_failed"); n != 1 {
 		t.Fatalf("token_verify_failed ledger count = %d, want 1 (MINOR 4: must ledger even on this error path)", n)
+	}
+}
+
+// ---- G05 E-1: a token is bound to its trace_id too ----
+
+// lastVerifyFailReason returns the reason of the newest token_verify_failed
+// ledger row.
+func lastVerifyFailReason(t *testing.T, st *store.Store) string {
+	t.Helper()
+	var reason string
+	if err := st.DB().QueryRow(`SELECT json_extract(payload, '$.reason') FROM events WHERE kind = 'token_verify_failed' ORDER BY id DESC LIMIT 1`).Scan(&reason); err != nil {
+		t.Fatalf("read token_verify_failed reason: %v", err)
+	}
+	return reason
+}
+
+// TestTokenCrossTraceConsumeFails (FIX-G05-E1): a token minted under
+// trace-a is refused when consumed under trace-b (context_mismatch), the
+// token's REAL triple is demoted, the token is burned, and no undo window
+// opens - since B-8 the window is keyed to the token's own trace, while the
+// tool keeps its undo record under the caller's trace, so a cross-trace
+// consume would leave an op `kahya undo` reports as no_record.
+func TestTokenCrossTraceConsumeFails(t *testing.T) {
+	e, st := testEngine(t)
+	ctx := context.Background()
+	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
+
+	d, err := e.Check(ctx, CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-a", ToolInput: []byte(`{}`)})
+	if err != nil || d.Result != ResultAllow || d.Token == "" {
+		t.Fatalf("Check = %+v, %v; want an ALLOW carrying a token", d, err)
+	}
+	err = e.ConsumeToken(ctx, ConsumeInput{
+		Token: d.Token, Tool: "fs_write", Class: ClassW1, Scope: "global",
+		TaskID: "t1", TraceID: "trace-b", ToolInput: []byte(`{}`),
+	})
+	if !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("ConsumeToken under another trace: err = %v, want ErrTokenInvalid", err)
+	}
+	if got := lastVerifyFailReason(t, st); got != "context_mismatch" {
+		t.Fatalf("token_verify_failed reason = %q, want context_mismatch", got)
+	}
+	if n := countEvents(t, st, "demoted"); n != 1 {
+		t.Fatalf("demoted = %d, want 1 (the token's real triple)", n)
+	}
+	if lvl := getState(t, st, "fs_write", "W1", "global").Level; lvl != L1 {
+		t.Fatalf("fs_write/W1/global level = %d, want L1", lvl)
+	}
+	var windows int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM undo_windows`).Scan(&windows); err != nil {
+		t.Fatal(err)
+	}
+	if windows != 0 {
+		t.Fatalf("undo_windows = %d after a refused consume, want 0", windows)
+	}
+
+	// The token was burned by the refused attempt: even its own trace can
+	// no longer present it.
+	err = e.ConsumeToken(ctx, ConsumeInput{
+		Token: d.Token, Tool: "fs_write", Class: ClassW1, Scope: "global",
+		TaskID: "t1", TraceID: "trace-a", ToolInput: []byte(`{}`),
+	})
+	if !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("second ConsumeToken under the token's own trace: err = %v, want ErrTokenInvalid", err)
+	}
+	if got := lastVerifyFailReason(t, st); got != "replay_or_unknown" {
+		t.Fatalf("second token_verify_failed reason = %q, want replay_or_unknown", got)
 	}
 }
