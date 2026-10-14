@@ -801,10 +801,13 @@ func run() int {
 		DowngradeAtRatio:       cfg.DowngradeAtRatio,
 		CacheHitAlarmThreshold: cfg.CacheHitAlarmThreshold,
 		EstRequestTokens:       cfg.EstRequestTokens,
+		// FIX-U-1: daily/monthly USD buckets are the configured local
+		// calendar day/month (config timezone), never the UTC day.
+		Location: cfg.Location(),
 	}
 	governorNotifier := telegram.NewAlarmNotifier(notifier, tgBot)
 	governor := anthproxy.Boot(bootEvents, limits, nil, governorNotifier)
-	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode)
+	log.Info("anthproxy_governor_booted", "events_replayed", len(bootEvents), "credential_mode", cfg.CredentialMode, "timezone", cfg.Location().String())
 
 	credential := buildCredentialSource(cfg, log)
 	// W3-05: the Anthropic forward-proxy becomes a CLIENT of egressGate -

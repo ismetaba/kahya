@@ -37,6 +37,15 @@ type Limits struct {
 	// zero-value Limits (e.g. a test literal that predates this field)
 	// never silently disables the reservation.
 	EstRequestTokens int64
+	// Location is the calendar zone every daily/monthly USD bucket (and
+	// the once-per-day downgrade/alarm dedupe) is keyed in: config key
+	// `timezone` via config.Config.Location(), passed by main.go
+	// (FIX-U-1 / G00 U-1, C-22). nil falls back to time.Local - the same
+	// default Location() itself has - so a hand-built Limits (tests)
+	// behaves like an unset timezone. The bucket is deliberately NOT UTC:
+	// HANDOFF §4's "günlük bütçe $10" is the user's own day, and a UTC
+	// bucket reset an Istanbul user's daily budget at 03:00 local every night.
+	Location *time.Location
 }
 
 // defaultEstRequestTokens is the built-in floor for Limits.EstRequestTokens
@@ -113,7 +122,7 @@ type EventLedger interface {
 	LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error
 }
 
-// dailyAgg is one UTC calendar day's running aggregate.
+// dailyAgg is one calendar day's (Governor.loc) running aggregate.
 type dailyAgg struct {
 	usd             float64
 	calls           int64
@@ -148,8 +157,8 @@ type ReservationID uint64
 // day/month are captured at reservation time (not re-derived from a later
 // now() call) so releaseLocked always subtracts from the SAME daily/
 // monthly bucket the estimate was added to, even if a request happens to
-// straddle a UTC day/month boundary between CheckBeforeForward and its
-// eventual release.
+// straddle a calendar day/month boundary (in g.loc) between
+// CheckBeforeForward and its eventual release.
 type reservation struct {
 	taskID string
 	tokens int64
@@ -167,10 +176,11 @@ type Governor struct {
 	mu     sync.Mutex
 	limits Limits
 	now    func() time.Time
+	loc    *time.Location // calendar zone for every day/month key below (Limits.Location, nil -> time.Local)
 
 	perTask map[string]int64     // task_id -> completed input+output+cache_creation sum
-	daily   map[string]*dailyAgg // "2006-01-02" (UTC) -> aggregate
-	monthly map[string]float64   // "2006-01" (UTC) -> completed usd sum
+	daily   map[string]*dailyAgg // "2006-01-02" (g.loc day) -> aggregate
+	monthly map[string]float64   // "2006-01" (g.loc month) -> completed usd sum
 
 	// Reservation state (BLOCKER 2 fix): CheckBeforeForward's
 	// check-then-act was a TOCTOU - concurrent requests could each observe
@@ -186,8 +196,8 @@ type Governor struct {
 	nextReservationID  uint64
 	reservations       map[ReservationID]reservation
 	perTaskReservedTok map[string]int64   // task_id -> reserved token sum
-	dailyReservedUSD   map[string]float64 // "2006-01-02" (UTC) -> reserved usd sum
-	monthlyReservedUSD map[string]float64 // "2006-01" (UTC) -> reserved usd sum
+	dailyReservedUSD   map[string]float64 // "2006-01-02" (g.loc day) -> reserved usd sum
+	monthlyReservedUSD map[string]float64 // "2006-01" (g.loc month) -> reserved usd sum
 
 	notifier notify.Notifier
 }
@@ -196,14 +206,20 @@ type Governor struct {
 // that don't need boot rebuild use this directly; production always goes
 // through Boot instead so restart-safe totals are in place before the
 // first request is ever checked. now defaults to time.Now when nil so
-// tests can inject a fixed/controllable clock.
+// tests can inject a fixed/controllable clock. The calendar zone of every
+// day/month bucket is limits.Location (nil = time.Local, never UTC).
 func NewGovernor(limits Limits, now func() time.Time, notifier notify.Notifier) *Governor {
 	if now == nil {
 		now = time.Now
 	}
+	loc := limits.Location
+	if loc == nil {
+		loc = time.Local
+	}
 	return &Governor{
 		limits:             limits,
 		now:                now,
+		loc:                loc,
 		perTask:            map[string]int64{},
 		daily:              map[string]*dailyAgg{},
 		monthly:            map[string]float64{},
@@ -266,8 +282,8 @@ func (g *Governor) recordLocked(ts time.Time, r ModelCallRecord) {
 	if r.TaskID != "" {
 		g.perTask[r.TaskID] += tokens
 	}
-	day := ts.UTC().Format(dayLayout)
-	month := ts.UTC().Format(monthLayout)
+	day := g.dayKey(ts)
+	month := g.monthKey(ts)
 	agg := g.dayAggLocked(day)
 	agg.usd += r.USD
 	agg.calls++
@@ -284,6 +300,14 @@ func (g *Governor) dayAggLocked(day string) *dailyAgg {
 	}
 	return a
 }
+
+// dayKey/monthKey are the ONLY places a timestamp becomes a bucket key:
+// the calendar day/month of ts in g.loc (config timezone), never UTC
+// (FIX-U-1). Boot replays ledger rows whose ts is UTC RFC3339Nano and
+// RecordUsage/CheckBeforeForward pass g.now() - ts.In(g.loc) makes both
+// land in the same local-day bucket.
+func (g *Governor) dayKey(ts time.Time) string   { return ts.In(g.loc).Format(dayLayout) }
+func (g *Governor) monthKey(ts time.Time) string { return ts.In(g.loc).Format(monthLayout) }
 
 // CheckResult is CheckBeforeForward's decision.
 type CheckResult struct {
@@ -346,7 +370,7 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 		}
 	}
 
-	today := g.now().UTC().Format(dayLayout)
+	today := g.dayKey(g.now())
 	if g.limits.DailyBudgetUSD > 0 {
 		var completedUSD float64
 		if agg := g.daily[today]; agg != nil {
@@ -357,7 +381,7 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 		}
 	}
 
-	month := g.now().UTC().Format(monthLayout)
+	month := g.monthKey(g.now())
 	if g.limits.MonthlyBudgetUSD > 0 {
 		if g.monthly[month]+g.monthlyReservedUSD[month]+estUSD > g.limits.MonthlyBudgetUSD {
 			return CheckResult{Message: MsgMonthlyBudgetBlock}
@@ -573,7 +597,7 @@ func (g *Governor) downgradedLocked() bool {
 	if g.limits.DailyBudgetUSD <= 0 {
 		return false
 	}
-	today := g.now().UTC().Format(dayLayout)
+	today := g.dayKey(g.now())
 	agg := g.daily[today]
 	if agg == nil {
 		return false
@@ -597,7 +621,7 @@ func (g *Governor) downgradedLocked() bool {
 // releaseLocked treats as a no-op. It ledgers kind=model_call
 // unconditionally, then runs the once-per-day downgrade/alarm/cache-buster
 // bookkeeping against the freshly-updated totals, ledgering/alarming each
-// side effect at most once per UTC day. systemHash is the sha256 hex of
+// side effect at most once per calendar day (g.loc). systemHash is the sha256 hex of
 // the request's system[0] block (empty string if the request had none).
 //
 // eventLedger/traceID are passed per-call (rather than stored on Governor)
@@ -619,7 +643,7 @@ func (g *Governor) RecordUsage(ctx context.Context, reservation ReservationID, e
 	}
 	g.recordLocked(now, r)
 
-	day := now.UTC().Format(dayLayout)
+	day := g.dayKey(now)
 	agg := g.dayAggLocked(day)
 
 	var busterSuspect bool

@@ -307,6 +307,14 @@ estimate falls back to the new `est_request_tokens` config key (committed
 default `50000`) — see `kahyad/internal/anthproxy/governor.go`'s
 `estimateRequestLocked` for the full estimation strategy.
 
+**FIX-U-1 (G00 U-1, C-22)** — daily/monthly budget buckets and the
+once-per-day alarm/downgrade dedupe are keyed on the calendar day in
+`config.timezone` (`cfg.Location()` → `anthproxy.Limits.Location`, default
+the daemon's local zone) — never UTC; ledger `created_at` stays UTC, and
+`Boot` replays it into the same local-day bucket. Before this an Istanbul
+user's daily budget reset at 03:00 local. `anthproxy_governor_booted`
+carries `timezone`.
+
 ### W3-08 note — secret-lane branch (HANDOFF §4 ⚑ ordering invariant)
 
 `kahyad/internal/secretlane` + `kahyad/internal/mlx` add the Go routing

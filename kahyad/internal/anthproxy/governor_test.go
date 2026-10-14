@@ -83,6 +83,10 @@ func testLimits() Limits {
 		DowngradeAtRatio:       0.8,
 		CacheHitAlarmThreshold: 0.5,
 		EstRequestTokens:       50_000,
+		// FIX-U-1: this file's day.UTC().Format(dayLayout) assertions stay
+		// independent of the machine's TZ; the timezone tests in
+		// governor_tz_test.go set their own Location.
+		Location: time.UTC,
 	}
 }
 
