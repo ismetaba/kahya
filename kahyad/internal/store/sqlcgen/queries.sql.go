@@ -85,6 +85,32 @@ func (q *Queries) ClaimOutboxRow(ctx context.Context, arg ClaimOutboxRowParams) 
 	return result.RowsAffected()
 }
 
+const clearTaskWorkerPGID = `-- name: ClearTaskWorkerPGID :execrows
+UPDATE tasks
+SET worker_pgid = NULL, updated_at = ?
+WHERE id = ? AND worker_pgid = ?
+`
+
+type ClearTaskWorkerPGIDParams struct {
+	UpdatedAt  string        `json:"updated_at"`
+	ID         string        `json:"id"`
+	WorkerPgid sql.NullInt64 `json:"worker_pgid"`
+}
+
+// I-13: NULLs worker_pgid once the worker that OnStart recorded has
+// exited (spawn.Run returned), and after the halt executor killed (or
+// refused to kill, identity mismatch) a persisted pgid - compare-and-set on
+// the recorded pgid so an older spawn's late clear can never erase a newer
+// spawn's record. A stale pgid is a future unrelated process group once
+// the pid is reused.
+func (q *Queries) ClearTaskWorkerPGID(ctx context.Context, arg ClearTaskWorkerPGIDParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, clearTaskWorkerPGID, arg.UpdatedAt, arg.ID, arg.WorkerPgid)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const confirmFact = `-- name: ConfirmFact :exec
 UPDATE facts SET confirmed_at = ?, updated_at = ? WHERE id = ?
 `

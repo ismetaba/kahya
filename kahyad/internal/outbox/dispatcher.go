@@ -138,6 +138,9 @@ type Store interface {
 	// two places a fresh worker pid needs recording (the first is
 	// kahyad/internal/server's handleTask, the first-spawn path).
 	SetTaskWorkerPGID(ctx context.Context, arg sqlcgen.SetTaskWorkerPGIDParams) error
+	// ClearTaskWorkerPGID NULLs that column once spawn.Run returned
+	// (FIX-I-13; compare-and-set on the recorded pgid).
+	ClearTaskWorkerPGID(ctx context.Context, arg sqlcgen.ClearTaskWorkerPGIDParams) (int64, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -508,8 +511,12 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	runCtx, cancelRun := context.WithTimeout(ctx, d.taskTimeout)
 	defer cancelRun()
 
+	// workerPID is the pid OnStart persisted as tasks.worker_pgid; it is
+	// cleared again once spawn.Run returned (FIX-I-13).
+	var workerPID int
 	outcome, runErr := spawn.Run(runCtx, spawnCfg, env, spawn.Callbacks{
 		OnStart: func(pid int) {
+			workerPID = pid
 			if d.live != nil {
 				d.live.RegisterWorker(t.ID, t.TraceID, pid, pid)
 			}
@@ -542,6 +549,17 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// and a decision that is never recorded would leave the row for an
 	// uncounted lease re-claim.
 	recordCtx := context.WithoutCancel(ctx)
+	if workerPID > 0 {
+		// FIX-I-13: the worker's process group is gone (spawn.Run reaps it on
+		// every exit path); a persisted pgid must not outlive it.
+		if _, err := d.store.ClearTaskWorkerPGID(recordCtx, sqlcgen.ClearTaskWorkerPGIDParams{
+			UpdatedAt: d.nowRFC3339(), ID: t.ID, WorkerPgid: sql.NullInt64{Int64: int64(workerPID), Valid: true},
+		}); err != nil {
+			d.ledgerRaw(recordCtx, t.TraceID, "outbox.worker_pgid_clear_failed", map[string]any{
+				"event": "outbox.worker_pgid_clear_failed", "task_id": t.ID, "err": err.Error(),
+			})
+		}
+	}
 	d.ledgerRaw(recordCtx, t.TraceID, EventResumeDispatched, map[string]any{
 		"event": EventResumeDispatched, "task_id": t.ID, "session_id": env.SessionID, "resume": env.Resume,
 	})

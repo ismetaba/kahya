@@ -33,6 +33,13 @@ type Querier interface {
 	// increments on each claim"), including a crash-safe re-claim after a
 	// previous lease expired without the row ever being acknowledged.
 	ClaimOutboxRow(ctx context.Context, arg ClaimOutboxRowParams) (int64, error)
+	// I-13: NULLs worker_pgid once the worker that OnStart recorded has
+	// exited (spawn.Run returned), and after the halt executor killed (or
+	// refused to kill, identity mismatch) a persisted pgid - compare-and-set on
+	// the recorded pgid so an older spawn's late clear can never erase a newer
+	// spawn's record. A stale pgid is a future unrelated process group once
+	// the pid is reused.
+	ClearTaskWorkerPGID(ctx context.Context, arg ClearTaskWorkerPGIDParams) (int64, error)
 	// `kahya fact confirm <id>` (or a W5-03 ritual Dogru answer): lifts the
 	// agent_derived quarantine half of the injection-eligibility predicate.
 	// Never touches source_tier or confidence - an agent_derived fact stays

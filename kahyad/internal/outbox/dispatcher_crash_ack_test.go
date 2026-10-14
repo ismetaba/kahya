@@ -75,3 +75,27 @@ func TestDispatcherFailsTaskOnExplicitWorkerErrorLine(t *testing.T) {
 		t.Errorf("outbox.redispatch_crashed rows = %d, want 0 (an explicit error line is not a crash)", n)
 	}
 }
+
+// TestProcessResumeClearsWorkerPGIDOnExit (FIX-I-13): the redispatch path's
+// OnStart persists the worker's pgid; once spawn.Run returned it is cleared,
+// so no later halt can SIGKILL an unrelated group that reused the pid.
+func TestProcessResumeClearsWorkerPGIDOnExit(t *testing.T) {
+	st := testStore(t)
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	enqueueResumeRow(t, st, "t1")
+	m := task.NewMachine(st.Queries, st)
+	d := newTestDispatcher(st, m, []string{"python3", "testdata/echo_session_worker.py"})
+	if n, _ := d.ClaimAndDispatch(context.Background()); n != 1 {
+		t.Fatalf("claimed = %d, want 1", n)
+	}
+	row, err := st.Queries.GetTaskByID(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != task.StatusDone {
+		t.Fatalf("status = %q, want done", row.Status)
+	}
+	if row.WorkerPgid.Valid {
+		t.Fatalf("worker_pgid = %d after the redispatched worker exited, want NULL", row.WorkerPgid.Int64)
+	}
+}

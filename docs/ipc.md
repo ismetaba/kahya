@@ -43,6 +43,21 @@ in-group descendant survives a task, timed out or not; the only survivors
 are ones that first leave the group (`setpgid(0, 0)`) or session
 (`setsid`), which the sanctioned worker never does.
 
+The worker's pgid is also persisted (`tasks.worker_pgid`, W6-03) so a
+`⌥⎋` halt can still reach a worker that outlived a crashed kahyad (macOS
+has no PDEATHSIG). **That record lives exactly as long as the worker
+(FIX-I-13):** `handleTask` and the outbox dispatcher clear it
+(`ClearTaskWorkerPGID`, compare-and-set on the recorded pid) as soon as
+`spawn.Run` returns, and the halt executor kills a pgid it only knows from
+the DB (no in-memory `LiveRegistry` entry) only while
+`spawn.NewWorkerIdentity(worker_cmd)` still recognizes the group leader —
+`ps -ww -o command= -p <pgid>` must end with the configured worker
+arguments (`-m kahya_worker`) after the worker's executable (a macOS
+framework Python shows up as `…/Python.app/Contents/MacOS/Python`). A
+mismatch, a dead pid or any `ps` error is never killed: the halt logs
+`halt.stale_pgid_skipped` and clears the stale record; a DB-sourced kill
+clears it too.
+
 ## 2 · Envelope v1 (worker stdin)
 
 Single JSON object, written once, then stdin is closed:

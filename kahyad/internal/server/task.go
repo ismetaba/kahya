@@ -122,6 +122,10 @@ type TaskStore interface {
 	// orphaned by a daemon crash/restart is still killable via this
 	// column, since macOS has no PDEATHSIG.
 	SetTaskWorkerPGID(ctx context.Context, arg sqlcgen.SetTaskWorkerPGIDParams) error
+	// ClearTaskWorkerPGID NULLs that column again once spawn.Run returned
+	// (FIX-I-13; compare-and-set on the recorded pgid) - a stale pgid names
+	// an unrelated process group once the pid is reused.
+	ClearTaskWorkerPGID(ctx context.Context, arg sqlcgen.ClearTaskWorkerPGIDParams) (int64, error)
 }
 
 // SetTaskStore wires POST /v1/task's tasks-table persistence. Call before
@@ -1011,8 +1015,14 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// never read in that case (maybeSpeak/Speak themselves no-op).
 	var answerText strings.Builder
 
+	// workerPID is the pid OnStart persisted as tasks.worker_pgid, cleared
+	// again once spawn.Run returned (FIX-I-13). OnStart runs synchronously
+	// inside spawn.Run, so it is set before Run returns.
+	var workerPID int
+
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
 		OnStart: func(pid int) {
+			workerPID = pid
 			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
 			if s.taskLiveRegistry != nil {
 				// G03 / B-14: sid == pid (spawn.Run's Setsid), plus this
@@ -1068,6 +1078,15 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	if runErr != nil {
 		log.Error("task_spawn_error", "task_id", taskID, "err", runErr.Error())
+	}
+	// FIX-I-13: the worker (and its whole process group - spawn.Run reaps it
+	// on every exit path) is gone; its persisted pgid must not outlive it.
+	if workerPID > 0 && s.taskStore != nil {
+		if _, err := s.taskStore.ClearTaskWorkerPGID(persistCtx, sqlcgen.ClearTaskWorkerPGIDParams{
+			UpdatedAt: rfc3339Now(), ID: taskID, WorkerPgid: sql.NullInt64{Int64: int64(workerPID), Valid: true},
+		}); err != nil {
+			log.Warn("task_worker_pgid_clear_failed", "task_id", taskID, "err", err.Error())
+		}
 	}
 	// W4-04: guarded post-spawn status transition. A cloud-retry callback
 	// (NewTaskProxy's OnCloudUnreachable/OnNonRetryableFailure) may ALREADY

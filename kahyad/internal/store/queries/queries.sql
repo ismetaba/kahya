@@ -425,6 +425,17 @@ UPDATE tasks
 SET worker_pgid = ?, updated_at = ?
 WHERE id = ?;
 
+-- name: ClearTaskWorkerPGID :execrows
+-- I-13: NULLs worker_pgid once the worker that OnStart recorded has
+-- exited (spawn.Run returned), and after the halt executor killed (or
+-- refused to kill, identity mismatch) a persisted pgid - compare-and-set on
+-- the recorded pgid so an older spawn's late clear can never erase a newer
+-- spawn's record. A stale pgid is a future unrelated process group once
+-- the pid is reused.
+UPDATE tasks
+SET worker_pgid = NULL, updated_at = ?
+WHERE id = ? AND worker_pgid = ?;
+
 -- name: SetTaskHaltedAt :exec
 -- W6-03: stamped by the halt executor in the SAME step that transitions
 -- tasks.status to 'user_halted' (kahyad/internal/task.Machine.Transition,

@@ -65,3 +65,13 @@ func TestDispatcherTaskTimeoutWiredFromConfig(t *testing.T) {
 		t.Errorf("taskDispatcher.SetTaskTimeout(%s), want SetTaskTimeout(%s)", calls[0], want)
 	}
 }
+
+// TestHaltWorkerIdentityWiredFromWorkerCmd (FIX-I-13): the halt executor
+// must check a persisted pgid against the configured worker command before
+// it ever SIGKILLs it.
+func TestHaltWorkerIdentityWiredFromWorkerCmd(t *testing.T) {
+	calls := mainCalls(t, "haltExecutor", "SetWorkerIdentity")
+	if len(calls) != 1 || calls[0] != "spawn.NewWorkerIdentity(cfg.WorkerCmd)" {
+		t.Fatalf("haltExecutor.SetWorkerIdentity calls = %q, want exactly [spawn.NewWorkerIdentity(cfg.WorkerCmd)]", calls)
+	}
+}

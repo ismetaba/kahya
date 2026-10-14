@@ -59,6 +59,10 @@ type Store interface {
 	// CancelOutboxRowsByTask is task spec step 3.4 ("cancel the task's
 	// undelivered outbox rows").
 	CancelOutboxRowsByTask(ctx context.Context, arg sqlcgen.CancelOutboxRowsByTaskParams) (int64, error)
+	// ClearTaskWorkerPGID (FIX-I-13) NULLs a persisted worker_pgid
+	// (compare-and-set on the recorded value) once the DB-sourced pgid was
+	// killed or found to no longer be our worker.
+	ClearTaskWorkerPGID(ctx context.Context, arg sqlcgen.ClearTaskWorkerPGIDParams) (int64, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -157,6 +161,12 @@ type Executor struct {
 	jsonl *logx.Logger
 	// now is time.Now by default; tests substitute a fixed clock.
 	now func() time.Time
+	// workerIdentity (FIX-I-13, SetWorkerIdentity) reports whether a
+	// process group a pgid read back from tasks.worker_pgid names is still
+	// one of our workers - spawn.NewWorkerIdentity(cfg.WorkerCmd) in
+	// production. nil skips the check (pre-FIX-I-13 behavior; main.go always
+	// wires it).
+	workerIdentity func(pgid int) bool
 }
 
 // NewExecutor constructs an Executor. store/machine may not be nil in
@@ -178,6 +188,12 @@ func (x *Executor) SetJSONLLogger(l *logx.Logger) { x.jsonl = l }
 // comment. Safe to leave unset (the speech-kill step is then simply
 // skipped).
 func (x *Executor) SetSpeechKiller(s SpeechKiller) { x.speech = s }
+
+// SetWorkerIdentity wires the identity check killProcessGroup runs before
+// SIGKILLing a pgid it only knows from the DB (FIX-I-13) - see the
+// workerIdentity field. The in-memory LiveRegistry pid needs no check: it is
+// always a worker this process spawned and is still running.
+func (x *Executor) SetWorkerIdentity(fn func(pgid int) bool) { x.workerIdentity = fn }
 
 // SetClock overrides Executor's clock (tests only).
 func (x *Executor) SetClock(now func() time.Time) { x.now = now }
@@ -400,12 +416,38 @@ func (x *Executor) killProcessGroup(traceID string, t sqlcgen.Task) {
 		return
 	}
 
+	// FIX-I-13: a pgid known only from the DB is just a number once its
+	// worker exited - the kernel reuses pids - so it is killed only when its
+	// leader still looks like our worker. A mismatch is never killed (halt is
+	// best-effort-complete; killing an unrelated process group is
+	// irreversible harm), only skipped and the stale record cleared.
+	if source == "db" && x.workerIdentity != nil && !x.workerIdentity(pgid) {
+		x.logJSONL(traceID, "halt.stale_pgid_skipped", t.ID, fmt.Sprintf("%d", pgid))
+		x.clearPGID(traceID, t.ID, pgid)
+		return
+	}
+
 	err := syscall.Kill(-pgid, syscall.SIGKILL)
 	if err != nil && !errors.Is(err, syscall.ESRCH) {
 		x.logJSONLErr(traceID, "halt.kill_process_group_failed", t.ID, err)
 		return
 	}
 	x.logJSONL(traceID, "halt.kill_process_group", t.ID, source)
+	if source == "db" {
+		// Nothing owns this record any more (no spawn.Run of this process
+		// will clear it) - drop it so no later halt reads it again.
+		x.clearPGID(traceID, t.ID, pgid)
+	}
+}
+
+// clearPGID NULLs taskID's persisted worker_pgid if it still holds pgid
+// (FIX-I-13). Best-effort: a failure is logged and never stops the halt.
+func (x *Executor) clearPGID(traceID, taskID string, pgid int) {
+	if _, err := x.store.ClearTaskWorkerPGID(context.Background(), sqlcgen.ClearTaskWorkerPGIDParams{
+		UpdatedAt: x.nowRFC3339(), ID: taskID, WorkerPgid: sql.NullInt64{Int64: int64(pgid), Valid: true},
+	}); err != nil {
+		x.logJSONLErr(traceID, "halt.worker_pgid_clear_failed", taskID, err)
+	}
 }
 
 func (x *Executor) ledgerRaw(ctx context.Context, traceID, kind string, payload map[string]any) {

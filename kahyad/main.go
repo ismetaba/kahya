@@ -698,6 +698,9 @@ func run() int {
 	// W6-05: ⌥⎋ also kills this task's in-flight `say` child, if any - see
 	// halt.SpeechKiller's own doc comment.
 	haltExecutor.SetSpeechKiller(speaker)
+	// FIX-I-13: a worker_pgid read back from the DB (no live in-memory
+	// entry) is killed only while its process still looks like our worker.
+	haltExecutor.SetWorkerIdentity(spawn.NewWorkerIdentity(cfg.WorkerCmd))
 	srv.SetHaltExecutor(haltExecutor)
 
 	// W4-07 acceptance gate: the dev-only w2_slow_stub MCP tool
