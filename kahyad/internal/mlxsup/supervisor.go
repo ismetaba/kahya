@@ -126,6 +126,21 @@ type Config struct {
 	// to 0 every time the child successfully becomes healthy again.
 	MaxRestarts int
 
+	// BeforeSpawn, when non-nil, runs under the supervisor's own lock
+	// immediately before EVERY child spawn - the first EnsureRunning spawn
+	// and every crash-restart alike. A non-nil error aborts that spawn
+	// without starting a process: EnsureRunning returns it wrapped
+	// ("mlxsup: spawn <name>: <err>", errors.Is-transparent) and the state
+	// stays StateDown so a later EnsureRunning may try again; a
+	// crash-restart logs mlx_restart_failed and likewise leaves StateDown
+	// (a refusal is not a crash: crashCount is not incremented, so it never
+	// leads to StateFailed by itself). kahyad/internal/mlx wires its
+	// fail-closed free-memory gate here (HANDOFF §4 ⚑ "kahyad yüklemeden
+	// önce kullanılabilir belleği kontrol eder") so the gate runs exactly
+	// once per load, never once per request (FIX-I-9). It must not call
+	// back into this Supervisor (it runs under s.mu).
+	BeforeSpawn func() error
+
 	// Log is the boot-scoped logger every event=mlx_* line is written
 	// through (never scoped to a request trace_id - a supervised
 	// process's lifecycle spans many requests).
@@ -365,6 +380,20 @@ func (s *Supervisor) StopForIdle() {
 // hold s.mu; it is released by the time this returns, exactly as it was
 // found (locked).
 func (s *Supervisor) spawnLocked() error {
+	if s.cfg.BeforeSpawn != nil {
+		if err := s.cfg.BeforeSpawn(); err != nil {
+			// A refused spawn leaves NO child behind: clear the previous
+			// (exited) generation so a later EnsureRunning re-runs this
+			// gate and spawns again once it passes - exactly what
+			// StopForIdle already does. supervise never clears s.cmd after
+			// a crash, so without this a refused crash-restart would leave
+			// s.cmd pointing at the dead process and every later
+			// EnsureRunning would skip the spawn and return "exited before
+			// becoming healthy" until kahyad restarted (FIX-I-9).
+			s.clearGenerationLocked()
+			return err
+		}
+	}
 	cmd := exec.Command(s.cfg.Cmd[0], s.cfg.Cmd[1:]...)
 	cmd.Dir = s.cfg.Dir
 	cmd.Env = append(append([]string{}, os.Environ()...), s.cfg.ExtraEnv...)
@@ -385,6 +414,10 @@ func (s *Supervisor) spawnLocked() error {
 	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
+		// Same reasoning as a BeforeSpawn refusal: no child was started,
+		// so the previous (exited) generation must not keep EnsureRunning
+		// from ever trying again (FIX-I-9).
+		s.clearGenerationLocked()
 		return err
 	}
 
@@ -397,6 +430,18 @@ func (s *Supervisor) spawnLocked() error {
 
 	go s.supervise(cmd, done)
 	return nil
+}
+
+// clearGenerationLocked forgets the current (exited or never-started)
+// child generation after a spawn attempt that started no process, so the
+// next EnsureRunning spawns afresh. Caller must hold s.mu. A no-op for the
+// process bookkeeping when nothing was ever spawned.
+func (s *Supervisor) clearGenerationLocked() {
+	s.cmd = nil
+	s.done = nil
+	if s.state != StateDisabled && s.state != StateFailed {
+		s.state = StateDown
+	}
 }
 
 // supervise blocks on cmd.Wait() and reacts once the child exits: if this

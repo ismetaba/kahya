@@ -376,7 +376,10 @@ a cloud model, without changing anything in §2-§6 above:
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
-  ~17GB model + 4GB headroom) before every spawn attempt; on-demand load
+  ~17GB model + 4GB headroom) before every spawn attempt (FIX-I-9: wired
+  as `mlxsup.Config.BeforeSpawn`, so it gates crash-restarts too and never
+  a call to an already-warm server; a refused spawn starts nothing and
+  leaves the supervisor retryable by the next request); on-demand load
   (first secret-lane need, never at boot); idle-TTL unload
   (`mlx.qwen_idle_ttl_seconds`, default 600s, zero in-flight requests) via
   `mlxsup.Supervisor.StopForIdle` (a NEW primitive alongside `Stop` —

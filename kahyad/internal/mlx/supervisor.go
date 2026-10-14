@@ -10,7 +10,8 @@
 // is explicit: "REUSE it for the Qwen server, do NOT fork a second
 // supervisor") - this file only adds the two things that generic package
 // intentionally does NOT know about: the fail-closed free-memory gate
-// (memcheck.go) that must run BEFORE every EnsureRunning attempt, and the
+// (memcheck.go) that must run before every spawn, via
+// mlxsup.Config.BeforeSpawn (FIX-I-9), and the
 // idle-TTL unload policy (in-flight request tracking + a periodic
 // idle-check that calls mlxsup's StopForIdle) that only makes sense for a
 // 17GB-resident model sharing a machine with ComfyUI/Wan - mlx/embed's
@@ -136,6 +137,18 @@ func New(cfg Config) *Supervisor {
 		cfg.Host = "127.0.0.1"
 	}
 
+	// FIX-I-9: the fail-closed free-memory gate (HANDOFF §4 ⚑ "kahyad
+	// yüklemeden önce kullanılabilir belleği kontrol eder") runs under
+	// mlxsup's lock right before EVERY spawn - the first load and every
+	// crash-restart alike - and never on a call to an already-warm server.
+	gate := func() error {
+		ok, _, err := HasSufficientMemory(cfg.MemCheck)
+		if err != nil || !ok {
+			return ErrLocalModelUnavailable
+		}
+		return nil
+	}
+
 	sup := mlxsup.New(mlxsup.Config{
 		Name:         "qwen",
 		Cmd:          cfg.Cmd,
@@ -146,6 +159,7 @@ func New(cfg Config) *Supervisor {
 		MinBackoff:   cfg.MinBackoff,
 		MaxBackoff:   cfg.MaxBackoff,
 		MaxRestarts:  cfg.MaxRestarts,
+		BeforeSpawn:  gate,
 		Log:          cfg.Log,
 	})
 
@@ -168,24 +182,28 @@ func (s *Supervisor) BaseURL() string {
 func (s *Supervisor) State() string { return s.sup.State() }
 
 // EnsureRunning is the ONE entrypoint every secret-lane caller uses before
-// sending Qwen a request (task spec step 1): first the fail-closed
-// memcheck (memcheck.go) - insufficient free memory returns
-// ErrLocalModelUnavailable WITHOUT EVER attempting to spawn/contact
-// anything, structurally guaranteeing no code path from this failure mode
-// to the Anthropic proxy (there IS no such path in this package at all).
-// Only once memcheck passes does this delegate to the underlying
-// mlxsup.Supervisor's own spawn/poll/health machinery; ANY failure there
-// (spawn error, startup-grace timeout, MaxRestarts exceeded) is likewise
-// collapsed to the SAME ErrLocalModelUnavailable sentinel - callers never
-// need to distinguish "why" local is unavailable, only that it is, and
-// that the fail-closed response is identical either way.
+// sending Qwen a request (task spec step 1). It delegates to the underlying
+// mlxsup.Supervisor's spawn/poll/health machinery, whose BeforeSpawn hook
+// (wired in New) runs the fail-closed memcheck (memcheck.go) under
+// mlxsup's lock right before a spawn - and ONLY then: insufficient free
+// memory refuses the spawn and returns ErrLocalModelUnavailable WITHOUT
+// EVER starting/contacting anything, structurally guaranteeing no code
+// path from this failure mode to the Anthropic proxy (there IS no such
+// path in this package at all). A warm server never re-runs the gate: once
+// the ~17GB model is resident, free memory is necessarily below
+// RequiredFreeBytes, and re-checking would refuse every call until the
+// idle-TTL unload (FIX-I-9). ANY other failure (spawn error,
+// startup-grace timeout, MaxRestarts exceeded) is likewise collapsed to
+// the SAME ErrLocalModelUnavailable sentinel - callers never need to
+// distinguish "why" local is unavailable, only that it is, and that the
+// fail-closed response is identical either way.
 func (s *Supervisor) EnsureRunning(ctx context.Context) error {
-	ok, _, err := HasSufficientMemory(s.cfg.MemCheck)
-	if err != nil || !ok {
-		return ErrLocalModelUnavailable
-	}
-
 	if err := s.sup.EnsureRunning(ctx); err != nil {
+		if errors.Is(err, ErrLocalModelUnavailable) {
+			// The spawn gate refused: keep the byte-exact MsgNoLocalMemory
+			// text callers surface.
+			return ErrLocalModelUnavailable
+		}
 		return fmt.Errorf("%w: %s", ErrLocalModelUnavailable, err.Error())
 	}
 
@@ -198,9 +216,10 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 }
 
 // Do is the one entrypoint every actual Qwen HTTP call (classification,
-// local answering) should be wrapped in: it calls EnsureRunning (fail-
-// closed memcheck + spawn/health-poll - task spec step 1/2), tracks the
-// call as in-flight against the idle-TTL monitor (Acquire/release), and -
+// local answering) should be wrapped in: it calls EnsureRunning (spawn/
+// health-poll, behind the fail-closed spawn-time memcheck - task spec step
+// 1/2), tracks the call as in-flight against the idle-TTL monitor
+// (Acquire/release), and -
 // ONLY when the server was ALREADY warm before this call started - bounds
 // fn's own ctx to warmBudget (task spec: "300ms budget after WARM load").
 // A cold server (State() != "ok" before EnsureRunning) gets NO such bound

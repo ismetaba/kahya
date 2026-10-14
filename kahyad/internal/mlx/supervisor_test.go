@@ -93,6 +93,10 @@ func TestEnsureRunningMemcheckInsufficientNeverTouchesProxy(t *testing.T) {
 	if got := atomic.LoadInt64(&proxyHits); got != 0 {
 		t.Fatalf("fake proxy hit %d times, want 0 (memcheck-insufficient must never reach the proxy)", got)
 	}
+	// FIX-I-9: the spawn gate refused, so nothing was ever started.
+	if got := sup.State(); got != "down" {
+		t.Fatalf("State() = %q, want down (a refused spawn starts no process)", got)
+	}
 }
 
 // TestErrLocalModelUnavailableTurkishMessage pins the exact fail-closed

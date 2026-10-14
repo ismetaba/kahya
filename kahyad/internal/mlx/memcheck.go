@@ -29,9 +29,10 @@ const (
 	// slack that loading Qwen does not itself trigger the very memory
 	// pressure this check exists to avoid.
 	HeadroomBytes uint64 = 4 * (1 << 30)
-	// RequiredFreeBytes is the single fail-closed threshold: EnsureRunning
-	// refuses to even attempt loading the model unless at least this many
-	// bytes are currently available.
+	// RequiredFreeBytes is the single fail-closed threshold: the
+	// BeforeSpawn gate refuses to spawn (load) the model unless at least
+	// this many bytes are currently available. It is checked before a
+	// spawn only - never against an already-resident model (FIX-I-9).
 	RequiredFreeBytes = ModelBytes + HeadroomBytes
 )
 
@@ -139,8 +140,9 @@ func splitLines(s string) []string {
 	return lines
 }
 
-// CheckFunc produces one MemStatus sample - the seam Supervisor.
-// EnsureRunning calls before ever attempting to load the model. Tests
+// CheckFunc produces one MemStatus sample - the seam New wires into
+// mlxsup.Config.BeforeSpawn, consulted before every attempt to load the
+// model (first spawn and crash-restart alike, FIX-I-9). Tests
 // inject a fake; production uses RealVMStatCheck (the package-level
 // default).
 type CheckFunc func() (MemStatus, error)
