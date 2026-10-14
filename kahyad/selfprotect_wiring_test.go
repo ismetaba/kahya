@@ -6,8 +6,11 @@ package main
 // control secret and memory repo are as write-protected as prod's.
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"kahya/kahyad/internal/config"
@@ -79,5 +82,93 @@ func TestWiredDenyGlobsProtectEveryPythonChildImportRoot(t *testing.T) {
 				t.Errorf("%s: %s must be write-protected (hit=%v err=%v)", name, p, hit, err)
 			}
 		}
+	}
+}
+
+// TestWiredDenyGlobsProtectRealPythonChildStdlib (B-4 review round 2): over
+// this checkout's REAL venvs (skipped when one is absent), the deny list
+// main.go wires protects what each Python child actually loads from its
+// base interpreter — the stdlib modules every start-up imports
+// (encodings, site, json), the _ssl extension module and the non-system
+// dylibs it links (otool -L as the independent oracle). Under Homebrew all
+// of these are user-writable; nothing is written here.
+func TestWiredDenyGlobsProtectRealPythonChildStdlib(t *testing.T) {
+	repo, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := policy.Load(filepath.Join(repo, "policy.yaml"))
+	if err != nil {
+		t.Fatalf("policy.Load: %v", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	venvPy := func(rel ...string) string { return filepath.Join(append([]string{repo}, rel...)...) }
+	cfg := config.Config{
+		WorkerCmd: []string{venvPy("worker", ".venv", "bin", "python"), "-m", "kahya_worker"},
+		EmbedCmd:  []string{venvPy("mlx", "embed", ".venv", "bin", "python"), venvPy("mlx", "embed", "server.py")},
+		QwenCmd:   []string{venvPy("mlx", "qwen", ".venv", "bin", "python"), "-m", "mlx_lm.server"},
+	}
+	wired := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
+	denied := func(p string) bool {
+		t.Helper()
+		cp, err := mcpfs.Canonicalize(home, p)
+		if err != nil {
+			t.Fatalf("Canonicalize(%s): %v", p, err)
+		}
+		hit, err := mcpfs.MatchesAnyGlobCI(cp.Match, wired)
+		if err != nil {
+			t.Fatalf("MatchesAnyGlobCI(%s): %v", cp.Match, err)
+		}
+		return hit
+	}
+	ran := 0
+	for name, cmd := range map[string][]string{"worker": cfg.WorkerCmd, "embed": cfg.EmbedCmd, "qwen": cfg.QwenCmd} {
+		if _, err := os.Stat(cmd[0]); err != nil {
+			t.Logf("%s: no venv at %s; skipped", name, cmd[0])
+			continue
+		}
+		ran++
+		out, err := exec.Command(cmd[0], "-I", "-c",
+			"import encodings, json, site, sys\n"+
+				"print(encodings.__file__); print(json.__file__); print(site.__file__)\n"+
+				"try:\n import _ssl; print(_ssl.__file__)\nexcept Exception: pass\n").Output()
+		if err != nil {
+			t.Fatalf("%s: %s -I -c: %v", name, cmd[0], err)
+		}
+		files := strings.Fields(string(out))
+		if len(files) < 3 {
+			t.Fatalf("%s: interpreter printed %q, want at least 3 module paths", name, out)
+		}
+		for _, f := range files {
+			if !denied(f) {
+				t.Errorf("%s: %s (loaded by every %s spawn from the base interpreter) is not write-protected", name, f, name)
+			}
+		}
+		if len(files) < 4 {
+			continue
+		}
+		otool, err := exec.LookPath("otool")
+		if err != nil {
+			continue
+		}
+		deps, err := exec.Command(otool, "-L", files[3]).Output()
+		if err != nil {
+			t.Fatalf("%s: otool -L %s: %v", name, files[3], err)
+		}
+		for _, line := range strings.Split(string(deps), "\n")[1:] {
+			dep := strings.Fields(line)
+			if len(dep) == 0 || !filepath.IsAbs(dep[0]) || strings.HasPrefix(dep[0], "/usr/lib/") || strings.HasPrefix(dep[0], "/System/") {
+				continue
+			}
+			if !denied(dep[0]) {
+				t.Errorf("%s: %s, linked by %s, is not write-protected", name, dep[0], files[3])
+			}
+		}
+	}
+	if ran == 0 {
+		t.Skip("no Python venv in this checkout (make venv)")
 	}
 }

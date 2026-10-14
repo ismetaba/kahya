@@ -143,8 +143,11 @@ func TestSelfProtectDenyGlobsDeriveFromConfiguredCommands(t *testing.T) {
 		}
 	}
 
-	// A bare interpreter outside any venv is protected as a file; a
-	// relative one ("python3", resolved via PATH) yields no glob at all.
+	// A bare interpreter outside any venv is protected as a file (its base
+	// prefix too: pyruntime_test.go); a bare name ("python3") is resolved
+	// through PATH like exec.Command does, and one not found there (empty
+	// PATH here) or a relative script yields no glob at all.
+	t.Setenv("PATH", t.TempDir())
 	bare := Config{WorkerCmd: []string{"/opt/py/bin/python3", "/opt/k/fake/worker.py"}, EmbedCmd: []string{"python3", "rel/server.py"}}.SelfProtectDenyGlobs()
 	for _, p := range []string{"/opt/py/bin/python3", "/opt/k/fake/worker.py", "/opt/k/fake/json.py"} {
 		if !selfProtectHit(t, bare, p) {

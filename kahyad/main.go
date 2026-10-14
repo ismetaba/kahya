@@ -520,7 +520,8 @@ func run() int {
 	// FIX-B-4: fs_write/fs_delete and the shell_docker workdir check deny
 	// policy.yaml's globs PLUS the profile-aware self-protect globs derived
 	// from this config's own runtime paths (dev/redteam DataDir, KahyaDir,
-	// the code tree's bin/venvs/policy files).
+	// the code tree's bin/venvs/policy files, each Python child's base
+	// interpreter prefix and the dylibs it links).
 	denyGlobs := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
 	log.Info("self_protect_deny_globs", "count", len(denyGlobs)-len(pol.FSWriteDenyGlobs), "policy_count", len(pol.FSWriteDenyGlobs))
 	fsTool := mcpfs.New(home, denyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))

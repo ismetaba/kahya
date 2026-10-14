@@ -569,7 +569,16 @@ func (c Config) TmpDir() string {
 //     stdlib: <repo>/worker (the kahya_worker package is imported from the
 //     source tree, not installed), <repo>/mlx/embed (server.py),
 //     <repo>/mlx/qwen — plus every binary kahyad execs by path
-//     (MCPBridgePath, TriggerBinPath, HsCliPath, TTSSayBin).
+//     (MCPBridgePath, TriggerBinPath, HsCliPath, TTSSayBin);
+//   - beyond the venv, the code every such child runs from its BASE
+//     interpreter (pythonRuntimeProtect, B-4 review round 2): the
+//     interpreter's install prefix — the stdlib (encodings, site, json …)
+//     every start-up imports, lib-dynload, the framework/libpython dylib —
+//     found through argv0's symlinks and pyvenv.cfg, and the non-system
+//     dylibs those native images link; when the interpreter or such a
+//     dylib lives in a Homebrew keg, the whole Homebrew prefix (its kegs
+//     and the etc/ config their libraries load code from). These trees are
+//     outside the repo, so G04-2 does not apply to them.
 func (c Config) SelfProtectDenyGlobs() []string {
 	var globs []string
 	seen := make(map[string]bool)
@@ -620,6 +629,16 @@ func (c Config) SelfProtectDenyGlobs() []string {
 		}
 		if dir := PythonServiceDir(cmd); dir != "" {
 			add(dir, true)
+		}
+		// The base interpreter's install prefix (stdlib, lib-dynload,
+		// framework dylib) and the libraries its native images link
+		// (pyruntime.go, B-4 review round 2).
+		subtrees, files := pythonRuntimeProtect(cmd[0])
+		for _, s := range subtrees {
+			add(s, true)
+		}
+		for _, f := range files {
+			add(f, false)
 		}
 	}
 	// The worker's venv parent is its cwd and first PYTHONPATH entry
