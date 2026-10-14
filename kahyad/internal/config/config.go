@@ -318,6 +318,13 @@ type Config struct {
 	// this task's own key, spelled out for readability rather than as a
 	// dotted string.
 	TaskRetryW1MaxAuto int `yaml:"task_retry_w1_max_auto"`
+	// TaskMaxCrashResumes is `task_max_crash_resumes` (FIX-I-2, owner
+	// decision G10-2, default 3, must be >= 1): the cap on the resume
+	// scan's crash re-dispatches per task (tasks.crash_resumes - a worker
+	// that ended without finishing and with nothing parked or blocked).
+	// Past it the task moves to blocked_user and the user decides via
+	// `kahya task resolve <id>`. Cloud-park redispatches never count.
+	TaskMaxCrashResumes int `yaml:"task_max_crash_resumes"`
 
 	// --- W4-04 cloud-call error taxonomy / retry / task parking ---
 
@@ -802,6 +809,7 @@ type fileConfig struct {
 	Jobs                          *[]JobConfig    `yaml:"jobs"`
 	TriggerBinPath                *string         `yaml:"trigger_bin_path"`
 	TaskRetryW1MaxAuto            *int            `yaml:"task_retry_w1_max_auto"`
+	TaskMaxCrashResumes           *int            `yaml:"task_max_crash_resumes"`
 	CloudRetryMaxInline           *int            `yaml:"cloud_retry_max_inline"`
 	CloudRetryTaskSchedule        *[]string       `yaml:"cloud_retry_task_schedule"`
 	CloudRetryGiveUpAfter         *string         `yaml:"cloud_retry_give_up_after"`
@@ -912,6 +920,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateCloudRetry(cfg.CloudRetryMaxInline, cfg.CloudRetryTaskSchedule, cfg.CloudRetryGiveUpAfter); err != nil {
+		return Config{}, err
+	}
+	if err := validateTaskResilience(cfg.TaskMaxCrashResumes); err != nil {
 		return Config{}, err
 	}
 	if err := validateAnchorIntervalHours(cfg.AnchorIntervalHours); err != nil {
@@ -1198,6 +1209,8 @@ func defaults(home, env string) Config {
 
 		// W4-02 task durability default (task spec, verbatim: "default 3").
 		TaskRetryW1MaxAuto: 3,
+		// FIX-I-2 crash-resume cap (owner decision G10-2: 3).
+		TaskMaxCrashResumes: 3,
 
 		// W4-04 cloud-call error taxonomy defaults (task spec, verbatim):
 		// max_inline=3; task_schedule 1m,5m,15m,60m (then hourly - see the
@@ -1628,6 +1641,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.TaskRetryW1MaxAuto != nil {
 		cfg.TaskRetryW1MaxAuto = *fc.TaskRetryW1MaxAuto
 	}
+	if fc.TaskMaxCrashResumes != nil {
+		cfg.TaskMaxCrashResumes = *fc.TaskMaxCrashResumes
+	}
 	if fc.CloudRetryMaxInline != nil {
 		cfg.CloudRetryMaxInline = *fc.CloudRetryMaxInline
 	}
@@ -1900,6 +1916,18 @@ func validateCloudRetry(maxInline int, taskSchedule []string, giveUpAfter string
 	}
 	if _, err := time.ParseDuration(giveUpAfter); err != nil {
 		return fmt.Errorf("config: cloud_retry_give_up_after=%q invalid: %w", giveUpAfter, err)
+	}
+	return nil
+}
+
+// validateTaskResilience fails Load closed (same posture as
+// validateCloudRetry) on task_max_crash_resumes < 1 (FIX-I-2): a task that
+// may never be resumed even once would turn every transient worker crash
+// into blocked_user, and a non-positive cap cannot express "unlimited"
+// (there is no unlimited - the cap is what stops the resume loop).
+func validateTaskResilience(maxCrashResumes int) error {
+	if maxCrashResumes < 1 {
+		return fmt.Errorf("config: task_max_crash_resumes=%d invalid, must be >= 1", maxCrashResumes)
 	}
 	return nil
 }

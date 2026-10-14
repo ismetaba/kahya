@@ -72,6 +72,11 @@ sql:
       # 0019 (B-7) is a plain CREATE TABLE (sensitive_reads) - same
       # reasoning as 0004/0009.
       - "kahyad/migrations/0019_sensitive_reads.sql"
+      # 0020 (I-2) is a plain ALTER TABLE (tasks.crash_resumes) - a column
+      # the task queries below read and write, so it MUST be here. (0021,
+      # the I-14 data-only status backfill, is intentionally NOT listed:
+      # it changes no schema.)
+      - "kahyad/migrations/0020_task_resilience.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

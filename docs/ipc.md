@@ -560,6 +560,28 @@ treats this as `task_error` with the generic Turkish message
 trace_id substituted in). This also covers the case where kahyad could not
 even manage the process at all (e.g. `worker_cmd` misconfigured).
 
+**`tasks.status` after the worker exits (W4-02/FIX-I-2):** a terminal
+`error` line moves `tasks.status` to `failed` (the worker itself said the
+task is over — nothing is left to resume), and so does a run kahyad could
+not manage at all (`worker_cmd` misconfigured); a clean `result` moves it to
+`done`. An exit without any terminal line, a timeout and
+`cloud_unreachable` leave it `executing` for the resume scan (W4-07), whose
+own re-dispatches are now counted in `tasks.crash_resumes` (migration 0020)
+and capped by `task_max_crash_resumes` (config, default 3, ≥ 1): at the cap
+the task moves to `blocked_user` with the notice `"Görev %s: işçi süreci %d
+kez yarıda kesildi, otomatik devam limiti doldu — 'kahya task resolve %s'
+ile karar ver."` (`task.resume_cap_exceeded`). Cloud-park redispatches never
+count, and `kahya task resolve <id> --retry` resets the count. A status a
+proxy callback, the budget pause or a halt already set mid-run is never
+overridden. A **budget block** (task token ceiling, daily or monthly budget)
+moves the task to `blocked_user` too (owner decision G10-1: resumed only by
+`kahya task resolve <id> --retry`, never auto-parked to a later day):
+`tasks.state` stays `paused_budget`, the SSE `error` message is
+`"Görev bütçe tavanı nedeniyle duraklatıldı. Ayrıntı: kahya log --trace %s —
+devam için: kahya task resolve %s --retry"`, ledger `task_budget_blocked`;
+the proxy pauses, ledgers `task_paused_budget` and alarms once per dispatch
+(every blocked request still gets its 503).
+
 **Timeout:** if `cfg.task_timeout_min` elapses before the process sends a
 terminal line, kahyad kills the whole process group and ends the stream
 with `event: error`, message

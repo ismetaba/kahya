@@ -361,6 +361,10 @@ type Proxy struct {
 	// otherwise park the task (outbox row + notification) once per CLI
 	// retry. A redispatch builds a new Proxy, so this is once per dispatch.
 	cloudUnreachableFired atomic.Bool
+	// budgetBlockedOnce gates onBudgetBlocked's side effects (FIX-I-2):
+	// PauseBudget, the task_paused_budget ledger row and the alarm fire once
+	// per Proxy; every blocked request still gets its 503.
+	budgetBlockedOnce sync.Once
 
 	// requestCount is a test-only observability hook (W4-03's no-cloud-
 	// fallback regression test - kahyad/internal/reader's own tests spin up
@@ -774,18 +778,26 @@ func (p *Proxy) ledgerAuthReject(ctx context.Context, r *http.Request) {
 	})
 }
 
+// onBudgetBlocked pauses the task (PauseBudget), ledgers task_paused_budget
+// and raises the alarm - exactly once per Proxy (FIX-I-2): the worker CLI
+// retries the 503 on its own, which used to produce one alarm per retry.
+// The writes ignore the inbound request's cancellation (the once is spent
+// either way, so the rows must not be lost to a disconnecting client).
 func (p *Proxy) onBudgetBlocked(ctx context.Context, message string) {
-	if p.cfg.PauseBudget != nil {
-		_ = p.cfg.PauseBudget(ctx, p.cfg.TaskID)
-	}
-	if p.cfg.EventLedger != nil {
-		_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventTaskPausedBudget, map[string]any{
-			"task_id": p.cfg.TaskID, "message": message,
-		})
-	}
-	if p.cfg.Notifier != nil {
-		_ = p.cfg.Notifier.Alarm(ctx, p.cfg.TraceID, EventTaskPausedBudget, message, map[string]any{"task_id": p.cfg.TaskID})
-	}
+	p.budgetBlockedOnce.Do(func() {
+		ctx := context.WithoutCancel(ctx)
+		if p.cfg.PauseBudget != nil {
+			_ = p.cfg.PauseBudget(ctx, p.cfg.TaskID)
+		}
+		if p.cfg.EventLedger != nil {
+			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventTaskPausedBudget, map[string]any{
+				"task_id": p.cfg.TaskID, "message": message,
+			})
+		}
+		if p.cfg.Notifier != nil {
+			_ = p.cfg.Notifier.Alarm(ctx, p.cfg.TraceID, EventTaskPausedBudget, message, map[string]any{"task_id": p.cfg.TaskID})
+		}
+	})
 }
 
 // onKeychainUnavailable notifies exactly once per Proxy (task spec step 1:

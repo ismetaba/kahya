@@ -212,6 +212,7 @@ type Task struct {
 	Attempts       int64          `json:"attempts"`
 	WorkerPgid     sql.NullInt64  `json:"worker_pgid"`
 	HaltedAt       sql.NullString `json:"halted_at"`
+	CrashResumes   int64          `json:"crash_resumes"`
 }
 
 type ToolCall struct {

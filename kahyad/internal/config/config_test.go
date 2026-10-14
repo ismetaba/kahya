@@ -119,6 +119,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TaskRetryW1MaxAuto != 3 {
 		t.Errorf("TaskRetryW1MaxAuto = %d, want 3", cfg.TaskRetryW1MaxAuto)
 	}
+	// FIX-I-2 (owner decision G10-2): crash-resume cap default.
+	if cfg.TaskMaxCrashResumes != 3 {
+		t.Errorf("TaskMaxCrashResumes = %d, want 3", cfg.TaskMaxCrashResumes)
+	}
 	// W4-04: cloud-call error taxonomy defaults (task spec, verbatim).
 	if cfg.CloudRetryMaxInline != 3 {
 		t.Errorf("CloudRetryMaxInline = %d, want 3", cfg.CloudRetryMaxInline)
@@ -423,6 +427,48 @@ func TestLoadFailsClosedOnInvalidCloudRetryMaxInline(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() error = nil, want an error for max_inline=0")
+	}
+}
+
+// TestLoadRejectsZeroTaskMaxCrashResumes (FIX-I-2): task_max_crash_resumes
+// < 1 fails Load closed (a task that may never be resumed once would turn
+// every transient worker crash into blocked_user); a positive value
+// overrides the default.
+func TestLoadRejectsZeroTaskMaxCrashResumes(t *testing.T) {
+	for _, tc := range []struct {
+		yaml    string
+		wantErr bool
+		want    int
+	}{
+		{"task_max_crash_resumes: 0\n", true, 0},
+		{"task_max_crash_resumes: -1\n", true, 0},
+		{"task_max_crash_resumes: 5\n", false, 5},
+	} {
+		t.Run(strings.TrimSpace(tc.yaml), func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			dataDir := filepath.Join(home, "Library", "Application Support", "Kahya")
+			if err := os.MkdirAll(dataDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() error = nil, want an error for %q", tc.yaml)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.TaskMaxCrashResumes != tc.want {
+				t.Errorf("TaskMaxCrashResumes = %d, want %d", cfg.TaskMaxCrashResumes, tc.want)
+			}
+		})
 	}
 }
 

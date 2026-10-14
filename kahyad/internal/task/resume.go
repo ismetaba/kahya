@@ -79,6 +79,11 @@ const (
 	// there is no auto-retry cap to hit, because there is no auto-retry at
 	// all (HANDOFF §6 W4 ⚑).
 	MsgW2W3ReceiptlessFmt = "Görev %s: '%s' aracı yarıda kesildi ve makbuzu yok. W2/W3 sınıfı olduğu için otomatik tekrarlanmadı — 'kahya task resolve %s' ile karar ver."
+	// MsgResumeCapExceededFmt (FIX-I-2): %s=task_id, %d=crash_resumes,
+	// %s=task_id. The task's worker kept ending without finishing and the
+	// resume scan's crash re-dispatch budget (task_max_crash_resumes) ran
+	// out.
+	MsgResumeCapExceededFmt = "Görev %s: işçi süreci %d kez yarıda kesildi, otomatik devam limiti doldu — 'kahya task resolve %s' ile karar ver."
 )
 
 // Notification event kinds this file's blocked_user path ledgers via
@@ -87,6 +92,7 @@ const (
 const (
 	EventW1RetryCapExceeded = "task.w1_retry_cap_exceeded"
 	EventW2W3Receiptless    = "task.w2w3_receiptless_blocked"
+	EventResumeCapExceeded  = "task.resume_cap_exceeded"
 )
 
 // defaultW1MaxAuto mirrors config.Config's own default (kept as a small,
@@ -95,6 +101,11 @@ const (
 // reason to take; NewResume's caller (main.go) always threads the real
 // configured value through).
 const defaultW1MaxAuto = 3
+
+// defaultMaxCrashResumes mirrors config.Config.TaskMaxCrashResumes' default
+// (owner decision G10-2: 3 - the first spawn plus 3 crash resumes = 4 runs);
+// main.go threads the configured value through SetMaxCrashResumes.
+const defaultMaxCrashResumes = 3
 
 // Notifier is the narrow notification surface Resume needs.
 // *notify.JSONLNotifier already has exactly this method shape (a subset
@@ -158,7 +169,10 @@ type Resume struct {
 	notifier  Notifier
 	live      LiveChecker
 	w1MaxAuto int
-	now       func() time.Time
+	// maxCrashResumes caps the resume scan's own crash re-dispatches per
+	// task (tasks.crash_resumes, FIX-I-2) - see SetMaxCrashResumes.
+	maxCrashResumes int
+	now             func() time.Time
 }
 
 // NewResume constructs a Resume. live may be nil (every 'executing' task
@@ -174,8 +188,20 @@ func NewResume(store Store, toolCalls ToolCallStore, outbox OutboxEnqueuer, mach
 	}
 	return &Resume{
 		store: store, toolCalls: toolCalls, outbox: outbox, machine: machine,
-		notifier: notifier, live: live, w1MaxAuto: w1MaxAuto, now: time.Now,
+		notifier: notifier, live: live, w1MaxAuto: w1MaxAuto,
+		maxCrashResumes: defaultMaxCrashResumes, now: time.Now,
 	}
+}
+
+// SetMaxCrashResumes sets the cap on the resume scan's crash re-dispatches
+// per task (config task_max_crash_resumes, FIX-I-2): a task whose
+// tasks.crash_resumes already reached n is moved to blocked_user instead of
+// being enqueued again. n <= 0 restores defaultMaxCrashResumes.
+func (r *Resume) SetMaxCrashResumes(n int) {
+	if n <= 0 {
+		n = defaultMaxCrashResumes
+	}
+	r.maxCrashResumes = n
 }
 
 // SetClock overrides Resume's clock (tests only).
@@ -225,6 +251,14 @@ func (r *Resume) Scan(ctx context.Context) (int, error) {
 //     Turkish W1-cap string.
 //   - The most recent receipt-less row is class W2/W3 -> mark it failed,
 //     blocked_user + the exact Turkish W2/W3 string. No auto-retry at all.
+//
+// FIX-I-2: every "requeue" outcome above first passes the crash-resume cap
+// (requeueOrBlock): a task whose crash re-dispatches (tasks.crash_resumes)
+// already reached task_max_crash_resumes moves to blocked_user with
+// MsgResumeCapExceededFmt instead of being enqueued again - so a tool-less
+// task whose worker keeps dying can no longer loop forever. The receipt-less
+// W1-cap and W2/W3 decisions are taken first, so their own byte-exact
+// notices keep priority (a W2/W3 call never auto-retries anyway).
 func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 	traceID := t.TraceID
 
@@ -233,7 +267,7 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 		return fmt.Errorf("list receipt-less tool_calls: %w", err)
 	}
 	if len(rows) == 0 {
-		return r.enqueueResume(ctx, traceID, t.ID)
+		return r.requeueOrBlock(ctx, t)
 	}
 
 	row := rows[0]
@@ -257,7 +291,22 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 		return r.blockOnW1CapExceeded(ctx, traceID, t.ID, row.ToolName, attempts)
 	}
 
-	return r.enqueueResume(ctx, traceID, t.ID)
+	return r.requeueOrBlock(ctx, t)
+}
+
+// requeueOrBlock is ProcessTask's single requeue point (FIX-I-2): within the
+// crash-resume cap the task is enqueued again (enqueueResume counts it);
+// at the cap an 'executing' task moves to blocked_user once. A task that is
+// no longer 'executing' (ProcessTask is exported; Scan only ever passes
+// 'executing' rows) is never blocked or notified a second time.
+func (r *Resume) requeueOrBlock(ctx context.Context, t sqlcgen.Task) error {
+	if int(t.CrashResumes) >= r.maxCrashResumes {
+		if t.Status != StatusExecuting {
+			return nil
+		}
+		return r.blockOnResumeCapExceeded(ctx, t.TraceID, t.ID, t.CrashResumes)
+	}
+	return r.enqueueResume(ctx, t.TraceID, t.ID)
 }
 
 // blockOnW1CapExceeded implements the W1-past-cap branch: transition the
@@ -268,6 +317,22 @@ func (r *Resume) blockOnW1CapExceeded(ctx context.Context, traceID, taskID, tool
 	}
 	msg := fmt.Sprintf(MsgW1RetryCapExceededFmt, taskID, tool, attempts, taskID)
 	return r.notify(ctx, traceID, EventW1RetryCapExceeded, msg, taskID, tool, attempts)
+}
+
+// blockOnResumeCapExceeded implements the crash-resume cap (FIX-I-2):
+// transition the task to blocked_user and notify with the exact Turkish
+// string (the notifier ledgers EventResumeCapExceeded with the message).
+func (r *Resume) blockOnResumeCapExceeded(ctx context.Context, traceID, taskID string, crashResumes int64) error {
+	if err := r.machine.Transition(ctx, traceID, taskID, StatusBlockedUser); err != nil {
+		return fmt.Errorf("transition to blocked_user: %w", err)
+	}
+	if r.notifier == nil {
+		return nil
+	}
+	msg := fmt.Sprintf(MsgResumeCapExceededFmt, taskID, crashResumes, taskID)
+	return r.notifier.Notify(ctx, traceID, EventResumeCapExceeded, msg, map[string]any{
+		"task_id": taskID, "crash_resumes": crashResumes,
+	})
 }
 
 // blockOnReceiptless implements the W2/W3-receipt-less branch: transition
@@ -341,10 +406,16 @@ func writeOutboxResumeRowAt(ctx context.Context, outbox OutboxEnqueuer, traceID,
 // than through a status transition, since the task never leaves
 // 'executing' in either case) and writes the resume row. The task's OWN
 // status is left at 'executing' throughout - nothing here changes it.
+// FIX-I-2: it also bumps tasks.crash_resumes - this is the one path that
+// counts toward task_max_crash_resumes (cloud-park redispatches go through
+// Machine.Transition and never touch it).
 func (r *Resume) enqueueResume(ctx context.Context, traceID, taskID string) error {
 	ts := r.nowRFC3339()
 	if _, err := r.store.IncrementTaskAttempts(ctx, sqlcgen.IncrementTaskAttemptsParams{UpdatedAt: ts, ID: taskID}); err != nil {
 		return fmt.Errorf("increment attempts: %w", err)
+	}
+	if _, err := r.store.IncrementTaskCrashResumes(ctx, sqlcgen.IncrementTaskCrashResumesParams{UpdatedAt: ts, ID: taskID}); err != nil {
+		return fmt.Errorf("increment crash_resumes: %w", err)
 	}
 	return writeOutboxResumeRow(ctx, r.outbox, r.now, traceID, taskID)
 }

@@ -228,6 +228,10 @@ type Querier interface {
 	// resume scan's within-cap W1 receipt-less retry path (which re-dispatches
 	// without any status change, since the task never leaves 'executing').
 	IncrementTaskAttempts(ctx context.Context, arg IncrementTaskAttemptsParams) (int64, error)
+	// I-2 (0020_task_resilience): one more resume-scan crash re-dispatch of
+	// this task (kahyad/internal/task.Resume.enqueueResume) - never a cloud-park
+	// redispatch. Returns the new count.
+	IncrementTaskCrashResumes(ctx context.Context, arg IncrementTaskCrashResumesParams) (int64, error)
 	// anchor_log queries: kahyad/internal/anchor/push.go is the only writer
 	// (InsertAnchorLog/MarkAnchorPushed); push.go and verify.go both read.
 	// status is always 'pending' at insert time (task spec step 3: "insert
@@ -573,6 +577,9 @@ type Querier interface {
 	// already marked delivered (or that somehow no longer exists) must never
 	// have its lease resurrected.
 	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
+	// I-2: `kahya task resolve <id> --retry` (kahyad/internal/task.Resolver.
+	// Retry) starts a fresh crash budget.
+	ResetTaskCrashResumes(ctx context.Context, arg ResetTaskCrashResumesParams) error
 	// Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
 	// valid_to set, status='retracted' - NEVER a DELETE. The caller
 	// (kahyad/internal/factengine/retract.go) always inserts a negative

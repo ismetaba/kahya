@@ -1124,6 +1124,9 @@ func run() int {
 	// (taskLive) OR while one of its side effects is still executing inside
 	// kahyad (taskReceipts) - the latter outlives a killed worker.
 	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, task.AnyLive(taskLive, taskReceipts), cfg.TaskRetryW1MaxAuto)
+	// FIX-I-2: the resume scan's crash re-dispatches are capped per task
+	// (task_max_crash_resumes, owner decision G10-2); past it -> blocked_user.
+	taskResume.SetMaxCrashResumes(cfg.TaskMaxCrashResumes)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)
 	// W4-04: a redispatched cloud-lane task needs its OWN fresh Anthropic
 	// forward-proxy listener to make any model call at all - srv.

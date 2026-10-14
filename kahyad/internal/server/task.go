@@ -70,6 +70,12 @@ const (
 	// itself fails for a reason OTHER than ErrLocalModelUnavailable (which
 	// gets its own exact fail-closed message - see handleSecretLaneTask).
 	MsgSecretLaneModelCallFailed = "Yerel model çağrısı başarısız oldu. Ayrıntı: kahya log --trace %s"
+	// MsgTaskPausedBudgetFmt (FIX-I-2) is the SSE "error" message of a task
+	// the cost governor stopped (task token ceiling / daily / monthly
+	// budget): the task is blocked_user and resumes only by an explicit
+	// `kahya task resolve <id> --retry` (owner decision G10-1). %s=trace_id,
+	// %s=task_id.
+	MsgTaskPausedBudgetFmt = "Görev bütçe tavanı nedeniyle duraklatıldı. Ayrıntı: kahya log --trace %s — devam için: kahya task resolve %s --retry"
 	// MsgDerinDuringDowngrade is W4-08's spend-warning: prefixed as the
 	// FIRST "delta" SSE event on a "derin düşün" task that is honored
 	// despite an active 80% cost-governor downgrade (HANDOFF §4 cost
@@ -406,9 +412,26 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 		MaxInlineRetries: s.cfg.CloudRetryMaxInline,
 		JSONLLog:         s.log,
 		PauseBudget: func(ctx context.Context, pausedTaskID string) error {
-			return s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
+			if err := s.taskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
 				State: "paused_budget", UpdatedAt: rfc3339Now(), ID: pausedTaskID,
-			})
+			}); err != nil {
+				return err
+			}
+			if s.taskMachine == nil {
+				return nil
+			}
+			// FIX-I-2, HANDOFF S4 "tavanda gorev DURAKLAR": blocked_user is
+			// the one non-terminal status that both the resume scan
+			// (ListExecutingTasks excludes it) and the outbox dispatcher
+			// (its never-redeliver guard) leave alone, so the task really
+			// stops instead of looping through resume -> 503 -> alarm. The
+			// user resumes it with `kahya task resolve <id> --retry` once the
+			// budget allows (owner decision G10-1: no auto-park to a later
+			// day).
+			if err := s.taskMachine.Transition(ctx, traceID, pausedTaskID, task.StatusBlockedUser); err != nil && !errors.Is(err, task.ErrIllegalTransition) {
+				return err
+			}
+			return nil
 		},
 		OnCloudUnreachable: func(ctx context.Context, tid string) error {
 			if s.taskCloudRetry == nil {
@@ -1411,12 +1434,25 @@ type postSpawnDecision struct {
 
 // decidePostSpawn is the pure post-spawn decision (G10). current is the
 // durability status re-read AFTER spawn.Run ("" when it could not be read):
-// a cloud-retry callback or a halt may already have moved it mid-run, and
-// that decision is never overridden. FIX-I-7: a task kahyad parked itself
-// (bekliyor-yeniden-deneme) reports kahyad's parked state whatever the
-// worker's own terminal line said. Otherwise only a clean StatusOK moves
-// the task (to done); every other outcome stays 'executing' for the resume
-// scan (W4-07, see handleTask's comment).
+// a cloud-retry callback, the budget pause or a halt may already have moved
+// it mid-run, and that decision is never overridden.
+//
+//   - bekliyor-yeniden-deneme (FIX-I-7): kahyad parked the task itself; it
+//     reports its parked state whatever the worker's terminal line said.
+//   - blocked_user (FIX-I-2): only NewTaskProxy's PauseBudget can move a
+//     task whose worker is still live there (the resume scan skips live
+//     tasks), so this is the budget block: tasks.state stays paused_budget
+//     and the SSE names `kahya task resolve <id> --retry`.
+//   - failed / user_halted / done (a callback or a halt decided), intent
+//     (never entered the machine): untouched.
+//
+// Otherwise (still 'executing', or unknown): StatusOK -> done; runErr
+// (kahyad itself could not run the worker - a resume would hit the same
+// failure) -> failed; a worker that printed its OWN terminal error line
+// (model loop ended in error, envelope invalid) -> failed, nothing is left
+// to resume (FIX-I-2). A timeout, a crash without any terminal line and
+// cloud_unreachable stay 'executing' for the resume scan (W4-07, see
+// handleTask's comment), now bounded by task_max_crash_resumes.
 func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceID, taskID string, timeoutMin int) postSpawnDecision {
 	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
 	switch current {
@@ -1425,18 +1461,28 @@ func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceI
 			finalState: "waiting_retry", ledgerKind: "task_waiting_retry",
 			sseEvent: "error", ssePayload: map[string]string{"message": task.MsgCloudParked},
 		}}
+	case task.StatusBlockedUser:
+		return postSpawnDecision{mapping: taskOutcomeMapping{
+			// ledger kind task_budget_blocked, NOT task_paused_budget: the
+			// proxy already wrote that row (once, with the governor message).
+			finalState: "paused_budget", ledgerKind: "task_budget_blocked",
+			sseEvent: "error", ssePayload: map[string]string{"message": fmt.Sprintf(MsgTaskPausedBudgetFmt, traceID, taskID)},
+		}}
 	case task.StatusExecuting, "":
 		// still running as far as the state machine knows: decided below
 	default:
-		// failed / user_halted / done / blocked_user (a callback, a halt or
-		// the resume scan already decided), or intent (the task never
-		// entered the machine): never overridden here.
 		return postSpawnDecision{mapping: m}
 	}
-	if runErr == nil && outcome.Status == spawn.StatusOK {
+	switch {
+	case runErr != nil:
+		return postSpawnDecision{toStatus: task.StatusFailed, mapping: m}
+	case outcome.Status == spawn.StatusOK:
 		return postSpawnDecision{toStatus: task.StatusDone, mapping: m}
+	case outcome.Status == spawn.StatusError && outcome.ErrMsg != "":
+		return postSpawnDecision{toStatus: task.StatusFailed, mapping: m}
+	default:
+		return postSpawnDecision{mapping: m}
 	}
-	return postSpawnDecision{mapping: m}
 }
 
 // policyCheckRequest is POST /policy/check's request body (HANDOFF §4 IPC

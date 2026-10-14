@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // ErrTaskNotResolvable is returned by Retry/Abort when the task is not
@@ -58,12 +60,20 @@ func (rs *Resolver) SetClock(now func() time.Time) { rs.now = now }
 // row. Returns ErrTaskNotResolvable (wrapping the underlying
 // ErrIllegalTransition) if taskID's current status has no legal edge into
 // 'executing' (e.g. it is already 'done'/'failed'/'user_halted').
+//
+// FIX-I-2: an explicit human --retry also resets tasks.crash_resumes - a
+// fresh crash-resume budget (task_max_crash_resumes) for the resumed task.
 func (rs *Resolver) Retry(ctx context.Context, traceID, taskID string) error {
 	if err := rs.machine.Transition(ctx, traceID, taskID, StatusExecuting); err != nil {
 		if errors.Is(err, ErrIllegalTransition) {
 			return fmt.Errorf("%w: %v", ErrTaskNotResolvable, err)
 		}
 		return err
+	}
+	if err := rs.store.ResetTaskCrashResumes(ctx, sqlcgen.ResetTaskCrashResumesParams{
+		UpdatedAt: rs.now().UTC().Format(time.RFC3339Nano), ID: taskID,
+	}); err != nil {
+		return fmt.Errorf("task: reset crash_resumes (task %s): %w", taskID, err)
 	}
 	return writeOutboxResumeRow(ctx, rs.outbox, rs.now, traceID, taskID)
 }

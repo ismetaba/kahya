@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"kahya/kahyad/internal/spawn"
@@ -26,6 +27,11 @@ func TestDecidePostSpawnTable(t *testing.T) {
 		{"executing_ok_done", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusOK}, task.StatusDone, "done", "result", ""},
 		{"unknown_ok_done", "", nil, spawn.Outcome{Status: spawn.StatusOK}, task.StatusDone, "done", "result", ""},
 		{"executing_crash_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusError}, "", "error", "error", ""},
+		{"executing_error_line_failed", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, task.StatusFailed, "error", "error", "x"},
+		{"unknown_error_line_failed", "", nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, task.StatusFailed, "error", "error", "x"},
+		{"executing_runerr_failed", task.StatusExecuting, errors.New("bad worker_cmd"), spawn.Outcome{}, task.StatusFailed, "error", "error", ""},
+		{"executing_cloud_unreachable_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusCloudUnreachable}, "", "waiting_retry", "error", task.MsgCloudParked},
+		{"budget_blocked_reports_paused", task.StatusBlockedUser, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "paused_budget", "error", fmt.Sprintf(MsgTaskPausedBudgetFmt, trace, id)},
 		{"executing_timeout_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusTimeout}, "", "error", "error", ""},
 		{"parked_error_line_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "waiting_retry", "error", task.MsgCloudParked},
 		{"parked_ok_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "waiting_retry", "error", task.MsgCloudParked},

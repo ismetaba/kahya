@@ -939,7 +939,7 @@ func (q *Queries) GetSessionTaint(ctx context.Context, sessionID string) (Sessio
 
 const getTaskByID = `-- name: GetTaskByID :one
 
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE id = ?
 `
@@ -971,6 +971,7 @@ func (q *Queries) GetTaskByID(ctx context.Context, id string) (Task, error) {
 		&i.Attempts,
 		&i.WorkerPgid,
 		&i.HaltedAt,
+		&i.CrashResumes,
 	)
 	return i, err
 }
@@ -1099,6 +1100,28 @@ func (q *Queries) IncrementTaskAttempts(ctx context.Context, arg IncrementTaskAt
 	var attempts int64
 	err := row.Scan(&attempts)
 	return attempts, err
+}
+
+const incrementTaskCrashResumes = `-- name: IncrementTaskCrashResumes :one
+UPDATE tasks
+SET crash_resumes = crash_resumes + 1, updated_at = ?
+WHERE id = ?
+RETURNING crash_resumes
+`
+
+type IncrementTaskCrashResumesParams struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+// I-2 (0020_task_resilience): one more resume-scan crash re-dispatch of
+// this task (kahyad/internal/task.Resume.enqueueResume) - never a cloud-park
+// redispatch. Returns the new count.
+func (q *Queries) IncrementTaskCrashResumes(ctx context.Context, arg IncrementTaskCrashResumesParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, incrementTaskCrashResumes, arg.UpdatedAt, arg.ID)
+	var crash_resumes int64
+	err := row.Scan(&crash_resumes)
+	return crash_resumes, err
 }
 
 const insertAnchorLog = `-- name: InsertAnchorLog :one
@@ -1829,7 +1852,7 @@ func (q *Queries) InsertSessionTaintTainted(ctx context.Context, arg InsertSessi
 const insertTask = `-- name: InsertTask :one
 INSERT INTO tasks (id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 `
 
 type InsertTaskParams struct {
@@ -1889,6 +1912,7 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		&i.Attempts,
 		&i.WorkerPgid,
 		&i.HaltedAt,
+		&i.CrashResumes,
 	)
 	return i, err
 }
@@ -2580,7 +2604,7 @@ func (q *Queries) ListEvidenceByFact(ctx context.Context, factID int64) ([]ListE
 }
 
 const listExecutingTasks = `-- name: ListExecutingTasks :many
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE status = 'executing'
   AND status != 'user_halted'
@@ -2629,6 +2653,7 @@ func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
 			&i.Attempts,
 			&i.WorkerPgid,
 			&i.HaltedAt,
+			&i.CrashResumes,
 		); err != nil {
 			return nil, err
 		}
@@ -2682,7 +2707,7 @@ func (q *Queries) ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedA
 }
 
 const listNonTerminalTasks = `-- name: ListNonTerminalTasks :many
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE status NOT IN ('done', 'failed', 'user_halted')
 ORDER BY updated_at ASC
@@ -2721,6 +2746,7 @@ func (q *Queries) ListNonTerminalTasks(ctx context.Context) ([]Task, error) {
 			&i.Attempts,
 			&i.WorkerPgid,
 			&i.HaltedAt,
+			&i.CrashResumes,
 		); err != nil {
 			return nil, err
 		}
@@ -3307,6 +3333,24 @@ type RenewOutboxLeaseParams struct {
 // have its lease resurrected.
 func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, renewOutboxLease, arg.LeaseUntil, arg.ID)
+	return err
+}
+
+const resetTaskCrashResumes = `-- name: ResetTaskCrashResumes :exec
+UPDATE tasks
+SET crash_resumes = 0, updated_at = ?
+WHERE id = ?
+`
+
+type ResetTaskCrashResumesParams struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+// I-2: `kahya task resolve <id> --retry` (kahyad/internal/task.Resolver.
+// Retry) starts a fresh crash budget.
+func (q *Queries) ResetTaskCrashResumes(ctx context.Context, arg ResetTaskCrashResumesParams) error {
+	_, err := q.db.ExecContext(ctx, resetTaskCrashResumes, arg.UpdatedAt, arg.ID)
 	return err
 }
 

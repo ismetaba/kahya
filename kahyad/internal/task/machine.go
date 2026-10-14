@@ -125,6 +125,11 @@ type Store interface {
 	// same Store value with Machine without a second, overlapping
 	// interface definition.
 	ListExecutingTasks(ctx context.Context) ([]sqlcgen.Task, error)
+	// IncrementTaskCrashResumes / ResetTaskCrashResumes maintain
+	// tasks.crash_resumes (FIX-I-2): the resume scan's own crash
+	// re-dispatches (Resume.enqueueResume), reset by Resolver.Retry.
+	IncrementTaskCrashResumes(ctx context.Context, arg sqlcgen.IncrementTaskCrashResumesParams) (int64, error)
+	ResetTaskCrashResumes(ctx context.Context, arg sqlcgen.ResetTaskCrashResumesParams) error
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)

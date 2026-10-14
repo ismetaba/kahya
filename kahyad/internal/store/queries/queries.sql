@@ -41,7 +41,7 @@ ORDER BY id ASC;
 -- InsertTaskRow type.
 INSERT INTO tasks (id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at;
+RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes;
 
 -- name: UpdateTaskState :exec
 UPDATE tasks
@@ -407,7 +407,7 @@ SELECT count(*) FROM sensitive_reads;
 -- reuses the existing Task model type here rather than emitting a second,
 -- differently-ordered Row type (the same convention InsertTask's own doc
 -- comment already established for lane/secret_category).
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE id = ?;
 
@@ -443,7 +443,7 @@ WHERE id = ?;
 -- idempotent no-op HaltTask itself decides on a direct GetTaskByID lookup
 -- (task spec step 8) - this query is only ever consulted for the {all:true}
 -- fan-out, never for a single --task <id> halt.
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE status NOT IN ('done', 'failed', 'user_halted')
 ORDER BY updated_at ASC;
@@ -476,6 +476,22 @@ SET attempts = attempts + 1, updated_at = ?
 WHERE id = ?
 RETURNING attempts;
 
+-- name: IncrementTaskCrashResumes :one
+-- I-2 (0020_task_resilience): one more resume-scan crash re-dispatch of
+-- this task (kahyad/internal/task.Resume.enqueueResume) - never a cloud-park
+-- redispatch. Returns the new count.
+UPDATE tasks
+SET crash_resumes = crash_resumes + 1, updated_at = ?
+WHERE id = ?
+RETURNING crash_resumes;
+
+-- name: ResetTaskCrashResumes :exec
+-- I-2: `kahya task resolve <id> --retry` (kahyad/internal/task.Resolver.
+-- Retry) starts a fresh crash budget.
+UPDATE tasks
+SET crash_resumes = 0, updated_at = ?
+WHERE id = ?;
+
 -- name: SetTaskNextRetry :exec
 -- W4-04: writes tasks.next_retry_at when kahyad/internal/task.CloudRetry
 -- parks a task in 'bekliyor-yeniden-deneme' (the status change itself
@@ -504,7 +520,7 @@ WHERE id = ?;
 -- exact scenario this comment quotes: even a future change to this WHERE
 -- clause that loosens 'executing' can never accidentally resume a halted
 -- task without ALSO having to delete this line first.
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
 FROM tasks
 WHERE status = 'executing'
   AND status != 'user_halted'
