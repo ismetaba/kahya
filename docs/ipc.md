@@ -749,7 +749,13 @@ one new edge), and a halt counts — `"⛔ N görev durduruldu"`, `halted_at`,
 happened. Migration 0021 (data only) moves old `intent` rows whose
 `state` is `done`/`error` to `done`/`failed`. A task row without a stored
 envelope (the briefing's) is never resumed: the outbox dispatcher fails it
-and acks the resume row (`outbox.envelope_invalid`, once — G10-E2).
+and acks the resume row (`outbox.envelope_invalid`, once — G10-E2). So a
+kahyad that dies mid-briefing leaves exactly one trace after the restart:
+the boot scan enqueues the row once, `kahya task show` says `Durum:
+failed`, one `outbox.envelope_invalid` row, the outbox row delivered. A
+stored envelope of a one-shot mode session (`mode` `reader` or `stt`) is
+never resumed either: the dispatcher fails the task and acks the row
+(`outbox.resume_unsupported_mode`, no worker; G10-E2 step 3).
 
 **Sessions that run inside kahyad are live; local rows are never handed to
 a worker (FIX-I-14 review):** a local answer and a briefing run have no

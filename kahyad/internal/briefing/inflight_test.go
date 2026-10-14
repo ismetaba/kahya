@@ -169,3 +169,100 @@ func TestRunOfflineBriefingEndsFailedNotParked(t *testing.T) {
 		t.Errorf("ClaimAndDispatch = (%d, %v), want (0, nil)", c, err)
 	}
 }
+
+// TestBriefingInterruptedByRestartEndsFailedWithOneEnvelopeInvalidRow
+// (G10-E2 acceptance): kahyad dies while the briefing worker runs, so the
+// briefing's row (no stored envelope) is left 'executing' and the new boot's
+// LiveRegistry knows nothing of it. The boot's resume scan enqueues it, the
+// dispatcher cannot build a resume envelope, and the task fails with its row
+// acked: one outbox.envelope_invalid row on the briefing's trace, however
+// many scan/dispatch ticks follow. Before G10-E2 the row was neither acked
+// nor cancelled - re-claimed every lease period with a fresh
+// envelope_invalid row each time, the task stuck 'executing' forever.
+func TestBriefingInterruptedByRestartEndsFailedWithOneEnvelopeInvalidRow(t *testing.T) {
+	st := newTestStore(t)
+	m := task.NewMachine(st.Queries, st)
+	live := task.NewLiveRegistry() // the process that dies mid-briefing
+	const trace = "trace-briefing-restart"
+	var midStatus, bootStatus string
+	var bootScanned, bootClaimed int
+	sp := &midRunSpawner{err: errors.New("worker killed with its kahyad")}
+	sp.fn = func(env spawn.Envelope) {
+		// The restarted kahyad: a fresh machine and an empty live registry
+		// over the same brain.db, the boot scan, then the dispatch ticks.
+		bootLive := task.NewLiveRegistry()
+		bootMachine := task.NewMachine(st.Queries, st)
+		row, err := st.Queries.GetTaskByID(context.Background(), env.TaskID)
+		if err != nil {
+			t.Errorf("GetTaskByID: %v", err)
+			return
+		}
+		midStatus = row.Status
+		r := task.NewResume(st.Queries, st.Queries, st.Queries, bootMachine, nil, task.AnyLive(bootLive), 3)
+		d := outbox.NewDispatcher(st.Queries, st, bootMachine, spawn.Config{Cmd: []string{"/nonexistent/worker"}}, bootLive)
+		d.SetLeaseDuration(20 * time.Millisecond)
+		for round := 0; round < 4; round++ {
+			n, err := r.Scan(context.Background())
+			if err != nil {
+				t.Errorf("boot scan: %v", err)
+			}
+			c, err := d.ClaimAndDispatch(context.Background())
+			if err != nil {
+				t.Errorf("dispatch: %v", err)
+			}
+			bootScanned += n
+			bootClaimed += c
+			time.Sleep(40 * time.Millisecond) // any unacked row's lease expires
+		}
+		// What the restarted kahyad reports - read before the dead process's
+		// Run (which in reality never continues) returns below.
+		if row, err := st.Queries.GetTaskByID(context.Background(), env.TaskID); err == nil {
+			bootStatus = row.Status
+		}
+	}
+	o := &Orchestrator{
+		Classifier: permissiveClassifier(),
+		Spawner:    sp,
+		Delivery:   &fakeDelivery{Sent: true},
+		TaskStore:  st.Queries,
+		Machine:    m,
+		Live:       live,
+		Ledger:     st,
+		Now:        fixedNow(time.Date(2026, 7, 13, 8, 30, 0, 0, time.UTC)),
+	}
+	res, _ := o.Run(context.Background(), trace) // the dead process's run never delivers
+
+	if midStatus != task.StatusExecuting {
+		t.Fatalf("status when kahyad died = %q, want executing (the test must exercise a scan candidate)", midStatus)
+	}
+	if bootScanned != 1 || bootClaimed != 1 {
+		t.Errorf("boot ticks scanned %d, claimed %d; want 1, 1 (one resume attempt, never re-claimed)", bootScanned, bootClaimed)
+	}
+	if bootStatus != task.StatusFailed {
+		t.Errorf("status after the restart = %q, want failed (kahya task show: Durum: failed)", bootStatus)
+	}
+	row, err := st.Queries.GetTaskByID(context.Background(), res.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != task.StatusFailed {
+		t.Errorf("final status = %q, want failed", row.Status)
+	}
+	var n int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM events WHERE kind = 'outbox.envelope_invalid' AND trace_id = ?`, trace).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("outbox.envelope_invalid rows on the briefing trace = %d, want exactly 1", n)
+	}
+	var total, pending int
+	if err := st.DB().QueryRow(`SELECT count(*), count(*) FILTER (WHERE dispatched_at IS NULL AND canceled_at IS NULL) FROM outbox WHERE task_id = ?`, res.TaskID).Scan(&total, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || pending != 0 {
+		t.Errorf("outbox rows = %d (%d pending), want 1 delivered", total, pending)
+	}
+	if n := countEventKind(t, st, "task.illegal_transition"); n != 0 {
+		t.Errorf("task.illegal_transition rows = %d, want 0", n)
+	}
+}

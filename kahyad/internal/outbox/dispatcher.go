@@ -89,6 +89,11 @@ const (
 	// envelope's): such a task is answered on-device only and is NEVER
 	// given to a worker (W3-08), so it is failed and the row acked instead.
 	EventResumeRefusedSecretLane = "outbox.resume_refused_secret_lane"
+	// EventResumeUnsupportedMode (G10-E2 step 3, the I-4 A guard) fires when
+	// a claimed row's stored envelope is a one-shot mode session (reader,
+	// stt): those are never resumed, so the task is failed and the row acked
+	// instead of a worker being re-spawned with resume:true.
+	EventResumeUnsupportedMode = "outbox.resume_unsupported_mode"
 	// EventRedispatchCrashed (G10-E1) fires when a redispatched worker ended
 	// without a terminal line and nothing moved its task meanwhile (a crash,
 	// a kill, kahyad failing to run it): the row is acked and the task stays
@@ -492,6 +497,20 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	}
 	if env.Lane == spawn.LaneSecret {
 		d.refuseSecretLane(ctx, t, row)
+		return
+	}
+	// G10-E2 step 3 (the I-4 A guard): a reader or stt session is one-shot -
+	// its caller consumed (or lost) the answer with the process that ran
+	// it, and buildResumeEnvelope would hand the worker resume:true for a
+	// mode that has no conversation to continue. Leaving the task
+	// 'executing' would re-run the same loop on every scan; fail it
+	// (fail-closed, never 'done') and ack the row, like an envelope-less row.
+	if env.Mode != "" {
+		d.ledgerRaw(ctx, t.TraceID, EventResumeUnsupportedMode, map[string]any{
+			"event": EventResumeUnsupportedMode, "task_id": t.ID, "outbox_id": row.ID, "mode": env.Mode,
+		})
+		d.failUnresumable(ctx, t)
+		d.markDelivered(ctx, row.ID)
 		return
 	}
 
