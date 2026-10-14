@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -206,6 +207,62 @@ func TestRunStartsWorkerAsSessionLeader(t *testing.T) {
 	}
 	if ids.SID == own {
 		t.Errorf("worker shares the spawner's session %d, want a new one", own)
+	}
+}
+
+// TestRunReapsSurvivingGroupMemberOnNormalExit (G03 / B-14, robust review)
+// is the regression test for the second half of the B-14 blocker: Run
+// SIGKILLs the worker's process group when the worker exits on its OWN, not
+// only on a timeout. A worker that leaves a live child behind IN its group
+// (testdata/orphan_group_child_worker.py reports the child's pid, then the
+// leader finishes while the child sleeps on) must leave no process in the
+// group once Run returns. Before the fix the child outlived the task, and
+// once handleTask's deferred Unregister dropped the worker from the live
+// registry it became unattributable - a window a worker that read
+// <socket>.secret could use on the control routes
+// (kahyad/internal/server/controlauth.go). Reaping the group on the
+// normal-exit path closes that window for every in-group descendant.
+func TestRunReapsSurvivingGroupMemberOnNormalExit(t *testing.T) {
+	env := testEnvelope(t)
+	dir, err := os.MkdirTemp("", "k")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "child.pid")
+	cfg := testConfig("testdata/orphan_group_child_worker.py")
+	cfg.Cmd = append(cfg.Cmd, pidFile)
+
+	var pid int
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	outcome, err := Run(ctx, cfg, env, Callbacks{OnStart: func(p int) { pid = p }})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Status != StatusOK {
+		t.Fatalf("outcome.Status = %q, want %q (the leader exits cleanly on its own)", outcome.Status, StatusOK)
+	}
+	if pid == 0 {
+		t.Fatal("OnStart never called with a non-zero pid")
+	}
+	// Clean up the surviving child if this fix is absent (so a red run does
+	// not leak a 30s sleeper); harmless ESRCH no-op once the group is reaped.
+	defer func() { _ = syscall.Kill(-pid, syscall.SIGKILL) }()
+
+	// The leader only exits after its child has published a pid, so the
+	// child really was alive and in the group at exit time. After a
+	// normal-exit Run the group must be empty: kill(-pgid) reached it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, _ := exec.Command("pgrep", "-g", strconv.Itoa(pid)).CombinedOutput()
+		if len(strings.TrimSpace(string(out))) == 0 {
+			break // group empty: no orphan survives the normal exit.
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("orphan child still in worker group %d after a normal-exit Run: %s (want kill(-pgid) on the normal path too, not only on timeout)", pid, out)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

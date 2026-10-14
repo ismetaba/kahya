@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -178,5 +182,84 @@ func TestWorkerSessionAttributionResistsGroupJoin(t *testing.T) {
 	}
 	if n := identityOverrideCount(t, f.store, "trace-dirty", "/policy/check", "body", "t-clean"); n != 4 {
 		t.Errorf("worker_identity_override(body, claimed t-clean) under trace-dirty = %d, want 4 (one per /policy/check probe)", n)
+	}
+}
+
+// TestWorkerGroupReapedClosesOrphanControlAccess (G03 / B-14, robust review
+// round 2) is the regression test for the second half of the B-14 blocker:
+// a worker's forked child that stays in the worker's process group (no
+// setsid, no setpgid) and OUTLIVES the task's live registration. Before the
+// fix, spawn.Run reaped the worker's group only on a timeout, so on a normal
+// exit such a child kept running; once handleTask's deferred Unregister
+// dropped the worker from the registry the child became unattributable, and
+// with the secret it read from <socket>.secret it promoted the autonomy
+// ladder on the control route /policy/promote (and could launder a clean
+// task's ids on the worker routes). spawn.Run now SIGKILLs the worker's
+// group on the normal-exit path too, so the child is dead before it is ever
+// unregistered and never reaches a control route.
+func TestWorkerGroupReapedClosesOrphanControlAccess(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+	reg := task.NewLiveRegistry()
+	f.srv.SetTaskLiveRegistry(reg)
+
+	dir, err := os.MkdirTemp("", "k")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	pidFile := filepath.Join(dir, "child.pid")
+	goFile := filepath.Join(dir, "go")
+	outFile := filepath.Join(dir, "out")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg := spawn.Config{
+		Cmd:    []string{"python3", "testdata/orphan_control_worker.py", pidFile, goFile, outFile},
+		Socket: f.srv.cfg.Socket,
+	}
+	outcome, err := spawn.Run(ctx, cfg, spawn.Envelope{TaskID: "t-dirty", TraceID: "trace-dirty"}, spawn.Callbacks{
+		OnStart:  func(pid int) { reg.RegisterWorker("t-dirty", "trace-dirty", pid, pid) },
+		OnStderr: func(line string) { t.Logf("orphan_control_worker stderr: %s", line) },
+	})
+	reg.Unregister("t-dirty") // exactly what handleTask's deferred Unregister does once Run returns
+	if err != nil || outcome.Status != spawn.StatusOK {
+		t.Fatalf("worker run = %+v, %v; want status ok", outcome, err)
+	}
+
+	// The leader only exits after its child has published a pid, so the
+	// child was alive and in the group when Run returned.
+	var childPID int
+	for i := 0; i < 300; i++ {
+		if b, e := os.ReadFile(pidFile); e == nil && strings.TrimSpace(string(b)) != "" {
+			childPID, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("worker child never published its pid")
+	}
+	defer func() { _ = syscall.Kill(childPID, syscall.SIGKILL) }() // cleanup if the fix is absent
+
+	// Release the child. With the fix it was SIGKILLed with the worker's
+	// group on normal exit (before this write), so it never promotes; without
+	// the fix it is now an unattributable, secret-carrying caller and does.
+	if err := os.WriteFile(goFile, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write go file: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, e := os.ReadFile(outFile); e == nil {
+			t.Fatalf("orphan child reached a control route after the task ended: POST /policy/promote -> %q (want it reaped with the worker's group on normal exit)", strings.TrimSpace(string(b)))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	var promoted int
+	if err := f.store.DB().QueryRow(`SELECT count(*) FROM autonomy_state`).Scan(&promoted); err != nil {
+		t.Fatalf("count autonomy_state: %v", err)
+	}
+	if promoted != 0 {
+		t.Fatalf("autonomy_state rows after a reaped orphan = %d, want 0 (no laundered promote)", promoted)
 	}
 }

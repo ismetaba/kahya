@@ -33,8 +33,15 @@ kahyad has no timeout policy of its own inside the spawn layer — the
 caller (the `/v1/task` handler) derives a `context.Context` with a
 deadline of `cfg.task_timeout_min` minutes and passes it in. When that
 context is done before the process exits on its own, kahyad SIGKILLs the
-whole process group and waits for it to be fully reaped before continuing
-— no orphan process ever survives a task, timed out or not.
+whole process group and waits for it to be fully reaped before continuing.
+kahyad also SIGKILLs the group when the worker exits **on its own** (the
+normal-exit path, not only on a timeout — G03 / B-14 robust review): the
+worker's live-registry entry is dropped the instant `spawn.Run` returns, so
+a descendant still in the group would otherwise outlive the task's
+attribution and, with the secret, reach the control routes (§5a). No
+in-group descendant survives a task, timed out or not; the only survivors
+are ones that first leave the group (`setpgid(0, 0)`) or session
+(`setsid`), which the sanctioned worker never does.
 
 ## 2 · Envelope v1 (worker stdin)
 
@@ -563,20 +570,33 @@ fails closed (`reason=attributed_worker_without_trace`). Because pinning
 happens before the handlers run, the outer `event=http_request` JSONL line
 keeps the trace id the caller *declared*, while `policy_decision`,
 `hafiza_injected` and `worker_identity_override` rows carry the pinned one —
-deliberately, so the two traces cross-reference each other. A forked worker
-child that calls `setsid()` (the sanctioned worker never does) is
-unattributable and therefore refused on worker routes without the secret;
-changing only its process group gains it nothing.
+deliberately, so the two traces cross-reference each other.
+
+The live-worker rules above hold **while the worker is registered**, i.e.
+while its task is running. The registration is dropped when `spawn.Run`
+returns (`handleTask`'s deferred `Unregister`), so a descendant that
+outlives the task would afterwards be unattributable — and, reading
+`<socket>.secret`, could promote the ladder on a control route or launder a
+clean task's ids on a worker route. To close that, `spawn.Run` SIGKILLs the
+worker's process group when the worker exits, on the **normal-exit path as
+well as on a timeout** (G03 / B-14 robust review; §1): no descendant that
+stayed in the worker's group outlives the task. A child that first leaves
+the group — `setpgid(0, 0)` (a new group in the same session) or `setsid()`
+(a new session), neither of which the sanctioned worker does — escapes the
+reap and is unattributable; it is refused on worker routes without the
+secret.
 
 **Same-uid limit.** A worker compromised to the point of reading arbitrary
 files as the user can read `<socket>.secret`; this gate closes the path for
 everything that only uses what a worker is *given* (its env, its tools, a
 prompt-injected model), and B-14 refuses the secret on control routes from
-anywhere inside a live worker's session. The one residual is a forked worker
-child that calls `setsid()` *and* reads the secret file: it is
-unattributable, so it reaches the control routes. Sandboxing the worker (`sandbox-exec`),
-a Keychain-ACL'd secret, or a separate uid were considered and declined for
-now (owner decisions G03-1/2/3).
+anywhere inside a live worker's session. The residual is a forked worker
+child that **both** escapes the process-group reap (`setpgid(0, 0)` or
+`setsid()`) and outlives the task **and** reads the secret file: once the
+worker is unregistered it is unattributable, so with the secret it reaches
+the control routes. Sandboxing the worker (`sandbox-exec`), a Keychain-ACL'd
+secret, or a separate uid would close even that, and were considered and
+declined for now (owner decisions G03-1/2/3).
 
 ## 6 · `POST /policy/check` (HTTP-over-UDS, same socket)
 

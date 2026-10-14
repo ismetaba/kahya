@@ -78,14 +78,21 @@
 //     harness, the CLI) is served only with the control secret - else 403
 //     reason unattributable_worker_route.
 //   - Control routes: a caller attributable to a live worker is refused
-//     even WITH the secret (reason live_worker_on_control_route) - a
-//     worker that managed to read <socket>.secret still cannot use it from
-//     anywhere in its own session, however it rearranges its process
-//     groups. Residual (same-uid limit, owner decisions G03-1/2/3): a
-//     forked child that calls setsid() (the sanctioned worker never does)
-//     is unattributable - refused on the worker routes without the
-//     secret, but served on control routes if it ALSO read the secret
-//     file.
+//     even WITH the secret (reason live_worker_on_control_route) - while a
+//     worker's task is running, a child that read <socket>.secret cannot
+//     use it from anywhere in that worker's session, however it rearranges
+//     its process groups. That refusal depends on the worker still being
+//     registered: handleTask drops the registration (deferred Unregister)
+//     the moment spawn.Run returns, after which the worker's session no
+//     longer maps to a live worker. So spawn.Run SIGKILLs the worker's
+//     process group when the task ends - on the normal-exit path as well as
+//     on a timeout - and no descendant still in that group outlives the
+//     task. Residual (same-uid limit, owner decisions G03-1/2/3): a forked
+//     child that leaves the worker's group BEFORE that reap - setpgid(0, 0)
+//     (a new group in the same session) or setsid() (a new session); the
+//     sanctioned worker does neither - outlives the task and is then
+//     unattributable, so it is refused on the worker routes without the
+//     secret but served on control routes if it ALSO read the secret file.
 package server
 
 import (

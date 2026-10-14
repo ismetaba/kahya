@@ -186,6 +186,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #2 | /v1/mcp taint gate keys on the attributed live worker's session, not the bridge's headers | `kahyad/internal/server/TestMCPGateTaintCheckUsesAttributedSession` | FIX-B-14 | ci-hermetic |
 | Safety #2 | worker cannot borrow another live worker's identity via setpgid — attribution keyed on the worker's own session (spawn.Run setsid) | `kahyad/internal/server/TestWorkerSessionAttributionResistsGroupJoin` | FIX-B-14 | ci-hermetic |
 | Safety #2 | a UDS peer that cannot be resolved to a session is refused on worker and control routes, even with the control secret | `kahyad/internal/server/TestUnresolvedPeerRefusedEvenWithSecret` | FIX-B-14 | ci-hermetic |
+| Safety #2 | a worker's in-group child cannot outlive the task's registration — spawn.Run reaps the group on normal exit too, so it never reaches a control route once unregistered | `kahyad/internal/server/TestWorkerGroupReapedClosesOrphanControlAccess` | FIX-B-14 | ci-hermetic |
 | Safety #3 | agent_derived / untrusted-sourced memory quarantined from injection | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W12-05 | ci-hermetic |
 | Safety #3 | memory search for-injection excludes agent_derived facts | `kahyad/internal/server/TestMemorySearchForInjectionExcludesAgentDerived` | W12-05 | ci-hermetic |
 | Safety #3 | red-team planted-mail-poisons-profile scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |

@@ -274,12 +274,16 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     read the SAME pinned headers; deny-all still fails closed at boot;
 //     every decision is ledgered; an auto-allowed W1 still opens a
 //     5-minute undo window.
-//   - Residual: a forked worker child that calls setsid() (leaving the
-//     worker's session for a fresh one; the sanctioned worker never does)
-//     is unattributable and therefore refused here outright (403
-//     unattributable_worker_route) unless it ALSO read the control secret
-//     file - the same-uid limit docs/ipc.md section 5a documents.
-//     Changing only its process group (setpgid) gains it nothing.
+//   - Residual: a forked worker child that leaves the worker's process
+//     group - setpgid(0, 0) (a new group in the same session) or setsid()
+//     (a new session); the sanctioned worker does neither - AND outlives
+//     the task is unattributable once handleTask unregisters the worker, so
+//     it is refused here outright (403 unattributable_worker_route) unless
+//     it ALSO read the control secret file. A child that merely stays in
+//     the worker's group gains nothing: spawn.Run SIGKILLs the group when
+//     the worker exits (normal exit as well as timeout), so it cannot
+//     outlive the task. This is the same-uid limit docs/ipc.md section 5a
+//     documents.
 func (s *Server) policyGateMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {

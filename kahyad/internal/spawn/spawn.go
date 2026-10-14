@@ -216,24 +216,38 @@ type stdoutLine struct {
 // Run blocks until the process exits on its own or ctx is done, whichever
 // comes first; it has no timeout policy of its own - the caller is
 // responsible for giving ctx a deadline that reflects cfg.task_timeout_min
-// (kahyad/internal/server's /v1/task handler does this). On ctx.Done, Run
-// sends SIGKILL to the entire process group.
+// (kahyad/internal/server's /v1/task handler does this). Run SIGKILLs the
+// entire process group on BOTH exit paths - on ctx.Done (a timeout/halt)
+// and, since G03 / B-14's robust review, when the worker exits on its own
+// too. The normal-exit reap is a security requirement, not just hygiene: a
+// UDS caller is attributed to the live worker whose session it is in
+// (kahyad/internal/server/controlauth.go), and that attribution is dropped
+// the moment handleTask's deferred Unregister runs after Run returns. A
+// worker descendant still in the group when the task ends would, after
+// that Unregister, be unattributable - and a worker that read <socket>.
+// secret could then use it on control routes (promote the autonomy ladder)
+// or launder a clean task's ids on the worker routes. Killing the group
+// before Run returns means no in-group descendant ever reaches that
+// post-registration, unattributable state.
 //
 // Run's guarantee is a BOUNDED RETURN, not "no descendant process ever
 // survives": every process still in the child's own process group is
-// killed and (within drainGrace of the group's own exit) reaped before
-// Run returns. A grandchild that detaches from the group itself
-// (setsid/`start_new_session=True`, e.g. Python's subprocess.Popen) is, by
-// definition, OUTSIDE that group - kill(-pgid) cannot reach it, and if it
-// also still holds the worker's stdout/stderr pipe write-end open (e.g.
-// by not redirecting its own stdout/stderr away from the inherited ones),
-// kahyad's stdout/stderr readers never see a natural EOF from it either.
-// Run tolerates this: after drainGrace, it reclaims its own pipe read-ends
-// to unblock those readers and returns anyway, rather than hang
+// killed (on whichever path ends the run) and (within drainGrace of the
+// group's own exit) reaped before Run returns. A grandchild that detaches
+// from the group itself - setsid/`start_new_session=True` (e.g. Python's
+// subprocess.Popen), or setpgid(0, 0) into a new group of the same session
+// - is, by definition, OUTSIDE that group, so kill(-pgid) cannot reach it,
+// and if it also still holds the worker's stdout/stderr pipe write-end open
+// (e.g. by not redirecting its own stdout/stderr away from the inherited
+// ones), kahyad's stdout/stderr readers never see a natural EOF from it
+// either. Run tolerates this: after drainGrace, it reclaims its own pipe
+// read-ends to unblock those readers and returns anyway, rather than hang
 // indefinitely on a process it was never going to be able to kill. This
 // is a documented, accepted limitation, not a bug - the sanctioned worker
-// (W12-09) does not setsid; a future `⌥⎋` halt (W6-03) is what handles the
-// sanctioned tree's own halt semantics, not Run.
+// (W12-09) does not setsid or setpgid; a future `⌥⎋` halt (W6-03) is what
+// handles the sanctioned tree's own halt semantics, not Run. The residual
+// (a descendant that leaves the group AND reads the secret file) is the
+// same-uid limit controlauth.go documents (owner decisions G03-1/2/3).
 //
 // Whenever the worker DID send a terminal {"type":"result"/"error"} stdout
 // line before ctx.Done fired - it just hadn't exited yet - Run reports
@@ -392,6 +406,17 @@ func Run(ctx context.Context, cfg Config, env Envelope, cb Callbacks) (Outcome, 
 		// so Run always returns bounded regardless.
 		return awaitExitBounded(stdout, stderr, waitErrCh, &outcome, &sawTerminal), nil
 	case <-waitErrCh:
+		// The worker exited on its own. Reap its process group before
+		// returning (G03 / B-14 robust review): the direct child is already
+		// gone (waitErrCh fired only after cmd.Wait() returned), but any
+		// descendant it left behind in the group is still alive, and once
+		// handleTask's deferred Unregister runs after this return it would be
+		// unattributable - a window a secret-reading worker could use on the
+		// control routes. kill(-pgid) targets the group, which outlives its
+		// dead leader as long as it has members; an empty group is a
+		// harmless ESRCH no-op. A descendant that already left the group
+		// (setsid / setpgid(0, 0)) is out of reach - the documented residual.
+		killGroup(cmd)
 		// BLOCKER 1: an already-recorded terminal result/error outcome
 		// (sawTerminal) is authoritative - finalizeOutcome only falls back
 		// to StatusError here (the process ended - any exit code - without
@@ -479,11 +504,16 @@ func awaitExitBounded(stdout, stderr io.Closer, waitErrCh <-chan error, outcome 
 }
 
 // killGroup sends SIGKILL to cmd's entire process group (the negative pid
-// convention). A nil Process (should not happen after a successful Start)
-// is a no-op. This can only ever reach processes still IN the group - a
-// grandchild that detached via setsid/`start_new_session=True` is outside
-// it by definition and survives (see Run's doc comment; awaitExitBounded
-// is what keeps Run itself from hanging on that, not this function).
+// convention). Run calls it on BOTH exit paths - ctx.Done and normal exit
+// (G03 / B-14; see Run's doc comment). A nil Process (should not happen
+// after a successful Start) is a no-op. This can only ever reach processes
+// still IN the group - a grandchild that detached via
+// setsid/`start_new_session=True` or setpgid(0, 0) is outside it by
+// definition and survives (see Run's doc comment; awaitExitBounded is what
+// keeps Run itself from hanging on that, not this function). On the normal-
+// exit path the group leader is already reaped, but the group lives on while
+// it has members, so kill(-pgid) still reaches them; an already-empty group
+// is a harmless ESRCH no-op.
 func killGroup(cmd *exec.Cmd) {
 	if cmd.Process == nil {
 		return
