@@ -283,6 +283,28 @@ func (c *CloudRetry) giveUp(ctx context.Context, traceID, taskID string, t sqlcg
 // -, done) is left alone: no illegal-transition attempt, no second
 // notification, one EventCloudFailureSkipped row.
 func (c *CloudRetry) FailNonRetryable(ctx context.Context, traceID, taskID, reasonID string) error {
+	return c.failNonRetryable(ctx, traceID, taskID, reasonID, true)
+}
+
+// NotifiedByEgressGate is the task.failed payload's notified_by value when
+// FailNonRetryableAlreadyNotified wrote the row (FIX-U-4).
+const NotifiedByEgressGate = "egress_gate"
+
+// FailNonRetryableAlreadyNotified is FailNonRetryable minus the user
+// notification (FIX-U-4): the caller has ALREADY sent the one user-facing
+// message for this failure - kahyad/main.go's combined egress gate
+// (secretlane.ChainEgressGates -> CloudBlockedNotices) raises
+// secretlane.MsgSecretLaneCloudBlockedNotice the first time the backstop
+// blocks a task, so a second "Bulut cagrisi kalici hatayla reddedildi" line
+// for the same event would be noise. tasks.status -> failed and the
+// task.failed ledger row are written exactly as FailNonRetryable writes them
+// (same already-terminal guard); the payload records notified_by so the
+// omission is visible in the ledger, never silent (HANDOFF S5 safety #4).
+func (c *CloudRetry) FailNonRetryableAlreadyNotified(ctx context.Context, traceID, taskID, reasonID string) error {
+	return c.failNonRetryable(ctx, traceID, taskID, reasonID, false)
+}
+
+func (c *CloudRetry) failNonRetryable(ctx context.Context, traceID, taskID, reasonID string, notifyUser bool) error {
 	if t, err := c.store.GetTaskByID(ctx, taskID); err == nil && !IsLegalTransition(t.Status, StatusFailed) {
 		c.ledgerRaw(ctx, traceID, EventCloudFailureSkipped, map[string]any{
 			"task_id": taskID, "reason": reasonID, "status": t.Status,
@@ -292,9 +314,14 @@ func (c *CloudRetry) FailNonRetryable(ctx context.Context, traceID, taskID, reas
 	if err := c.machine.Transition(ctx, traceID, taskID, StatusFailed); err != nil {
 		return fmt.Errorf("task: cloudretry fail non-retryable transition: %w", err)
 	}
-	c.ledgerRaw(ctx, traceID, EventCloudTaskFailed, map[string]any{
-		"task_id": taskID, "reason": reasonID,
-	})
+	payload := map[string]any{"task_id": taskID, "reason": reasonID}
+	if !notifyUser {
+		payload["notified_by"] = NotifiedByEgressGate
+	}
+	c.ledgerRaw(ctx, traceID, EventCloudTaskFailed, payload)
+	if !notifyUser {
+		return nil
+	}
 	msg := fmt.Sprintf(MsgCloudNonRetryableFmt, reasonID)
 	return c.notify(ctx, traceID, EventCloudTaskFailed, msg, taskID, map[string]any{"reason": reasonID})
 }

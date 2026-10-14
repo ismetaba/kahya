@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -260,6 +261,55 @@ func TestFailNonRetryableTransitionsAndNotifies(t *testing.T) {
 	want := "Bulut çağrısı kalıcı hatayla reddedildi (authentication_error). Görev durduruldu."
 	if notifier.calls[0].message != want {
 		t.Errorf("notify message = %q, want %q", notifier.calls[0].message, want)
+	}
+}
+
+// TestFailNonRetryableAlreadyNotifiedSkipsNotifyButLedgers (FIX-U-4): the
+// egress-gate path fails the task and ledgers task.failed (reason +
+// notified_by) exactly like FailNonRetryable, but sends no second user
+// message - the secret-lane notice already went out.
+func TestFailNonRetryableAlreadyNotifiedSkipsNotifyButLedgers(t *testing.T) {
+	st, m, cr, notifier := newCloudRetryFixture(t, nil, 0)
+	insertTask(t, st, "t1")
+	transitionToExecuting(t, m, "trace-t1", "t1")
+
+	if err := cr.FailNonRetryableAlreadyNotified(context.Background(), "trace-t1", "t1", "secret_lane_cloud_blocked"); err != nil {
+		t.Fatalf("FailNonRetryableAlreadyNotified: %v", err)
+	}
+	got, err := st.Queries.GetTaskByID(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("GetTaskByID: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Fatalf("status = %q, want %q", got.Status, StatusFailed)
+	}
+	if n := countEventsOfKind(t, st, EventCloudTaskFailed); n != 1 {
+		t.Fatalf("task.failed ledgered %d times, want 1", n)
+	}
+	if len(notifier.calls) != 0 {
+		t.Fatalf("Notify called %d times (%+v), want 0 (the user was already notified)", len(notifier.calls), notifier.calls)
+	}
+	var raw string
+	if err := st.DB().QueryRow(`SELECT payload FROM events WHERE kind = ?`, EventCloudTaskFailed).Scan(&raw); err != nil {
+		t.Fatalf("read task.failed payload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if payload["reason"] != "secret_lane_cloud_blocked" || payload["notified_by"] != NotifiedByEgressGate {
+		t.Fatalf("task.failed payload = %v, want reason secret_lane_cloud_blocked + notified_by %s", payload, NotifiedByEgressGate)
+	}
+
+	// The FIX-I-6 already-terminal guard holds for this variant too.
+	if err := cr.FailNonRetryableAlreadyNotified(context.Background(), "trace-t1", "t1", "secret_lane_cloud_blocked"); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if n := countEventsOfKind(t, st, EventCloudTaskFailed); n != 1 {
+		t.Fatalf("task.failed after a second call = %d, want still 1", n)
+	}
+	if n := countEventsOfKind(t, st, EventCloudFailureSkipped); n != 1 {
+		t.Fatalf("%s = %d, want 1", EventCloudFailureSkipped, n)
 	}
 }
 

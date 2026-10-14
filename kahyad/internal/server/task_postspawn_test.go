@@ -37,6 +37,9 @@ func TestDecidePostSpawnTable(t *testing.T) {
 		{"parked_ok_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "waiting_retry", "error", task.MsgCloudParked},
 		{"halted_ok_untouched", task.StatusUserHalted, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "done", "result", ""},
 		{"failed_runerr_untouched", task.StatusFailed, errors.New("boom"), spawn.Outcome{}, "", "error", "error", ""},
+		// FIX-U-4: the egress-gate callback already failed the task; the
+		// worker's "result ok" only sets the free-text state/SSE.
+		{"failed_ok_untouched", task.StatusFailed, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "done", "result", ""},
 		{"intent_ok_untouched", task.StatusIntent, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "done", "result", ""},
 	}
 	for _, c := range cases {

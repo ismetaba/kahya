@@ -359,7 +359,18 @@ a cloud model, without changing anything in §2-§6 above:
   single forwarded request and refuses with `403` + ledger
   `secretlane_cloud_blocked` — this is the enforcement even if a
   prompt-injected worker tries the cloud URL directly, since the worker
-  never gets to choose or override its own task's lane.
+  never gets to choose or override its own task's lane. FIX-U-4: that
+  secret-lane 403 (`secretlane.ErrCloudBlocked`) is terminal for the task -
+  the proxy fires `OnNonRetryableFailure(ReasonSecretLaneCloudBlocked)`
+  once per proxy (ledger `proxy.egress_blocked_terminal`, then
+  `tasks.status` -> `failed` with `task.failed{reason:
+  "secret_lane_cloud_blocked", notified_by: "egress_gate"}` and no second
+  user message besides the one `secretlane_cloud_blocked_notice`),
+  regardless of what the worker's own terminal line later says (a worker
+  printing `result ok` after the 403 only sets the free-text state). A
+  lane READ failure (`ErrCloudBlockedLookupFailed`, transient) and the
+  W3-05 allowlist/sensitive-read/budget hook's denials still answer 403
+  without failing the task from the proxy (the worker's error line does).
 - **Sticky, persisted lane:** `tasks.lane`/`tasks.secret_category`
   (`kahyad/migrations/0006_secret_lane.sql`) are set on `InsertTask` (the
   classification above already ran) and only ever WIDEN thereafter

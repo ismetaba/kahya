@@ -460,6 +460,14 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 			if s.taskCloudRetry == nil {
 				return nil
 			}
+			if reasonID == anthproxy.ReasonSecretLaneCloudBlocked {
+				// FIX-U-4 + FIX-B-6: the combined egress gate main.go builds
+				// (secretlane.ChainEgressGates) already raised
+				// secretlane.MsgSecretLaneCloudBlockedNotice (once per task)
+				// before this callback ran - fail the task and ledger it,
+				// never notify the user a second time.
+				return s.taskCloudRetry.FailNonRetryableAlreadyNotified(ctx, traceID, tid, reasonID)
+			}
 			return s.taskCloudRetry.FailNonRetryable(ctx, traceID, tid, reasonID)
 		},
 	})
