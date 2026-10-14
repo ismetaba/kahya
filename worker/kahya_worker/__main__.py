@@ -359,6 +359,12 @@ def main(argv: list[str] | None = None) -> int:
     return asyncio.run(_run_session(envelope, socket_path, mcp_bridge))
 
 
+# B-1: the kahya-mcp bridge's per-tools/call budget env var
+# (kahyad/cmd/kahya-mcp toolCallTimeoutEnvVar), forwarded to the bridge by
+# _build_options when kahyad set it.
+MCP_TOOLCALL_TIMEOUT_ENV = "KAHYA_MCP_TOOLCALL_TIMEOUT_S"
+
+
 def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> ClaudeAgentOptions:
     """Builds the one ClaudeAgentOptions this task's session uses (step
     2): model/system_prompt/mcp_servers/allowed_tools/hooks/can_use_tool
@@ -371,7 +377,19 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
     of starting a fresh one (docs/ipc.md's own W4-02 note) - streaming
     input mode stays in force either way (HANDOFF §4 ⚑: hooks/
     can_use_tool do not run under one-shot query()), so nothing else in
-    this function's shape changes for a resumed task."""
+    this function's shape changes for a resumed task.
+
+    B-1: when kahyad set KAHYA_MCP_TOOLCALL_TIMEOUT_S (an approval wait is
+    configured - kahyad/internal/spawn.BuildEnv), it is passed to the
+    bridge explicitly too, so the bridge's tools/call budget outlasts the
+    wait whatever environment the bundled CLI gives its stdio servers."""
+    bridge_env = {
+        "KAHYA_SOCKET": socket_path,
+        "KAHYA_TRACE_ID": envelope.trace_id,
+    }
+    toolcall_timeout = os.environ.get(MCP_TOOLCALL_TIMEOUT_ENV, "")
+    if toolcall_timeout:
+        bridge_env[MCP_TOOLCALL_TIMEOUT_ENV] = toolcall_timeout
     return ClaudeAgentOptions(
         model=envelope.model,
         resume=envelope.session_id if envelope.resume else None,
@@ -380,10 +398,7 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
             "kahya_memory": {
                 "type": "stdio",
                 "command": mcp_bridge,
-                "env": {
-                    "KAHYA_SOCKET": socket_path,
-                    "KAHYA_TRACE_ID": envelope.trace_id,
-                },
+                "env": bridge_env,
             },
         },
         # --- BLOCKER 2 FIX (deviation from this task's own step 2 note,

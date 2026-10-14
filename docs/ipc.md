@@ -105,7 +105,7 @@ MCP timeouts only when an approval wait is configured):
 | `ANTHROPIC_API_KEY` | A **per-task random token**, `"kahya-task-" + 32 lowercase hex chars` (`spawn.NewAPIKey`) — **NOT a real Anthropic key**. The real key never leaves kahyad (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). Since W12-08, the per-task forward-proxy listener rejects any inbound request whose `x-api-key`/`Authorization` does not match this exact token (`401` + ledger `proxy_auth_reject`), so no other local process can spend through kahyad's real key by guessing `ANTHROPIC_API_KEY`. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertion applies to `ANTHROPIC_API_KEY` (`kahya_worker.__main__`'s step-6 check): required to match the per-task token shape in `"keychain"` mode; not enforced as the worker's own auth in `"passthrough"` mode, since the SDK subprocess authenticates via its own forwarded credential instead. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
-| `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. |
+| `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. The worker also passes it explicitly in the `kahya_memory` stdio server's own `env` (`_build_options`). |
 | `MCP_TOOL_TIMEOUT` | Since B-1, only when `approval_wait_seconds > 0`: `(approval_wait_seconds + 90) * 1000` (ms) — the bundled `claude` CLI's own hard per-MCP-call limit, set explicitly because its default is unknown. Set after the inherited environment, so a parent shell's value never shortens it. |
 | `KAHYA_TMP_DIR` | Since W6-02: `config.Config.TmpDir()` (`<data_dir>/tmp`, e.g. `~/Library/Application Support/Kahya/tmp` — created 0700 at kahyad startup). `mode=="stt"` sessions read this to decide whether `input_audio_path` is safe to delete after transcription (`kahya_worker.__main__._maybe_delete_audio`): a file is deleted **iff** its resolved parent directory equals this exact value — never a repo fixture, never any other path. Empty/unset is a fail-CLOSED no-op (never delete). |
 
@@ -631,13 +631,19 @@ Request:
 }
 ```
 
-`preflight` (since B-1): kahyad decides and ledgers the decision (payload
-`preflight:true`) but **mints nothing** — no `pending_approvals` row, no
-token, no undo window — so the response never carries
-`pending_approval_id` or `token`. The binding decision, and the only
-pending approval a human is ever asked about, comes from the tool-side
-gate on `/v1/mcp` (§6a). A non-preflight call (a script with the control
-secret) keeps the original behavior below.
+`preflight` (since B-1) is sent `true` by the worker's `can_use_tool` on
+every call (`kahya_worker.hooks.POLICY_CHECK_PREFLIGHT`): kahyad decides
+and ledgers the decision (payload `preflight:true`) but **mints nothing** —
+no `pending_approvals` row, no token, no undo window — so the response
+never carries `pending_approval_id` or `token`. The binding decision, and
+the only pending approval a human is ever asked about, comes from the
+tool-side gate on `/v1/mcp` (§6a). The worker maps `needs_approval` for
+one of kahyad's own MCP tools (`mcp__kahya_memory__*`) to "allow — defer
+to the binding gate" (`event=tool_gate decision=defer`) and denies it for
+any SDK built-in tool, which has no kahyad-side executor (`"Bu araç için
+onay gerekiyor ancak bu yüzeyden onaylanamaz (reddedildi)."`). A
+non-preflight call (a script with the control secret) keeps the original
+behavior below.
 
 `task_id`/`trace_id` stay in the body (backward compatibility), but for a
 call from a live worker kahyad spawned the **authority is the UDS peer's

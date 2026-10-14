@@ -11,11 +11,12 @@ import tempfile
 import unittest
 
 import _pathfix  # noqa: F401
-from fixtures import UnixHTTPFixture, respond_hang, respond_json
+from fixtures import UnixHTTPFixture, respond_hang, respond_json, respond_json_capturing
 
 from kahya_worker import logging as wlog
 from kahya_worker.hooks import (
     POLICY_FAIL_CLOSED_MESSAGE,
+    POLICY_NEEDS_APPROVAL_NON_MCP_MESSAGE,
     make_can_use_tool,
     make_user_prompt_submit_hook,
 )
@@ -183,6 +184,74 @@ class TestCanUseTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
+
+    # ---- B-1: preflight + needs_approval deferral ----
+
+    async def test_needs_approval_for_kahya_mcp_tool_defers_to_binding_gate(self) -> None:
+        """B-1: needs_approval for one of kahyad's own MCP tools is ALLOWED
+        through to kahyad's binding gate on /v1/mcp, which parks the call
+        for the human decision and executes exactly the approved bytes -
+        before B-1 this fell into the garbage branch and denied."""
+        body = json.dumps({
+            "decision": "needs_approval",
+            "reason": "Bu eylem için onay gerekiyor (otonomi seviyesi yetersiz).",
+            "rule": "ladder-v1",
+        }).encode("utf-8")
+        with UnixHTTPFixture(self._tmp.name, respond_json(200, body)) as sock:
+            can_use_tool = make_can_use_tool(sock, "t_1", "trace-1", None)
+            result = await can_use_tool(
+                "mcp__kahya_memory__fs_write", {"path": "~/x.md", "content_base64": "aGk="}, {}
+            )
+
+        self.assertIsInstance(result, PermissionResultAllow)
+        lines = self._log_lines()
+        self.assertTrue(
+            any(l.get("event") == "tool_gate" and l.get("decision") == "defer" for l in lines),
+            lines,
+        )
+        self.assertTrue(all(l.get("trace_id") == "trace-policy-test" for l in lines))
+
+    async def test_needs_approval_for_non_mcp_tool_denies_with_turkish_message(self) -> None:
+        """B-1: an SDK built-in tool has no kahyad-side executor to defer
+        to - needs_approval for it fails closed with the exact Turkish
+        message."""
+        body = json.dumps({"decision": "needs_approval", "reason": "x", "rule": "ladder-v1"}).encode("utf-8")
+        with UnixHTTPFixture(self._tmp.name, respond_json(200, body)) as sock:
+            can_use_tool = make_can_use_tool(sock, "t_1", "trace-1", None)
+            result = await can_use_tool("Bash", {"command": "ls"}, {})
+
+        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertEqual(result.message, POLICY_NEEDS_APPROVAL_NON_MCP_MESSAGE)
+        self.assertEqual(
+            POLICY_NEEDS_APPROVAL_NON_MCP_MESSAGE.encode("utf-8"),
+            "Bu araç için onay gerekiyor ancak bu yüzeyden onaylanamaz (reddedildi).".encode("utf-8"),
+        )
+
+    async def test_needs_approval_with_error_field_denies_fail_closed(self) -> None:
+        """B-1: a self-contradictory needs_approval body (an "error"
+        alongside it) is garbage - fail-closed, never a deferral."""
+        body = json.dumps({"decision": "needs_approval", "error": "x"}).encode("utf-8")
+        with UnixHTTPFixture(self._tmp.name, respond_json(200, body)) as sock:
+            can_use_tool = make_can_use_tool(sock, "t_1", "trace-1", None)
+            result = await can_use_tool("mcp__kahya_memory__memory_write", {}, {})
+
+        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
+
+    async def test_policy_check_request_carries_preflight_true(self) -> None:
+        """B-1: every /policy/check the worker sends is a preflight, so
+        kahyad mints no pending approval/token for it."""
+        captured: list = []
+        body = json.dumps({"decision": "allow", "rule": "ladder-v1"}).encode("utf-8")
+        with UnixHTTPFixture(self._tmp.name, respond_json_capturing(200, body, captured)) as sock:
+            can_use_tool = make_can_use_tool(sock, "t_1", "trace-1", "sess-1")
+            result = await can_use_tool("mcp__kahya_memory__memory_search", {"query": "x"}, {})
+
+        self.assertIsInstance(result, PermissionResultAllow)
+        self.assertEqual(len(captured), 1)
+        self.assertIs(captured[0]["preflight"], True)
+        self.assertEqual(captured[0]["tool_name"], "mcp__kahya_memory__memory_search")
+        self.assertEqual(captured[0]["task_id"], "t_1")
 
     async def test_connection_refused_denies_fail_closed(self) -> None:
         """Fail-closed proven with kahyad's socket absent entirely (the

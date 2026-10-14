@@ -495,6 +495,32 @@ class TestBuildOptions(unittest.TestCase):
         self.assertFalse(warning, f"can_use_tool is shadowed and would never fire: {warning!r}")
 
 
+class TestBuildOptionsApprovalWait(unittest.TestCase):
+    """B-1: the bridge's tools/call budget (set by kahyad when an approval
+    wait is configured) reaches the kahya-mcp stdio server explicitly."""
+
+    def test_toolcall_timeout_forwarded_to_bridge_when_set(self) -> None:
+        from unittest import mock
+
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(VALID_ENVELOPE).encode("utf-8"))
+        with mock.patch.dict(os.environ, {"KAHYA_MCP_TOOLCALL_TIMEOUT_S": "360"}):
+            options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+        self.assertEqual(options.mcp_servers["kahya_memory"]["env"]["KAHYA_MCP_TOOLCALL_TIMEOUT_S"], "360")
+
+    def test_toolcall_timeout_absent_when_unset(self) -> None:
+        from unittest import mock
+
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(VALID_ENVELOPE).encode("utf-8"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KAHYA_MCP_TOOLCALL_TIMEOUT_S", None)
+            options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+        self.assertNotIn("KAHYA_MCP_TOOLCALL_TIMEOUT_S", options.mcp_servers["kahya_memory"]["env"])
+
+
 class TestResumeOptionWiring(unittest.TestCase):
     """W4-02: _build_options must translate envelope.resume/session_id
     into ClaudeAgentOptions(resume=...) - streaming input mode (and

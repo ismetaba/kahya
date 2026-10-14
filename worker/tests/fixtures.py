@@ -41,7 +41,9 @@ def _make_handler(respond: Callable[[http.server.BaseHTTPRequestHandler], None])
 
         def do_POST(self) -> None:  # noqa: N802 - http.server's naming convention
             length = int(self.headers.get("Content-Length", 0))
-            self.rfile.read(length)
+            # Kept on the handler so a capturing responder
+            # (respond_json_capturing) can inspect what the client sent.
+            self.request_body = self.rfile.read(length)
             respond(self)
 
     return Handler
@@ -104,5 +106,22 @@ def respond_hang(delay_s: float) -> Callable[[http.server.BaseHTTPRequestHandler
 
     def respond(_handler: http.server.BaseHTTPRequestHandler) -> None:
         time.sleep(delay_s)
+
+    return respond
+
+
+def respond_json_capturing(
+    status: int, body: bytes, captured: list
+) -> Callable[[http.server.BaseHTTPRequestHandler], None]:
+    """Like ``respond_json``, but first appends each request's decoded JSON
+    body to ``captured`` (B-1: lets a test assert what the worker actually
+    sent, e.g. ``"preflight": true``)."""
+    import json
+
+    inner = respond_json(status, body)
+
+    def respond(handler: http.server.BaseHTTPRequestHandler) -> None:
+        captured.append(json.loads(getattr(handler, "request_body", b"") or b"null"))
+        inner(handler)
 
     return respond
