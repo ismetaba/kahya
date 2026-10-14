@@ -11,9 +11,10 @@
 // supervisor") - this file only adds the two things that generic package
 // intentionally does NOT know about: the fail-closed free-memory gate
 // (memcheck.go) that must run before every spawn, via
-// mlxsup.Config.BeforeSpawn (FIX-I-9), and the
-// idle-TTL unload policy (in-flight request tracking + a periodic
-// idle-check that calls mlxsup's StopForIdle) that only makes sense for a
+// mlxsup.Config.BeforeSpawn (FIX-I-9), and the idle-TTL unload policy
+// (in-flight request tracking + a periodic idle-check that calls mlxsup's
+// StopForIdle; the idle-check holds the same lock Do/Acquire register
+// under, through StopForIdle - FIX-U-2) that only makes sense for a
 // 17GB-resident model sharing a machine with ComfyUI/Wan - mlx/embed's
 // tiny Qwen3-Embedding-0.6B service (W12-11) has no such policy and is
 // unaffected by anything in this package.
@@ -230,14 +231,25 @@ func (s *Supervisor) EnsureRunning(ctx context.Context) error {
 // never skips ahead to cloud"). warmBudget<=0 disables the budget
 // entirely (fn always gets ctx unchanged).
 func (s *Supervisor) Do(ctx context.Context, warmBudget time.Duration, fn func(ctx context.Context) error) error {
-	warmBefore := s.State() == mlxsup.StateOK
+	// FIX-U-2: read "was it warm" AND register this call as in-flight in
+	// ONE s.mu critical section, BEFORE EnsureRunning. checkIdle decides
+	// "zero in-flight" under the same lock and keeps it through
+	// StopForIdle, so from here on the idle monitor can neither decide to
+	// unload under this call nor be half-way through an unload when
+	// EnsureRunning looks at the child: a Do() arriving during an unload
+	// blocks on s.mu until the child is reaped and mlxsup's cmd is nil,
+	// then EnsureRunning respawns it (a cold load - warmBefore is false, so
+	// no warm budget is applied - never a connection reset or an "exited
+	// before becoming healthy" error).
+	s.mu.Lock()
+	warmBefore := s.sup.State() == mlxsup.StateOK
+	s.inFlight++
+	s.mu.Unlock()
+	defer s.releaseOne()
 
 	if err := s.EnsureRunning(ctx); err != nil {
 		return err
 	}
-
-	release := s.Acquire()
-	defer release()
 
 	callCtx := ctx
 	if warmBefore && warmBudget > 0 {
@@ -255,19 +267,29 @@ func (s *Supervisor) Do(ctx context.Context, warmBudget time.Duration, fn func(c
 // after it completes (success or failure alike). This is what the
 // idle-TTL monitor consults: "ZERO in-flight requests" (task spec step 1)
 // is only ever true between a release() and the next Acquire().
+//
+// Do is the race-free composition (it registers BEFORE EnsureRunning). A
+// caller composing EnsureRunning + Acquire by hand must call Acquire
+// FIRST and EnsureRunning second (FIX-U-2): Acquire after EnsureRunning
+// leaves a window in which checkIdle sees zero in-flight and unloads the
+// server this caller is about to use.
 func (s *Supervisor) Acquire() (release func()) {
 	s.mu.Lock()
 	s.inFlight++
 	s.mu.Unlock()
-	return func() {
-		s.mu.Lock()
-		s.inFlight--
-		if s.inFlight <= 0 {
-			s.inFlight = 0
-			s.idleSince = time.Now()
-		}
-		s.mu.Unlock()
+	return s.releaseOne
+}
+
+// releaseOne is the release half of Acquire/Do: drops one in-flight
+// request and, at zero, starts the idle clock.
+func (s *Supervisor) releaseOne() {
+	s.mu.Lock()
+	s.inFlight--
+	if s.inFlight <= 0 {
+		s.inFlight = 0
+		s.idleSince = time.Now()
 	}
+	s.mu.Unlock()
 }
 
 // runIdleMonitor is the background goroutine started by New whenever
@@ -295,16 +317,25 @@ func (s *Supervisor) checkIdle() {
 		s.inFlight == 0 &&
 		!s.idleSince.IsZero() &&
 		time.Since(s.idleSince) >= s.cfg.IdleTTL
-	if due {
-		// Reset immediately so a slow StopForIdle (or a concurrent tick)
-		// can never fire twice for the same idle period.
-		s.idleSince = time.Time{}
-	}
-	s.mu.Unlock()
-
 	if !due {
+		s.mu.Unlock()
 		return
 	}
+	// Reset immediately so a slow StopForIdle (or a concurrent tick)
+	// can never fire twice for the same idle period.
+	s.idleSince = time.Time{}
+	// FIX-U-2: the "due" decision (inFlight == 0) and the unload itself
+	// happen under ONE hold of s.mu: Do/Acquire cannot register a new
+	// in-flight request between the decision and the kill, and a Do() that
+	// arrives meanwhile blocks on s.mu until StopForIdle has reaped the
+	// child and cleared mlxsup's cmd, then respawns. The hold is bounded
+	// by mlxsup's stopGrace (2s) plus the kill; State() and Stop() take
+	// only mlxsup's own lock, so /health and shutdown are never blocked by
+	// it. Lock order is always mlx s.mu -> mlxsup s.mu (State() above is
+	// already read under s.mu), and StopForIdle does not hold mlxsup's lock
+	// while it waits for the reap - no deadlock. OnUnloaded runs after the
+	// unlock: it may write the ledger and must not hold up callers.
+	//
 	// NOTE (observed live, KAHYA_MLX_TESTS=1): mlxsup.Supervisor.
 	// StopForIdle sets its OWN State() to "down" BEFORE it finishes
 	// SIGKILLing/reaping the child (which, for a real ~16GB process, can
@@ -318,6 +349,7 @@ func (s *Supervisor) checkIdle() {
 	// counter), never infer it from State() alone - see mlx/live_test.go's
 	// own comment on this exact point.
 	s.sup.StopForIdle()
+	s.mu.Unlock()
 	if s.cfg.OnUnloaded != nil {
 		s.cfg.OnUnloaded()
 	}
