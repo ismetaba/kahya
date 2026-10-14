@@ -275,13 +275,23 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 	// that method's doc comment - kept SEPARATE from this package's own
 	// EventTaskUserHalted below (the exact ledger `kind` string the W6-03
 	// acceptance criterion greps for).
+	//
+	// FIX-I-14: only a transition that actually happened counts as a halt
+	// (haltedNow, halted_at, task.user_halted below). A lost race
+	// (ErrLostTransitionRace - the task concurrently reached a terminal
+	// status) or an illegal edge is logged and NOT counted; the remaining
+	// safety steps (outbox cancel, approvals) still run regardless.
+	haltedNow = true
 	if err := x.machine.Transition(ctx, traceID, taskID, task.StatusUserHalted); err != nil {
 		x.logJSONLErr(traceID, "halt.transition_failed", taskID, err)
+		haltedNow = false
 	}
-	if err := x.store.SetTaskHaltedAt(ctx, sqlcgen.SetTaskHaltedAtParams{
-		HaltedAt: sql.NullString{String: x.nowRFC3339(), Valid: true}, UpdatedAt: x.nowRFC3339(), ID: taskID,
-	}); err != nil {
-		x.logJSONLErr(traceID, "halt.halted_at_persist_failed", taskID, err)
+	if haltedNow {
+		if err := x.store.SetTaskHaltedAt(ctx, sqlcgen.SetTaskHaltedAtParams{
+			HaltedAt: sql.NullString{String: x.nowRFC3339(), Valid: true}, UpdatedAt: x.nowRFC3339(), ID: taskID,
+		}); err != nil {
+			x.logJSONLErr(traceID, "halt.halted_at_persist_failed", taskID, err)
+		}
 	}
 
 	// Step 4: cancel the task's undelivered outbox rows (task spec step
@@ -309,7 +319,10 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 
 	// Step 6: ledger task.user_halted (task spec step 3.6 - the
 	// approval.invalidated half is already ledgered per-row above, by
-	// InvalidateApprovalsForTask itself).
+	// InvalidateApprovalsForTask itself) - only for a real halt (FIX-I-14).
+	if !haltedNow {
+		return false, nil
+	}
 	x.ledgerRaw(ctx, traceID, EventTaskUserHalted, map[string]any{
 		"event": EventTaskUserHalted, "task_id": taskID,
 	})

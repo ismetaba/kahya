@@ -700,6 +700,24 @@ shape).
 - `UpdateTaskState` — `done` or `error` once the terminal outcome is known.
 - Ledger `task_done` / `task_error` / `task_timeout` to match.
 
+**Every task row walks the status machine (FIX-I-14):** cloud or local,
+`tasks.status` goes `intent → executing → done|failed` (plus the W4-02
+park/block/halt edges). Secret-lane and downgrade-routed local tasks
+(`handleSecretLaneTask`) used to stay at `intent` forever, so `kahya task
+show` reported an answered task as `intent` and every halt-all swept it;
+they now enter `executing` before the local answer and end `done` (answer
+delivered) or `failed` (any local-answer error, `yerel model için bellek
+yok` included — fail-closed, never a cloud fallback). The morning
+briefing's own task row does the same (`failed` on a spawn/summary error,
+`done` once the summary validated; `tasks.state` `done`/`error` alongside).
+A task that has not started yet can be halted (`intent → user_halted`, the
+one new edge), and a halt counts — `"⛔ N görev durduruldu"`, `halted_at`,
+`task.user_halted` — only when the `user_halted` transition really
+happened. Migration 0021 (data only) moves old `intent` rows whose
+`state` is `done`/`error` to `done`/`failed`. A task row without a stored
+envelope (the briefing's) is never resumed: the outbox dispatcher fails it
+and acks the resume row (`outbox.envelope_invalid`, once — G10-E2).
+
 All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a
 timeout — which cancels the timeout context by design — never prevents

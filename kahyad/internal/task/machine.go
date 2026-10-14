@@ -42,7 +42,8 @@ const (
 )
 
 // allowedTransitions is the COMPLETE legal-transition table (task spec
-// step 2, verbatim): intent->executing; executing->{done, failed,
+// step 2, verbatim, plus FIX-I-14's intent->user_halted):
+// intent->{executing, user_halted}; executing->{done, failed,
 // blocked_user, bekliyor-yeniden-deneme, user_halted};
 // bekliyor-yeniden-deneme->{executing, user_halted};
 // blocked_user->{executing, failed, user_halted}. Any (from, to) pair not
@@ -52,9 +53,16 @@ const (
 // with no entry at all (done, failed, user_halted) has zero legal
 // outbound edges, which is exactly right: they are this machine's
 // terminal states.
+//
+// intent->user_halted (FIX-I-14): a task that has not started yet can be
+// halted too - the window between InsertTask and the first Transition on
+// the cloud path, a briefing's own window, and legacy local rows from
+// before every task row walked the machine. Without the edge every ⌥⎋
+// attempted an illegal transition per such row and still counted it.
 var allowedTransitions = map[string]map[string]bool{
 	StatusIntent: {
-		StatusExecuting: true,
+		StatusExecuting:  true,
+		StatusUserHalted: true,
 	},
 	StatusExecuting: {
 		StatusDone:        true,

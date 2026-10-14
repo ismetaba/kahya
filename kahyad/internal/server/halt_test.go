@@ -133,6 +133,34 @@ func TestHandleHaltAllHaltsEveryExecutingTask(t *testing.T) {
 	}
 }
 
+// TestHandleHaltAllSkipsDoneTasks (FIX-I-14): a completed task is never
+// counted in "N görev durduruldu".
+func TestHandleHaltAllSkipsDoneTasks(t *testing.T) {
+	client, st := newHaltTestFixture(t)
+	insertHaltTestTask(t, st, "t-done")
+	m := task.NewMachine(st.Queries, st)
+	if err := m.Transition(context.Background(), "trace-t-done", "t-done", task.StatusDone); err != nil {
+		t.Fatalf("Transition(->done): %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]bool{"all": true})
+	resp, err := client.Post("http://kahyad/halt", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /halt: %v", err)
+	}
+	defer resp.Body.Close()
+	var hr haltResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if hr.Halted != 0 {
+		t.Errorf("halted = %d, want 0", hr.Halted)
+	}
+	if got, _ := st.Queries.GetTaskByID(context.Background(), "t-done"); got.Status != task.StatusDone {
+		t.Errorf("status = %q, want done", got.Status)
+	}
+}
+
 func TestHandleHaltSingleTaskID(t *testing.T) {
 	client, st := newHaltTestFixture(t)
 	insertHaltTestTask(t, st, "t1")

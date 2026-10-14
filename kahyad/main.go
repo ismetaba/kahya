@@ -955,9 +955,11 @@ func run() int {
 		// W6-01: fans out to both Telegram (remote) and Hammerspoon (local) - see localDelivery's own doc comment above.
 		Delivery:  localDelivery,
 		TaskStore: st.Queries,
-		Ledger:    st,
-		Dedupe:    briefing.StoreDedupeChecker{Store: st.Queries},
-		Log:       log,
+		// FIX-I-14: the briefing's task row walks the status machine too.
+		Machine: taskMachine,
+		Ledger:  st,
+		Dedupe:  briefing.StoreDedupeChecker{Store: st.Queries},
+		Log:     log,
 	}
 	sched.RegisterHandler("morning-briefing", func(ctx context.Context) error {
 		_, err := briefingOrchestrator.Run(ctx, scheduler.TraceIDFromContext(ctx))

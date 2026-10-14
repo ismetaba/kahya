@@ -389,7 +389,7 @@ func TestMigrationFromV1UpgradesToV2(t *testing.T) {
 	}
 	defer s.Close()
 
-	const latestVersion = 20 // 0001-0020; bump alongside each new migration file
+	const latestVersion = 21 // 0001-0021; bump alongside each new migration file
 	if s.SchemaVersion() != latestVersion {
 		t.Errorf("SchemaVersion() after upgrade = %d, want %d", s.SchemaVersion(), latestVersion)
 	}

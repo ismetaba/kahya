@@ -334,6 +334,18 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		d.ledgerRaw(ctx, t.TraceID, "outbox.envelope_invalid", map[string]any{
 			"event": "outbox.envelope_invalid", "task_id": t.ID, "err": err.Error(),
 		})
+		// G10-E2 (with FIX-I-14): a task with no usable stored envelope (the
+		// briefing's row has none; a corrupt one cannot be decoded) can
+		// never be resumed. Leaving the row unacknowledged made lease
+		// expiry re-claim it every leaseDuration forever, with the task
+		// stuck in 'executing'. Fail-closed instead: the task fails (never
+		// 'done'; kahya task show says so) and the row is acked.
+		if terr := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusFailed); terr != nil {
+			d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
+				"event": "outbox.transition_failed", "task_id": t.ID, "err": terr.Error(),
+			})
+		}
+		d.markDelivered(ctx, row.ID)
 		return
 	}
 
@@ -521,8 +533,10 @@ func (d *Dispatcher) markDelivered(ctx context.Context, outboxID int64) {
 }
 
 // ErrNoStoredEnvelope is returned by buildResumeEnvelope when the task
-// row has no persisted envelope to resume from at all (should not happen
-// in production - POST /v1/task always stores one at InsertTask time).
+// row has no persisted envelope to resume from at all. POST /v1/task always
+// stores one; the briefing's task row has none (it is never resumed - its
+// next scheduled run starts from scratch), so processResume fails such a
+// task and acks the row (G10-E2).
 var ErrNoStoredEnvelope = errors.New("outbox: task has no stored envelope to resume from")
 
 // buildResumeEnvelope reconstructs the spawn.Envelope to re-spawn t's

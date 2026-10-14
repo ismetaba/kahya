@@ -1245,12 +1245,25 @@ func (s *Server) logClarificationTurn(ctx context.Context, traceID, taskID strin
 // caller) is this function's own original behavior: open its own SSE
 // stream exactly as before.
 func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt, lane string, speakOverride bool, dbCtx, persistCtx context.Context, preOpened func(event string, payload any)) {
+	// FIX-I-14: this task enters the W4-02 status machine like a cloud task
+	// (intent -> executing here, done|failed in finishSecretLaneTask) - it
+	// used to sit at 'intent' forever, so `kahya task show` reported an
+	// answered task as intent and every halt-all swept it. Best-effort,
+	// like handleTask's own transition: a failure is logged and the answer
+	// path is unaffected.
+	if s.taskMachine != nil {
+		if err := s.taskMachine.Transition(dbCtx, traceID, taskID, task.StatusExecuting); err != nil {
+			log.Warn("task_transition_executing_failed", "task_id", taskID, "err", err.Error())
+		}
+	}
+
 	writeSSE := preOpened
 	if writeSSE == nil {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			log.Error("task_streaming_unsupported")
 			writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
+			s.finishLocalTaskStatus(persistCtx, log, taskID, traceID, task.StatusFailed)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1307,6 +1320,9 @@ func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logg
 				log.Warn("task_ledger_error", "kind", "task_error", "err", lerr.Error())
 			}
 		}
+		// FIX-I-14: a failed local answer (mlx.ErrLocalModelUnavailable
+		// included - fail-closed, never a cloud fallback) is terminal.
+		s.finishLocalTaskStatus(persistCtx, log, taskID, traceID, task.StatusFailed)
 		writeSSE("error", map[string]string{"message": msg})
 		return
 	}
@@ -1324,6 +1340,7 @@ func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logg
 		}
 	}
 	log.Info("task_done", "task_id", taskID, "processed_locally", true)
+	s.finishLocalTaskStatus(persistCtx, log, taskID, traceID, task.StatusDone)
 
 	// W6-01: first_token's OTHER relay point (see logFirstToken's own doc
 	// comment) - the W3-08 secret-lane LOCAL path. mlx_lm.server's
@@ -1348,6 +1365,23 @@ func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logg
 	// event above - see maybeSpeak's own doc comment (SCOPE DECISION: this
 	// is the interactive `kahya ask` path's own call site).
 	s.maybeSpeak(persistCtx, traceID, taskID, lane, speakOverride, answer)
+}
+
+// finishLocalTaskStatus moves a local (secret-lane / downgrade-routed) task
+// from 'executing' to its terminal status (FIX-I-14). Only from 'executing':
+// a halt that won meanwhile (user_halted) - or an executing transition that
+// never took hold - is left as it is.
+func (s *Server) finishLocalTaskStatus(persistCtx context.Context, log *logx.Logger, taskID, traceID, to string) {
+	if s.taskMachine == nil {
+		return
+	}
+	cur, err := s.taskDurabilityStatus(persistCtx, taskID)
+	if err != nil || cur != task.StatusExecuting {
+		return
+	}
+	if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, to); terr != nil {
+		log.Warn("task_transition_terminal_failed", "task_id", taskID, "to", to, "err", terr.Error())
+	}
 }
 
 // taskOutcomeMapping is spawn.Run's terminal outcome translated into the

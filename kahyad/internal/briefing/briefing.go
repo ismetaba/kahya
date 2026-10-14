@@ -41,6 +41,7 @@ import (
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/task"
 )
 
 // Turkish, byte-exact user-facing strings (CLAUDE.md language policy;
@@ -104,8 +105,21 @@ type TaintWriter interface {
 // task's - the SAME mechanism that lets POST /policy/check deny a W-class
 // call from this untrusted session. *store.Store's sqlc Queries satisfies
 // this directly.
+//
+// UpdateTaskState/GetTaskByID (FIX-I-14) record how the run's worker
+// session ended (tasks.state done|error) and let the terminal transition
+// skip a task a proxy callback or a halt already moved.
 type TaskStore interface {
 	InsertTask(ctx context.Context, arg sqlcgen.InsertTaskParams) (sqlcgen.Task, error)
+	UpdateTaskState(ctx context.Context, arg sqlcgen.UpdateTaskStateParams) error
+	GetTaskByID(ctx context.Context, id string) (sqlcgen.Task, error)
+}
+
+// Machine is the narrow task-status-transition surface Run needs (FIX-I-14)
+// - *kahyad/internal/task.Machine satisfies it (the same shape
+// kahyad/internal/halt.Machine uses).
+type Machine interface {
+	Transition(ctx context.Context, traceID, taskID, to string) error
 }
 
 // Ledger is the append-only events sink this package writes to.
@@ -169,6 +183,10 @@ type Orchestrator struct {
 	TaskStore TaskStore
 	Ledger    Ledger
 	Dedupe    DedupeChecker
+	// Machine (FIX-I-14) drives the briefing's own task row through the
+	// W4-02 status machine: intent -> executing -> done|failed. Optional
+	// (nil skips the transitions); main.go wires the daemon's task.Machine.
+	Machine Machine
 
 	// Log is the process-wide JSONL logger (HANDOFF §4 ⚑: "her satir
 	// trace_id iceren JSONL") - optional (nil is a documented no-op,
@@ -358,6 +376,10 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		}); err != nil {
 			return result, fmt.Errorf("briefing: insert task row: %w", err)
 		}
+		// FIX-I-14: the briefing's row walks the status machine like every
+		// other task (intent -> executing -> done|failed) instead of
+		// sitting at 'intent' for every later halt-all to sweep.
+		o.transitionTask(ctx, traceID, taskID, task.StatusExecuting)
 	}
 
 	// Worker JSONL line (started) - the untrusted session's own
@@ -370,6 +392,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	if err != nil {
 		o.jsonlWarn(traceID, "briefing_worker_failed", "task_id", taskID, "err", err.Error())
 		o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "spawn_failed", "err": err.Error()})
+		o.finishTask(ctx, traceID, taskID, task.StatusFailed)
 		return result, fmt.Errorf("briefing: spawn worker: %w", err)
 	}
 
@@ -377,15 +400,20 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	if err := json.Unmarshal([]byte(rawJSON), &raw); err != nil {
 		o.jsonlWarn(traceID, "briefing_worker_failed", "task_id", taskID, "err", err.Error())
 		o.ledgerRaw(ctx, traceID, EventSummaryRejected, map[string]any{"err": err.Error()})
+		o.finishTask(ctx, traceID, taskID, task.StatusFailed)
 		return result, fmt.Errorf("briefing: decode summary: %w", err)
 	}
 	validated, err := ValidateBriefingSummaryV1(raw)
 	if err != nil {
 		o.jsonlWarn(traceID, "briefing_worker_failed", "task_id", taskID, "err", err.Error())
 		o.ledgerRaw(ctx, traceID, EventSummaryRejected, map[string]any{"err": err.Error()})
+		o.finishTask(ctx, traceID, taskID, task.StatusFailed)
 		return result, fmt.Errorf("briefing: validate summary: %w", err)
 	}
 	o.jsonlInfo(traceID, "briefing_worker_done", "task_id", taskID, "lines", len(validated.Lines))
+	// The worker session (this task) is over; delivery below is not part of
+	// it (a failed send is ledgered/logged on its own).
+	o.finishTask(ctx, traceID, taskID, task.StatusDone)
 
 	// --- Defense-in-depth redaction (task spec step 6): the pre-
 	// classifier runs ONCE MORE on the final, already-validated summary
@@ -433,6 +461,44 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 
 	result.Delivered = true
 	return result, nil
+}
+
+// transitionTask moves the briefing's task row (FIX-I-14). No-op when no
+// task row was written (TaskStore unwired) or no Machine is wired; a
+// failure is logged, never fatal to the briefing.
+func (o *Orchestrator) transitionTask(ctx context.Context, traceID, taskID, to string) {
+	if o.TaskStore == nil || o.Machine == nil {
+		return
+	}
+	if err := o.Machine.Transition(ctx, traceID, taskID, to); err != nil {
+		o.jsonlWarn(traceID, "briefing_task_transition_failed", "task_id", taskID, "to", to, "err", err.Error())
+	}
+}
+
+// finishTask records the end of the briefing's worker session (FIX-I-14):
+// tasks.state done|error and the matching terminal status. The writes
+// ignore Run's cancellation - the outcome must be recorded either way.
+func (o *Orchestrator) finishTask(ctx context.Context, traceID, taskID, to string) {
+	if o.TaskStore == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	state := "done"
+	if to != task.StatusDone {
+		state = "error"
+	}
+	if err := o.TaskStore.UpdateTaskState(ctx, sqlcgen.UpdateTaskStateParams{
+		State: state, UpdatedAt: rfc3339(o.now()), ID: taskID,
+	}); err != nil {
+		o.jsonlWarn(traceID, "briefing_task_state_failed", "task_id", taskID, "err", err.Error())
+	}
+	// Only from 'executing': the worker's proxy may already have parked,
+	// budget-blocked or failed the task (or a halt won) - never overridden,
+	// and no illegal-transition noise.
+	if t, err := o.TaskStore.GetTaskByID(ctx, taskID); err != nil || t.Status != task.StatusExecuting {
+		return
+	}
+	o.transitionTask(ctx, traceID, taskID, to)
 }
 
 func (o *Orchestrator) ledgerRaw(ctx context.Context, traceID, kind string, payload map[string]any) {

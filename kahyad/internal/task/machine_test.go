@@ -196,6 +196,29 @@ func TestUserHaltedToExecutingIllegal(t *testing.T) {
 	}
 }
 
+// TestIntentToUserHaltedLegal (FIX-I-14): a task that never started (the
+// window between InsertTask and its first Transition, a briefing or
+// secret-lane row from before the fix) can be halted too - no
+// task.illegal_transition, and it stays out of every resume path.
+func TestIntentToUserHaltedLegal(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t9")
+	m := NewMachine(st.Queries, st)
+
+	if err := m.Transition(context.Background(), "trace", "t9", StatusUserHalted); err != nil {
+		t.Fatalf("Transition(intent->user_halted) error = %v, want nil (legal)", err)
+	}
+	if got := taskStatus(t, st, "t9"); got != StatusUserHalted {
+		t.Errorf("status = %q, want %q", got, StatusUserHalted)
+	}
+	if n := countEventsOfKind(t, st, EventIllegalTransition); n != 0 {
+		t.Errorf("%s rows = %d, want 0", EventIllegalTransition, n)
+	}
+	if got := taskAttempts(t, st, "t9"); got != 0 {
+		t.Errorf("attempts = %d, want 0 (halting a never-started task is not a dispatch)", got)
+	}
+}
+
 func TestIntentToDoneIllegal(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t5")
