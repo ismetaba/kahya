@@ -15,7 +15,8 @@
 //
 // The OS temp dir carve-out (B-10 fix): a temp root itself (/tmp,
 // /private/tmp, os.TempDir(), $TMPDIR) is never mountable; only its STRICT
-// descendants are, and /var/folders is not a temp root at all.
+// descendants are, and /var/folders is not a temp root at all. A strict
+// ancestor of a temp root or a system deny dir (/private) is never mountable.
 package shell
 
 import (
@@ -113,6 +114,24 @@ func isStrictlyUnderAnyCI(target string, roots []string) bool {
 	for _, root := range roots {
 		if root != "" && isStrictlyUnderCI(root, target) {
 			return true
+		}
+	}
+	return false
+}
+
+// isStrictAncestorOfAnyCI reports whether target is a STRICT ancestor of
+// any non-empty root (root sits underneath target, never equal to it),
+// case-insensitively (APFS). Mounting such a target would expose every
+// denied root below it, so validateWorkdir rejects it (B-10 review fix:
+// /private is the common parent of /private/etc, /private/var and
+// /private/tmp).
+func isStrictAncestorOfAnyCI(target string, roots []string) bool {
+	for _, root := range roots {
+		if root != "" && isStrictlyUnderCI(target, root) {
+			return true
+		}
+		if root != "" && filepath.Clean(target) == "/" && filepath.Clean(root) != "/" {
+			return true // isStrictlyUnderCI never treats "/" as a root
 		}
 	}
 	return false
@@ -227,6 +246,12 @@ func validateWorkdir(cp mcpfs.CanonicalPath, home string, allowedRoots []string)
 	tempRoots := osTempDirRoots()
 	if equalsAnyCI(workdir, tempRoots) {
 		return "temp_root_itself", errors.New(reasonWorkdirTempRoot)
+	}
+	// An ANCESTOR of a system deny dir or of a temp root (macOS /private,
+	// also reached as /Volumes/<boot volume>/private) would bind-mount those
+	// denied children rw at /work: rejected before the carve-out can apply.
+	if isStrictAncestorOfAnyCI(workdir, systemDenyDirs) || isStrictAncestorOfAnyCI(workdir, tempRoots) {
+		return "system_dir", errors.New(reasonWorkdirScopeRejected)
 	}
 	if isStrictlyUnderAnyCI(workdir, tempRoots) {
 		return "", nil

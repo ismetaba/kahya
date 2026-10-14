@@ -228,6 +228,62 @@ func TestValidateWorkdir_TempDirSiblingNotCarvedOut(t *testing.T) {
 	}
 }
 
+// TestValidateWorkdir_AncestorOfDeniedDirRejected: a workdir that is a
+// strict ANCESTOR of a system deny dir or of a temp root (macOS /private is
+// the common parent of /private/etc, /private/var and /private/tmp) would
+// bind-mount those denied children rw at /work, so it is rejected as
+// system_dir too. "/Volumes/Macintosh HD/private" canonicalizes to /private
+// on macOS (the boot volume alias is a symlink to "/").
+func TestValidateWorkdir_AncestorOfDeniedDirRejected(t *testing.T) {
+	checked := 0
+	for _, p := range []string{"/private", "/Volumes/Macintosh HD/private"} {
+		if fi, err := os.Stat(p); err != nil || !fi.IsDir() {
+			continue // Linux: no /private
+		}
+		checked++
+		t.Run(p, func(t *testing.T) {
+			if got := rejectedWorkdirReason(t, productionShapedHome, p); got != "system_dir" {
+				t.Fatalf("workdir %q: ledger reason = %q, want system_dir", p, got)
+			}
+			cp, err := mcpfs.Canonicalize(productionShapedHome, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, verr := validateWorkdir(cp, productionShapedHome, nil)
+			if code != "system_dir" || verr == nil || verr.Error() != reasonWorkdirScopeRejected {
+				t.Fatalf("validateWorkdir(%q) = (%q, %v), want (system_dir, reasonWorkdirScopeRejected)", p, code, verr)
+			}
+		})
+	}
+	if runtime.GOOS == "darwin" && checked == 0 {
+		t.Fatal("macOS without /private: test precondition broken")
+	}
+}
+
+func TestIsStrictAncestorOfAnyCI(t *testing.T) {
+	roots := []string{"/private/etc", "/private/tmp", "/Etc"}
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"/private", true},
+		{"/PRIVATE", true},
+		{"/private/etc", false}, // equal: handled by the ancestor-or-self deny rules, not this one
+		{"/private/etc/x", false},
+		{"/priv", false},
+		{"/", true},
+		{"/home/x", false},
+	}
+	for _, c := range cases {
+		if got := isStrictAncestorOfAnyCI(c.target, roots); got != c.want {
+			t.Errorf("isStrictAncestorOfAnyCI(%q) = %v, want %v", c.target, got, c.want)
+		}
+	}
+	if isStrictAncestorOfAnyCI("/private", []string{""}) {
+		t.Error("an empty root must never match")
+	}
+}
+
 func TestOSTempDirRoots_NoEmptyDotOrSlashEntries(t *testing.T) {
 	t.Setenv("TMPDIR", "")
 	roots := osTempDirRoots()
