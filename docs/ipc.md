@@ -167,8 +167,24 @@ all** (an upstream `401 authentication_error`, task `failed`). Now:
   durduruldu.`). Only the header's presence is checked. The egress gate
   (secret-lane backstop) still runs first, so its `403` always wins.
 - `CLAUDE_CODE_OAUTH_TOKEN` is deliberately **not** stripped from the
-  worker env (owner decision): in passthrough it is a legitimate
-  credential source of the worker CLI's own login.
+  worker env by kahyad (owner decision G11-1/G11-2; G00 H-2(b) not
+  applied). It is **not** a working way to give the worker a real login,
+  though: the worker's belt-and-braces leak check (`_check_real_key_leak`,
+  "API anahtarı worker'a verilmez") refuses to start, in every credential
+  mode, when any env value contains `sk-ant-` — and every real Claude Code
+  OAuth token does (`sk-ant-oat01-…`, from `claude setup-token`). Such a
+  task exits 2 before any SDK client exists, with one `worker.jsonl` line
+  `{"event":"real_key_in_env","var":"CLAUDE_CODE_OAUTH_TOKEN"}` (the value
+  is never logged). **The passthrough credential is the worker CLI's
+  stored `claude /login` session** (macOS Keychain); do not export
+  `CLAUDE_CODE_OAUTH_TOKEN` into kahyad's environment (launchd plist or
+  shell). Only non-secret values pass the check — the hermetic e2e seam
+  `CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy` below. Pinned by
+  `worker/tests/test_main.py`
+  `test_passthrough_refuses_real_claude_code_oauth_token_in_env` /
+  `test_passthrough_accepts_non_secret_oauth_seam_value`. (Accepting a
+  real `sk-ant-oat` token here would loosen the leak check and needs its
+  own owner decision.)
 
 Hermetic header-capture probe (handbook G11 I-1 Repro A, 2026-10-14,
 pinned `claude-agent-sdk==0.2.111` → bundled CLI **2.1.202**; fresh
@@ -1092,10 +1108,12 @@ seed note, one `trace_id` spanning every JSONL log, every injected
    SQLite is genuinely rebuilt from the markdown source of truth).
    `TestW12PassthroughCloudAuth` (FIX-I-1) runs the default
    `credential_mode: passthrough` the same way, with the worker CLI's own
-   credential supplied by `CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy` (never
-   the developer's real login; the CLI's other egress is pinned to a dead
-   local proxy): the mock must see `Authorization: Bearer hermetic-dummy`
-   and never the local token.
+   credential supplied by `CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy` (a
+   test-only seam, never the developer's real login — a real `sk-ant-oat01-…`
+   token in that variable is refused by the worker's leak check, see the
+   W12-08 note; the CLI's other egress is pinned to a dead local proxy):
+   the mock must see `Authorization: Bearer hermetic-dummy` and never the
+   local token.
 
 2. **`make install-agent`** (or, for a quick foreground run instead of a
    launchd-managed one, `make run-daemon` in a separate terminal) — brings

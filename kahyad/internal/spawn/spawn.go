@@ -585,8 +585,14 @@ func killGroup(cmd *exec.Cmd) {
 //     the auxiliary pair itself (CLIAuxiliaryModel).
 //
 // CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT listed (owner decision
-// G11-1/G11-2): in passthrough it is a legitimate credential source of the
-// worker CLI's own Claude Code login, which is what passthrough forwards.
+// G11-1/G11-2; G00 H-2(b) not applied): kahyad does not strip the worker
+// CLI's own credential variable. It is not a way to hand the worker a REAL
+// login, though: the worker's leak check (_check_real_key_leak in
+// worker/kahya_worker/__main__.py) refuses to start whenever any env value
+// contains "sk-ant-", which every real Claude Code OAuth token
+// ("sk-ant-oat01-...") does. The passthrough credential is the CLI's stored
+// `claude /login` session; only non-secret values such as the hermetic e2e
+// seam pass through usefully (docs/ipc.md W12-08 note).
 var secretEnvDenylist = map[string]bool{
 	"KAHYA_ANTHROPIC_KEY_OVERRIDE":   true,
 	"ANTHROPIC_API_KEY":              true,

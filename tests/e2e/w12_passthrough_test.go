@@ -21,6 +21,9 @@ import (
 // hermetic-dummy (the CLI's documented OAuth-token env source; deliberately
 // NOT in spawn's secretEnvDenylist, owner decision G11-1/G11-2) so the test
 // never depends on - or touches - the developer's real Claude Code login.
+// This is a test-only seam: a REAL token ("sk-ant-oat01-...") in that
+// variable is refused by the worker's leak check (real_key_in_env), so in
+// production the credential is the CLI's stored `claude /login` session.
 // Before FIX-I-1 BuildEnv also set ANTHROPIC_API_KEY=<token>, the CLI chose
 // that as its single credential source, and the proxy stripped it: every
 // passthrough call reached the upstream with no credential at all.

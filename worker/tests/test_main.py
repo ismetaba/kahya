@@ -291,6 +291,50 @@ class TestStartupEnvAssertions(unittest.TestCase):
             code, _out = run_main_with(dict(VALID_ENVELOPE), env)
         self.assertEqual(code, 2)
 
+    def test_passthrough_refuses_real_claude_code_oauth_token_in_env(self) -> None:
+        """FIX-I-1 (review): kahyad passes CLAUDE_CODE_OAUTH_TOKEN through
+        (owner decision G11-1/G11-2), but a real Claude Code OAuth token
+        starts with "sk-ant-oat01-" and the leak check refuses it in every
+        mode - the passthrough credential is the CLI's stored `claude
+        /login` session, never an env-supplied real token (docs/ipc.md
+        W12-08 note). The refusal happens before any SDK client exists and
+        the log names the variable, never its value."""
+        def refuse_real_client(options=None):
+            raise AssertionError("ClaudeSDKClient constructed despite a real token in env")
+
+        token = "sk-ant-oat01-" + "x" * 40
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = self._passthrough_env(log_dir, CLAUDE_CODE_OAUTH_TOKEN=token)
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            code, out = run_main_with(dict(VALID_ENVELOPE), env, client_factory=refuse_real_client)
+            with open(os.path.join(log_dir, "worker.jsonl"), encoding="utf-8") as f:
+                raw_log = f.read()
+            lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        leaks = [l for l in lines if l.get("event") == "real_key_in_env"]
+        self.assertEqual(len(leaks), 1, lines)
+        self.assertEqual(leaks[0].get("var"), "CLAUDE_CODE_OAUTH_TOKEN")
+        self.assertNotIn("sk-ant-", raw_log.lower())
+
+    def test_passthrough_accepts_non_secret_oauth_seam_value(self) -> None:
+        """The hermetic e2e seam (tests/e2e TestW12PassthroughCloudAuth,
+        CLAUDE_CODE_OAUTH_TOKEN=hermetic-dummy) carries no "sk-ant-" bytes,
+        so the same passthrough env starts normally."""
+        messages = [
+            ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=1, session_id="sess-1",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as log_dir:
+            env = self._passthrough_env(log_dir, CLAUDE_CODE_OAUTH_TOKEN="hermetic-dummy")
+            code, _out = run_main_with(
+                dict(VALID_ENVELOPE), env, client_factory=fake_client_factory(messages=messages)
+            )
+        self.assertEqual(code, 0)
+
 
 class TestStdoutProtocolAndSession(unittest.TestCase):
     def test_success_stream_emits_session_delta_result_one_json_per_line(self) -> None:

@@ -207,7 +207,11 @@ WORKER_SETTING_SOURCES: tuple[str, ...] = ()
 # Either way, the "API anahtarı worker'a verilmez" invariant (HANDOFF §4
 # IPC ⚑ - a real Anthropic key must never reach the worker) is checked
 # BELT-AND-BRACES IN BOTH MODES: no environment value may ever contain the
-# "sk-ant-" prefix of a real Anthropic key (see _check_real_key_leak).
+# "sk-ant-" prefix of a real Anthropic key (see _check_real_key_leak). That
+# includes CLAUDE_CODE_OAUTH_TOKEN: kahyad passes it through (owner decision
+# G11-1/G11-2), but a real Claude Code OAuth token ("sk-ant-oat01-...") is
+# refused here, so the passthrough credential is the CLI's stored
+# `claude /login` session (docs/ipc.md W12-08 note).
 _TASK_TOKEN_RE = re.compile(r"^kahya-task-[0-9a-f]{32}$")
 _TASK_TOKEN_HEADER = "X-Kahya-Task-Token"
 _CUSTOM_HEADER_LINE_RE = re.compile(

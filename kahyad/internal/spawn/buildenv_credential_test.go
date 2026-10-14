@@ -120,10 +120,14 @@ func TestBuildEnvPinsCLIAuxiliaryModel(t *testing.T) {
 }
 
 // TestBuildEnvKeepsWorkerCLIOwnOAuthToken pins owner decision G11-1/G11-2
-// (G00 H-2(b) deliberately NOT applied): CLAUDE_CODE_OAUTH_TOKEN is a
-// legitimate credential source of the worker CLI's own Claude Code login
-// in passthrough mode, so BuildEnv must pass it through untouched - unlike
-// ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, which would override that login.
+// (G00 H-2(b) deliberately NOT applied): kahyad does not strip the worker
+// CLI's own CLAUDE_CODE_OAUTH_TOKEN, so BuildEnv must pass it through
+// untouched - unlike ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, which would
+// override the CLI's login. This is the kahyad half only: the worker's own
+// leak check still refuses a real "sk-ant-oat01-..." value (worker/tests/
+// test_main.py test_passthrough_refuses_real_claude_code_oauth_token_in_env),
+// so in production the passthrough credential is the CLI's stored
+// `claude /login` session and this variable only carries non-secret seams.
 func TestBuildEnvKeepsWorkerCLIOwnOAuthToken(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "worker-own-oauth-token")
 	cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "http://127.0.0.1:1", APIKey: "kahya-task-abc", CredentialMode: "passthrough"}
