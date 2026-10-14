@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/secretlane"
 )
 
 // TestGateItemKeepsCleanText proves an item that matches no path glob and
@@ -15,7 +16,7 @@ func TestGateItemKeepsCleanText(t *testing.T) {
 	c := &fakeClassifier{}
 	item := CollectedItem{Section: "gh_pr", Text: "kahya/gold-token#12: bump deps"}
 
-	out := gateItem(context.Background(), c, nil, item)
+	out := gateItem(context.Background(), c, nil, item, secretlane.DefaultBudget)
 	if out.Dropped {
 		t.Fatalf("Dropped = true, want false (clean item)")
 	}
@@ -34,7 +35,7 @@ func TestGateItemDropsOnPathGlobBeforeEverClassifying(t *testing.T) {
 	globs := fakeGlobMatcher{Paths: map[string]bool{"/Users/x/Documents/saglik/notes.md": true}}
 	item := CollectedItem{Section: "file", Text: "notes.md (2026-07-12T08:00:00Z)", Path: "/Users/x/Documents/saglik/notes.md"}
 
-	out := gateItem(context.Background(), c, globs, item)
+	out := gateItem(context.Background(), c, globs, item, secretlane.DefaultBudget)
 	if !out.Dropped {
 		t.Fatal("Dropped = false, want true (path matched a secret-lane glob)")
 	}
@@ -55,7 +56,7 @@ func TestGateItemDropsOnSecretLaneVerdict(t *testing.T) {
 	c := &fakeClassifier{Marks: []string{"IBAN"}}
 	item := CollectedItem{Section: "gh_pr", Text: "kahya/x#3: rotate IBAN in docs"}
 
-	out := gateItem(context.Background(), c, nil, item)
+	out := gateItem(context.Background(), c, nil, item, secretlane.DefaultBudget)
 	if !out.Dropped {
 		t.Fatal("Dropped = false, want true (secret-lane verdict)")
 	}
@@ -75,7 +76,7 @@ func TestGateItemFailClosedOnClassifierError(t *testing.T) {
 	c := &fakeClassifier{Err: errors.New("qwen unavailable (simulated)")}
 	item := CollectedItem{Section: "gh_pr", Text: "kahya/x#4: totally ordinary PR title"}
 
-	out := gateItem(context.Background(), c, nil, item)
+	out := gateItem(context.Background(), c, nil, item, secretlane.DefaultBudget)
 	if !out.Dropped {
 		t.Fatal("Dropped = false, want true (classifier error must fail closed)")
 	}
@@ -92,9 +93,43 @@ func TestGateItemFailClosedOnClassifierError(t *testing.T) {
 // "assume safe".
 func TestGateItemFailClosedOnNilClassifier(t *testing.T) {
 	item := CollectedItem{Section: "gh_pr", Text: "anything"}
-	out := gateItem(context.Background(), nil, nil, item)
+	out := gateItem(context.Background(), nil, nil, item, secretlane.DefaultBudget)
 	if !out.Dropped || out.DropReason != DropReasonClassifierUnavailable {
 		t.Fatalf("gateItem(nil classifier) = %+v, want Dropped=true reason=%q", out, DropReasonClassifierUnavailable)
+	}
+}
+
+// slowCleanClassifier answers a clean verdict after delay (a warm local
+// Qwen at the slow end of the live-measured 300-900ms range), or the ctx
+// error when the caller's budget runs out first.
+type slowCleanClassifier struct{ delay time.Duration }
+
+func (c slowCleanClassifier) Classify(ctx context.Context, _ string) (secretlane.Verdict, error) {
+	select {
+	case <-time.After(c.delay):
+		return secretlane.Verdict{SecretLane: false, Category: secretlane.CategoryNone}, nil
+	case <-ctx.Done():
+		return secretlane.Verdict{SecretLane: true, Category: secretlane.CategoryUnknown}, ctx.Err()
+	}
+}
+
+// TestGateItemHonoursBudgetParameter (FIX-P-4): gateItem bounds the
+// classify call by the budget its caller passes, not by a hard-coded
+// 300ms. A clean item a 600ms classifier would keep is kept under a 2s
+// budget and dropped fail-closed (classify_failed) under a 100ms one.
+// Before the fix the 300ms constant dropped it whatever the caller wanted.
+func TestGateItemHonoursBudgetParameter(t *testing.T) {
+	slow := slowCleanClassifier{delay: 600 * time.Millisecond}
+	item := CollectedItem{Section: "gh_pr", Text: "kahya/x#5: an ordinary, clean PR title"}
+
+	kept := gateItem(context.Background(), slow, nil, item, 2*time.Second)
+	if kept.Dropped || kept.Line != item.Text {
+		t.Fatalf("gateItem(budget=2s) = %+v, want kept verbatim", kept)
+	}
+
+	dropped := gateItem(context.Background(), slow, nil, item, 100*time.Millisecond)
+	if !dropped.Dropped || dropped.DropReason != DropReasonClassifyFailed || dropped.Line != PlaceholderSecretLane {
+		t.Fatalf("gateItem(budget=100ms) = %+v, want dropped with %q and the placeholder", dropped, DropReasonClassifyFailed)
 	}
 }
 

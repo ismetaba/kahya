@@ -844,6 +844,9 @@ func run() int {
 		Host:    "127.0.0.1",
 		Port:    cfg.QwenPort,
 		IdleTTL: time.Duration(cfg.QwenIdleTTLSeconds) * time.Second,
+		// FIX-P-4: the warm per-call classification bound
+		// (cfg.qwen_classify_budget_ms); a cold load is never bounded by it.
+		ClassifyWarmBudget: time.Duration(cfg.QwenClassifyBudgetMS) * time.Millisecond,
 		OnUnloaded: func() {
 			if err := st.LogEvent(context.Background(), bootTraceID, "mlx_unloaded", map[string]any{"name": "qwen"}); err != nil {
 				log.Warn("mlx_unloaded_ledger_error", "err", err.Error())
@@ -963,7 +966,10 @@ func run() int {
 			CalendarNames: cfg.BriefingCalendarNames,
 		},
 		Classifier: secretLaneClassifier,
-		Globs:      briefing.PolicyGlobMatcher{Globs: pol.SecretLaneGlobs},
+		// FIX-P-4: warm the SAME supervisor the classifier's adapter uses,
+		// once before the gate loop and once before the redaction pass.
+		Warmer: qwenSup,
+		Globs:  briefing.PolicyGlobMatcher{Globs: pol.SecretLaneGlobs},
 		GH: briefing.GHCollector{
 			Runner: briefing.ExecGHRunner{HTTPSProxy: fmt.Sprintf("http://127.0.0.1:%d", cfg.EgressPort)},
 			Repos:  cfg.BriefingGHRepos,

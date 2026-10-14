@@ -131,7 +131,7 @@ func TestGateItemClassifierTimeoutFailsClosedAndBounded(t *testing.T) {
 	go func() {
 		// context.Background(): the exact deadline-less context the scheduler
 		// passes in production - the timeout MUST come from gateItem itself.
-		done <- gateItem(context.Background(), hangingClassifier{}, nil, CollectedItem{Text: "some pr title"})
+		done <- gateItem(context.Background(), hangingClassifier{}, nil, CollectedItem{Text: "some pr title"}, secretlane.DefaultBudget)
 	}()
 
 	select {

@@ -12,7 +12,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS"} {
 		t.Setenv(k, "")
 	}
 }
@@ -1486,6 +1486,79 @@ func TestLoadAutonomyBootstrapLevels(t *testing.T) {
 			}
 			if !reflect.DeepEqual(cfg.AutonomyBootstrapLevels, tc.want) {
 				t.Fatalf("AutonomyBootstrapLevels = %v, want %v", cfg.AutonomyBootstrapLevels, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadQwenClassifyBudgetDefaultFileAndEnv (FIX-P-4): the warm local
+// classification budget defaults to 300ms (HANDOFF S4 "<300ms"), is a real
+// config.yaml key, and the env var overrides the file.
+func TestLoadQwenClassifyBudgetDefaultFileAndEnv(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.QwenClassifyBudgetMS != 300 {
+			t.Errorf("QwenClassifyBudgetMS = %d, want 300", cfg.QwenClassifyBudgetMS)
+		}
+	})
+	t.Run("file", func(t *testing.T) {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		writeConfigYAML(t, home, "qwen_classify_budget_ms: 1500\n")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.QwenClassifyBudgetMS != 1500 {
+			t.Errorf("QwenClassifyBudgetMS = %d, want 1500", cfg.QwenClassifyBudgetMS)
+		}
+	})
+	t.Run("env_over_file", func(t *testing.T) {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		writeConfigYAML(t, home, "qwen_classify_budget_ms: 1500\n")
+		t.Setenv("KAHYA_QWEN_CLASSIFY_BUDGET_MS", "2000")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.QwenClassifyBudgetMS != 2000 {
+			t.Errorf("QwenClassifyBudgetMS = %d, want 2000 (env beats file)", cfg.QwenClassifyBudgetMS)
+		}
+	})
+}
+
+// TestLoadFailsClosedOnInvalidQwenClassifyBudget (FIX-P-4): a budget < 1ms
+// (file or env) fails Load closed - it would fail every warm local
+// classification closed and silently empty every briefing.
+func TestLoadFailsClosedOnInvalidQwenClassifyBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env string
+	}{
+		{"file_zero", "qwen_classify_budget_ms: 0\n", ""},
+		{"file_negative", "qwen_classify_budget_ms: -5\n", ""},
+		{"env_zero", "", "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			if tc.env != "" {
+				t.Setenv("KAHYA_QWEN_CLASSIFY_BUDGET_MS", tc.env)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "qwen_classify_budget_ms") {
+				t.Fatalf("Load() error = %v, want a qwen_classify_budget_ms validation error", err)
 			}
 		})
 	}

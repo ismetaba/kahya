@@ -18,6 +18,7 @@ package briefing
 
 import (
 	"context"
+	"time"
 
 	"kahya/kahyad/internal/secretlane"
 )
@@ -62,6 +63,34 @@ type Classifier interface {
 
 var _ Classifier = (*secretlane.Classifier)(nil)
 
+// Warmer is the narrow "bring the local classifier model up and block
+// until it answers /v1/models" surface Run uses ONCE right before the gate
+// loop, and once more before the delivery-time redaction pass (FIX-P-4).
+// *kahyad/internal/mlx.Supervisor satisfies this directly (EnsureRunning:
+// fail-closed spawn-time memcheck + spawn + health poll bounded by its own
+// StartupGrace; an already-warm server returns at once and never re-runs
+// the memcheck - FIX-I-9). nil means "no warm-up step": every hermetic
+// test that injects a fake Classifier, and nothing else.
+type Warmer interface {
+	EnsureRunning(ctx context.Context) error
+}
+
+// gateClassifyBudget bounds ONE gate/redaction classify call AFTER the
+// model has been warmed - a hang backstop only (HTTPQwenClassifier has no
+// timeout of its own and the production ctx has no deadline). The real
+// per-call latency bound for a warm Qwen call is mlx.Config.
+// ClassifyWarmBudget (cfg.qwen_classify_budget_ms, default 300ms), applied
+// inside mlx.QwenClassifierAdapter; this value stays comfortably ABOVE it
+// so the adapter's budget, not this backstop, is what decides.
+const gateClassifyBudget = 5 * time.Second
+
+// classifierWarmupBudget bounds the ONE cold warm-up call before the gate
+// loop: generous, above mlx.Config.StartupGrace's 120s default, so a cold
+// 17GB load is bounded by the supervisor's own grace, never by an
+// unrelated clock here (task spec: "cold model means the classification
+// WAITS for load or fails closed - it never skips ahead to cloud").
+const classifierWarmupBudget = 3 * time.Minute
+
 // GlobMatcher is the narrow policy.yaml secret_lane_globs surface the gate
 // needs for file-sourced items. PolicyGlobMatcher (production.go) is the
 // production implementation, wrapping policy.MatchGlob.
@@ -81,11 +110,11 @@ type gateOutcome struct {
 
 // gateItem runs the ordering-invariant gate on one item, in this fixed
 // order: (1) file-path glob check (file-sourced items only - HANDOFF's
-// "globs are file-path-only" rule), (2) content classification. Both a
-// positive secret-lane verdict AND a classifier error/unavailability drop
-// the item - only a clean, successfully-classified non-secret item is
-// ever kept.
-func gateItem(ctx context.Context, classifier Classifier, globs GlobMatcher, item CollectedItem) gateOutcome {
+// "globs are file-path-only" rule), (2) content classification bounded by
+// budget. Both a positive secret-lane verdict AND a classifier error/
+// unavailability/timeout drop the item - only a clean, successfully-
+// classified non-secret item is ever kept.
+func gateItem(ctx context.Context, classifier Classifier, globs GlobMatcher, item CollectedItem, budget time.Duration) gateOutcome {
 	if item.Path != "" && globs != nil && globs.MatchesSecretLane(item.Path) {
 		return gateOutcome{Item: item, Line: PlaceholderSecretLane, Dropped: true, DropReason: DropReasonPathGlob}
 	}
@@ -95,15 +124,17 @@ func gateItem(ctx context.Context, classifier Classifier, globs GlobMatcher, ite
 		// bytes through to a cloud-facing prompt.
 		return gateOutcome{Item: item, Line: PlaceholderSecretLane, Dropped: true, DropReason: DropReasonClassifierUnavailable}
 	}
-	// Bound the classify call by the warm-model budget (secretlane.
-	// DefaultBudget, 300ms) INDEPENDENTLY of the ctx the caller passed: the
-	// production caller (the scheduler handler) invokes Run with
-	// context.Background() (no deadline), so a genuinely HUNG local Qwen
-	// (connection accepted, never answers - HTTPQwenClassifier has no timeout
-	// of its own) would otherwise wedge the entire briefing forever with no
-	// fail-closed degradation. On deadline the Classify call returns a
-	// context error, which the err branch below already treats fail-closed.
-	cctx, cancel := context.WithTimeout(ctx, secretlane.DefaultBudget)
+	// Bound the classify call by budget INDEPENDENTLY of the ctx the caller
+	// passed: the production caller (the scheduler handler) invokes Run
+	// with context.Background() (no deadline), so a genuinely HUNG local
+	// Qwen (connection accepted, never answers - HTTPQwenClassifier has no
+	// timeout of its own) would otherwise wedge the entire briefing forever
+	// with no fail-closed degradation. On deadline the Classify call returns
+	// a context error, which the err branch below already treats
+	// fail-closed. Run passes gateClassifyBudget after its warm-up (FIX-P-4):
+	// the 300ms warm figure is the mlx adapter's own per-call budget
+	// (cfg.qwen_classify_budget_ms), never applied here to a cold load.
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	verdict, err := classifier.Classify(cctx, item.Text)
 	if err != nil {

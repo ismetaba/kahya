@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/secretlane"
 )
 
 // TestQwenClassifierAdapterEndToEnd exercises the full Supervisor ->
@@ -55,5 +57,75 @@ func TestQwenClassifierAdapterMemcheckInsufficientFailsClosed(t *testing.T) {
 	_, err := adapter.Classify(context.Background(), "her hangi bir metin")
 	if !errors.Is(err, ErrLocalModelUnavailable) {
 		t.Fatalf("Classify() error = %v, want ErrLocalModelUnavailable", err)
+	}
+}
+
+// TestClassifyWarmBudgetDefaultsAndOverride (FIX-P-4): the warm
+// classification budget defaults to secretlane.DefaultBudget (HANDOFF S4
+// "<300ms") and an explicit Config value (cfg.qwen_classify_budget_ms)
+// overrides it. New spawns nothing, so no Cmd is needed.
+func TestClassifyWarmBudgetDefaultsAndOverride(t *testing.T) {
+	def := New(Config{})
+	t.Cleanup(def.Stop)
+	if got := def.ClassifyWarmBudget(); got != secretlane.DefaultBudget {
+		t.Errorf("default ClassifyWarmBudget() = %v, want %v", got, secretlane.DefaultBudget)
+	}
+	over := New(Config{ClassifyWarmBudget: 1500 * time.Millisecond})
+	t.Cleanup(over.Stop)
+	if got := over.ClassifyWarmBudget(); got != 1500*time.Millisecond {
+		t.Errorf("override ClassifyWarmBudget() = %v, want 1.5s", got)
+	}
+	neg := New(Config{ClassifyWarmBudget: -time.Second})
+	t.Cleanup(neg.Stop)
+	if got := neg.ClassifyWarmBudget(); got != secretlane.DefaultBudget {
+		t.Errorf("negative ClassifyWarmBudget() = %v, want the default %v", got, secretlane.DefaultBudget)
+	}
+}
+
+// TestQwenClassifierAdapterAppliesConfiguredWarmBudget (FIX-P-4): the
+// adapter bounds a WARM call by the supervisor's configured
+// ClassifyWarmBudget, never a hard-coded 300ms. The fake server answers
+// every classification after 600ms (the slow end of the live-measured
+// warm range): with the default budget the warm call fails closed
+// (deadline), with a 2s budget the same warm call succeeds. The first,
+// cold call of each supervisor gets no budget at all (Do's contract).
+func TestQwenClassifierAdapterAppliesConfiguredWarmBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		budget  time.Duration
+		wantErr bool
+	}{
+		{"default_300ms_fails_closed", 0, true},
+		{"configured_2s_succeeds", 2 * time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			port := freePort(t)
+			sup := New(Config{
+				Cmd:                []string{"python3", "testdata/fake_qwen_server.py", strconv.Itoa(port), "600"},
+				Port:               port,
+				MemCheck:           sufficientMemCheck,
+				PollInterval:       200 * time.Millisecond,
+				StartupGrace:       realConnectTimeout,
+				ClassifyWarmBudget: tc.budget,
+				Log:                testLogger(t),
+			})
+			t.Cleanup(sup.Stop)
+			adapter := NewQwenClassifierAdapter(sup, "qwen3-30b-a3b")
+
+			// Cold call: loads the server; no warm budget applies.
+			if _, err := adapter.Classify(context.Background(), "soğuk çağrı"); err != nil {
+				t.Fatalf("cold Classify() error = %v, want nil (no budget on a cold load)", err)
+			}
+			_, err := adapter.Classify(context.Background(), "sıcak çağrı")
+			if tc.wantErr {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("warm Classify() error = %v, want a deadline error under the default budget", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("warm Classify() error = %v, want nil under a 2s ClassifyWarmBudget", err)
+			}
+		})
 	}
 }

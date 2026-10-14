@@ -443,7 +443,23 @@ a cloud model, without changing anything in §2-§6 above:
   tuning finding for W4-08's intent router, which owns the combined
   routing+classification path going forward, not a correctness bug: every
   fail-closed/ordering-invariant/proxy-backstop guarantee holds regardless
-  of how long classification actually takes). `mlx_lm.server`'s Qwen3 chat
+  of how long classification actually takes). FIX-P-4 makes the warm
+  bound a config key: `qwen_classify_budget_ms` (default 300, env
+  `KAHYA_QWEN_CLASSIFY_BUDGET_MS`, `< 1` fails `config.Load`) feeds
+  `mlx.Config.ClassifyWarmBudget`, which `QwenClassifierAdapter` hands
+  `Supervisor.Do` - it bounds only a call to an already-warm server, never a
+  cold load; raise it per machine after measuring with `KAHYA_MLX_TESTS=1`.
+  The morning briefing (`kahyad/internal/briefing`) warms the same
+  supervisor once (`Orchestrator.Warmer`, `EnsureRunning` under a 3-minute
+  budget) right before its gate loop and again before its redaction pass,
+  so a model the idle TTL unloaded overnight is loaded before the first
+  item is classified; the gate itself keeps only a 5s hang backstop per
+  call. If the warm-up fails, no item is classified and no worker is
+  spawned: the user gets one notice,
+  `"Yerel sınıflandırıcı hazır değil; brifing içeriği gizli-şerit kuralı gereği gönderilmedi"`
+  (`briefing.MsgClassifierUnavailable`), the ledger gets `briefing.classifier_unavailable` + `briefing.failed`, and no
+  `briefing.delivered` row is written, so a later run the same day still
+  delivers. `mlx_lm.server`'s Qwen3 chat
   template defaults to an extended "thinking" trace before answering — the
   classifier and local answerer both pass
   `chat_template_kwargs:{"enable_thinking":false}` to get a direct answer.

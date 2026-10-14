@@ -28,10 +28,13 @@ func NewQwenClassifierAdapter(sup *Supervisor, model string) *QwenClassifierAdap
 	return &QwenClassifierAdapter{sup: sup, http: secretlane.NewHTTPQwenClassifier(sup.BaseURL(), model)}
 }
 
-// Classify implements secretlane.QwenClassifier.
+// Classify implements secretlane.QwenClassifier. A warm server's call is
+// bounded by the supervisor's ClassifyWarmBudget
+// (cfg.qwen_classify_budget_ms, default 300ms - FIX-P-4); a cold one is
+// not (Do's own contract: a cold load WAITS or fails closed).
 func (a *QwenClassifierAdapter) Classify(ctx context.Context, text string) (secretlane.Verdict, error) {
 	var v secretlane.Verdict
-	err := a.sup.Do(ctx, secretlane.DefaultBudget, func(callCtx context.Context) error {
+	err := a.sup.Do(ctx, a.sup.ClassifyWarmBudget(), func(callCtx context.Context) error {
 		var innerErr error
 		v, innerErr = a.http.Classify(callCtx, text)
 		return innerErr

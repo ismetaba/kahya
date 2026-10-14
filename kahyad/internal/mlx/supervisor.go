@@ -29,6 +29,7 @@ import (
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/mlxsup"
+	"kahya/kahyad/internal/secretlane"
 )
 
 // Turkish user-facing strings (CLAUDE.md language policy), byte-exact per
@@ -91,6 +92,16 @@ type Config struct {
 	// IdleCheckInterval is the idle-monitor's poll cadence (default 30s).
 	IdleCheckInterval time.Duration
 
+	// ClassifyWarmBudget bounds ONE already-warm classification call made
+	// through QwenClassifierAdapter (adapters.go) -
+	// cfg.qwen_classify_budget_ms (FIX-P-4). Default 300ms, the HANDOFF S4
+	// "<300ms" target. The live test (live_test.go) measured 300-900ms
+	// per warm call on real hardware, so an operator raises this per
+	// machine. It NEVER applies to a cold load (Do's own contract) and is
+	// never a security boundary: a timeout is simply fail-closed
+	// (secret-lane) for that one text.
+	ClassifyWarmBudget time.Duration
+
 	// MemCheck is the free-memory gate (memcheck.go's CheckFunc) consulted
 	// before every spawn attempt. nil means RealVMStatCheck (production);
 	// tests inject a fake to drive the fail-closed path deterministically
@@ -137,6 +148,9 @@ func New(cfg Config) *Supervisor {
 	if cfg.Host == "" {
 		cfg.Host = "127.0.0.1"
 	}
+	if cfg.ClassifyWarmBudget <= 0 {
+		cfg.ClassifyWarmBudget = secretlane.DefaultBudget
+	}
 
 	// FIX-I-9: the fail-closed free-memory gate (HANDOFF §4 ⚑ "kahyad
 	// yüklemeden önce kullanılabilir belleği kontrol eder") runs under
@@ -181,6 +195,10 @@ func (s *Supervisor) BaseURL() string {
 // State reports the underlying mlxsup.Supervisor's state verbatim
 // ("ok"|"starting"|"down"|"disabled"|"failed").
 func (s *Supervisor) State() string { return s.sup.State() }
+
+// ClassifyWarmBudget reports Config.ClassifyWarmBudget after defaults - the
+// per-call bound QwenClassifierAdapter hands Do for a warm server.
+func (s *Supervisor) ClassifyWarmBudget() time.Duration { return s.cfg.ClassifyWarmBudget }
 
 // EnsureRunning is the ONE entrypoint every secret-lane caller uses before
 // sending Qwen a request (task spec step 1). It delegates to the underlying

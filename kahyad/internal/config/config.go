@@ -283,6 +283,14 @@ type Config struct {
 	// ~17GB server is unloaded (SIGTERM+reap, ledger `mlx_unloaded`) and
 	// lazily reloaded on the next secret-lane request.
 	QwenIdleTTLSeconds int `yaml:"qwen_idle_ttl_seconds"`
+	// QwenClassifyBudgetMS is cfg.mlx.qwen_classify_budget_ms (FIX-P-4):
+	// the per-call bound on ONE classification against an already-WARM
+	// local Qwen (mlx.Config.ClassifyWarmBudget). Default 300 = the HANDOFF
+	// S4 "<300ms" target; raise it after measuring this machine with
+	// KAHYA_MLX_TESTS=1 (the live test saw 300-900ms warm). It never
+	// bounds a cold load, and a timeout is fail-closed (the text counts as
+	// secret-lane). Values < 1 fail Load.
+	QwenClassifyBudgetMS int `yaml:"qwen_classify_budget_ms"`
 
 	// Env is KAHYA_ENV ("prod" default | "dev"). It is env-only: there is
 	// no config.yaml key for it, since it exists precisely so tests and the
@@ -811,6 +819,7 @@ type fileConfig struct {
 	QwenModelName                 *string         `yaml:"qwen_model_name"`
 	QwenPort                      *int            `yaml:"qwen_port"`
 	QwenIdleTTLSeconds            *int            `yaml:"qwen_idle_ttl_seconds"`
+	QwenClassifyBudgetMS          *int            `yaml:"qwen_classify_budget_ms"`
 	Jobs                          *[]JobConfig    `yaml:"jobs"`
 	TriggerBinPath                *string         `yaml:"trigger_bin_path"`
 	TaskRetryW1MaxAuto            *int            `yaml:"task_retry_w1_max_auto"`
@@ -937,6 +946,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateApprovalWait(cfg.ApprovalWaitSeconds, cfg.TaskTimeoutMin, explicitApprovalWait); err != nil {
+		return Config{}, err
+	}
+	if err := validateQwenClassifyBudgetMS(cfg.QwenClassifyBudgetMS); err != nil {
 		return Config{}, err
 	}
 
@@ -1135,6 +1147,18 @@ func validateTickIntervals(resumeScanSeconds, outboxDispatchSeconds int) error {
 	return nil
 }
 
+// validateQwenClassifyBudgetMS fails Load closed (same posture as every
+// other validate* function above) on qwen_classify_budget_ms < 1
+// (FIX-P-4): a zero or negative budget would fail every warm local
+// classification closed - silently turning every briefing item and every
+// task prompt into a secret-lane placeholder.
+func validateQwenClassifyBudgetMS(ms int) error {
+	if ms < 1 {
+		return fmt.Errorf("config: qwen_classify_budget_ms must be >= 1, got %d", ms)
+	}
+	return nil
+}
+
 // defaults returns Config's built-in defaults for env ("prod", "dev", or
 // any other validateEnv-accepted profile name - Load always passes a value
 // validateEnv would accept; defaults itself does not re-validate it).
@@ -1206,6 +1230,8 @@ func defaults(home, env string) Config {
 		QwenModelName:      "mlx-community/Qwen3-30B-A3B-4bit",
 		QwenPort:           8765,
 		QwenIdleTTLSeconds: 600,
+		// FIX-P-4: the warm classification budget, HANDOFF S4 "<300ms".
+		QwenClassifyBudgetMS: 300,
 
 		// W4-01 scheduler defaults: no jobs declared out of the box (see
 		// Config.Jobs's doc comment); TriggerBinPath follows the same
@@ -1637,6 +1663,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.QwenIdleTTLSeconds != nil {
 		cfg.QwenIdleTTLSeconds = *fc.QwenIdleTTLSeconds
 	}
+	if fc.QwenClassifyBudgetMS != nil {
+		cfg.QwenClassifyBudgetMS = *fc.QwenClassifyBudgetMS
+	}
 	if fc.Jobs != nil {
 		cfg.Jobs = *fc.Jobs
 	}
@@ -1801,6 +1830,11 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_QWEN_IDLE_TTL_SECONDS"); v != "" {
 		if s, err := strconv.Atoi(v); err == nil {
 			cfg.QwenIdleTTLSeconds = s
+		}
+	}
+	if v := os.Getenv("KAHYA_QWEN_CLASSIFY_BUDGET_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil {
+			cfg.QwenClassifyBudgetMS = ms
 		}
 	}
 	if v := os.Getenv("KAHYA_ANCHOR_REMOTE"); v != "" {

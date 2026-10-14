@@ -38,7 +38,6 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/logx"
-	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/task"
@@ -55,6 +54,11 @@ const (
 	// missing/revoked (collect_calendar.go's ErrCalendarNoAccess) - the
 	// briefing still delivers; only this one section is skipped.
 	MsgCalendarNoAccess = "Takvim erişimi yok"
+	// MsgClassifierUnavailable is delivered INSTEAD of a briefing body when
+	// the local secret-lane classifier could not be brought up (memory
+	// pressure / spawn failure - FIX-P-4): HANDOFF S4 fail-closed - nothing
+	// was classified, so nothing may reach the cloud summarizer.
+	MsgClassifierUnavailable = "Yerel sınıflandırıcı hazır değil; brifing içeriği gizli-şerit kuralı gereği gönderilmedi"
 )
 
 // Ledger event kinds this package appends (HANDOFF §5 safety #4 - every
@@ -67,6 +71,9 @@ const (
 	EventCalendarUnavailable = "briefing.calendar_unavailable"
 	EventSummaryRejected     = "briefing.summary_rejected"
 	EventFailed              = "briefing.failed"
+	// EventClassifierUnavailable (FIX-P-4): the warm-up of the local
+	// classifier failed; payload {phase: gate|redaction, err}.
+	EventClassifierUnavailable = "briefing.classifier_unavailable"
 )
 
 // briefingUntrustedReason is the reason string InsertUntrusted's
@@ -172,6 +179,9 @@ type Result struct {
 	// CalendarNoAccess is true iff the calendar section was skipped
 	// because the Automation TCC grant is missing/revoked.
 	CalendarNoAccess bool
+	// ClassifierUnavailable is true iff the Warmer failed and the run
+	// delivered MsgClassifierUnavailable instead of a summary (FIX-P-4).
+	ClassifierUnavailable bool
 }
 
 // Orchestrator is kahyad's W5-01 morning-briefing job: one per kahyad
@@ -220,6 +230,17 @@ type Orchestrator struct {
 	// CalendarBudget overrides calendarCollectBudget (tests only, so a
 	// hanging-calendar-runner test need not wait the full production budget).
 	CalendarBudget time.Duration
+
+	// Warmer brings the local classifier up ONCE right before the gate
+	// loop, and again before the delivery-time redaction pass (gate.go's
+	// Warmer; FIX-P-4). nil = no warm-up (hermetic tests with a fake
+	// Classifier). main.go wires the SAME *mlx.Supervisor the Classifier's
+	// QwenClassifierAdapter already uses - never a second supervisor.
+	Warmer Warmer
+	// WarmupBudget overrides classifierWarmupBudget (tests only).
+	WarmupBudget time.Duration
+	// ClassifyBudget overrides gateClassifyBudget (tests only).
+	ClassifyBudget time.Duration
 }
 
 func (o *Orchestrator) now() time.Time {
@@ -234,6 +255,20 @@ func (o *Orchestrator) calendarBudget() time.Duration {
 		return o.CalendarBudget
 	}
 	return calendarCollectBudget
+}
+
+func (o *Orchestrator) warmupBudget() time.Duration {
+	if o.WarmupBudget > 0 {
+		return o.WarmupBudget
+	}
+	return classifierWarmupBudget
+}
+
+func (o *Orchestrator) classifyBudget() time.Duration {
+	if o.ClassifyBudget > 0 {
+		return o.ClassifyBudget
+	}
+	return gateClassifyBudget
 }
 
 // newBriefingSessionID mints a fresh, random session_id for one briefing
@@ -350,20 +385,50 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		"gh_prs", len(prs), "gh_runs", len(runs), "calendar_events", calendarEventCount, "files", len(files),
 	)
 
+	// --- FIX-P-4: warm the local classifier ONCE, with a cold-load
+	// budget, right before the gate loop. At 08:30 the idle-TTL has
+	// usually unloaded Qwen; without this the first item's (warm-sized)
+	// classify budget cut the cold load short and items dropped fail-closed
+	// one after another. Warming here (after the collectors, not before
+	// them) also leaves the idle monitor no collector-sized gap in which to
+	// unload the model again before the first classify call. ---
+	classifierReady := o.warmClassifier(ctx, traceID, "gate") == nil
+
 	// --- Ordering-invariant gate: EVERY item, classified/checked BEFORE
 	// anything worker-facing is ever built (this package's own doc
 	// comment; gate.go's own doc comment for the full rationale). ---
 	bySection := make(map[string][]string, 4)
 	anyDropped := false
+	droppedCount := 0
+	var maxClassifyMS int64
 	for _, it := range items {
-		outcome := gateItem(ctx, o.Classifier, o.Globs, it)
+		var outcome gateOutcome
+		if !classifierReady {
+			// FAIL-CLOSED, and cheap: the model is known to be down, so do
+			// not pay a per-item budget wait just to observe the same error.
+			outcome = gateOutcome{Item: it, Line: PlaceholderSecretLane, Dropped: true, DropReason: DropReasonClassifierUnavailable}
+		} else {
+			start := time.Now()
+			outcome = gateItem(ctx, o.Classifier, o.Globs, it, o.classifyBudget())
+			if ms := time.Since(start).Milliseconds(); ms > maxClassifyMS {
+				maxClassifyMS = ms
+			}
+		}
 		if outcome.Dropped {
 			anyDropped = true
+			droppedCount++
 			o.ledgerRaw(ctx, traceID, EventItemDropped, map[string]any{
 				"section": it.Section, "reason": outcome.DropReason,
 			})
 		}
 		bySection[it.Section] = append(bySection[it.Section], outcome.Line)
+	}
+	o.jsonlInfo(traceID, "briefing_gated", "items", len(items), "dropped", droppedCount, "max_classify_ms", maxClassifyMS)
+
+	if !classifierReady {
+		// Nothing was classified, so nothing may reach the cloud
+		// summarizer: no task row, no worker, one notice (FIX-P-4).
+		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarNoAccess, Result{CalendarNoAccess: calendarNoAccess})
 	}
 
 	prompt := buildPrompt(bySection)
@@ -441,7 +506,13 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// --- Defense-in-depth redaction (task spec step 6): the pre-
 	// classifier runs ONCE MORE on the final, already-validated summary
 	// text - this is a backstop, never the primary gate (that already ran
-	// above, at collection time). ---
+	// above, at collection time). Re-warm first (FIX-P-4): the idle-TTL may
+	// have unloaded the model during the cloud call; a warm server returns
+	// at once. If it cannot come up the summary is withheld, never
+	// delivered unredacted. ---
+	if err := o.warmClassifier(ctx, traceID, "redaction"); err != nil {
+		return o.deliverClassifierUnavailable(ctx, traceID, date, calendarNoAccess, result)
+	}
 	redacted := make([]string, len(validated.Lines))
 	for i, l := range validated.Lines {
 		redacted[i] = l
@@ -453,8 +524,9 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		// ship a secret-lane line in the clear precisely when the classifier
 		// hiccups, defeating this defense-in-depth backstop. The budget
 		// timeout (independent of the deadline-less production ctx) keeps a
-		// hung classifier from wedging delivery forever.
-		cctx, cancel := context.WithTimeout(ctx, secretlane.DefaultBudget)
+		// hung classifier from wedging delivery forever; the warm per-call
+		// bound itself is the mlx adapter's (FIX-P-4).
+		cctx, cancel := context.WithTimeout(ctx, o.classifyBudget())
 		v, cerr := o.Classifier.Classify(cctx, l)
 		cancel()
 		if cerr != nil || v.SecretLane {
@@ -467,7 +539,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// merely contingent on the summarizer model choosing, on its own, to
 	// mention that something was omitted (task spec: "represented in the
 	// delivered briefing only by the placeholder line").
-	fullText := renderDeliveryText(traceID, redacted, calendarNoAccess, anyDropped)
+	fullText := renderDeliveryText(traceID, redacted, calendarNoAccess, anyDropped, "")
 
 	sent := o.Delivery.SendNotification(ctx, traceID, fullText)
 	if !sent {
@@ -484,6 +556,48 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 
 	result.Delivered = true
 	return result, nil
+}
+
+// warmClassifier runs the Warmer once with the cold-load budget and logs
+// the outcome (FIX-P-4). A nil Warmer is a no-op success. Any error is
+// reported (JSONL + ledger) and returned; callers treat it as "classifier
+// unavailable" - every item then drops fail-closed WITHOUT a per-item
+// classify call (there is nothing to wait for), and no worker is spawned.
+func (o *Orchestrator) warmClassifier(ctx context.Context, traceID, phase string) error {
+	if o.Warmer == nil {
+		return nil
+	}
+	wctx, cancel := context.WithTimeout(ctx, o.warmupBudget())
+	defer cancel()
+	start := time.Now()
+	err := o.Warmer.EnsureRunning(wctx)
+	elapsed := time.Since(start).Milliseconds()
+	if err != nil {
+		o.jsonlWarn(traceID, "briefing_classifier_warmup_failed", "phase", phase, "elapsed_ms", elapsed, "err", err.Error())
+		o.ledgerRaw(ctx, traceID, EventClassifierUnavailable, map[string]any{"phase": phase, "err": err.Error()})
+		return err
+	}
+	o.jsonlInfo(traceID, "briefing_classifier_warm", "phase", phase, "elapsed_ms", elapsed)
+	return nil
+}
+
+// deliverClassifierUnavailable is the fail-closed short circuit (FIX-P-4,
+// owner decision G08-2): no worker is spawned at the gate phase (nothing
+// was classified, so nothing may reach the cloud - HANDOFF S4 ordering
+// invariant) and no summary is delivered at the redaction phase (the
+// backstop cannot run); the user gets ONE Turkish notice carrying the
+// trace_id, and NO briefing.delivered row is written - so a later manual
+// `kahya job run morning-briefing` (after freeing memory) still delivers
+// the real briefing for this day. base carries what the run already knows
+// (TaskID/SessionID at the redaction phase). Run returns an error so the
+// scheduler ledgers job_failed.
+func (o *Orchestrator) deliverClassifierUnavailable(ctx context.Context, traceID, date string, calendarNoAccess bool, base Result) (Result, error) {
+	text := renderDeliveryText(traceID, nil, calendarNoAccess, false, MsgClassifierUnavailable)
+	sent := o.Delivery.SendNotification(ctx, traceID, text)
+	o.jsonlWarn(traceID, "briefing_classifier_unavailable", "date", date, "notice_sent", sent)
+	o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "classifier_unavailable", "notice_sent": sent})
+	base.ClassifierUnavailable = true
+	return base, errors.New("briefing: local classifier unavailable (fail-closed, no summary produced)")
 }
 
 // transitionTask moves the briefing's task row (FIX-I-14). No-op when no
@@ -607,10 +721,11 @@ func buildPrompt(bySection map[string][]string) string {
 // line, PlaceholderSecretLane appended once more whenever anyItemDropped
 // (so its presence in the delivered text is guaranteed by this package's
 // own control flow, never merely contingent on the summarizer model
-// choosing to mention it), and - deterministically, Go-side, never
-// model-dependent - MsgCalendarNoAccess whenever the calendar section was
-// skipped for a missing TCC grant.
-func renderDeliveryText(traceID string, lines []string, calendarNoAccess, anyItemDropped bool) string {
+// choosing to mention it), a non-empty notice line (FIX-P-4:
+// MsgClassifierUnavailable instead of a summary), and - deterministically,
+// Go-side, never model-dependent - MsgCalendarNoAccess whenever the
+// calendar section was skipped for a missing TCC grant.
+func renderDeliveryText(traceID string, lines []string, calendarNoAccess, anyItemDropped bool, notice string) string {
 	var b strings.Builder
 	b.WriteString(TelegramTitle + "\n")
 	b.WriteString("trace_id: " + traceID + "\n\n")
@@ -619,6 +734,9 @@ func renderDeliveryText(traceID string, lines []string, calendarNoAccess, anyIte
 	}
 	if anyItemDropped {
 		b.WriteString("- " + PlaceholderSecretLane + "\n")
+	}
+	if notice != "" {
+		b.WriteString("\n" + notice + "\n")
 	}
 	if calendarNoAccess {
 		b.WriteString("\n" + MsgCalendarNoAccess + "\n")
