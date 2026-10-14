@@ -17,11 +17,33 @@
 // EXACTLY the bytes about to run — an invisible code point hidden inside
 // an otherwise-innocent-looking script defeats that regardless of how the
 // script is used).
+//
+// B-9 fix: the five W3-09 literals alone let the obvious equivalents
+// through, and HANDOFF §5 safety #6's "shell-shaped" class covers them
+// too, so two rule classes now sit on top of them (each only ever ADDS a
+// rejection):
+//   - shell_shaped (the same verbatim reason): Terminal/iTerm/Script
+//     Editor/Automator automation (`do script`, `write text`, `.doScript(`,
+//     `application "Terminal"`) and JXA ObjC-bridge process spawning
+//     (`$.system`, `$.popen`, `$.exec*`, `$.posix_spawn`, `$.fork`);
+//   - code_loader (reasonCodeLoader): bodies that load or generate further
+//     code the scanner cannot see — `run script`, `load script`, `use
+//     script`, `use framework` (AppleScriptObjC), `ObjC.import`/
+//     `ObjC.bindFunction`, JXA `Library(`, `eval(`, the Function
+//     constructor, `fromCharCode(`, `atob(`. Owner decision G04-3: the
+//     ObjC bridge imports are refused outright, false positives accepted.
+//
+// The rules run on flatten(s) and, for tokens a string concatenation can
+// split ("NS"+"Task", "do shell" & " script", Application("Term"+"inal")),
+// on joinSplitTokens(s) / collapse(s). System Events `keystroke`/`key code`
+// stay allowed (owner decision G04-4); the W2 approval card is their
+// boundary.
 package osascript
 
 import (
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // maxScriptBytes is the hard size ceiling (this task's spec step 1,
@@ -35,6 +57,7 @@ const (
 	reasonShellShaped  = "Kabuk komutu içeren script reddedildi — Docker shell aracını kullanın."
 	reasonTooLarge     = "Script çok büyük (32KB sınırını aşıyor) — reddedildi."
 	reasonControlChars = "Script görünmez veya çift-yönlü kontrol karakterleri içeriyor — reddedildi."
+	reasonCodeLoader   = "Başka kod yükleyen ya da üreten script reddedildi (run script / load script / use script / ObjC köprüsü / eval) — Docker shell aracını kullanın."
 )
 
 // Reason codes (English, log/ledger-facing — CLAUDE.md language policy:
@@ -44,6 +67,7 @@ const (
 	ReasonCodeTooLarge     = "too_large"
 	ReasonCodeControlChars = "control_chars"
 	ReasonCodeShellShaped  = "shell_shaped"
+	ReasonCodeCodeLoader   = "code_loader"
 )
 
 // RerouteSuggestion is the structured "you could re-request this via
@@ -73,9 +97,10 @@ type ScanResult struct {
 }
 
 // Scan runs every W3-09 static REJECT rule against script, in a fixed
-// order (size, then control code points, then shell-shaped patterns —
-// this task's spec step 1 lists all three; the order itself carries no
-// safety meaning since ANY one of them alone rejects the whole body).
+// order (size, then control code points, then shell-shaped patterns, then
+// code loaders — ANY one of them alone rejects the whole body; the
+// shell-shaped rule runs before the code-loader rule only so that a body
+// like eval("do shell script …") keeps the shell_shaped code).
 func Scan(script []byte) ScanResult {
 	if len(script) > maxScriptBytes {
 		return ScanResult{Rejected: true, Reason: reasonTooLarge, ReasonCode: ReasonCodeTooLarge}
@@ -84,12 +109,16 @@ func Scan(script []byte) ScanResult {
 	if _, bad := firstForbiddenRune(s); bad {
 		return ScanResult{Rejected: true, Reason: reasonControlChars, ReasonCode: ReasonCodeControlChars}
 	}
-	if isShellShaped(s) {
+	forms := normalizedForms(s)
+	if isShellShaped(forms) {
 		res := ScanResult{Rejected: true, Reason: reasonShellShaped, ReasonCode: ReasonCodeShellShaped}
 		if cmd, ok := extractPureShellWrapper(s); ok {
 			res.Reroute = &RerouteSuggestion{Tool: "shell_docker", Command: cmd}
 		}
 		return res
+	}
+	if isCodeLoader(forms) {
+		return ScanResult{Rejected: true, Reason: reasonCodeLoader, ReasonCode: ReasonCodeCodeLoader}
 	}
 	return ScanResult{}
 }
@@ -107,6 +136,141 @@ func flatten(s string) string {
 	return whitespaceRun.ReplaceAllString(strings.ToLower(s), " ")
 }
 
+// isConcatDelimiter reports the string-literal and concatenation
+// delimiters a reject token can be split across: " ' ` + & [ ].
+func isConcatDelimiter(r rune) bool {
+	switch r {
+	case '"', '\'', '`', '+', '&', '[', ']':
+		return true
+	}
+	return false
+}
+
+func isWordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// collapse is the fully collapsed form (B-9 fix): lowercase, then every
+// whitespace rune AND every concatenation delimiter removed, so a
+// multi-word AppleScript command split across string literals
+// ("do shell" & " script") rejoins into "doshellscript". It is used for
+// that one token only: dropping the space BETWEEN two words also fuses
+// ordinary prose ("Returns task" -> "returnstask" contains "nstask").
+func collapse(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsSpace(r) || isConcatDelimiter(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// joinSplitTokens is the concatenation-joined form every other split-token
+// rule runs on (B-9 fix): lowercase; concatenation delimiters removed; a
+// whitespace run is removed unless it sits between two word runes in the
+// ORIGINAL text with no delimiter next to it, in which case it becomes one
+// space. So "NS" + "Task", $["NS " + "Task"], $ . system and
+// Application("Term"+"inal") join into nstask / $.system /
+// application(terminal, while prose keeps its word spacing ("returns
+// task"). An identifier cannot contain a word-to-word space, so keeping
+// those spaces never un-splits a token a string concatenation produced.
+// Parentheses and dots are kept: they mark call sites ($.system, eval().
+func joinSplitTokens(s string) string {
+	rs := []rune(strings.ToLower(s))
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(rs); {
+		r := rs[i]
+		if isConcatDelimiter(r) {
+			i++
+			continue
+		}
+		if !unicode.IsSpace(r) {
+			b.WriteRune(r)
+			i++
+			continue
+		}
+		j := i
+		for j < len(rs) && unicode.IsSpace(rs[j]) {
+			j++
+		}
+		if i > 0 && j < len(rs) && isWordRune(rs[i-1]) && isWordRune(rs[j]) {
+			b.WriteByte(' ')
+		}
+		i = j
+	}
+	return b.String()
+}
+
+// scanForms carries the three normalized forms every rule matches on.
+type scanForms struct {
+	flat   string // flatten: lowercase, whitespace runs -> one space
+	joined string // joinSplitTokens
+	coll   string // collapse
+}
+
+func normalizedForms(s string) scanForms {
+	return scanForms{flat: flatten(s), joined: joinSplitTokens(s), coll: collapse(s)}
+}
+
+// shellShapedFlatRes: Terminal/iTerm/Script Editor/Automator automation and
+// JXA ObjC-bridge process spawning, matched on flatten(s) with word
+// boundaries (so "undo script" does NOT trip "do script").
+var shellShapedFlatRes = []*regexp.Regexp{
+	regexp.MustCompile(`\bdo\s+script\b`),  // Terminal.app
+	regexp.MustCompile(`\bwrite\s+text\b`), // iTerm2
+	regexp.MustCompile(`\.doscript\s*\(`),  // JXA Application("Terminal").doScript(
+	regexp.MustCompile(`application\s*(?:id\s+)?\(?\s*["']?(?:terminal|iterm2?|script editor|automator|com\.apple\.terminal|com\.googlecode\.iterm2)\b`),
+	regexp.MustCompile(`\$\.(?:system|popen|execl|execle|execlp|execv|execve|execvp|posix_spawn|fork)\b`),
+}
+
+// shellShapedJoinedTokens: the same class, matched on joinSplitTokens(s)
+// so string-concatenation evasions ("NS"+"Task", Application("Term"+
+// "inal"), $["sys"+"tem"]) are caught. "doshellscript" is additionally
+// matched on collapse(s) (see collapse).
+var shellShapedJoinedTokens = []string{
+	"nstask", "nsapplescript", "doshellscript",
+	"applicationterminal", "application(terminal", "applicationiterm", "application(iterm",
+	"application(scripteditor", "application(script editor", "application(automator",
+	"com.apple.terminal", "com.googlecode.iterm2",
+	".doscript(", "writetext(", "$.system", "$.popen", "$system(", "$popen(",
+}
+
+// codeLoaderFlatRes / codeLoaderJoinedTokens: bodies that LOAD or
+// GENERATE further code at run time (nested interpreter, script library,
+// ObjC bridge import, eval/obfuscation) — the scanner cannot see what that
+// code will do, so the class is refused outright (HANDOFF §5 safety #6;
+// owner decision G04-3).
+var codeLoaderFlatRes = []*regexp.Regexp{
+	regexp.MustCompile(`\brun\s+script\b`),
+	regexp.MustCompile(`\bload\s+script\b`),
+	regexp.MustCompile(`\buse\s+script\b`), // NOT "use scripting additions": \b after "script" fails on "scripting"
+	regexp.MustCompile(`\buse\s+framework\b`),
+	regexp.MustCompile(`\bobjc\.(?:import|bindfunction)\b`),
+	regexp.MustCompile(`\blibrary\s*\(`),
+	regexp.MustCompile(`\beval\s*\(`),
+	regexp.MustCompile(`\bnew\s+function\s*\(`),
+	regexp.MustCompile(`\bfunction\s*\(\s*["']`), // Function("return ...")() constructor; an anonymous function (x) has an identifier, not a quote
+	regexp.MustCompile(`\bfromcharcode\s*\(`),
+	regexp.MustCompile(`\batob\s*\(`),
+}
+
+// codeLoaderJoinedTokens: ONLY the JXA tokens a string concatenation can
+// split ("Ob"+"jC.import", this["ev"+"al"]). AppleScript keywords
+// (run/load/use script, use framework) are NOT here on purpose: they are
+// language keywords that cannot be split by string concatenation, and
+// their boundary-less forms are false positives — "usescript" is a
+// substring of the standard header `use scripting additions`, "loadscript"
+// of an identifier like `reloadScriptFlag`, "useframework" of
+// `reuseFramework`. Accepted false positive (fail-closed): prose where a
+// word ending in "eval"/"library" is followed by "(" ("retrieval (beta)").
+var codeLoaderJoinedTokens = []string{
+	"objc.import", "objcimport(", "objc.bindfunction", "fromcharcode(", "eval(", "library(",
+}
+
 // isShellShaped implements this task's spec step 1's five reject
 // patterns, case-insensitive and whitespace-tolerant throughout (via
 // flatten): "do shell script", "doShellScript", "NSTask", "NSAppleScript",
@@ -114,9 +278,11 @@ func flatten(s string) string {
 // idiom for spawning a process — this task's spec step 3 calls out
 // `ObjC.import('Foundation')` combined with NSTask specifically, which
 // the blanket "nstask" substring rule below already catches regardless of
-// whether ObjC.import appears alongside it).
-func isShellShaped(s string) bool {
-	flat := flatten(s)
+// whether ObjC.import appears alongside it) — plus, since B-9, the
+// shellShapedFlatRes rules on the flat form and shellShapedJoinedTokens on
+// the concatenation-joined/collapsed forms.
+func isShellShaped(f scanForms) bool {
+	flat := f.flat
 	switch {
 	case strings.Contains(flat, "do shell script"):
 		return true
@@ -128,9 +294,37 @@ func isShellShaped(s string) bool {
 		return true
 	case strings.Contains(flat, "current application") && strings.Contains(flat, "task"):
 		return true
-	default:
-		return false
+	case strings.Contains(f.coll, "doshellscript"):
+		return true
 	}
+	for _, re := range shellShapedFlatRes {
+		if re.MatchString(flat) {
+			return true
+		}
+	}
+	for _, tok := range shellShapedJoinedTokens {
+		if strings.Contains(f.joined, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCodeLoader reports a body that loads or generates further code
+// (codeLoaderFlatRes on the flat form, codeLoaderJoinedTokens on the
+// concatenation-joined form).
+func isCodeLoader(f scanForms) bool {
+	for _, re := range codeLoaderFlatRes {
+		if re.MatchString(f.flat) {
+			return true
+		}
+	}
+	for _, tok := range codeLoaderJoinedTokens {
+		if strings.Contains(f.joined, tok) {
+			return true
+		}
+	}
+	return false
 }
 
 // pureShellWrapperRe matches a script whose ENTIRE (trimmed) body is

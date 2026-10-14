@@ -237,6 +237,10 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
 | Safety #6 | `do shell script` in osascript rejected (not a reroute) | `mcp/osascript/TestScanRejectsDoShellScript` | W3-09 | ci-hermetic |
+| Safety #6 | Terminal/iTerm/ObjC-bridge/code-loader osascript bodies rejected (not only do shell script) | `mcp/osascript/TestScanRejectsTerminalAndITermAutomation` | FIX-B-9 | ci-hermetic |
+| Safety #6 | osascript bodies that load or generate code (run/load/use script, use framework, ObjC.import, Library, eval, Function) rejected as code_loader | `mcp/osascript/TestScanRejectsCodeLoaders` | FIX-B-9 | ci-hermetic |
+| Safety #6 | concatenation-split reject tokens ("NS"+"Task", "do shell" & " script") still rejected | `mcp/osascript/TestScanCollapsedFormCatchesStringConcatenation` | FIX-B-9 | ci-hermetic |
+| Safety #6 | a scan-rejected osascript body never reaches policy or exec, ledgered with its reason_code | `mcp/osascript/TestRunJXAScanRejectedTerminalDoScriptNeverExecutes` | FIX-B-9 | ci-hermetic |
 | Safety #6 | model shell defaults to Docker `--network none` (real Docker) | `mcp/shell/TestLive_DefaultNetworkNoneBlocksEgress` | W3-04 | local-integration |
 | Safety #6 | shell_docker workdir: OS temp root itself never mountable (strict descendants only) | `mcp/shell/TestValidateWorkdir_OSTempRootItselfRejected` | FIX-B-10 | ci-hermetic |
 | Safety #6 | shell_docker workdir: a `$TMPDIR` sibling under /var/folders is not carved out (system_dir) | `mcp/shell/TestValidateWorkdir_TempDirSiblingNotCarvedOut` | FIX-B-10 | ci-hermetic |

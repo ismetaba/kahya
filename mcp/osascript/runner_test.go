@@ -82,6 +82,60 @@ func TestRunJXAScanRejectedNSTaskNeverExecutes(t *testing.T) {
 	}
 }
 
+// TestRunJXAScanRejectedTerminalDoScriptNeverExecutes (B-9): a JXA body
+// driving Terminal is rejected by the scanner before any policy decision -
+// no Check, no exec - and ledgered with reason_code=shell_shaped.
+func TestRunJXAScanRejectedTerminalDoScriptNeverExecutes(t *testing.T) {
+	r, pc, ledger, exec := newTestRunner()
+
+	out, err := r.RunJXA(context.Background(), "trace-b9", "task-b9", ScriptInput{
+		Script: `Application("Terminal").doScript("whoami")`,
+	})
+	if err != nil {
+		t.Fatalf("RunJXA = err %v, want nil", err)
+	}
+	if !out.Rejected || out.Reason != reasonShellShaped || out.Reroute != nil {
+		t.Fatalf("out = %+v, want Rejected with reasonShellShaped and no reroute", out)
+	}
+	if pc.checkCalls != 0 || pc.consumeCalls != 0 {
+		t.Errorf("policy calls: check=%d consume=%d, want 0/0", pc.checkCalls, pc.consumeCalls)
+	}
+	if exec.callCount() != 0 {
+		t.Errorf("Executor.Run called %d times, want 0", exec.callCount())
+	}
+	evs := ledger.find("osascript_scan_rejected")
+	if len(evs) != 1 {
+		t.Fatalf("osascript_scan_rejected ledger events = %d, want 1", len(evs))
+	}
+	if evs[0].traceID != "trace-b9" || evs[0].payload["reason_code"] != ReasonCodeShellShaped || evs[0].payload["tool"] != "jxa_run" {
+		t.Errorf("ledger event = %+v, want trace-b9 / reason_code=shell_shaped / tool=jxa_run", evs[0])
+	}
+}
+
+// TestRunApplescriptScanRejectedCodeLoaderLedgersReasonCode (B-9): a body
+// that loads further code (run script) is rejected before any policy
+// decision and ledgered with reason_code=code_loader.
+func TestRunApplescriptScanRejectedCodeLoaderLedgersReasonCode(t *testing.T) {
+	r, pc, ledger, exec := newTestRunner()
+
+	out, err := r.RunApplescript(context.Background(), "trace-b9", "task-b9", ScriptInput{
+		Script: `run script "return 1"`,
+	})
+	if err != nil {
+		t.Fatalf("RunApplescript = err %v, want nil", err)
+	}
+	if !out.Rejected || out.Reason != reasonCodeLoader || out.Reroute != nil {
+		t.Fatalf("out = %+v, want Rejected with reasonCodeLoader and no reroute", out)
+	}
+	if pc.checkCalls != 0 || exec.callCount() != 0 {
+		t.Errorf("check=%d exec=%d, want 0/0", pc.checkCalls, exec.callCount())
+	}
+	evs := ledger.find("osascript_scan_rejected")
+	if len(evs) != 1 || evs[0].payload["reason_code"] != ReasonCodeCodeLoader {
+		t.Fatalf("osascript_scan_rejected events = %+v, want one with reason_code=code_loader", evs)
+	}
+}
+
 // ---- policy deny/needs-approval: no execution ----
 
 func TestRunApplescriptPolicyDeniedNeverExecutes(t *testing.T) {
