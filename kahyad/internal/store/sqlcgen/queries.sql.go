@@ -189,28 +189,35 @@ func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePending
 	return result.RowsAffected()
 }
 
-const countEventsByKindAndDate = `-- name: CountEventsByKindAndDate :one
-SELECT count(*) FROM events WHERE kind = ? AND date(created_at) = ?
+const countEventsByKindBetween = `-- name: CountEventsByKindBetween :one
+SELECT count(*) FROM events
+WHERE kind = ?
+  AND julianday(created_at) >= julianday(?2)
+  AND julianday(created_at) <  julianday(?3)
 `
 
-type CountEventsByKindAndDateParams struct {
-	Kind      string `json:"kind"`
-	CreatedAt string `json:"created_at"`
+type CountEventsByKindBetweenParams struct {
+	Kind    string      `json:"kind"`
+	StartTs interface{} `json:"start_ts"`
+	EndTs   interface{} `json:"end_ts"`
 }
 
-// W5-01's once-per-day idempotency check: counts events of kind on the
-// UTC calendar date dateStr ("YYYY-MM-DD" - SQLite's date() truncates
-// created_at to exactly this, and every created_at this codebase writes
-// is already UTC RFC3339/RFC3339Nano, so no timezone conversion is
-// needed). kahyad/internal/briefing.Orchestrator.Run consults this
-// BEFORE ever classifying a single collector item or spawning a worker
-// for a scheduled OR manual run: a non-zero count for kind=
-// "briefing.delivered" means today's briefing already went out, so this
-// run logs briefing.skipped_duplicate and sends nothing - a missed-run-
-// fired-on-wake plus the regular 08:30 run can therefore never deliver
-// two notifications the same date.
-func (q *Queries) CountEventsByKindAndDate(ctx context.Context, arg CountEventsByKindAndDateParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countEventsByKindAndDate, arg.Kind, arg.CreatedAt)
+// Once-per-LOCAL-day idempotency check (W5-01, fixed by G08/P-14): counts
+// events of kind whose created_at falls in [start_ts, end_ts). The caller
+// (kahyad/internal/briefing.StoreDedupeChecker) computes the user's local
+// calendar day's bounds in Go (config.Config.Location()) and passes them
+// as UTC RFC3339Nano strings - created_at is always UTC RFC3339Nano
+// (store.InsertEventWithDigest), so the comparison is a plain instant
+// comparison and this SQL never needs a timezone of its own. julianday()
+// makes it numeric (fractional-second digits vary between rows), the
+// same reasoning as kahyad/internal/metrics' windowClause.
+// kahyad/internal/briefing.Orchestrator.Run consults this BEFORE ever
+// classifying a single collector item or spawning a worker for a
+// scheduled OR manual run: a non-zero count for kind="briefing.delivered"
+// means today's briefing already went out, so this run logs
+// briefing.skipped_duplicate and sends nothing.
+func (q *Queries) CountEventsByKindBetween(ctx context.Context, arg CountEventsByKindBetweenParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countEventsByKindBetween, arg.Kind, arg.StartTs, arg.EndTs)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3258,8 +3265,8 @@ type ListUncooledEpisodesOlderThanRow struct {
 // Active episodes not yet hot-window-cooled, created at or before cutoff
 // (RFC3339 UTC string compare - every created_at this codebase writes is
 // already normalized to that format, so a plain string comparison sorts
-// correctly, matching CountEventsByKindAndDate's own date()-free
-// convention above for the same reason).
+// correctly; like CountEventsByKindBetween's instant compare above, it
+// needs no timezone conversion for the same reason).
 func (q *Queries) ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error) {
 	rows, err := q.db.QueryContext(ctx, listUncooledEpisodesOlderThan, createdAt)
 	if err != nil {

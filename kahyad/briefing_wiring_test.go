@@ -83,3 +83,16 @@ func TestBriefingFileCollectorCapWiring(t *testing.T) {
 		t.Errorf("briefing.FileGlobCollector.Globs = %q, want cfg.BriefingFileGlobs", files["Globs"])
 	}
 }
+
+// TestBriefingLocationWiring (FIX-P-14): the briefing's once-per-day gate
+// computes its day in cfg.Location() - kahyad's single calendar zone
+// source (G00 C-22) - and uses the ledger-backed dedupe.
+func TestBriefingLocationWiring(t *testing.T) {
+	orch := onlyCompositeLit(t, "briefing", "Orchestrator")
+	if orch["Location"] != "cfg.Location()" {
+		t.Errorf("briefing.Orchestrator.Location = %q, want cfg.Location()", orch["Location"])
+	}
+	if orch["Dedupe"] != "briefing.StoreDedupeChecker{Store: st.Queries}" {
+		t.Errorf("briefing.Orchestrator.Dedupe = %q, want the store-backed checker", orch["Dedupe"])
+	}
+}

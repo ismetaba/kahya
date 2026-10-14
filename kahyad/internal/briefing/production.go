@@ -8,6 +8,7 @@ package briefing
 
 import (
 	"context"
+	"time"
 
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store/sqlcgen"
@@ -35,7 +36,7 @@ func (m PolicyGlobMatcher) MatchesSecretLane(path string) bool {
 // eventCounter is the narrow sqlc surface StoreDedupeChecker needs.
 // *sqlcgen.Queries (via *store.Store) satisfies this directly.
 type eventCounter interface {
-	CountEventsByKindAndDate(ctx context.Context, arg sqlcgen.CountEventsByKindAndDateParams) (int64, error)
+	CountEventsByKindBetween(ctx context.Context, arg sqlcgen.CountEventsByKindBetweenParams) (int64, error)
 }
 
 // StoreDedupeChecker is the production DedupeChecker: the once-per-day
@@ -47,10 +48,15 @@ type StoreDedupeChecker struct {
 	Store eventCounter
 }
 
-// AlreadyDeliveredToday implements DedupeChecker.
-func (d StoreDedupeChecker) AlreadyDeliveredToday(ctx context.Context, date string) (bool, error) {
-	n, err := d.Store.CountEventsByKindAndDate(ctx, sqlcgen.CountEventsByKindAndDateParams{
-		Kind: EventDelivered, CreatedAt: date,
+// AlreadyDelivered implements DedupeChecker: true iff a briefing.delivered
+// row exists with created_at in [dayStart, dayEnd) - the LOCAL calendar
+// day Run computed from Orchestrator.Location (FIX-P-14). The bounds go to
+// SQL as UTC RFC3339Nano instants, the same form created_at is stored in.
+func (d StoreDedupeChecker) AlreadyDelivered(ctx context.Context, dayStart, dayEnd time.Time) (bool, error) {
+	n, err := d.Store.CountEventsByKindBetween(ctx, sqlcgen.CountEventsByKindBetweenParams{
+		Kind:    EventDelivered,
+		StartTs: dayStart.UTC().Format(time.RFC3339Nano),
+		EndTs:   dayEnd.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		return false, err

@@ -347,6 +347,7 @@ func TestRunClassifierUnavailableDoesNotWriteDeliveredSoRetryStillDelivers(t *te
 		Ledger:     st,
 		Dedupe:     StoreDedupeChecker{Store: st.Queries},
 		Now:        time.Now,
+		Location:   time.UTC, // FIX-P-14: local day = UTC day, machine-independent
 	}
 
 	first, err := o.Run(context.Background(), "trace-p4-retry-1")

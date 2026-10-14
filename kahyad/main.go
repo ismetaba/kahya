@@ -996,7 +996,10 @@ func run() int {
 		Live:   taskLive,
 		Ledger: st,
 		Dedupe: briefing.StoreDedupeChecker{Store: st.Queries},
-		Log:    log,
+		// FIX-P-14: the once-per-day gate's "day" is the configured local
+		// calendar day (config timezone), never the UTC date.
+		Location: cfg.Location(),
+		Log:      log,
 	}
 	sched.RegisterHandler("morning-briefing", func(ctx context.Context) error {
 		_, err := briefingOrchestrator.Run(ctx, scheduler.TraceIDFromContext(ctx))

@@ -464,6 +464,15 @@ type Config struct {
 	// briefing. Default 50; each item costs one local classification call
 	// and one prompt line. Values < 1 fail Load.
 	BriefingMaxFileItems int `yaml:"briefing_max_file_items"`
+	// Timezone is cfg.timezone (FIX-P-14): the IANA zone name every "which
+	// calendar day is it" decision in kahyad uses (the briefing's
+	// once-per-day gate, metrics/readiness day buckets, metrics absolute
+	// --since dates, the cost governor's daily/monthly USD buckets). Empty
+	// (default) = the daemon process's time.Local, i.e. the macOS system
+	// zone - the user's own zone on a single-user Mac. Ledger timestamps
+	// stay UTC regardless (store.InsertEventWithDigest). An unknown name
+	// fails Load. Read it through Location(), never directly.
+	Timezone string `yaml:"timezone"`
 
 	// --- W5-02 nightly consolidation ---
 
@@ -845,6 +854,7 @@ type fileConfig struct {
 	BriefingFileGlobs             *[]string       `yaml:"briefing_file_globs"`
 	BriefingCalendarNames         *[]string       `yaml:"briefing_calendar_names"`
 	BriefingMaxFileItems          *int            `yaml:"briefing_max_file_items"`
+	Timezone                      *string         `yaml:"timezone"`
 	ConsolidationAutoCommit       *bool           `yaml:"consolidation_auto_commit"`
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
@@ -958,6 +968,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateBriefingMaxFileItems(cfg.BriefingMaxFileItems); err != nil {
+		return Config{}, err
+	}
+	if err := validateTimezone(cfg.Timezone); err != nil {
 		return Config{}, err
 	}
 
@@ -1179,6 +1192,34 @@ func validateBriefingMaxFileItems(n int) error {
 	return nil
 }
 
+// validateTimezone fails Load closed on an unknown timezone name
+// (FIX-P-14): kahyad must never silently run its day boundaries in a zone
+// the operator did not ask for. Empty = time.Local (see Config.Timezone).
+func validateTimezone(tz string) error {
+	if tz == "" {
+		return nil
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		return fmt.Errorf("config: timezone %q: %w", tz, err)
+	}
+	return nil
+}
+
+// Location resolves Timezone (see its doc comment) - the ONE calendar zone
+// source for kahyad (G00 C-22). It never errors: Load already validated
+// the name; a defensive fallback to time.Local keeps a caller that builds
+// Config by hand (tests) working.
+func (c Config) Location() *time.Location {
+	if c.Timezone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(c.Timezone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // defaults returns Config's built-in defaults for env ("prod", "dev", or
 // any other validateEnv-accepted profile name - Load always passes a value
 // validateEnv would accept; defaults itself does not re-validate it).
@@ -1324,6 +1365,8 @@ func defaults(home, env string) Config {
 		BriefingMinute: defaultBriefingMinute,
 		// FIX-P-23: changed-file cap per briefing.
 		BriefingMaxFileItems: 50,
+		// FIX-P-14: "" = the daemon's time.Local (Config.Location).
+		Timezone: "",
 
 		// W5-02 nightly consolidation: suggestion mode is the ONLY mode for
 		// the first 2 weeks, unconditionally (HANDOFF §6 W5 ⚑) - kahyad
@@ -1748,6 +1791,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.BriefingMaxFileItems != nil {
 		cfg.BriefingMaxFileItems = *fc.BriefingMaxFileItems
 	}
+	if fc.Timezone != nil {
+		cfg.Timezone = *fc.Timezone
+	}
 	if fc.ConsolidationAutoCommit != nil {
 		cfg.ConsolidationAutoCommit = *fc.ConsolidationAutoCommit
 	}
@@ -1866,6 +1912,9 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.BriefingMaxFileItems = n
 		}
+	}
+	if v := os.Getenv("KAHYA_TIMEZONE"); v != "" {
+		cfg.Timezone = v
 	}
 	if v := os.Getenv("KAHYA_ANCHOR_REMOTE"); v != "" {
 		cfg.AnchorRemote = v

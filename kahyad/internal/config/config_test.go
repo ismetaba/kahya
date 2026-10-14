@@ -6,13 +6,14 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clearEnv resets every config-relevant env var to unset so tests don't leak
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS", "KAHYA_TIMEZONE"} {
 		t.Setenv(k, "")
 	}
 }
@@ -1621,5 +1622,94 @@ func TestLoadFailsClosedOnInvalidBriefingMaxFileItems(t *testing.T) {
 				t.Fatalf("Load() error = %v, want a briefing_max_file_items validation error", err)
 			}
 		})
+	}
+}
+
+// TestLoadTimezoneDefaultEmptyIsLocal (FIX-P-14): no timezone key means the
+// daemon's own time.Local - the macOS system zone under launchd.
+func TestLoadTimezoneDefaultEmptyIsLocal(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Timezone != "" {
+		t.Errorf("Timezone = %q, want empty", cfg.Timezone)
+	}
+	if cfg.Location() != time.Local {
+		t.Errorf("Location() = %v, want time.Local", cfg.Location())
+	}
+}
+
+// TestLoadTimezoneFileAndEnv (FIX-P-14): timezone is a real config.yaml key
+// and KAHYA_TIMEZONE overrides the file. ("UTC" and "Local" need no tzdata.)
+func TestLoadTimezoneFileAndEnv(t *testing.T) {
+	t.Run("file", func(t *testing.T) {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		writeConfigYAML(t, home, "timezone: \"UTC\"\n")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if got := cfg.Location().String(); got != "UTC" {
+			t.Errorf("Location() = %q, want UTC", got)
+		}
+	})
+	t.Run("env_over_file", func(t *testing.T) {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		writeConfigYAML(t, home, "timezone: \"UTC\"\n")
+		t.Setenv("KAHYA_TIMEZONE", "Local")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Timezone != "Local" || cfg.Location() != time.Local {
+			t.Errorf("Timezone = %q, Location() = %v; want Local / time.Local (env beats file)", cfg.Timezone, cfg.Location())
+		}
+	})
+}
+
+// TestLoadRejectsInvalidTimezone (FIX-P-14): an unknown zone name fails
+// Load closed (file or env) - kahyad never silently runs its day
+// boundaries in a zone nobody asked for.
+func TestLoadRejectsInvalidTimezone(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env string
+	}{
+		{"file", "timezone: \"Mars/Olympus\"\n", ""},
+		{"env", "", "Mars/Olympus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			if tc.env != "" {
+				t.Setenv("KAHYA_TIMEZONE", tc.env)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "timezone") {
+				t.Fatalf("Load() error = %v, want a timezone validation error", err)
+			}
+		})
+	}
+}
+
+// TestLocationFallsBackToLocalForHandBuiltConfig (FIX-P-14): a Config built
+// by hand with a bad name (Load never returns one) still yields a usable
+// zone, never nil.
+func TestLocationFallsBackToLocalForHandBuiltConfig(t *testing.T) {
+	if got := (Config{Timezone: "Mars/Olympus"}).Location(); got != time.Local {
+		t.Errorf("Location() = %v, want time.Local", got)
+	}
+	if got := (Config{Timezone: "UTC"}).Location(); got != time.UTC {
+		t.Errorf("Location() = %v, want time.UTC", got)
 	}
 }

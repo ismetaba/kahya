@@ -175,10 +175,12 @@ type Delivery interface {
 	SendNotification(ctx context.Context, traceID, text string) bool
 }
 
-// DedupeChecker is the once-per-day idempotency check's read surface.
-// StoreDedupeChecker (production.go) is the production implementation.
+// DedupeChecker is the once-per-day idempotency check's read surface:
+// was a briefing delivered in [dayStart, dayEnd) - the user's LOCAL
+// calendar day (FIX-P-14)? StoreDedupeChecker (production.go) is the
+// production implementation.
 type DedupeChecker interface {
-	AlreadyDeliveredToday(ctx context.Context, date string) (bool, error)
+	AlreadyDelivered(ctx context.Context, dayStart, dayEnd time.Time) (bool, error)
 }
 
 // Result is Run's successful/attempted outcome - returned even on a
@@ -252,6 +254,12 @@ type Orchestrator struct {
 	// key and every timestamp this run writes are derived from this.
 	Now func() time.Time
 
+	// Location is the calendar-day zone for the once-per-day gate and the
+	// "date" every ledger payload of this run carries (FIX-P-14). nil =
+	// time.Local; main.go passes cfg.Location(), kahyad's single calendar
+	// zone source. Timestamps written by the run stay UTC instants.
+	Location *time.Location
+
 	// CalendarBudget overrides calendarCollectBudget (tests only, so a
 	// hanging-calendar-runner test need not wait the full production budget).
 	CalendarBudget time.Duration
@@ -275,6 +283,13 @@ func (o *Orchestrator) now() time.Time {
 		return o.Now()
 	}
 	return time.Now()
+}
+
+func (o *Orchestrator) location() *time.Location {
+	if o.Location != nil {
+		return o.Location
+	}
+	return time.Local
 }
 
 func (o *Orchestrator) calendarBudget() time.Duration {
@@ -338,12 +353,24 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		return Result{}, errors.New("briefing: no delivery surface wired")
 	}
 
-	now := o.now().UTC()
-	date := now.Format("2006-01-02")
+	// FIX-P-14: the "day" is the user's LOCAL calendar day in o.Location
+	// (config timezone), never the UTC date - in Istanbul (UTC+3) a launchd
+	// catch-up firing between 00:00 and 03:00 local used to land on the
+	// previous UTC day (a second briefing, or a skipped one). Row
+	// timestamps stay UTC instants.
+	loc := o.location()
+	nowInstant := o.now()
+	now := nowInstant.UTC()
+	nowLocal := nowInstant.In(loc)
+	date := nowLocal.Format("2006-01-02") // the LOCAL calendar day (ledger payloads, JSONL)
+	dayStart := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), 0, 0, 0, 0, loc)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+	tz := loc.String()
 
 	// Once-per-day idempotency (task spec step 3 / acceptance criterion):
 	// a missed-run-fired-on-wake plus the regular scheduled run must never
-	// both deliver. Checked FIRST, before a single collector runs, so a
+	// both deliver within one local calendar day [dayStart, dayEnd).
+	// Checked FIRST, before a single collector runs, so a
 	// duplicate run does the least possible work. This check-then-act is
 	// safe because every production invocation of this job (launchd
 	// catch-up, the 08:30 fire, a manual `kahya job run morning-briefing`)
@@ -353,17 +380,17 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// the first run has finished and recorded its EventDelivered row, and
 	// then no-ops here instead of racing it.
 	if o.Dedupe != nil {
-		already, err := o.Dedupe.AlreadyDeliveredToday(ctx, date)
+		already, err := o.Dedupe.AlreadyDelivered(ctx, dayStart, dayEnd)
 		if err != nil {
 			return Result{}, fmt.Errorf("briefing: dedupe check: %w", err)
 		}
 		if already {
-			o.ledgerRaw(ctx, traceID, EventSkippedDuplicate, map[string]any{"date": date})
+			o.ledgerRaw(ctx, traceID, EventSkippedDuplicate, map[string]any{"date": date, "tz": tz})
 			return Result{SkippedDuplicate: true}, nil
 		}
 	}
 
-	o.ledgerRaw(ctx, traceID, EventStarted, map[string]any{"date": date})
+	o.ledgerRaw(ctx, traceID, EventStarted, map[string]any{"date": date, "tz": tz})
 
 	var items []CollectedItem
 	var calendarNoAccess, calendarTimeout bool
@@ -618,7 +645,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// criterion's "collector, worker, and delivery lines all under one
 	// trace_id".
 	o.jsonlInfo(traceID, "briefing_delivered", "date", date)
-	o.ledgerRaw(ctx, traceID, EventDelivered, map[string]any{"date": date})
+	o.ledgerRaw(ctx, traceID, EventDelivered, map[string]any{"date": date, "tz": tz})
 	_ = o.FileState.Save(now) // best-effort: never fails the run
 
 	result.Delivered = true

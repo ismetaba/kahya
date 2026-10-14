@@ -900,19 +900,25 @@ SELECT id, trace_id, ts, kind, payload, created_at
 FROM events
 ORDER BY id ASC;
 
--- name: CountEventsByKindAndDate :one
--- W5-01's once-per-day idempotency check: counts events of kind on the
--- UTC calendar date dateStr ("YYYY-MM-DD" - SQLite's date() truncates
--- created_at to exactly this, and every created_at this codebase writes
--- is already UTC RFC3339/RFC3339Nano, so no timezone conversion is
--- needed). kahyad/internal/briefing.Orchestrator.Run consults this
--- BEFORE ever classifying a single collector item or spawning a worker
--- for a scheduled OR manual run: a non-zero count for kind=
--- "briefing.delivered" means today's briefing already went out, so this
--- run logs briefing.skipped_duplicate and sends nothing - a missed-run-
--- fired-on-wake plus the regular 08:30 run can therefore never deliver
--- two notifications the same date.
-SELECT count(*) FROM events WHERE kind = ? AND date(created_at) = ?;
+-- name: CountEventsByKindBetween :one
+-- Once-per-LOCAL-day idempotency check (W5-01, fixed by G08/P-14): counts
+-- events of kind whose created_at falls in [start_ts, end_ts). The caller
+-- (kahyad/internal/briefing.StoreDedupeChecker) computes the user's local
+-- calendar day's bounds in Go (config.Config.Location()) and passes them
+-- as UTC RFC3339Nano strings - created_at is always UTC RFC3339Nano
+-- (store.InsertEventWithDigest), so the comparison is a plain instant
+-- comparison and this SQL never needs a timezone of its own. julianday()
+-- makes it numeric (fractional-second digits vary between rows), the
+-- same reasoning as kahyad/internal/metrics' windowClause.
+-- kahyad/internal/briefing.Orchestrator.Run consults this BEFORE ever
+-- classifying a single collector item or spawning a worker for a
+-- scheduled OR manual run: a non-zero count for kind="briefing.delivered"
+-- means today's briefing already went out, so this run logs
+-- briefing.skipped_duplicate and sends nothing.
+SELECT count(*) FROM events
+WHERE kind = ?
+  AND julianday(created_at) >= julianday(sqlc.arg(start_ts))
+  AND julianday(created_at) <  julianday(sqlc.arg(end_ts));
 
 -- W5-02 (nightly consolidation) queries below: hot-window detail-atom
 -- promotion (facts INSERT, episodes.cooled_at) - see
@@ -933,8 +939,8 @@ ORDER BY seq ASC;
 -- Active episodes not yet hot-window-cooled, created at or before cutoff
 -- (RFC3339 UTC string compare - every created_at this codebase writes is
 -- already normalized to that format, so a plain string comparison sorts
--- correctly, matching CountEventsByKindAndDate's own date()-free
--- convention above for the same reason).
+-- correctly; like CountEventsByKindBetween's instant compare above, it
+-- needs no timezone conversion for the same reason).
 SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at
 FROM episodes
 WHERE status = 'active' AND cooled_at IS NULL AND created_at <= ?

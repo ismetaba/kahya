@@ -3,6 +3,7 @@ package briefing
 import (
 	"context"
 	"strings"
+	"time"
 
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/spawn"
@@ -154,6 +155,6 @@ type fakeDedupe struct {
 	Err     error
 }
 
-func (f fakeDedupe) AlreadyDeliveredToday(ctx context.Context, date string) (bool, error) {
+func (f fakeDedupe) AlreadyDelivered(ctx context.Context, dayStart, dayEnd time.Time) (bool, error) {
 	return f.Already, f.Err
 }

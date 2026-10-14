@@ -171,6 +171,9 @@ func TestW5GateSingleNotificationTraceIDThenDuplicateSkipped(t *testing.T) {
 		Dedupe:     dedupe,
 		Log:        log,
 		Now:        now,
+		// FIX-P-14: now is 08:30 UTC today; without a fixed zone a machine
+		// far west of UTC would put that instant on "yesterday".
+		Location: time.UTC,
 	}
 
 	const traceID = "trace-w5-gate-briefing"

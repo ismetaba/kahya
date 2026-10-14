@@ -272,6 +272,9 @@ func TestRunOncePerDaySecondRunSkipsDuplicate(t *testing.T) {
 		Ledger:     ledger,
 		Dedupe:     dedupe,
 		Now:        time.Now,
+		// FIX-P-14: the local day is the UTC day here, whatever zone the
+		// test machine runs in (the ledger stamps real UTC instants).
+		Location: time.UTC,
 	}
 
 	first, err := o.Run(context.Background(), "trace-once-1")
@@ -493,4 +496,124 @@ func TestRunFileItemsCappedAndLoggedTruncated(t *testing.T) {
 	if collected["files"] != float64(2) || collected["files_truncated"] != float64(3) || collected["files_first_run"] != true {
 		t.Errorf("briefing_collected = %v, want files=2 files_truncated=3 files_first_run=true", collected)
 	}
+}
+
+// istanbulZone is Europe/Istanbul as a fixed +03:00 zone (no DST since
+// 2016) - time.LoadLocation would need tzdata.
+func istanbulZone() *time.Location { return time.FixedZone("UTC+3", 3*3600) }
+
+// seedDelivered writes a briefing.delivered row at an explicit instant
+// through the sole ledger writer - Run's own rows are stamped with the real
+// wall clock, so a "previous delivery" must be seeded this way.
+func seedDelivered(t *testing.T, st *store.Store, at time.Time) {
+	t.Helper()
+	if _, err := store.InsertEventWithDigest(context.Background(), st.DB(), "trace-prev-delivery", EventDelivered, []byte(`{}`), at); err != nil {
+		t.Fatalf("seed %s: %v", EventDelivered, err)
+	}
+}
+
+// newDedupeOrchestrator is a minimal real-store briefing whose clock and
+// calendar zone the dedupe tests below fix.
+func newDedupeOrchestrator(st *store.Store, delivery *fakeDelivery, now time.Time, loc *time.Location) *Orchestrator {
+	return &Orchestrator{
+		Classifier: permissiveClassifier(),
+		Spawner:    &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:   delivery,
+		Ledger:     st,
+		Dedupe:     StoreDedupeChecker{Store: st.Queries},
+		Now:        fixedNow(now),
+		Location:   loc,
+	}
+}
+
+// TestRunDedupeNewLocalDayAfterUTCSameDayDelivers (FIX-P-14, scenario B):
+// delivered 2026-07-12 08:30 Istanbul (05:30Z); a manual run at 2026-07-13
+// 01:00 Istanbul (= 2026-07-12 22:00Z, still the same UTC day) is a NEW
+// local day and must deliver. Before the fix the UTC date matched and the
+// run was skipped.
+func TestRunDedupeNewLocalDayAfterUTCSameDayDelivers(t *testing.T) {
+	st := newTestStore(t)
+	ist := istanbulZone()
+	seedDelivered(t, st, time.Date(2026, 7, 12, 5, 30, 0, 0, time.UTC))
+	delivery := &fakeDelivery{Sent: true}
+	o := newDedupeOrchestrator(st, delivery, time.Date(2026, 7, 13, 1, 0, 0, 0, ist), ist)
+
+	res, err := o.Run(context.Background(), "trace-p14-b")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.SkippedDuplicate || !res.Delivered {
+		t.Fatalf("result = %+v, want Delivered=true SkippedDuplicate=false (a new local day)", res)
+	}
+	if len(delivery.Calls) != 1 {
+		t.Fatalf("Telegram sends = %d, want 1", len(delivery.Calls))
+	}
+	var date, tz string
+	if err := st.DB().QueryRow(`SELECT json_extract(payload, '$.date'), json_extract(payload, '$.tz') FROM events WHERE kind = ? AND trace_id = ?`,
+		EventDelivered, "trace-p14-b").Scan(&date, &tz); err != nil {
+		t.Fatal(err)
+	}
+	if date != "2026-07-13" || tz != "UTC+3" {
+		t.Errorf("%s payload date/tz = %q/%q, want the local day 2026-07-13 / UTC+3", EventDelivered, date, tz)
+	}
+}
+
+// TestRunDedupeSameLocalDayAcrossUTCMidnightSkips (FIX-P-14, scenario A):
+// a launchd catch-up delivered at 2026-07-13 01:30 Istanbul
+// (= 2026-07-12 22:30Z); the regular 08:30 Istanbul run the same local day
+// is on the NEXT UTC day and must be skipped. Before the fix it delivered a
+// second briefing seven hours later.
+func TestRunDedupeSameLocalDayAcrossUTCMidnightSkips(t *testing.T) {
+	st := newTestStore(t)
+	ist := istanbulZone()
+	seedDelivered(t, st, time.Date(2026, 7, 12, 22, 30, 0, 0, time.UTC))
+	delivery := &fakeDelivery{Sent: true}
+	o := newDedupeOrchestrator(st, delivery, time.Date(2026, 7, 13, 8, 30, 0, 0, ist), ist)
+
+	res, err := o.Run(context.Background(), "trace-p14-a")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.SkippedDuplicate || res.Delivered {
+		t.Fatalf("result = %+v, want SkippedDuplicate=true Delivered=false (same local day)", res)
+	}
+	if len(delivery.Calls) != 0 {
+		t.Fatalf("Telegram sends = %d, want 0", len(delivery.Calls))
+	}
+	var date, tz string
+	if err := st.DB().QueryRow(`SELECT json_extract(payload, '$.date'), json_extract(payload, '$.tz') FROM events WHERE kind = ? AND trace_id = ?`,
+		EventSkippedDuplicate, "trace-p14-a").Scan(&date, &tz); err != nil {
+		t.Fatal(err)
+	}
+	if date != "2026-07-13" || tz != "UTC+3" {
+		t.Errorf("%s payload date/tz = %q/%q, want 2026-07-13 / UTC+3", EventSkippedDuplicate, date, tz)
+	}
+}
+
+// TestRunNilLocationUsesTimeLocal (FIX-P-14): an Orchestrator without a
+// Location computes its day in time.Local - the same default
+// config.Config.Location() has - and says so in the ledger payload.
+func TestRunNilLocationUsesTimeLocal(t *testing.T) {
+	ledger := &fakeLedger{}
+	o := &Orchestrator{
+		Classifier: permissiveClassifier(),
+		Spawner:    &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:   &fakeDelivery{Sent: true},
+		Ledger:     ledger,
+		Now:        fixedNow(time.Date(2026, 7, 12, 23, 30, 0, 0, time.UTC)),
+	}
+	if _, err := o.Run(context.Background(), "trace-p14-local"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := time.Date(2026, 7, 12, 23, 30, 0, 0, time.UTC).In(time.Local).Format("2006-01-02")
+	for _, e := range ledger.events {
+		if e.kind != EventStarted {
+			continue
+		}
+		if e.payload["date"] != want || e.payload["tz"] != time.Local.String() {
+			t.Errorf("%s payload = %v, want date %s tz %s", EventStarted, e.payload, want, time.Local.String())
+		}
+		return
+	}
+	t.Fatalf("no %s row", EventStarted)
 }
