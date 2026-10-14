@@ -83,6 +83,47 @@ func TestHangingCalendarDoesNotWedgeBriefing(t *testing.T) {
 	}
 }
 
+// TestHangingGHDoesNotWedgeBriefing (FIX-P-8) is the gh twin of the
+// calendar test above: `gh` had no timeout of its own and the scheduler
+// passes context.Background(), so a gh hung on a stalled CONNECT held the
+// briefing - and the scheduler's per-job lock - forever. The per-call
+// timeout and the section budget now bound it; the briefing still
+// delivers, and the gh failure is ledgered (briefing.gh_unavailable).
+func TestHangingGHDoesNotWedgeBriefing(t *testing.T) {
+	delivery := &fakeDelivery{Sent: true}
+	ledger := &fakeLedger{}
+	o := &Orchestrator{
+		Classifier: permissiveClassifier(),
+		GH:         GHCollector{Runner: alwaysHangingGHRunner{}, Repos: []string{"kahya/x"}, CallTimeout: 100 * time.Millisecond},
+		GHBudget:   500 * time.Millisecond, // fast, not the 2m production budget
+		Spawner:    &fakeWorkerSpawner{RawJSON: `{"lines":["ozet"]}`},
+		Delivery:   delivery,
+		Ledger:     ledger,
+		Now:        time.Now,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = o.Run(context.Background(), "trace-gh-hang")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("briefing wedged on a hanging gh collector - the gh timeouts did not fire")
+	}
+
+	if len(delivery.Calls) != 1 {
+		t.Fatalf("delivery calls = %d, want 1 (briefing must still deliver despite the hung gh)", len(delivery.Calls))
+	}
+	if n := ledger.count(EventGHUnavailable); n != 1 {
+		t.Errorf("%s events = %d, want 1", EventGHUnavailable, n)
+	}
+	if n := ledger.count(EventDelivered); n != 1 {
+		t.Errorf("%s events = %d, want 1", EventDelivered, n)
+	}
+}
+
 // TestDeliveryRedactionFailsClosedOnClassifierError is the regression test
 // for the W5-01 review BLOCKER: the step-6 defense-in-depth redaction pass
 // discarded the classifier error, so a secret line was delivered VERBATIM

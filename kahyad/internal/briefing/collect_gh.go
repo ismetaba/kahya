@@ -11,12 +11,15 @@
 package briefing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 )
 
 // ghItemsPerRepo is the task spec's own fixed cap ("gh run list --limit
@@ -32,6 +35,19 @@ const (
 	ghTitleMaxLen      = 200
 	ghConclusionMaxLen = 40
 )
+
+// ghCallTimeout bounds ONE `gh` invocation (one subcommand, one repo) -
+// FIX-P-8. The production ctx has no deadline (scheduler.Trigger passes
+// context.Background()), so without this a `gh` hung on a stalled CONNECT
+// through the egress proxy or an unreachable api.github.com wedged the
+// whole briefing - and, through the scheduler's per-job lock, every later
+// 08:30 run too. A healthy call is ~1-3s.
+const ghCallTimeout = 30 * time.Second
+
+// ghKillWaitDelay is exec.Cmd.WaitDelay for the gh process: after the
+// ctx-driven kill (or after gh itself exited), Output() stops waiting on
+// the stdout pipe even if a grandchild still holds it open.
+const ghKillWaitDelay = 2 * time.Second
 
 // GHPullRequest is one collected, already length/charclass-capped GitHub
 // pull request signal.
@@ -84,6 +100,9 @@ func (r ExecGHRunner) Run(ctx context.Context, args []string) ([]byte, error) {
 		env = append(env, "HTTPS_PROXY="+r.HTTPSProxy, "https_proxy="+r.HTTPSProxy)
 	}
 	cmd.Env = env
+	// Stdin stays nil (/dev/null), so gh never blocks on an interactive
+	// prompt; WaitDelay bounds the pipe wait after the process is gone.
+	cmd.WaitDelay = ghKillWaitDelay
 	return cmd.Output()
 }
 
@@ -91,6 +110,22 @@ func (r ExecGHRunner) Run(ctx context.Context, args []string) ([]byte, error) {
 type GHCollector struct {
 	Runner GHRunner
 	Repos  []string
+	// CallTimeout overrides ghCallTimeout (tests only).
+	CallTimeout time.Duration
+}
+
+func (c GHCollector) callTimeout() time.Duration {
+	if c.CallTimeout > 0 {
+		return c.CallTimeout
+	}
+	return ghCallTimeout
+}
+
+// runBounded runs one gh invocation under the per-call timeout.
+func (c GHCollector) runBounded(ctx context.Context, args []string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(ctx, c.callTimeout())
+	defer cancel()
+	return c.Runner.Run(cctx, args)
 }
 
 type ghPullRequestJSON struct {
@@ -103,14 +138,16 @@ type ghRunJSON struct {
 	Conclusion   string `json:"conclusion"`
 }
 
-// Collect runs `gh pr list`/`gh run list` for every configured repo. A
-// nil Runner or empty Repos list is a documented no-op (nil, nil, nil) -
-// the gh section of a briefing simply has zero items until an operator
-// configures repos, never an error. A single repo's (or single
-// subcommand's) failure is NON-FATAL: it is skipped, never aborting the
-// whole briefing (kahyad's own collectors must be at least as tolerant of
-// a transient `gh`/network hiccup as the rest of this task's design is of
-// a missing Calendar TCC grant).
+// Collect runs `gh pr list`/`gh run list` for every configured repo, each
+// invocation bounded by the per-call timeout (FIX-P-8). A nil Runner or
+// empty Repos list is a documented no-op (nil, nil, nil) - the gh section
+// of a briefing simply has zero items until an operator configures repos,
+// never an error. A single repo's (or single subcommand's) failure is
+// still NON-FATAL for the briefing: the collector returns whatever it did
+// collect, and REPORTS every failure through the returned error
+// (errors.Join; nil when nothing failed) so Run can log and ledger it.
+// Once ctx itself is done (Run's section budget), the remaining repos are
+// skipped without another gh invocation.
 func (c GHCollector) Collect(ctx context.Context) ([]GHPullRequest, []GHRun, error) {
 	if c.Runner == nil || len(c.Repos) == 0 {
 		return nil, nil, nil
@@ -118,25 +155,41 @@ func (c GHCollector) Collect(ctx context.Context) ([]GHPullRequest, []GHRun, err
 
 	var prs []GHPullRequest
 	var runs []GHRun
+	var errs []error
 	limit := strconv.Itoa(ghItemsPerRepo)
 
 	for _, repo := range c.Repos {
-		if prOut, err := c.Runner.Run(ctx, []string{
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("gh collect: %s: %w", repo, err))
+			break
+		}
+
+		prOut, err := c.runBounded(ctx, []string{
 			"pr", "list", "--repo", repo, "--state", "open", "--limit", limit, "--json", "number,title",
-		}); err == nil {
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("gh pr list %s: %w", repo, err))
+		} else {
 			var items []ghPullRequestJSON
-			if json.Unmarshal(prOut, &items) == nil {
+			if err := decodeGHJSON(prOut, &items); err != nil {
+				errs = append(errs, fmt.Errorf("gh pr list %s: decode: %w", repo, err))
+			} else {
 				for _, it := range items {
 					prs = append(prs, GHPullRequest{Repo: repo, Number: it.Number, Title: capText(it.Title, ghTitleMaxLen)})
 				}
 			}
 		}
 
-		if runOut, err := c.Runner.Run(ctx, []string{
+		runOut, err := c.runBounded(ctx, []string{
 			"run", "list", "--repo", repo, "--limit", limit, "--json", "workflowName,conclusion",
-		}); err == nil {
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("gh run list %s: %w", repo, err))
+		} else {
 			var items []ghRunJSON
-			if json.Unmarshal(runOut, &items) == nil {
+			if err := decodeGHJSON(runOut, &items); err != nil {
+				errs = append(errs, fmt.Errorf("gh run list %s: decode: %w", repo, err))
+			} else {
 				for _, it := range items {
 					runs = append(runs, GHRun{
 						Repo: repo, Workflow: capText(it.WorkflowName, ghTitleMaxLen),
@@ -146,7 +199,18 @@ func (c GHCollector) Collect(ctx context.Context) ([]GHPullRequest, []GHRun, err
 			}
 		}
 	}
-	return prs, runs, nil
+	return prs, runs, errors.Join(errs...)
+}
+
+// decodeGHJSON decodes one gh --json reply. Empty output (no bytes, or
+// whitespace only) means "no items" - gh prints [] for an empty list, so
+// this only tolerates a silent success; anything else that is not the
+// expected JSON array is reported.
+func decodeGHJSON(out []byte, v any) error {
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(out, v)
 }
 
 // ghPullRequestItems adapts a []GHPullRequest into the gate's uniform

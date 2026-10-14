@@ -74,6 +74,9 @@ const (
 	// EventClassifierUnavailable (FIX-P-4): the warm-up of the local
 	// classifier failed; payload {phase: gate|redaction, err}.
 	EventClassifierUnavailable = "briefing.classifier_unavailable"
+	// EventGHUnavailable (FIX-P-8): a gh call failed or timed out; the gh
+	// section is partial or empty, the briefing goes on. Payload {err}.
+	EventGHUnavailable = "briefing.gh_unavailable"
 )
 
 // briefingUntrustedReason is the reason string InsertUntrusted's
@@ -95,6 +98,12 @@ const calendarCollectBudget = 20 * time.Second
 // state file only advances after a delivered briefing, so every failed run
 // before the first delivery is also a first run.
 const firstRunFileLookback = 24 * time.Hour
+
+// ghCollectBudget bounds the whole gh section (FIX-P-8): a backstop above
+// the per-call timeout, since N repos x 2 calls x ghCallTimeout could
+// otherwise reach many minutes. Repos not reached in time are skipped for
+// the day.
+const ghCollectBudget = 2 * time.Minute
 
 // Config is this package's own run-time configuration - a narrower,
 // already-`~`-expanded projection of config.Config's own
@@ -248,6 +257,8 @@ type Orchestrator struct {
 	WarmupBudget time.Duration
 	// ClassifyBudget overrides gateClassifyBudget (tests only).
 	ClassifyBudget time.Duration
+	// GHBudget overrides ghCollectBudget (tests only).
+	GHBudget time.Duration
 }
 
 func (o *Orchestrator) now() time.Time {
@@ -262,6 +273,13 @@ func (o *Orchestrator) calendarBudget() time.Duration {
 		return o.CalendarBudget
 	}
 	return calendarCollectBudget
+}
+
+func (o *Orchestrator) ghBudget() time.Duration {
+	if o.GHBudget > 0 {
+		return o.GHBudget
+	}
+	return ghCollectBudget
 }
 
 func (o *Orchestrator) warmupBudget() time.Duration {
@@ -345,7 +363,17 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// --- Collect (each source is independently best-effort: one
 	// source's failure never aborts the whole briefing) ---
 
-	prs, runs, _ := o.GH.Collect(ctx)
+	// FIX-P-8: the gh section is bounded (per call and as a whole) so a
+	// hung gh can never hold this run - and the scheduler's per-job lock -
+	// forever. A failure is non-fatal (the same tolerance as the calendar
+	// section) but never silent: JSONL + ledger.
+	ghCtx, ghCancel := context.WithTimeout(ctx, o.ghBudget())
+	prs, runs, ghErr := o.GH.Collect(ghCtx)
+	ghCancel()
+	if ghErr != nil {
+		o.jsonlWarn(traceID, "briefing_gh_collect_error", "err", ghErr.Error(), "prs", len(prs), "runs", len(runs))
+		o.ledgerRaw(ctx, traceID, EventGHUnavailable, map[string]any{"err": ghErr.Error()})
+	}
 	items = append(items, ghPullRequestItems(prs)...)
 	items = append(items, ghRunItems(runs)...)
 
@@ -457,6 +485,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 
 	if o.Taint != nil {
 		if err := o.Taint.InsertUntrusted(ctx, traceID, sessionID, briefingUntrustedReason); err != nil {
+			o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "taint_failed", "err": err.Error()})
 			return result, fmt.Errorf("briefing: taint session: %w", err)
 		}
 	}
@@ -478,6 +507,7 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 			CreatedAt: nowStr,
 			Lane:      spawn.LaneNormal,
 		}); err != nil {
+			o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "task_row_failed", "err": err.Error()})
 			return result, fmt.Errorf("briefing: insert task row: %w", err)
 		}
 		// FIX-I-14: the briefing's row walks the status machine like every
@@ -559,7 +589,11 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 
 	sent := o.Delivery.SendNotification(ctx, traceID, fullText)
 	if !sent {
+		// FIX-P-8: a started run never ends without a terminal ledger row
+		// (delivered | failed | summary_rejected) - a stalled egress path
+		// that timed the gh section out usually fails this send too.
 		o.jsonlWarn(traceID, "briefing_delivery_failed", "date", date)
+		o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "delivery_failed"})
 		return result, errors.New("briefing: delivery failed (egress-blocked or disabled)")
 	}
 
