@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -102,6 +103,17 @@ func waitPendingID(t *testing.T, st *store.Store, tool string) string {
 	}
 }
 
+// pendingRows counts every pending_approvals row and the live
+// (consumed_at IS NULL) ones: a parked call's post-wait re-check must never
+// mint a second row (and so a second Telegram/Hammerspoon card).
+func pendingRows(t *testing.T, st *store.Store) (total, live int) {
+	t.Helper()
+	if err := st.DB().QueryRow(`SELECT count(*), count(*) FILTER (WHERE consumed_at IS NULL) FROM pending_approvals`).Scan(&total, &live); err != nil {
+		t.Fatalf("count pending_approvals: %v", err)
+	}
+	return total, live
+}
+
 func eventCount(t *testing.T, st *store.Store, kind string) int {
 	t.Helper()
 	var n int
@@ -199,6 +211,9 @@ func TestMCPGateWaitDeniedReturnsTurkishDenyMessage(t *testing.T) {
 		t.Fatalf("demoted = %d, want 1", n)
 	}
 	waitEventOutcome(t, f.store, "denied", time.Second)
+	if total, live := pendingRows(t, f.store); total != 1 || live != 0 {
+		t.Fatalf("pending_approvals after a denial = %d rows (%d live), want exactly 1 decided row", total, live)
+	}
 }
 
 // TestMCPGateWaitCanceledWhenClientDisconnects: a parked call whose client
@@ -244,6 +259,15 @@ func TestMCPGateWaitTimeoutReturnsTurkishTimeoutMessage(t *testing.T) {
 		t.Fatalf("timed-out memory_write = %+v (body %s), want isError with %q", o.err, o.body, fmt.Sprintf(MsgApprovalWaitTimeoutFmt, id))
 	}
 	waitEventOutcome(t, f.store, "timeout", time.Second)
+	// The post-wait re-check (NoMintPending) minted no second row, and the
+	// original one is still undecided.
+	if total, live := pendingRows(t, f.store); total != 1 || live != 1 {
+		t.Fatalf("pending_approvals after a timed-out wait = %d rows (%d live), want exactly 1 live row", total, live)
+	}
+	var consumed sql.NullString
+	if err := f.store.DB().QueryRow(`SELECT consumed_at FROM pending_approvals WHERE id = ?`, id).Scan(&consumed); err != nil || consumed.Valid {
+		t.Fatalf("pending row %s consumed_at = %+v (err %v), want NULL (the id is still live)", id, consumed, err)
+	}
 
 	// The id is still live: approve it, and the model's identical retry
 	// redeems the grant and executes once.
@@ -298,6 +322,9 @@ func TestHaltWakesApprovalWaiterWithDeny(t *testing.T) {
 	waitEventOutcome(t, f.store, "denied", time.Second)
 	if _, err := os.Stat(filepath.Join(f.memoryDir, "inbox", "approved.md")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("halted memory_write created the file (stat err %v)", err)
+	}
+	if total, live := pendingRows(t, f.store); total != 1 || live != 0 {
+		t.Fatalf("pending_approvals after a halt = %d rows (%d live), want exactly 1 invalidated row", total, live)
 	}
 }
 
