@@ -240,6 +240,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #6 | every policy fixture carries the full mandatory deny-glob list (fixture drift guard) | `kahyad/internal/policy/TestPolicyFixturesCarryEveryMandatoryDenyGlob` | FIX-B-4 | ci-hermetic |
 | Safety #6 | fs_write refuses git config / .git / ssh / memory-repo / python-startup paths before any policy check | `mcp/fs/TestHandleWriteDeniesGitConfigFamilies` | FIX-B-4 | ci-hermetic |
 | Safety #6 | a repo's .git or the ~/Kahya memory repo is never a shell_docker workdir; the repo root stays mountable | `mcp/shell/TestRun_WorkdirInB4DenyFamiliesRejected` | FIX-B-4 | ci-hermetic |
+| Safety #6 | runtime data/memory/code paths self-protected by profile-aware deny globs (dev ⇒ Kahya-dev) | `kahyad/internal/config/TestSelfProtectDenyGlobsProfileAware` | FIX-B-4 | ci-hermetic |
+| Safety #6 | self-protect globs cover DataDir, KahyaDir, memory, backups, brain.db, the control secret and only the code tree's bin/venvs/policy files (G04-2) | `kahyad/internal/config/TestSelfProtectDenyGlobsCoversDataAndMemoryAndCode` | FIX-B-4 | ci-hermetic |
+| Safety #6 | self-protect globs match the symlink-resolved canonical path mcp/fs checks | `kahyad/internal/config/TestSelfProtectDenyGlobsResolveSymlinkedHome` | FIX-B-4 | ci-hermetic |
+| Safety #6 | kahyad wires policy.yaml's deny globs plus the self-protect globs into fs and shell_docker | `kahyad/TestWiredDenyGlobsIncludeSelfProtect` | FIX-B-4 | ci-hermetic |
+| Safety #6 | the real dev-profile kahyad refuses fs_write into its own data/memory dirs before any policy decision | `tests/w3/TestB4SelfProtectDenyGlobsRefuseRuntimePathsOverRealBins` | FIX-B-4 | local-integration |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
 | Safety #6 | `do shell script` in osascript rejected (not a reroute) | `mcp/osascript/TestScanRejectsDoShellScript` | W3-09 | ci-hermetic |
 | Safety #6 | Terminal/iTerm/ObjC-bridge/code-loader osascript bodies rejected (not only do shell script) | `mcp/osascript/TestScanRejectsTerminalAndITermAutomation` | FIX-B-9 | ci-hermetic |

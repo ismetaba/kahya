@@ -515,7 +515,13 @@ func run() int {
 	// the server's approval wait, so fs/shell/osascript calls that need
 	// approval park for the human decision too.
 	fsPolicyClient := srv.FSPolicyClient()
-	fsTool := mcpfs.New(home, pol.FSWriteDenyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
+	// FIX-B-4: fs_write/fs_delete and the shell_docker workdir check deny
+	// policy.yaml's globs PLUS the profile-aware self-protect globs derived
+	// from this config's own runtime paths (dev/redteam DataDir, KahyaDir,
+	// the code tree's bin/venvs/policy files).
+	denyGlobs := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
+	log.Info("self_protect_deny_globs", "count", len(denyGlobs)-len(pol.FSWriteDenyGlobs), "policy_count", len(pol.FSWriteDenyGlobs))
+	fsTool := mcpfs.New(home, denyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
 	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
 	// paths) - this wires the SEPARATE, content-based half so a file whose
@@ -549,7 +555,7 @@ func run() int {
 	if err != nil {
 		log.Error("shell_pinned_digest_load_failed", "path", cfg.DockerImageDigestPath, "err", err.Error())
 	}
-	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, pol.FSWriteDenyGlobs, cfg.ShellWorkdirRoots, fsPolicyClient, st, server.NewFSLogger(log))
+	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, denyGlobs, cfg.ShellWorkdirRoots, fsPolicyClient, st, server.NewFSLogger(log))
 
 	// W3-05: needs_network:true jobs attach to the kahya-egress internal
 	// Docker network instead of being refused outright (W3-04's
@@ -1325,6 +1331,16 @@ func embedServiceDir(cmd []string) string {
 		return ""
 	}
 	return filepath.Dir(cmd[1])
+}
+
+// wiredFSDenyGlobs is the deny-glob list kahyad hands mcp/fs (fs_write/
+// fs_delete) and mcp/shell (shell_docker workdir): policy.yaml's own
+// fs_write_deny_globs (already ~-expanded) followed by
+// cfg.SelfProtectDenyGlobs() (FIX-B-4). A fresh slice, so neither input is
+// aliased. On a policy load failure policyGlobs is empty (deny-all mode),
+// and the self-protect globs still apply.
+func wiredFSDenyGlobs(policyGlobs []string, cfg config.Config) []string {
+	return append(append([]string{}, policyGlobs...), cfg.SelfProtectDenyGlobs()...)
 }
 
 // hostPortFromURL resolves rawURL's host and port (defaulting to 80/443

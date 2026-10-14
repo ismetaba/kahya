@@ -535,6 +535,107 @@ func (c Config) TmpDir() string {
 	return filepath.Join(c.DataDir, "tmp")
 }
 
+// SelfProtectDenyGlobs returns fs_write_deny_globs entries DERIVED from this
+// config's own runtime paths (B-4): a profile-aware guard, so a dev/redteam
+// profile's DataDir/KahyaDir and the installed code tree are as protected
+// as prod's hardcoded "~/Library/Application Support/Kahya/**" and
+// "~/Kahya/**". main.go merges them with policy.FSWriteDenyGlobs for
+// fs_write/fs_delete and the shell_docker workdir check; hostexec has its
+// own git hardening and uses no deny globs.
+//
+// Every entry is absolute (config paths are already ~-expanded). A
+// directory gets "/**" (the directory itself and its whole subtree); a
+// file is listed exactly. Each path is listed as configured AND, when it
+// differs, with its deepest existing ancestor's symlinks resolved — the
+// form mcp/fs.Canonicalize hands MatchesAnyGlobCI (e.g. /var/folders ->
+// /private/var/folders on macOS), so a symlinked home cannot slip past.
+// A relative or empty path is skipped (it could never match a canonical
+// absolute path). Overlap with policy.yaml's own globs is harmless
+// (MatchesAnyGlobCI is an OR).
+//
+// Code tree (decision G04-2): only the sub-paths kahyad itself runs or
+// trusts — bin/ (kahyad, kahya-mcp, kahya-trigger), the worker, embed and
+// Qwen venvs, policy.yaml/policy.dev.yaml — never the whole repo, so a
+// shell_docker task may still use a repo subdirectory as its workdir
+// (the repo's .git is covered by the mandatory "**/.git/**"). The repo
+// root is derived like defaultWorkerCmd: two directories up from the
+// running executable.
+func (c Config) SelfProtectDenyGlobs() []string {
+	var globs []string
+	seen := make(map[string]bool)
+	add := func(p string, subtree bool) {
+		for _, form := range selfProtectForms(p) {
+			g := form
+			if subtree {
+				g = filepath.Join(form, "**")
+			}
+			if !seen[g] {
+				seen[g] = true
+				globs = append(globs, g)
+			}
+		}
+	}
+	// Runtime data: brain.db (+ WAL/SHM), logs, undo pre-images, tmp, the
+	// control socket's secret; the memory repo and its backups.
+	for _, dir := range []string{c.DataDir, c.LogDir, c.KahyaDir, c.MemoryDir, c.BackupDir} {
+		add(dir, true)
+	}
+	// An unset DBPath/Socket yields relative "-wal"/".secret" names, which
+	// selfProtectForms skips.
+	for _, f := range []string{c.DBPath, c.DBPath + "-wal", c.DBPath + "-shm", ControlSecretPath(c.Socket)} {
+		add(f, false)
+	}
+	// Runtime trust anchors kahyad reads: the policy it boots with and the
+	// committed image-digest pins.
+	add(c.PolicyPath, false)
+	add(c.DockerImageDigestPath, false)
+	add(c.EgressSidecarDigestPath, false)
+	if exe, err := os.Executable(); err == nil {
+		repo := filepath.Dir(filepath.Dir(exe))
+		add(filepath.Join(repo, "bin"), true)
+		add(filepath.Join(repo, "worker", ".venv"), true)
+		add(filepath.Join(repo, "mlx", "embed", ".venv"), true)
+		add(filepath.Join(repo, "mlx", "qwen", ".venv"), true)
+		add(filepath.Join(repo, "policy.yaml"), false)
+		add(filepath.Join(repo, "policy.dev.yaml"), false)
+	}
+	return globs
+}
+
+// selfProtectForms returns p (cleaned) and, when it differs, p with its
+// deepest existing ancestor's symlinks resolved. Empty or relative p
+// yields nothing.
+func selfProtectForms(p string) []string {
+	if p == "" || !filepath.IsAbs(p) {
+		return nil
+	}
+	p = filepath.Clean(p)
+	out := []string{p}
+	if r := resolveExistingAncestor(p); r != "" && r != p {
+		out = append(out, r)
+	}
+	return out
+}
+
+// resolveExistingAncestor resolves the symlinks of p's deepest existing
+// ancestor (p itself when it exists) and re-appends the not-yet-existing
+// remainder verbatim; "" when nothing resolves.
+func resolveExistingAncestor(p string) string {
+	rest := ""
+	cur := p
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
 // JobConfig is one cfg.jobs entry (W4-01 task spec step 1). Name must be
 // DNS-label chars only (kahyad/internal/scheduler renders it into a
 // "com.kahya.job.<name>" launchd Label and a "job-<name>.log" filename —
