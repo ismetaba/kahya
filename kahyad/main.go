@@ -515,7 +515,10 @@ func run() int {
 	policyEngine.SetInvalidatedHook(func(info policy.PendingApprovalInfo) {
 		go tgBot.OnApprovalInvalidated(context.Background(), info)
 	})
-	log.Info("telegram_bot_wired", "enabled", tgBot.Enabled())
+	// FIX-P-5: "online" is always false here - New never dials; the
+	// lifecycle-ctx Start goroutine below brings the bot online (getMe
+	// with backoff) and logs telegram_online once Telegram answers.
+	log.Info("telegram_bot_wired", "enabled", tgBot.Enabled(), "online", tgBot.Online())
 
 	// BLOCKER B/C: the shared, daemon-lifetime forward-proxy (egress.Proxy,
 	// started below) cannot infer which task a needs_network:true
@@ -1358,7 +1361,11 @@ func run() int {
 	// W3-07: the Telegram bot's long-polling loop - Start blocks internally
 	// until ctx is cancelled (it stops its own poller from a ctx.Done()
 	// goroutine), a no-op on a disabled bot. Same ctx-cancelled-then-joined
-	// pattern as the boot reindex goroutine/undo sweeper above.
+	// pattern as the boot reindex goroutine/undo sweeper above. FIX-P-5:
+	// Start first retries getMe with backoff until Telegram is reachable
+	// (a daemon booted without network recovers by itself); a shutdown
+	// during that wait returns at once, so telegramDone.Wait() never
+	// stalls on an unreachable API.
 	var telegramDone sync.WaitGroup
 	telegramDone.Add(1)
 	go func() {

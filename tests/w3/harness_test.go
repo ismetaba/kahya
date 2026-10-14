@@ -219,7 +219,34 @@ func bootKahyad(t *testing.T, opts daemonOpts) *daemon {
 	}
 	t.Cleanup(func() { stopProcess(d.cmd) })
 	waitForHealth(t, d.client, homeDir)
+	if opts.telegramURL != "" {
+		// FIX-P-5: the bot's getMe now runs inside Start (concurrently
+		// with srv.Run), and a card produced before it succeeds falls back
+		// locally instead of reaching the fake Bot API - wait for the
+		// telegram_online JSONL line so no gate races the first probe.
+		waitForJSONLEvent(t, errPath, "telegram_online", 10*time.Second, homeDir)
+	}
 	return d
+}
+
+// waitForJSONLEvent polls kahyad's mirrored-to-stderr JSONL log until a
+// line with event == kind appears (any trace_id), or fails the test.
+func waitForJSONLEvent(t *testing.T, path, kind string, timeout time.Duration, homeDir string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(path)
+		for _, line := range strings.Split(string(b), "\n") {
+			var rec struct {
+				Event string `json:"event"`
+			}
+			if json.Unmarshal([]byte(line), &rec) == nil && rec.Event == kind {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("no %s JSONL line within %v\n%s", kind, timeout, dumpLogs(homeDir))
 }
 
 // resolveDockerHost returns the current `docker` CLI context's endpoint

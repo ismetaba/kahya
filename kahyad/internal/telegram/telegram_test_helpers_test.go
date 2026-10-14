@@ -248,6 +248,9 @@ func newTestBot(t *testing.T, cfg Config, sender Sender, ledger Ledger, gate Egr
 		cfg: cfg, tb: tb, sender: sender, ledger: ledger, egress: gate, engine: engine, local: local,
 		home: testHome(t), cards: map[string]*cardState{},
 	}
+	// FIX-P-5: every test built here assumes a REACHABLE bot (send never
+	// dials while offline); a test of the offline path stores false itself.
+	b.online.Store(true)
 	b.registerHandlers()
 	return b
 }

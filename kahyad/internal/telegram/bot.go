@@ -24,19 +24,31 @@
 // returns an error) — every other kahyad subsystem is unaffected either
 // way (task spec step 1).
 //
+// Enabled vs Online (FIX-P-5): Enabled means CONFIGURED (a token was read
+// and telebot was constructed); Online means REACHABLE (Start's getMe
+// succeeded). New never touches the network
+// (Settings{Offline: true}), so a daemon that boots before Wi-Fi is up
+// still gets an Enabled bot; Start retries getMe with capped backoff until
+// it succeeds, and only then starts long-polling. While the bot is not
+// Online, send never dials: it degrades to the local fallback at once.
+//
 // Testability: this package never calls the real Telegram Bot API in
 // tests. Sender is the narrow Send/Edit/Respond subset of *telebot.Bot
 // this package actually uses — production wires the real *telebot.Bot (it
 // satisfies Sender directly, no adapter); every test in this package
-// injects an in-memory fake instead, while still driving the REAL
-// telebot.Bot middleware/dispatch machinery via Settings{Offline: true}
-// (skips telebot's own network-touching NewBot's getMe call) so the
-// allowlist/handler wiring itself is exercised authentically.
+// injects an in-memory fake instead (or an httptest fake Bot API server),
+// while still driving the REAL telebot.Bot middleware/dispatch machinery
+// via Settings{Offline: true} so the allowlist/handler wiring itself is
+// exercised authentically.
 package telegram
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tele "gopkg.in/telebot.v4"
@@ -183,6 +195,14 @@ type Bot struct {
 	remembered RememberedMarker
 	ritual     RitualAnswerer
 
+	// online is FIX-P-5's "reachable" bit: set by Start's waitOnline once
+	// getMe succeeds; false (the zero value) until then - send never dials
+	// while false.
+	online atomic.Bool
+	// probeBackoff is waitOnline's delay before getMe retry #attempt+1;
+	// nil means defaultProbeBackoff (tests build Bot literals without New).
+	probeBackoff func(attempt int) time.Duration
+
 	mu    sync.Mutex
 	cards map[string]*cardState
 }
@@ -195,26 +215,34 @@ type Bot struct {
 // asserted (no webhook)"). apiURL empty means "use telebot's own default
 // (https://api.telegram.org)" — see Config.APIURL's doc comment for the
 // one (hermetic-testing-only) case it is ever non-empty.
+//
+// Offline is ALWAYS true (FIX-P-5): telebot's NewBot would otherwise call
+// getMe synchronously and fail construction whenever the network is not
+// up yet at boot, disabling the bot for the whole process lifetime. Start's
+// waitOnline does that getMe instead, with retry and backoff.
 func buildSettings(token, apiURL string) tele.Settings {
 	return tele.Settings{
-		Token:  token,
-		URL:    apiURL,
-		Poller: &tele.LongPoller{Timeout: longPollTimeout},
+		Token:   token,
+		URL:     apiURL,
+		Poller:  &tele.LongPoller{Timeout: longPollTimeout},
+		Offline: true,
 	}
 }
 
-// New constructs a Bot. It NEVER returns an error: an unconfigured
-// chat_id/user_id pair, a missing/locked kahya.telegram Keychain item, or
-// a telebot construction failure all resolve to a DISABLED bot (task spec
-// step 1: "missing/locked Keychain ⇒ log telegram_disabled + continue,
-// local surfaces unaffected, daemon fine") — every other kahyad subsystem
-// is wired identically regardless of whether this returns an enabled or a
-// disabled Bot.
+// New constructs a Bot. It NEVER returns an error and NEVER touches the
+// network (FIX-P-5): an unconfigured chat_id/user_id pair, a missing/locked
+// kahya.telegram Keychain item, or a telebot construction failure all
+// resolve to a DISABLED bot (task spec step 1: "missing/locked Keychain ⇒
+// log telegram_disabled + continue, local surfaces unaffected, daemon
+// fine") — every other kahyad subsystem is wired identically regardless
+// of whether this returns an enabled or a disabled Bot. An Enabled bot
+// starts NOT Online; Start brings it online.
 func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, engine FeedbackEngine, local LocalNotifier, home string, secretLaneGlobs []string, log *logx.Logger) *Bot {
 	b := &Bot{
 		cfg: cfg, ledger: ledger, egress: egressGate, engine: engine, local: local,
 		home: home, secretLaneGlobs: secretLaneGlobs, log: log,
-		cards: map[string]*cardState{},
+		cards:        map[string]*cardState{},
+		probeBackoff: defaultProbeBackoff,
 	}
 	if !cfg.Enabled() {
 		b.logDisabled("telegram.chat_id/telegram.user_id not configured")
@@ -236,9 +264,115 @@ func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, en
 	return b
 }
 
-// Enabled reports whether this Bot has a live long-polling connection (a
-// real token was read AND telebot constructed successfully).
+// Enabled reports whether this Bot is CONFIGURED: a real token was read
+// AND telebot was constructed (offline). It says nothing about whether
+// Telegram is reachable right now - see Online.
 func (b *Bot) Enabled() bool { return b.tb != nil }
+
+// Online reports whether Telegram was REACHABLE: false until Start's getMe
+// succeeds. send never dials while this is false.
+func (b *Bot) Online() bool { return b.online.Load() }
+
+// setOnline records a reachability change, logging only real transitions.
+func (b *Bot) setOnline(v bool) {
+	if b.online.Swap(v) != v && b.log != nil {
+		b.log.Info("telegram_online_changed", "online", v)
+	}
+}
+
+// probeBackoffBase/probeBackoffMax bound waitOnline's getMe retry delay.
+const (
+	probeBackoffBase = 1 * time.Second
+	probeBackoffMax  = 60 * time.Second
+)
+
+// defaultProbeBackoff is 1s, 2s, 4s, ... capped at 60s, with +/-10%
+// jitter (so a fleet of wake-from-sleep retries does not synchronize).
+func defaultProbeBackoff(attempt int) time.Duration {
+	d := probeBackoffBase << uint(min(max(attempt, 0), 10))
+	if d > probeBackoffMax {
+		d = probeBackoffMax
+	}
+	return d + time.Duration(rand.Int64N(int64(d)/5)) - d/10
+}
+
+// getMe is telebot's own unexported getMe re-done over the exported Raw
+// (Bot.Me is an exported field, so the result can be stored back).
+func (b *Bot) getMe() (*tele.User, error) {
+	data, err := b.tb.Raw("getMe", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct{ Result *tele.User }
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Result == nil {
+		return nil, errors.New("telegram: getMe returned no user")
+	}
+	return resp.Result, nil
+}
+
+// getMeCtx runs getMe in its own goroutine so a ctx cancel (daemon
+// shutdown) returns IMMEDIATELY: tele.Bot.Raw aborts an in-flight request
+// only through the bot's stop channel, which does not exist before
+// tele.Bot.Start - so without this wrapper a getMe against a black-holed
+// network would hold shutdown for up to telebot's 1-minute HTTP client
+// timeout. The abandoned goroutine ends by itself within that minute;
+// nothing waits for it.
+func (b *Bot) getMeCtx(ctx context.Context) (*tele.User, error) {
+	type result struct {
+		me  *tele.User
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		me, err := b.getMe()
+		ch <- result{me, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.me, r.err
+	}
+}
+
+// waitOnline blocks until getMe succeeds (then stores the bot identity in
+// tb.Me, marks the bot Online and returns true) or ctx ends (false). Each
+// failure is logged as telegram_getme_failed and retried after
+// probeBackoff(attempt).
+func (b *Bot) waitOnline(ctx context.Context) bool {
+	backoff := b.probeBackoff
+	if backoff == nil {
+		backoff = defaultProbeBackoff
+	}
+	for attempt := 0; ; attempt++ {
+		me, err := b.getMeCtx(ctx)
+		if ctx.Err() != nil {
+			return false
+		}
+		if err == nil {
+			b.tb.Me = me
+			b.setOnline(true)
+			if b.log != nil {
+				b.log.Info("telegram_online", "username", me.Username, "attempts", attempt+1)
+			}
+			return true
+		}
+		delay := backoff(attempt)
+		if b.log != nil {
+			b.log.Warn("telegram_getme_failed", "attempt", attempt+1, "retry_in_ms", delay.Milliseconds(), "err", err.Error())
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
+		}
+	}
+}
 
 func (b *Bot) logDisabled(reason string) {
 	if b.log != nil {
@@ -323,13 +457,19 @@ func (b *Bot) ledgerUnauthorized(chatID, userID int64) {
 	})
 }
 
-// Start begins long-polling (task spec step 1: "Start long-polling only")
-// and blocks until ctx is cancelled — main.go runs this in its own
-// goroutine, the same ctx-cancelled-then-joined pattern the boot reindex
-// goroutine and the undo-window sweeper already use. No-op on a disabled
-// Bot.
+// Start brings the bot online and then long-polls (task spec step 1:
+// "Start long-polling only"), blocking until ctx is cancelled — main.go
+// runs this in its own goroutine under the daemon's lifecycle ctx, the
+// same ctx-cancelled-then-joined pattern the boot reindex goroutine and
+// the undo-window sweeper already use. FIX-P-5: it first retries getMe
+// with backoff (waitOnline) until Telegram is reachable, so a daemon that
+// booted offline recovers by itself; a cancel during that wait returns at
+// once. No-op on a disabled Bot.
 func (b *Bot) Start(ctx context.Context) {
 	if !b.Enabled() {
+		return
+	}
+	if !b.waitOnline(ctx) {
 		return
 	}
 	go func() {
@@ -344,9 +484,16 @@ func (b *Bot) Start(ctx context.Context) {
 // step 5), THEN the actual send. A blocked/failed send falls back to a
 // local notify line (best-effort) and is never silently swallowed; it
 // returns nil on any failure so callers can skip card-state bookkeeping
-// for a message that never actually reached Telegram.
+// for a message that never actually reached Telegram. FIX-P-5 (decision
+// G09-1): while the bot is not Online, send returns BEFORE the egress
+// check without touching the network - one local telegram_offline line
+// instead of a send that could block on the HTTP client timeout.
 func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.ReplyMarkup) *tele.Message {
 	if !b.Enabled() {
+		return nil
+	}
+	if !b.Online() {
+		b.fallbackLocal(ctx, traceID, "telegram_offline", msgTelegramOffline)
 		return nil
 	}
 	// MINOR D fix: SessionID is now set (== traceID) alongside TraceID, so

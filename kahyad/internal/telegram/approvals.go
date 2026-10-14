@@ -34,6 +34,10 @@ const (
 	suffixApproved = "\n\n✅ Onaylandı"
 	suffixRejected = "\n\n❌ Reddedildi"
 	suffixExpired  = "\n\n⏰ Süresi doldu"
+
+	// msgTelegramOffline is the local-fallback line send writes when the
+	// bot is configured but Telegram is not reachable (FIX-P-5).
+	msgTelegramOffline = "Telegram çevrimdışı; onay/alarm CLI/yerel yüzeyden takip edilmeli."
 )
 
 // cbActionApprove/cbActionDeny are the single leading byte of every
@@ -161,6 +165,14 @@ func (b *Bot) sendRedactedNotice(ctx context.Context, info policy.PendingApprova
 // later callback/expiry can edit that SAME message rather than send a new
 // one.
 func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalInfo) {
+	// FIX-P-5: while Telegram is unreachable a multi-chunk card would get
+	// one telegram_offline local line PER CHUNK from send - one line for
+	// the whole card instead (the pending_approvals row and `kahya
+	// approvals` stay the real surface; nothing is queued).
+	if !b.Online() {
+		b.fallbackLocal(ctx, info.TraceID, "telegram_offline", msgTelegramOffline)
+		return
+	}
 	payload := renderPendingApprovalPayload(b.home, info.Tool, info.ToolInput)
 	rendered := payload.Render()
 	chunks := approval.ChunkForTelegram(rendered, 0)
