@@ -55,7 +55,10 @@ type Querier interface {
 	// given pending_approval_id ever affects a row; a second call against the
 	// same id - Approve or Deny, forged or genuine - affects 0 rows, which
 	// kahyad/internal/policy/engine.go treats as already-used/rejects, minting
-	// no token and performing no bookkeeping a second time.
+	// no token and performing no bookkeeping a second time. decision (B-1,
+	// 0018_approval_grants.sql) is written in the SAME atomic UPDATE:
+	// 'approved' (Approve), 'denied' (Deny) or 'invalidated' (the W6-03 halt
+	// executor's InvalidateApprovalsForTask).
 	ConsumePendingApproval(ctx context.Context, arg ConsumePendingApprovalParams) (int64, error)
 	// W5-01's once-per-day idempotency check: counts events of kind on the
 	// UTC calendar date dateStr ("YYYY-MM-DD" - SQLite's date() truncates
@@ -87,6 +90,15 @@ type Querier interface {
 	// as HANDOFF S5 memory #3 requires (closed, never deleted, never
 	// reopened).
 	GetActiveFactByTriple(ctx context.Context, arg GetActiveFactByTripleParams) (Fact, error)
+	// B-1: the grant Engine.Approve minted for ONE pending_approvals row, in
+	// ANY consumed/revoked state. Engine.Approve consumes the pending row
+	// (decision='approved') BEFORE it mints the grant - two statements on one
+	// serialized connection (store/db.go SetMaxOpenConns(1)) - so the
+	// server-side waiter's DB probe (Engine.PendingApprovalDecision) treats
+	// 'approved' as decided ONLY once this row exists; otherwise a probe
+	// landing between the two statements would re-check too early, find
+	// nothing to redeem and refuse a perfectly good approval.
+	GetApprovalGrantByPendingApprovalID(ctx context.Context, pendingApprovalID sql.NullString) (ApprovalToken, error)
 	GetApprovalToken(ctx context.Context, tokenHash string) (ApprovalToken, error)
 	// W3-02 (autonomy ladder engine) queries below: autonomy_state,
 	// approval_tokens, undo_windows. See migrations/0003_autonomy_policy.sql
@@ -163,6 +175,14 @@ type Querier interface {
 	// receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
 	// the mechanism that makes resume double-execution-safe.
 	GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCallParams) (ToolCall, error)
+	// B-1: the most recent human-approval grant (grant_kind='approval') for
+	// this EXACT (task_id, tool, scope, approved_bytes_hash) that nothing has
+	// consumed or halt-revoked yet. Expiry is checked in Go (RFC3339Nano
+	// strings do not sort reliably in SQL - see ListUnconsumedPendingApprovals).
+	// Engine.redeemApprovedGrant burns the row it returns with
+	// ConsumeApprovalToken (WHERE consumed_at IS NULL), so a concurrent
+	// redeemer that read the same row loses that UPDATE and redeems nothing.
+	GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeemableApprovalGrantParams) (ApprovalToken, error)
 	// W4-03 (taint tiers + Reader/Actor split) queries below. See
 	// migrations/0009_session_taint.sql for the schema and
 	// kahyad/internal/taint/taint.go for the only caller (a narrow Store
@@ -219,6 +239,11 @@ type Querier interface {
 	// review amendment) so a consume-failure demotion can target this exact
 	// triple, recovered by token_hash - never whatever (tool,class,scope) the
 	// /policy/consume-token caller happens to claim.
+	// grant_kind/pending_approval_id (B-1, 0018_approval_grants.sql) record the
+	// token's lineage: 'auto' (ladder auto-allow, no pending row), 'approval'
+	// (Engine.Approve's redeemable grant, linked to the pending_approvals row
+	// the human answered) or 'exchanged' (the fresh token Engine.Check mints
+	// when it redeems an 'approval' grant - never redeemable itself).
 	InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error
 	InsertAutonomyState(ctx context.Context, arg InsertAutonomyStateParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) (Chunk, error)

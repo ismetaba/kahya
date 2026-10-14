@@ -55,9 +55,16 @@ func (e *Engine) InvalidateApprovalsForTask(ctx context.Context, traceID, taskID
 
 	now := rfc3339(e.nowUTC())
 	invalidated := 0
+	// decidedIDs (B-1) are the rows THIS call invalidated; their
+	// approvalDecidedHook fires only after the token revocation below, so a
+	// tool call parked on one of them (kahyad/internal/server's approval
+	// wait) wakes to a task whose grants are already all revoked.
+	var decidedIDs []string
 	for _, row := range rows {
 		affected, err := e.store.ConsumePendingApproval(ctx, sqlcgen.ConsumePendingApprovalParams{
-			ConsumedAt: sql.NullString{String: now, Valid: true}, ID: row.ID,
+			ConsumedAt: sql.NullString{String: now, Valid: true},
+			Decision:   sql.NullString{String: PendingDecisionInvalidated, Valid: true},
+			ID:         row.ID,
 		})
 		if err != nil {
 			// Best-effort: log via the ledger and move on to the next row -
@@ -76,6 +83,7 @@ func (e *Engine) InvalidateApprovalsForTask(ctx context.Context, traceID, taskID
 			continue
 		}
 		invalidated++
+		decidedIDs = append(decidedIDs, row.ID)
 		e.ledgerRaw(ctx, traceID, EventApprovalInvalidated, map[string]any{
 			"event": EventApprovalInvalidated, "pending_approval_id": row.ID,
 			"task_id": taskID, "tool": row.Tool, "class": row.Class,
@@ -108,6 +116,12 @@ func (e *Engine) InvalidateApprovalsForTask(ctx context.Context, traceID, taskID
 		e.ledgerRaw(ctx, traceID, "approval_token_revoke_failed", map[string]any{
 			"event": "approval_token_revoke_failed", "task_id": taskID, "err": err.Error(),
 		})
+	}
+
+	// B-1: wake every tool call parked on an id this halt invalidated - as
+	// a denial (approved=false): nothing it was waiting for will execute.
+	for _, id := range decidedIDs {
+		e.fireApprovalDecided(id, false)
 	}
 
 	return invalidated, nil

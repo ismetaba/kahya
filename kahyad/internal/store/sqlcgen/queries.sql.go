@@ -135,12 +135,13 @@ func (q *Queries) ConsumeApprovalToken(ctx context.Context, arg ConsumeApprovalT
 
 const consumePendingApproval = `-- name: ConsumePendingApproval :execrows
 UPDATE pending_approvals
-SET consumed_at = ?
+SET consumed_at = ?, decision = ?
 WHERE id = ? AND consumed_at IS NULL
 `
 
 type ConsumePendingApprovalParams struct {
 	ConsumedAt sql.NullString `json:"consumed_at"`
+	Decision   sql.NullString `json:"decision"`
 	ID         string         `json:"id"`
 }
 
@@ -150,9 +151,12 @@ type ConsumePendingApprovalParams struct {
 // given pending_approval_id ever affects a row; a second call against the
 // same id - Approve or Deny, forged or genuine - affects 0 rows, which
 // kahyad/internal/policy/engine.go treats as already-used/rejects, minting
-// no token and performing no bookkeeping a second time.
+// no token and performing no bookkeeping a second time. decision (B-1,
+// 0018_approval_grants.sql) is written in the SAME atomic UPDATE:
+// 'approved' (Approve), 'denied' (Deny) or 'invalidated' (the W6-03 halt
+// executor's InvalidateApprovalsForTask).
 func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePendingApprovalParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, consumePendingApproval, arg.ConsumedAt, arg.ID)
+	result, err := q.db.ExecContext(ctx, consumePendingApproval, arg.ConsumedAt, arg.Decision, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -275,8 +279,44 @@ func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactBy
 	return i, err
 }
 
+const getApprovalGrantByPendingApprovalID = `-- name: GetApprovalGrantByPendingApprovalID :one
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
+FROM approval_tokens
+WHERE pending_approval_id = ? AND grant_kind = 'approval'
+LIMIT 1
+`
+
+// B-1: the grant Engine.Approve minted for ONE pending_approvals row, in
+// ANY consumed/revoked state. Engine.Approve consumes the pending row
+// (decision='approved') BEFORE it mints the grant - two statements on one
+// serialized connection (store/db.go SetMaxOpenConns(1)) - so the
+// server-side waiter's DB probe (Engine.PendingApprovalDecision) treats
+// 'approved' as decided ONLY once this row exists; otherwise a probe
+// landing between the two statements would re-check too early, find
+// nothing to redeem and refuse a perfectly good approval.
+func (q *Queries) GetApprovalGrantByPendingApprovalID(ctx context.Context, pendingApprovalID sql.NullString) (ApprovalToken, error) {
+	row := q.db.QueryRowContext(ctx, getApprovalGrantByPendingApprovalID, pendingApprovalID)
+	var i ApprovalToken
+	err := row.Scan(
+		&i.TokenHash,
+		&i.TaskID,
+		&i.TraceID,
+		&i.Tool,
+		&i.Class,
+		&i.Scope,
+		&i.ApprovedBytesHash,
+		&i.MintedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.RevokedAt,
+		&i.GrantKind,
+		&i.PendingApprovalID,
+	)
+	return i, err
+}
+
 const getApprovalToken = `-- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
 FROM approval_tokens
 WHERE token_hash = ?
 `
@@ -296,6 +336,8 @@ func (q *Queries) GetApprovalToken(ctx context.Context, tokenHash string) (Appro
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.RevokedAt,
+		&i.GrantKind,
+		&i.PendingApprovalID,
 	)
 	return i, err
 }
@@ -732,7 +774,7 @@ func (q *Queries) GetOpenUndoWindowByTrace(ctx context.Context, traceID string) 
 }
 
 const getPendingApproval = `-- name: GetPendingApproval :one
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE id = ?
 `
@@ -752,6 +794,7 @@ func (q *Queries) GetPendingApproval(ctx context.Context, id string) (PendingApp
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.ToolInput,
+		&i.Decision,
 	)
 	return i, err
 }
@@ -791,6 +834,55 @@ func (q *Queries) GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCall
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getRedeemableApprovalGrant = `-- name: GetRedeemableApprovalGrant :one
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
+FROM approval_tokens
+WHERE task_id = ? AND tool = ? AND scope = ? AND approved_bytes_hash = ?
+  AND grant_kind = 'approval' AND consumed_at IS NULL AND revoked_at IS NULL
+ORDER BY minted_at DESC
+LIMIT 1
+`
+
+type GetRedeemableApprovalGrantParams struct {
+	TaskID            string `json:"task_id"`
+	Tool              string `json:"tool"`
+	Scope             string `json:"scope"`
+	ApprovedBytesHash string `json:"approved_bytes_hash"`
+}
+
+// B-1: the most recent human-approval grant (grant_kind='approval') for
+// this EXACT (task_id, tool, scope, approved_bytes_hash) that nothing has
+// consumed or halt-revoked yet. Expiry is checked in Go (RFC3339Nano
+// strings do not sort reliably in SQL - see ListUnconsumedPendingApprovals).
+// Engine.redeemApprovedGrant burns the row it returns with
+// ConsumeApprovalToken (WHERE consumed_at IS NULL), so a concurrent
+// redeemer that read the same row loses that UPDATE and redeems nothing.
+func (q *Queries) GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeemableApprovalGrantParams) (ApprovalToken, error) {
+	row := q.db.QueryRowContext(ctx, getRedeemableApprovalGrant,
+		arg.TaskID,
+		arg.Tool,
+		arg.Scope,
+		arg.ApprovedBytesHash,
+	)
+	var i ApprovalToken
+	err := row.Scan(
+		&i.TokenHash,
+		&i.TaskID,
+		&i.TraceID,
+		&i.Tool,
+		&i.Class,
+		&i.Scope,
+		&i.ApprovedBytesHash,
+		&i.MintedAt,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.RevokedAt,
+		&i.GrantKind,
+		&i.PendingApprovalID,
 	)
 	return i, err
 }
@@ -1024,20 +1116,22 @@ func (q *Queries) InsertAnchorLog(ctx context.Context, arg InsertAnchorLogParams
 }
 
 const insertApprovalToken = `-- name: InsertApprovalToken :exec
-INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, grant_kind, pending_approval_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
 `
 
 type InsertApprovalTokenParams struct {
-	TokenHash         string `json:"token_hash"`
-	TaskID            string `json:"task_id"`
-	TraceID           string `json:"trace_id"`
-	Tool              string `json:"tool"`
-	Class             string `json:"class"`
-	Scope             string `json:"scope"`
-	ApprovedBytesHash string `json:"approved_bytes_hash"`
-	MintedAt          string `json:"minted_at"`
-	ExpiresAt         string `json:"expires_at"`
+	TokenHash         string         `json:"token_hash"`
+	TaskID            string         `json:"task_id"`
+	TraceID           string         `json:"trace_id"`
+	Tool              string         `json:"tool"`
+	Class             string         `json:"class"`
+	Scope             string         `json:"scope"`
+	ApprovedBytesHash string         `json:"approved_bytes_hash"`
+	MintedAt          string         `json:"minted_at"`
+	ExpiresAt         string         `json:"expires_at"`
+	GrantKind         string         `json:"grant_kind"`
+	PendingApprovalID sql.NullString `json:"pending_approval_id"`
 }
 
 // consumed_at starts NULL (a literal, not a param - see
@@ -1046,6 +1140,11 @@ type InsertApprovalTokenParams struct {
 // review amendment) so a consume-failure demotion can target this exact
 // triple, recovered by token_hash - never whatever (tool,class,scope) the
 // /policy/consume-token caller happens to claim.
+// grant_kind/pending_approval_id (B-1, 0018_approval_grants.sql) record the
+// token's lineage: 'auto' (ladder auto-allow, no pending row), 'approval'
+// (Engine.Approve's redeemable grant, linked to the pending_approvals row
+// the human answered) or 'exchanged' (the fresh token Engine.Check mints
+// when it redeems an 'approval' grant - never redeemable itself).
 func (q *Queries) InsertApprovalToken(ctx context.Context, arg InsertApprovalTokenParams) error {
 	_, err := q.db.ExecContext(ctx, insertApprovalToken,
 		arg.TokenHash,
@@ -1057,6 +1156,8 @@ func (q *Queries) InsertApprovalToken(ctx context.Context, arg InsertApprovalTok
 		arg.ApprovedBytesHash,
 		arg.MintedAt,
 		arg.ExpiresAt,
+		arg.GrantKind,
+		arg.PendingApprovalID,
 	)
 	return err
 }
@@ -2803,7 +2904,7 @@ func (q *Queries) ListToolCallsByTask(ctx context.Context, taskID string) ([]Too
 }
 
 const listUnconsumedPendingApprovals = `-- name: ListUnconsumedPendingApprovals :many
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE consumed_at IS NULL
 ORDER BY minted_at ASC
@@ -2836,6 +2937,7 @@ func (q *Queries) ListUnconsumedPendingApprovals(ctx context.Context) ([]Pending
 			&i.ExpiresAt,
 			&i.ConsumedAt,
 			&i.ToolInput,
+			&i.Decision,
 		); err != nil {
 			return nil, err
 		}
@@ -2851,7 +2953,7 @@ func (q *Queries) ListUnconsumedPendingApprovals(ctx context.Context) ([]Pending
 }
 
 const listUnconsumedPendingApprovalsByTask = `-- name: ListUnconsumedPendingApprovalsByTask :many
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE task_id = ? AND consumed_at IS NULL
 ORDER BY minted_at ASC
@@ -2882,6 +2984,7 @@ func (q *Queries) ListUnconsumedPendingApprovalsByTask(ctx context.Context, task
 			&i.ExpiresAt,
 			&i.ConsumedAt,
 			&i.ToolInput,
+			&i.Decision,
 		); err != nil {
 			return nil, err
 		}

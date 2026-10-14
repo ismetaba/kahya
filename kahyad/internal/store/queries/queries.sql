@@ -186,13 +186,47 @@ WHERE tool = ? AND class = ? AND scope = ?;
 -- review amendment) so a consume-failure demotion can target this exact
 -- triple, recovered by token_hash - never whatever (tool,class,scope) the
 -- /policy/consume-token caller happens to claim.
-INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL);
+-- grant_kind/pending_approval_id (B-1, 0018_approval_grants.sql) record the
+-- token's lineage: 'auto' (ladder auto-allow, no pending row), 'approval'
+-- (Engine.Approve's redeemable grant, linked to the pending_approvals row
+-- the human answered) or 'exchanged' (the fresh token Engine.Check mints
+-- when it redeems an 'approval' grant - never redeemable itself).
+INSERT INTO approval_tokens (token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, grant_kind, pending_approval_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?);
 
 -- name: GetApprovalToken :one
-SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
 FROM approval_tokens
 WHERE token_hash = ?;
+
+-- name: GetRedeemableApprovalGrant :one
+-- B-1: the most recent human-approval grant (grant_kind='approval') for
+-- this EXACT (task_id, tool, scope, approved_bytes_hash) that nothing has
+-- consumed or halt-revoked yet. Expiry is checked in Go (RFC3339Nano
+-- strings do not sort reliably in SQL - see ListUnconsumedPendingApprovals).
+-- Engine.redeemApprovedGrant burns the row it returns with
+-- ConsumeApprovalToken (WHERE consumed_at IS NULL), so a concurrent
+-- redeemer that read the same row loses that UPDATE and redeems nothing.
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
+FROM approval_tokens
+WHERE task_id = ? AND tool = ? AND scope = ? AND approved_bytes_hash = ?
+  AND grant_kind = 'approval' AND consumed_at IS NULL AND revoked_at IS NULL
+ORDER BY minted_at DESC
+LIMIT 1;
+
+-- name: GetApprovalGrantByPendingApprovalID :one
+-- B-1: the grant Engine.Approve minted for ONE pending_approvals row, in
+-- ANY consumed/revoked state. Engine.Approve consumes the pending row
+-- (decision='approved') BEFORE it mints the grant - two statements on one
+-- serialized connection (store/db.go SetMaxOpenConns(1)) - so the
+-- server-side waiter's DB probe (Engine.PendingApprovalDecision) treats
+-- 'approved' as decided ONLY once this row exists; otherwise a probe
+-- landing between the two statements would re-check too early, find
+-- nothing to redeem and refuse a perfectly good approval.
+SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
+FROM approval_tokens
+WHERE pending_approval_id = ? AND grant_kind = 'approval'
+LIMIT 1;
 
 -- name: ConsumeApprovalToken :execrows
 -- The single atomic single-use guarantee (HANDOFF S5 safety #5): only the
@@ -267,7 +301,7 @@ INSERT INTO pending_approvals (id, task_id, trace_id, tool, class, scope, approv
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?);
 
 -- name: GetPendingApproval :one
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE id = ?;
 
@@ -278,7 +312,7 @@ WHERE id = ?;
 -- rather than comparing RFC3339Nano strings in SQL (that format's
 -- trailing-zero-trimmed fractional seconds do NOT always sort
 -- lexicographically in timestamp order).
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE consumed_at IS NULL
 ORDER BY minted_at ASC;
@@ -290,9 +324,12 @@ ORDER BY minted_at ASC;
 -- given pending_approval_id ever affects a row; a second call against the
 -- same id - Approve or Deny, forged or genuine - affects 0 rows, which
 -- kahyad/internal/policy/engine.go treats as already-used/rejects, minting
--- no token and performing no bookkeeping a second time.
+-- no token and performing no bookkeeping a second time. decision (B-1,
+-- 0018_approval_grants.sql) is written in the SAME atomic UPDATE:
+-- 'approved' (Approve), 'denied' (Deny) or 'invalidated' (the W6-03 halt
+-- executor's InvalidateApprovalsForTask).
 UPDATE pending_approvals
-SET consumed_at = ?
+SET consumed_at = ?, decision = ?
 WHERE id = ? AND consumed_at IS NULL;
 
 -- name: ListUnconsumedPendingApprovalsByTask :many
@@ -300,7 +337,7 @@ WHERE id = ? AND consumed_at IS NULL;
 -- not-yet-consumed pending_approvals row for taskID, oldest first - the
 -- SAME "not-yet-consumed" definition ListUnconsumedPendingApprovals above
 -- uses, scoped to one task instead of every task in the system.
-SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input
+SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
 WHERE task_id = ? AND consumed_at IS NULL
 ORDER BY minted_at ASC;

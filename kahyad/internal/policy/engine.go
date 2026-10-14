@@ -175,6 +175,15 @@ type Store interface {
 	InsertApprovalToken(ctx context.Context, arg sqlcgen.InsertApprovalTokenParams) error
 	GetApprovalToken(ctx context.Context, tokenHash string) (sqlcgen.ApprovalToken, error)
 	ConsumeApprovalToken(ctx context.Context, arg sqlcgen.ConsumeApprovalTokenParams) (int64, error)
+	// GetRedeemableApprovalGrant/GetApprovalGrantByPendingApprovalID back
+	// the B-1 approval loop (migrations/0018_approval_grants.sql): the
+	// binding Engine.Check redeems a human Approve's single-use grant for
+	// the exact (task_id, tool, scope, approved_bytes_hash) it was bound to
+	// (redeemApprovedGrant), and the server-side approval waiter's probe
+	// (PendingApprovalDecision) reports "approved" only once that grant row
+	// exists.
+	GetRedeemableApprovalGrant(ctx context.Context, arg sqlcgen.GetRedeemableApprovalGrantParams) (sqlcgen.ApprovalToken, error)
+	GetApprovalGrantByPendingApprovalID(ctx context.Context, pendingApprovalID sql.NullString) (sqlcgen.ApprovalToken, error)
 
 	// Pending-approval persistence (post-security-review amendment): a
 	// NEEDS_APPROVAL decision's pending_approval_id is now a server-issued,
@@ -304,6 +313,15 @@ type Engine struct {
 	// halt executor's own request path - same "fire a goroutine for any
 	// real network send" caller obligation as pendingApprovalHook.
 	invalidatedHook func(PendingApprovalInfo)
+	// approvalDecidedHook (B-1) fires once per Approve (approved=true),
+	// Deny (false) and per row InvalidateApprovalsForTask consumes (false),
+	// AFTER the row is durably consumed (and, for approve, the grant token
+	// minted; for invalidate, the task's tokens revoked).
+	// kahyad/internal/server's approvalWaiter subscribes so a tool call
+	// parked on this id wakes immediately. nil by default. Synchronous -
+	// keep it fast (the server's waiter only does a non-blocking channel
+	// send).
+	approvalDecidedHook func(pendingApprovalID string, approved bool)
 	// taintChecker is W4-03's session-tier read (SetTaintChecker). nil (the
 	// default) means the taint check is skipped entirely - matching every
 	// other not-yet-wired dependency's "unwired means no-op" posture in
@@ -368,6 +386,25 @@ func (e *Engine) SetPendingApprovalHook(fn func(PendingApprovalInfo)) {
 // only controls whether an approval surface (Telegram) is told about it.
 func (e *Engine) SetInvalidatedHook(fn func(PendingApprovalInfo)) {
 	e.invalidatedHook = fn
+}
+
+// SetApprovalDecidedHook registers fn to be called once per human decision
+// on a pending approval (see approvalDecidedHook's own doc comment on the
+// Engine struct): Approve -> (id, true), Deny -> (id, false), and every row
+// the halt executor's InvalidateApprovalsForTask invalidates -> (id, false).
+// main.go wires kahyad/internal/server.Server.ApprovalDecided here so a
+// tool call parked on that id by the server's approval wait (B-1) resumes
+// at once instead of on its next DB probe. nil (the default) means no hook
+// runs; the waiter's own periodic probe still observes the decision.
+func (e *Engine) SetApprovalDecidedHook(fn func(pendingApprovalID string, approved bool)) {
+	e.approvalDecidedHook = fn
+}
+
+// fireApprovalDecided calls the registered approvalDecidedHook, if any.
+func (e *Engine) fireApprovalDecided(id string, approved bool) {
+	if e.approvalDecidedHook != nil {
+		e.approvalDecidedHook(id, approved)
+	}
 }
 
 // SetTaintChecker wires the W4-03 session-tier read Check consults FIRST
@@ -456,6 +493,20 @@ type CheckInput struct {
 	TraceID   string
 	SessionID string
 	ToolInput []byte
+	// Preflight (B-1) is the worker-side can_use_tool early-reject mode
+	// (HANDOFF S5: can_use_tool is "erken-ret/UX katmani, guvenlik siniri
+	// degil"): decide and ledger (payload preflight:true), but NEVER mint a
+	// pending_approvals row, a token or an undo window, and never redeem a
+	// grant. Only POST /policy/check sets it (kahyad/internal/server/
+	// task.go) - the binding decision, and the only pending approval a human
+	// ever answers, comes from the tool-side gate on /v1/mcp.
+	Preflight bool
+	// NoMintPending (B-1) is the tool-side post-wait re-check
+	// (kahyad/internal/server.checkWithApprovalWait): redeem an approval
+	// grant when one exists, otherwise answer needs_approval WITHOUT minting
+	// a second pending_approvals row - the original one is still the one the
+	// human has to answer.
+	NoMintPending bool
 }
 
 // Decision is one Engine.Check outcome.
@@ -475,8 +526,15 @@ type Decision struct {
 	// and never W3, which never reaches ResultAllow at all). The caller
 	// (a side-effectful MCP tool) MUST present this to
 	// Engine.ConsumeToken/POST /policy/consume-token immediately before
-	// executing.
+	// executing. Since B-1 a W3 decision CAN reach ResultAllow - but only by
+	// redeeming a written local human approval (redeemApprovedGrant), never
+	// via the ladder. A Preflight decision never carries a token.
 	Token string
+	// RedeemedPendingApprovalID (B-1) is set iff this ALLOW came from
+	// redeeming a human approval grant (redeemApprovedGrant) - the id of
+	// the pending_approvals row that was approved. Empty on every other
+	// decision.
+	RedeemedPendingApprovalID string
 }
 
 // pendingApprovalIDBytesLen is the pending_approval_id's raw (pre-hex)
@@ -494,6 +552,13 @@ const pendingApprovalTTL = 10 * time.Minute
 // must treat all of these identically: fail-closed, no token minted, no
 // bookkeeping performed.
 var ErrInvalidPendingApproval = errors.New("policy: invalid or unrecognized pending_approval_id")
+
+// pending_approvals.decision values (B-1, migrations/0018_approval_grants.sql).
+const (
+	PendingDecisionApproved    = "approved"
+	PendingDecisionDenied      = "denied"
+	PendingDecisionInvalidated = "invalidated"
+)
 
 // mintPendingApproval is the server-side truth behind a NEEDS_APPROVAL
 // decision's pending_approval_id (post-security-review amendment - this
@@ -568,9 +633,14 @@ func (e *Engine) getValidPendingApproval(ctx context.Context, id string) (sqlcge
 // Only the FIRST caller to reach this for a given id ever succeeds; a
 // second (or racing concurrent) call affects 0 rows and is rejected -
 // before any token is minted or any bookkeeping happens.
-func (e *Engine) consumePendingApproval(ctx context.Context, id string) error {
+//
+// decision (B-1) is recorded in the SAME atomic UPDATE: "approved" (Approve)
+// or "denied" (Deny) - the halt executor writes "invalidated" itself
+// (halt.go).
+func (e *Engine) consumePendingApproval(ctx context.Context, id, decision string) error {
 	affected, err := e.store.ConsumePendingApproval(ctx, sqlcgen.ConsumePendingApprovalParams{
 		ConsumedAt: sql.NullString{String: rfc3339(e.nowUTC()), Valid: true},
+		Decision:   sql.NullString{String: decision, Valid: true},
 		ID:         id,
 	})
 	if err != nil {
@@ -672,6 +742,19 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	}
 	level := int(state.Level)
 
+	// B-1: a human already approved EXACTLY these bytes for this task ->
+	// redeem that grant (single-use) instead of asking again. Deliberately
+	// BEFORE the W3 branch: W3 never auto-allows, so redemption is the ONLY
+	// way a W3 action ever executes (HANDOFF S5 product principle: written
+	// local "onayla", then exactly one execution). Deliberately AFTER the
+	// taint gate above: a session that turned tainted while the human was
+	// deciding is still denied, approval or not.
+	if !in.Preflight {
+		if d, ok := e.redeemApprovedGrant(ctx, in, class, scope, hash, level); ok {
+			return d, nil
+		}
+	}
+
 	// HARD-CODED: W3 never auto-allows, at any level, ever - see this
 	// file's package doc comment and autoLevelFor's.
 	if class == ClassW3 {
@@ -681,8 +764,12 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 	threshold, _ := autoLevelFor(class)
 	if level >= threshold {
 		var token string
-		if class != ClassR {
-			tok, err := e.mintToken(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash)
+		// B-1: a Preflight (worker can_use_tool) allow mints nothing - no
+		// token (the worker has no consume step, so it would only ever be an
+		// orphan row) and no undo window; the tool-side gate's own binding
+		// Check mints both when the call actually executes.
+		if class != ClassR && !in.Preflight {
+			tok, err := e.mintToken(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash, GrantKindAuto, "")
 			if err != nil {
 				d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
 				e.ledgerDecision(ctx, in, class, scope, level, d)
@@ -740,7 +827,15 @@ func (e *Engine) denyIfTainted(ctx context.Context, in CheckInput, class ActionC
 // (DENY) - a NEEDS_APPROVAL decision with no corresponding row would be
 // approvable by nothing, which is a worse failure mode than an honest
 // deny.
+//
+// B-1: a Preflight or NoMintPending check answers needs_approval WITHOUT a
+// new row (PendingApprovalID stays empty) - see CheckInput's doc comments.
 func (e *Engine) needsApproval(ctx context.Context, in CheckInput, class ActionClass, scope string, level int, hash, reason string) (Decision, error) {
+	if in.Preflight || in.NoMintPending {
+		d := Decision{Result: ResultNeedsApproval, Reason: reason, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
+		e.ledgerDecision(ctx, in, class, scope, level, d)
+		return d, nil
+	}
 	id, err := e.mintPendingApproval(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash, in.ToolInput)
 	if err != nil {
 		d := Decision{Result: ResultDeny, Reason: ReasonPolicyStateError, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level}
@@ -775,6 +870,16 @@ func (e *Engine) ledgerDecision(ctx context.Context, in CheckInput, class Action
 	}
 	if d.Reason != "" {
 		payload["reason"] = d.Reason
+	}
+	// B-1: a worker-side preflight decision is marked as such, so a ledger
+	// reader never mistakes the non-binding can_use_tool answer for the
+	// binding tool-side one; a redeemed approval names the pending row the
+	// human answered.
+	if in.Preflight {
+		payload["preflight"] = true
+	}
+	if d.RedeemedPendingApprovalID != "" {
+		payload["redeemed_pending_approval_id"] = d.RedeemedPendingApprovalID
 	}
 	_ = e.ledger.LogEvent(ctx, in.TraceID, "policy_decision", payload)
 }
@@ -1021,12 +1126,16 @@ func isTypedOnayla(typed string) bool {
 // (isTypedOnayla - ignored entirely for a non-W3 class, which passes
 // whatever typed happens to be, even ""), atomically single-use-consume
 // the row (BLOCKER 2 - missing/expired/already-consumed all reject with
-// no token minted), mint a one-time token bound to the row's
-// task_id+approved_bytes_hash, open a W1 undo window (a manually-approved
-// W1 write earns the same 5-minute safety net an auto-allowed one gets),
+// no token minted), mint a one-time GRANT (B-1: grant_kind='approval')
+// bound to the row's task_id+tool+scope+approved_bytes_hash - the binding
+// Engine.Check of the very tool call that asked redeems it exactly once
+// (redeemApprovedGrant, approval_loop.go) - open a W1 undo window (a
+// manually-approved W1 write earns the same 5-minute safety net an
+// auto-allowed one gets),
 // bump consecutive_approvals, and - exactly at the 20th consecutive
 // approval - ledger promotion_suggested (the level itself never changes
-// here; only `kahya autonomy promote` changes it, per HANDOFF S4).
+// here; only `kahya autonomy promote` changes it, per HANDOFF S4), and
+// finally fire approvalDecidedHook so a parked tool call resumes.
 //
 // surface is NEVER read from an HTTP request body by either of this
 // engine's two callers (kahyad/internal/server's handlePolicyFeedback and
@@ -1075,11 +1184,18 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface, typed 
 		}
 	}
 
-	if err := e.consumePendingApproval(ctx, pendingApprovalID); err != nil {
+	if err := e.consumePendingApproval(ctx, pendingApprovalID, PendingDecisionApproved); err != nil {
 		return FeedbackResult{}, err
 	}
 
-	token, err := e.mintToken(ctx, pa.TaskID, pa.TraceID, pa.Tool, class, pa.Scope, pa.ApprovedBytesHash)
+	// B-1: the token is a single-use GRANT (grant_kind='approval') bound to
+	// this pending row's exact (task_id, tool, scope, approved_bytes_hash):
+	// the tool call parked on this id (kahyad/internal/server's approval
+	// wait) - or the model's identical retry within tokenTTL - redeems it
+	// through its own binding Engine.Check (redeemApprovedGrant). The raw
+	// value is still returned for in-process callers (FeedbackResult.Token)
+	// but no HTTP route hands it out any more.
+	token, err := e.mintToken(ctx, pa.TaskID, pa.TraceID, pa.Tool, class, pa.Scope, pa.ApprovedBytesHash, GrantKindApproval, pa.ID)
 	if err != nil {
 		return FeedbackResult{}, err
 	}
@@ -1121,6 +1237,9 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface, typed 
 		}
 	}
 
+	// B-1: AFTER the grant row exists, so a woken waiter's re-check always
+	// finds something to redeem.
+	e.fireApprovalDecided(pa.ID, true)
 	return FeedbackResult{Token: token}, nil
 }
 
@@ -1135,7 +1254,7 @@ func (e *Engine) Deny(ctx context.Context, pendingApprovalID string) error {
 	if err != nil {
 		return err
 	}
-	if err := e.consumePendingApproval(ctx, pendingApprovalID); err != nil {
+	if err := e.consumePendingApproval(ctx, pendingApprovalID, PendingDecisionDenied); err != nil {
 		return err
 	}
 	class := ActionClass(pa.Class)
@@ -1143,6 +1262,7 @@ func (e *Engine) Deny(ctx context.Context, pendingApprovalID string) error {
 		"event": "policy_feedback_denied", "tool": pa.Tool, "class": class, "scope": pa.Scope,
 	})
 	e.demote(ctx, pa.Tool, class, pa.Scope, pa.TraceID, "denied")
+	e.fireApprovalDecided(pa.ID, false)
 	return nil
 }
 

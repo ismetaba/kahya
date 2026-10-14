@@ -63,6 +63,12 @@ sql:
       # several task SELECTs reference, so it MUST be here for sqlc to see the
       # column is gone and regenerate the Task model without it.
       - "kahyad/migrations/0017_drop_task_taint_tier.sql"
+      # 0018 (B-1) is two plain ALTER TABLE + CREATE INDEX on approval_tokens
+      # and one ALTER TABLE on pending_approvals - columns the queries below
+      # reference (grant_kind, pending_approval_id, decision), so it MUST be
+      # here, and AFTER 0017 (sqlc reads the schema list in order; listed
+      # before 0003 it stops with relation "approval_tokens" does not exist).
+      - "kahyad/migrations/0018_approval_grants.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

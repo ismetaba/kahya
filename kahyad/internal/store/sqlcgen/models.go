@@ -29,6 +29,8 @@ type ApprovalToken struct {
 	ExpiresAt         string         `json:"expires_at"`
 	ConsumedAt        sql.NullString `json:"consumed_at"`
 	RevokedAt         sql.NullString `json:"revoked_at"`
+	GrantKind         string         `json:"grant_kind"`
+	PendingApprovalID sql.NullString `json:"pending_approval_id"`
 }
 
 type AutonomyState struct {
@@ -177,6 +179,7 @@ type PendingApproval struct {
 	ExpiresAt         string         `json:"expires_at"`
 	ConsumedAt        sql.NullString `json:"consumed_at"`
 	ToolInput         []byte         `json:"tool_input"`
+	Decision          sql.NullString `json:"decision"`
 }
 
 type SessionTaint struct {

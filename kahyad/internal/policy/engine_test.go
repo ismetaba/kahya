@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ func testEngine(t *testing.T) (*Engine, *store.Store) {
 	t.Cleanup(func() { st.Close() })
 
 	tools := []ToolRule{
+		{Name: "memory_search", Class: ClassR, ScopeKey: "global"},
 		{Name: "fs_read", Class: ClassR, ScopeKey: "global"},
 		{Name: "fs_write", Class: ClassW1, ScopeKey: "global"},
 		{Name: "shell_docker", Class: ClassW2, ScopeKey: "global"},
@@ -208,7 +210,11 @@ func TestTwentyApprovalsSuggestPromotionButLevelUnchanged(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 20; i++ {
-		d, err := e.Check(ctx, CheckInput{Tool: "fs_read", TraceID: "trace-approve", TaskID: "t1", ToolInput: []byte(`{}`)})
+		// Distinct bytes per call (B-1): a re-Check of bytes that were just
+		// approved REDEEMS that grant (allow) instead of asking again - this
+		// test is about 20 separate approvals, so each one is for a new call.
+		in := CheckInput{Tool: "fs_read", TraceID: "trace-approve", TaskID: "t1", ToolInput: []byte(fmt.Sprintf(`{"call":%d}`, i))}
+		d, err := e.Check(ctx, in)
 		if err != nil {
 			t.Fatalf("Check #%d: %v", i, err)
 		}

@@ -82,14 +82,32 @@ func rawBytesHash(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Grant kinds (B-1) - approval_tokens.grant_kind (migrations/
+// 0018_approval_grants.sql). ConsumeToken never looks at the kind: every
+// token is single-use either way; the kind only decides which rows the
+// binding Engine.Check may REDEEM (redeemApprovedGrant: GrantKindApproval
+// only).
+const (
+	// GrantKindAuto is Engine.Check's own ladder auto-allow token.
+	GrantKindAuto = "auto"
+	// GrantKindApproval is Engine.Approve's grant: redeemable exactly once
+	// by a binding re-check for the same task/tool/scope/bytes.
+	GrantKindApproval = "approval"
+	// GrantKindExchanged is the fresh token minted AT redemption - consumed
+	// by the calling tool's ConsumeToken, never redeemable itself.
+	GrantKindExchanged = "exchanged"
+)
+
 // mintToken generates 32 random bytes, persists only their SHA-256 (plus
 // task_id/trace_id/tool/class/scope/approved_bytes_hash/expiry), and
 // returns the raw token as lowercase hex - the ONE time the raw value ever
 // exists outside this function's stack. class/scope are the token's REAL
 // bound identity (post-security-review amendment): ConsumeToken's fail
 // path below recovers them from this row, never from whatever a consume
-// caller happens to claim.
-func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, approvedHash string) (string, error) {
+// caller happens to claim. grantKind/pendingApprovalID (B-1) record the
+// token's lineage: GrantKindAuto with no pending row, or GrantKindApproval/
+// GrantKindExchanged linked to the pending_approvals row a human answered.
+func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, class ActionClass, scope, approvedHash, grantKind, pendingApprovalID string) (string, error) {
 	raw := make([]byte, tokenBytesLen)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -108,6 +126,8 @@ func (e *Engine) mintToken(ctx context.Context, taskID, traceID, tool string, cl
 		ApprovedBytesHash: approvedHash,
 		MintedAt:          rfc3339(now),
 		ExpiresAt:         rfc3339(now.Add(tokenTTL)),
+		GrantKind:         grantKind,
+		PendingApprovalID: sql.NullString{String: pendingApprovalID, Valid: pendingApprovalID != ""},
 	}); err != nil {
 		return "", err
 	}

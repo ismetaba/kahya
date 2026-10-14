@@ -172,6 +172,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | #0 | end-to-end binding decision in kahyad (real bins) | `tests/e2e/TestW12Acceptance` | W12-10 | local-integration |
 | #0 | control-plane routes (promote/feedback/undo/halt/approvals/task) refuse without kahyad's per-boot control secret | `kahyad/internal/server/TestControlRoutesRequireSecret` | FIX-B-3 | ci-hermetic |
 | #0 | a worker-plane caller cannot self-approve a W3 pending approval via /approvals/{id}/decision | `kahyad/internal/server/TestApprovalsDecisionRequiresControlSecret` | FIX-B-3 | ci-hermetic |
+| #0 | `can_use_tool` is preflight only: a worker-side /policy/check never mints a pending approval, token or undo window | `kahyad/internal/policy/TestCheckPreflightNeverMintsPendingOrToken` | FIX-B-1 | ci-hermetic |
 | Safety #1 | allowlist-external egress hard-blocked after sensitive read, session-lifetime | `kahyad/internal/egress/TestCheck_SensitiveReadBlocksNonAllowlistedHost` | W3-05 | ci-hermetic |
 | Safety #1 | sensitive-read flag only rises, never clears | `kahyad/internal/egress/TestSensitiveTracker_RisesOnlyNeverClears` | W3-05 | ci-hermetic |
 | Safety #1 | non-allowlisted host denied (allowlist is the gate) | `kahyad/internal/egress/TestCheck_NotInAllowlistDenies` | W3-05 | ci-hermetic |
@@ -204,6 +205,9 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | secret-lane diff never to Telegram (redacted title only) | `kahyad/internal/telegram/TestSecretLaneRedactedOnlyTitleSent` | W3-07 | ci-hermetic |
 | Safety #5 | Telegram chat_id/user_id allowlist enforced Go-side (mismatch dropped) | `kahyad/internal/telegram/TestAllowlistMiddlewareDropsMismatch` | W3-07 | ci-hermetic |
 | Safety #5 | W3 approval local-only over real bins (not via Telegram / CLI onayla) | `tests/w3/TestGate2_W3NeverApprovedViaTelegramOnlyLocalOnayla` | W3-10 | local-integration |
+| Safety #5 | approved WYSIWYE bytes execute exactly once (approve -> same-task binding re-check redeems the grant once) | `kahyad/internal/policy/TestApprovedGrantRedeemedByBindingRecheck` | FIX-B-1 | ci-hermetic |
+| Safety #5 | approval grant bound to task + bytes (different bytes / another task never redeem it) | `kahyad/internal/policy/TestApprovedGrantNotRedeemedForDifferentBytesOrTask` | FIX-B-1 | ci-hermetic |
+| Safety #5 | a halt revokes approved-but-unexecuted grants (never redeemed afterwards) | `kahyad/internal/policy/TestHaltRevokedGrantNotRedeemable` | FIX-B-1 | ci-hermetic |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
@@ -225,6 +229,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #5 | re-embed gate refuses without a green candidate | `kahyad/internal/eval/TestReEmbedGateRefusesWithoutGreenCandidate` | W78-01 | ci-hermetic |
 | Product A | W3 never auto-allows, even with a forged L4 autonomy row | `kahyad/internal/policy/TestW3NeverAllowsEvenWithForgedL4Row` | W3-02 | ci-hermetic |
 | Product A | W3 card is notice-only, no approve keyboard on Telegram | `kahyad/internal/telegram/TestW3NoticeOnlyNoKeyboard` | W3-07 | ci-hermetic |
+| Product A | a written local W3 approval executes exactly once (grant single-use; W3 never auto-allows afterwards) | `kahyad/internal/policy/TestW3ApprovedGrantRedeemedExactlyOnce` | FIX-B-1 | ci-hermetic |
 | Product B | unknown tool denied fail-closed (static metadata, executor-side) | `kahyad/internal/policy/TestUnknownToolDeniesFailClosed` | W3-01 | ci-hermetic |
 | Product B | full autonomy ladder matrix decided from static class metadata | `kahyad/internal/policy/TestLadderMatrix` | W3-02 | ci-hermetic |
 | Product B | `POST /policy/check` on a timed-out context ⇒ DENY fail-closed | `kahyad/internal/policy/TestCheckContextTimeoutDeniesFailClosed` | W78-03 | ci-hermetic |
