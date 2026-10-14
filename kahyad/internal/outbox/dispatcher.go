@@ -97,6 +97,11 @@ const (
 	// reported its own terminal error line: the task is failed (nothing is
 	// left to resume - FIX-I-2's first-spawn rule) and the row acked.
 	EventRedispatchWorkerError = "outbox.redispatch_worker_error"
+	// EventStaleRowDropped (FIX-I-8) fires when a claimed row would
+	// redispatch a parked task before its next_retry_at: the park's own row
+	// owns that attempt, so this one is acked without a spawn and the task
+	// stays parked.
+	EventStaleRowDropped = "outbox.stale_row_dropped"
 )
 
 // defaultBatchSize/defaultLeaseDuration are Dispatcher's own defaults
@@ -364,6 +369,23 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		t.Status == task.StatusDone || t.Status == task.StatusFailed {
 		d.ledgerRaw(ctx, t.TraceID, EventRedeliveryGuarded, map[string]any{
 			"event": EventRedeliveryGuarded, "task_id": t.ID, "status": t.Status,
+		})
+		d.markDelivered(ctx, row.ID)
+		return
+	}
+
+	// FIX-I-8: a parked task's NEXT attempt is owned by the row
+	// CloudRetry.park enqueued at next_retry_at. Any other due row for it (a
+	// resume-scan or `resolve --retry` row written before the park, a row
+	// stuck behind a blocked dispatcher) would redispatch it early and bypass
+	// the 1m/5m/15m/60m schedule - drop it. Both columns are written in
+	// task.FixedNanoRFC3339 form, so the text comparison is chronological
+	// (resume.go's own doc comment); the park's own row has available_at ==
+	// next_retry_at and passes.
+	if t.Status == task.StatusRetryWait && t.NextRetryAt.Valid && row.AvailableAt.Valid && row.AvailableAt.String < t.NextRetryAt.String {
+		d.ledgerRaw(ctx, t.TraceID, EventStaleRowDropped, map[string]any{
+			"event": EventStaleRowDropped, "task_id": t.ID, "outbox_id": row.ID,
+			"available_at": row.AvailableAt.String, "next_retry_at": t.NextRetryAt.String,
 		})
 		d.markDelivered(ctx, row.ID)
 		return

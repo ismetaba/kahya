@@ -172,10 +172,23 @@ func Resumable(t sqlcgen.Task) bool {
 	return t.Envelope.Valid && t.Envelope.String != "" && t.Lane != laneSecret
 }
 
-// OutboxEnqueuer is the narrow outbox-table write surface enqueueResume
-// needs. *sqlcgen.Queries satisfies this directly.
+// OutboxEnqueuer is the narrow outbox-table surface enqueueResume,
+// CloudRetry.park and Resolver.Retry need. *sqlcgen.Queries satisfies this
+// directly.
+//
+// Every row written through it carries FixedNanoRFC3339 timestamps
+// (writeOutboxResumeRowAt is the only writer): kahyad/internal/outbox
+// compares available_at with tasks.next_retry_at as plain text (FIX-I-8's
+// stale-row guard), which is only chronological for that fixed-width form.
 type OutboxEnqueuer interface {
 	InsertOutboxRow(ctx context.Context, arg sqlcgen.InsertOutboxRowParams) (sqlcgen.Outbox, error)
+	// CountPendingOutboxRowsByTask (FIX-I-8) counts the task's undelivered,
+	// uncanceled rows - enqueueResume's dedupe.
+	CountPendingOutboxRowsByTask(ctx context.Context, taskID sql.NullString) (int64, error)
+	// CancelOutboxRowsByTask (FIX-I-8) cancels the task's undelivered rows -
+	// Resolver.Retry clears every older pending row (the park's future one
+	// included) before writing its own.
+	CancelOutboxRowsByTask(ctx context.Context, arg sqlcgen.CancelOutboxRowsByTaskParams) (int64, error)
 }
 
 var _ OutboxEnqueuer = (*sqlcgen.Queries)(nil)
@@ -429,7 +442,19 @@ func writeOutboxResumeRowAt(ctx context.Context, outbox OutboxEnqueuer, traceID,
 // FIX-I-2: it also bumps tasks.crash_resumes - this is the one path that
 // counts toward task_max_crash_resumes (cloud-park redispatches go through
 // Machine.Transition and never touch it).
+//
+// FIX-I-8: while a resume row for the task is still pending (undelivered,
+// not canceled - a row the dispatcher has claimed but not finished counts
+// too) nothing is enqueued and nothing is bumped: that row already owns the
+// next attempt. No ledger or log line either (the scan runs every tick).
 func (r *Resume) enqueueResume(ctx context.Context, traceID, taskID string) error {
+	pending, err := r.outbox.CountPendingOutboxRowsByTask(ctx, sql.NullString{String: taskID, Valid: true})
+	if err != nil {
+		return fmt.Errorf("count pending outbox rows: %w", err)
+	}
+	if pending > 0 {
+		return nil
+	}
 	ts := r.nowRFC3339()
 	if _, err := r.store.IncrementTaskAttempts(ctx, sqlcgen.IncrementTaskAttemptsParams{UpdatedAt: ts, ID: taskID}); err != nil {
 		return fmt.Errorf("increment attempts: %w", err)

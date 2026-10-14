@@ -300,3 +300,80 @@ func (n jsonlLikeNotifier) Notify(ctx context.Context, traceID, kind, message st
 	}
 	return n.ledger.LogEvent(ctx, traceID, kind, full)
 }
+
+// pendingOutboxRows counts taskID's undelivered, uncanceled outbox rows.
+func pendingOutboxRows(t *testing.T, st *store.Store, taskID string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM outbox WHERE task_id = ? AND dispatched_at IS NULL AND canceled_at IS NULL`, taskID).Scan(&n); err != nil {
+		t.Fatalf("count pending outbox rows: %v", err)
+	}
+	return n
+}
+
+// TestEnqueueResumeSkipsWhenPendingRowExists (FIX-I-8): while a resume row
+// for the task is still waiting (undelivered, not canceled), the resume
+// scan enqueues no second one - and bumps neither attempts nor
+// crash_resumes. Before, every scan tick behind a busy dispatcher piled up
+// another immediately-due row.
+func TestEnqueueResumeSkipsWhenPendingRowExists(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	insertTask(t, st, "t1")
+	m := NewMachine(st.Queries, st)
+	mustTransition(t, m, ctx, "t1", StatusExecuting)
+	r := newResume(st, m, &fakeNotifier{}, 3)
+	attemptsBefore := taskAttempts(t, st, "t1")
+
+	for i := 0; i < 2; i++ {
+		row, err := st.Queries.GetTaskByID(ctx, "t1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.ProcessTask(ctx, row); err != nil {
+			t.Fatalf("ProcessTask #%d: %v", i+1, err)
+		}
+	}
+	if n := countOutboxResumeRows(t, st); n != 1 {
+		t.Errorf("outbox task_resume rows = %d, want 1", n)
+	}
+	if got := taskAttempts(t, st, "t1"); got != attemptsBefore+1 {
+		t.Errorf("attempts = %d, want %d (only the first ProcessTask enqueued)", got, attemptsBefore+1)
+	}
+	if got := taskCrashResumes(t, st, "t1"); got != 1 {
+		t.Errorf("crash_resumes = %d, want 1", got)
+	}
+}
+
+// TestEnqueueResumeAfterRowDeliveredEnqueuesAgain (FIX-I-8): once the
+// pending row was consumed (delivered), the next scan enqueues a fresh one.
+func TestEnqueueResumeAfterRowDeliveredEnqueuesAgain(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	insertTask(t, st, "t1")
+	m := NewMachine(st.Queries, st)
+	mustTransition(t, m, ctx, "t1", StatusExecuting)
+	r := newResume(st, m, &fakeNotifier{}, 3)
+
+	for i := 0; i < 2; i++ {
+		row, err := st.Queries.GetTaskByID(ctx, "t1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.ProcessTask(ctx, row); err != nil {
+			t.Fatalf("ProcessTask #%d: %v", i+1, err)
+		}
+		if i == 0 {
+			markAllOutboxDelivered(t, st)
+		}
+	}
+	if n := countOutboxResumeRows(t, st); n != 2 {
+		t.Errorf("outbox task_resume rows = %d, want 2", n)
+	}
+	if n := pendingOutboxRows(t, st, "t1"); n != 1 {
+		t.Errorf("pending rows = %d, want 1", n)
+	}
+	if got := taskCrashResumes(t, st, "t1"); got != 2 {
+		t.Errorf("crash_resumes = %d, want 2", got)
+	}
+}

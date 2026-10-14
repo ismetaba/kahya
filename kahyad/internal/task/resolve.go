@@ -20,6 +20,7 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -63,6 +64,11 @@ func (rs *Resolver) SetClock(now func() time.Time) { rs.now = now }
 //
 // FIX-I-2: an explicit human --retry also resets tasks.crash_resumes - a
 // fresh crash-resume budget (task_max_crash_resumes) for the resumed task.
+//
+// FIX-I-8: the user said "now", so every older pending resume row for the
+// task - a parked task's future row at next_retry_at included - is canceled
+// and next_retry_at is cleared before the one fresh row is written; the
+// task is never redispatched a second time by a leftover row.
 func (rs *Resolver) Retry(ctx context.Context, traceID, taskID string) error {
 	if err := rs.machine.Transition(ctx, traceID, taskID, StatusExecuting); err != nil {
 		if errors.Is(err, ErrIllegalTransition) {
@@ -70,10 +76,22 @@ func (rs *Resolver) Retry(ctx context.Context, traceID, taskID string) error {
 		}
 		return err
 	}
+	now := rs.now().UTC().Format(time.RFC3339Nano)
+	if _, err := rs.outbox.CancelOutboxRowsByTask(ctx, sqlcgen.CancelOutboxRowsByTaskParams{
+		CanceledAt: sql.NullString{String: now, Valid: true},
+		TaskID:     sql.NullString{String: taskID, Valid: true},
+	}); err != nil {
+		return fmt.Errorf("task: cancel pending outbox rows (task %s): %w", taskID, err)
+	}
 	if err := rs.store.ResetTaskCrashResumes(ctx, sqlcgen.ResetTaskCrashResumesParams{
-		UpdatedAt: rs.now().UTC().Format(time.RFC3339Nano), ID: taskID,
+		UpdatedAt: now, ID: taskID,
 	}); err != nil {
 		return fmt.Errorf("task: reset crash_resumes (task %s): %w", taskID, err)
+	}
+	if err := rs.store.SetTaskNextRetry(ctx, sqlcgen.SetTaskNextRetryParams{
+		NextRetryAt: sql.NullString{}, UpdatedAt: now, ID: taskID,
+	}); err != nil {
+		return fmt.Errorf("task: clear next_retry_at (task %s): %w", taskID, err)
 	}
 	return writeOutboxResumeRow(ctx, rs.outbox, rs.now, traceID, taskID)
 }

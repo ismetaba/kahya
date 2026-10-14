@@ -2,8 +2,10 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
+	"time"
 )
 
 // TestResolverAbortMovesBlockedUserToFailed is the acceptance test (b)'s
@@ -79,5 +81,48 @@ func TestResolverRetryMovesBlockedUserBackToExecutingAndRequeues(t *testing.T) {
 	}
 	if n := countOutboxResumeRows(t, st); n != 1 {
 		t.Errorf("outbox task_resume rows = %d, want 1", n)
+	}
+}
+
+// TestResolverRetryCancelsPendingRowsAndClearsNextRetryAt (FIX-I-8): `kahya
+// task resolve <id> --retry` on a parked task means "now": the park's own
+// future row (and any other pending one) is canceled, next_retry_at is
+// cleared, and exactly one fresh row is left.
+func TestResolverRetryCancelsPendingRowsAndClearsNextRetryAt(t *testing.T) {
+	st, m, cr, _ := newCloudRetryFixture(t, []time.Duration{time.Hour}, 30*24*time.Hour)
+	ctx := context.Background()
+	insertTask(t, st, "t1")
+	mustTransition(t, m, ctx, "t1", StatusExecuting)
+	if err := cr.ParkOrGiveUp(ctx, "trace-t1", "t1"); err != nil {
+		t.Fatal(err)
+	}
+	var parkRowID int64
+	if err := st.DB().QueryRow(`SELECT id FROM outbox WHERE task_id = 't1'`).Scan(&parkRowID); err != nil {
+		t.Fatalf("park row: %v", err)
+	}
+
+	rs := NewResolver(st.Queries, st.Queries, m)
+	if err := rs.Retry(ctx, "trace-t1", "t1"); err != nil {
+		t.Fatalf("Retry() error = %v", err)
+	}
+	if got := taskStatus(t, st, "t1"); got != StatusExecuting {
+		t.Errorf("status = %q, want %q", got, StatusExecuting)
+	}
+	var canceledAt sql.NullString
+	if err := st.DB().QueryRow(`SELECT canceled_at FROM outbox WHERE id = ?`, parkRowID).Scan(&canceledAt); err != nil {
+		t.Fatal(err)
+	}
+	if !canceledAt.Valid {
+		t.Error("the park's row must be canceled - it would redispatch the task a second time at next_retry_at")
+	}
+	if n := pendingOutboxRows(t, st, "t1"); n != 1 {
+		t.Errorf("pending rows = %d, want exactly the fresh one", n)
+	}
+	row, err := st.Queries.GetTaskByID(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.NextRetryAt.Valid {
+		t.Errorf("next_retry_at = %q, want NULL", row.NextRetryAt.String)
 	}
 }

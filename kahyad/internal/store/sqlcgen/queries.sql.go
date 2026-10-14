@@ -190,6 +190,23 @@ func (q *Queries) CountEventsByKindAndDate(ctx context.Context, arg CountEventsB
 	return count, err
 }
 
+const countPendingOutboxRowsByTask = `-- name: CountPendingOutboxRowsByTask :one
+SELECT COUNT(*) FROM outbox
+WHERE task_id = ? AND dispatched_at IS NULL AND canceled_at IS NULL
+`
+
+// I-8: "is a resume for this task already waiting?" - undelivered and not
+// canceled (a claimed-but-unacknowledged row counts too: the dispatcher acks
+// every row it finishes, G10-E1). The resume scan
+// (kahyad/internal/task.Resume.enqueueResume) skips enqueueing - and
+// bumping attempts/crash_resumes - while one exists.
+func (q *Queries) CountPendingOutboxRowsByTask(ctx context.Context, taskID sql.NullString) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPendingOutboxRowsByTask, taskID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countSensitiveReads = `-- name: CountSensitiveReads :one
 SELECT count(*) FROM sensitive_reads
 `

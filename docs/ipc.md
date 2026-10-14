@@ -763,6 +763,19 @@ line fails the task (`outbox.redispatch_worker_error`), the same rule
 `handleTask` applies at first spawn (FIX-I-2). A row's lease now only
 matters when kahyad itself dies while dispatching it.
 
+**The backoff schedule holds; one pending resume per task (FIX-I-8):** a
+parked task's next attempt belongs to the row `CloudRetry.park` enqueued
+at `next_retry_at`. Any other due row for it (a resume-scan or `resolve
+--retry` row written before the park, a row stuck behind a busy
+dispatcher) is dropped — acked with `outbox.stale_row_dropped`, no spawn,
+the task stays `bekliyor-yeniden-deneme` (`available_at` and
+`next_retry_at` are both fixed-width `FixedNanoRFC3339` text, so the
+comparison is chronological). The resume scan enqueues nothing — and
+bumps neither `attempts` nor `crash_resumes` — while an undelivered,
+uncanceled resume row for the task exists. `kahya task resolve <id>
+--retry` cancels every pending row of the task (the park's future one
+included), clears `next_retry_at` and writes one fresh row.
+
 All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a
 timeout — which cancels the timeout context by design — never prevents

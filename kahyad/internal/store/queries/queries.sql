@@ -676,6 +676,15 @@ UPDATE outbox
 SET canceled_at = ?
 WHERE task_id = ? AND dispatched_at IS NULL AND canceled_at IS NULL;
 
+-- name: CountPendingOutboxRowsByTask :one
+-- I-8: "is a resume for this task already waiting?" - undelivered and not
+-- canceled (a claimed-but-unacknowledged row counts too: the dispatcher acks
+-- every row it finishes, G10-E1). The resume scan
+-- (kahyad/internal/task.Resume.enqueueResume) skips enqueueing - and
+-- bumping attempts/crash_resumes - while one exists.
+SELECT COUNT(*) FROM outbox
+WHERE task_id = ? AND dispatched_at IS NULL AND canceled_at IS NULL;
+
 -- name: ClaimOutboxRow :execrows
 -- The atomic single-claim guarantee (mirrors ConsumeApprovalToken/
 -- ConsumePendingApproval's own "UPDATE ... WHERE <still claimable>"

@@ -72,6 +72,12 @@ type Querier interface {
 	// fired-on-wake plus the regular 08:30 run can therefore never deliver
 	// two notifications the same date.
 	CountEventsByKindAndDate(ctx context.Context, arg CountEventsByKindAndDateParams) (int64, error)
+	// I-8: "is a resume for this task already waiting?" - undelivered and not
+	// canceled (a claimed-but-unacknowledged row counts too: the dispatcher acks
+	// every row it finishes, G10-E1). The resume scan
+	// (kahyad/internal/task.Resume.enqueueResume) skips enqueueing - and
+	// bumping attempts/crash_resumes - while one exists.
+	CountPendingOutboxRowsByTask(ctx context.Context, taskID sql.NullString) (int64, error)
 	CountSensitiveReads(ctx context.Context) (int64, error)
 	// The per-(task_id, tool_name, args_hash) attempt count the resume scan
 	// compares against task.retry.w1_max_auto (task spec step 6: "at most
