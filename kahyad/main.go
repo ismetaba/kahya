@@ -924,9 +924,14 @@ func run() int {
 	// to the real /usr/bin/tmutil or touch the real machine's Time Machine
 	// exclusion list/alarm channel (HARD CONSTRAINT: no real tmutil call
 	// in any code path that runs during `make test`).
+	// FIX-P-18: st.Queries lets CheckOffsite read the last backup.no_offsite
+	// row, so the once-per-24h alarm limit survives a restart (a launchd
+	// KeepAlive crash loop); tm stays nil outside prod, and the
+	// backup-nightly handler below re-applies the exclusions with it.
+	var tm *backup.TimeMachine
 	if cfg.Env == config.EnvProd {
 		tmCtx, tmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		tm := backup.NewTimeMachine(backup.NewExecTMRunner(), governorNotifier, backup.RealClock{}, log)
+		tm = backup.NewTimeMachine(backup.NewExecTMRunner(), governorNotifier, backup.RealClock{}, st.Queries, log)
 		tm.EnsureExclusions(tmCtx, cfg.DBPath, cfg.BackupDir)
 		tm.CheckOffsite(tmCtx, bootTraceID)
 		tmCancel()
@@ -948,7 +953,18 @@ func run() int {
 	snapshotter := backup.NewSnapshotter(st, governorNotifier, cfg.BackupDir)
 	pusher := backup.NewPusher(backup.NewExecGitRunner(), governorNotifier, cfg.KahyaDir)
 	sched.RegisterHandler("backup-nightly", func(ctx context.Context) error {
-		return snapshotter.Run(ctx, scheduler.TraceIDFromContext(ctx))
+		if err := snapshotter.Run(ctx, scheduler.TraceIDFromContext(ctx)); err != nil {
+			return err
+		}
+		// FIX-P-18 (decision G09-5: per-file exclusion + nightly re-apply):
+		// the Time Machine exclusion is a sticky xattr on the inode and
+		// SQLite may recreate -wal/-shm, so re-exclude after every good
+		// snapshot. prod only (tm is nil otherwise - no real tmutil in
+		// make test).
+		if tm != nil {
+			tm.EnsureExclusions(ctx, cfg.DBPath, cfg.BackupDir)
+		}
+		return nil
 	})
 	sched.RegisterHandler("memory-push", func(ctx context.Context) error {
 		return pusher.Run(ctx, scheduler.TraceIDFromContext(ctx))

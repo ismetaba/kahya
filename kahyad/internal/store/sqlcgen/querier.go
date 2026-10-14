@@ -168,6 +168,10 @@ type Querier interface {
 	// in-flight 'pending' row to retry (offline case, task spec step 5) before
 	// ever considering a new one.
 	GetLatestAnchorLog(ctx context.Context) (AnchorLog, error)
+	// Most recent ledger row of one kind (highest id) - kahyad/internal/backup.
+	// TimeMachine.CheckOffsite reads the last backup.no_offsite alarm so the
+	// once-per-24h rate limit survives a daemon restart (FIX-P-18).
+	GetLatestEventByKind(ctx context.Context, kind string) (Event, error)
 	// G07-2 (FIX-P-3): the last legacy event id - events with id <=
 	// base_event_id predate 0010's running digest and were never folded into
 	// it. Written once by migrations/0023_anchor_local_fallback.sql, never by

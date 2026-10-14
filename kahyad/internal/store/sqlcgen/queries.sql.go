@@ -756,6 +756,31 @@ func (q *Queries) GetLatestAnchorLog(ctx context.Context) (AnchorLog, error) {
 	return i, err
 }
 
+const getLatestEventByKind = `-- name: GetLatestEventByKind :one
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = ?
+ORDER BY id DESC
+LIMIT 1
+`
+
+// Most recent ledger row of one kind (highest id) - kahyad/internal/backup.
+// TimeMachine.CheckOffsite reads the last backup.no_offsite alarm so the
+// once-per-24h rate limit survives a daemon restart (FIX-P-18).
+func (q *Queries) GetLatestEventByKind(ctx context.Context, kind string) (Event, error) {
+	row := q.db.QueryRowContext(ctx, getLatestEventByKind, kind)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.TraceID,
+		&i.Ts,
+		&i.Kind,
+		&i.Payload,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getLedgerChainBase = `-- name: GetLedgerChainBase :one
 SELECT base_event_id FROM ledger_chain_base WHERE id = 1
 `

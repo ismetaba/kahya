@@ -65,6 +65,12 @@ Binding text (HANDOFF §6, quote verbatim):
    "tek diskte kalamaz". If no destination is configured, ledger `backup.no_offsite` + alarm
    (Turkish, exact): `Time Machine hedefi yok: brain.db yedekleri makine dışına kopyalanmıyor.`
    (alarm at most once per 24h; do not block startup). Log the result once per startup.
+   **Post-review note (FIX-P-18, decision G09-5):** the 24h limit reads the last
+   `backup.no_offsite` ledger row, so it survives restarts (a launchd KeepAlive crash loop sends
+   one alarm, not one per restart; JSONL `rate_limited_by: ledger`). A `-wal`/`-shm` sibling that
+   does not exist yet is skipped (`tm_exclusion_skipped_missing`), every added exclusion is
+   re-checked (`tm_exclusion_unverified`), and `backup-nightly` re-applies the per-file
+   exclusions after a good snapshot (SQLite can recreate `-wal`, losing the sticky xattr).
 4. Register both jobs in the `jobs:` config section (W4-01 syncs the launchd plists):
    `backup-nightly` `{Hour: 3, Minute: 30}`, `memory-push` `{Hour: 3, Minute: 45}`.
 5. Add `backups/` to `~/Kahya/.gitignore` (commit in `~/Kahya`, author=user is fine — this is

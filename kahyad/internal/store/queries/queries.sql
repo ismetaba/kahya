@@ -24,6 +24,16 @@ FROM events
 WHERE kind = ?
 ORDER BY id ASC;
 
+-- name: GetLatestEventByKind :one
+-- Most recent ledger row of one kind (highest id) - kahyad/internal/backup.
+-- TimeMachine.CheckOffsite reads the last backup.no_offsite alarm so the
+-- once-per-24h rate limit survives a daemon restart (FIX-P-18).
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = ?
+ORDER BY id DESC
+LIMIT 1;
+
 -- name: InsertTask :one
 -- lane/secret_category (W3-08): the caller ALREADY knows this task's
 -- secret-lane verdict before this row is ever created (kahyad/internal/
