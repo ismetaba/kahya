@@ -66,6 +66,12 @@ const (
 	EventCloudWaitingRetryDup = "task.waiting_retry_dup"
 )
 
+// ReasonNotResumable (FIX-I-14 review) is the EventCloudTaskFailed /
+// EventCloudFailureSkipped payload reason when ParkOrGiveUp meets a task the
+// outbox can never redispatch (Resumable == false): it is failed instead of
+// parked.
+const ReasonNotResumable = "not_resumable"
+
 // defaultCloudRetrySchedule mirrors config.Config's own cloud_retry_task_
 // schedule default (task spec: "1m, 5m, 15m, 60m, then hourly" - see
 // NewCloudRetry's doc comment for why re-using the schedule's own last
@@ -124,10 +130,21 @@ func (c *CloudRetry) SetClock(now func() time.Time) { c.now = now }
 // it parks in bekliyor-yeniden-deneme with next_retry_at set per
 // schedule[attempts-1] (clamped to the schedule's last entry - "then
 // hourly" when that entry is itself 60m, exactly the default).
+//
+// FIX-I-14 review: a task the outbox can never redispatch (Resumable ==
+// false - the briefing's envelope-less row, whose worker's proxy reports an
+// offline morning here) is never parked: the park row could only ever fail
+// it (G10-E2), the park notice ("Ağ dönünce otomatik devam edecek") would
+// never come true and the parked row would sit non-terminal for the next
+// halt-all to sweep. It fails now instead (failNotResumable).
 func (c *CloudRetry) ParkOrGiveUp(ctx context.Context, traceID, taskID string) error {
 	t, err := c.store.GetTaskByID(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("task: cloudretry load %s: %w", taskID, err)
+	}
+
+	if !Resumable(t) {
+		return c.failNotResumable(ctx, traceID, taskID, t)
 	}
 
 	// FIX-I-7: already parked - the same outage reported again (the worker
@@ -212,6 +229,29 @@ func (c *CloudRetry) park(ctx context.Context, traceID, taskID string, t sqlcgen
 		"task_id": taskID, "next_retry_at": nextRetryAtStr, "attempts": t.Attempts,
 	})
 	return c.notify(ctx, traceID, EventCloudWaitingRetry, MsgCloudParked, taskID, nil)
+}
+
+// failNotResumable is ParkOrGiveUp's branch for a task that can never be
+// resumed (FIX-I-14 review): executing -> failed with one task.failed row
+// (reason ReasonNotResumable) and NO notification - the session that owns
+// the task (the briefing run) reports its own failure, and any park/give-up
+// text would misdescribe it. A task that already left every state 'failed'
+// is reachable from (a repeat report of the same outage, a halt that won)
+// is left alone with one task.cloud_failure_skipped row.
+func (c *CloudRetry) failNotResumable(ctx context.Context, traceID, taskID string, t sqlcgen.Task) error {
+	if !IsLegalTransition(t.Status, StatusFailed) {
+		c.ledgerRaw(ctx, traceID, EventCloudFailureSkipped, map[string]any{
+			"task_id": taskID, "reason": ReasonNotResumable, "status": t.Status,
+		})
+		return nil
+	}
+	if err := c.machine.Transition(ctx, traceID, taskID, StatusFailed); err != nil {
+		return fmt.Errorf("task: cloudretry fail not-resumable transition: %w", err)
+	}
+	c.ledgerRaw(ctx, traceID, EventCloudTaskFailed, map[string]any{
+		"task_id": taskID, "reason": ReasonNotResumable, "attempts": t.Attempts,
+	})
+	return nil
 }
 
 // giveUp transitions taskID executing -> failed, ledgers task.failed

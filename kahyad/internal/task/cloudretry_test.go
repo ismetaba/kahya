@@ -164,6 +164,7 @@ func TestParkOrGiveUpGivesUpPastGiveUpAfter(t *testing.T) {
 	if _, err := st2.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
 		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running",
 		UpdatedAt: created.Format(time.RFC3339), CreatedAt: created.Format(time.RFC3339), Lane: "normal",
+		Envelope: storedEnvelope("t1"), // a worker-bound (resumable) cloud task
 	}); err != nil {
 		t.Fatalf("InsertTask: %v", err)
 	}
@@ -208,6 +209,7 @@ func TestParkOrGiveUpStillParksJustBeforeGiveUpAfter(t *testing.T) {
 	if _, err := st.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
 		ID: "t1", TraceID: "trace-t1", SessionID: sql.NullString{}, State: "running",
 		UpdatedAt: created.Format(time.RFC3339), CreatedAt: created.Format(time.RFC3339), Lane: "normal",
+		Envelope: storedEnvelope("t1"), // a worker-bound (resumable) cloud task
 	}); err != nil {
 		t.Fatalf("InsertTask: %v", err)
 	}

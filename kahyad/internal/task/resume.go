@@ -152,6 +152,26 @@ func (a anyLive) IsLive(taskID string) bool {
 	return false
 }
 
+// laneSecret mirrors kahyad/internal/spawn.LaneSecret (tasks.lane /
+// envelope.lane for a W3-08 secret-lane task) - duplicated rather than
+// imported, the convention spawn's own envelope.go follows for router;
+// TestLaneSecretMatchesSpawn pins the two together.
+const laneSecret = "secret"
+
+// Resumable reports whether the outbox dispatcher could ever redispatch a
+// worker for t (FIX-I-14 review): only a task row that stored the envelope
+// it was first handed to a worker with (POST /v1/task's cloud path), and
+// never a secret-lane row (W3-08: answered on-device, never by a worker -
+// kahyad/internal/outbox refuses such a row even when it stored an
+// envelope). A locally answered task (secret-lane or downgrade-routed)
+// and the briefing's one-shot session store no envelope. ParkOrGiveUp and
+// kahyad's budget pause (kahyad/internal/server.NewTaskProxy) fail a
+// non-resumable task instead of parking or blocking it - nothing could
+// ever resume it, so it would sit non-terminal forever.
+func Resumable(t sqlcgen.Task) bool {
+	return t.Envelope.Valid && t.Envelope.String != "" && t.Lane != laneSecret
+}
+
 // OutboxEnqueuer is the narrow outbox-table write surface enqueueResume
 // needs. *sqlcgen.Queries satisfies this directly.
 type OutboxEnqueuer interface {

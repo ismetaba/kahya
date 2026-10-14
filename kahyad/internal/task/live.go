@@ -13,6 +13,17 @@
 // startup resume scan (which runs before anything registers) always
 // treats every 'executing' task as not-live, per this file's own
 // LiveChecker contract.
+//
+// In-process sessions (FIX-I-14 review): a task whose session runs INSIDE
+// kahyad - a secret-lane or downgrade-routed local answer
+// (kahyad/internal/server.handleSecretLaneTask) or the morning briefing's
+// run (kahyad/internal/briefing.Orchestrator.Run) - has no worker pid to
+// register, yet it is 'executing' for its whole run. BeginInProcess makes
+// it live for IsLive (the resume scan and the outbox dispatcher leave it
+// alone) without giving it a pid: PID and BySID only ever see real
+// workers (the halt executor kills by PID; caller attribution keys on the
+// worker session). A cloud task (server.handleTask) holds one too, for the
+// window between its executing transition and its worker's registration.
 package task
 
 import "sync"
@@ -36,6 +47,9 @@ import "sync"
 type LiveRegistry struct {
 	mu      sync.RWMutex
 	entries map[string]liveEntry
+	// inProcess counts the open BeginInProcess sessions per task_id
+	// (FIX-I-14 review) - see the package doc comment above.
+	inProcess map[string]int
 }
 
 // liveEntry is one live worker: its pid, its session id, and the trace_id
@@ -48,7 +62,7 @@ type liveEntry struct {
 
 // NewLiveRegistry constructs an empty LiveRegistry.
 func NewLiveRegistry() *LiveRegistry {
-	return &LiveRegistry{entries: make(map[string]liveEntry)}
+	return &LiveRegistry{entries: make(map[string]liveEntry), inProcess: make(map[string]int)}
 }
 
 // Register records that taskID's worker is running as pid, with
@@ -80,12 +94,42 @@ func (l *LiveRegistry) Unregister(taskID string) {
 	delete(l.entries, taskID)
 }
 
-// IsLive implements LiveChecker.
+// BeginInProcess records that taskID's session is running inside kahyad
+// itself, with no worker process (FIX-I-14 review): a local answer or a
+// briefing run. Until the returned end func is called, IsLive(taskID) is
+// true, so neither the resume scan nor the outbox dispatcher treats the
+// still-running session as a crashed worker. Call it BEFORE the task's
+// intent -> executing transition and end it only AFTER its terminal
+// transition: then any scan that reads the row as 'executing' also sees
+// it live. PID/BySID never report it (there is no pid). end is
+// idempotent; Unregister (the worker path) does not end it.
+func (l *LiveRegistry) BeginInProcess(taskID string) (end func()) {
+	l.mu.Lock()
+	l.inProcess[taskID]++
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			if l.inProcess[taskID] <= 1 {
+				delete(l.inProcess, taskID)
+				return
+			}
+			l.inProcess[taskID]--
+		})
+	}
+}
+
+// IsLive implements LiveChecker: a worker kahyad spawned for taskID is
+// running, or taskID's in-process session is (BeginInProcess).
 func (l *LiveRegistry) IsLive(taskID string) bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	_, ok := l.entries[taskID]
-	return ok
+	if _, ok := l.entries[taskID]; ok {
+		return true
+	}
+	return l.inProcess[taskID] > 0
 }
 
 // PID returns taskID's live worker pid, if any - `kahya task show <id>`'s

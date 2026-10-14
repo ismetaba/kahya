@@ -34,19 +34,29 @@ func testStore(t *testing.T) *store.Store {
 }
 
 // insertTask inserts a minimal tasks row (status defaults to 'intent' -
-// migrations/0007_task_durability.sql's DEFAULT) and returns its id.
+// migrations/0007_task_durability.sql's DEFAULT) and returns its id. The
+// row stores an envelope, like every task POST /v1/task hands to a worker
+// (FIX-I-14 review: an envelope-less row is not resumable - see
+// insertTaskWithoutEnvelope); nothing in this package decodes it.
 func insertTask(t *testing.T, st *store.Store, id string) sqlcgen.Task {
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339)
 	row, err := st.Queries.InsertTask(context.Background(), sqlcgen.InsertTaskParams{
 		ID: id, TraceID: "trace-" + id, SessionID: sql.NullString{},
 		State: "running", UpdatedAt: now, CreatedAt: now,
-		Lane: "normal",
+		Lane:     "normal",
+		Envelope: storedEnvelope(id),
 	})
 	if err != nil {
 		t.Fatalf("insertTask: %v", err)
 	}
 	return row
+}
+
+// storedEnvelope is a placeholder tasks.envelope value for a test row that
+// models a worker-bound (resumable) task; this package never decodes it.
+func storedEnvelope(id string) sql.NullString {
+	return sql.NullString{String: `{"schema_version":1,"task_id":"` + id + `"}`, Valid: true}
 }
 
 func countEventsOfKind(t *testing.T, st *store.Store, kind string) int {

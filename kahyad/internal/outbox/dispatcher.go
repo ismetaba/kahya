@@ -68,6 +68,11 @@ const (
 	// spawn.Run returns for that original processResume call - see the
 	// package doc comment.
 	EventResumeSkippedLive = "outbox.resume_skipped_live"
+	// EventResumeRefusedSecretLane (FIX-I-14 review) fires when a claimed
+	// row's task is a secret-lane task (its row's lane or its stored
+	// envelope's): such a task is answered on-device only and is NEVER
+	// given to a worker (W3-08), so it is failed and the row acked instead.
+	EventResumeRefusedSecretLane = "outbox.resume_refused_secret_lane"
 )
 
 // defaultBatchSize/defaultLeaseDuration are Dispatcher's own defaults
@@ -304,8 +309,14 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// not at the time this row was originally enqueued - a task can have
 	// moved to blocked_user (the resume scan's own W1-cap/W2-W3 branch) or
 	// user_halted (a later ⌥⎋, W6-03) any time between enqueue and this
-	// claim.
-	if t.Status == task.StatusUserHalted || t.Status == task.StatusBlockedUser {
+	// claim. FIX-I-14 review: a task that already ENDED (done/failed) is
+	// guarded the same way - e.g. a resume scan that read the row as
+	// 'executing' just before its in-process session (a local answer, a
+	// briefing) reached its terminal status. Without this the dispatcher
+	// attempted an illegal done -> executing transition below and left the
+	// row for lease re-claim forever.
+	if t.Status == task.StatusUserHalted || t.Status == task.StatusBlockedUser ||
+		t.Status == task.StatusDone || t.Status == task.StatusFailed {
 		d.ledgerRaw(ctx, t.TraceID, EventRedeliveryGuarded, map[string]any{
 			"event": EventRedeliveryGuarded, "task_id": t.ID, "status": t.Status,
 		})
@@ -322,10 +333,30 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// as claimed (NOT delivered) - the running worker's own processResume
 	// call will mark it delivered itself once spawn.Run returns for THAT
 	// call (see the package doc comment).
+	//
+	// FIX-I-14 review: the registry also reports a session running INSIDE
+	// kahyad (task.LiveRegistry.BeginInProcess - a local answer, a
+	// briefing run) as live. No processResume call owns such a session, so
+	// the row's lease expires; by the re-claim the session has reached its
+	// terminal status and the guard above acks the row.
 	if d.live != nil && d.live.IsLive(t.ID) {
 		d.ledgerRaw(ctx, t.TraceID, EventResumeSkippedLive, map[string]any{
 			"event": EventResumeSkippedLive, "task_id": t.ID, "outbox_id": row.ID,
 		})
+		return
+	}
+
+	// FIX-I-14 review, W3-08 first layer: a secret-lane task is answered
+	// on-device ONLY - kahyad never spawns the worker for it, so no resume
+	// path (the resume scan after a kahyad restart mid local answer, a
+	// `kahya task resolve --retry`, a legacy row that stored its envelope)
+	// may hand its stored envelope - the secret prompt - to one. Its local
+	// answer is gone with the process that ran it: the task fails
+	// (fail-closed) and the row is acked. Checked on the row's own lane
+	// BEFORE the envelope is even decoded, and again on the decoded
+	// envelope below.
+	if t.Lane == spawn.LaneSecret {
+		d.refuseSecretLane(ctx, t, row)
 		return
 	}
 
@@ -335,17 +366,18 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 			"event": "outbox.envelope_invalid", "task_id": t.ID, "err": err.Error(),
 		})
 		// G10-E2 (with FIX-I-14): a task with no usable stored envelope (the
-		// briefing's row has none; a corrupt one cannot be decoded) can
-		// never be resumed. Leaving the row unacknowledged made lease
-		// expiry re-claim it every leaseDuration forever, with the task
-		// stuck in 'executing'. Fail-closed instead: the task fails (never
-		// 'done'; kahya task show says so) and the row is acked.
-		if terr := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusFailed); terr != nil {
-			d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
-				"event": "outbox.transition_failed", "task_id": t.ID, "err": terr.Error(),
-			})
-		}
+		// briefing's row has none, nor has a locally answered task's; a
+		// corrupt one cannot be decoded) can never be resumed. Leaving the
+		// row unacknowledged made lease expiry re-claim it every
+		// leaseDuration forever, with the task stuck in 'executing'.
+		// Fail-closed instead: the task fails (never 'done'; kahya task show
+		// says so) and the row is acked.
+		d.failUnresumable(ctx, t)
 		d.markDelivered(ctx, row.ID)
+		return
+	}
+	if env.Lane == spawn.LaneSecret {
+		d.refuseSecretLane(ctx, t, row)
 		return
 	}
 
@@ -488,6 +520,42 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	}
 }
 
+// refuseSecretLane is processResume's W3-08 refusal (FIX-I-14 review): no
+// worker, one EventResumeRefusedSecretLane row, the task failed and the
+// row acked.
+func (d *Dispatcher) refuseSecretLane(ctx context.Context, t sqlcgen.Task, row sqlcgen.Outbox) {
+	d.ledgerRaw(ctx, t.TraceID, EventResumeRefusedSecretLane, map[string]any{
+		"event": EventResumeRefusedSecretLane, "task_id": t.ID, "outbox_id": row.ID, "status": t.Status,
+	})
+	d.failUnresumable(ctx, t)
+	d.markDelivered(ctx, row.ID)
+}
+
+// failUnresumable moves a task the dispatcher can never resume to 'failed'
+// through legal edges only (FIX-I-14 review): intent and
+// bekliyor-yeniden-deneme have no edge into 'failed', so they pass through
+// 'executing' first (an envelope-less task parked by an older build, a
+// legacy row a --retry revived). A task already terminal is left alone.
+// A failed transition is ledgered, never fatal - the caller acks the row
+// either way, so it is never re-claimed forever.
+func (d *Dispatcher) failUnresumable(ctx context.Context, t sqlcgen.Task) {
+	if t.Status == task.StatusIntent || t.Status == task.StatusRetryWait {
+		if err := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusExecuting); err != nil {
+			d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
+				"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
+			})
+			return
+		}
+	} else if !task.IsLegalTransition(t.Status, task.StatusFailed) {
+		return
+	}
+	if err := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusFailed); err != nil {
+		d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
+			"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
+		})
+	}
+}
+
 // renewLeaseWhileRunning extends outboxID's lease every leaseDuration/3
 // (BLOCKER 2(b) fix) until done is closed - processResume closes done via
 // defer immediately once spawn.Run returns, which also stops this
@@ -533,10 +601,12 @@ func (d *Dispatcher) markDelivered(ctx context.Context, outboxID int64) {
 }
 
 // ErrNoStoredEnvelope is returned by buildResumeEnvelope when the task
-// row has no persisted envelope to resume from at all. POST /v1/task always
-// stores one; the briefing's task row has none (it is never resumed - its
-// next scheduled run starts from scratch), so processResume fails such a
-// task and acks the row (G10-E2).
+// row has no persisted envelope to resume from at all. POST /v1/task stores
+// one for every task it hands to a worker; a locally answered task
+// (secret-lane or downgrade-routed, FIX-I-14 review) stores none, nor does
+// the briefing's task row (it is never resumed - its next scheduled run
+// starts from scratch), so processResume fails such a task and acks the
+// row (G10-E2).
 var ErrNoStoredEnvelope = errors.New("outbox: task has no stored envelope to resume from")
 
 // buildResumeEnvelope reconstructs the spawn.Envelope to re-spawn t's

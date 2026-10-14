@@ -48,6 +48,16 @@ type TaskLiveRegistry interface {
 	Unregister(taskID string)
 }
 
+// inProcessSessions is the optional part of a TaskLiveRegistry that marks a
+// task live while its session runs inside kahyad itself, with no worker
+// (FIX-I-14 review; *task.LiveRegistry.BeginInProcess). handleSecretLaneTask
+// holds one for the whole local answer, handleTask's cloud path from its
+// executing transition until it returns (the window before its worker
+// registers).
+type inProcessSessions interface {
+	BeginInProcess(taskID string) (end func())
+}
+
 // SetTaskLiveRegistry wires handleTask's own Register/Unregister calls
 // (task.go) around every worker it spawns - a *task.LiveRegistry
 // satisfies this directly. Call before Prepare(); nil (the default) means
@@ -65,11 +75,24 @@ type TaskLiveRegistry interface {
 // trace_id (controlauth.go). Unwired (nil, or no BySID), no caller is
 // ever attributable, so every worker-route call then needs the control
 // secret (fail-closed).
+//
+// FIX-I-14 review: when reg also implements inProcessSessions (a
+// *task.LiveRegistry does - BeginInProcess), handleSecretLaneTask registers
+// every local answer in it for the answer's whole run: the task is
+// 'executing' meanwhile, and without the registration the resume scan
+// (which consults this same registry) took it for a crashed worker and the
+// outbox dispatcher re-ran it in a worker - for a secret-lane task, with
+// the secret prompt. handleTask's cloud path holds one too, covering the
+// window between its executing transition and its worker's registration.
 func (s *Server) SetTaskLiveRegistry(reg TaskLiveRegistry) {
 	s.taskLiveRegistry = reg
 	s.workerLookup = nil
 	if wl, ok := reg.(workerLookup); ok {
 		s.workerLookup = wl
+	}
+	s.taskInProcess = nil
+	if ip, ok := reg.(inProcessSessions); ok {
+		s.taskInProcess = ip
 	}
 }
 

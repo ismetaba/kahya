@@ -694,7 +694,9 @@ shape).
 **Persistence per task** (`kahyad/internal/store/sqlcgen`, tables `tasks`
 + `events`):
 - `InsertTask` — `state='running'`, `taint_tier='untrusted'`, `model`, the
-  full envelope JSON, before the SSE response even starts.
+  full envelope JSON (only for a task handed to a worker: a locally
+  answered secret-lane / downgrade-routed task stores none — FIX-I-14
+  review), before the SSE response even starts.
 - Ledger `task_spawned` right after the insert.
 - `UpdateTaskSession` — as the worker's `"session"` line arrives, if any.
 - `UpdateTaskState` — `done` or `error` once the terminal outcome is known.
@@ -717,6 +719,32 @@ happened. Migration 0021 (data only) moves old `intent` rows whose
 `state` is `done`/`error` to `done`/`failed`. A task row without a stored
 envelope (the briefing's) is never resumed: the outbox dispatcher fails it
 and acks the resume row (`outbox.envelope_invalid`, once — G10-E2).
+
+**Sessions that run inside kahyad are live; local rows are never handed to
+a worker (FIX-I-14 review):** a local answer and a briefing run have no
+worker pid, yet their task is `executing` for the whole run. Each holds
+`task.LiveRegistry.BeginInProcess(task_id)` from before its `executing`
+transition until after its terminal one (`handleSecretLaneTask` via
+`SetTaskLiveRegistry`, the briefing via `Orchestrator.Live`; main.go hands
+the same registry to the resume scan and the outbox dispatcher), so a
+resume-scan tick in the middle never takes the running session for a
+crashed worker (`PID`/`BySID` still report only real workers). A cloud
+task holds one too, from its `executing` transition until `handleTask`
+returns, covering the window before its worker registers. A locally
+answered task — secret lane or downgrade route — stores **no**
+`tasks.envelope` (it is never given to a worker), and the outbox
+dispatcher never gives a secret-lane row (row lane or stored envelope
+lane) to a worker: after a kahyad restart mid-answer, or a `kahya task
+resolve --retry`, it fails the task and acks the row
+(`outbox.resume_refused_secret_lane`; a downgrade-routed row takes the
+envelope-less G10-E2 path). A task the outbox could never resume
+(`task.Resumable` false: no stored envelope, or secret lane) is never
+parked or budget-blocked either: `CloudRetry.ParkOrGiveUp` fails it
+(`task.failed` reason `not_resumable`, no notice) and the budget pause
+fails it instead of `blocked_user`. A resume row whose task already ended
+(`done`/`failed`) is acked (`outbox.redelivery_guarded`) instead of an
+illegal `→ executing` attempt; an envelope-less row found parked ends
+`failed` through `bekliyor-yeniden-deneme → executing → failed`.
 
 All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a

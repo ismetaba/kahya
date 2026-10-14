@@ -54,3 +54,48 @@ func TestLiveRegistryBySID(t *testing.T) {
 		t.Fatalf("IsLive(t2)/IsLive(t3) = false, want true")
 	}
 }
+
+// TestLiveRegistryInProcessSessionIsLiveWithoutPID (FIX-I-14 review): a
+// session running inside kahyad (a local answer, a briefing run) is live
+// for the resume scan and the dispatcher, but it has no pid: PID and BySID
+// never report it (the halt executor kills by PID), the worker path's
+// Unregister does not end it, and end is idempotent.
+func TestLiveRegistryInProcessSessionIsLiveWithoutPID(t *testing.T) {
+	l := NewLiveRegistry()
+	end := l.BeginInProcess("l1")
+	if !l.IsLive("l1") {
+		t.Fatal("IsLive(l1) during the in-process session = false")
+	}
+	if pid, ok := l.PID("l1"); ok {
+		t.Fatalf("PID(l1) = (%d, true), want no pid for an in-process session", pid)
+	}
+	for _, sid := range []int{0, -1, 1} {
+		if tid, _, ok := l.BySID(sid); ok {
+			t.Fatalf("BySID(%d) = %q, want no match", sid, tid)
+		}
+	}
+	l.Unregister("l1")
+	if !l.IsLive("l1") {
+		t.Fatal("Unregister (the worker path) ended the in-process session")
+	}
+
+	// Two overlapping sessions of one task: live until both ended.
+	end2 := l.BeginInProcess("l1")
+	end()
+	end() // idempotent: must not end the second session
+	if !l.IsLive("l1") {
+		t.Fatal("IsLive(l1) = false while a second session is still open")
+	}
+	end2()
+	if l.IsLive("l1") {
+		t.Fatal("IsLive(l1) after every session ended = true")
+	}
+
+	// A worker and an in-process session never mask each other.
+	l.RegisterWorker("w1", "tr", 4242, 4242)
+	endW := l.BeginInProcess("w1")
+	endW()
+	if pid, ok := l.PID("w1"); !ok || pid != 4242 || !l.IsLive("w1") {
+		t.Fatalf("worker w1 lost after its in-process session ended: pid=%d ok=%v", pid, ok)
+	}
+}

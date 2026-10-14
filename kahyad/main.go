@@ -957,9 +957,13 @@ func run() int {
 		TaskStore: st.Queries,
 		// FIX-I-14: the briefing's task row walks the status machine too.
 		Machine: taskMachine,
-		Ledger:  st,
-		Dedupe:  briefing.StoreDedupeChecker{Store: st.Queries},
-		Log:     log,
+		// FIX-I-14 review: and is live (taskLive.BeginInProcess) for its
+		// whole run, so the resume scan / outbox dispatcher below never
+		// take a running briefing for a crashed worker.
+		Live:   taskLive,
+		Ledger: st,
+		Dedupe: briefing.StoreDedupeChecker{Store: st.Queries},
+		Log:    log,
 	}
 	sched.RegisterHandler("morning-briefing", func(ctx context.Context) error {
 		_, err := briefingOrchestrator.Run(ctx, scheduler.TraceIDFromContext(ctx))
@@ -1125,6 +1129,9 @@ func run() int {
 	// FIX-I-12: a task is "live" for the resume scan while its worker runs
 	// (taskLive) OR while one of its side effects is still executing inside
 	// kahyad (taskReceipts) - the latter outlives a killed worker.
+	// FIX-I-14 review: taskLive also reports a session running inside
+	// kahyad itself (BeginInProcess - a local answer via srv, a briefing
+	// run) live, for the scan and for taskDispatcher alike.
 	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, task.AnyLive(taskLive, taskReceipts), cfg.TaskRetryW1MaxAuto)
 	// FIX-I-2: the resume scan's crash re-dispatches are capped per task
 	// (task_max_crash_resumes, owner decision G10-2); past it -> blocked_user.

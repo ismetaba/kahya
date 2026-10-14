@@ -122,6 +122,17 @@ type Machine interface {
 	Transition(ctx context.Context, traceID, taskID, to string) error
 }
 
+// LiveSessions marks the briefing's task live for its whole run (FIX-I-14
+// review) - *kahyad/internal/task.LiveRegistry satisfies it
+// (BeginInProcess). The briefing's worker is never registered as a worker
+// (it runs inside Run, its row stores no envelope), so without this the
+// resume scan took the 'executing' row of a still-running briefing for a
+// crashed worker and the outbox dispatcher failed it (G10-E2) while the
+// briefing went on to deliver.
+type LiveSessions interface {
+	BeginInProcess(taskID string) (end func())
+}
+
 // Ledger is the append-only events sink this package writes to.
 // *store.Store already has exactly this method shape.
 type Ledger interface {
@@ -187,6 +198,12 @@ type Orchestrator struct {
 	// W4-02 status machine: intent -> executing -> done|failed. Optional
 	// (nil skips the transitions); main.go wires the daemon's task.Machine.
 	Machine Machine
+	// Live (FIX-I-14 review) keeps the briefing's task live for the resume
+	// scan and the outbox dispatcher from before its executing transition
+	// until after its terminal one. Optional (nil registers nothing);
+	// main.go wires the daemon's task.LiveRegistry - the same one the
+	// scan and the dispatcher consult.
+	Live LiveSessions
 
 	// Log is the process-wide JSONL logger (HANDOFF §4 ⚑: "her satir
 	// trace_id iceren JSONL") - optional (nil is a documented no-op,
@@ -363,6 +380,12 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 		}
 	}
 	if o.TaskStore != nil {
+		// FIX-I-14 review: live BEFORE the row can be 'executing'; the
+		// deferred end runs after every finishTask (the terminal status), so
+		// a resume-scan tick never sees this run's row executing-but-not-live.
+		if o.Live != nil {
+			defer o.Live.BeginInProcess(taskID)()
+		}
 		nowStr := rfc3339(now)
 		if _, err := o.TaskStore.InsertTask(ctx, sqlcgen.InsertTaskParams{
 			ID:        taskID,

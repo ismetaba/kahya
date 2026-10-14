@@ -428,7 +428,20 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 			// user resumes it with `kahya task resolve <id> --retry` once the
 			// budget allows (owner decision G10-1: no auto-park to a later
 			// day).
-			if err := s.taskMachine.Transition(ctx, traceID, pausedTaskID, task.StatusBlockedUser); err != nil && !errors.Is(err, task.ErrIllegalTransition) {
+			//
+			// FIX-I-14 review: a task --retry could never resume
+			// (task.Resumable false - the briefing's envelope-less row) is
+			// failed instead: blocked_user would leave it non-terminal
+			// forever (its retry can only fail it, G10-E2) for the next
+			// halt-all to sweep. A row that cannot be read keeps the
+			// blocked_user pause - it stops the task either way.
+			to := task.StatusBlockedUser
+			if s.taskDurabilityStore != nil {
+				if t, err := s.taskDurabilityStore.GetTaskByID(ctx, pausedTaskID); err == nil && !task.Resumable(t) {
+					to = task.StatusFailed
+				}
+			}
+			if err := s.taskMachine.Transition(ctx, traceID, pausedTaskID, to); err != nil && !errors.Is(err, task.ErrIllegalTransition) {
 				return err
 			}
 			return nil
@@ -757,13 +770,26 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FIX-I-14 review: tasks.envelope exists only so the outbox dispatcher
+	// can re-spawn this task's WORKER (W4-02). A task answered locally - the
+	// secret lane (W3-08: never a worker) or the governor's downgrade route
+	// - is never handed to a worker, so it stores none: no resume path (a
+	// kahyad restart mid-answer, a `kahya task resolve --retry`) can ever
+	// turn its row into a worker envelope (processResume fails an
+	// envelope-less task, G10-E2), and a downgrade-routed answer is never
+	// re-run in the cloud behind the governor's back.
+	storedEnvelope := sql.NullString{String: string(envelopeJSON), Valid: true}
+	if lane == spawn.LaneSecret || decision.Local {
+		storedEnvelope = sql.NullString{}
+	}
+
 	if _, err := s.taskStore.InsertTask(dbCtx, sqlcgen.InsertTaskParams{
 		ID:             taskID,
 		TraceID:        traceID,
 		SessionID:      sql.NullString{},
 		State:          "running",
 		Model:          sql.NullString{String: envelope.Model, Valid: true},
-		Envelope:       sql.NullString{String: string(envelopeJSON), Valid: true},
+		Envelope:       storedEnvelope,
 		UpdatedAt:      now,
 		CreatedAt:      now,
 		Lane:           lane,
@@ -840,6 +866,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// request (tasks.state-based SSE reporting below is unaffected either
 	// way) - it is logged and the guarded post-spawn transition further
 	// down simply has nothing to move if this never took hold.
+	//
+	// FIX-I-14 review: the worker registers live only once spawn.Run has
+	// started it (OnStart below); the in-process session covers the window
+	// from this transition until then (proxy setup, SSE open, process
+	// start), so a resume-scan tick in it never enqueues a second worker
+	// for this task. It ends when handleTask returns - the same moment the
+	// deferred worker Unregister below runs.
+	if s.taskInProcess != nil {
+		defer s.taskInProcess.BeginInProcess(taskID)()
+	}
 	if s.taskMachine != nil {
 		if err := s.taskMachine.Transition(dbCtx, traceID, taskID, task.StatusExecuting); err != nil {
 			log.Warn("task_transition_executing_failed", "task_id", taskID, "err", err.Error())
@@ -1245,6 +1281,19 @@ func (s *Server) logClarificationTurn(ctx context.Context, traceID, taskID strin
 // caller) is this function's own original behavior: open its own SSE
 // stream exactly as before.
 func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, taskID, traceID, prompt, lane string, speakOverride bool, dbCtx, persistCtx context.Context, preOpened func(event string, payload any)) {
+	// FIX-I-14 review: the answer runs inside kahyad, with no worker to
+	// register - mark it live for its WHOLE run (registered before the
+	// executing transition below, ended by the defer only after
+	// finishSecretLaneTask's terminal transition), so a resume-scan tick
+	// that reads this row as 'executing' also sees it live and never
+	// enqueues it for a worker. (A kahyad restart mid-answer leaves the row
+	// 'executing' with an empty registry: the outbox dispatcher then fails
+	// it - a secret-lane row is never given to a worker, and a locally
+	// answered task stores no envelope to resume from.)
+	if s.taskInProcess != nil {
+		defer s.taskInProcess.BeginInProcess(taskID)()
+	}
+
 	// FIX-I-14: this task enters the W4-02 status machine like a cloud task
 	// (intent -> executing here, done|failed in finishSecretLaneTask) - it
 	// used to sit at 'intent' forever, so `kahya task show` reported an

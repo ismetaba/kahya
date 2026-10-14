@@ -212,6 +212,14 @@ type Server struct {
 	// reverse lookup (SetTaskLiveRegistry wires it). nil means no caller
 	// is ever attributable to a live worker - see controlauth.go.
 	workerLookup workerLookup
+	// taskInProcess (FIX-I-14 review) is the same *task.LiveRegistry seen
+	// through BeginInProcess (SetTaskLiveRegistry wires it): a local
+	// (secret-lane / downgrade-routed) answer is registered live for its
+	// whole run - and a cloud task from its executing transition until
+	// its worker registers - so the resume scan and the outbox dispatcher
+	// never take a still-running task for a crashed worker. nil = never
+	// registered (the documented unwired posture).
+	taskInProcess inProcessSessions
 
 	// taskMachine/taskCloudRetry wire the W4-04 cloud-call error taxonomy:
 	// taskMachine drives handleTask's own intent->executing transition
