@@ -190,3 +190,51 @@ func TestSecretLaneNoAnswererWiredFailsClosed(t *testing.T) {
 		t.Fatal("no error SSE frame received")
 	}
 }
+
+// TestPassiveFutureVerbPromptStaysCloudLane is review finding B-2 end to
+// end: "yapılacak" folds to "yapilacak", which contains "ilac", so before
+// FIX-B-2 this ordinary prompt was a FINAL deterministic sağlık hit -
+// tasks.lane='secret' and (with no local answerer wired) an error frame
+// instead of a result. The lexicon now matches at word starts only, so
+// the prompt stays on the normal lane and the worker answers it.
+func TestPassiveFutureVerbPromptStaysCloudLane(t *testing.T) {
+	script := filepath.Join(spawnTestdataDir(t), "echo_worker.py")
+	f := newTaskTestFixture(t, []string{"python3", script}, 5)
+
+	traceID := "trace-passive-future-verb-000001"
+	resp := postTask(t, f.client, traceID, "Toplantı yarın yapılacak, not al")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var taskID string
+	var processedLocally *bool
+	for _, fr := range readAllSSE(t, resp) {
+		if fr.event == "error" {
+			t.Errorf("error frame: %s", fr.data)
+		}
+		if fr.event != "result" {
+			continue
+		}
+		var r struct {
+			TaskID           string `json:"task_id"`
+			ProcessedLocally *bool  `json:"processed_locally"`
+		}
+		if err := json.Unmarshal([]byte(fr.data), &r); err != nil {
+			t.Fatalf("decode result frame %q: %v", fr.data, err)
+		}
+		taskID, processedLocally = r.TaskID, r.ProcessedLocally
+	}
+	if taskID == "" {
+		t.Fatal("no result frame (the prompt was routed to the secret lane)")
+	}
+	if processedLocally == nil || *processedLocally {
+		t.Errorf("processed_locally = %v, want false", processedLocally)
+	}
+	row, err := f.store.Queries.GetTaskLane(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("GetTaskLane: %v", err)
+	}
+	if row.Lane != secretlane.LaneNormal {
+		t.Errorf("persisted lane = %q (category %v), want %q", row.Lane, row.SecretCategory, secretlane.LaneNormal)
+	}
+}

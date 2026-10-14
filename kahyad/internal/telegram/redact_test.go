@@ -250,3 +250,17 @@ func TestNonSecretLanePathSendsFullDiff(t *testing.T) {
 		t.Error("non-secret-lane W2 card must still carry the approval keyboard")
 	}
 }
+
+// TestIsSecretLaneDoesNotFlagOrdinaryWordContainingEFT is review finding
+// B-2 at the Telegram redaction seam: fs_write content that merely
+// contains "eft" inside an ordinary word ("defter") is not secret-lane,
+// while the whole word "EFT" still is.
+func TestIsSecretLaneDoesNotFlagOrdinaryWordContainingEFT(t *testing.T) {
+	home := testHome(t)
+	if isSecretLane(home, nil, "fs_write", fsWriteInput(t, "~/notlar/defter.md", "Bu defter çok güzel")) {
+		t.Error(`isSecretLane("Bu defter çok güzel") = true, want false (no word "eft")`)
+	}
+	if !isSecretLane(home, nil, "fs_write", fsWriteInput(t, "~/notlar/defter.md", "EFT ile 500 TL gönder")) {
+		t.Error(`isSecretLane("EFT ile 500 TL gönder") = false, want true (whole word "EFT")`)
+	}
+}

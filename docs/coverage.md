@@ -254,5 +254,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product B | policy state read error ⇒ DENY fail-closed | `kahyad/internal/policy/TestDBErrorPathDeniesFailClosed` | W12-07 | ci-hermetic |
 | Product C | secret-lane fixture ⇒ zero cloud forward-proxy requests | `kahyad/internal/reader/TestNoCloudFallbackSecretLaneFixtureNeverHitsProxy` | W4-03 | ci-hermetic |
 | Product C | local-model unavailable (memory pressure) ⇒ fail-closed, zero cloud requests | `kahyad/internal/reader/TestNoCloudFallbackLocalUnavailableNeverHitsProxy` | W4-03 | ci-hermetic |
+| Product C | finans/sağlık/kimlik lexicon keeps every suffixed true positive (word-start prefix match, fail-closed) | `kahyad/internal/secretlane/TestClassifyDeterministicLexiconSuffixedTruePositives` | FIX-B-2 | ci-hermetic |
+| Product C | every lexicon entry matches only at a word start, never inside another word ("yapılacak" ≠ ilaç, "defter" ≠ eft) | `kahyad/internal/secretlane/TestClassifyDeterministicLexiconEveryEntryWordStartOnly` | FIX-B-2 | ci-hermetic |
 | Product C | CLI prints "🔒 yerel işlendi" badge on local processing | `kahyad/cmd/kahya/TestOneShotProcessedLocallyPrintsBadge` | W3-08 | ci-hermetic |
 | Product D | memory content can never lower a permission / raise autonomy | `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | W78-03 | ci-hermetic |

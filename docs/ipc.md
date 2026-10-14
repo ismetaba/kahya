@@ -165,7 +165,9 @@ a cloud model, without changing anything in §2-§6 above:
   everything.** `POST /v1/task`'s handler runs
   `secretlane.ClassifyDeterministic(prompt)` — IBAN/TCKN (checksum-
   verified)/card-number (Luhn-verified)/CVV regexes, plus a folded
-  (`kahyad/internal/textnorm.Fold`) sağlık/finans/kimlik keyword lexicon —
+  (`kahyad/internal/textnorm.Fold`) sağlık/finans/kimlik keyword lexicon
+  matched at word starts only (prefix entries tolerate Turkish suffixes,
+  `eft`/`tckn` are whole-word; FIX-B-2) —
   **before** the envelope above is even constructed, i.e. before any
   worker could be spawned or any Anthropic-proxy listener opened. A hit is
   final: `lane="secret"`, no model consulted. This call takes **no live

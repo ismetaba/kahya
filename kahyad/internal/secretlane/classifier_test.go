@@ -5,8 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/textnorm"
 )
 
 // --- Deterministic pre-pass fixtures (task spec step 7, byte-exact) ---
@@ -469,4 +472,209 @@ func TestClassifyBlocksOnHangingQwenUntilCtxDone(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Classify() never returned after the Qwen call was released")
 	}
+}
+
+// --- FIX-B-2: lexicon terms match only at a WORD START (prefix entries)
+// or as a WHOLE WORD (whole-word entries), never buried inside another
+// word. Fixtures are byte-exact Turkish (never ASCII-folded by hand). ---
+
+// TestClassifyDeterministicLexiconWordStartFalsePositives is review
+// finding B-2's reproduction: before the fix every row below except the
+// guard rows was a deterministic secret-lane hit, because the lexicon was
+// matched with strings.Contains on Fold(text) - the passive-future suffix
+// "-ılacak" folds to "ilacak" and contains "ilac", and "defter"/"sefte"/
+// "Eftalya" contain "eft".
+func TestClassifyDeterministicLexiconWordStartFalsePositives(t *testing.T) {
+	for _, s := range []string{
+		// "ilaç"/"ilac" inside the passive future suffix -ılacak.
+		"Toplantı yarın yapılacak",
+		"kullanılacak",
+		"anlatılacak",
+		"yazılacak",
+		"katılacak",
+		// "eft" inside ordinary words (whole-word entry since FIX-B-2).
+		"Bu defter çok güzel",
+		"defterdeki notlar",
+		"sefte",
+		"Eftalya ile görüştüm",
+		"eftelik",
+		// "şifre"/"sifre" inside deşifre (decode).
+		"deşifre etmek",
+		"desifre etmek",
+		// "psikolog" inside a longer non-medical word.
+		"parapsikolog",
+		// Guard rows: never a hit, before or after the fix.
+		"kılavuz",
+		"hesaplama",
+		"havalandırma",
+		"psikoloji dersi",
+		// A digit glued to the term is not a word start (\p{N} is a word
+		// rune) - a deliberate, accepted change from the pre-fix behavior.
+		"2ilaç",
+	} {
+		if v, ok := classifyDeterministic(s); ok {
+			t.Errorf("%q: ok=true verdict=%+v, want no deterministic hit", s, v)
+		}
+	}
+}
+
+// TestClassifyDeterministicLexiconSuffixedTruePositives locks the other
+// side of the word-start rule: a prefix entry still tolerates any Turkish
+// suffix chain after it, and every non-letter/non-digit rune (space,
+// punctuation, '/', apostrophe, text start/end) is a word boundary.
+func TestClassifyDeterministicLexiconSuffixedTruePositives(t *testing.T) {
+	for _, tc := range []struct {
+		text, category string
+	}{
+		{"ilaçlarımı aldım", CategorySaglik},
+		{"ilacımı içtim", CategorySaglik},
+		{"İLAÇ listesi", CategorySaglik},
+		{"bu konu hakkında ilaç yok", CategorySaglik},
+		{"hastaneye gittim", CategorySaglik},
+		{"reçetemi yazdır", CategorySaglik},
+		{"e-reçete kodu geldi", CategorySaglik},
+		{"tahlillerim çıktı", CategorySaglik},
+		{"sağlığım iyi", CategorySaglik},
+		{"Doktor raporu ekte", CategorySaglik},
+		{"ozetle: ~/Documents/saglik/tahlil.md", CategorySaglik},
+		{"nöropsikiyatri randevum yarın", CategorySaglik},
+		{"şifremi unuttum", CategoryFinans},
+		{"havaleyi yaptım", CategoryFinans},
+		{"banka hesabıma yatır", CategoryFinans},
+		{"doğum tarihiniz nedir", CategoryKimlik},
+		{"TCKN'im lazım", CategoryKimlik},
+		// Prefix rule: same as the pre-fix behavior (decision G02-1 keeps
+		// the sağlık root prefix-matched - fail-closed).
+		{"sağlıklı beslenme", CategorySaglik},
+		{"sağlıkta ve hastalıkta", CategorySaglik},
+		{"(ilaç)", CategorySaglik},
+		{"ilaç", CategorySaglik},
+	} {
+		v, ok := classifyDeterministic(tc.text)
+		if !ok || !v.SecretLane {
+			t.Errorf("%q: ok=%v verdict=%+v, want a deterministic secret-lane hit", tc.text, ok, v)
+			continue
+		}
+		if v.Category != tc.category {
+			t.Errorf("%q: category = %q, want %q", tc.text, v.Category, tc.category)
+		}
+	}
+}
+
+// TestClassifyDeterministicLexiconWholeWordEFT pins the three-letter "eft"
+// entry to whole-word matching.
+func TestClassifyDeterministicLexiconWholeWordEFT(t *testing.T) {
+	for _, s := range []string{
+		"EFT ile gönderdim",
+		"eft'le yolladım",
+		"ödeme/eft bilgisi",
+		"eft",
+		"(eft)",
+	} {
+		v, ok := classifyDeterministic(s)
+		if !ok || v.Category != CategoryFinans || v.Reason != "keyword:eft" {
+			t.Errorf("%q: ok=%v verdict=%+v, want finans keyword:eft", s, ok, v)
+		}
+	}
+	// The lexicon is scanned in order and "havale" precedes "eft": the
+	// first hit wins (same as before the fix).
+	if v, ok := classifyDeterministic("havale/eft bilgisi"); !ok || v.Reason != "keyword:havale" {
+		t.Errorf("havale/eft bilgisi: ok=%v verdict=%+v, want keyword:havale", ok, v)
+	}
+	for _, s := range []string{"defter", "sefte", "eftelik", "eft1"} {
+		if v, ok := classifyDeterministic(s); ok {
+			t.Errorf("%q: ok=true verdict=%+v, want no deterministic hit", s, v)
+		}
+	}
+}
+
+// TestClassifyDeterministicLexiconEntriesFolded keeps every lexicon entry
+// pre-folded and non-empty: an unfolded entry would never match Fold(text),
+// and an empty one would match at every offset.
+func TestClassifyDeterministicLexiconEntriesFolded(t *testing.T) {
+	for _, lex := range [][]lexEntry{saglikKeywords, finansKeywords, kimlikKeywords} {
+		for _, e := range lex {
+			if e.text == "" {
+				t.Errorf("empty lexicon entry %+v", e)
+				continue
+			}
+			if got := textnorm.Fold(e.text); got != e.text {
+				t.Errorf("lexicon entry %q is not pre-folded (Fold = %q)", e.text, got)
+			}
+		}
+	}
+}
+
+// TestClassifyDeterministicLexiconEveryEntryWordStartOnly gives EVERY
+// lexicon entry its own false-positive check: the entry glued after a
+// letter or digit (buried inside another word) never matches, while the
+// entry at text start, after a space, and between punctuation always
+// does; a prefix entry keeps matching with a Turkish suffix after it, a
+// whole-word entry does not. The same entry text, run through the full
+// pre-pass, is a hit of the lexicon's own category.
+func TestClassifyDeterministicLexiconEveryEntryWordStartOnly(t *testing.T) {
+	for _, lex := range []struct {
+		category string
+		entries  []lexEntry
+	}{
+		{CategorySaglik, saglikKeywords},
+		{CategoryFinans, finansKeywords},
+		{CategoryKimlik, kimlikKeywords},
+	} {
+		for _, e := range lex.entries {
+			for _, glue := range []string{"a", "ş", "ü", "7"} {
+				if matchLexicon(glue+e.text, e) {
+					t.Errorf("%q matched inside %q, want no match mid-word", e.text, glue+e.text)
+				}
+				if matchLexicon("x "+glue+e.text+" y", e) {
+					t.Errorf("%q matched inside %q, want no match mid-word", e.text, "x "+glue+e.text+" y")
+				}
+			}
+			for _, ok := range []string{e.text, "x " + e.text, "(" + e.text + ")", "~/" + e.text + ".md", "a" + e.text + " " + e.text} {
+				if !matchLexicon(ok, e) {
+					t.Errorf("%q did not match %q, want a word-start match", e.text, ok)
+				}
+			}
+			suffixed := e.text + "ler"
+			if got := matchLexicon(suffixed, e); got == e.wholeWord {
+				t.Errorf("%q in %q: match=%v, want %v (wholeWord=%v)", e.text, suffixed, got, !e.wholeWord, e.wholeWord)
+			}
+			if !matchLexicon(e.text+"'ler", e) {
+				t.Errorf("%q did not match %q, want the apostrophe to end the word", e.text, e.text+"'ler")
+			}
+			v, ok := classifyDeterministic(e.text)
+			if !ok || v.Category != lex.category {
+				t.Errorf("classifyDeterministic(%q) = %+v ok=%v, want category %q", e.text, v, ok, lex.category)
+			}
+		}
+	}
+}
+
+// Large-input benchmarks (review finding B-2a): fs_read classifies the
+// WHOLE file on every read, so the lexicon must stay a SIMD substring scan
+// (strings.Index) plus an O(1) boundary check per occurrence - never a
+// per-entry regexp, which measured ~20x slower on 1 MiB. No timing
+// assertion runs inside make test; compare with
+//
+//	go test -tags sqlite_fts5 -run '^$' -bench ClassifyDeterministicLarge ./kahyad/internal/secretlane/
+func benchmarkClassifyDeterministicLarge(b *testing.B, unit string) {
+	text := strings.Repeat(unit, (1<<20)/len(unit)+1)[:1<<20]
+	b.SetBytes(1 << 20)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		classifyDeterministic(text)
+	}
+}
+
+// BenchmarkClassifyDeterministicLargeNoHit: 1 MiB with no lexicon term at
+// all (every entry scans the whole text).
+func BenchmarkClassifyDeterministicLargeNoHit(b *testing.B) {
+	benchmarkClassifyDeterministicLarge(b, "merhaba dünya bugün hava güzel toplantı yarın saat üçte ofiste olacak ")
+}
+
+// BenchmarkClassifyDeterministicLargePassive: 1 MiB where "ilac" and "eft"
+// occur thousands of times INSIDE words (the boundary-check path) but no
+// lexicon term occurs as a word.
+func BenchmarkClassifyDeterministicLargePassive(b *testing.B) {
+	benchmarkClassifyDeterministicLarge(b, "rapor yarın yapılacak ve sunum pazartesi anlatılacak; notlar defterde yazılacak ")
 }

@@ -20,6 +20,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"kahya/kahyad/internal/textnorm"
 )
@@ -224,61 +226,164 @@ func stripNonDigits(s string) string {
 //
 // Every entry is pre-folded (textnorm.Fold - Turkish dotted/dotless-I +
 // Unicode lowercase, the SAME folding kahyad/internal/search's trigram
-// index uses) so matching against Fold(text) is exact-substring, never a
-// second ad-hoc casefold. Entries deliberately include BOTH the correct
-// Turkish-diacritic spelling AND its common ASCII-folded variant (Fold
-// does NOT strip ğ/ş/ç/ı - only the I-family - so "sağlık" and "saglik"
-// are different folded strings and both need their own entry) - this is a
-// lexicon, not a stemmer (tasks/README.md forbids hand-rolled morphology),
-// so coverage is deliberately representative, not exhaustive.
+// index uses) and matched against Fold(text), never a second ad-hoc
+// casefold. Entries deliberately include BOTH the correct Turkish-diacritic
+// spelling AND its common ASCII-folded variant (Fold does NOT strip
+// ğ/ş/ç/ı - only the I-family - so "sağlık" and "saglik" are different
+// folded strings and both need their own entry) - this is a lexicon, not a
+// stemmer (tasks/README.md: byte-exact Turkish fixtures, never manual
+// stemming), so coverage is deliberately representative, not exhaustive.
+//
+// Matching is word-start (prefix) or whole-word on Fold(text) (review
+// finding B-2): strings.Index plus a rune-boundary check, no regexp (see
+// matchLexicon). A prefix entry matches only when it starts a word - the
+// preceding rune is absent or not a letter/digit - and may be followed by
+// any Turkish suffix chain ("ilaçlarımı", "tahlillerim", "hastaneye"); a
+// whole-word entry must also end a word. A term buried inside another word
+// never matches: the passive-future suffix "-ılacak" folds to "ilacak" and
+// so contains "ilac", and "defter"/"sefte" contain "eft", but neither is
+// the WORD "ilaç"/"eft". Word-start matching still over-matches on purpose
+// ("sağlıklı", "şifreli" stay secret-lane): the error direction is
+// fail-closed.
 
-var saglikKeywords = foldAll([]string{
-	"tahlil sonuçları", "tahlil sonuclari", "tahlil sonucu",
-	// Bare "tahlil" (lab test/analysis) ALSO stands alone so it substring-
-	// matches inside a Turkish suffix compound the phrases above don't
-	// cover, e.g. "tahlillerim" (my test results): "tahlillerim" contains
-	// "tahlil" as a prefix, so no separate suffix table is needed here -
-	// this is exactly the review fixture ("tahlil" in "tahlillerim").
-	"tahlil",
-	"sağlık", "saglik",
+// lexEntry is one lexicon term plus its matching mode (see matchLexicon).
+type lexEntry struct {
+	text      string // pre-folded (textnorm.Fold) - also the Verdict.Reason suffix
+	wholeWord bool   // true: the match must ALSO end at a word boundary
+}
+
+var saglikKeywords = lexicon(
+	prefix("tahlil sonuçları", "tahlil sonuclari", "tahlil sonucu"),
+	// Bare "tahlil" (lab test/analysis) as a word-start prefix also covers
+	// a Turkish suffix compound the phrases above don't, e.g.
+	// "tahlillerim" (my test results) - no separate suffix table needed.
+	prefix("tahlil"),
+	// Decision G02-1: the sağlık root stays a PREFIX entry (fail-closed):
+	// "sağlıkta", "sağlıktan", "sağlık raporum" all keep matching.
+	prefix("sağlık", "saglik"),
 	// "sağlığ"/"saglig" are the Turkish consonant-softening (yumuşama)
 	// stem of "sağlık"/"saglik": a vowel-initial possessive suffix turns
 	// the word-final k into ğ (sağlık + -ım -> sağlığım, "my health"), so
-	// plain "sağlık" is NEVER a substring of "sağlığım" - this stem entry
-	// is what the review fixture ("sağlık" in "sağlığım") actually needs,
-	// not the unsuffixed form above. Both the Turkish-diacritic and
-	// ASCII-folded spellings are listed for the same reason every other
-	// pair in this lexicon is (Fold does not touch ğ).
-	"sağlığ", "saglig",
-	"hastane", "reçete", "recete",
-	"teşhis", "teshis", "diagnoz", "ilaç", "ilac",
-	"ameliyat", "psikiyatr", "psikolog", "doktor raporu",
-	"epikriz", "biyopsi", "tetkik sonucu", "kan tahlili",
-	"hasta dosyası", "hasta dosyasi",
-})
+	// plain "sağlık" never starts "sağlığım" - this stem entry is what the
+	// review fixture ("sağlık" in "sağlığım") actually needs. Both
+	// spellings are listed for the same reason every other pair here is
+	// (Fold does not touch ğ).
+	prefix("sağlığ", "saglig"),
+	prefix("hastane", "reçete", "recete"),
+	prefix("teşhis", "teshis", "diagnoz", "ilaç", "ilac"),
+	prefix("ameliyat", "psikiyatr", "psikolog", "doktor raporu"),
+	// The neuro- compounds are single Turkish words, so the word-start
+	// rule alone would no longer see "psikiyatr"/"psikolog" inside them
+	// (the pre-B-2 substring match did) - listed explicitly so FIX-B-2
+	// never narrows a medical true positive.
+	prefix("nöropsikiyatr", "noropsikiyatr", "nöropsikolog", "noropsikolog"),
+	prefix("epikriz", "biyopsi", "tetkik sonucu", "kan tahlili"),
+	prefix("hasta dosyası", "hasta dosyasi"),
+)
 
-var finansKeywords = foldAll([]string{
-	"kredi kartı ekstresi", "kredi karti ekstresi",
-	"kredi kartı numarası", "kredi karti numarasi",
-	"banka hesap", "hesap numarası", "hesap numarasi",
-	"maaş bordrosu", "maas bordrosu", "vergi levhası", "vergi levhasi",
-	"kredi notu", "banka ekstresi", "havale", "eft",
-	"şifre", "sifre", "güvenlik kodu", "guvenlik kodu",
-})
+var finansKeywords = lexicon(
+	prefix("kredi kartı ekstresi", "kredi karti ekstresi"),
+	prefix("kredi kartı numarası", "kredi karti numarasi"),
+	// "banka hesab" is the consonant-softened stem of "banka hesap"
+	// ("banka hesabım", "banka hesabıma") - same reasoning as "sağlığ".
+	prefix("banka hesap", "banka hesab", "hesap numarası", "hesap numarasi"),
+	prefix("maaş bordrosu", "maas bordrosu", "vergi levhası", "vergi levhasi"),
+	prefix("kredi notu", "banka ekstresi", "havale"),
+	// Three letters: whole-word ONLY ("EFT ile", "eft'le"), never a
+	// substring ("defter", "sefte", "Eftalya" - review finding B-2).
+	whole("eft"),
+	prefix("şifre", "sifre", "güvenlik kodu", "guvenlik kodu"),
+)
 
-var kimlikKeywords = foldAll([]string{
-	"tc kimlik", "t.c. kimlik", "tckn", "kimlik numarası", "kimlik numarasi",
-	"pasaport numarası", "pasaport numarasi", "ehliyet numarası", "ehliyet numarasi",
-	"doğum tarihi", "dogum tarihi", "anne kızlık soyadı", "anne kizlik soyadi",
-	"nüfus cüzdanı", "nufus cuzdani",
-})
+var kimlikKeywords = lexicon(
+	prefix("tc kimlik", "t.c. kimlik"),
+	// Whole-word: "TCKN'im" (apostrophe is a boundary) matches.
+	whole("tckn"),
+	prefix("kimlik numarası", "kimlik numarasi"),
+	prefix("pasaport numarası", "pasaport numarasi", "ehliyet numarası", "ehliyet numarasi"),
+	prefix("doğum tarihi", "dogum tarihi", "anne kızlık soyadı", "anne kizlik soyadi"),
+	prefix("nüfus cüzdanı", "nufus cuzdani"),
+)
 
-func foldAll(words []string) []string {
-	out := make([]string, len(words))
-	for i, w := range words {
-		out[i] = textnorm.Fold(w)
+func prefix(words ...string) []lexEntry { return entries(words, false) }
+func whole(words ...string) []lexEntry  { return entries(words, true) }
+
+// entries pre-folds every word (textnorm.Fold - the SAME folding applied
+// to the text at match time).
+func entries(words []string, wholeWord bool) []lexEntry {
+	out := make([]lexEntry, 0, len(words))
+	for _, w := range words {
+		out = append(out, lexEntry{text: textnorm.Fold(w), wholeWord: wholeWord})
 	}
 	return out
+}
+
+func lexicon(groups ...[]lexEntry) []lexEntry {
+	var out []lexEntry
+	for _, g := range groups {
+		out = append(out, g...)
+	}
+	return out
+}
+
+// isWordRune reports whether r is a "word" rune for boundary purposes:
+// any Unicode letter or number (unicode.IsNumber == \p{N}, so a digit
+// glued to a term - "2ilaç" - is NOT a word start). Everything else -
+// space, punctuation, apostrophe, '/', '.', '_', '-', and utf8.RuneError
+// for a stray byte - is a boundary.
+func isWordRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }
+
+// wordStartAt reports whether byte offset i of s is at a word start:
+// i == 0, or the rune ending at i is not a word rune.
+func wordStartAt(s string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(s[:i])
+	return !isWordRune(r)
+}
+
+// wordEndAt reports whether byte offset i of s is at a word end:
+// i == len(s), or the rune starting at i is not a word rune.
+func wordEndAt(s string, i int) bool {
+	if i >= len(s) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(s[i:])
+	return !isWordRune(r)
+}
+
+// matchLexicon reports whether folded contains e.text starting at a WORD
+// START (the preceding rune is absent or not a letter/digit) and, for a
+// wholeWord entry, also ending at a word end. Prefix entries deliberately
+// allow any continuation so Turkish suffix chains still match
+// ("hastaneye", "ilaçlarımı", "tahlillerim") without a stemmer - but
+// never a term buried INSIDE another word: "yapılacak" (folded
+// "yapilacak") does not contain the WORD "ilaç"; "defter" does not
+// contain the WORD "eft" (review finding B-2).
+func matchLexicon(folded string, e lexEntry) bool {
+	// strings.Index is the same SIMD substring scan the pre-FIX-B-2 code
+	// used (strings.Contains), so a lexicon MISS - the common case on a
+	// large fs_read payload - costs what it did before; only the (rare)
+	// occurrences are boundary-checked, in O(1) each (review finding
+	// B-2a: a per-entry regexp measured ~20x slower on 1 MiB). e.text is
+	// valid UTF-8 and never starts with a continuation byte, so every
+	// Index hit starts on a rune boundary of folded and advancing one byte
+	// past a rejected hit is safe.
+	off := 0
+	for off <= len(folded) {
+		i := strings.Index(folded[off:], e.text)
+		if i < 0 {
+			return false
+		}
+		start := off + i
+		end := start + len(e.text)
+		if wordStartAt(folded, start) && (!e.wholeWord || wordEndAt(folded, end)) {
+			return true
+		}
+		off = start + 1
+	}
+	return false
 }
 
 // classifyDeterministic runs the regex/lexicon pre-pass. A hit is FINAL
@@ -307,18 +412,18 @@ func classifyDeterministic(text string) (Verdict, bool) {
 
 	folded := textnorm.Fold(text)
 	for _, kw := range saglikKeywords {
-		if strings.Contains(folded, kw) {
-			return Verdict{SecretLane: true, Category: CategorySaglik, Reason: "keyword:" + kw}, true
+		if matchLexicon(folded, kw) {
+			return Verdict{SecretLane: true, Category: CategorySaglik, Reason: "keyword:" + kw.text}, true
 		}
 	}
 	for _, kw := range finansKeywords {
-		if strings.Contains(folded, kw) {
-			return Verdict{SecretLane: true, Category: CategoryFinans, Reason: "keyword:" + kw}, true
+		if matchLexicon(folded, kw) {
+			return Verdict{SecretLane: true, Category: CategoryFinans, Reason: "keyword:" + kw.text}, true
 		}
 	}
 	for _, kw := range kimlikKeywords {
-		if strings.Contains(folded, kw) {
-			return Verdict{SecretLane: true, Category: CategoryKimlik, Reason: "keyword:" + kw}, true
+		if matchLexicon(folded, kw) {
+			return Verdict{SecretLane: true, Category: CategoryKimlik, Reason: "keyword:" + kw.text}, true
 		}
 	}
 	return Verdict{}, false

@@ -23,9 +23,8 @@ import (
 var ErrNoActiveFact = errors.New("factengine: no active fact matches subject/predicate/object")
 
 // retractionFoldAll folds every entry of words via textnorm.Fold, mirroring
-// kahyad/internal/secretlane's/consolidation's own foldAll helpers (kept
-// as an independent copy here rather than imported - each of those is
-// unexported in its own package).
+// kahyad/internal/secretlane's lexicon pre-folding (its unexported entries
+// helper; kept as an independent copy here rather than imported).
 func retractionFoldAll(words []string) []string {
 	out := make([]string, len(words))
 	for i, w := range words {

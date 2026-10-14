@@ -586,7 +586,9 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// at all until classification has completed.
 	//
 	// Deliberately uses secretlane.ClassifyDeterministic (regex/lexicon
-	// pre-pass ONLY - IBAN/TCKN/card-number/CVV/keyword lexicon), NOT the
+	// pre-pass ONLY - IBAN/TCKN/card-number/CVV/keyword lexicon; keyword
+	// hits are word-start anchored since FIX-B-2, so "yapılacak" is no
+	// longer the word "ilaç"), NOT the
 	// full Qwen-backed s.secretLaneClassifier: the task spec's own
 	// ingestion-point list names memory_write content, fs reads flagged for
 	// model consumption, and (W4-03) mail/web Reader input - it does NOT
