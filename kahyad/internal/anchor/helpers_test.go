@@ -2,6 +2,7 @@ package anchor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // newTestStore opens a real, fully-migrated brain.db under a fresh temp
@@ -74,6 +76,134 @@ func readRemoteAnchorsLog(t *testing.T, remoteDir string) string {
 	}
 	return string(b)
 }
+
+// remoteAnchorLines returns every non-blank anchors.log line the remote's
+// anchorBranch holds, read from a fresh clone's remote-tracking ref (so it
+// also works for a bare remote whose HEAD names an unborn branch, where a
+// fresh clone's working tree stays empty).
+func remoteAnchorLines(t *testing.T, remoteDir string) []string {
+	t.Helper()
+	cloneDir := filepath.Join(t.TempDir(), "lines-clone")
+	runGit(t, "", "clone", "-q", remoteDir, cloneDir)
+	if runGitAllowFail(cloneDir, "rev-parse", "--verify", "-q", "refs/remotes/origin/"+anchorBranch) == "" {
+		return nil // the remote has no anchorBranch yet
+	}
+	out := runGit(t, cloneDir, "show", "refs/remotes/origin/"+anchorBranch+":"+anchorLogFileName)
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// logTestEvent appends one ledger event through the real store choke
+// point (store.LogEvent -> InsertEventWithDigest).
+func logTestEvent(t *testing.T, st *store.Store, kind string) {
+	t.Helper()
+	if err := st.LogEvent(context.Background(), "trace-"+kind, kind, map[string]any{"kind": kind}); err != nil {
+		t.Fatalf("LogEvent(%s): %v", kind, err)
+	}
+}
+
+// runPusher is one Pusher.Run that must not return an error (push
+// failures are offline behavior, never a Run error).
+func runPusher(t *testing.T, p *Pusher, traceID string) {
+	t.Helper()
+	if err := p.Run(context.Background(), traceID); err != nil {
+		t.Fatalf("Run(%s): %v", traceID, err)
+	}
+}
+
+// remoteCommitCount is `git rev-list --count <anchorBranch>` on the bare
+// remote itself.
+func remoteCommitCount(t *testing.T, remoteDir string) string {
+	t.Helper()
+	return runGit(t, remoteDir, "rev-list", "--count", anchorBranch)
+}
+
+// anchorRows lists every anchor_log row (event_id order).
+func anchorRows(t *testing.T, st *store.Store) []sqlcgen.AnchorLog {
+	t.Helper()
+	rows, err := st.Queries.ListAnchorLogs(context.Background())
+	if err != nil {
+		t.Fatalf("ListAnchorLogs: %v", err)
+	}
+	return rows
+}
+
+// flakyGitRunner delegates to a real GitRunner but fails the first
+// failPushes `push` invocations - the "commit landed in the clone, push
+// did not" offline shape TestPusherRunOfflineLeavesRowPending (unreachable
+// remote: the clone itself fails) cannot produce. Set failPushes AFTER a
+// first successful push when a test needs the remote branch to exist.
+type flakyGitRunner struct {
+	inner      GitRunner
+	failPushes int
+	pushes     int
+}
+
+func (f *flakyGitRunner) Clone(ctx context.Context, remote, dir string, env []string) (string, string, error) {
+	return f.inner.Clone(ctx, remote, dir, env)
+}
+
+func (f *flakyGitRunner) Run(ctx context.Context, dir string, env []string, args ...string) (string, string, error) {
+	if len(args) > 0 && args[0] == "push" {
+		f.pushes++
+		if f.failPushes > 0 {
+			f.failPushes--
+			return "", "simulated push failure", errors.New("simulated push failure")
+		}
+	}
+	return f.inner.Run(ctx, dir, env, args...)
+}
+
+// failMarkStore embeds the real queries and fails MarkAnchorPushed the
+// first failMarks times ("push landed, bookkeeping did not").
+type failMarkStore struct {
+	*sqlcgen.Queries
+	failMarks int
+}
+
+func (s *failMarkStore) MarkAnchorPushed(ctx context.Context, arg sqlcgen.MarkAnchorPushedParams) error {
+	if s.failMarks > 0 {
+		s.failMarks--
+		return errors.New("simulated mark failure")
+	}
+	return s.Queries.MarkAnchorPushed(ctx, arg)
+}
+
+// pushBogusLine pushes line (newline-terminated) to remote's anchorBranch
+// from a throwaway clone, bypassing Pusher entirely - "somebody else (an
+// old brain.db, a second machine) already wrote this remote".
+func pushBogusLine(t *testing.T, remote, line string) {
+	t.Helper()
+	clone := filepath.Join(t.TempDir(), "bogus-clone")
+	runGit(t, "", "clone", "-q", remote, clone)
+	if out := runGitAllowFail(clone, "rev-parse", "--verify", "-q", "refs/remotes/origin/"+anchorBranch); out == "" {
+		runGit(t, clone, "checkout", "-q", "-b", anchorBranch)
+	}
+	if err := appendAnchorLine(filepath.Join(clone, anchorLogFileName), line); err != nil {
+		t.Fatalf("appendAnchorLine: %v", err)
+	}
+	runGit(t, clone, "add", anchorLogFileName)
+	runGit(t, clone, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "bogus")
+	runGit(t, clone, "push", "-q", "origin", anchorBranch)
+}
+
+// runGitAllowFail runs `git -C dir args...` and returns its trimmed stdout,
+// or "" when git exits non-zero.
+func runGitAllowFail(dir string, args ...string) string {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// bogusDigest is a well-formed 64-hex digest no real ledger produces.
+const bogusDigest = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 // recordedAlarm is one fakeNotifier.Alarm call (mirrors
 // kahyad/internal/backup's own test helper of the same shape).

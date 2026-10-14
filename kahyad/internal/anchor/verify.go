@@ -141,7 +141,7 @@ func (v *Verifier) checkRemote(ctx context.Context) (ok bool, mismatchEventID in
 	}
 	defer cleanup()
 
-	if err := ensureClone(ctx, v.runner, v.remote, v.repoDir, env); err != nil {
+	if _, err := ensureClone(ctx, v.runner, v.remote, v.repoDir, env); err != nil {
 		return false, 0, err
 	}
 

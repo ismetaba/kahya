@@ -210,6 +210,13 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | local ledger tamper detected vs external anchor | `kahyad/internal/anchor/TestVerifyDetectsLocalTamperAfterTwoAnchors` | W4-05 | ci-hermetic |
 | Safety #4 | remote-anchor mismatch detected | `kahyad/internal/anchor/TestVerifyDetectsRemoteMismatch` | W4-05 | ci-hermetic |
 | Safety #4 | anchor ledger is append-only (first line unchanged on 2nd anchor) | `kahyad/internal/anchor/TestPusherRunSecondAnchorAppendsAndFirstLineUnchanged` | W4-05 | ci-hermetic |
+| Safety #4 | anchor push retry never duplicates a remote line: a failed push is retried as the same row-derived line, exactly once | `kahyad/internal/anchor/TestPusherRetryAfterFailedPushDoesNotDuplicateLine` | FIX-P-13 | ci-hermetic |
+| Safety #4 | a failed first push to a brand-new (unborn-branch) anchor remote recovers on the next tick instead of staying pending forever | `kahyad/internal/anchor/TestPusherRecoversWhenFirstPushToEmptyRemoteFails` | FIX-P-13 | ci-hermetic |
+| Safety #4 | a push that landed before its bookkeeping failed is not appended again on retry | `kahyad/internal/anchor/TestPusherSkipsAppendWhenRemoteAlreadyHasLine` | FIX-P-13 | ci-hermetic |
+| Safety #4 | anchor push never writes behind a remote that is ahead of the local ledger (row stays pending, `remote_ahead` alarm) | `kahyad/internal/anchor/TestPusherRefusesToPushWhenRemoteAhead` | FIX-P-13 | ci-hermetic |
+| Safety #4 | anchor push never adds a second, different digest for an event the remote already anchored (`digest_mismatch` alarm, source push) | `kahyad/internal/anchor/TestPusherRefusesToPushConflictingDigestForSameEvent` | FIX-P-13 | ci-hermetic |
+| Safety #4 | junk left in the local anchor clone never travels to the remote (the clone is reset to the remote tip) | `kahyad/internal/anchor/TestPusherDivergedCloneIsResetToRemote` | FIX-P-13 | ci-hermetic |
+| Safety #4 | a rotated `anchor_remote` is pushed to directly; the old repository receives nothing more | `kahyad/internal/anchor/TestPusherFollowsAnchorRemoteRotation` | FIX-P-13 | ci-hermetic |
 | Safety #4 | every `<hafiza>` injection block logged with `block_sha256` | `kahyad/internal/server/TestMemorySearchForInjectionLedgersHafizaInjected` | W12-05 | ci-hermetic |
 | Safety #4 | e2e `hafiza_injected` + sha256 over real bins | `tests/e2e/TestW12Acceptance` | W12-10 | local-integration |
 | Safety #4 | every model call is ledgered once even when the worker hangs up mid-stream: the proxy's body Close records the usage observed so far (`model_call` status `aborted`), a later upstream EOF never records twice | `kahyad/internal/anthproxy/TestUsageCapturingBodyCloseBeforeEOFRecordsOnce` | FIX-I-11 | ci-hermetic |

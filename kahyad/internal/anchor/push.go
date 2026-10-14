@@ -1,11 +1,13 @@
 // push.go implements the W4-05 anchor push (task spec step 3): every
 // anchor.interval_hours (kahyad/internal/scheduler.RegisterTick), plus once
 // at startup and once at graceful shutdown, read the current running
-// digest, clone-or-pull the anchor repo, append one anchors.log line,
-// commit, and push - marking the attempt 'pushed' only once the push has
-// actually landed. Offline behavior (task spec step 5): a push failure
-// leaves the attempt 'pending' for the next tick to retry (never
-// duplicated - see claimPendingRow's own doc comment), and the oldest
+// digest, sync the working clone to the remote tip, append the row's one
+// anchors.log line, commit, and push - marking the attempt 'pushed' only
+// once the push has actually landed. Offline behavior (task spec step 5): a
+// push failure leaves the attempt 'pending' for the next tick to retry
+// (never duplicated - neither the anchor_log row, see claimPendingRow, nor
+// the remote anchors.log line: pushRow is idempotent per row, FIX-P-13),
+// and the oldest
 // pending attempt sitting unpushed for more than 2 x interval_hours fires
 // the exact Turkish AlarmStalePending string.
 package anchor
@@ -18,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"kahya/kahyad/internal/logx"
@@ -185,12 +188,17 @@ func (p *Pusher) insertPending(ctx context.Context, state DigestState) (sqlcgen.
 	})
 }
 
-// pushRow performs the actual git work for one anchor_log row: clone-or-
-// pull, append the anchors.log line, commit, and push - marking the row
-// 'pushed' + ledger `anchor.pushed` only once the push itself has
-// succeeded. Any failure along the way (SSH key material, clone, commit,
-// push) returns an error and leaves the row exactly as it was ('pending') -
-// there is no partial-success state to clean up, since the row's own
+// pushRow performs the git work for one anchor_log row, idempotently
+// (FIX-P-13): sync the working clone to the remote tip (ensureClone - the
+// clone is a cache), derive the row's one line (anchorLineForRow), append
+// it only if the remote does not already hold it, commit only if that
+// changed anything, push (a no-op push exits 0), and only then mark the
+// row 'pushed' + ledger `anchor.pushed`. A remote that is AHEAD of this row
+// (its last line anchors a larger event_id) or that already anchored this
+// event_id with a DIFFERENT digest is never pushed to: AlarmRemoteAhead /
+// AlarmMismatch fire and the row stays 'pending' (fail-closed - no silent
+// "repair", the remote is never made non-monotonic). Any failure returns
+// an error and leaves the row exactly as it was ('pending'): the row's own
 // status is the last thing this function ever changes.
 func (p *Pusher) pushRow(ctx context.Context, traceID string, row sqlcgen.AnchorLog) error {
 	env, cleanup, err := p.sshEnv()
@@ -199,7 +207,7 @@ func (p *Pusher) pushRow(ctx context.Context, traceID string, row sqlcgen.Anchor
 	}
 	defer cleanup()
 
-	if err := ensureClone(ctx, p.runner, p.remote, p.repoDir, env); err != nil {
+	if _, err := ensureClone(ctx, p.runner, p.remote, p.repoDir, env); err != nil {
 		return err
 	}
 
@@ -207,25 +215,64 @@ func (p *Pusher) pushRow(ctx context.Context, traceID string, row sqlcgen.Anchor
 	if h, err := p.hostname(); err == nil && h != "" {
 		host = h
 	}
-	line := formatAnchorLine(row.EventID, row.DigestHex, p.now().UTC().Format(time.RFC3339), host)
-
+	line := anchorLineForRow(row, host)
 	logPath := filepath.Join(p.repoDir, anchorLogFileName)
-	if err := appendAnchorLine(logPath, line); err != nil {
+
+	// The clone now mirrors the remote exactly, so its last line is the
+	// remote's last line: it alone says whether THIS row is already there.
+	last, have, err := lastAnchorLine(logPath)
+	if err != nil {
 		return err
+	}
+	switch {
+	case have && last.eventID > row.EventID:
+		// The remote anchored an event this ledger does not reach. Never
+		// append a smaller event_id after a larger one - alarm, leave the
+		// row pending (the stale-pending alarm keeps nagging too).
+		p.raiseMismatch(ctx, traceID, fmt.Sprintf(AlarmRemoteAhead, last.eventID, row.EventID), map[string]any{
+			"event_id": last.eventID, "reason": ReasonRemoteAhead, "local_last_event_id": row.EventID, "source": "push",
+		})
+		p.logWarn(traceID, "anchor_push_remote_ahead", "remote_event_id", last.eventID, "event_id", row.EventID)
+		return fmt.Errorf("anchor: remote is ahead of the local ledger (remote event %d > local %d)", last.eventID, row.EventID)
+	case have && last.eventID == row.EventID && last.digestHex != row.DigestHex:
+		// G07 extra finding A: the remote already anchored THIS event_id
+		// with a different digest (ledger_digest_state/anchor_log rewritten
+		// since, or a second brain.db sharing the repo). Appending would
+		// make the remote non-monotonic - refuse, alarm, leave pending.
+		p.raiseMismatch(ctx, traceID, fmt.Sprintf(AlarmMismatch, row.EventID), map[string]any{
+			"event_id": row.EventID, "reason": ReasonDigestMismatch, "source": "push",
+		})
+		p.logWarn(traceID, "anchor_push_digest_conflict", "event_id", row.EventID)
+		return fmt.Errorf("anchor: remote already anchored event %d with a different digest", row.EventID)
+	case have && last.eventID == row.EventID:
+		// An earlier attempt's push landed but MarkAnchorPushed did not -
+		// never append the same line twice.
+		p.logInfo(traceID, "anchor_push_line_present", "event_id", row.EventID)
+	default:
+		if err := appendAnchorLine(logPath, line); err != nil {
+			return err
+		}
 	}
 
 	if _, stderr, err := p.runner.Run(ctx, p.repoDir, env, "add", anchorLogFileName); err != nil {
 		return fmt.Errorf("anchor: git add: %w: %s", err, stderr)
 	}
-	commitEnv := append(append([]string{}, env...),
-		"GIT_AUTHOR_NAME="+anchorCommitAuthorName, "GIT_AUTHOR_EMAIL="+anchorCommitAuthorEmail,
-		"GIT_COMMITTER_NAME="+anchorCommitAuthorName, "GIT_COMMITTER_EMAIL="+anchorCommitAuthorEmail,
-	)
-	commitMsg := "anchor: event " + strconv.FormatInt(row.EventID, 10)
-	if _, stderr, err := p.runner.Run(ctx, p.repoDir, commitEnv, "commit", "-m", commitMsg); err != nil {
-		return fmt.Errorf("anchor: git commit: %w: %s", err, stderr)
+	status, stderr, err := p.runner.Run(ctx, p.repoDir, env, "status", "--porcelain", "--", anchorLogFileName)
+	if err != nil {
+		return fmt.Errorf("anchor: git status: %w: %s", err, stderr)
 	}
-	if _, stderr, err := p.runner.Run(ctx, p.repoDir, env, "push", "origin", anchorBranch); err != nil {
+	if strings.TrimSpace(status) != "" {
+		commitEnv := append(append([]string{}, env...),
+			"GIT_AUTHOR_NAME="+anchorCommitAuthorName, "GIT_AUTHOR_EMAIL="+anchorCommitAuthorEmail,
+			"GIT_COMMITTER_NAME="+anchorCommitAuthorName, "GIT_COMMITTER_EMAIL="+anchorCommitAuthorEmail,
+		)
+		commitMsg := "anchor: event " + strconv.FormatInt(row.EventID, 10)
+		if _, stderr, err := p.runner.Run(ctx, p.repoDir, commitEnv, "commit", "--quiet", "-m", commitMsg); err != nil {
+			return fmt.Errorf("anchor: git commit: %w: %s", err, stderr)
+		}
+	}
+	// A no-op push ("Everything up-to-date") exits 0 - safe to run always.
+	if _, stderr, err := p.runner.Run(ctx, p.repoDir, env, "push", "--quiet", "origin", anchorBranch); err != nil {
 		return fmt.Errorf("anchor: git push: %w: %s", err, stderr)
 	}
 
@@ -250,6 +297,25 @@ func (p *Pusher) pushRow(ctx context.Context, traceID string, row sqlcgen.Anchor
 	}
 	p.logInfo(traceID, "anchor_pushed", "event_id", row.EventID, "digest_hex", row.DigestHex)
 	return nil
+}
+
+// raiseMismatch reports a push-side anchor.mismatch: through the notifier
+// (which both ledgers the event and alarms) when wired, else straight to
+// the ledger - the same fallback verify.go's mismatch uses. Only ids and
+// the reason code travel (HANDOFF S5 #5: no ledger content in alarms).
+func (p *Pusher) raiseMismatch(ctx context.Context, traceID, message string, payload map[string]any) {
+	if p.notifier != nil {
+		_ = p.notifier.Alarm(ctx, traceID, EventAnchorMismatch, message, payload)
+		return
+	}
+	if p.ledger != nil {
+		withMessage := make(map[string]any, len(payload)+1)
+		for k, v := range payload {
+			withMessage[k] = v
+		}
+		withMessage["message"] = message
+		_ = p.ledger.LogEvent(ctx, traceID, EventAnchorMismatch, withMessage)
+	}
 }
 
 // sshEnv prepares the GIT_SSH_COMMAND environment for one push attempt

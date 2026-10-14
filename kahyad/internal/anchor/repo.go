@@ -1,6 +1,7 @@
-// repo.go is the git plumbing push.go and verify.go share: clone-or-pull
-// the anchor repo into a fixed local working directory, append one
-// anchors.log line, commit, and push - all via a small injectable
+// repo.go is the git plumbing push.go and verify.go share: keep a local
+// working clone of the anchor repo mirrored to the remote tip (a cache,
+// never state - see ensureClone), append one anchors.log line, commit, and
+// push - all via a small injectable
 // GitRunner so tests never shell out to a real SSH remote (task spec step
 // 8: "push against a local file:// bare repo ... no SSH in CI").
 package anchor
@@ -13,7 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
+
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // anchorLogFileName is the one file this package ever appends to inside
@@ -79,39 +84,75 @@ func runCmd(cmd *exec.Cmd, env []string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-// ensureClone clone-or-pulls repoDir up to date with remote (task spec
-// step 3): if repoDir already looks like a git working tree, pull
-// --ff-only; otherwise clone fresh and, since a brand new/still commit-less
-// bare remote leaves an unborn HEAD whose name is not guaranteed to be
-// anchorBranch, explicitly check out (creating if necessary) anchorBranch
-// and set the fixed commit identity once.
-func ensureClone(ctx context.Context, runner GitRunner, remote, repoDir string, env []string) error {
-	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
-		_, stderr, err := runner.Run(ctx, repoDir, env, "pull", "--ff-only", "origin", anchorBranch)
-		if err != nil {
-			return fmt.Errorf("anchor: git pull: %w: %s", err, strings.TrimSpace(stderr))
+// remoteBranchRef is the fetched remote-tracking ref every read of "what
+// the remote actually holds" goes through - never a local branch.
+const remoteBranchRef = "refs/remotes/origin/" + anchorBranch
+
+// ensureClone makes repoDir an exact mirror of the remote's anchorBranch
+// (FIX-P-13): the working clone is a CACHE of the remote, never state -
+// anchor_log rows are the state and pushRow re-derives the row's line from
+// the row itself, so discarding local leftovers (an unpushed commit from a
+// failed push, a half-appended anchors.log, an edit by anyone sharing this
+// uid) is always safe. Every call:
+//
+//  1. clones the remote if repoDir is not a clone yet, otherwise points
+//     origin at remote (a rotated anchor_remote - runbook S6 - must never
+//     keep feeding the old repository) and fetches with --prune;
+//  2. removes the working anchors.log, then either checks local
+//     anchorBranch out at the remote tip (--force, discarding local
+//     commits and edits) or - when the remote has no anchorBranch yet (a
+//     brand-new bare repo, first anchor ever) - leaves HEAD on an unborn
+//     anchorBranch with an empty index, so the next commit is the remote
+//     branch's first.
+//
+// remoteHasBranch reports which of the two it was. Nothing here ever
+// rewrites the remote: reset/checkout touch only this local cache, and
+// the later push is a plain (never forced) push.
+func ensureClone(ctx context.Context, runner GitRunner, remote, repoDir string, env []string) (remoteHasBranch bool, err error) {
+	if _, statErr := os.Stat(filepath.Join(repoDir, ".git")); statErr == nil {
+		if _, stderr, err := runner.Run(ctx, repoDir, env, "remote", "set-url", "origin", remote); err != nil {
+			return false, fmt.Errorf("anchor: git remote set-url: %w: %s", err, strings.TrimSpace(stderr))
 		}
-		return nil
+		if _, stderr, err := runner.Run(ctx, repoDir, env, "fetch", "--quiet", "--prune", "origin"); err != nil {
+			return false, fmt.Errorf("anchor: git fetch: %w: %s", err, strings.TrimSpace(stderr))
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(repoDir), 0o700); err != nil {
+			return false, fmt.Errorf("anchor: mkdir parent of %s: %w", repoDir, err)
+		}
+		if _, stderr, err := runner.Clone(ctx, remote, repoDir, env); err != nil {
+			return false, fmt.Errorf("anchor: git clone: %w: %s", err, strings.TrimSpace(stderr))
+		}
+		// Best-effort: a global git identity may not be configured at all
+		// in a fresh test/CI environment (pushRow also passes the identity
+		// through GIT_AUTHOR_*/GIT_COMMITTER_* on the commit itself).
+		_, _, _ = runner.Run(ctx, repoDir, env, "config", "user.name", anchorCommitAuthorName)
+		_, _, _ = runner.Run(ctx, repoDir, env, "config", "user.email", anchorCommitAuthorEmail)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(repoDir), 0o700); err != nil {
-		return fmt.Errorf("anchor: mkdir parent of %s: %w", repoDir, err)
+	logPath := filepath.Join(repoDir, anchorLogFileName)
+	if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("anchor: reset %s: %w", logPath, err)
 	}
-	if _, stderr, err := runner.Clone(ctx, remote, repoDir, env); err != nil {
-		return fmt.Errorf("anchor: git clone: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	if _, _, err := runner.Run(ctx, repoDir, env, "checkout", anchorBranch); err != nil {
-		if _, stderr, err2 := runner.Run(ctx, repoDir, env, "checkout", "-b", anchorBranch); err2 != nil {
-			return fmt.Errorf("anchor: git checkout -b %s: %w: %s", anchorBranch, err2, strings.TrimSpace(stderr))
+	if _, _, err := runner.Run(ctx, repoDir, env, "rev-parse", "--verify", "-q", remoteBranchRef); err == nil {
+		if _, stderr, err := runner.Run(ctx, repoDir, env, "checkout", "--quiet", "--force", "-B", anchorBranch, remoteBranchRef); err != nil {
+			return false, fmt.Errorf("anchor: git checkout -B %s %s: %w: %s", anchorBranch, remoteBranchRef, err, strings.TrimSpace(stderr))
 		}
+		return true, nil
 	}
-	// Best-effort: a global git identity may not be configured at all in a
-	// fresh test/CI environment, which would otherwise fail every commit
-	// below with "Please tell me who you are".
-	_, _, _ = runner.Run(ctx, repoDir, env, "config", "user.name", anchorCommitAuthorName)
-	_, _, _ = runner.Run(ctx, repoDir, env, "config", "user.email", anchorCommitAuthorEmail)
-	return nil
+	// Unborn remote branch (git clone warned "cloned an empty repository"
+	// or "remote HEAD refers to nonexistent ref"): mirror that locally -
+	// HEAD on an unborn anchorBranch, no local commits, nothing staged.
+	if _, stderr, err := runner.Run(ctx, repoDir, env, "symbolic-ref", "HEAD", "refs/heads/"+anchorBranch); err != nil {
+		return false, fmt.Errorf("anchor: git symbolic-ref HEAD: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if _, stderr, err := runner.Run(ctx, repoDir, env, "update-ref", "-d", "refs/heads/"+anchorBranch); err != nil {
+		return false, fmt.Errorf("anchor: git update-ref -d: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if _, stderr, err := runner.Run(ctx, repoDir, env, "read-tree", "--empty"); err != nil {
+		return false, fmt.Errorf("anchor: git read-tree --empty: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	return false, nil
 }
 
 // appendAnchorLine appends one already-newline-terminated anchor line to
@@ -144,6 +185,20 @@ type anchorLine struct {
 // <hostname>\n".
 func formatAnchorLine(eventID int64, digestHex, ts, hostname string) string {
 	return fmt.Sprintf("%d %s %s %s\n", eventID, digestHex, ts, hostname)
+}
+
+// anchorLineForRow renders the ONE line an anchor_log row ever produces
+// (FIX-P-13): its timestamp is the row's own anchored_at (UTC, RFC3339,
+// second precision), never "now", so a retry, the local fallback and the
+// remote all carry byte-identical event_id/digest/timestamp fields and
+// pushRow can tell "already there" from "new". hostname is informational
+// only (never a security identity).
+func anchorLineForRow(row sqlcgen.AnchorLog, hostname string) string {
+	ts := row.AnchoredAt
+	if t, err := time.Parse(time.RFC3339Nano, row.AnchoredAt); err == nil {
+		ts = t.UTC().Format(time.RFC3339)
+	}
+	return formatAnchorLine(row.EventID, row.DigestHex, ts, hostname)
 }
 
 // lastAnchorLine returns the last non-blank line of an anchors.log file at
@@ -179,18 +234,30 @@ func lastAnchorLine(path string) (line anchorLine, ok bool, err error) {
 		return anchorLine{}, false, nil
 	}
 
-	fields := strings.Fields(last)
-	if len(fields) < 4 {
-		return anchorLine{}, false, fmt.Errorf("anchor: malformed anchors.log line %q", last)
+	l, err := parseAnchorLine(last)
+	if err != nil {
+		return anchorLine{}, false, err
 	}
-	var eventID int64
-	if _, err := fmt.Sscanf(fields[0], "%d", &eventID); err != nil {
-		return anchorLine{}, false, fmt.Errorf("anchor: malformed anchors.log event_id in %q: %w", last, err)
+	return l, true, nil
+}
+
+// parseAnchorLine parses one non-blank anchors.log line (task spec step
+// 2's format; the hostname is everything from the fourth field on,
+// rejoined with single spaces). A malformed line is an error - fail-closed:
+// a line this package cannot read exactly is never treated as fine.
+func parseAnchorLine(line string) (anchorLine, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 4 {
+		return anchorLine{}, fmt.Errorf("anchor: malformed anchors.log line %q", line)
+	}
+	eventID, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return anchorLine{}, fmt.Errorf("anchor: malformed anchors.log event_id in %q: %w", line, err)
 	}
 	return anchorLine{
 		eventID:   eventID,
 		digestHex: fields[1],
 		ts:        fields[2],
 		hostname:  strings.Join(fields[3:], " "),
-	}, true, nil
+	}, nil
 }

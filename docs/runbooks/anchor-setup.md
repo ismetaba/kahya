@@ -100,6 +100,19 @@ defaults to empty.
    cd /tmp/anchor-check && cat anchors.log && git log --oneline
    ```
 
+   Each line is `<event_id> <digest_hex> <timestamp> <hostname>`. The
+   timestamp is the moment kahyad recorded the anchor
+   (`anchor_log.anchored_at`, UTC, second precision), not the moment the
+   push landed, so a push retried after an offline period produces the
+   byte-identical line and is never appended twice (lines written before
+   FIX-P-13 carry the push time; verify never reads the timestamp).
+   kahyad's local clone (`~/Library/Application Support/Kahya/anchor-repo`)
+   is only a cache: every push first resets it to the remote tip. If the
+   remote already holds a later event than the one being anchored, or the
+   same event with a different digest, kahyad pushes nothing, leaves the
+   anchor pending and raises a `DEFTER UYARISI` alarm (`anchor.mismatch`,
+   reason `remote_ahead` / `digest_mismatch`).
+
 3. Run the tamper drill locally to prove `kahya ledger verify` actually
    catches a rewritten ledger (do this on a throwaway/dev brain.db, not
    your real one, unless you intend to immediately restore from backup

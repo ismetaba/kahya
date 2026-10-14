@@ -11,8 +11,10 @@
 //
 // push.go is the write side: every anchor.interval_hours (plus once at
 // startup and once at graceful shutdown), it reads the current running
-// digest, clones-or-pulls the anchor repo, appends one `anchors.log` line,
-// commits, and pushes. verify.go is the read side (`kahya ledger verify`):
+// digest, syncs its working clone to the remote tip (the clone is only a
+// cache of the remote), appends the row's one `anchors.log` line unless the
+// remote already holds it, commits, and pushes - idempotent per anchor_log
+// row, and never on top of a remote that is ahead of the local ledger. verify.go is the read side (`kahya ledger verify`):
 // it recomputes the digest from event 1 forward and, at every point the
 // local anchor_log table recorded a checkpoint, compares the recomputed
 // digest against what was anchored - any mismatch means the local ledger
@@ -49,6 +51,40 @@ const (
 	// AlarmMismatch fires when verify.go's recompute disagrees with an
 	// anchored checkpoint - the tamper-detection leg of the W4-07 gate.
 	AlarmMismatch = "DEFTER UYARISI: yerel defter uzak çapayla uyuşmuyor (event %d). Olası kurcalama — hemen incele."
+)
+
+// AlarmRemoteAhead fires (push.go and verify.go) when the remote
+// anchors.log already anchored an event_id the local ledger does not reach:
+// the local ledger was truncated, or restored from an older backup, or a
+// fresh brain.db was pointed at an old anchor repo. %d/%d = the remote
+// event_id, the local event_id (push: the row being anchored; verify: the
+// local ledger's last event). Never sent with ledger content (only ids).
+const AlarmRemoteAhead = "DEFTER UYARISI: yerel defter uzak çapanın gerisinde (uzak event %d, yerel son event %d). Olası kırpma ya da eski yedekten geri yükleme — hemen incele."
+
+// Mismatch reasons (English identifiers). VerifyResult.Reason, the
+// anchor.mismatch ledger payload's "reason" key (verify and push) and the
+// JSONL ledger_verify_mismatch line all carry exactly one of these.
+const (
+	// ReasonDigestMismatch: the recompute up to an anchored event_id
+	// disagrees with the anchored digest (a remote line, or a local
+	// anchor_log row the remote has no line for); on the push side, the
+	// remote already anchored this row's event_id with a different digest.
+	ReasonDigestMismatch = "digest_mismatch"
+	// ReasonRemoteAhead: the remote anchored an event_id the local ledger
+	// no longer reaches (truncation, or restore from an older backup).
+	ReasonRemoteAhead = "remote_ahead"
+	// ReasonLocalAnchorLogInconsistent: the local anchor_log disagrees with
+	// the remote (no row for a remote line, a row 'pushed' to this remote
+	// that the remote never received, or the same event_id with a
+	// different digest).
+	ReasonLocalAnchorLogInconsistent = "local_anchor_log_inconsistent"
+	// ReasonDigestStateMismatch: ledger_digest_state does not equal the
+	// recompute over the local events it claims to cover.
+	ReasonDigestStateMismatch = "digest_state_mismatch"
+	// ReasonRemoteNonMonotonic: the remote anchors.log event_ids are not
+	// strictly increasing (a second brain.db pushed into this repo, or a
+	// rewritten remote).
+	ReasonRemoteNonMonotonic = "remote_non_monotonic"
 )
 
 // Ledger is the append-only events ledger sink both push.go and verify.go
