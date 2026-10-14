@@ -348,6 +348,11 @@ func writeConfigYAML(t *testing.T, homeDir string, opts daemonOpts) {
 	// B-1: hermetic gates never park a needs_approval tool call for the
 	// 300s default approval wait - it answers at once with its pending id.
 	b.WriteString("approval_wait_seconds: 0\n")
+	// Never exec the real Hammerspoon CLI from a test daemon: the default
+	// ui_hs_cli (/opt/homebrew/bin/hs) pops a "Hammerspoon is not running"
+	// dialog on the developer's screen (or, with Hammerspoon running, real
+	// approval cards). /usr/bin/true accepts and ignores every hs -c call.
+	b.WriteString("ui_hs_cli: /usr/bin/true\n")
 	b.WriteString("embed_cmd: []\n")
 	fmt.Fprintf(&b, "egress_port: %d\n", freeTCPPort(t))
 

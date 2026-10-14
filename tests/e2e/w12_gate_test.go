@@ -365,7 +365,11 @@ func writeConfigYAML(t *testing.T, homeDir, upstreamURL string) {
 		// approval_wait_seconds: 0 (B-1): a needs_approval tool call answers
 		// at once with its pending id instead of parking for the default
 		// 300s approval wait.
-		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\napproval_wait_seconds: 0\nembed_cmd: []\n",
+		// Never exec the real Hammerspoon CLI from a test daemon: the default
+		// ui_hs_cli (/opt/homebrew/bin/hs) pops a "Hammerspoon is not running"
+		// dialog on the developer's screen (or, with Hammerspoon running, real
+		// approval cards). /usr/bin/true accepts and ignores every hs -c call.
+		"credential_mode: keychain\nanthropic_upstream_url: %q\ntask_timeout_min: 2\napproval_wait_seconds: 0\nui_hs_cli: /usr/bin/true\nembed_cmd: []\n",
 		upstreamURL,
 	)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {

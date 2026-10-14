@@ -288,6 +288,11 @@ func writeConfigYAML(t *testing.T, homeDir string, opts daemonOpts) {
 	var b strings.Builder
 	b.WriteString("task_timeout_min: 2\n")
 	fmt.Fprintf(&b, "approval_wait_seconds: %d\n", opts.approvalWaitSeconds)
+	// Never exec the real Hammerspoon CLI from a test daemon: the default
+	// ui_hs_cli (/opt/homebrew/bin/hs) pops a "Hammerspoon is not running"
+	// dialog on the developer's screen (or, with Hammerspoon running, real
+	// approval cards). /usr/bin/true accepts and ignores every hs -c call.
+	b.WriteString("ui_hs_cli: /usr/bin/true\n")
 	b.WriteString("embed_cmd: []\n")
 	// A fixed default (3128) egress port would collide across concurrently
 	// running test BINARIES (`go test ./...` runs different packages in
