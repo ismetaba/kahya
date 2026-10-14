@@ -554,12 +554,22 @@ func (c Config) TmpDir() string {
 // (MatchesAnyGlobCI is an OR).
 //
 // Code tree (decision G04-2): only the sub-paths kahyad itself runs or
-// trusts — bin/ (kahyad, kahya-mcp, kahya-trigger), the worker, embed and
-// Qwen venvs, policy.yaml/policy.dev.yaml — never the whole repo, so a
-// shell_docker task may still use a repo subdirectory as its workdir
-// (the repo's .git is covered by the mandatory "**/.git/**"). The repo
-// root is derived like defaultWorkerCmd: two directories up from the
-// running executable.
+// trusts — never the whole repo, so a shell_docker task may still use a
+// repo subdirectory such as kahyad/ or docs/ as its workdir (the repo's
+// .git is covered by the mandatory "**/.git/**"). Two derivations, both
+// kept so neither a moved binary nor a config override opens a hole:
+//   - from the running executable (two directories up, like
+//     defaultWorkerCmd): bin/ (kahyad, kahya-mcp, kahya-trigger), the
+//     worker, embed and Qwen venvs, policy.yaml/policy.dev.yaml;
+//   - from the configured commands themselves (B-4 review): each Python
+//     child's venv (or bare interpreter) and its IMPORT ROOT — the
+//     directory that is its cwd and first sys.path / PYTHONPATH entry
+//     (PythonServiceDir; for the worker also spawn's PYTHONPATH dir, the
+//     venv's parent), where any top-level module or package shadows the
+//     stdlib: <repo>/worker (the kahya_worker package is imported from the
+//     source tree, not installed), <repo>/mlx/embed (server.py),
+//     <repo>/mlx/qwen — plus every binary kahyad execs by path
+//     (MCPBridgePath, TriggerBinPath, HsCliPath, TTSSayBin).
 func (c Config) SelfProtectDenyGlobs() []string {
 	var globs []string
 	seen := make(map[string]bool)
@@ -599,7 +609,67 @@ func (c Config) SelfProtectDenyGlobs() []string {
 		add(filepath.Join(repo, "policy.yaml"), false)
 		add(filepath.Join(repo, "policy.dev.yaml"), false)
 	}
+	for _, cmd := range [][]string{c.WorkerCmd, c.EmbedCmd, c.QwenCmd} {
+		if len(cmd) == 0 {
+			continue
+		}
+		if venv := pythonVenvDir(cmd[0]); venv != "" {
+			add(venv, true)
+		} else {
+			add(cmd[0], false)
+		}
+		if dir := PythonServiceDir(cmd); dir != "" {
+			add(dir, true)
+		}
+	}
+	// The worker's venv parent is its cwd and first PYTHONPATH entry
+	// whatever its argv shape (spawn.pythonWorkerDir).
+	if len(c.WorkerCmd) > 0 {
+		if venv := pythonVenvDir(c.WorkerCmd[0]); venv != "" {
+			add(filepath.Dir(venv), true)
+		}
+	}
+	for _, bin := range []string{c.MCPBridgePath, c.TriggerBinPath, c.HsCliPath, c.TTSSayBin} {
+		add(bin, false)
+	}
 	return globs
+}
+
+// PythonServiceDir returns the working directory — and so the FIRST import
+// root (sys.path[0]) — of a Python child kahyad spawns from cmd: for a
+// script invocation [<python>, <script.py>, ...] the script's own
+// directory (python puts it first on sys.path; main.go runs the child
+// there); for a module invocation [<dir>/.venv/bin/python, "-m",
+// <module>, ...] the venv's parent <dir> (main.go runs the child there,
+// and for -m python puts the cwd first on sys.path). "" — the child
+// inherits kahyad's own cwd — when cmd has fewer than two entries or a
+// module invocation's interpreter is not inside a ".venv/bin/" layout.
+// Only cmd[1] is inspected (no interpreter flags before the script or -m).
+// main.go derives the embed and Qwen services' cwd from this function, so
+// the cwd and SelfProtectDenyGlobs' import-root entry cannot drift apart;
+// spawn.pythonWorkerDir derives the worker's the same way (venv parent).
+func PythonServiceDir(cmd []string) string {
+	if len(cmd) < 2 {
+		return ""
+	}
+	if cmd[1] == "-m" {
+		if venv := pythonVenvDir(cmd[0]); venv != "" {
+			return filepath.Dir(venv)
+		}
+		return ""
+	}
+	return filepath.Dir(cmd[1])
+}
+
+// pythonVenvDir returns the ".venv" directory argv0 runs from
+// ("<dir>/.venv/bin/python" -> "<dir>/.venv"), or "" when argv0 does not
+// sit in that layout.
+func pythonVenvDir(argv0 string) string {
+	venv := filepath.Dir(filepath.Dir(argv0))
+	if filepath.Base(venv) != ".venv" {
+		return ""
+	}
+	return venv
 }
 
 // selfProtectForms returns p (cleaned) and, when it differs, p with its

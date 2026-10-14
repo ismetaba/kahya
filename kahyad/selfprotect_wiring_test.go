@@ -56,3 +56,28 @@ func TestWiredDenyGlobsIncludeSelfProtect(t *testing.T) {
 		t.Error("with no policy globs, the self-protect globs must still protect brain.db")
 	}
 }
+
+// TestWiredDenyGlobsProtectEveryPythonChildImportRoot (B-4 review): the cwd
+// main.go gives the embed and Qwen services (config.PythonServiceDir) and
+// the worker's import root are write-protected, so an fs_write can never
+// plant a module that shadows the stdlib on the next spawn. The Qwen cwd
+// is a fixed directory, never kahyad's own cwd (".").
+func TestWiredDenyGlobsProtectEveryPythonChildImportRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	wired := wiredFSDenyGlobs(nil, cfg)
+	for name, cmd := range map[string][]string{"worker": cfg.WorkerCmd, "embed": cfg.EmbedCmd, "qwen": cfg.QwenCmd} {
+		dir := config.PythonServiceDir(cmd)
+		if !filepath.IsAbs(dir) {
+			t.Fatalf("%s: service dir %q must be an absolute, fixed directory (cmd %v)", name, dir, cmd)
+		}
+		for _, p := range []string{filepath.Join(dir, "json.py"), filepath.Join(dir, "encodings", "__init__.py"), cmd[0]} {
+			if hit, err := mcpfs.MatchesAnyGlobCI(p, wired); err != nil || !hit {
+				t.Errorf("%s: %s must be write-protected (hit=%v err=%v)", name, p, hit, err)
+			}
+		}
+	}
+}

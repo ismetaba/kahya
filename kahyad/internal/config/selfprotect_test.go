@@ -88,14 +88,90 @@ func TestSelfProtectDenyGlobsCoversDataAndMemoryAndCode(t *testing.T) {
 	if slices.Contains(globs, filepath.Join(repo, "**")) {
 		t.Errorf("the whole code tree %s/** must NOT be denied (decision G04-2)", repo)
 	}
-	for _, p := range []string{filepath.Join(repo, "bin", "kahyad"), filepath.Join(repo, "worker", ".venv", "lib", "python3.12", "site-packages", "x.py")} {
+	for _, p := range []string{
+		filepath.Join(repo, "bin", "kahyad"), filepath.Join(repo, "worker", ".venv", "lib", "python3.12", "site-packages", "x.py"),
+		// Python import roots kahyad runs from (B-4 review): the worker
+		// package and anything shadowing the stdlib from <repo>/worker
+		// (its cwd and first PYTHONPATH entry), the embed script and its
+		// directory (sys.path[0]), the Qwen service directory (its cwd).
+		filepath.Join(repo, "worker", "kahya_worker", "__main__.py"), filepath.Join(repo, "worker", "kahya_worker", "hooks.py"),
+		filepath.Join(repo, "worker", "json.py"), filepath.Join(repo, "worker", "encodings", "__init__.py"),
+		filepath.Join(repo, "mlx", "embed", "server.py"), filepath.Join(repo, "mlx", "embed", "json.py"),
+		filepath.Join(repo, "mlx", "qwen", "json.py"),
+		cfg.MCPBridgePath, cfg.TriggerBinPath,
+	} {
 		if !selfProtectHit(t, globs, p) {
 			t.Errorf("code path %s kahyad runs must be write-protected", p)
 		}
 	}
-	for _, p := range []string{filepath.Join(repo, "worker", "kahya_worker", "__main__.py"), filepath.Join(repo, "kahyad", "main.go"), filepath.Join(repo, "docs", "x.md")} {
+	for _, p := range []string{filepath.Join(repo, "kahyad", "main.go"), filepath.Join(repo, "mcp", "fs", "server.go"), filepath.Join(repo, "docs", "x.md"), filepath.Join(repo, "mlx", "README.md")} {
 		if selfProtectHit(t, globs, p) {
 			t.Errorf("ordinary repo source %s must stay writable (G04-2: sub-paths only)", p)
+		}
+	}
+}
+
+// TestSelfProtectDenyGlobsDeriveFromConfiguredCommands (B-4 review): the
+// code-execution roots come from the configured commands themselves, not
+// only from os.Executable(), so an override elsewhere is covered: each
+// Python child's venv and its import root (cwd / sys.path[0] /
+// PYTHONPATH), and every binary kahyad execs by path.
+func TestSelfProtectDenyGlobsDeriveFromConfiguredCommands(t *testing.T) {
+	cfg := Config{
+		WorkerCmd:      []string{"/opt/k/w/.venv/bin/python", "-m", "kahya_worker"},
+		EmbedCmd:       []string{"/opt/k/e/.venv/bin/python", "/opt/k/e/server.py"},
+		QwenCmd:        []string{"/opt/k/q/.venv/bin/python", "-m", "mlx_lm.server"},
+		MCPBridgePath:  "/opt/k/b/kahya-mcp",
+		TriggerBinPath: "/opt/k/b/kahya-trigger",
+		HsCliPath:      "/opt/k/hs/hs",
+		TTSSayBin:      "/opt/k/say/say",
+	}
+	globs := cfg.SelfProtectDenyGlobs()
+	for _, p := range []string{
+		"/opt/k/w/kahya_worker/hooks.py", "/opt/k/w/json.py", "/opt/k/w/.venv/lib/site.py",
+		"/opt/k/e/server.py", "/opt/k/e/json.py", "/opt/k/e/.venv/bin/python",
+		"/opt/k/q/json.py", "/opt/k/q/.venv/lib/python3.12/site-packages/mlx_lm/server.py",
+		"/opt/k/b/kahya-mcp", "/opt/k/b/kahya-trigger", "/opt/k/hs/hs", "/opt/k/say/say",
+	} {
+		if !selfProtectHit(t, globs, p) {
+			t.Errorf("%s (run by kahyad per its configured commands) must be write-protected; globs %v", p, globs)
+		}
+	}
+	for _, p := range []string{"/opt/k/other/x.py", "/opt/k/b/notes.txt", "/opt/k/hs/README"} {
+		if selfProtectHit(t, globs, p) {
+			t.Errorf("%s is not run by kahyad and must stay writable", p)
+		}
+	}
+
+	// A bare interpreter outside any venv is protected as a file; a
+	// relative one ("python3", resolved via PATH) yields no glob at all.
+	bare := Config{WorkerCmd: []string{"/opt/py/bin/python3", "/opt/k/fake/worker.py"}, EmbedCmd: []string{"python3", "rel/server.py"}}.SelfProtectDenyGlobs()
+	for _, p := range []string{"/opt/py/bin/python3", "/opt/k/fake/worker.py", "/opt/k/fake/json.py"} {
+		if !selfProtectHit(t, bare, p) {
+			t.Errorf("%s must be write-protected; globs %v", p, bare)
+		}
+	}
+	for _, g := range bare {
+		if !filepath.IsAbs(g) {
+			t.Errorf("relative command entry yielded glob %q", g)
+		}
+	}
+}
+
+func TestPythonServiceDir(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  []string
+		want string
+	}{
+		{[]string{"/r/mlx/embed/.venv/bin/python", "/r/mlx/embed/server.py"}, "/r/mlx/embed"},
+		{[]string{"/r/mlx/qwen/.venv/bin/python", "-m", "mlx_lm.server", "--port", "1"}, "/r/mlx/qwen"},
+		{[]string{"/r/worker/.venv/bin/python", "-m", "kahya_worker"}, "/r/worker"},
+		{[]string{"python3", "-m", "mlx_lm.server"}, ""},
+		{[]string{"/r/.venv/bin/python"}, ""},
+		{nil, ""},
+	} {
+		if got := PythonServiceDir(tc.cmd); got != tc.want {
+			t.Errorf("PythonServiceDir(%v) = %q, want %q", tc.cmd, got, tc.want)
 		}
 	}
 }

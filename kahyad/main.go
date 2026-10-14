@@ -297,12 +297,14 @@ func run() int {
 	// note), 127.0.0.1-only (HANDOFF §4 ⚑ supervision contract). embedDir
 	// is the mlx/embed directory the service's own script/venv live under
 	// - derived from cfg.EmbedCmd (a two-element
-	// [".../.venv/bin/python", ".../server.py"] slice) so the child runs
-	// with that directory as its cwd regardless of kahyad's own.
+	// [".../.venv/bin/python", ".../server.py"] slice) by
+	// config.PythonServiceDir so the child runs with that directory as its
+	// cwd regardless of kahyad's own (and cfg.SelfProtectDenyGlobs
+	// write-protects exactly that import root - B-4 review).
 	embedSup := mlxsup.New(mlxsup.Config{
 		Name:      "embed",
 		Cmd:       cfg.EmbedCmd,
-		Dir:       embedServiceDir(cfg.EmbedCmd),
+		Dir:       config.PythonServiceDir(cfg.EmbedCmd),
 		ExtraEnv:  []string{fmt.Sprintf("KAHYA_EMBED_PORT=%d", cfg.EmbedPort)},
 		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", cfg.EmbedPort),
 		Log:       log,
@@ -792,9 +794,12 @@ func run() int {
 	// note, same "not at boot" posture as the W12-11 embed service above),
 	// fail-closed on insufficient free memory (kahyad/internal/mlx.
 	// HasSufficientMemory), idle-TTL unloaded after cfg.qwen_idle_ttl_seconds
-	// with zero in-flight requests. qwenDir is the mlx/qwen directory the
-	// service's own venv lives under - derived from cfg.QwenCmd the exact
-	// same way embedServiceDir derives mlx/embed's, two lines above.
+	// with zero in-flight requests. Its cwd is the mlx/qwen directory the
+	// service's own venv lives under (config.PythonServiceDir: for a "-m"
+	// invocation, the venv's parent). It used to be filepath.Dir("-m") =
+	// ".", i.e. kahyad's own cwd, which `python -m` puts first on
+	// sys.path; the cwd is now a fixed directory that
+	// cfg.SelfProtectDenyGlobs write-protects (B-4 review).
 	qwenArgv := append(append([]string{}, cfg.QwenCmd...),
 		"--model", cfg.QwenModelPath,
 		"--host", "127.0.0.1",
@@ -802,7 +807,7 @@ func run() int {
 	)
 	qwenSup := mlx.New(mlx.Config{
 		Cmd:     qwenArgv,
-		Dir:     embedServiceDir(cfg.QwenCmd),
+		Dir:     config.PythonServiceDir(cfg.QwenCmd),
 		Host:    "127.0.0.1",
 		Port:    cfg.QwenPort,
 		IdleTTL: time.Duration(cfg.QwenIdleTTLSeconds) * time.Second,
@@ -1315,22 +1320,6 @@ func run() int {
 
 	log.Info("shutdown_complete")
 	return 0
-}
-
-// embedServiceDir derives the working directory the embed service child
-// process should run with: the directory containing cmd's own script
-// path (cmd[1], e.g. ".../mlx/embed/server.py" -> ".../mlx/embed"). Empty
-// cmd (or a single-element cmd - should not happen with
-// config.defaultEmbedCmd or any sane override) leaves the child running
-// with kahyad's own cwd instead (mlxsup.Config.Dir's documented zero-value
-// behavior) - a harmless fallback, since the embed service locates its
-// model purely via the user-home-based HF cache, never via a relative
-// path of its own.
-func embedServiceDir(cmd []string) string {
-	if len(cmd) < 2 {
-		return ""
-	}
-	return filepath.Dir(cmd[1])
 }
 
 // wiredFSDenyGlobs is the deny-glob list kahyad hands mcp/fs (fs_write/
