@@ -190,6 +190,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #1 | a wrong `X-Kahya-Task-Token` is a local-auth reject in both credential modes, even beside a matching legacy header | `kahyad/internal/anthproxy/TestProxyRejectsWrongTaskTokenHeader` | FIX-I-1 | ci-hermetic |
 | Safety #1 | passthrough worker env carries the token only in `ANTHROPIC_CUSTOM_HEADERS`, never `ANTHROPIC_API_KEY` (no parent value leaks back in) | `kahyad/internal/spawn/TestBuildEnvPassthroughOmitsAPIKeyAndSetsCustomHeader` | FIX-I-1 | ci-hermetic |
 | Safety #1 | real bins, passthrough default: the worker CLI's own credential reaches the upstream, the local token never does | `tests/e2e/TestW12PassthroughCloudAuth` | FIX-I-1 | local-integration |
+| Safety #1 | the worker CLI's own `CLAUDE_CODE_OAUTH_TOKEN` is passed through (owner decision G11-1/G11-2), while `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` overrides are stripped | `kahyad/internal/spawn/TestBuildEnvKeepsWorkerCLIOwnOAuthToken` | FIX-I-1 | ci-hermetic |
 | Safety #1 | only `/v1/messages` (+`count_tokens`) reach the upstream through the per-task proxy; files/batches/admin are 404 `proxy.path_rejected`, zero upstream bytes | `kahyad/internal/anthproxy/TestProxyRejectsUnknownPath` | FIX-I-10 | ci-hermetic |
 | Safety #2 | missing taint record ⇒ untrusted (fail-closed) | `kahyad/internal/taint/TestGetMissingRowIsTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint read error ⇒ fail-closed to tainted | `kahyad/internal/taint/TestGetOnReadErrorFailsClosedToTainted` | W4-03 | ci-hermetic |

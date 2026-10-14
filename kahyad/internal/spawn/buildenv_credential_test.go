@@ -118,3 +118,20 @@ func TestBuildEnvPinsCLIAuxiliaryModel(t *testing.T) {
 		t.Errorf("CLIAuxiliaryModel %q is not in AllowedModels", CLIAuxiliaryModel)
 	}
 }
+
+// TestBuildEnvKeepsWorkerCLIOwnOAuthToken pins owner decision G11-1/G11-2
+// (G00 H-2(b) deliberately NOT applied): CLAUDE_CODE_OAUTH_TOKEN is a
+// legitimate credential source of the worker CLI's own Claude Code login
+// in passthrough mode, so BuildEnv must pass it through untouched - unlike
+// ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, which would override that login.
+func TestBuildEnvKeepsWorkerCLIOwnOAuthToken(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "worker-own-oauth-token")
+	cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "http://127.0.0.1:1", APIKey: "kahya-task-abc", CredentialMode: "passthrough"}
+	resolved, _ := resolveEnv(BuildEnv(cfg, Envelope{TaskID: "t", TraceID: "tr"}))
+	if got := resolved["CLAUDE_CODE_OAUTH_TOKEN"]; got != "worker-own-oauth-token" {
+		t.Errorf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the inherited value passed through (owner decision)", got)
+	}
+	if secretEnvDenylist["CLAUDE_CODE_OAUTH_TOKEN"] {
+		t.Error("CLAUDE_CODE_OAUTH_TOKEN is in secretEnvDenylist; owner decision G11-1/G11-2 keeps it")
+	}
+}
