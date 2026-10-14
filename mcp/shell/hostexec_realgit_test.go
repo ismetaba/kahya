@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -364,6 +365,96 @@ func TestHandle_GitRealSubmoduleConfigNeverRuns(t *testing.T) {
 			t.Fatalf("git %v in the superproject: unexpected error: %v", args, err)
 		}
 		assertMarkerAbsent(t, marker, "superproject git "+strings.Join(args, " "))
+	}
+}
+
+// submoduleBumpFixture builds home/code/repo with a submodule "child" and
+// a superproject commit that bumps the submodule pointer, so `git show`
+// (and `git diff HEAD~1`) of the superproject has a submodule change to
+// render. The child's .gitattributes selects diff driver "tc"; the caller
+// plants the driver's program in the SUBMODULE's own config
+// (.git/modules/child/config), which the superproject's gitRepoConfigSafe
+// scan never reads. Returns (home, superproject, submodule work tree).
+func submoduleBumpFixture(t *testing.T) (home, super, sub string) {
+	t.Helper()
+	home, super = realGitRepo(t)
+	child := filepath.Join(home, "code", "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fixtureGit(t, child, "init", "-q")
+	if err := os.WriteFile(filepath.Join(child, "c.txt"), []byte("c1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, ".gitattributes"), []byte("* diff=tc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixtureGit(t, child, "add", "c.txt", ".gitattributes")
+	fixtureGit(t, child, "commit", "-q", "-m", "c1")
+	fixtureGit(t, super, "submodule", "-q", "add", child, "child")
+	fixtureGit(t, super, "commit", "-q", "-m", "add child")
+	sub = filepath.Join(super, "child")
+	if err := os.WriteFile(filepath.Join(sub, "c.txt"), []byte("c2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixtureGit(t, sub, "commit", "-q", "-a", "-m", "c2")
+	fixtureGit(t, super, "add", "child")
+	fixtureGit(t, super, "commit", "-q", "-m", "bump child")
+	return home, super, sub
+}
+
+// TestHandle_GitRealSubmoduleShowNeverRunsSubmoduleProgram (B-4 review):
+// a superproject's own config diff.submodule=diff (no program in it, so
+// the scan passes it) makes `git show` / `git diff <rev>` spawn a CHILD
+// `git diff` inside the submodule work tree. That child reads the
+// submodule's own config — invisible to gitRepoConfigSafe — and does not
+// inherit --no-ext-diff/--no-textconv, so a diff.<d>.textconv/command
+// there ran on the host. Two independent layers now stop it: the fixed
+// `-c diff.submodule=short` (no child process at all) and
+// --ignore-submodules=all on every subcommand; each alone must hold.
+func TestHandle_GitRealSubmoduleShowNeverRunsSubmoduleProgram(t *testing.T) {
+	requireRealGit(t)
+	clearInheritedGitEnv(t)
+	for _, key := range []string{"diff.tc.textconv", "diff.tc.command"} {
+		t.Run(key, func(t *testing.T) {
+			home, super, sub := submoduleBumpFixture(t)
+			script, marker := markerScript(t, t.TempDir())
+			fixtureGit(t, sub, "config", key, script) // lands in super/.git/modules/child/config
+			fixtureGit(t, super, "config", "diff.submodule", "diff")
+
+			// Control: the superproject's own flags do not reach the child.
+			controlGit(t, realGitFixtureEnv(), marker, super, "show", "--no-ext-diff", "--no-textconv")
+
+			for _, args := range [][]string{{"show"}, {"show", "HEAD"}, {"diff", "HEAD~1"}, {"log"}, {"status"}} {
+				ledger := &fakeLedger{}
+				out, err := newRealGitHostExec(home, ledger).Handle(context.Background(), "trace-subshow", "task-1", HostExecArgs{Command: "git", RepoPath: super, Args: args})
+				if err != nil {
+					t.Fatalf("git %v: unexpected error: %v", args, err)
+				}
+				if out.ExitCode != 0 {
+					t.Fatalf("git %v: exit %d, stderr %q", args, out.ExitCode, out.Stderr)
+				}
+				assertMarkerAbsent(t, marker, "superproject git "+strings.Join(args, " "))
+			}
+
+			// Layer isolation, under the scrubbed env with no scan in front:
+			// (a) -c diff.submodule=short alone (flag stripped), (b) the
+			// --ignore-submodules=all flag alone (the -c pair stripped).
+			full := hardenedArgvFor(t, home, super, "show")
+			onlyShort := slices.DeleteFunc(slices.Clone(full), func(a string) bool { return a == gitNoSubmoduleRecursionFlag })
+			ci := slices.Index(full, "diff.submodule=short")
+			if ci < 1 || full[ci-1] != "-c" {
+				t.Fatalf("hardened argv lacks -c diff.submodule=short: %v", full)
+			}
+			onlyIgnore := slices.Delete(slices.Clone(full), ci-1, ci+1)
+			for name, argv := range map[string][]string{"diff.submodule=short only": onlyShort, "--ignore-submodules=all only": onlyIgnore} {
+				res, err := processExecutor{}.RunEnv(context.Background(), argv[0], argv[1:], nil, gitScrubbedEnv())
+				if err != nil || res.ExitCode != 0 {
+					t.Fatalf("%s: err=%v exit=%d stderr=%q", name, err, res.ExitCode, res.Stderr)
+				}
+				assertMarkerAbsent(t, marker, name)
+			}
+		})
 	}
 }
 

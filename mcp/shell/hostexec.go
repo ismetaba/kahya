@@ -19,8 +19,10 @@
 // Every git call therefore (1) runs under a CLOSED, scrubbed environment
 // (gitScrubbedEnv: no system/global config, no inherited GIT_* / PAGER /
 // HOME, no transport), (2) carries fixed `-c` neutralizers before the
-// subcommand (gitHardeningArgs) plus --no-ext-diff/--no-textconv and
-// --ignore-submodules=all where the subcommand accepts them, and (3) is
+// subcommand (gitHardeningArgs) plus --no-ext-diff/--no-textconv where the
+// subcommand accepts them and --ignore-submodules=all on every subcommand
+// (git never enters a submodule, whose own config the scan cannot see),
+// and (3) is
 // refused outright when the repo's own config (every scope git reads:
 // .git/config, config.worktree, included files) holds a program-running
 // key (gitRepoConfigSafe) — filter.<d>.clean runs even under
@@ -96,6 +98,14 @@ var gitHardeningArgs = []string{
 	"-c", "credential.helper=",
 	"-c", "uploadpack.packObjectsHook=",
 	"-c", "status.submoduleSummary=false",
+	// diff.submodule=diff (a superproject setting with no program in it,
+	// so the scan passes it) makes log -p/show/diff <rev> spawn a CHILD
+	// `git diff` inside the submodule work tree; the child reads the
+	// submodule's own config (.git/modules/<name>/config, never scanned)
+	// and does not inherit --no-ext-diff/--no-textconv, so a
+	// diff.<d>.command there ran on the host (B-4 review, Apple Git 2.54).
+	// "short" renders a submodule change in-process, with no child.
+	"-c", "diff.submodule=short",
 	"-c", "protocol.ext.allow=never",
 }
 
@@ -104,12 +114,16 @@ var gitHardeningArgs = []string{
 // textconv/external-diff program is not run for the diff output itself.
 var gitNoProgramDiffFlags = []string{"--no-ext-diff", "--no-textconv"}
 
-// gitNoSubmoduleRecursionFlag is appended after status and diff — the two
-// subcommands that compare against a work tree: without it git recurses
-// into every submodule's work tree, where the submodule's OWN config
-// (.git/modules/<name>/config — invisible to the superproject's
-// gitRepoConfigSafe scan) can run a filter.<d>.clean program. log/show are
-// tree-to-tree only and never enter a submodule work tree.
+// gitNoSubmoduleRecursionFlag is appended after EVERY subcommand (status,
+// diff, log and show all accept it): git then never looks inside a
+// submodule at all. Without it, status/diff recurse into every submodule's
+// work tree, where the submodule's OWN config (.git/modules/<name>/config
+// — invisible to the superproject's gitRepoConfigSafe scan) can run a
+// filter.<d>.clean program; and show/log -p/diff <rev> with a
+// superproject diff.submodule=diff spawn a child `git diff` in the
+// submodule work tree that runs the submodule's diff.<d>.command. The
+// latter is ALSO closed by gitHardeningArgs' -c diff.submodule=short: two
+// independent layers (B-4 review).
 const gitNoSubmoduleRecursionFlag = "--ignore-submodules=all"
 
 // gitScrubbedEnv is the CLOSED environment shell_host's git runs under
@@ -302,8 +316,8 @@ type hostExecPlan struct {
 //
 // git argv order (B-4): git, gitHardeningArgs, -C <repo>, <subcommand>,
 // then our per-subcommand flags (--no-ext-diff --no-textconv for
-// log/diff/show; --ignore-submodules=all for status/diff), then the
-// model's own trailing args LAST — those can never start with "-"
+// log/diff/show; --ignore-submodules=all for all four), then the model's
+// own trailing args LAST — those can never start with "-"
 // (validateGitArgs), so they can never be read as one of our flags.
 func (h *HostExec) validate(in HostExecArgs) (hostExecPlan, error) {
 	switch in.Command {
@@ -321,9 +335,7 @@ func (h *HostExec) validate(in HostExecArgs) (hostExecPlan, error) {
 		if sub != "status" {
 			argv = append(argv, gitNoProgramDiffFlags...) // log|diff|show
 		}
-		if sub == "status" || sub == "diff" {
-			argv = append(argv, gitNoSubmoduleRecursionFlag)
-		}
+		argv = append(argv, gitNoSubmoduleRecursionFlag) // all four subcommands
 		argv = append(argv, in.Args[1:]...)
 		return hostExecPlan{argv: argv, canonRepo: cp.Match, repoOp: cp.Op, env: gitScrubbedEnv()}, nil
 

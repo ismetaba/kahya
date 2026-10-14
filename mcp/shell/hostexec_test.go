@@ -309,7 +309,7 @@ func TestHandle_GitNeutralizedEnvAndArgv(t *testing.T) {
 	if !slices.Equal(out.Argv[1:1+len(gitHardeningArgs)], gitHardeningArgs) {
 		t.Fatalf("argv must carry gitHardeningArgs right after git, got %v", out.Argv)
 	}
-	for _, pair := range [][2]string{{"-c", "core.fsmonitor=false"}, {"-c", "diff.external="}} {
+	for _, pair := range [][2]string{{"-c", "core.fsmonitor=false"}, {"-c", "diff.external="}, {"-c", "diff.submodule=short"}} {
 		i := slices.Index(out.Argv, pair[1])
 		if i < 1 || out.Argv[i-1] != pair[0] {
 			t.Fatalf("argv missing %q %q: %v", pair[0], pair[1], out.Argv)
@@ -363,8 +363,8 @@ func TestHandle_GitDiffShowAppendNoProgramFlags(t *testing.T) {
 	}{
 		{"status", false, true},
 		{"diff", true, true},
-		{"show", true, false},
-		{"log", true, false},
+		{"show", true, true},
+		{"log", true, true},
 	} {
 		t.Run(tc.sub, func(t *testing.T) {
 			exec := &fakeExecutor{}
@@ -401,8 +401,8 @@ func TestHandle_GitStatusArgvUnchangedForModelArgs(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	n := len(out.Argv)
-	if n < 4 || !slices.Equal(out.Argv[n-4:], []string{"log", "--no-ext-diff", "--no-textconv", "HEAD~1"}) {
-		t.Fatalf("expected argv to end with [log --no-ext-diff --no-textconv HEAD~1] (model args LAST), got %v", out.Argv)
+	if n < 5 || !slices.Equal(out.Argv[n-5:], []string{"log", "--no-ext-diff", "--no-textconv", gitNoSubmoduleRecursionFlag, "HEAD~1"}) {
+		t.Fatalf("expected argv to end with [log --no-ext-diff --no-textconv %s HEAD~1] (model args LAST), got %v", gitNoSubmoduleRecursionFlag, out.Argv)
 	}
 	count := 0
 	for _, a := range out.Argv {
