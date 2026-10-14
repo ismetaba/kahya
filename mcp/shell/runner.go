@@ -421,7 +421,8 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	// bare $HOME path canonicalize clean and get bind-mounted rw at
 	// /work — this scope gate (workdir.go) runs FIRST, still entirely
 	// mechanical/pre-policy/never-approval-overridable, exactly like the
-	// deny-glob check right below it.
+	// deny-glob check right below it. A temp root itself (/tmp, $TMPDIR)
+	// is never mountable; only its strict descendants are (B-10).
 	if reasonCode, werr := validateWorkdir(cp, r.Home, r.WorkdirRoots); werr != nil {
 		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_workdir_rejected", map[string]any{
 			"event": "shell_workdir_rejected", "tool": "shell_docker", "canonical_workdir": cp.Match,

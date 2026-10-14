@@ -237,6 +237,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
 | Safety #6 | `do shell script` in osascript rejected (not a reroute) | `mcp/osascript/TestScanRejectsDoShellScript` | W3-09 | ci-hermetic |
 | Safety #6 | model shell defaults to Docker `--network none` (real Docker) | `mcp/shell/TestLive_DefaultNetworkNoneBlocksEgress` | W3-04 | local-integration |
+| Safety #6 | shell_docker workdir: OS temp root itself never mountable (strict descendants only) | `mcp/shell/TestValidateWorkdir_OSTempRootItselfRejected` | FIX-B-10 | ci-hermetic |
+| Safety #6 | shell_docker workdir: a `$TMPDIR` sibling under /var/folders is not carved out (system_dir) | `mcp/shell/TestValidateWorkdir_TempDirSiblingNotCarvedOut` | FIX-B-10 | ci-hermetic |
 | Memory #1 | source-trust lattice: agent_derived quarantined until confirmed | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W5-04 | ci-hermetic |
 | Memory #1 | extractor-claimed user_asserted downgraded to agent_derived + ledgered | `kahyad/internal/factengine/TestExtractorClaimedUserAssertedStoredAsAgentDerivedAndLedgered` | W12-05 | ci-hermetic |
 | Memory #2 | namesakes never auto-merge on name similarity | `kahyad/internal/factengine/TestNamesakeFixtureYieldsTwoDistinctEntitiesNoAutoMerge` | W5-04 | ci-hermetic |

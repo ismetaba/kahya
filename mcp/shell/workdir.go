@@ -12,6 +12,10 @@
 // deny-glob-before-approval ordering, and mcp/fs's identical posture) and
 // can never be relaxed by an approval token — HANDOFF §5 safety #6:
 // "yalnızca görevin kendi açık iş dizini; başka hiçbir şey mount edilmez."
+//
+// The OS temp dir carve-out (B-10 fix): a temp root itself (/tmp,
+// /private/tmp, os.TempDir(), $TMPDIR) is never mountable; only its STRICT
+// descendants are, and /var/folders is not a temp root at all.
 package shell
 
 import (
@@ -30,6 +34,7 @@ const (
 	reasonWorkdirScopeRejected  = "shell_docker reddedildi: iş dizini yalnızca görevin kendi dar iş dizini olabilir; kök (/), ev dizini, ev dizininin bir üst dizini, sistem dizinleri (/etc, /usr, /bin, /sbin, /var, /opt, /System, /Library, /Applications) veya hassas bir alt-dizin (~/.ssh, ~/.aws, ~/.gnupg, ~/.config, ~/Library) mount edilemez; onay bu kuralı geçersiz kılamaz."
 	reasonWorkdirNotDir         = "shell_docker reddedildi: iş dizini mevcut değil ya da bir dizin değil."
 	reasonWorkdirNotAllowedRoot = "shell_docker reddedildi: iş dizini yapılandırılmış izinli köklerin (shell_workdir_roots) hiçbirinin altında değil; onay bu kuralı geçersiz kılamaz."
+	reasonWorkdirTempRoot       = "shell_docker reddedildi: iş dizini geçici dizin kökünün kendisi (/tmp, $TMPDIR) olamaz; görev için bu kökün altında ayrı bir alt-dizin kullanın. Onay bu kuralı geçersiz kılamaz."
 )
 
 // systemDenyDirs are top-level (or /private/-prefixed) system directories a
@@ -81,25 +86,84 @@ func isUnderAnyCI(target string, roots []string) bool {
 	return false
 }
 
+// isStrictlyUnderCI reports whether target sits STRICTLY underneath root
+// (never equal to it), case-insensitively (APFS) — the OS-temp-dir
+// carve-out's predicate (B-10 fix): the carve-out exists for task-scoped
+// scratch SUBDIRECTORIES of a temp root, never for the root itself. An
+// empty, "." or "/" root never matches (a "/" root would carve out the
+// whole filesystem).
+func isStrictlyUnderCI(root, target string) bool {
+	if root == "" {
+		return false
+	}
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	if root == "." || root == "/" {
+		return false
+	}
+	prefix := strings.ToLower(root)
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return strings.HasPrefix(strings.ToLower(target), prefix)
+}
+
+// isStrictlyUnderAnyCI is isStrictlyUnderCI applied to every non-empty root.
+func isStrictlyUnderAnyCI(target string, roots []string) bool {
+	for _, root := range roots {
+		if root != "" && isStrictlyUnderCI(root, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// equalsAnyCI reports whether target, cleaned and case-folded, equals any
+// non-empty root (cleaned and case-folded the same way).
+func equalsAnyCI(target string, roots []string) bool {
+	t := strings.ToLower(filepath.Clean(target))
+	for _, root := range roots {
+		if root != "" && strings.ToLower(filepath.Clean(root)) == t {
+			return true
+		}
+	}
+	return false
+}
+
 // osTempDirRoots enumerates every path this platform's OS temp dir might
 // resolve to — the ONE deliberate carve-out from systemDenyDirs' /var,
 // /private/var entries, so t.TempDir()-based unit tests AND every live
 // container test (container_test.go's liveWorkdir doc comment) keep
-// working: t.TempDir() itself lives under /var/folders on macOS
-// (EvalSymlinks-resolved to /private/var/folders), which would otherwise be
-// caught by the "/var"/"/private/var" system-dir deny rule above.
+// working. Only STRICT descendants of these roots are carved out
+// (validateWorkdir); a root itself is rejected (temp_root_itself).
+//
+// B-10 fix: /var/folders and /private/var/folders are NOT roots. On macOS
+// os.TempDir() and $TMPDIR are already /var/folders/xx/yyyy/T/ (resolved:
+// /private/var/folders/xx/yyyy/T), and t.TempDir() sits under that, so
+// listing the /var/folders parent only ever opened $TMPDIR's siblings
+// (…/C caches, …/0) and other users' temp trees. On Linux os.TempDir() is
+// /tmp. Empty, "." and "/" candidates are never added (EvalSymlinks("")
+// used to contribute ".").
 func osTempDirRoots() []string {
-	candidates := []string{os.TempDir(), os.Getenv("TMPDIR"), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"}
+	candidates := []string{os.TempDir(), os.Getenv("TMPDIR"), "/tmp", "/private/tmp"}
 	out := make([]string, 0, len(candidates)*2)
 	seen := map[string]bool{}
 	add := func(p string) {
-		if p == "" || seen[p] {
+		if strings.TrimSpace(p) == "" {
+			return
+		}
+		p = filepath.Clean(p)
+		if p == "." || p == "/" || seen[p] {
 			return
 		}
 		seen[p] = true
 		out = append(out, p)
 	}
 	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
 		add(c)
 		if resolved, err := filepath.EvalSymlinks(c); err == nil {
 			add(resolved)
@@ -155,8 +219,17 @@ func validateWorkdir(cp mcpfs.CanonicalPath, home string, allowedRoots []string)
 			return "sensitive_home_subtree", errors.New(reasonWorkdirScopeRejected)
 		}
 	}
-	if isUnderAnyCI(workdir, osTempDirRoots()) {
-		return "", nil // OS temp dir carve-out.
+	// OS temp dir carve-out (B-10 fix): a temp root itself is never
+	// mountable (the whole shared /tmp, or $TMPDIR with kahyad's own
+	// KAHYA_TMP_DIR and the worker's temp files under it); only its STRICT
+	// descendants are. Kept before the system-dir check, so a
+	// $TMPDIR/<task> scratch dir under /private/var still passes.
+	tempRoots := osTempDirRoots()
+	if equalsAnyCI(workdir, tempRoots) {
+		return "temp_root_itself", errors.New(reasonWorkdirTempRoot)
+	}
+	if isStrictlyUnderAnyCI(workdir, tempRoots) {
+		return "", nil
 	}
 	for _, sysDir := range systemDenyDirs {
 		if isAncestorOrSelfCI(sysDir, workdir) {
