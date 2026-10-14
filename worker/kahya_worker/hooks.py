@@ -23,10 +23,20 @@ binding gate, which parks the call for the human decision and executes
 exactly the approved bytes - the only pending approval a human ever sees
 is that gate's. ``needs_approval`` for any other tool (an SDK built-in,
 which has no kahyad-side executor) is a fail-closed deny.
+
+UDS calls run in a worker thread (``asyncio.to_thread``) so the SDK's event
+loop keeps draining stdout/control messages while kahyad answers
+(FIX-I-16): ``udshttp.post_json`` is deliberately stdlib-only and
+synchronous, and calling it directly inside these ``async`` callbacks froze
+the whole loop for up to the 5 s budget (serializing parallel tool checks
+and stalling the SDK's reader). Only ``post_json`` runs off-loop; every
+decision, log line and the fail-closed handling stay on the loop, after the
+``to_thread`` return - ``to_thread`` re-raises ``UDSHTTPError`` unchanged.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Awaitable, Callable
 
@@ -93,7 +103,9 @@ def make_user_prompt_submit_hook(
 
         prompt = input_data.get("prompt", "")
         try:
-            resp = post_json(
+            # FIX-I-16: off the event loop (see the module docstring).
+            resp = await asyncio.to_thread(
+                post_json,
                 socket_path,
                 MEMORY_SEARCH_PATH,
                 {
@@ -151,7 +163,10 @@ def make_can_use_tool(
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], ctx: Any) -> Any:
         start = time.monotonic()
         try:
-            resp = post_json(
+            # FIX-I-16: off the event loop; the needs_approval/allow/deny
+            # handling below runs back on the loop (G00 C-6).
+            resp = await asyncio.to_thread(
+                post_json,
                 socket_path,
                 POLICY_CHECK_PATH,
                 {

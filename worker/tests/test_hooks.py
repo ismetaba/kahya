@@ -6,6 +6,7 @@ layer, so these tests also double-check the two modules integrate
 correctly.
 """
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -76,6 +77,32 @@ class TestUserPromptSubmitHook(unittest.IsolatedAsyncioTestCase):
             hook = make_user_prompt_submit_hook(sock, "t_1", "trace-1", memory_injection=True)
             result = await hook({"prompt": "merhaba"}, None, {})
         self.assertEqual(result, {})
+
+    async def test_user_prompt_submit_does_not_block_event_loop(self) -> None:
+        """A 1 s kahyad round trip must not freeze the asyncio loop the
+        SDK's stdout reader / control writer run on (FIX-I-16)."""
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        with UnixHTTPFixture(self._tmp.name, respond_hang(1.0)) as sock:
+            hook = make_user_prompt_submit_hook(sock, "t_1", "trace-1", memory_injection=True)
+            hook_task = asyncio.create_task(hook({"prompt": "iki daire nerede?"}, None, {}))
+            ticker_task = asyncio.create_task(ticker())
+            result = await hook_task
+            ticks_at_hook_return = ticks
+            await ticker_task
+        # respond_hang never writes a response: the server closes the
+        # connection after ~1 s, http.client raises -> UDSHTTPError -> the
+        # hook continues without injection.
+        self.assertEqual(result, {})
+        self.assertGreaterEqual(
+            ticks_at_hook_return, 5, "event loop was blocked while the UDS memory search was in flight"
+        )
 
 
 class TestCanUseTool(unittest.IsolatedAsyncioTestCase):
@@ -270,6 +297,31 @@ class TestCanUseTool(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, PermissionResultDeny)
         self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
         self.assertLess(elapsed, 6.0)
+
+    async def test_can_use_tool_does_not_block_event_loop(self) -> None:
+        """A 1 s kahyad round trip must not freeze the asyncio loop the
+        SDK's stdout reader / control writer run on (FIX-I-16)."""
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        with UnixHTTPFixture(self._tmp.name, respond_hang(1.0)) as sock:
+            gate = make_can_use_tool(sock, "t1", "trace-1", None)
+            gate_task = asyncio.create_task(gate("mcp__kahya_memory__memory_search", {"q": "x"}, None))
+            ticker_task = asyncio.create_task(ticker())
+            result = await gate_task
+            ticks_at_gate_return = ticks
+            await ticker_task
+        # fixtures.respond_hang sleeps delay_s and NEVER writes a response:
+        # the handler returns, the server closes the connection, http.client
+        # raises -> UDSHTTPError -> fail-closed deny after ~1 s.
+        self.assertIsInstance(result, PermissionResultDeny)
+        self.assertEqual(result.message, POLICY_FAIL_CLOSED_MESSAGE)
+        self.assertGreaterEqual(ticks_at_gate_return, 5, "event loop was blocked while the UDS call was in flight")
 
 
 if __name__ == "__main__":

@@ -781,7 +781,13 @@ this endpoint for every tool-use attempt, but the endpoint itself, running
 inside kahyad, is what's binding). **Caller timeout budget: 5 seconds;
 any error or timeout on the caller's side must be treated as `deny`
 (fail-closed)** — the endpoint itself does no I/O beyond one ledger
-insert, so it always answers in well under that budget.
+insert, so it always answers in well under that budget. Worker side
+(FIX-I-16): `kahya_worker.hooks` runs the synchronous stdlib UDS call
+(`udshttp.post_json`) in a worker thread via `asyncio.to_thread`, for both
+`can_use_tool` and the `UserPromptSubmit` memory search, so the SDK's event
+loop keeps draining the CLI's stdout/control messages (and parallel tool
+checks really run in parallel) while kahyad answers; the fail-closed
+handling is unchanged.
 
 **Body size cap:** the request body is capped at 1 MiB
 (`http.MaxBytesReader`, `kahyad/internal/server.policyCheckMaxBody`) before
