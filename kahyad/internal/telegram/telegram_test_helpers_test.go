@@ -219,12 +219,17 @@ func newPolicyFixture(t *testing.T) policyFixture {
 	// them. shell_docker is the irreversible W2 the engine-backstop tests
 	// use (TestForgedIrreversibleW2CallbackRejectedAtEngine); it and
 	// applescript_run (W2, irreversible as in policy.yaml) also carry the
-	// non-fs tool bodies the FIX-P-6 redaction tests classify.
+	// non-fs tool bodies the FIX-P-6 redaction tests classify, together
+	// with jxa_run/shell_host (W2, irreversible) and memory_write (W1,
+	// reversible - its card keeps the keyboard), all as in policy.yaml.
 	tools := []policy.ToolRule{
 		{Name: "fs_write", Class: policy.ClassW2, Reversible: true, Undo: "pre-op git checkpoint restore"},
 		{Name: "fs_delete", Class: policy.ClassW2, Reversible: true, Undo: "move back from Trash"},
+		{Name: "memory_write", Class: policy.ClassW1, Reversible: true, Undo: "git revert"},
 		{Name: "shell_docker", Class: policy.ClassW2},
+		{Name: "shell_host", Class: policy.ClassW2},
 		{Name: "applescript_run", Class: policy.ClassW2},
+		{Name: "jxa_run", Class: policy.ClassW2},
 		{Name: "mail_send", Class: policy.ClassW3},
 	}
 	byName := make(map[string]policy.ToolRule, len(tools))

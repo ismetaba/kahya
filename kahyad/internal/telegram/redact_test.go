@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -464,4 +465,215 @@ func TestSecretLaneUncanonicalizablePathFailsClosed(t *testing.T) {
 	r.deliver(t, "fs_write", policy.ClassW2, input, "trace-p6a-uncanonical")
 
 	assertOnlyRedactedTitle(t, r, "fs_write", []string{"plan.txt", "Finans", "merhaba"}, "canonicalize_error")
+}
+
+// scriptEnvelope builds an applescript_run/jxa_run tool_input exactly the
+// way mcp/osascript/runner.go's buildScriptToolInput does (json.Marshal of
+// {script, target_app}): a newline or tab inside the script travels as the
+// two bytes `\n` / `\t`, which is what the raw card listing shows.
+func scriptEnvelope(t *testing.T, script, targetApp string) []byte {
+	t.Helper()
+	b, err := json.Marshal(struct {
+		Script    string `json:"script"`
+		TargetApp string `json:"target_app,omitempty"`
+	}{script, targetApp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestApplescriptMultilineBodyIBANRedacted (FIX-P-6 review): an ordinary
+// multi-line script whose IBAN starts a new line. The raw listing shows
+// the JSON escape `\nTR33 ...`, which has no word boundary before "TR33";
+// the escape-decoded pass of outboundSecretLane still catches it.
+func TestApplescriptMultilineBodyIBANRedacted(t *testing.T) {
+	r := newRedactFixture(t)
+	input := scriptEnvelope(t, "set notlar to \"kira\"\n"+testIBAN+"\ndisplay dialog notlar", "Finder")
+
+	r.deliver(t, "applescript_run", policy.ClassW2, input, "trace-p6-applescript-multiline")
+
+	assertOnlyRedactedTitle(t, r, "applescript_run", []string{"TR33", "8413", "display dialog", "Finder"}, "escape:iban")
+}
+
+// TestMemoryWriteMultilineNoteIBANRedacted (FIX-P-6 review): memory_write
+// is W1 reversible, so its card keeps the approve keyboard; a markdown
+// note whose IBAN starts a new line (JSON `\n\nTR33 ...`) is redacted -
+// one title, no keyboard, one telegram_card_redacted row.
+func TestMemoryWriteMultilineNoteIBANRedacted(t *testing.T) {
+	r := newRedactFixture(t)
+	input, err := json.Marshal(map[string]string{
+		"file":    "inbox/2026-10-15.md",
+		"content": "# Notlar\n\n" + testIBAN + "\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.deliver(t, "memory_write", policy.ClassW1, input, "trace-p6-memwrite-multiline")
+
+	assertOnlyRedactedTitle(t, r, "memory_write", []string{"TR33", "8413", "Notlar", "inbox"}, "escape:iban")
+}
+
+// TestEscapedToolBodySecretsRedacted (FIX-P-6 review): every escape form
+// a raw card listing can carry a secret behind - a JSON control escape
+// before a TCKN or card number, a \uXXXX-escaped letter or separator, a
+// JSON document nested inside a JSON tool_input (double escape), a
+// shell_host argument list, and literal escapes inside OLD file content
+// on disk - is decoded and classified before anything is sent.
+func TestEscapedToolBodySecretsRedacted(t *testing.T) {
+	cases := []struct {
+		name, tool string
+		class      policy.ActionClass
+		input      func(t *testing.T, r redactFixture) []byte
+		forbidden  []string
+		reason     string
+	}{
+		{
+			name: "jxa_tckn_after_newline", tool: "jxa_run", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				return scriptEnvelope(t, "const x = 1;\n10000000146", "")
+			},
+			forbidden: []string{"10000000146", "const x"}, reason: "escape:tckn",
+		},
+		{
+			name: "applescript_card_after_tab", tool: "applescript_run", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				return scriptEnvelope(t, "set x to \"kart:\t4111 1111 1111 1111\"", "Finder")
+			},
+			forbidden: []string{"4111", "kart"}, reason: "escape:card_number",
+		},
+		{
+			name: "unicode_escaped_letter", tool: "applescript_run", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				return []byte(`{"script":"set x to \"\u0054R33 0006 1005 1978 6457 8413 26\""}`)
+			},
+			forbidden: []string{"R33 0006", "8413"}, reason: "escape:iban",
+		},
+		{
+			name: "unicode_escaped_separator", tool: "applescript_run", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				return []byte(`{"script":"x\u0020TR33 0006 1005 1978 6457 8413 26"}`)
+			},
+			forbidden: []string{"TR33", "8413"}, reason: "escape:iban",
+		},
+		{
+			name: "nested_json_double_escape", tool: "memory_write", class: policy.ClassW1,
+			input: func(t *testing.T, r redactFixture) []byte {
+				inner, err := json.Marshal(map[string]string{"not": "kira\n" + testIBAN})
+				if err != nil {
+					t.Fatal(err)
+				}
+				outer, err := json.Marshal(map[string]string{"file": "inbox/ayar.md", "content": string(inner)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return outer
+			},
+			forbidden: []string{"TR33", "8413", "kira"}, reason: "escape:iban",
+		},
+		{
+			name: "shell_host_arg_newline", tool: "shell_host", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				b, err := json.Marshal(struct {
+					Command  string   `json:"command"`
+					RepoPath string   `json:"repo_path,omitempty"`
+					Args     []string `json:"args,omitempty"`
+				}{"git", "/tmp/repo", []string{"commit", "-m", "kira\n" + testIBAN}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			},
+			forbidden: []string{"TR33", "8413", "commit"}, reason: "escape:iban",
+		},
+		{
+			name: "old_file_content_literal_escape", tool: "fs_delete", class: policy.ClassW1,
+			input: func(t *testing.T, r redactFixture) []byte {
+				r.writeHomeFile(t, "Belgeler/ayar.json", `{"not": "kira\n`+testIBAN+`"}`+"\n")
+				return []byte(`{"path":"~/Belgeler/ayar.json"}`)
+			},
+			forbidden: []string{"TR33", "8413", "ayar.json", "kira"}, reason: "escape:iban",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRedactFixture(t)
+			r.deliver(t, tc.tool, tc.class, tc.input(t, r), "trace-p6-escape-"+tc.name)
+			assertOnlyRedactedTitle(t, r, tc.tool, tc.forbidden, tc.reason)
+		})
+	}
+}
+
+// TestEscapedCleanBodyStillSendsFullCard (FIX-P-6 review, false-positive
+// guard): decoding escapes never redacts a clean card - a JSON file whose
+// content carries ordinary `\n` / `\u00e7` escapes, and a clean multi-line
+// memory_write note, still get the full card with the keyboard.
+func TestEscapedCleanBodyStillSendsFullCard(t *testing.T) {
+	cases := []struct {
+		name, tool string
+		class      policy.ActionClass
+		input      func(t *testing.T, r redactFixture) []byte
+		want       string
+	}{
+		{
+			name: "fs_write_json_with_escapes", tool: "fs_write", class: policy.ClassW2,
+			input: func(t *testing.T, r redactFixture) []byte {
+				return fsWriteInput(t, "~/Belgeler/ayar.json", `{"not": "satir 1\nsatir 2 \u00e7ay", "yol": "C:\\temp"}`+"\n")
+			},
+			want: `satir 1\nsatir 2 \u00e7ay`,
+		},
+		{
+			name: "memory_write_multiline_note", tool: "memory_write", class: policy.ClassW1,
+			input: func(t *testing.T, r redactFixture) []byte {
+				b, err := json.Marshal(map[string]string{"file": "inbox/2026-10-15.md", "content": "# Notlar\n\nbugün hava güzel\n\tsüt al\n"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			},
+			want: `bugün hava güzel\n\tsüt al`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRedactFixture(t)
+			r.deliver(t, tc.tool, tc.class, tc.input(t, r), "trace-p6-escape-clean-"+tc.name)
+			sent := r.sender.sent
+			if len(sent) != 1 {
+				t.Fatalf("sent = %q, want exactly the one-chunk card", r.sender.allTexts())
+			}
+			if !strings.Contains(sent[0].Text, tc.want) {
+				t.Fatalf("card %q does not carry %q", sent[0].Text, tc.want)
+			}
+			if sent[0].Markup == nil {
+				t.Fatalf("a clean reversible card must carry the approve keyboard")
+			}
+			if reasons := redactedReasons(r.ledger); len(reasons) != 0 {
+				t.Fatalf("telegram_card_redacted reasons = %q, want none", reasons)
+			}
+		})
+	}
+}
+
+// TestFoldBackslashEscapesDecodesOneLevel pins the decoder behind
+// outboundSecretLane's escape pass: one nesting level per call, JSON
+// escapes plus \xHH (ASCII) and \u{...}, surrogate pairs joined, and every
+// malformed or unknown escape kept verbatim (so a clean round is a no-op).
+func TestFoldBackslashEscapesDecodesOneLevel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`satir\nTR33\tx\r\b\f`, "satir\nTR33\tx\r\b\f"},
+		{`\"q\" \\ \/ \'`, `"q" \ / '`},
+		{`TR33 ç \u{1F600} 😀`, "TR33 ç \U0001F600 \U0001F600"},
+		{`\uD83D tek`, "� tek"},
+		{`\x54R33 \xC4 \x4`, `TR33 \xC4 \x4`},
+		{`a\\nb`, `a\nb`},
+		{`\q \u12 \u{} \u{110000} sonda\`, `\q \u12 \u{} \u{110000} sonda\`},
+		{"temiz metin", "temiz metin"},
+	}
+	for _, tc := range cases {
+		if got := foldBackslashEscapes(tc.in); got != tc.want {
+			t.Errorf("foldBackslashEscapes(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
 }

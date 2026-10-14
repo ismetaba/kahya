@@ -14,7 +14,10 @@
 //     the rendered card, which carries the OLD file content read from disk
 //     (render.go's readCurrentFile), every non-fs tool body (script,
 //     command, args) and the warning lines, or the W3 notice with its
-//     summary — runs through the same deterministic pre-pass.
+//     summary — runs through the same deterministic pre-pass, both as sent
+//     and with its backslash escapes decoded (a non-fs body is listed as
+//     its raw JSON tool_input, where a newline before an IBAN is the two
+//     bytes `\n`).
 //
 // The local surface (`kahya approve <id>`) always shows the full card.
 package telegram
@@ -23,6 +26,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"regexp"
+	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"kahya/kahyad/internal/canon"
 	"kahya/kahyad/internal/secretlane"
@@ -116,18 +122,186 @@ var visibleEscapeRe = regexp.MustCompile(`<U\+[0-9A-F]{4,6}>`)
 // hidden inside an IBAN as a visible escape ("TR33<U+200B>0006..."), which
 // the IBAN/TCKN/card regexes would not match, while a human reading the
 // card still sees the number. canon.Normalize's Canonical form also strips
-// any raw control code point the text still carries. The classifier is
-// local and deterministic: it cannot error, and any hit redacts.
+// any raw control code point the text still carries.
+//
+// Then the same two passes run over the text with its backslash escapes
+// decoded, one nesting level per round (foldBackslashEscapes, at most
+// maxEscapeFoldRounds rounds): every non-fs card is a raw listing of its
+// JSON tool_input (render.go -> approval.BuildOsascript), so a newline or
+// tab inside a script, note or argument is the two bytes `\n` / `\t`, and
+// `\nTR33 ...` has no word boundary before "TR33" for the classifier's
+// regexes - yet the reader sees the number. The same holds for literal
+// escapes inside file content (a JSON file in a diff) and for a JSON
+// document nested in a JSON tool_input (`\\n`, the second round). A hit
+// in any form redacts; the decoded forms only ever add hits.
+//
+// The classifier is local and deterministic: it cannot error, and any hit
+// redacts.
 func outboundSecretLane(text string) (bool, string) {
-	if v := secretlane.ClassifyDeterministic(text); v.SecretLane {
-		return true, "content:" + v.Reason
+	if secret, reason := classifyOutboundForm(text, "content:", "canonical:"); secret {
+		return true, reason
 	}
-	if folded := visibleEscapeRe.ReplaceAllString(canon.Normalize(text).Canonical, ""); folded != text {
-		if v := secretlane.ClassifyDeterministic(folded); v.SecretLane {
-			return true, "canonical:" + v.Reason
+	decoded := text
+	for round := 0; round < maxEscapeFoldRounds; round++ {
+		next := foldBackslashEscapes(decoded)
+		if next == decoded {
+			break
+		}
+		decoded = next
+		if secret, reason := classifyOutboundForm(decoded, "escape:", "escape_canonical:"); secret {
+			return true, reason
 		}
 	}
 	return false, ""
+}
+
+// classifyOutboundForm runs the deterministic pre-pass over text and over
+// its escape-stripped canonical form (see outboundSecretLane), prefixing
+// the classifier's reason with plainPrefix / canonicalPrefix.
+func classifyOutboundForm(text, plainPrefix, canonicalPrefix string) (bool, string) {
+	if v := secretlane.ClassifyDeterministic(text); v.SecretLane {
+		return true, plainPrefix + v.Reason
+	}
+	if folded := visibleEscapeRe.ReplaceAllString(canon.Normalize(text).Canonical, ""); folded != text {
+		if v := secretlane.ClassifyDeterministic(folded); v.SecretLane {
+			return true, canonicalPrefix + v.Reason
+		}
+	}
+	return false, ""
+}
+
+// maxEscapeFoldRounds bounds how many nested escape levels
+// outboundSecretLane decodes: a JSON tool_input is one level, a JSON
+// document carried inside it two; more rounds stop early once a round
+// changes nothing.
+const maxEscapeFoldRounds = 4
+
+// foldBackslashEscapes decodes ONE level of backslash escapes in s: the
+// JSON escapes (\n \r \t \b \f \" \\ \/ and \uXXXX, a surrogate pair
+// joined into one rune) plus the source-language forms a script body can
+// spell a character with (\' , \xHH for ASCII, \u{H...} as in
+// JavaScript/JXA). Any other backslash, and a malformed escape, is kept
+// verbatim, so a round that finds nothing to decode returns s unchanged.
+func foldBackslashEscapes(s string) string {
+	i := strings.IndexByte(s, '\\')
+	if i < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	b.WriteString(s[:i])
+	for i < len(s) {
+		c := s[i]
+		if c != '\\' || i+1 == len(s) {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		switch e := s[i+1]; e {
+		case 'n':
+			b.WriteByte('\n')
+			i += 2
+		case 'r':
+			b.WriteByte('\r')
+			i += 2
+		case 't':
+			b.WriteByte('\t')
+			i += 2
+		case 'b':
+			b.WriteByte('\b')
+			i += 2
+		case 'f':
+			b.WriteByte('\f')
+			i += 2
+		case '"', '\\', '/', '\'':
+			b.WriteByte(e)
+			i += 2
+		case 'u':
+			r, n := decodeUnicodeEscape(s[i:])
+			if n == 0 {
+				b.WriteByte(c)
+				i++
+				continue
+			}
+			b.WriteRune(r)
+			i += n
+		case 'x':
+			if i+4 <= len(s) {
+				if v, ok := hexValue(s[i+2 : i+4]); ok && v < utf8.RuneSelf {
+					b.WriteByte(byte(v))
+					i += 4
+					continue
+				}
+			}
+			b.WriteByte(c)
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// decodeUnicodeEscape decodes the \u escape at the start of s ("\uXXXX",
+// a "\uD8XX\uDCXX" surrogate pair, or "\u{H...}") and reports how many
+// bytes it consumed; n == 0 means s does not start with a well-formed one.
+// A lone surrogate decodes to U+FFFD, as encoding/json does.
+func decodeUnicodeEscape(s string) (r rune, n int) {
+	if len(s) >= 4 && s[2] == '{' {
+		end := strings.IndexByte(s[3:], '}')
+		if end < 1 || end > 6 {
+			return 0, 0
+		}
+		v, ok := hexValue(s[3 : 3+end])
+		if !ok || v > utf8.MaxRune {
+			return 0, 0
+		}
+		return rune(v), 3 + end + 1
+	}
+	if len(s) < 6 {
+		return 0, 0
+	}
+	v, ok := hexValue(s[2:6])
+	if !ok {
+		return 0, 0
+	}
+	r = rune(v)
+	if !utf16.IsSurrogate(r) {
+		return r, 6
+	}
+	if len(s) >= 12 && s[6] == '\\' && s[7] == 'u' {
+		if lo, ok := hexValue(s[8:12]); ok {
+			if pair := utf16.DecodeRune(r, rune(lo)); pair != utf8.RuneError {
+				return pair, 12
+			}
+		}
+	}
+	return utf8.RuneError, 6
+}
+
+// hexValue parses a non-empty run of ASCII hex digits.
+func hexValue(h string) (uint32, bool) {
+	if h == "" {
+		return 0, false
+	}
+	var v uint32
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | uint32(d)
+	}
+	return v, true
 }
 
 // redactedNoticeText builds the ONLY text a secret-lane approval may ever
