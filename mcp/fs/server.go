@@ -119,7 +119,15 @@ type PolicyDecision struct {
 // same call shape runs out-of-process (this package's own doc comment).
 type PolicyClient interface {
 	Check(ctx context.Context, tool, scope, taskID, traceID string, toolInput []byte) (PolicyDecision, error)
-	ConsumeToken(ctx context.Context, token, tool, class, scope, taskID, traceID string, toolInput []byte) error
+	// ConsumeToken burns the one-time token and returns the operation id
+	// kahyad assigned to this consumed token (the approval_tokens.token_hash
+	// - see kahyad/internal/policy.ConsumeResult). B-8: every undo record
+	// this package keeps, and every undo_windows row kahyad keeps, is keyed
+	// by this id, never by trace_id. "" is tolerated (a PolicyClient that
+	// predates op ids): HandleWrite/HandleDelete then mint a local id so the
+	// record is still individually addressable in-process. mcp/shell and
+	// mcp/osascript alias this interface and ignore the id.
+	ConsumeToken(ctx context.Context, token, tool, class, scope, taskID, traceID string, toolInput []byte) (opID string, err error)
 }
 
 // Ledger is the append-only events sink every handler in this package
@@ -214,9 +222,11 @@ type Server struct {
 	// tests override directly so they never touch the real ~/.Trash).
 	TrashDir string
 	// UndoDir is the fallback pre-image copy root for a fs_write target
-	// NOT inside any git work tree (HANDOFF task spec: "~/Library/
-	// Application Support/Kahya/undo/<task_id>/<sha256-of-canonical-
-	// path>" — kahyad wires this to filepath.Join(cfg.DataDir, "undo")).
+	// NOT inside any git work tree: "~/Library/Application Support/Kahya/
+	// undo/<task_id>/<op_id>" (B-8: one copy per OPERATION; the W3-03 task
+	// spec's <sha256-of-canonical-path> name let a second write to the same
+	// file overwrite the first write's pre-image) — kahyad wires this to
+	// filepath.Join(cfg.DataDir, "undo").
 	UndoDir string
 
 	Policy PolicyClient
@@ -351,6 +361,10 @@ type FsWriteOutput struct {
 	GitCheckpoint bool   `json:"git_checkpoint"`
 	PreHash       string `json:"pre_hash"`
 	PostHash      string `json:"post_hash"`
+	// OpID is this operation's id (B-8): kahyad's approval_tokens.token_hash
+	// for the consumed token - the key of its undo_windows row and of this
+	// package's undo record, and the op_id in its fs_write ledger line.
+	OpID string `json:"op_id"`
 	// Replayed is true when this is the stored result of an EARLIER,
 	// identical, completed fs_write of the same task (FIX-I-4 receipt
 	// replay): nothing was written this call.
@@ -366,6 +380,8 @@ type FsDeleteArgs struct {
 type FsDeleteOutput struct {
 	Path      string `json:"path"`
 	TrashPath string `json:"trash_path"`
+	// OpID: see FsWriteOutput.OpID.
+	OpID string `json:"op_id"`
 	// Replayed: see FsWriteOutput.Replayed (nothing was moved this call).
 	Replayed bool `json:"replayed,omitempty"`
 }
@@ -627,15 +643,17 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 		return FsWriteOutput{}, errors.New(decision.Reason)
 	}
 
-	if err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_write", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	opID, err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_write", decision.Class, defaultScope, taskID, traceID, toolInput)
+	if err != nil {
 		return FsWriteOutput{}, fmt.Errorf("fs_write: onay jetonu tüketilemedi: %w", err)
 	}
+	opID = normalizeOpID(opID)
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
 	// The whole side effect (FIX-I-4): everything after ConsumeToken runs
 	// inside the receipt lifecycle, so a completed write is never repeated.
 	effect := func(ctx context.Context) (json.RawMessage, error) {
-		rec, err := s.checkpointPreImage(cp, taskID, traceID)
+		rec, err := s.checkpointPreImage(cp, taskID, traceID, opID)
 		if err != nil {
 			return nil, fmt.Errorf("fs_write: %w", err)
 		}
@@ -645,21 +663,29 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 		// an unconfined os.* call against cp.Op — see rootedWrite's doc
 		// comment for the TOCTOU this closes.
 		if err := rootedWrite(cp.AncestorDir, cp.Rel, content); err != nil {
+			// B-8: nothing was written, so this operation's pre-image copy
+			// is not needed - removed so a failed write never leaves a copy
+			// under UndoDir that no undo record will ever purge. (kahyad's
+			// window for the consumed token stays open with no record:
+			// `kahya undo` reports it no_record, the sweep expires it.)
+			if rec.CopyPath != "" {
+				_ = os.Remove(rec.CopyPath)
+			}
 			return nil, fmt.Errorf("fs_write: %w", err)
 		}
 
 		postHash := sha256Hex(content)
-		s.registry.Put(traceID, rec)
+		s.registry.Put(rec) // B-8: keyed by rec.OpID, never overwrites an earlier op
 
 		s.logAndLedger(ctx, traceID, "fs_write", map[string]any{
-			"event": "fs_write", "canonical_path": cp.Match, "task_id": taskID,
+			"event": "fs_write", "canonical_path": cp.Match, "task_id": taskID, "op_id": opID,
 			"pre_existed": rec.HadPrev, "pre_hash": rec.PreHash, "post_hash": postHash,
 			"git_checkpoint": rec.GitBlobSHA != "", "git_blob_sha": rec.GitBlobSHA, "copy_path": rec.CopyPath,
 		})
 
 		return json.Marshal(FsWriteOutput{
 			Path: cp.Match, PreExisted: rec.HadPrev, GitCheckpoint: rec.GitBlobSHA != "",
-			PreHash: rec.PreHash, PostHash: postHash,
+			PreHash: rec.PreHash, PostHash: postHash, OpID: opID,
 		})
 	}
 	raw, replayed, err := ExecuteWithReceipt(ctx, s.Receipts, rin, effect)
@@ -735,9 +761,11 @@ func (s *Server) HandleDelete(ctx context.Context, traceID, taskID string, args 
 	if decision.Result != PolicyResultAllow {
 		return FsDeleteOutput{}, errors.New(decision.Reason)
 	}
-	if err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_delete", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	opID, err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_delete", decision.Class, defaultScope, taskID, traceID, toolInput)
+	if err != nil {
 		return FsDeleteOutput{}, fmt.Errorf("fs_delete: onay jetonu tüketilemedi: %w", err)
 	}
+	opID = normalizeOpID(opID)
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
 	effect := func(ctx context.Context) (json.RawMessage, error) {
@@ -749,17 +777,17 @@ func (s *Server) HandleDelete(ctx context.Context, traceID, taskID string, args 
 			return nil, fmt.Errorf("fs_delete: %w", err)
 		}
 
-		s.registry.Put(traceID, undoRecord{
-			Tool: "fs_delete", CanonicalPath: cp.Match, OpPath: cp.Op,
+		s.registry.Put(undoRecord{
+			OpID: opID, Tool: "fs_delete", CanonicalPath: cp.Match, OpPath: cp.Op,
 			AncestorDir: cp.AncestorDir, Rel: cp.Rel,
 			TrashPath: trashPath, TaskID: taskID, TraceID: traceID,
 		})
 
 		s.logAndLedger(ctx, traceID, "fs_delete", map[string]any{
-			"event": "fs_delete", "canonical_path": cp.Match, "trash_path": trashPath, "task_id": taskID,
+			"event": "fs_delete", "canonical_path": cp.Match, "trash_path": trashPath, "task_id": taskID, "op_id": opID,
 		})
 
-		return json.Marshal(FsDeleteOutput{Path: cp.Match, TrashPath: trashPath})
+		return json.Marshal(FsDeleteOutput{Path: cp.Match, TrashPath: trashPath, OpID: opID})
 	}
 	raw, replayed, err := ExecuteWithReceipt(ctx, s.Receipts, rin, effect)
 	if err != nil {
@@ -1082,12 +1110,12 @@ func rootReadFileConfined(ancestorDir, rel string) ([]byte, error) {
 // pre-image (if any), and — when the target is inside a git work tree —
 // checkpoints it via `git hash-object -w` (no working-tree/index side
 // effects); otherwise (or on any git failure) falls back to copying the
-// pre-image under s.UndoDir/<task_id>/<sha256-of-canonical-path>. A
+// pre-image under s.UndoDir/<task_id>/<op_id> (B-8: per operation). A
 // target that did not exist before this write (HadPrev false) needs
 // neither: its "pre-image" is simply "absent", and undo_write's own
 // HadPrev-false branch knows to remove (to Trash) the file this write
 // created instead of restoring bytes.
-func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID string) (undoRecord, error) {
+func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID, opID string) (undoRecord, error) {
 	// BLOCKER fix: confined to cp.AncestorDir, exactly like the write
 	// that follows this checkpoint — see rootReadFileConfined's doc
 	// comment.
@@ -1100,7 +1128,7 @@ func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID string) (u
 	}
 
 	rec := undoRecord{
-		Tool: "fs_write", CanonicalPath: cp.Match, OpPath: cp.Op,
+		OpID: opID, Tool: "fs_write", CanonicalPath: cp.Match, OpPath: cp.Op,
 		AncestorDir: cp.AncestorDir, Rel: cp.Rel,
 		HadPrev: hadPrev, PreHash: sha256Hex(data), TaskID: taskID, TraceID: traceID,
 	}
@@ -1117,7 +1145,7 @@ func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID string) (u
 		}
 	}
 
-	copyPath, err := s.copyPreImage(taskID, cp.Match, data)
+	copyPath, err := s.copyPreImage(taskID, opID, data)
 	if err != nil {
 		return undoRecord{}, fmt.Errorf("copy pre-image: %w", err)
 	}
@@ -1125,18 +1153,43 @@ func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID string) (u
 	return rec, nil
 }
 
-// copyPreImage implements the non-git fallback's exact path shape:
-// s.UndoDir/<task_id>/<sha256-of-canonical-path>.
-func (s *Server) copyPreImage(taskID, canonicalMatchPath string, data []byte) (string, error) {
+// copyPreImage writes the non-git fallback pre-image copy to
+// s.UndoDir/<task_id>/<op_id> (B-8: per OPERATION - the old
+// <sha256-of-canonical-path> name meant a second write to the same file in
+// the same task silently overwrote the first write's pre-image, so the
+// first operation could never be undone). opID is already normalizeOpID'd
+// (plain lowercase hex), so it is safe as a single path component.
+func (s *Server) copyPreImage(taskID, opID string, data []byte) (string, error) {
 	dir := filepath.Join(s.UndoDir, taskDirName(taskID))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	dest := filepath.Join(dir, sha256Hex([]byte(canonicalMatchPath)))
+	dest := filepath.Join(dir, opID)
 	if err := os.WriteFile(dest, data, 0o600); err != nil {
 		return "", err
 	}
 	return dest, nil
+}
+
+// normalizeOpID returns opID when it is a plain lowercase hex identifier
+// (what kahyad's engine hands back: the sha256 hex of the token bytes) and
+// a freshly minted local hex id otherwise ("" from a PolicyClient without
+// op ids, or anything that is not safe to use verbatim as a file name under
+// UndoDir - the same defensive posture as taskDirName). Never returns "".
+func normalizeOpID(opID string) string {
+	if n := len(opID); n >= 16 && n <= 128 {
+		ok := true
+		for _, c := range opID {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return opID
+		}
+	}
+	return randHex(16)
 }
 
 // taskDirName is the undo-copy directory name for taskID — a fixed

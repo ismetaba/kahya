@@ -397,6 +397,8 @@ func run() int {
 	// undoWindowDuration const - production behavior is unchanged at the
 	// default, but a shorter config.yaml value (or a test's direct
 	// SetUndoWindowDuration call) now actually takes effect end-to-end.
+	// B-8: the window is per executed operation, counted from that
+	// operation's own token consume (Engine.ConsumeTokenOp).
 	policyEngine.SetUndoWindowDuration(time.Duration(cfg.UndoWindowSeconds) * time.Second)
 	srv.SetPolicyEngine(policyEngine)
 	// B-1 approval loop (owner decision G01-1 option 1): a tool call that
@@ -428,8 +430,9 @@ func run() int {
 	// bypass policyGateMiddleware's own deny-all short-circuit (they run
 	// their own gate chain - see mcp.go's fsOwnedTools). undoDir is
 	// cfg.DataDir/undo (fallback pre-image copies for a fs_write target
-	// NOT inside any git work tree); policyEngine's undo-window-expiry
-	// hook purges those copies once their 5-minute window lapses.
+	// NOT inside any git work tree, one per operation: undo/<task_id>/
+	// <op_id>, B-8); policyEngine's undo-window-expiry hook purges each
+	// copy once its own operation's 5-minute window lapses.
 	home, err := os.UserHomeDir()
 	if err != nil {
 		log.Error("fs_tool_home_dir_failed", "err", err.Error())
@@ -1319,11 +1322,12 @@ func run() int {
 		}
 	}()
 
-	// W3-02: sweep expired undo_windows rows (deadline passed, still
-	// state="open" -> "expired" + ledger undo_window_expired) every 30s,
-	// for as long as kahyad runs. Same ctx-cancelled-then-joined pattern as
-	// the boot reindex goroutine above (BLOCKER 2's reasoning applies
-	// identically: a sweep must never race st.Close() on shutdown).
+	// W3-02: sweep expired undo_windows rows (one per executed W1 op since
+	// B-8; deadline passed, still state="open" -> "expired" + ledger
+	// undo_window_expired) every 30s, for as long as kahyad runs. Same
+	// ctx-cancelled-then-joined pattern as the boot reindex goroutine above
+	// (BLOCKER 2's reasoning applies identically: a sweep must never race
+	// st.Close() on shutdown).
 	var undoSweepDone sync.WaitGroup
 	undoSweepDone.Add(1)
 	go func() {

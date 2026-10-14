@@ -172,16 +172,6 @@ type Querier interface {
 	// callers.
 	GetLedgerDigestState(ctx context.Context) (LedgerDigestState, error)
 	GetMergeLedger(ctx context.Context, id int64) (MergeLedger, error)
-	// Idempotent-open lookup (post-security-review amendment): Engine.Check's
-	// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
-	// reuse an already-OPEN window for the same (task_id, tool, trace_id)
-	// instead of opening a second one on a retried call - a retry must never
-	// leave multiple simultaneously-open undo windows for the same action.
-	GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg GetOpenUndoWindowByTaskToolTraceParams) (UndoWindow, error)
-	// Sessions/tasks are not guaranteed to open exactly one undo window per
-	// trace_id, so this returns the most recently opened OPEN one - the same
-	// "most recent wins" convention GetTaskBySession above already uses.
-	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (UndoWindow, error)
 	GetPendingApproval(ctx context.Context, id string) (PendingApproval, error)
 	// The idempotent-replay lookup (task spec step 4): the most recent
 	// status='receipt' row for this exact (task_id, tool_name, args_hash)
@@ -388,6 +378,11 @@ type Querier interface {
 	// scan, while the idempotent-replay lookup (GetReceiptToolCall below)
 	// only ever matches an attempt that reached 'receipt'.
 	InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error)
+	// B-8 (0022_undo_windows_per_op.sql): one row per EXECUTED W1 operation,
+	// inserted by kahyad/internal/policy.Engine.ConsumeTokenOp only. op_id =
+	// the consumed token's approval_tokens.token_hash (unique per executed
+	// side effect - idx_undo_windows_op_id); scope = that token's real bound
+	// scope, so an undo demotes the real (tool, class, scope) triple.
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
 	// W5-03 (truth-ritual) queries below: the eval_labels durable label store
 	// plus the two small facts/episodes reads kahyad/internal/ritual's sampler
@@ -504,6 +499,12 @@ type Querier interface {
 	// fan-out, never for a single --task <id> halt.
 	ListNonTerminalTasks(ctx context.Context) ([]Task, error)
 	ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
+	// B-8: every still-OPEN window for one trace, NEWEST FIRST. id is an
+	// AUTOINCREMENT integer, strictly increasing within one brain.db, so
+	// ORDER BY id DESC is the exact reverse of consume (= execution) order -
+	// the LIFO order `kahya undo --trace <id>` undoes in (a later write to the
+	// same file must be reverted before an earlier one).
+	ListOpenUndoWindowsByTrace(ctx context.Context, traceID string) ([]UndoWindow, error)
 	// Every not-yet-pushed anchor_log row, oldest first - push.go's
 	// stale-pending alarm (task spec step 5: "if the oldest pending is older
 	// than 2 x interval_hours, alarm") reads index [0].

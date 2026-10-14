@@ -40,7 +40,7 @@ func TestHandleWriteGitCheckpointThenUndoByteIdenticalRestore(t *testing.T) {
 		t.Error("PreExisted = false, want true")
 	}
 
-	if err := s.UndoWrite(context.Background(), "trace-git"); err != nil {
+	if err := s.UndoWrite(context.Background(), out.OpID); err != nil {
 		t.Fatalf("UndoWrite: %v", err)
 	}
 	restored, err := os.ReadFile(target)
@@ -79,7 +79,7 @@ func TestHandleWriteNonGitFallbackCopyThenUndoRestore(t *testing.T) {
 		t.Fatalf("undo copy dir %s: entries=%v err=%v, want exactly 1 file", copyDir, entries, err)
 	}
 
-	if err := s.UndoWrite(context.Background(), "trace-copy"); err != nil {
+	if err := s.UndoWrite(context.Background(), out.OpID); err != nil {
 		t.Fatalf("UndoWrite: %v", err)
 	}
 	restored, err := os.ReadFile(target)
@@ -111,7 +111,7 @@ func TestHandleWriteNewFileUndoMovesToTrash(t *testing.T) {
 		t.Fatalf("newly-written file missing: %v", err)
 	}
 
-	if err := s.UndoWrite(context.Background(), "trace-new"); err != nil {
+	if err := s.UndoWrite(context.Background(), out.OpID); err != nil {
 		t.Fatalf("UndoWrite: %v", err)
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
@@ -176,10 +176,11 @@ func TestUndoDeleteRestoresOriginalLocation(t *testing.T) {
 	led := &fakeLedger{}
 	s := newTestServer(t, home, nil, nil, pc, led)
 
-	if _, err := s.HandleDelete(context.Background(), "trace-restore", "task-1", FsDeleteArgs{Path: "~/restoreme.txt"}); err != nil {
+	out, err := s.HandleDelete(context.Background(), "trace-restore", "task-1", FsDeleteArgs{Path: "~/restoreme.txt"})
+	if err != nil {
 		t.Fatalf("HandleDelete: %v", err)
 	}
-	if err := s.UndoDelete(context.Background(), "trace-restore"); err != nil {
+	if err := s.UndoDelete(context.Background(), out.OpID); err != nil {
 		t.Fatalf("UndoDelete: %v", err)
 	}
 	restored, err := os.ReadFile(target)
@@ -200,7 +201,8 @@ func TestPurgeExpiredRemovesFallbackCopyAndEmptiesUndoDir(t *testing.T) {
 	pc := &fakePolicyClient{decision: allowDecision("tok-expire")}
 	s := newTestServer(t, home, nil, nil, pc, &fakeLedger{})
 
-	if _, err := s.HandleWrite(context.Background(), "trace-expire", "task-99", FsWriteArgs{Path: "~/toexpire.txt", ContentBase64: b64("post-image")}); err != nil {
+	out, err := s.HandleWrite(context.Background(), "trace-expire", "task-99", FsWriteArgs{Path: "~/toexpire.txt", ContentBase64: b64("post-image")})
+	if err != nil {
 		t.Fatalf("HandleWrite: %v", err)
 	}
 
@@ -210,7 +212,7 @@ func TestPurgeExpiredRemovesFallbackCopyAndEmptiesUndoDir(t *testing.T) {
 		t.Fatalf("undo dir before purge: entries=%v err=%v, want exactly 1", entries, err)
 	}
 
-	s.PurgeExpired("trace-expire", "task-99", "fs_write")
+	s.PurgeExpired("trace-expire", "task-99", "fs_write", out.OpID)
 
 	entries, err = os.ReadDir(taskDir)
 	if err != nil {
@@ -220,8 +222,8 @@ func TestPurgeExpiredRemovesFallbackCopyAndEmptiesUndoDir(t *testing.T) {
 		t.Errorf("undo/task-99 has %d entries after purge, want 0 (empty)", len(entries))
 	}
 
-	// A purged trace's undo record is gone: undo must now fail cleanly.
-	if err := s.UndoWrite(context.Background(), "trace-expire"); !errors.Is(err, ErrNoUndoRecord) {
+	// A purged operation's undo record is gone: undo must now fail cleanly.
+	if err := s.UndoWrite(context.Background(), out.OpID); !errors.Is(err, ErrNoUndoRecord) {
 		t.Errorf("UndoWrite after purge = %v, want ErrNoUndoRecord", err)
 	}
 }

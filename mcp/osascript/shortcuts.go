@@ -80,7 +80,7 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	if decision.Result != PolicyResultAllow {
 		return ShortcutOutput{}, errors.New(decision.Reason)
 	}
-	if err := r.Policy.ConsumeToken(ctx, decision.Token, "shortcuts_run", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	if _, err := r.Policy.ConsumeToken(ctx, decision.Token, "shortcuts_run", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: onay jetonu tüketilemedi: %w", err)
 	}
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token

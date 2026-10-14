@@ -1063,15 +1063,18 @@ func runAutonomyPromote(client *Client, args []string, stdout, stderr io.Writer)
 	return 0
 }
 
-// runUndo implements `kahya undo --trace <id>`: triggers the registered
-// undo window for that trace while it is still open (HANDOFF S4 ladder
-// L2 row - 5-minute grace period on an auto-allowed W1 write). Recipe
-// EXECUTION itself is delegated to the owning tool (W3-03) - this command
-// only opens/closes the window server-side.
+// runUndo implements `kahya undo --trace <id> [--last]` (W3-02 + B-8):
+// triggers EVERY still-open undo window of that trace, newest first (or
+// only the newest with --last, owner decision G05-2), and prints one line
+// per operation with its recipe outcome. Exit 0 when no recipe FAILED
+// (unsupported/no_record are reported, not errors); exit 1 when any recipe
+// failed (owner decision G05-3), so a script can tell "nothing to do" from
+// "a restore broke"; exit 2 on a usage error.
 func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("undo", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	trace := fs.String("trace", "", "geri al: bu trace_id'nin açık geri-alma penceresini tetikle")
+	trace := fs.String("trace", "", "geri al: bu trace_id'nin açık geri-alma pencerelerini tetikle")
+	last := fs.Bool("last", false, "yalnız en yeni işlemi geri al (varsayılan: trace'teki tüm açık işlemler, yeniden eskiye)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1081,12 +1084,33 @@ func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	tool, err := client.PolicyUndo(context.Background(), traceid.New(), *trace)
+	ops, err := client.PolicyUndo(context.Background(), traceid.New(), *trace, *last)
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return 1
 	}
-	fmt.Fprintf(stdout, MsgUndoTriggered+"\n", tool)
+	fmt.Fprintf(stdout, MsgUndoSummary+"\n", len(ops), *trace)
+	failed := false
+	for _, op := range ops {
+		switch op.Recipe {
+		case "executed":
+			fmt.Fprintf(stdout, MsgUndoOpExecuted+"\n", op.Tool, op.Path)
+		case "unsupported":
+			fmt.Fprintf(stdout, MsgUndoOpUnsupported+"\n", op.Tool)
+		case "no_record":
+			fmt.Fprintf(stdout, MsgUndoOpNoRecord+"\n", op.Tool)
+		default: // "failed" (and any outcome this CLI does not know: fail-closed)
+			failed = true
+			target := op.Path
+			if target == "" {
+				target = op.OpID
+			}
+			fmt.Fprintf(stdout, MsgUndoOpFailed+"\n", op.Tool, target, op.Error)
+		}
+	}
+	if failed {
+		return 1
+	}
 	return 0
 }
 

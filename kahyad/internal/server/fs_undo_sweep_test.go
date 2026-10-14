@@ -1,6 +1,7 @@
 // fs_undo_sweep_test.go is the MINOR fix's end-to-end regression: proves
 // mcp/fs.Server.PurgeExpired is reachable through the REAL production
-// wiring — policy.Engine.Check opening a W1 undo window,
+// wiring — the fs tool's own ConsumeToken (policy.Engine.ConsumeTokenOp,
+// FIX-B-8) opening the write's per-operation W1 undo window,
 // SweepExpiredUndoWindows flipping it to "expired" once its (here,
 // deliberately short, config-injected) deadline passes, and firing
 // SetUndoExpiryHook(fsTool.PurgeExpired) — rather than only ever being
@@ -17,6 +18,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,7 +56,8 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 // TestFsUndoWindowExpiryPurgesFallbackCopyThroughRealSweepPath is the
 // MINOR fix's own acceptance criterion, verbatim: "inject a short window
-// via config", open it through a REAL policy.Engine.Check W1 ALLOW, write
+// via config", open it through a REAL W1 ALLOW + consume (FIX-B-8: the
+// window opens at ConsumeTokenOp, keyed by the op id), write
 // a REAL fallback pre-image copy through the fs tool, sweep with the REAL
 // Engine.SweepExpiredUndoWindows so it fires the REAL
 // SetUndoExpiryHook(fsTool.PurgeExpired) callback, and only THEN assert
@@ -87,8 +90,8 @@ func TestFsUndoWindowExpiryPurgesFallbackCopyThroughRealSweepPath(t *testing.T) 
 	engine.SetUndoWindowDuration(shortWindow)
 
 	// L2 is fs_write/W1/global's auto-allow threshold (HANDOFF S4
-	// ladder) — seeded directly so Check() auto-allows (and therefore
-	// opens the undo window) without 20 real approvals first.
+	// ladder) — seeded directly so Check() auto-allows (and the consume
+	// that follows opens the undo window) without 20 real approvals first.
 	seedAutonomyState(t, st, "fs_write", "W1", "global", policy.L2)
 
 	undoDir := filepath.Join(dataDir, "undo")
@@ -102,10 +105,19 @@ func TestFsUndoWindowExpiryPurgesFallbackCopyThroughRealSweepPath(t *testing.T) 
 	}
 
 	const taskID, traceID = "task-sweep", "trace-sweep"
-	if _, err := fsTool.HandleWrite(context.Background(), traceID, taskID, mcpfs.FsWriteArgs{
+	out, err := fsTool.HandleWrite(context.Background(), traceID, taskID, mcpfs.FsWriteArgs{
 		Path: "~/toexpire.txt", ContentBase64: base64.StdEncoding.EncodeToString([]byte("post-image")),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("HandleWrite: %v", err)
+	}
+	// FIX-B-8: the one window is keyed by the write's own op id.
+	var windowOpID string
+	if err := st.DB().QueryRow(`SELECT op_id FROM undo_windows`).Scan(&windowOpID); err != nil {
+		t.Fatalf("read undo_windows.op_id: %v", err)
+	}
+	if out.OpID == "" || windowOpID != out.OpID {
+		t.Fatalf("undo_windows.op_id = %q, HandleWrite OpID = %q; want the same non-empty id", windowOpID, out.OpID)
 	}
 
 	// home is not a git work tree, so checkpointPreImage's non-git
@@ -152,7 +164,7 @@ func TestFsUndoWindowExpiryPurgesFallbackCopyThroughRealSweepPath(t *testing.T) 
 	// The fs tool's own in-memory undo record is gone too — undo must now
 	// fail cleanly, exactly like a direct PurgeExpired call would leave
 	// it.
-	if err := fsTool.UndoWrite(ctx, traceID); err == nil {
-		t.Error("UndoWrite after the real expiry sweep = nil error, want an error (no undo record)")
+	if _, err := fsTool.UndoOp(ctx, traceID, out.OpID); !errors.Is(err, mcpfs.ErrNoUndoRecord) {
+		t.Errorf("UndoOp after the real expiry sweep = %v, want ErrNoUndoRecord", err)
 	}
 }

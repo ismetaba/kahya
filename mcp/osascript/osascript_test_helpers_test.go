@@ -73,12 +73,14 @@ func (f *fakePolicyClient) Check(_ context.Context, _, _, _, _ string, toolInput
 	return f.decision, nil
 }
 
-func (f *fakePolicyClient) ConsumeToken(_ context.Context, _, _, _, _, _, _ string, toolInput []byte) error {
+// ConsumeToken returns no op id (FIX-B-8): this package ignores it - only
+// mcp/fs keys undo records by it.
+func (f *fakePolicyClient) ConsumeToken(_ context.Context, _, _, _, _, _, _ string, toolInput []byte) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumeCalls++
 	f.lastConsumeToolInput = append([]byte(nil), toolInput...)
-	return f.consumeErr
+	return "", f.consumeErr
 }
 
 func allowDecision(token string) PolicyDecision {

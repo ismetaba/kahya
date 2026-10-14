@@ -1,8 +1,9 @@
 // engine.go implements the W3-02 binding policy decision: given a tool
 // name, a ladder scope, and a task/trace correlation pair, it answers
 // ALLOW / NEEDS_APPROVAL / DENY per the autonomy ladder (HANDOFF S4 ladder
-// flag), tracks per-(tool,class,scope) promotion/demotion state, and opens
-// the W1 5-minute undo window on an auto-allowed undoable write. This
+// flag) and tracks per-(tool,class,scope) promotion/demotion state; the W1
+// 5-minute undo window is opened per CONSUMED W1 token (one window per
+// executed operation - see tokens.go ConsumeTokenOp, B-8). This
 // REPLACES W12-07's interim static allow/deny table (formerly interim.go,
 // now retired) as the decision logic task.go's POST /policy/check and
 // mcp.go's policyGateMiddleware consult.
@@ -124,6 +125,9 @@ const defaultScope = "global"
 // ever calling that purge directly) — NewEngine still defaults to this
 // exact 5-minute constant, so every caller that never calls
 // SetUndoWindowDuration keeps today's production behavior unchanged.
+// B-8: the window is per OPERATION, counted from that operation's own
+// consume time (ConsumeTokenOp), so every executed W1 write gets the full
+// window no matter how many preceded it in the same task.
 const undoWindowDuration = 5 * time.Minute
 
 // promotionThreshold is the "20 ardisik onay + 0 red" terfi-ONERI
@@ -206,8 +210,9 @@ type Store interface {
 	RevokeApprovalTokensByTask(ctx context.Context, arg sqlcgen.RevokeApprovalTokensByTaskParams) (int64, error)
 
 	InsertUndoWindow(ctx context.Context, arg sqlcgen.InsertUndoWindowParams) (sqlcgen.UndoWindow, error)
-	GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error)
-	GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg sqlcgen.GetOpenUndoWindowByTaskToolTraceParams) (sqlcgen.UndoWindow, error)
+	// ListOpenUndoWindowsByTrace returns every still-open undo_windows row
+	// for one trace_id, NEWEST FIRST (B-8: TriggerUndo undoes LIFO).
+	ListOpenUndoWindowsByTrace(ctx context.Context, traceID string) ([]sqlcgen.UndoWindow, error)
 	ListOpenUndoWindows(ctx context.Context) ([]sqlcgen.UndoWindow, error)
 	SetUndoWindowState(ctx context.Context, arg sqlcgen.SetUndoWindowStateParams) error
 }
@@ -280,8 +285,9 @@ type Engine struct {
 	// unchanged) - a set hook lets the owning tool (mcp/fs.Server.
 	// PurgeExpired) delete its own fallback pre-image copy without this
 	// package needing to know anything about what that tool stores or
-	// where.
-	undoExpiryHook func(traceID, taskID, tool string)
+	// where. opID (B-8) is the expired row's op_id - the operation id the
+	// owning tool keyed its own record by ("" for a pre-0022 legacy row).
+	undoExpiryHook func(traceID, taskID, tool, opID string)
 	// undoWindowDuration is openUndoWindow's own configurable window
 	// length (MINOR fix: config.Config.UndoWindowSeconds, defaulted here
 	// to the package-level undoWindowDuration const by NewEngine) - see
@@ -353,8 +359,9 @@ func NewEngine(pol Policy, store Store, ledger Ledger) *Engine {
 // SetUndoWindowDuration overrides Engine's undo-window length (MINOR fix:
 // config.Config.UndoWindowSeconds, defaulted to the package-level
 // undoWindowDuration const of 5 minutes - see main.go's wiring). Every
-// window opened by a Check/Approve call AFTER this is called uses d;
-// windows already open keep their originally-recorded deadline. Tests
+// window ConsumeTokenOp opens AFTER this is called uses d (B-8: one window
+// per consumed W1 token, counted from that consume); windows already open
+// keep their originally-recorded deadline. Tests
 // use this to inject a short window so purge-on-expiry can be exercised
 // end-to-end through the real SweepExpiredUndoWindows -> SetUndoExpiryHook
 // path instead of only ever calling the owning tool's purge directly.
@@ -364,8 +371,9 @@ func (e *Engine) SetUndoWindowDuration(d time.Duration) { e.undoWindowDuration =
 // an undo_windows row to "expired" (W3-03 task spec: "Purge fallback
 // pre-image copies when the 5-minute window expires — hook the
 // undo_window_expired event"). Call before the undo sweeper goroutine
-// starts (main.go); nil (the default) means no hook runs.
-func (e *Engine) SetUndoExpiryHook(fn func(traceID, taskID, tool string)) {
+// starts (main.go); nil (the default) means no hook runs. opID (B-8) is
+// the expired operation's id ("" for a pre-0022 legacy row).
+func (e *Engine) SetUndoExpiryHook(fn func(traceID, taskID, tool, opID string)) {
 	e.undoExpiryHook = fn
 }
 
@@ -445,9 +453,9 @@ func (e *Engine) SetSessionResolver(r SessionResolver) {
 // fireUndoExpiryHook calls the registered hook, if any - a small helper so
 // SweepExpiredUndoWindows and TriggerUndo's own expiry branch share
 // exactly one nil-check instead of duplicating it.
-func (e *Engine) fireUndoExpiryHook(traceID, taskID, tool string) {
+func (e *Engine) fireUndoExpiryHook(traceID, taskID, tool, opID string) {
 	if e.undoExpiryHook != nil {
-		e.undoExpiryHook(traceID, taskID, tool)
+		e.undoExpiryHook(traceID, taskID, tool, opID)
 	}
 }
 
@@ -783,8 +791,8 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 		var token string
 		// B-1: a Preflight (worker can_use_tool) allow mints nothing - no
 		// token (the worker has no consume step, so it would only ever be an
-		// orphan row) and no undo window; the tool-side gate's own binding
-		// Check mints both when the call actually executes.
+		// orphan row); the tool-side gate's own binding Check mints it when
+		// the call actually executes.
 		if class != ClassR && !in.Preflight {
 			tok, err := e.mintToken(ctx, in.TaskID, in.TraceID, in.Tool, class, scope, hash, GrantKindAuto, "")
 			if err != nil {
@@ -793,16 +801,9 @@ func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
 				return d, err
 			}
 			token = tok
-			if class == ClassW1 {
-				// Best-effort: a failure here must not retroactively flip an
-				// already-decided ALLOW to deny (the token above is already
-				// minted and valid) - it is ledgered for visibility instead.
-				if err := e.openUndoWindow(ctx, in.TaskID, in.Tool, in.TraceID); err != nil {
-					e.ledgerRaw(ctx, in.TraceID, "undo_window_open_failed", map[string]any{
-						"event": "undo_window_open_failed", "task_id": in.TaskID, "tool": in.Tool, "err": err.Error(),
-					})
-				}
-			}
+			// B-8: the W1 undo window is opened by ConsumeTokenOp when this
+			// token is actually consumed - never here (a Check whose token is
+			// never consumed executes nothing, so it has nothing to undo).
 		}
 		d := Decision{Result: ResultAllow, Rule: RuleLadderV1, Class: class, Scope: scope, Level: level, Token: token}
 		e.ledgerDecision(ctx, in, class, scope, level, d)
@@ -971,31 +972,37 @@ func (e *Engine) demote(ctx context.Context, tool string, class ActionClass, sco
 	})
 }
 
-// openUndoWindow inserts an undo_windows row with a 5-minute deadline and
-// ledgers undo_window_opened (HANDOFF S4 ladder L2 row). MINOR 5 fix:
-// idempotent open - a retried Check/Approve call for the same (task_id,
-// tool, trace_id) reuses the existing OPEN window instead of opening a
-// second one, so a retry never leaves multiple simultaneously-open undo
-// windows for the same action.
-func (e *Engine) openUndoWindow(ctx context.Context, taskID, tool, traceID string) error {
-	if _, err := e.store.GetOpenUndoWindowByTaskToolTrace(ctx, sqlcgen.GetOpenUndoWindowByTaskToolTraceParams{
-		TaskID: taskID, Tool: tool, TraceID: traceID,
-	}); err == nil {
-		return nil // already open - nothing to do
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
+// openUndoWindow inserts one undo_windows row for ONE executed W1
+// operation (B-8): opID is the consumed token's approval_tokens.token_hash
+// (unique per executed side effect - ConsumeApprovalToken is an atomic
+// single-use UPDATE, and idx_undo_windows_op_id is a partial UNIQUE index
+// on op_id), scope is that token's real bound scope. Called ONLY from
+// ConsumeTokenOp; Check, Approve and the B-1 grant redemption never open
+// windows (G00 C-2). Deadline = now + e.undoWindowDuration, counted from
+// THIS operation's own consume time, so every operation gets the full
+// window regardless of how many preceded it in the same task/trace. The
+// old "reuse an already-open window for the same task/tool/trace" lookup
+// is gone: a retried Check mints a token, but only a consumed token - an
+// executed operation - opens a window.
+func (e *Engine) openUndoWindow(ctx context.Context, taskID, tool, traceID, opID, scope string) error {
+	if opID == "" {
+		return errors.New("policy: openUndoWindow requires a non-empty op_id")
 	}
-
+	if scope == "" {
+		scope = defaultScope
+	}
 	now := e.nowUTC()
 	row, err := e.store.InsertUndoWindow(ctx, sqlcgen.InsertUndoWindowParams{
 		TaskID: taskID, Tool: tool, TraceID: traceID,
 		OpenedAt: rfc3339(now), Deadline: rfc3339(now.Add(e.undoWindowDuration)),
+		OpID: opID, Scope: scope,
 	})
 	if err != nil {
 		return err
 	}
 	e.ledgerRaw(ctx, traceID, "undo_window_opened", map[string]any{
-		"event": "undo_window_opened", "task_id": taskID, "tool": tool, "deadline": row.Deadline,
+		"event": "undo_window_opened", "task_id": taskID, "tool": tool,
+		"op_id": opID, "scope": scope, "deadline": row.Deadline,
 	})
 	return nil
 }
@@ -1021,9 +1028,9 @@ func (e *Engine) SweepExpiredUndoWindows(ctx context.Context) (int, error) {
 		}
 		n++
 		e.ledgerRaw(ctx, w.TraceID, "undo_window_expired", map[string]any{
-			"event": "undo_window_expired", "task_id": w.TaskID, "tool": w.Tool,
+			"event": "undo_window_expired", "task_id": w.TaskID, "tool": w.Tool, "op_id": w.OpID,
 		})
-		e.fireUndoExpiryHook(w.TraceID, w.TaskID, w.Tool)
+		e.fireUndoExpiryHook(w.TraceID, w.TaskID, w.Tool, w.OpID)
 	}
 	return n, nil
 }
@@ -1048,51 +1055,78 @@ func (e *Engine) RunUndoSweeper(ctx context.Context, interval time.Duration) {
 // unexpired) undo_windows row matches traceID.
 var ErrNoOpenUndoWindow = errors.New("policy: no open undo window for this trace")
 
-// TriggerUndo implements `kahya undo --trace <id>`'s server-side half: it
-// finds the most recent OPEN undo_windows row for traceID, marks it
-// "triggered", demotes the owning (tool,class,scope) triple (HANDOFF S4:
-// undo is a demotion trigger), and ledgers undo_triggered. Recipe
-// EXECUTION itself (Trash restore, git checkpoint restore, ...) is
-// delegated to the owning tool (W3-03) - this is only the window/trigger
-// plumbing, per this task's Out of scope.
+// TriggerUndo implements `kahya undo --trace <id>`'s server-side half
+// (B-8 shape): it flips EVERY still-open, unexpired undo_windows row for
+// traceID to "triggered", NEWEST FIRST (LIFO - a later write to the same
+// file must be reverted before an earlier one), ledgers undo_triggered per
+// row (with op_id), and demotes each distinct (tool, scope) pair ONCE per
+// call (HANDOFF S4: undo is a demotion trigger; one `kahya undo` is one
+// user signal, not N - owner decision G05-4). The demoted scope is the
+// row's own recorded scope (the consumed token's real bound scope), no
+// longer the 'global' simplification. With onlyLast (`--last`, G05-2) only
+// the newest open row is triggered.
 //
-// Scope is not recorded on undo_windows (the migration's fixed 3-table
-// schema has no scope column there - see approval_tokens' identical
-// limitation in tokens.go), so the demotion below targets scope="global"
-// as a documented simplification; per-resource undo-triggered demotion
-// scoping is deferred alongside full scope-value plumbing.
-func (e *Engine) TriggerUndo(ctx context.Context, traceID string) (sqlcgen.UndoWindow, error) {
-	row, err := e.store.GetOpenUndoWindowByTrace(ctx, traceID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return sqlcgen.UndoWindow{}, ErrNoOpenUndoWindow
-	}
+// Rows whose deadline already passed are flipped to "expired" (+
+// undo_window_expired + the expiry hook) and skipped, exactly as the sweep
+// would have done. A row whose "triggered" flip fails is skipped too and
+// ledgered undo_trigger_failed: it stays "open" (the next `kahya undo`
+// retries it) and is NOT returned, so the caller never executes a recipe
+// for an un-flipped row (fail-closed). Returns the triggered rows in the
+// order they were triggered (newest first); the caller executes each
+// owning tool's recipe in that same order. ErrNoOpenUndoWindow when
+// nothing was triggered; only a ListOpenUndoWindowsByTrace error returns
+// (nil, err). Legacy pre-0022 rows (empty op_id) are triggered like any other
+// - the owning tool then reports no record for them.
+//
+// Recipe EXECUTION itself (Trash restore, git checkpoint restore, ...) is
+// delegated to the owning tool (W3-03) - this is only the window/trigger
+// plumbing.
+func (e *Engine) TriggerUndo(ctx context.Context, traceID string, onlyLast bool) ([]sqlcgen.UndoWindow, error) {
+	rows, err := e.store.ListOpenUndoWindowsByTrace(ctx, traceID)
 	if err != nil {
-		return sqlcgen.UndoWindow{}, err
+		return nil, err
 	}
-
 	now := e.nowUTC()
-	if deadline, perr := time.Parse(time.RFC3339Nano, row.Deadline); perr == nil && now.After(deadline) {
-		_ = e.store.SetUndoWindowState(ctx, sqlcgen.SetUndoWindowStateParams{State: "expired", ID: row.ID})
-		e.ledgerRaw(ctx, traceID, "undo_window_expired", map[string]any{
-			"event": "undo_window_expired", "task_id": row.TaskID, "tool": row.Tool,
+	var triggered []sqlcgen.UndoWindow
+	demoted := make(map[string]bool)
+	for _, row := range rows {
+		if deadline, perr := time.Parse(time.RFC3339Nano, row.Deadline); perr == nil && now.After(deadline) {
+			_ = e.store.SetUndoWindowState(ctx, sqlcgen.SetUndoWindowStateParams{State: "expired", ID: row.ID})
+			e.ledgerRaw(ctx, traceID, "undo_window_expired", map[string]any{
+				"event": "undo_window_expired", "task_id": row.TaskID, "tool": row.Tool, "op_id": row.OpID,
+			})
+			e.fireUndoExpiryHook(traceID, row.TaskID, row.Tool, row.OpID)
+			continue
+		}
+		if err := e.store.SetUndoWindowState(ctx, sqlcgen.SetUndoWindowStateParams{State: "triggered", ID: row.ID}); err != nil {
+			e.ledgerRaw(ctx, traceID, "undo_trigger_failed", map[string]any{
+				"event": "undo_trigger_failed", "task_id": row.TaskID, "tool": row.Tool, "op_id": row.OpID, "err": err.Error(),
+			})
+			continue
+		}
+		e.ledgerRaw(ctx, traceID, "undo_triggered", map[string]any{
+			"event": "undo_triggered", "task_id": row.TaskID, "tool": row.Tool, "op_id": row.OpID, "scope": row.Scope,
 		})
-		e.fireUndoExpiryHook(traceID, row.TaskID, row.Tool)
-		return sqlcgen.UndoWindow{}, ErrNoOpenUndoWindow
-	}
+		triggered = append(triggered, row)
 
-	if err := e.store.SetUndoWindowState(ctx, sqlcgen.SetUndoWindowStateParams{State: "triggered", ID: row.ID}); err != nil {
-		return sqlcgen.UndoWindow{}, err
+		scope := normalizeScope(row.Scope)
+		key := row.Tool + "\x00" + scope
+		if !demoted[key] {
+			demoted[key] = true
+			class := ActionClass("")
+			if t, ok := e.policy.ToolsByName[row.Tool]; ok {
+				class = t.Class
+			}
+			e.demote(ctx, row.Tool, class, scope, traceID, "undo")
+		}
+		if onlyLast {
+			break
+		}
 	}
-	e.ledgerRaw(ctx, traceID, "undo_triggered", map[string]any{
-		"event": "undo_triggered", "task_id": row.TaskID, "tool": row.Tool,
-	})
-
-	class := ActionClass("")
-	if t, ok := e.policy.ToolsByName[row.Tool]; ok {
-		class = t.Class
+	if len(triggered) == 0 {
+		return nil, ErrNoOpenUndoWindow
 	}
-	e.demote(ctx, row.Tool, class, defaultScope, traceID, "undo")
-	return row, nil
+	return triggered, nil
 }
 
 // FeedbackResult is Engine.Approve's return value.
@@ -1160,10 +1194,10 @@ func isTypedOnayla(typed string) bool {
 // no token minted), mint a one-time GRANT (B-1: grant_kind='approval')
 // bound to the row's task_id+tool+scope+approved_bytes_hash - the binding
 // Engine.Check of the very tool call that asked redeems it exactly once
-// (redeemApprovedGrant, approval_loop.go) - open a W1 undo window (a
-// manually-approved W1 write earns the same 5-minute safety net an
-// auto-allowed one gets),
-// bump consecutive_approvals, and - exactly at the 20th consecutive
+// (redeemApprovedGrant, approval_loop.go) - bump consecutive_approvals
+// (B-8: no undo window here; the approved W1 write's window opens when its
+// exchanged token is consumed - ConsumeTokenOp - exactly like an
+// auto-allowed one), and - exactly at the 20th consecutive
 // approval - ledger promotion_suggested (the level itself never changes
 // here; only `kahya autonomy promote` changes it, per HANDOFF S4), and
 // finally fire approvalDecidedHook so a parked tool call resumes.
@@ -1245,13 +1279,9 @@ func (e *Engine) Approve(ctx context.Context, pendingApprovalID, surface, typed 
 	if err != nil {
 		return FeedbackResult{}, err
 	}
-	if class == ClassW1 {
-		if err := e.openUndoWindow(ctx, pa.TaskID, pa.Tool, pa.TraceID); err != nil {
-			e.ledgerRaw(ctx, pa.TraceID, "undo_window_open_failed", map[string]any{
-				"event": "undo_window_open_failed", "task_id": pa.TaskID, "tool": pa.Tool, "err": err.Error(),
-			})
-		}
-	}
+	// B-8: the W1 undo window is opened by ConsumeTokenOp when the exchanged
+	// token this grant redeems into is actually consumed - never here (an
+	// approval nobody redeems executes nothing).
 
 	state, err := e.loadState(ctx, pa.Tool, class, pa.Scope)
 	if err == nil {

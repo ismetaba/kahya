@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -87,21 +88,25 @@ func (f *fakePolicyClient) Check(_ context.Context, tool, _ /* scope */, taskID,
 	return f.decision, nil
 }
 
-func (f *fakePolicyClient) ConsumeToken(_ context.Context, token, _ /* tool */, _ /* class */, _ /* scope */, _ /* taskID */, _ /* traceID */ string, _ []byte) error {
+// ConsumeToken returns a distinct 32-hex op id per successful consume
+// (FIX-B-8), standing in for the real engine's token_hash: every multi-op
+// test then sees one independently addressable record per operation, and
+// normalizeOpID keeps the id verbatim (plain lowercase hex, >= 16 chars).
+func (f *fakePolicyClient) ConsumeToken(_ context.Context, token, _ /* tool */, _ /* class */, _ /* scope */, _ /* taskID */, _ /* traceID */ string, _ []byte) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumeCalls++
 	if f.consumeErr != nil {
-		return f.consumeErr
+		return "", f.consumeErr
 	}
 	if f.consumedTokens == nil {
 		f.consumedTokens = make(map[string]bool)
 	}
 	if f.consumedTokens[token] {
-		return errors.New("policy: approval token invalid, expired, or already consumed")
+		return "", errors.New("policy: approval token invalid, expired, or already consumed")
 	}
 	f.consumedTokens[token] = true
-	return nil
+	return fmt.Sprintf("%032x", f.consumeCalls), nil
 }
 
 // allowDecision is the common "ladder auto-allowed, W1 token minted"

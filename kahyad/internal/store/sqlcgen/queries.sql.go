@@ -767,66 +767,6 @@ func (q *Queries) GetMergeLedger(ctx context.Context, id int64) (MergeLedger, er
 	return i, err
 }
 
-const getOpenUndoWindowByTaskToolTrace = `-- name: GetOpenUndoWindowByTaskToolTrace :one
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
-FROM undo_windows
-WHERE task_id = ? AND tool = ? AND trace_id = ? AND state = 'open'
-ORDER BY opened_at DESC
-LIMIT 1
-`
-
-type GetOpenUndoWindowByTaskToolTraceParams struct {
-	TaskID  string `json:"task_id"`
-	Tool    string `json:"tool"`
-	TraceID string `json:"trace_id"`
-}
-
-// Idempotent-open lookup (post-security-review amendment): Engine.Check's
-// W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
-// reuse an already-OPEN window for the same (task_id, tool, trace_id)
-// instead of opening a second one on a retried call - a retry must never
-// leave multiple simultaneously-open undo windows for the same action.
-func (q *Queries) GetOpenUndoWindowByTaskToolTrace(ctx context.Context, arg GetOpenUndoWindowByTaskToolTraceParams) (UndoWindow, error) {
-	row := q.db.QueryRowContext(ctx, getOpenUndoWindowByTaskToolTrace, arg.TaskID, arg.Tool, arg.TraceID)
-	var i UndoWindow
-	err := row.Scan(
-		&i.ID,
-		&i.TaskID,
-		&i.Tool,
-		&i.TraceID,
-		&i.OpenedAt,
-		&i.Deadline,
-		&i.State,
-	)
-	return i, err
-}
-
-const getOpenUndoWindowByTrace = `-- name: GetOpenUndoWindowByTrace :one
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
-FROM undo_windows
-WHERE trace_id = ? AND state = 'open'
-ORDER BY opened_at DESC
-LIMIT 1
-`
-
-// Sessions/tasks are not guaranteed to open exactly one undo window per
-// trace_id, so this returns the most recently opened OPEN one - the same
-// "most recent wins" convention GetTaskBySession above already uses.
-func (q *Queries) GetOpenUndoWindowByTrace(ctx context.Context, traceID string) (UndoWindow, error) {
-	row := q.db.QueryRowContext(ctx, getOpenUndoWindowByTrace, traceID)
-	var i UndoWindow
-	err := row.Scan(
-		&i.ID,
-		&i.TaskID,
-		&i.Tool,
-		&i.TraceID,
-		&i.OpenedAt,
-		&i.Deadline,
-		&i.State,
-	)
-	return i, err
-}
-
 const getPendingApproval = `-- name: GetPendingApproval :one
 SELECT id, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, tool_input, decision
 FROM pending_approvals
@@ -2012,9 +1952,9 @@ func (q *Queries) InsertToolCallIntent(ctx context.Context, arg InsertToolCallIn
 }
 
 const insertUndoWindow = `-- name: InsertUndoWindow :one
-INSERT INTO undo_windows (task_id, tool, trace_id, opened_at, deadline, state)
-VALUES (?, ?, ?, ?, ?, 'open')
-RETURNING id, task_id, tool, trace_id, opened_at, deadline, state
+INSERT INTO undo_windows (task_id, tool, trace_id, opened_at, deadline, state, op_id, scope)
+VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+RETURNING id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope
 `
 
 type InsertUndoWindowParams struct {
@@ -2023,8 +1963,15 @@ type InsertUndoWindowParams struct {
 	TraceID  string `json:"trace_id"`
 	OpenedAt string `json:"opened_at"`
 	Deadline string `json:"deadline"`
+	OpID     string `json:"op_id"`
+	Scope    string `json:"scope"`
 }
 
+// B-8 (0022_undo_windows_per_op.sql): one row per EXECUTED W1 operation,
+// inserted by kahyad/internal/policy.Engine.ConsumeTokenOp only. op_id =
+// the consumed token's approval_tokens.token_hash (unique per executed
+// side effect - idx_undo_windows_op_id); scope = that token's real bound
+// scope, so an undo demotes the real (tool, class, scope) triple.
 func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error) {
 	row := q.db.QueryRowContext(ctx, insertUndoWindow,
 		arg.TaskID,
@@ -2032,6 +1979,8 @@ func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowPara
 		arg.TraceID,
 		arg.OpenedAt,
 		arg.Deadline,
+		arg.OpID,
+		arg.Scope,
 	)
 	var i UndoWindow
 	err := row.Scan(
@@ -2042,6 +1991,8 @@ func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowPara
 		&i.OpenedAt,
 		&i.Deadline,
 		&i.State,
+		&i.OpID,
+		&i.Scope,
 	)
 	return i, err
 }
@@ -2805,7 +2756,7 @@ func (q *Queries) ListNonTerminalTasks(ctx context.Context) ([]Task, error) {
 }
 
 const listOpenUndoWindows = `-- name: ListOpenUndoWindows :many
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope
 FROM undo_windows
 WHERE state = 'open'
 `
@@ -2827,6 +2778,53 @@ func (q *Queries) ListOpenUndoWindows(ctx context.Context) ([]UndoWindow, error)
 			&i.OpenedAt,
 			&i.Deadline,
 			&i.State,
+			&i.OpID,
+			&i.Scope,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOpenUndoWindowsByTrace = `-- name: ListOpenUndoWindowsByTrace :many
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope
+FROM undo_windows
+WHERE trace_id = ? AND state = 'open'
+ORDER BY id DESC
+`
+
+// B-8: every still-OPEN window for one trace, NEWEST FIRST. id is an
+// AUTOINCREMENT integer, strictly increasing within one brain.db, so
+// ORDER BY id DESC is the exact reverse of consume (= execution) order -
+// the LIFO order `kahya undo --trace <id>` undoes in (a later write to the
+// same file must be reverted before an earlier one).
+func (q *Queries) ListOpenUndoWindowsByTrace(ctx context.Context, traceID string) ([]UndoWindow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenUndoWindowsByTrace, traceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UndoWindow{}
+	for rows.Next() {
+		var i UndoWindow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Tool,
+			&i.TraceID,
+			&i.OpenedAt,
+			&i.Deadline,
+			&i.State,
+			&i.OpID,
+			&i.Scope,
 		); err != nil {
 			return nil, err
 		}

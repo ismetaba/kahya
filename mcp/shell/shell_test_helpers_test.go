@@ -70,21 +70,23 @@ func (f *fakePolicyClient) Check(_ context.Context, tool, _, _, _ string, _ []by
 	return f.decision, nil
 }
 
-func (f *fakePolicyClient) ConsumeToken(_ context.Context, token, _, _, _, _, _ string, _ []byte) error {
+// ConsumeToken returns no op id (FIX-B-8): this package ignores it - only
+// mcp/fs keys undo records by it.
+func (f *fakePolicyClient) ConsumeToken(_ context.Context, token, _, _, _, _, _ string, _ []byte) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumeCalls++
 	if f.consumeErr != nil {
-		return f.consumeErr
+		return "", f.consumeErr
 	}
 	if f.consumedTokens == nil {
 		f.consumedTokens = make(map[string]bool)
 	}
 	if f.consumedTokens[token] {
-		return errors.New("policy: approval token invalid, expired, or already consumed")
+		return "", errors.New("policy: approval token invalid, expired, or already consumed")
 	}
 	f.consumedTokens[token] = true
-	return nil
+	return "", nil
 }
 
 func allowDecision(token string) PolicyDecision {

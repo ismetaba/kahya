@@ -46,6 +46,7 @@
 -- (background sweep once the deadline passes with no undo). Recipe
 -- EXECUTION itself is W3-03 - this table is only the window/trigger
 -- plumbing.
+-- B-8 (0022): one row per EXECUTED W1 operation, keyed by op_id.
 --
 -- NOTE: keep this file plain ASCII (see 0001_init_schema.sql's header -
 -- sqlc's sqlite parser silently corrupts every generated query in the

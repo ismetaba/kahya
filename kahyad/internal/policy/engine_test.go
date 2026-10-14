@@ -319,9 +319,14 @@ func TestDBErrorPathDeniesFailClosed(t *testing.T) {
 	}
 }
 
-// ---- ALLOW for W1 at/above L2 opens an undo window ----
+// ---- ALLOW for W1 at/above L2 mints a token; the window opens at consume ----
 
-func TestAllowW1AtL2OpensUndoWindow(t *testing.T) {
+// TestCheckAloneOpensNoUndoWindow (FIX-B-8, replaces
+// TestAllowW1AtL2OpensUndoWindow): a W1 ALLOW at L2 still mints its
+// one-time token, but opens NO undo window - a Check whose token is never
+// consumed executes nothing, so it has nothing to undo. The window opens in
+// ConsumeTokenOp (TestConsumeTokenW1OpensOneWindowPerOp).
+func TestCheckAloneOpensNoUndoWindow(t *testing.T) {
 	e, st := testEngine(t)
 	ctx := context.Background()
 	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
@@ -338,14 +343,14 @@ func TestAllowW1AtL2OpensUndoWindow(t *testing.T) {
 	}
 
 	var n int
-	if err := st.DB().QueryRow(`SELECT count(*) FROM undo_windows WHERE task_id='t1' AND state='open'`).Scan(&n); err != nil {
+	if err := st.DB().QueryRow(`SELECT count(*) FROM undo_windows`).Scan(&n); err != nil {
 		t.Fatalf("count undo_windows: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("open undo_windows rows = %d, want 1", n)
+	if n != 0 {
+		t.Fatalf("undo_windows rows after a Check alone = %d, want 0", n)
 	}
-	if countEvents(t, st, "undo_window_opened") != 1 {
-		t.Errorf("undo_window_opened ledger count != 1")
+	if got := countEvents(t, st, "undo_window_opened"); got != 0 {
+		t.Errorf("undo_window_opened ledger count = %d, want 0", got)
 	}
 }
 
@@ -447,7 +452,9 @@ func TestForgedPendingApprovalIDRejected(t *testing.T) {
 // TestApprovePendingApprovalSingleUse proves a REAL, Check-issued
 // pending_approval_id can only ever be approved once: the second Approve
 // call with the same id must reject, minting no second token and running
-// no second round of undo-window/consecutive-approvals bookkeeping.
+// no second round of consecutive-approvals bookkeeping. FIX-B-8 / G00 C-2:
+// Approve itself opens no undo window - the one window appears only once
+// the approved write's token is consumed (ConsumeTokenOp).
 func TestApprovePendingApprovalSingleUse(t *testing.T) {
 	e, st := testEngine(t)
 	ctx := context.Background()
@@ -482,12 +489,26 @@ func TestApprovePendingApprovalSingleUse(t *testing.T) {
 	if n := countApprovalTokens(t, st); n != 1 {
 		t.Fatalf("approval_tokens rows = %d, want exactly 1 (only the first Approve mints)", n)
 	}
-	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
-		t.Fatalf("open undo_windows rows = %d, want exactly 1 (only the first Approve opens one)", n)
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 0 {
+		t.Fatalf("open undo_windows rows after Approve = %d, want 0 (Approve opens none; consume does)", n)
 	}
 	row := getState(t, st, "fs_write", "W1", "global")
 	if row.ConsecutiveApprovals != 1 {
 		t.Fatalf("consecutive_approvals = %d, want 1 (only the first Approve should have counted)", row.ConsecutiveApprovals)
+	}
+
+	// The approved write executes: its token is consumed with the SAME
+	// bytes/task/trace Check saw, and exactly then its one window opens.
+	if _, err := e.ConsumeTokenOp(ctx, ConsumeInput{
+		Token: res1.Token, Tool: "fs_write", Class: ClassW1, TaskID: "t1", TraceID: "trace-single-use", ToolInput: []byte(`{}`),
+	}); err != nil {
+		t.Fatalf("ConsumeTokenOp(approved token): %v", err)
+	}
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
+		t.Fatalf("open undo_windows rows after ConsumeTokenOp = %d, want exactly 1", n)
+	}
+	if n := countApprovalTokens(t, st); n != 1 {
+		t.Fatalf("approval_tokens rows = %d, want still 1", n)
 	}
 }
 
@@ -523,35 +544,45 @@ func TestDenyPendingApprovalSingleUse(t *testing.T) {
 	}
 }
 
-// ---- MINOR 5 regression: undo window open is idempotent on retry ----
+// ---- MINOR 5 regression, B-8 shape: a retried Check opens nothing ----
 
-// TestUndoWindowIdempotentOnRetry proves a retried Check ALLOW call for
-// the same (task_id, tool, trace_id) never leaves more than one OPEN
-// undo_windows row.
-func TestUndoWindowIdempotentOnRetry(t *testing.T) {
+// TestRetriedCheckOpensNoExtraWindow (FIX-B-8, replaces
+// TestUndoWindowIdempotentOnRetry): two identical Check calls mint two
+// tokens but open no window; consuming the first opens exactly one; the
+// second, never consumed, still adds none. Consuming it too opens a second
+// window - by design: that is a second EXECUTED operation.
+func TestRetriedCheckOpensNoExtraWindow(t *testing.T) {
 	e, st := testEngine(t)
 	ctx := context.Background()
 	seedState(t, st, "fs_write", string(ClassW1), "global", L2)
 
 	in := CheckInput{Tool: "fs_write", TaskID: "t1", TraceID: "trace-retry", ToolInput: []byte(`{}`)}
+	consume := func(tok string) {
+		t.Helper()
+		if _, err := e.ConsumeTokenOp(ctx, ConsumeInput{Token: tok, Tool: "fs_write", Class: ClassW1, TaskID: "t1", TraceID: "trace-retry", ToolInput: []byte(`{}`)}); err != nil {
+			t.Fatalf("ConsumeTokenOp: %v", err)
+		}
+	}
 
 	d1, err := e.Check(ctx, in)
-	if err != nil {
-		t.Fatalf("first Check: %v", err)
+	if err != nil || d1.Result != ResultAllow {
+		t.Fatalf("first Check = %+v, %v; want allow", d1, err)
 	}
-	if d1.Result != ResultAllow {
-		t.Fatalf("first Check: Result = %q, want allow", d1.Result)
-	}
-
 	d2, err := e.Check(ctx, in)
-	if err != nil {
-		t.Fatalf("second (retried) Check: %v", err)
+	if err != nil || d2.Result != ResultAllow {
+		t.Fatalf("second (retried) Check = %+v, %v; want allow", d2, err)
 	}
-	if d2.Result != ResultAllow {
-		t.Fatalf("second Check: Result = %q, want allow", d2.Result)
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 0 {
+		t.Fatalf("open undo_windows rows after 2 identical Check calls = %d, want 0", n)
 	}
 
+	consume(d1.Token)
 	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 1 {
-		t.Fatalf("open undo_windows rows after 2 identical Check calls = %d, want exactly 1", n)
+		t.Fatalf("open undo_windows rows after consuming one token = %d, want 1", n)
+	}
+
+	consume(d2.Token)
+	if n := countOpenUndoWindows(t, st, "t1", "fs_write"); n != 2 {
+		t.Fatalf("open undo_windows rows after consuming both tokens = %d, want 2 (two executed operations)", n)
 	}
 }

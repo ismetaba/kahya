@@ -219,6 +219,16 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | a halt is counted, stamped `halted_at` and ledgered `task.user_halted` only when the `user_halted` transition happened; a lost race still cancels outbox rows | `kahyad/internal/halt/TestHaltTaskCountsOnlySuccessfulTransitions` | FIX-I-14 | ci-hermetic |
 | Safety #4 | a never-started (`intent`) task is halted legally; a `done` one is skipped | `kahyad/internal/halt/TestHaltAllIgnoresCompletedLocalTasks` | FIX-I-14 | ci-hermetic |
 | Safety #4 | migration 0021 maps legacy `intent` rows by their `state` (done→done, error→failed), leaves unknown rows alone | `kahyad/internal/store/TestMigration0021BackfillsIntentRows` | FIX-I-14 | ci-hermetic |
+| Safety #4 | W1 undo: every executed op of a task is individually undoable, newest first (no op silently overwritten, no orphan pre-image copy) | `mcp/fs/TestUndoTwoWritesSameTraceRestoresBothLIFO` | FIX-B-8 | ci-hermetic |
+| Safety #4 | the same file written twice keeps one pre-image per op; LIFO undo steps back v2 → v1 → original | `mcp/fs/TestUndoSameFileTwiceLIFORestoresOriginal` | FIX-B-8 | ci-hermetic |
+| Safety #4 | an undo record is never executed for another trace (fail-closed), and stays available for its own | `mcp/fs/TestUndoOpRejectsTraceMismatch` | FIX-B-8 | ci-hermetic |
+| Safety #4 | one `undo_windows` row per CONSUMED W1 token (`op_id` = token_hash, ledgered), none at Check time | `kahyad/internal/policy/TestConsumeTokenW1OpensOneWindowPerOp` | FIX-B-8 | ci-hermetic |
+| Safety #4 | an approved write's grant redemption opens no window; consuming its exchanged token opens exactly one | `kahyad/internal/policy/TestRedeemedGrantOpensWindowOnlyAtConsume` | FIX-B-8 | ci-hermetic |
+| Safety #4 | `kahya undo --trace` triggers every open op newest first and demotes each (tool, scope) once per call | `kahyad/internal/policy/TestTriggerUndoAllLIFODemotesOnce` | FIX-B-8 | ci-hermetic |
+| Safety #4 | an undo demotes the op's real bound scope, never `global` by default | `kahyad/internal/policy/TestTriggerUndoDemotesRealScope` | FIX-B-8 | ci-hermetic |
+| Safety #4 | a W1 operation whose undo window cannot be opened is refused (token burned, `undo_window_open_failed`) - fail-closed, never executed without its window | `kahyad/internal/policy/TestConsumeTokenOpRefusesWhenWindowCannotOpen` | FIX-B-8 | ci-hermetic |
+| Safety #4 | over the real engine + fs tool: `POST /policy/undo` restores both writes newest first, one demotion, then 404 | `kahyad/internal/server/TestPolicyUndoAllOpsThroughRealEngineAndRecipe` | FIX-B-8 | ci-hermetic |
+| Safety #4 | an undo after the fs tool lost its records (restart) reports `no_record` and restores nothing by guesswork | `kahyad/internal/server/TestPolicyUndoReportsNoRecordAfterRegistryLoss` | FIX-B-8 | ci-hermetic |
 | Safety #5 | homoglyph host normalized/rejected (WYSIWYE) | `kahyad/internal/canon/TestNormalize_HomoglyphHost` | W3-06 | ci-hermetic |
 | Safety #5 | bidi-override filename normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_BidiFilename` | W3-06 | ci-hermetic |
 | Safety #5 | zero-width URL normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_ZeroWidthURL` | W3-06 | ci-hermetic |

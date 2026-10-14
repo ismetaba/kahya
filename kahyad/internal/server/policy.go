@@ -38,7 +38,11 @@ type policyConsumeTokenRequest struct {
 }
 
 type policyConsumeTokenResponse struct {
-	OK    bool   `json:"ok"`
+	OK bool `json:"ok"`
+	// OpID (B-8) is the consumed token's operation id (policy.
+	// ConsumeResult.OpID) - the key of its undo_windows row for a W1 token,
+	// for an out-of-process tool to key its own undo record by.
+	OpID  string `json:"op_id,omitempty"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -67,7 +71,7 @@ func (s *Server) handlePolicyConsumeToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err := s.policyEngine.ConsumeToken(r.Context(), policy.ConsumeInput{
+	res, err := s.policyEngine.ConsumeTokenOp(r.Context(), policy.ConsumeInput{
 		Token: req.Token, Tool: req.Tool, Class: policy.ActionClass(req.Class), Scope: req.Scope,
 		TaskID: taskID, TraceID: traceID, ToolInput: req.ToolInput,
 	})
@@ -75,7 +79,7 @@ func (s *Server) handlePolicyConsumeToken(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusOK, policyConsumeTokenResponse{OK: false, Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, policyConsumeTokenResponse{OK: true})
+	writeJSON(w, http.StatusOK, policyConsumeTokenResponse{OK: true, OpID: res.OpID})
 }
 
 // ---- POST /policy/feedback ----
@@ -161,7 +165,7 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: "trace_id required for kind=undo"})
 			return
 		}
-		row, err := s.policyEngine.TriggerUndo(r.Context(), traceID)
+		rows, err := s.policyEngine.TriggerUndo(r.Context(), traceID, false)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, policy.ErrNoOpenUndoWindow) {
@@ -170,12 +174,15 @@ func (s *Server) handlePolicyFeedback(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, policyFeedbackResponse{OK: false, Error: err.Error()})
 			return
 		}
-		// W3-03: execute the owning tool's undo recipe (Trash restore /
-		// git-checkpoint restore) now that the window is durably
-		// "triggered" and the ladder state already demoted - see
-		// fs.go's dispatchFSUndo doc comment for why this is a SEPARATE,
-		// best-effort step from TriggerUndo's own bookkeeping.
-		s.dispatchFSUndo(r.Context(), traceID, row.Tool)
+		// W3-03 + B-8: execute each triggered operation's undo recipe
+		// (Trash restore / git-checkpoint restore), newest first, now that
+		// every window is durably "triggered" and the ladder state already
+		// demoted - see fs.go's dispatchFSUndo doc comment for why this is
+		// a SEPARATE step from TriggerUndo's own bookkeeping. This route's
+		// response carries no per-op detail (POST /policy/undo does).
+		for _, row := range rows {
+			s.dispatchFSUndo(r.Context(), traceID, row)
+		}
 		writeJSON(w, http.StatusOK, policyFeedbackResponse{OK: true})
 	default:
 		writeJSON(w, http.StatusBadRequest, policyFeedbackResponse{OK: false, Error: "kind must be approve, deny, or undo"})
@@ -267,26 +274,44 @@ func (s *Server) handlePolicyPromote(w http.ResponseWriter, r *http.Request) {
 
 // ---- POST /policy/undo ----
 
-// policyUndoRequest is POST /policy/undo's request body - `kahya undo
-// --trace <id>`'s server-side call.
+// policyUndoRequest is POST /policy/undo's request body (`kahya undo
+// --trace <id> [--last]`). Last=true triggers only the newest open
+// operation; the default triggers EVERY open operation of the trace,
+// newest first (B-8, owner decision G05-2).
 type policyUndoRequest struct {
 	TraceID string `json:"trace_id"`
+	Last    bool   `json:"last,omitempty"`
 }
 
-type policyUndoResponse struct {
-	OK     bool   `json:"ok"`
-	Tool   string `json:"tool,omitempty"`
-	TaskID string `json:"task_id,omitempty"`
+// policyUndoOp is one triggered operation's outcome (B-8).
+type policyUndoOp struct {
+	OpID   string `json:"op_id"`
+	Tool   string `json:"tool"`
+	TaskID string `json:"task_id"`
+	Path   string `json:"path,omitempty"` // canonical path, when the recipe ran
+	Recipe string `json:"recipe"`         // executed | failed | no_record | unsupported
 	Error  string `json:"error,omitempty"`
 }
 
+type policyUndoResponse struct {
+	OK bool `json:"ok"`
+	// Tool/TaskID describe the NEWEST triggered op (the pre-B-8 wire
+	// fields, kept so an older client still gets a sensible single answer).
+	Tool   string         `json:"tool,omitempty"`
+	TaskID string         `json:"task_id,omitempty"`
+	Ops    []policyUndoOp `json:"ops,omitempty"`
+	Error  string         `json:"error,omitempty"`
+}
+
 // handlePolicyUndo implements POST /policy/undo (`kahya undo --trace
-// <id>`'s real server-side call, kahyad/cmd/kahya/client.go's
-// PolicyUndo): triggers the undo window for trace_id while it is still
-// open (HANDOFF S4 ladder L2 row), then dispatches to the owning tool's
-// recipe (W3-03: mcp/fs.Server.UndoWrite/UndoDelete) - see
-// dispatchFSUndo's doc comment (fs.go) for why that is a separate,
-// best-effort step from TriggerUndo's own window/demotion bookkeeping.
+// <id> [--last]`'s real server-side call, kahyad/cmd/kahya/client.go's
+// PolicyUndo): Engine.TriggerUndo flips every still-open undo window of
+// trace_id (or only the newest, with last) to triggered, newest first,
+// demoting each (tool, scope) once; then each triggered operation's owning
+// recipe runs in that same LIFO order (W3-03: mcp/fs.Server.UndoOp) - see
+// dispatchFSUndo's doc comment (fs.go) for why that is a separate step
+// from TriggerUndo's own window/demotion bookkeeping. 404 +
+// ErrNoOpenUndoWindow's text when nothing was open.
 func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, policyCheckMaxBody)
 	var req policyUndoRequest
@@ -302,7 +327,7 @@ func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, policyUndoResponse{OK: false, Error: "trace_id required"})
 		return
 	}
-	row, err := s.policyEngine.TriggerUndo(r.Context(), req.TraceID)
+	rows, err := s.policyEngine.TriggerUndo(r.Context(), req.TraceID, req.Last)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, policy.ErrNoOpenUndoWindow) {
@@ -311,6 +336,10 @@ func (s *Server) handlePolicyUndo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, policyUndoResponse{OK: false, Error: err.Error()})
 		return
 	}
-	s.dispatchFSUndo(r.Context(), req.TraceID, row.Tool)
-	writeJSON(w, http.StatusOK, policyUndoResponse{OK: true, Tool: row.Tool, TaskID: row.TaskID})
+	// TriggerUndo returns err == nil only with at least one triggered row.
+	ops := make([]policyUndoOp, 0, len(rows))
+	for _, row := range rows { // newest first - LIFO, exactly TriggerUndo's order
+		ops = append(ops, s.dispatchFSUndo(r.Context(), req.TraceID, row))
+	}
+	writeJSON(w, http.StatusOK, policyUndoResponse{OK: true, Tool: rows[0].Tool, TaskID: rows[0].TaskID, Ops: ops})
 }

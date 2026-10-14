@@ -1108,9 +1108,14 @@ never a second copy": the SAME engine also gates `POST /v1/mcp`'s
 the loaded `policy.yaml` (missing ⇒ `deny`, reason
 `"Tanınmayan araç reddedildi (fail-closed)."`); look up
 `autonomy_state(tool,class,scope)` (missing row ⇒ L0); apply the HANDOFF
-§4 ladder table (R auto at L1+, W1 at L2+ — opening a 5-minute
-`undo_windows` row, idempotently reusing an already-open one for the same
-task_id/tool/trace_id on a retried call — W2 at L3+; **W3 never
+§4 ladder table (R auto at L1+, W1 at L2+ — the one-time token is minted
+here; the 5-minute `undo_windows` row is opened per EXECUTED operation when
+that token is consumed — `POST /policy/consume-token` /
+`Engine.ConsumeTokenOp` — keyed by `op_id` = the token's `token_hash` and
+carrying its real bound `scope`, so a retried or never-consumed Check opens
+nothing and every executed write gets its own full window; a W1 token whose
+window cannot be opened is refused, `ErrUndoWindowUnavailable`,
+`undo_window_open_failed`, fail-closed; B-8 — W2 at L3+; **W3 never
 auto-allows, at any level, hard-coded in Go**). `allow` on a non-R class
 mints a one-time approval token (bound to `task_id` + `tool`/`class`/
 `scope` + a sha256 of `tool_input`) the caller must present to
@@ -1324,7 +1329,13 @@ first boot). `{}` disables it.
 - **Undo recipe implementations** (Trash restore, git checkpoint restore,
   ...) — W3-03. `kahya undo --trace <id>` / `POST /policy/undo` only
   trigger the window + demotion; executing the actual recipe is the owning
-  tool's job.
+  tool's job. Since B-8 `kahya undo --trace <id>` triggers EVERY open op of
+  the trace newest-first (`--last` = newest only), demotes each
+  `(tool, scope)` once per call, and runs each op's recipe in that LIFO
+  order (`mcp/fs.Server.UndoOp`, records keyed by `op_id`, pre-image copies
+  at `undo/<task_id>/<op_id>`); the response and the CLI report one line
+  per op — `executed | failed | no_record | unsupported` — and the CLI
+  exits 1 only when a recipe failed.
 - **Session resume, receipts, retries, outbox dispatch** — landed in
   W4-02 as `kahyad/internal/task` (state machine `machine.go`, receipt/
   idempotent-replay lifecycle `receipts.go`, resume-scan `resume.go`) and

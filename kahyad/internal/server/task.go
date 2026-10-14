@@ -1660,8 +1660,9 @@ var malformedBodyDeny = policyCheckResponse{
 // It consults kahyad/internal/policy's W3-02 autonomy-ladder Engine - the
 // EXACT SAME one mcp.go's /v1/mcp gate already consults (one engine, two
 // mount points). No I/O beyond what Engine.Check itself does (one
-// autonomy_state read, at most one approval_tokens/undo_windows write, one
-// ledger insert), well inside the caller's 5s budget.
+// autonomy_state read, at most one approval_tokens write - B-8: undo
+// windows open only when a W1 token is consumed, never here - one ledger
+// insert), well inside the caller's 5s budget.
 func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	// BLOCKER 3: cap the body BEFORE decoding - the endpoint's whole 5s
 	// fail-closed budget (HANDOFF §4 IPC ⚑) must never be at risk from an

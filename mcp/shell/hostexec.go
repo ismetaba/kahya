@@ -228,7 +228,7 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	// token must not execute — the gate chain, not the validator, is the
 	// boundary. h.Exec.Run below is reached ONLY after ConsumeToken
 	// succeeds.
-	if err := h.Policy.ConsumeToken(ctx, decision.Token, "shell_host", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	if _, err := h.Policy.ConsumeToken(ctx, decision.Token, "shell_host", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: onay jetonu tüketilemedi: %w", err)
 	}
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token

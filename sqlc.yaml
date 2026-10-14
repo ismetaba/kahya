@@ -77,6 +77,11 @@ sql:
       # the I-14 data-only status backfill, is intentionally NOT listed:
       # it changes no schema.)
       - "kahyad/migrations/0020_task_resilience.sql"
+      # 0022 (B-8) is two plain ALTER TABLE ADD COLUMN statements
+      # (undo_windows.op_id/scope) plus a partial UNIQUE index - columns
+      # InsertUndoWindow/ListOpenUndoWindowsByTrace reference, so it MUST be
+      # here for sqlc to regenerate the UndoWindow model with them.
+      - "kahyad/migrations/0022_undo_windows_per_op.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

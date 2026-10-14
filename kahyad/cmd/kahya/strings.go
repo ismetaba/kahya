@@ -118,11 +118,28 @@ const (
 	// --trace. Exit 2.
 	MsgUndoTraceRequired = "undo komutu için --trace gerekli."
 
-	// MsgUndoTriggered is `kahya undo --trace <id>`'s success line (%s =
-	// the tool whose undo window was triggered). Recipe EXECUTION itself
-	// is delegated to the owning tool (W3-03) - this only reports that the
-	// window closed and the demotion was recorded.
-	MsgUndoTriggered = "Geri alma tetiklendi: %s. (Geri alma tarifi ilgili araç tarafından uygulanır.)"
+	// MsgUndoSummary is `kahya undo`'s header line: number of triggered
+	// operations, then the trace id (B-8: all open ops of the trace, newest
+	// first, unless --last).
+	MsgUndoSummary = "Geri alma tetiklendi: %d işlem, en yeniden en eskiye (trace %s)."
+
+	// MsgUndoOpExecuted is one per-op line whose recipe restored the bytes:
+	// tool, canonical path.
+	MsgUndoOpExecuted = "  geri alındı   %s  %s"
+
+	// MsgUndoOpUnsupported: the tool has no undo recipe (e.g. memory_write)
+	// - only the ladder demotion applied. %s = tool.
+	MsgUndoOpUnsupported = "  tarif yok     %s  (bu araç için geri alma tarifi yok; yalnız otonomi tenzili uygulandı)"
+
+	// MsgUndoOpNoRecord: the window was open but the tool holds no record
+	// (kahyad restarted mid-window, or the operation never completed its
+	// write). %s = tool.
+	MsgUndoOpNoRecord = "  kayıt yok     %s  (kahyad yeniden başlamış ya da işlem tamamlanmamış olabilir; dosya elle kontrol edilmeli)"
+
+	// MsgUndoOpFailed: the recipe ran and failed. tool, path-or-op_id,
+	// error (English, from the daemon). Any failed op makes `kahya undo`
+	// exit 1 (owner decision G05-3).
+	MsgUndoOpFailed = "  BAŞARISIZ     %s  %s — %s"
 
 	// ---- W3-06: kahya approvals / kahya approve <id> ----
 

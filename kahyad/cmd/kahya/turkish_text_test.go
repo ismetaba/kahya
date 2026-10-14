@@ -76,7 +76,10 @@ func TestFlagHelpTextsAreNotAsciiFolded(t *testing.T) {
 		{[]string{"reindex", "-h"}, "tüm parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)", "tum parçaları"},
 		// The two positional entity ids come BEFORE the flags (runEntityMerge).
 		{[]string{"entity", "merge", "1", "2", "-h"}, "ayırt edici kanıt olgu id'si (zorunlu)", "ayirt edici kanit"},
-		{[]string{"undo", "-h"}, "geri al: bu trace_id'nin açık geri-alma penceresini tetikle", "acik geri-alma"},
+		// FIX-B-8 (owner decision G05-2): `kahya undo --trace` triggers EVERY
+		// open window of the trace, so the help text is plural now.
+		{[]string{"undo", "-h"}, "geri al: bu trace_id'nin açık geri-alma pencerelerini tetikle", "acik geri-alma"},
+		{[]string{"undo", "-h"}, "yalnız en yeni işlemi geri al (varsayılan: trace'teki tüm açık işlemler, yeniden eskiye)", "yalniz en yeni"},
 		{[]string{"approvals", "show", "-h"}, "makine-okunur JSON çıktısı", "makine-okur JSON"},
 	}
 	for _, c := range cases {

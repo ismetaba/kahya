@@ -8,8 +8,8 @@
 //     single-use grant Engine.Approve persisted for that call's OWN pending
 //     approval - bound to exactly these (task_id, tool, scope,
 //     approved_bytes_hash) - burns it, and answers ALLOW with a freshly
-//     minted token the tool
-//     consumes immediately (ConsumeToken is unchanged). The approved bytes
+//     minted token the tool consumes immediately (ConsumeToken; for a W1
+//     tool ConsumeTokenOp opens that operation's undo window, B-8). The approved bytes
 //     never pass back through the model: the parked call resumes with the
 //     very bytes the human saw (HANDOFF S5 #5 WYSIWYE).
 //   - PendingApprovalDecision: the read-only probe the server-side waiter
@@ -128,16 +128,10 @@ func (e *Engine) redeemApprovedGrant(ctx context.Context, in CheckInput, class A
 			return d, true
 		}
 	}
-	if class == ClassW1 {
-		// The redeemed W1 write earns the same 5-minute safety net an
-		// auto-allowed one gets (idempotent per task/tool/trace). G00 C-2:
-		// G05 B-8 moves window opening to ConsumeTokenOp and removes this.
-		if err := e.openUndoWindow(ctx, in.TaskID, in.Tool, in.TraceID); err != nil {
-			e.ledgerRaw(ctx, in.TraceID, "undo_window_open_failed", map[string]any{
-				"event": "undo_window_open_failed", "task_id": in.TaskID, "tool": in.Tool, "err": err.Error(),
-			})
-		}
-	}
+	// G00 C-2 / B-8: no undo window here. The redeemed W1 write earns the
+	// same 5-minute safety net an auto-allowed one gets, but only when the
+	// exchanged token above is consumed (ConsumeTokenOp) - one window per
+	// executed operation, never one per redemption.
 	e.ledgerRaw(ctx, in.TraceID, "approval_grant_redeemed", map[string]any{
 		"event": "approval_grant_redeemed", "task_id": in.TaskID, "tool": in.Tool, "class": class,
 		"scope": scope, "pending_approval_id": pendingID,

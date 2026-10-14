@@ -92,7 +92,7 @@ func TestGitCheckpointNeverRunsRepoFilterProgram(t *testing.T) {
 	if b, err := os.ReadFile(marker); err == nil {
 		t.Fatalf("fs_write's git checkpoint RAN the repo's clean filter on the host (marker %q)", strings.TrimSpace(string(b)))
 	}
-	if err := s.UndoWrite(context.Background(), "trace-ckpt"); err != nil {
+	if err := s.UndoWrite(context.Background(), out.OpID); err != nil {
 		t.Fatalf("UndoWrite (the checkpoint blob must be the raw pre-image): %v", err)
 	}
 	if got, _ := os.ReadFile(target); string(got) != original {

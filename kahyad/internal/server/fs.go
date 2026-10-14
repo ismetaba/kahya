@@ -11,11 +11,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/secretlane"
+	"kahya/kahyad/internal/store/sqlcgen"
 	mcpfs "kahya/mcp/fs"
 )
 
@@ -90,11 +92,19 @@ func (a enginePolicyClient) Check(ctx context.Context, tool, scope, taskID, trac
 	}, err
 }
 
-func (a enginePolicyClient) ConsumeToken(ctx context.Context, token, tool, class, scope, taskID, traceID string, toolInput []byte) error {
-	return a.engine.ConsumeToken(ctx, policy.ConsumeInput{
+// ConsumeToken returns the consumed token's op id (B-8: policy.
+// ConsumeResult.OpID, the approval_tokens.token_hash) - mcp/fs keys its
+// per-operation undo record by it; for a W1 token the engine has already
+// opened that operation's undo window.
+func (a enginePolicyClient) ConsumeToken(ctx context.Context, token, tool, class, scope, taskID, traceID string, toolInput []byte) (string, error) {
+	res, err := a.engine.ConsumeTokenOp(ctx, policy.ConsumeInput{
 		Token: token, Tool: tool, Class: policy.ActionClass(class), Scope: scope,
 		TaskID: taskID, TraceID: traceID, ToolInput: toolInput,
 	})
+	if err != nil {
+		return "", err
+	}
+	return res.OpID, nil
 }
 
 // NewFSPolicyClient constructs the plain (non-waiting) mcp/fs.PolicyClient
@@ -227,34 +237,43 @@ func (a fsLoggerAdapter) Info(event string, args ...any)  { a.l.Info(event, args
 func (a fsLoggerAdapter) Warn(event string, args ...any)  { a.l.Warn(event, args...) }
 func (a fsLoggerAdapter) Error(event string, args ...any) { a.l.Error(event, args...) }
 
-// dispatchFSUndo invokes the owning recipe (mcp/fs.Server.UndoWrite/
-// UndoDelete) for an undo_windows row whose tool this package recognizes,
-// AFTER kahyad/internal/policy.Engine.TriggerUndo has already flipped that
-// row to "triggered" and demoted the ladder state (this task's own
-// ambiguity-decision note: demotion/window bookkeeping and recipe
-// EXECUTION are two separate steps - TriggerUndo does the former
-// unconditionally, this does the latter, best-effort, for the tools that
-// have one implemented today). A tool this package does not recognize
-// (e.g. memory_write, whose own undo recipe is a future task) or a nil
-// fsServer is silently skipped - the ladder-state demotion already
-// happened regardless, which is the safety-relevant half of `kahya undo`.
-// Any recipe-execution error is logged but never surfaces as an error to
-// the /policy/undo or /policy/feedback caller - the window/demotion
-// half's success is what those endpoints report on.
-func (s *Server) dispatchFSUndo(ctx context.Context, traceID, tool string) {
-	if s.fsServer == nil {
-		return
+// undoRecipe* are the per-operation outcomes policyUndoOp.Recipe carries
+// (policy.go, B-8).
+const (
+	undoRecipeExecuted    = "executed"    // recipe ran, bytes restored
+	undoRecipeFailed      = "failed"      // recipe ran and errored (logged + surfaced)
+	undoRecipeNoRecord    = "no_record"   // window exists but the tool has no record (kahyad restarted mid-window, the op never completed, or a pre-0022 row)
+	undoRecipeUnsupported = "unsupported" // tool has no undo recipe (memory_write/memory_forget today) - the ladder demotion still applied
+)
+
+// dispatchFSUndo executes the owning recipe (mcp/fs.Server.UndoOp) for ONE
+// triggered undo_windows row (B-8: one call per row Engine.TriggerUndo
+// returned, newest first), AFTER TriggerUndo has already flipped it to
+// "triggered" and demoted the ladder state (W3-03's ambiguity-decision
+// note: demotion/window bookkeeping and recipe EXECUTION are two separate
+// steps). A tool this package has no recipe for (memory_write, whose own
+// undo recipe is a future task) or a nil fsServer reports "unsupported" -
+// the demotion already happened regardless, which is the safety-relevant
+// half of `kahya undo`. A missing record is "no_record" and is never
+// guessed at (fail-closed: nothing is restored). Never returns an error:
+// the window/demotion half is what /policy/undo answers ok on; the recipe
+// outcome is surfaced per op in the response and logged under traceID.
+func (s *Server) dispatchFSUndo(ctx context.Context, traceID string, row sqlcgen.UndoWindow) policyUndoOp {
+	op := policyUndoOp{OpID: row.OpID, Tool: row.Tool, TaskID: row.TaskID, Recipe: undoRecipeUnsupported}
+	if s.fsServer == nil || (row.Tool != "fs_write" && row.Tool != "fs_delete") {
+		return op
 	}
-	var err error
-	switch tool {
-	case "fs_write":
-		err = s.fsServer.UndoWrite(ctx, traceID)
-	case "fs_delete":
-		err = s.fsServer.UndoDelete(ctx, traceID)
+	res, err := s.fsServer.UndoOp(ctx, traceID, row.OpID)
+	switch {
+	case errors.Is(err, mcpfs.ErrNoUndoRecord):
+		op.Recipe, op.Error = undoRecipeNoRecord, err.Error()
+		s.log.With(traceID).Warn("fs_undo_no_record", "tool", row.Tool, "op_id", row.OpID, "task_id", row.TaskID)
+	case err != nil:
+		op.Recipe, op.Error = undoRecipeFailed, err.Error()
+		op.Path = res.CanonicalPath
+		s.log.With(traceID).Error("fs_undo_recipe_failed", "tool", row.Tool, "op_id", row.OpID, "task_id", row.TaskID, "err", err.Error())
 	default:
-		return
+		op.Recipe, op.Path = undoRecipeExecuted, res.CanonicalPath
 	}
-	if err != nil {
-		s.log.With(traceID).Error("fs_undo_recipe_failed", "tool", tool, "err", err.Error())
-	}
+	return op
 }

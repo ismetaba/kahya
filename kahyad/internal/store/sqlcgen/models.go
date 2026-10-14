@@ -238,4 +238,6 @@ type UndoWindow struct {
 	OpenedAt string `json:"opened_at"`
 	Deadline string `json:"deadline"`
 	State    string `json:"state"`
+	OpID     string `json:"op_id"`
+	Scope    string `json:"scope"`
 }

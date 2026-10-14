@@ -572,7 +572,7 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	if decision.Result != mcpfs.PolicyResultAllow {
 		return RunOutput{}, errors.New(decision.Reason)
 	}
-	if err := r.Policy.ConsumeToken(ctx, decision.Token, "shell_docker", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	if _, err := r.Policy.ConsumeToken(ctx, decision.Token, "shell_docker", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: onay jetonu tüketilemedi: %w", err)
 	}
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token

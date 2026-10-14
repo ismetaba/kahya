@@ -347,37 +347,49 @@ func (c *Client) PolicyPromote(ctx context.Context, traceID, tool, class, scope 
 	return pr.Level, nil
 }
 
-// PolicyUndo calls POST /policy/undo {trace_id} (`kahya undo --trace
-// <id>`, W3-02). Returns the tool name whose undo window was triggered.
-func (c *Client) PolicyUndo(ctx context.Context, traceID, targetTraceID string) (string, error) {
-	body, err := json.Marshal(map[string]string{"trace_id": targetTraceID})
+// UndoOp mirrors kahyad's POST /policy/undo per-operation outcome row
+// (kahyad/internal/server.policyUndoOp, B-8).
+type UndoOp struct {
+	OpID   string `json:"op_id"`
+	Tool   string `json:"tool"`
+	TaskID string `json:"task_id"`
+	Path   string `json:"path,omitempty"`
+	Recipe string `json:"recipe"`
+	Error  string `json:"error,omitempty"`
+}
+
+// PolicyUndo calls POST /policy/undo {trace_id, last} (`kahya undo --trace
+// <id> [--last]`, W3-02 + B-8). Returns every triggered operation, newest
+// first, each with its recipe outcome.
+func (c *Client) PolicyUndo(ctx context.Context, traceID, targetTraceID string, last bool) ([]UndoOp, error) {
+	body, err := json.Marshal(map[string]any{"trace_id": targetTraceID, "last": last})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req, err := c.newRequest(ctx, http.MethodPost, "/policy/undo", traceID, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	var ur struct {
-		OK    bool   `json:"ok"`
-		Tool  string `json:"tool,omitempty"`
-		Error string `json:"error,omitempty"`
+		OK    bool     `json:"ok"`
+		Ops   []UndoOp `json:"ops,omitempty"`
+		Error string   `json:"error,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ur); err != nil {
-		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: decode response: %w", err)}
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: decode response: %w", err)}
 	}
 	if resp.StatusCode != http.StatusOK || !ur.OK {
 		if ur.Error != "" {
-			return "", fmt.Errorf("%s", ur.Error)
+			return nil, fmt.Errorf("%s", ur.Error)
 		}
-		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: status %d", resp.StatusCode)}
+		return nil, &unreachableError{sock: c.sock, err: fmt.Errorf("policy/undo: status %d", resp.StatusCode)}
 	}
-	return ur.Tool, nil
+	return ur.Ops, nil
 }
 
 // approvalListRow mirrors kahyad's GET /policy/approvals list row shape

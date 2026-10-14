@@ -43,6 +43,16 @@ const tokenTTL = 10 * time.Minute
 // sub-reason, as a token_verify_failed event).
 var ErrTokenInvalid = errors.New("policy: approval token invalid, expired, or already consumed")
 
+// ErrUndoWindowUnavailable is returned by ConsumeTokenOp when a W1 token
+// verified and was burned but its operation's undo_windows row could not be
+// opened (B-8, owner decision G05-5 / G00 H-1: fail-closed only - a W1 side
+// effect executed WITHOUT its undo window would silently break HANDOFF S4's
+// L2 promise "W1 (5-dk geri-alma + defter)"). The caller must not execute;
+// the token is already burned, so it can never be replayed, and the worker
+// obtains a fresh one with a new Check. Ledgered undo_window_open_failed;
+// nothing is demoted (the caller violated nothing).
+var ErrUndoWindowUnavailable = errors.New("policy: undo window could not be opened for this W1 operation; obtain a fresh token")
+
 // approvedBytesHash is the sha256(hex) of toolInput's WYSIWYE-
 // canonicalized form (kahyad/internal/canon.CanonicalizeBytes: NFC-
 // normalize, strip bidi/zero-width/other-Cf-category control code points -
@@ -189,14 +199,43 @@ func (e *Engine) failFromHash(ctx context.Context, in ConsumeInput, hash, reason
 	return ErrTokenInvalid
 }
 
-// ConsumeToken verifies and atomically consumes a one-time approval token
-// (POST /policy/consume-token). Success (nil error) means the caller may
-// proceed to execute; ANY non-nil error means fail-closed DENY - the
+// ConsumeResult is ConsumeTokenOp's success payload.
+type ConsumeResult struct {
+	// OpID is the consumed token's approval_tokens.token_hash - the
+	// per-operation identity every W1 undo_windows row and the owning
+	// tool's own undo record are keyed by (B-8). It is sha256(hex) of the
+	// 32 random token bytes, never the raw token itself, so handing it to
+	// the tool (and ledgering it) leaks nothing a replay could use: the
+	// token is already burned by the time OpID exists.
+	OpID string
+}
+
+// ConsumeToken is ConsumeTokenOp without the result - kept for every
+// caller that only needs the error (mcp.go's policyGateMiddleware,
+// eval/redteam). A W1 token consumed through it still opens its
+// operation's undo window.
+func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
+	_, err := e.ConsumeTokenOp(ctx, in)
+	return err
+}
+
+// ConsumeTokenOp verifies and atomically consumes a one-time approval
+// token (POST /policy/consume-token). Success (nil error) means the caller
+// may proceed to execute; ANY non-nil error means fail-closed DENY - the
 // token is already burned (or was never valid) either way, and a
 // token_verify_failed ledger event + demotion of the token's REAL
 // (tool,class,scope) - never the caller-supplied ConsumeInput fields -
 // has already been recorded.
-func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
+//
+// On success it returns the consumed token's OpID and, for a W1-class
+// token, has ALREADY opened that operation's undo_windows row (B-8: the
+// window opens when the side effect actually executes, never at
+// Check/Approve/redemption time - a token nobody consumes executes nothing
+// and therefore has nothing to undo). The window carries the token's REAL
+// bound task_id/trace_id/scope (the row's, never whatever the caller
+// claims). If that row cannot be written the call fails with
+// ErrUndoWindowUnavailable (fail-closed, owner decision G05-5).
+func (e *Engine) ConsumeTokenOp(ctx context.Context, in ConsumeInput) (ConsumeResult, error) {
 	raw, err := hex.DecodeString(in.Token)
 	if err != nil || len(raw) != tokenBytesLen {
 		// Malformed input carries no token hash at all - there is no row to
@@ -206,7 +245,7 @@ func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
 		e.ledgerRaw(ctx, in.TraceID, "token_verify_failed", map[string]any{
 			"event": "token_verify_failed", "tool": in.Tool, "task_id": in.TaskID, "reason": "malformed_token",
 		})
-		return ErrTokenInvalid
+		return ConsumeResult{}, ErrTokenInvalid
 	}
 	hash := rawBytesHash(raw)
 	now := e.nowUTC()
@@ -221,14 +260,14 @@ func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
 	if err != nil {
 		// MINOR 4: a DB error on the burn UPDATE itself must still ledger
 		// token_verify_failed rather than return a bare, unledgered error.
-		return e.failFromHash(ctx, in, hash, "update_error")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "update_error")
 	}
 	if affected == 0 {
 		// Replay (already consumed) or a hash nobody ever minted - either
 		// way, failFromHash recovers whatever REAL row exists (a replay's
 		// row still exists, already consumed) and demotes that, not
 		// whatever in.Tool/in.Class/in.Scope claims.
-		return e.failFromHash(ctx, in, hash, "replay_or_unknown")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "replay_or_unknown")
 	}
 
 	row, err := e.store.GetApprovalToken(ctx, hash)
@@ -239,18 +278,31 @@ func (e *Engine) ConsumeToken(ctx context.Context, in ConsumeInput) error {
 		// re-read will most likely fail identically, so nothing further is
 		// demoted at the tool level here either - there is no reliably
 		// recovered real triple to target.
-		return e.failFromHash(ctx, in, hash, "lookup_error")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "lookup_error")
 	}
 
 	if row.TaskID != in.TaskID || row.Tool != in.Tool {
-		return e.failFromHash(ctx, in, hash, "context_mismatch")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "context_mismatch")
 	}
 	expiresAt, perr := time.Parse(time.RFC3339Nano, row.ExpiresAt)
 	if perr != nil || now.After(expiresAt) {
-		return e.failFromHash(ctx, in, hash, "expired")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "expired")
 	}
 	if row.ApprovedBytesHash != approvedBytesHash(in.ToolInput) {
-		return e.failFromHash(ctx, in, hash, "hash_mismatch")
+		return ConsumeResult{}, e.failFromHash(ctx, in, hash, "hash_mismatch")
 	}
-	return nil
+
+	if ActionClass(row.Class) == ClassW1 {
+		// Owner decision G05-5 / G00 H-1: fail-closed only. The token is
+		// already burned, so refusing here can never be replayed; the caller
+		// gets an error (the tool refuses to execute) and must obtain a fresh
+		// token. Nothing is demoted - the caller violated nothing.
+		if err := e.openUndoWindow(ctx, row.TaskID, row.Tool, row.TraceID, hash, row.Scope); err != nil {
+			e.ledgerRaw(ctx, row.TraceID, "undo_window_open_failed", map[string]any{
+				"event": "undo_window_open_failed", "task_id": row.TaskID, "tool": row.Tool, "op_id": hash, "err": err.Error(),
+			})
+			return ConsumeResult{}, ErrUndoWindowUnavailable
+		}
+	}
+	return ConsumeResult{OpID: hash}, nil
 }

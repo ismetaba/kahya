@@ -243,34 +243,28 @@ SET consumed_at = ?
 WHERE token_hash = ? AND consumed_at IS NULL;
 
 -- name: InsertUndoWindow :one
-INSERT INTO undo_windows (task_id, tool, trace_id, opened_at, deadline, state)
-VALUES (?, ?, ?, ?, ?, 'open')
-RETURNING id, task_id, tool, trace_id, opened_at, deadline, state;
+-- B-8 (0022_undo_windows_per_op.sql): one row per EXECUTED W1 operation,
+-- inserted by kahyad/internal/policy.Engine.ConsumeTokenOp only. op_id =
+-- the consumed token's approval_tokens.token_hash (unique per executed
+-- side effect - idx_undo_windows_op_id); scope = that token's real bound
+-- scope, so an undo demotes the real (tool, class, scope) triple.
+INSERT INTO undo_windows (task_id, tool, trace_id, opened_at, deadline, state, op_id, scope)
+VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+RETURNING id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope;
 
--- name: GetOpenUndoWindowByTrace :one
--- Sessions/tasks are not guaranteed to open exactly one undo window per
--- trace_id, so this returns the most recently opened OPEN one - the same
--- "most recent wins" convention GetTaskBySession above already uses.
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+-- name: ListOpenUndoWindowsByTrace :many
+-- B-8: every still-OPEN window for one trace, NEWEST FIRST. id is an
+-- AUTOINCREMENT integer, strictly increasing within one brain.db, so
+-- ORDER BY id DESC is the exact reverse of consume (= execution) order -
+-- the LIFO order `kahya undo --trace <id>` undoes in (a later write to the
+-- same file must be reverted before an earlier one).
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope
 FROM undo_windows
 WHERE trace_id = ? AND state = 'open'
-ORDER BY opened_at DESC
-LIMIT 1;
-
--- name: GetOpenUndoWindowByTaskToolTrace :one
--- Idempotent-open lookup (post-security-review amendment): Engine.Check's
--- W1 auto-allow path (and Approve's W1 bookkeeping) call this FIRST and
--- reuse an already-OPEN window for the same (task_id, tool, trace_id)
--- instead of opening a second one on a retried call - a retry must never
--- leave multiple simultaneously-open undo windows for the same action.
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
-FROM undo_windows
-WHERE task_id = ? AND tool = ? AND trace_id = ? AND state = 'open'
-ORDER BY opened_at DESC
-LIMIT 1;
+ORDER BY id DESC;
 
 -- name: ListOpenUndoWindows :many
-SELECT id, task_id, tool, trace_id, opened_at, deadline, state
+SELECT id, task_id, tool, trace_id, opened_at, deadline, state, op_id, scope
 FROM undo_windows
 WHERE state = 'open';
 

@@ -279,7 +279,7 @@ func (r *Runner) run(ctx context.Context, traceID, taskID, tool string, lang Lan
 	if decision.Result != PolicyResultAllow {
 		return ScriptOutput{}, errors.New(decision.Reason)
 	}
-	if err := r.Policy.ConsumeToken(ctx, decision.Token, tool, decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
+	if _, err := r.Policy.ConsumeToken(ctx, decision.Token, tool, decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return ScriptOutput{}, fmt.Errorf("%s: onay jetonu tüketilemedi: %w", tool, err)
 	}
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token

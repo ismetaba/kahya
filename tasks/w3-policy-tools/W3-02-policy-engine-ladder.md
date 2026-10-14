@@ -38,7 +38,7 @@ W1 undo window comes from the ladder table row: `L2 | Eşlikçi | R, W1 (5-dk ge
 
 ## Steps
 1. Decision algorithm in `engine.go`: look up tool registration in loaded policy (W3-01); missing tool ⇒ DENY. Look up `autonomy_state` for (tool, class, scope); missing row ⇒ L0. Apply the ladder table. Result ∈ {ALLOW, NEEDS_APPROVAL, DENY}. Every decision writes an `events` row: `{event:"policy_decision", tool, class, scope, level, decision, trace_id, task_id}`.
-2. ALLOW for a W1 at L2+ opens an `undo_windows` row with `deadline = now + 5m` and schedules finalization; ledger event `undo_window_opened` / `undo_window_expired`.
+2. ALLOW for a W1 at L2+ opens an `undo_windows` row with `deadline = now + 5m` and schedules finalization; ledger event `undo_window_opened` / `undo_window_expired`. *(B-8 ile değişti: pencere artık jeton tüketiminde, işlem başına açılır — Check tek başına satır açmaz.)*
 3. NEEDS_APPROVAL response includes a `pending_approval_id`; when an approval surface reports approval via `/policy/feedback`, mint a token: 32 random bytes, store SHA-256 only, TTL 10 minutes, single-use, bound to `task_id` + `approved_bytes_hash` (hash supplied by the WYSIWYE pipeline once W3-06 lands; until then bind to the serialized tool-call args).
 4. `POST /policy/consume-token`: side-effectful MCP tools (W3-03/04/09, memory_write) MUST call this immediately before executing; verify unexpired + unconsumed + matching `approved_bytes_hash`; mark consumed atomically (single SQLite UPDATE ... WHERE consumed_at IS NULL). Any mismatch ⇒ DENY + ledger event `token_verify_failed`.
 5. Promotion/demotion in `/policy/feedback`: approve ⇒ `consecutive_approvals++`; at 20 with 0 denials emit ledger event `promotion_suggested` + (once W3-07 exists) a Telegram/CLI notification — level does NOT change. Deny, undo, or violation (e.g. `token_verify_failed`, WYSIWYE reject) ⇒ level minus one (floor L0), counter reset, ledger event `demoted`.
@@ -49,7 +49,7 @@ W1 undo window comes from the ladder table row: `L2 | Eşlikçi | R, W1 (5-dk ge
 
 ## Acceptance criteria
 - [ ] `go test ./kahyad/internal/policy/...` green in `make test`; includes the W3-never-ALLOW test and the token single-use test.
-- [ ] `curl --unix-socket ... -d '{"tool":"fs_write","class":"W1",...}' http://kahyad/policy/check` at fresh state (L0) returns NEEDS_APPROVAL; after `kahya autonomy promote fs_write W1 <scope>` to L2, same call returns ALLOW and `sqlite3 brain.db "SELECT * FROM undo_windows"` shows an open window.
+- [ ] `curl --unix-socket ... -d '{"tool":"fs_write","class":"W1",...}' http://kahyad/policy/check` at fresh state (L0) returns NEEDS_APPROVAL; after `kahya autonomy promote fs_write W1 <scope>` to L2, same call returns ALLOW and `sqlite3 brain.db "SELECT * FROM undo_windows"` shows an open window. *(B-8 ile değişti: pencere artık jeton tüketiminde, işlem başına açılır — Check tek başına satır açmaz.)*
 - [ ] Ledger check: every decision visible via `sqlite3 brain.db "SELECT json_extract(payload,'$.event') FROM events WHERE json_extract(payload,'$.event') LIKE 'policy_%'"` with `trace_id` populated.
 - [ ] 20 consecutive approvals produce a `promotion_suggested` event and NO `autonomy_state.level` change (test asserts both).
 - [ ] A replayed (already-consumed) token is rejected and a `token_verify_failed` + `demoted` event pair appears in the ledger (test).

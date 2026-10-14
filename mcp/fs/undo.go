@@ -6,7 +6,11 @@
 // undo_executed.
 //
 // The undo record itself is kept IN-MEMORY on this package's Server,
-// keyed by trace_id, rather than persisted to brain.db: kahyad is a
+// keyed by op_id (kahyad's approval_tokens.token_hash for the consumed
+// token; B-8), one record per executed fs_write/fs_delete, so a task that
+// performs N writes keeps N independently undoable records (a trace holds
+// a whole task's worth of operations - keying by trace_id kept only the
+// last one). It is not persisted to brain.db: kahyad is a
 // single long-running process and the undo window is only 5 minutes, so
 // an in-memory registry is the simplest correct implementation for this
 // task's scope. The tradeoff (documented, not hidden): a kahyad restart
@@ -33,8 +37,11 @@ import (
 )
 
 // undoRecord is one pending (not-yet-undone, not-yet-expired) undo entry,
-// keyed by trace_id in undoRegistry.
+// keyed by OpID in undoRegistry.
 type undoRecord struct {
+	// OpID is this record's key: kahyad's per-operation id for the
+	// one-time token this operation consumed (B-8). Never "".
+	OpID          string
 	Tool          string // "fs_write" | "fs_delete"
 	CanonicalPath string // CanonicalPath.Match — for ledger/display only
 	OpPath        string // CanonicalPath.Op — the actual path to restore to/from
@@ -60,7 +67,9 @@ type undoRecord struct {
 	TrashPath string
 }
 
-// undoRegistry is a small in-memory, mutex-guarded map[trace_id]undoRecord.
+// undoRegistry is a small in-memory, mutex-guarded map[op_id]undoRecord
+// (B-8: per operation, never per trace - a trace holds a whole task's
+// worth of operations).
 type undoRegistry struct {
 	mu      sync.Mutex
 	records map[string]undoRecord
@@ -70,37 +79,85 @@ func newUndoRegistry() *undoRegistry {
 	return &undoRegistry{records: make(map[string]undoRecord)}
 }
 
-func (r *undoRegistry) Put(traceID string, rec undoRecord) {
+// Put registers rec under rec.OpID. A duplicate OpID is a programming
+// error (kahyad never consumes the same token twice, and a locally minted
+// id is random) - the later record wins, exactly like a map assignment;
+// the caller's own fs_write/fs_delete ledger line carries the op_id.
+func (r *undoRegistry) Put(rec undoRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.records[traceID] = rec
+	r.records[rec.OpID] = rec
 }
 
-func (r *undoRegistry) Get(traceID string) (undoRecord, bool) {
+func (r *undoRegistry) Get(opID string) (undoRecord, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.records[traceID]
+	rec, ok := r.records[opID]
 	return rec, ok
 }
 
-func (r *undoRegistry) Delete(traceID string) {
+func (r *undoRegistry) Delete(opID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.records, traceID)
+	delete(r.records, opID)
 }
 
-// ErrNoUndoRecord is returned by UndoWrite/UndoDelete when no undo record
-// is registered for trace_id (kahyad restarted mid-window, the window
-// belongs to a different tool entirely, or this trace's record was
-// already consumed by an earlier undo/purge).
-var ErrNoUndoRecord = errors.New("fs: no undo record for this trace")
+// countForTrace reports how many records a trace still holds (tests).
+func (r *undoRegistry) countForTrace(traceID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, rec := range r.records {
+		if rec.TraceID == traceID {
+			n++
+		}
+	}
+	return n
+}
+
+// ErrNoUndoRecord is returned by UndoOp/UndoWrite/UndoDelete when no undo
+// record is registered for an op_id (kahyad restarted mid-window, the op
+// belongs to another trace or another tool, the op never completed its
+// write, or the record was already consumed by an earlier undo/purge).
+var ErrNoUndoRecord = errors.New("fs: no undo record for this operation")
+
+// UndoResult is UndoOp's success payload (what `kahya undo` prints).
+type UndoResult struct {
+	OpID          string
+	Tool          string // "fs_write" | "fs_delete"
+	CanonicalPath string
+}
+
+// UndoOp executes the recipe for ONE registered operation (B-8): kahyad
+// calls this once per undo_windows row Engine.TriggerUndo flipped, in the
+// order TriggerUndo returned them (newest first). traceID is a
+// defense-in-depth check: a record registered under a different trace is
+// reported as ErrNoUndoRecord, never executed, so a caller that got the
+// trace/op pairing wrong cannot revert another task's file. "" skips the
+// trace check (in-process callers that already hold the right record).
+func (s *Server) UndoOp(ctx context.Context, traceID, opID string) (UndoResult, error) {
+	rec, ok := s.registry.Get(opID)
+	if !ok || (traceID != "" && rec.TraceID != traceID) {
+		return UndoResult{}, ErrNoUndoRecord
+	}
+	res := UndoResult{OpID: opID, Tool: rec.Tool, CanonicalPath: rec.CanonicalPath}
+	switch rec.Tool {
+	case "fs_write":
+		return res, s.UndoWrite(ctx, opID)
+	case "fs_delete":
+		return res, s.UndoDelete(ctx, opID)
+	default:
+		return UndoResult{}, ErrNoUndoRecord
+	}
+}
 
 // UndoWrite implements fs_write's undo recipe (HANDOFF §4 locked recipe:
 // "dosya yazımı -> işlem-öncesi git checkpoint"). kahyad calls this AFTER
 // kahyad/internal/policy.Engine.TriggerUndo has already flipped the
 // owning undo_windows row to "triggered" and demoted the ladder state —
-// see kahyad/internal/server's dispatch wiring; this function's only job
-// is the RECIPE (restore bytes), not the ladder bookkeeping.
+// see kahyad/internal/server's dispatch wiring (via UndoOp); this
+// function's only job is the RECIPE (restore bytes), not the ladder
+// bookkeeping. opID addresses ONE operation's record (B-8).
 //
 // A target that did NOT exist before the write (HadPrev false) is undone
 // by moving the file this package created into Trash — never a plain
@@ -114,8 +171,8 @@ var ErrNoUndoRecord = errors.New("fs: no undo record for this trace")
 // mismatch means something is wrong with the stored pre-image, and
 // writing back unverified bytes could do more damage than refusing), and
 // then written back atomically.
-func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
-	rec, ok := s.registry.Get(traceID)
+func (s *Server) UndoWrite(ctx context.Context, opID string) error {
+	rec, ok := s.registry.Get(opID)
 	if !ok || rec.Tool != "fs_write" {
 		return ErrNoUndoRecord
 	}
@@ -124,8 +181,8 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 		if _, err := moveToTrashConfined(rec.AncestorDir, rec.Rel, s.TrashDir, filepath.Base(rec.OpPath)); err != nil {
 			return fmt.Errorf("fs undo_write: remove newly-created file: %w", err)
 		}
-		s.ledgerUndoExecuted(ctx, traceID, "fs_write", rec.CanonicalPath)
-		s.registry.Delete(traceID)
+		s.ledgerUndoExecuted(ctx, rec.TraceID, "fs_write", rec.CanonicalPath, opID)
+		s.registry.Delete(opID)
 		return nil
 	}
 
@@ -154,8 +211,8 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 		_ = os.Remove(rec.CopyPath) // best-effort cleanup; the undo itself already succeeded
 	}
 
-	s.ledgerUndoExecuted(ctx, traceID, "fs_write", rec.CanonicalPath)
-	s.registry.Delete(traceID)
+	s.ledgerUndoExecuted(ctx, rec.TraceID, "fs_write", rec.CanonicalPath, opID)
+	s.registry.Delete(opID)
 	return nil
 }
 
@@ -164,8 +221,8 @@ func (s *Server) UndoWrite(ctx context.Context, traceID string) error {
 // (server.go) handles the copy+remove recipe (never a plain unlink/
 // copy-loses-the-original shortcut), confined to rec.AncestorDir exactly
 // like a fresh write (BLOCKER fix).
-func (s *Server) UndoDelete(ctx context.Context, traceID string) error {
-	rec, ok := s.registry.Get(traceID)
+func (s *Server) UndoDelete(ctx context.Context, opID string) error {
+	rec, ok := s.registry.Get(opID)
 	if !ok || rec.Tool != "fs_delete" {
 		return ErrNoUndoRecord
 	}
@@ -176,40 +233,43 @@ func (s *Server) UndoDelete(ctx context.Context, traceID string) error {
 		return fmt.Errorf("fs undo_delete: restore from trash: %w", err)
 	}
 
-	s.ledgerUndoExecuted(ctx, traceID, "fs_delete", rec.CanonicalPath)
-	s.registry.Delete(traceID)
+	s.ledgerUndoExecuted(ctx, rec.TraceID, "fs_delete", rec.CanonicalPath, opID)
+	s.registry.Delete(opID)
 	return nil
 }
 
 // ledgerUndoExecuted writes the undo_executed ledger event both
 // UndoWrite and UndoDelete produce on success (this task's spec,
-// verbatim: "Both write ledger events undo_executed").
-func (s *Server) ledgerUndoExecuted(ctx context.Context, traceID, tool, canonicalPath string) {
+// verbatim: "Both write ledger events undo_executed"), under the
+// operation's own trace, with its op_id (B-8).
+func (s *Server) ledgerUndoExecuted(ctx context.Context, traceID, tool, canonicalPath, opID string) {
 	s.logAndLedger(ctx, traceID, "undo_executed", map[string]any{
-		"event": "undo_executed", "tool": tool, "canonical_path": canonicalPath,
+		"event": "undo_executed", "tool": tool, "canonical_path": canonicalPath, "op_id": opID,
 	})
 }
 
-// PurgeExpired removes any fallback pre-image copy (under UndoDir) still
-// on disk for traceID and forgets its registry entry (this task's spec:
-// "Purge fallback pre-image copies when the 5-minute window expires").
-// kahyad wires this directly as kahyad/internal/policy.Engine's
-// undo-window-expiry hook (SetUndoExpiryHook) — see kahyad/internal/
-// server's wiring in main.go. Git checkpoint blobs need no purge here
-// (unreferenced blobs are reclaimed by the repo's own eventual `git gc`,
-// per this task's own spec). Safe to call for a trace_id this package
-// never recorded (e.g. another tool's undo window expired, or fs_delete's
+// PurgeExpired removes the fallback pre-image copy (under UndoDir) still
+// on disk for ONE operation (B-8: opID, the expired undo_windows row's
+// op_id) and forgets its registry entry (this task's spec: "Purge fallback
+// pre-image copies when the 5-minute window expires"). kahyad wires this
+// directly as kahyad/internal/policy.Engine's undo-window-expiry hook
+// (SetUndoExpiryHook) — see kahyad/internal/server's wiring in main.go.
+// traceID/taskID/tool are for the log line only (the hook's signature).
+// Git checkpoint blobs need no purge here (unreferenced blobs are
+// reclaimed by the repo's own eventual `git gc`, per this task's own
+// spec). Safe to call for an op this package never recorded (another
+// tool's window, a legacy pre-0022 row with op_id "", or fs_delete's
 // record — which has no CopyPath to purge) — then simply a no-op beyond
 // forgetting the registry entry.
-func (s *Server) PurgeExpired(traceID, taskID, tool string) {
-	rec, ok := s.registry.Get(traceID)
+func (s *Server) PurgeExpired(traceID, taskID, tool, opID string) {
+	rec, ok := s.registry.Get(opID)
 	if !ok {
 		return
 	}
 	if rec.CopyPath != "" {
 		if err := os.Remove(rec.CopyPath); err != nil && !os.IsNotExist(err) {
-			s.Log.Warn("fs_undo_purge_error", "path", rec.CopyPath, "task_id", taskID, "tool", tool, "err", err.Error())
+			s.Log.With(traceID).Warn("fs_undo_purge_error", "path", rec.CopyPath, "task_id", taskID, "tool", tool, "op_id", opID, "err", err.Error())
 		}
 	}
-	s.registry.Delete(traceID)
+	s.registry.Delete(opID)
 }
