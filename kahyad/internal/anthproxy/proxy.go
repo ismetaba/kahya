@@ -90,6 +90,11 @@ const (
 	// retries were exhausted (task spec step 3), right before
 	// ProxyConfig.OnCloudUnreachable is invoked.
 	EventCloudUnreachable = "proxy.cloud_unreachable"
+	// EventInboundCanceled (FIX-I-6, JSONL only): the worker's own request
+	// was cancelled (worker died, timeout/halt/shutdown kill, hang-up)
+	// while an upstream attempt was in flight. Not an upstream verdict: no
+	// task callback fires; whoever cancelled the worker decides the task.
+	EventInboundCanceled = "proxy.inbound_canceled"
 )
 
 // MsgCloudUnreachableMarker is embedded in the Anthropic-shaped error
@@ -1051,13 +1056,29 @@ func undecodedContentEncoding(resp *http.Response) string {
 
 // handleUpstreamError is httputil.ReverseProxy's ErrorHandler: it fires
 // whenever Transport.RoundTrip (retryTransport, retry.go) returns a
-// non-nil error - which, per that type's own doc comment, happens in
-// exactly one case: every inline retry attempt classified Retryable and
-// the budget (MaxInlineRetries) ran out (ErrRetriesExhausted). Any OTHER
-// RoundTrip-level error (a bug, not a classified outcome) still falls
+// non-nil error - ErrInboundCanceled (the worker went away), ErrRetriesExhausted
+// (every inline attempt classified Retryable and MaxInlineRetries ran
+// out) or ErrNonRetryable (a transport-level NonRetryable failure). Any
+// OTHER RoundTrip-level error (a bug, not a classified outcome) still falls
 // through to the generic 502 - this proxy never invents retry behavior
 // beyond what retryTransport already decided.
+//
+// FIX-I-6: ErrInboundCanceled (the worker's own request was cancelled
+// mid-attempt) is checked FIRST and fires no callback at all: the task's
+// fate belongs to whoever cancelled the worker (task timeout -> resume
+// scan, halt -> user_halted, shutdown -> resume at boot), never to this
+// proxy. Only a JSONL line records it.
 func (p *Proxy) handleUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrInboundCanceled) {
+		if p.cfg.JSONLLog != nil {
+			attempts := 0
+			if data, _ := r.Context().Value(reqDataCtxKey{}).(*reqData); data != nil {
+				attempts = data.RetryAttempts
+			}
+			p.cfg.JSONLLog.With(p.cfg.TraceID).Info(EventInboundCanceled, "task_id", p.cfg.TaskID, "attempts", attempts)
+		}
+		return
+	}
 	if errors.Is(err, ErrRetriesExhausted) {
 		p.onCloudUnreachable(r)
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", MsgCloudUnreachableMarker)

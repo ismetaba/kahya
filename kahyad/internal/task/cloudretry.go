@@ -54,6 +54,11 @@ const (
 	// immediately path and the give-up-after-24h path, distinguished by
 	// the payload's "reason" field.
 	EventCloudTaskFailed = "task.failed"
+	// EventCloudFailureSkipped (FIX-I-6): a NonRetryable callback arrived
+	// for a task that is no longer in a state 'failed' can be reached from
+	// (a halt won the race, an earlier callback already failed it) - no
+	// transition, no notification; this row records the decision.
+	EventCloudFailureSkipped = "task.cloud_failure_skipped"
 )
 
 // defaultCloudRetrySchedule mirrors config.Config's own cloud_retry_task_
@@ -215,7 +220,18 @@ func (c *CloudRetry) giveUp(ctx context.Context, traceID, taskID string, t sqlcg
 // with the status/reason code, notify with the exact non-retryable
 // Turkish string (<sebep> = reasonID, a short English API error id -
 // cloudretry.ReasonForStatus).
+//
+// FIX-I-6 step 4: a task that already left every state 'failed' is legal
+// from (user_halted - a halt won the race -, failed - an earlier callback
+// -, done) is left alone: no illegal-transition attempt, no second
+// notification, one EventCloudFailureSkipped row.
 func (c *CloudRetry) FailNonRetryable(ctx context.Context, traceID, taskID, reasonID string) error {
+	if t, err := c.store.GetTaskByID(ctx, taskID); err == nil && !IsLegalTransition(t.Status, StatusFailed) {
+		c.ledgerRaw(ctx, traceID, EventCloudFailureSkipped, map[string]any{
+			"task_id": taskID, "reason": reasonID, "status": t.Status,
+		})
+		return nil
+	}
 	if err := c.machine.Transition(ctx, traceID, taskID, StatusFailed); err != nil {
 		return fmt.Errorf("task: cloudretry fail non-retryable transition: %w", err)
 	}

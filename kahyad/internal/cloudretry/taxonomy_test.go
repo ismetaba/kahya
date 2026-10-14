@@ -88,6 +88,28 @@ func TestClassifyTransportErrors(t *testing.T) {
 	}
 }
 
+// TestClassifyContextCanceledIsRetryable (FIX-I-6): a cancelled caller is
+// not a verdict about the upstream. anthproxy's retryTransport
+// short-circuits an inbound cancel (ErrInboundCanceled) before it ever
+// classifies; this row is the defense-in-depth half - a bare or wrapped
+// context.Canceled must never read as "the cloud rejected this task".
+func TestClassifyContextCanceledIsRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"context_canceled", context.Canceled},
+		{"context_canceled_wrapped", fmt.Errorf("Post \"https://api.anthropic.com/v1/messages\": %w", context.Canceled)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Classify(0, c.err); got != Retryable {
+				t.Errorf("Classify(0, %v) = %v, want Retryable", c.err, got)
+			}
+		})
+	}
+}
+
 // TestClassifyStatusTakesPrecedenceOverError proves a non-zero status
 // always wins even when err happens to also be non-nil (e.g. a body-read
 // glitch after a real error-status response arrived) - the task's own

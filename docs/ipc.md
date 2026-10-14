@@ -566,6 +566,22 @@ with `event: error`, message
 `"Görev zaman aşımına uğradı (%d dk)."` (minutes substituted in);
 `tasks.state` → `error`; ledger `task_timeout`.
 
+**A killed worker is never a cloud failure (FIX-I-6):** when the worker
+dies or is killed (task timeout, halt, shutdown) while one of its model
+calls is open through the per-task proxy, the proxy sees its *inbound*
+request cancelled. `retryTransport` returns `anthproxy.ErrInboundCanceled`
+for it — checked before the cloud-error taxonomy, so it is never retried,
+never parked and never `OnNonRetryableFailure` — and the proxy only writes
+the JSONL line `proxy.inbound_canceled` (`task_id`, `attempts`). The task's
+status is decided by whoever cancelled the worker: a timeout leaves it
+`executing` for the resume scan, a halt leaves `user_halted`. A pending
+inline-retry backoff sleep (up to 60 s with `Retry-After`) also ends on the
+cancel. `cloudretry.Classify` treats a bare `context.Canceled` as
+Retryable (defense in depth), and `task.CloudRetry.FailNonRetryable`
+leaves a task that can no longer reach `failed` (already `user_halted` or
+`failed`) untouched: no transition attempt, no second notification, one
+`task.cloud_failure_skipped` ledger row.
+
 **`event`-keyed lines (not `type`-keyed):** a few worker lines carry a
 top-level `"event"` key **instead of** `"type"` — kahyad matches these on
 `spawn.stdoutLine.Event`, never conflated with the `type` switch above.

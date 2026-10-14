@@ -86,9 +86,11 @@ func Classify(status int, err error) Class {
 
 // classifyTransportErr implements the task spec's transport-error half
 // (step 1, verbatim): "DNS failure, connection refused/reset, TLS
-// handshake timeout, context.DeadlineExceeded" are Retryable; anything
-// else observed with no HTTP response at all is NonRetryable (a closed
-// list, exactly mirroring the HTTP-status half's own closed list).
+// handshake timeout, context.DeadlineExceeded" are Retryable, and so is
+// context.Canceled (FIX-I-6: a cancelled caller is not an upstream
+// verdict); anything else observed with no HTTP response at all is
+// NonRetryable (a closed list, exactly mirroring the HTTP-status half's
+// own closed list).
 func classifyTransportErr(err error) Class {
 	if err == nil {
 		// Should not happen in practice (Classify is only ever called
@@ -102,6 +104,15 @@ func classifyTransportErr(err error) Class {
 	// (kahyad/internal/anthproxy's task_timeout_min context, or a dial/
 	// handshake timeout surfaced this way by net/http).
 	if errors.Is(err, context.DeadlineExceeded) {
+		return Retryable
+	}
+
+	// context.Canceled (FIX-I-6): a cancelled caller is not a verdict about
+	// the upstream. kahyad/internal/anthproxy's retryTransport short-
+	// circuits an inbound cancel (ErrInboundCanceled) before it ever
+	// classifies; this is defense in depth so a cancel can never read as
+	// "the cloud rejected this task" (which would fail it terminally).
+	if errors.Is(err, context.Canceled) {
 		return Retryable
 	}
 

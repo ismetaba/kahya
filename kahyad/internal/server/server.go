@@ -224,6 +224,10 @@ type Server struct {
 	// nil).
 	taskMachine    *task.Machine
 	taskCloudRetry *task.CloudRetry
+	// taskTimeoutOverride (tests only, SetTaskTimeoutForTests): when > 0 it
+	// replaces cfg.TaskTimeoutMin's whole-minute task deadline, so a test
+	// can let a worker be killed by its timeout in seconds (FIX-I-6).
+	taskTimeoutOverride time.Duration
 
 	// haltExecutor wires POST /halt (W6-03) - see halt.go's SetHaltExecutor
 	// doc comment. nil until that setter is called - the route answers 503

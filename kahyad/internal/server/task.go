@@ -902,7 +902,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	timeoutMin := s.cfg.TaskTimeoutMin
-	taskCtx, cancel := context.WithTimeout(dbCtx, time.Duration(timeoutMin)*time.Minute)
+	taskCtx, cancel := context.WithTimeout(dbCtx, s.taskDeadline())
 	defer cancel()
 
 	spawnCfg := spawn.Config{

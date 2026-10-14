@@ -1,6 +1,7 @@
 package anthproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -43,6 +44,14 @@ var ErrRetriesExhausted = errors.New("anthproxy: cloud upstream retries exhauste
 // path's ModifyResponse does.
 var ErrNonRetryable = errors.New("anthproxy: cloud upstream non-retryable transport failure")
 
+// ErrInboundCanceled (FIX-I-6): the INBOUND request's own context ended (the
+// worker died, was killed by a task timeout/halt/shutdown, or hung up) while
+// an upstream attempt was in flight or a backoff sleep was pending. This is
+// not an upstream verdict at all: never classified, never retried, never
+// parked, never a task failure - handleUpstreamError logs it and returns
+// (there is nobody left to answer).
+var ErrInboundCanceled = errors.New("anthproxy: inbound request canceled by the worker")
+
 // retryAttemptLogger is called once per upstream attempt (task spec step
 // 2: "each retry logs JSONL with trace_id, attempt number, status").
 // errMsg is empty on a real HTTP response, even an error-status one.
@@ -81,6 +90,11 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	var lastErr error
 	for attempt := 1; attempt <= maxInline; attempt++ {
+		// FIX-I-6: the worker already went away (before the first attempt,
+		// or during the backoff sleep below) - nothing to retry for.
+		if cerr := req.Context().Err(); cerr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInboundCanceled, cerr)
+		}
 		attemptReq := req
 		if attempt > 1 {
 			attemptReq = req.Clone(req.Context())
@@ -104,6 +118,22 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		if t.log != nil {
 			t.log(attempt, status, errMsg)
+		}
+
+		// FIX-I-6: an attempt that ended because the INBOUND request was
+		// cancelled says nothing about the upstream. Checked before
+		// Classify: net/http reports it as a bare context.Canceled, which
+		// the closed transport list would otherwise call NonRetryable and
+		// fail the task (racing a halt's user_halted, turning a timeout the
+		// resume scan owns into a terminal failure).
+		if cerr := req.Context().Err(); cerr != nil {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			if data != nil {
+				data.RetryAttempts = attempt
+			}
+			return nil, fmt.Errorf("%w: %v", ErrInboundCanceled, cerr)
 		}
 
 		if err == nil && status < 400 {
@@ -151,7 +181,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			_ = resp.Body.Close()
 		}
 		if attempt < maxInline {
-			t.sleepBeforeRetry(attempt, resp)
+			t.sleepBeforeRetry(req.Context(), attempt, resp)
 		}
 	}
 
@@ -167,8 +197,12 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // sleepBeforeRetry waits the delay before the NEXT attempt: the
 // upstream's own Retry-After header when the just-finished attempt sent
 // one (task spec step 1: "Honor a retry-after header when present"),
-// otherwise the jittered exponential backoff schedule.
-func (t *retryTransport) sleepBeforeRetry(attempt int, resp *http.Response) {
+// otherwise the jittered exponential backoff schedule. The real sleep ends
+// early when ctx (the inbound request's) is done - FIX-I-6: a worker that
+// went away must not keep a goroutine asleep for up to 60s; the loop's next
+// iteration then returns ErrInboundCanceled. The test Sleep hook is called
+// as-is.
+func (t *retryTransport) sleepBeforeRetry(ctx context.Context, attempt int, resp *http.Response) {
 	var delay time.Duration
 	if resp != nil {
 		if d, ok := cloudretry.ParseRetryAfter(resp.Header.Get("Retry-After")); ok {
@@ -182,5 +216,10 @@ func (t *retryTransport) sleepBeforeRetry(attempt int, resp *http.Response) {
 		t.sleep(delay)
 		return
 	}
-	time.Sleep(delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store"
@@ -123,6 +124,9 @@ type taskTestFixture struct {
 	srv    *Server
 	client *http.Client
 	store  *store.Store
+	// jsonlPath is the fixture logger's kahyad.jsonl (G10 tests assert
+	// JSONL-only lines such as proxy.inbound_canceled).
+	jsonlPath string
 }
 
 func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTestFixture {
@@ -148,6 +152,16 @@ func newTaskTestFixture(t *testing.T, workerCmd []string, timeoutMin int) taskTe
 // never sends it a single byte).
 func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin int, upstreamURL string, governor *anthproxy.Governor) taskTestFixture {
 	t.Helper()
+	return newTaskTestFixtureWithOptions(t, workerCmd, timeoutMin, upstreamURL, governor, nil)
+}
+
+// newTaskTestFixtureWithOptions is newTaskTestFixtureWithGovernor plus a
+// pre hook (G10): pre runs right before Prepare(), so the durability wiring
+// (wireDurability, a real CloudRetry, SetTaskTimeoutForTests, ...) is in
+// place before the serve goroutine starts (race-detector clean, unlike a
+// setter called after the fixture returns). nil pre is the plain fixture.
+func newTaskTestFixtureWithOptions(t *testing.T, workerCmd []string, timeoutMin int, upstreamURL string, governor *anthproxy.Governor, pre func(srv *Server, st *store.Store)) taskTestFixture {
+	t.Helper()
 	cfg := config.Config{
 		DBPath:               filepath.Join(t.TempDir(), "brain.db"),
 		MemoryDir:            t.TempDir(),
@@ -167,7 +181,12 @@ func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin
 	}
 	t.Cleanup(func() { st.Close() })
 
-	log := testLogger(t)
+	logDir := t.TempDir()
+	log, err := logx.New(logDir, "test0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	t.Cleanup(func() { log.Close() })
 	srv := New(cfg, log, "v-task-test", healthyDB)
 	srv.SetEventLogger(st)
 	srv.SetTaskStore(st.Queries)
@@ -179,13 +198,93 @@ func newTaskTestFixtureWithGovernor(t *testing.T, workerCmd []string, timeoutMin
 	srv.SetSessionTaintDB(st.DB())
 	srv.SetAnthproxy(governor, nil, anthproxy.NewPassthroughCredentialSource(), nil)
 	srv.SetPolicyEngine(policy.NewEngine(testPolicyDoc(), st.Queries, st))
+	if pre != nil {
+		pre(srv, st)
+	}
 	if err := srv.Prepare(); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	go srv.Serve() //nolint:errcheck
 	t.Cleanup(func() { srv.Shutdown() })
 
-	return taskTestFixture{srv: srv, client: unixHTTPClient(cfg.Socket), store: st}
+	return taskTestFixture{srv: srv, client: unixHTTPClient(cfg.Socket), store: st, jsonlPath: filepath.Join(logDir, "kahyad.jsonl")}
+}
+
+// wireDurability is the production durability wiring a G10 test needs
+// (main.go wires both): SetTaskCloudRetry sets s.taskMachine (no
+// CloudRetry), SetTaskDurability sets s.taskDurabilityStore, which
+// taskDurabilityStatus - and so every post-spawn status decision - reads.
+func wireDurability(srv *Server, st *store.Store) {
+	m := task.NewMachine(st.Queries, st)
+	srv.SetTaskCloudRetry(m, nil)
+	srv.SetTaskDurability(task.NewResolver(st.Queries, st.Queries, m), st.Queries, nil)
+}
+
+// wireDurabilityWithCloudRetry is wireDurability plus a REAL
+// task.CloudRetry (schedule nil = the production default), so the proxy's
+// OnCloudUnreachable/OnNonRetryableFailure callbacks really park/fail the
+// task.
+func wireDurabilityWithCloudRetry(schedule []time.Duration) func(srv *Server, st *store.Store) {
+	return func(srv *Server, st *store.Store) {
+		m := task.NewMachine(st.Queries, st)
+		srv.SetTaskCloudRetry(m, task.NewCloudRetry(st.Queries, st.Queries, m, st, nil, schedule, 0))
+		srv.SetTaskDurability(task.NewResolver(st.Queries, st.Queries, m), st.Queries, nil)
+	}
+}
+
+// taskRowByTrace returns the (id, status, state) of the one tasks row
+// carrying traceID.
+func taskRowByTrace(t *testing.T, st *store.Store, traceID string) (id, status, state string) {
+	t.Helper()
+	if err := st.DB().QueryRow(`SELECT id, status, state FROM tasks WHERE trace_id = ?`, traceID).Scan(&id, &status, &state); err != nil {
+		t.Fatalf("query tasks by trace %s: %v", traceID, err)
+	}
+	return id, status, state
+}
+
+// countEventsByTraceKind counts ledger rows of kind under traceID.
+func countEventsByTraceKind(t *testing.T, st *store.Store, traceID, kind string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM events WHERE trace_id = ? AND kind = ?`, traceID, kind).Scan(&n); err != nil {
+		t.Fatalf("count events %s/%s: %v", traceID, kind, err)
+	}
+	return n
+}
+
+// countJSONLEventLines counts the JSONL lines in path whose event is kind
+// and whose trace_id is traceID.
+func countJSONLEventLines(t *testing.T, path, traceID, kind string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if rec["event"] == kind && rec["trace_id"] == traceID {
+			n++
+		}
+	}
+	return n
+}
+
+// lastSSEMessage returns the last frame's event and its data "message".
+func lastSSEMessage(t *testing.T, frames []sseFrame) (event, message string) {
+	t.Helper()
+	if len(frames) == 0 {
+		t.Fatal("no SSE frames")
+	}
+	last := frames[len(frames)-1]
+	var payload struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal([]byte(last.data), &payload)
+	return last.event, payload.Message
 }
 
 // sseFrame is one parsed "event: X\ndata: Y" frame from a raw SSE body.

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/task"
@@ -95,6 +96,21 @@ func (s *Server) SetTaskDurability(resolver *task.Resolver, store TaskDurability
 func (s *Server) SetTaskCloudRetry(machine *task.Machine, cloudRetry *task.CloudRetry) {
 	s.taskMachine = machine
 	s.taskCloudRetry = cloudRetry
+}
+
+// SetTaskTimeoutForTests overrides the per-task deadline handleTask gives
+// the worker (normally cfg.TaskTimeoutMin minutes, an int, far too coarse
+// for a test). d <= 0 restores the configured value. Tests only; call
+// before Prepare().
+func (s *Server) SetTaskTimeoutForTests(d time.Duration) { s.taskTimeoutOverride = d }
+
+// taskDeadline is the deadline handleTask/handleSecretLaneTask give one
+// task run: cfg.TaskTimeoutMin minutes unless a test override is set.
+func (s *Server) taskDeadline() time.Duration {
+	if s.taskTimeoutOverride > 0 {
+		return s.taskTimeoutOverride
+	}
+	return time.Duration(s.cfg.TaskTimeoutMin) * time.Minute
 }
 
 // taskStatusToolCallView is one tool_calls row as `kahya task show <id>`
