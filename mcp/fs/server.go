@@ -29,6 +29,11 @@
 //  6. atomic write
 //  7. ledger
 //
+// FIX-I-4: fs_write/fs_delete also replay a completed identical call of the
+// same task from its durable receipt between steps 2 and 3 (no policy
+// decision, nothing executes), and run steps 5-7 as one effect inside
+// kahyad's tool_calls receipt lifecycle (receipts.go).
+//
 // kahyad's own /v1/mcp policyGateMiddleware (kahyad/internal/server/
 // mcp.go) is therefore told to skip its OWN generic Check+ConsumeToken
 // step for fs_read/fs_write/fs_delete entirely, deferring to this
@@ -250,6 +255,12 @@ type Server struct {
 	// so wiring this never takes a live-MLX dependency.
 	ContentClassifier ContentClassifier
 
+	// Receipts is the FIX-I-4 receipt seam (receipts.go): fs_write and
+	// fs_delete replay a completed identical call before their policy check
+	// and run their effect inside kahyad's tool_calls lifecycle. nil (tests,
+	// standalone use) = the direct pre-FIX-I-4 path; kahyad always wires it.
+	Receipts ReceiptExecutor
+
 	registry *undoRegistry
 	now      func() time.Time
 }
@@ -340,6 +351,10 @@ type FsWriteOutput struct {
 	GitCheckpoint bool   `json:"git_checkpoint"`
 	PreHash       string `json:"pre_hash"`
 	PostHash      string `json:"post_hash"`
+	// Replayed is true when this is the stored result of an EARLIER,
+	// identical, completed fs_write of the same task (FIX-I-4 receipt
+	// replay): nothing was written this call.
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // FsDeleteArgs is fs_delete's input.
@@ -351,6 +366,8 @@ type FsDeleteArgs struct {
 type FsDeleteOutput struct {
 	Path      string `json:"path"`
 	TrashPath string `json:"trash_path"`
+	// Replayed: see FsWriteOutput.Replayed (nothing was moved this call).
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // denyGlobReason is the Turkish, user/model-facing deny reason for a
@@ -564,9 +581,11 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 
 // HandleWrite implements fs_write (class W1) — the full gate chain this
 // package's doc comment describes, in order: canonicalize, deny-glob
-// (BEFORE any policy decision — HANDOFF §5 safety #6), Check,
-// ConsumeToken, pre-op checkpoint (git or fallback copy), atomic write,
-// ledger.
+// (BEFORE any policy decision — HANDOFF §5 safety #6), receipt replay
+// (FIX-I-4: a completed identical call of the same task answers from its
+// receipt, before any policy decision), Check, ConsumeToken, then the
+// effect inside the receipt lifecycle: pre-op checkpoint (git or fallback
+// copy), atomic write, undo record, ledger.
 func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args FsWriteArgs) (FsWriteOutput, error) {
 	cp, err := s.canonicalize(args.Path)
 	if err != nil {
@@ -590,6 +609,16 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 	}
 	toolInput := buildToolInput(cp.Match, content)
 
+	// FIX-I-4: keyed on the canonical {path, content} bytes the approval
+	// token is bound to (WYSIWYE) - only the identical write replays.
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "fs_write", ArgsHash: ReceiptArgsHash(toolInput)}
+	var stored FsWriteOutput
+	if hit, err := ReplayReceipt(ctx, s.Receipts, rin, &stored); err != nil {
+		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
+	} else if hit {
+		return s.replayedWrite(ctx, traceID, taskID, stored), nil
+	}
+
 	decision, err := s.Policy.Check(ctx, "fs_write", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
@@ -601,33 +630,71 @@ func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args F
 	if err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_write", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return FsWriteOutput{}, fmt.Errorf("fs_write: onay jetonu tüketilemedi: %w", err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
-	rec, err := s.checkpointPreImage(cp, taskID, traceID)
+	// The whole side effect (FIX-I-4): everything after ConsumeToken runs
+	// inside the receipt lifecycle, so a completed write is never repeated.
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		rec, err := s.checkpointPreImage(cp, taskID, traceID)
+		if err != nil {
+			return nil, fmt.Errorf("fs_write: %w", err)
+		}
+
+		// BLOCKER fix: confined to cp.AncestorDir (resolved BEFORE the
+		// Policy.Check/ConsumeToken/checkpointPreImage window above), never
+		// an unconfined os.* call against cp.Op — see rootedWrite's doc
+		// comment for the TOCTOU this closes.
+		if err := rootedWrite(cp.AncestorDir, cp.Rel, content); err != nil {
+			return nil, fmt.Errorf("fs_write: %w", err)
+		}
+
+		postHash := sha256Hex(content)
+		s.registry.Put(traceID, rec)
+
+		s.logAndLedger(ctx, traceID, "fs_write", map[string]any{
+			"event": "fs_write", "canonical_path": cp.Match, "task_id": taskID,
+			"pre_existed": rec.HadPrev, "pre_hash": rec.PreHash, "post_hash": postHash,
+			"git_checkpoint": rec.GitBlobSHA != "", "git_blob_sha": rec.GitBlobSHA, "copy_path": rec.CopyPath,
+		})
+
+		return json.Marshal(FsWriteOutput{
+			Path: cp.Match, PreExisted: rec.HadPrev, GitCheckpoint: rec.GitBlobSHA != "",
+			PreHash: rec.PreHash, PostHash: postHash,
+		})
+	}
+	raw, replayed, err := ExecuteWithReceipt(ctx, s.Receipts, rin, effect)
 	if err != nil {
-		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
+		return FsWriteOutput{}, err
 	}
-
-	// BLOCKER fix: confined to cp.AncestorDir (resolved BEFORE the
-	// Policy.Check/ConsumeToken/checkpointPreImage window above), never
-	// an unconfined os.* call against cp.Op — see rootedWrite's doc
-	// comment for the TOCTOU this closes.
-	if err := rootedWrite(cp.AncestorDir, cp.Rel, content); err != nil {
-		return FsWriteOutput{}, fmt.Errorf("fs_write: %w", err)
+	var out FsWriteOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return FsWriteOutput{}, fmt.Errorf("fs_write: decode result: %w", err)
 	}
+	if replayed {
+		// An identical call's receipt landed between the replay check and
+		// the claim: nothing ran this call either.
+		return s.replayedWrite(ctx, traceID, taskID, out), nil
+	}
+	return out, nil
+}
 
-	postHash := sha256Hex(content)
-	s.registry.Put(traceID, rec)
-
-	s.logAndLedger(ctx, traceID, "fs_write", map[string]any{
-		"event": "fs_write", "canonical_path": cp.Match, "task_id": taskID,
-		"pre_existed": rec.HadPrev, "pre_hash": rec.PreHash, "post_hash": postHash,
-		"git_checkpoint": rec.GitBlobSHA != "", "git_blob_sha": rec.GitBlobSHA, "copy_path": rec.CopyPath,
+// replayedWrite marks a receipt-replayed fs_write result and ledgers
+// fs_write_replayed (FIX-I-4; task.Receipts itself ledgers tool.replayed).
+func (s *Server) replayedWrite(ctx context.Context, traceID, taskID string, out FsWriteOutput) FsWriteOutput {
+	s.logAndLedger(ctx, traceID, "fs_write_replayed", map[string]any{
+		"event": "fs_write_replayed", "canonical_path": out.Path, "task_id": taskID,
 	})
+	out.Replayed = true
+	return out
+}
 
-	return FsWriteOutput{
-		Path: cp.Match, PreExisted: rec.HadPrev, GitCheckpoint: rec.GitBlobSHA != "",
-		PreHash: rec.PreHash, PostHash: postHash,
-	}, nil
+// replayedDelete is replayedWrite for fs_delete (fs_delete_replayed).
+func (s *Server) replayedDelete(ctx context.Context, traceID, taskID string, out FsDeleteOutput) FsDeleteOutput {
+	s.logAndLedger(ctx, traceID, "fs_delete_replayed", map[string]any{
+		"event": "fs_delete_replayed", "canonical_path": out.Path, "trash_path": out.TrashPath, "task_id": taskID,
+	})
+	out.Replayed = true
+	return out
 }
 
 // HandleDelete implements fs_delete (class W1): same gate chain as
@@ -651,6 +718,16 @@ func (s *Server) HandleDelete(ctx context.Context, traceID, taskID string, args 
 	}
 
 	toolInput := buildToolInput(cp.Match, nil)
+
+	// FIX-I-4: same receipt order as HandleWrite (replay before Check).
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "fs_delete", ArgsHash: ReceiptArgsHash(toolInput)}
+	var stored FsDeleteOutput
+	if hit, err := ReplayReceipt(ctx, s.Receipts, rin, &stored); err != nil {
+		return FsDeleteOutput{}, fmt.Errorf("fs_delete: %w", err)
+	} else if hit {
+		return s.replayedDelete(ctx, traceID, taskID, stored), nil
+	}
+
 	decision, err := s.Policy.Check(ctx, "fs_delete", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return FsDeleteOutput{}, fmt.Errorf("fs_delete: %w", err)
@@ -661,26 +738,41 @@ func (s *Server) HandleDelete(ctx context.Context, traceID, taskID string, args 
 	if err := s.Policy.ConsumeToken(ctx, decision.Token, "fs_delete", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return FsDeleteOutput{}, fmt.Errorf("fs_delete: onay jetonu tüketilemedi: %w", err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
-	// BLOCKER fix: source resolved through cp.AncestorDir/cp.Rel's os.Root
-	// confinement, exactly like fs_write's atomic write — see
-	// moveToTrashConfined's doc comment.
-	trashPath, err := moveToTrashConfined(cp.AncestorDir, cp.Rel, s.TrashDir, filepath.Base(cp.Op))
-	if err != nil {
-		return FsDeleteOutput{}, fmt.Errorf("fs_delete: %w", err)
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		// BLOCKER fix: source resolved through cp.AncestorDir/cp.Rel's
+		// os.Root confinement, exactly like fs_write's atomic write — see
+		// moveToTrashConfined's doc comment.
+		trashPath, err := moveToTrashConfined(cp.AncestorDir, cp.Rel, s.TrashDir, filepath.Base(cp.Op))
+		if err != nil {
+			return nil, fmt.Errorf("fs_delete: %w", err)
+		}
+
+		s.registry.Put(traceID, undoRecord{
+			Tool: "fs_delete", CanonicalPath: cp.Match, OpPath: cp.Op,
+			AncestorDir: cp.AncestorDir, Rel: cp.Rel,
+			TrashPath: trashPath, TaskID: taskID, TraceID: traceID,
+		})
+
+		s.logAndLedger(ctx, traceID, "fs_delete", map[string]any{
+			"event": "fs_delete", "canonical_path": cp.Match, "trash_path": trashPath, "task_id": taskID,
+		})
+
+		return json.Marshal(FsDeleteOutput{Path: cp.Match, TrashPath: trashPath})
 	}
-
-	s.registry.Put(traceID, undoRecord{
-		Tool: "fs_delete", CanonicalPath: cp.Match, OpPath: cp.Op,
-		AncestorDir: cp.AncestorDir, Rel: cp.Rel,
-		TrashPath: trashPath, TaskID: taskID, TraceID: traceID,
-	})
-
-	s.logAndLedger(ctx, traceID, "fs_delete", map[string]any{
-		"event": "fs_delete", "canonical_path": cp.Match, "trash_path": trashPath, "task_id": taskID,
-	})
-
-	return FsDeleteOutput{Path: cp.Match, TrashPath: trashPath}, nil
+	raw, replayed, err := ExecuteWithReceipt(ctx, s.Receipts, rin, effect)
+	if err != nil {
+		return FsDeleteOutput{}, err
+	}
+	var out FsDeleteOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return FsDeleteOutput{}, fmt.Errorf("fs_delete: decode result: %w", err)
+	}
+	if replayed {
+		return s.replayedDelete(ctx, traceID, taskID, out), nil
+	}
+	return out, nil
 }
 
 // ---- MCP registration ----

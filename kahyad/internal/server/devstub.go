@@ -2,14 +2,17 @@
 // only MCP tool that exists purely so the gate can drive the REAL
 // kahyad/internal/task.Receipts intent->executing->receipt/idempotent-
 // replay lifecycle end to end against a genuinely running kahyad, worker,
-// and kahya-mcp bridge (W4-02 built that machinery and proved it with a
-// stub tool of its own - receipts_test.go - but never wired it into the
-// REAL side-effectful tools: fs_write/shell_docker/applescript_run still
-// execute with no tool_calls row at all - see receipts.go's own doc
-// comment history and the "kahya-w4-receipt-gap" note. Closing THAT gap is
-// out of scope here; this file's whole reason to exist is to give W4-07's
-// scenario A something real to kill-and-resume against without first
-// closing it).
+// and kahya-mcp bridge with a slow, countable side effect.
+//
+// FIX-I-4: the receipt is no longer written HERE. Since the W4 receipt gap
+// was closed, every non-R tool on the generic /v1/mcp path (memory_write,
+// memory_forget, this stub) runs its handler inside
+// Receipts.ExecuteDetached in policyGateMiddleware (mcp.go / receipts.go),
+// and the real fs/shell/osascript tools do the same through their own
+// receipt seam - so this handler is a plain effect, and W4-07 scenario A now
+// proves the GENERIC path's receipt + replay (an inner Execute here would
+// have deadlocked on the same keyed lock, or written a second tool_calls
+// row for the one call).
 //
 // Effect = sleep(duration_ms), then append exactly one line to
 // counter_file - the task spec's own "side effect" definition
@@ -18,10 +21,8 @@
 // (mcp.go's buildMCPHandler), but deliberately NOT added to
 // fsOwnedTools/shellOwnedTools/osascriptOwnedTools: this tool has no
 // separate gate chain of its own, so it goes through policyGateMiddleware's
-// GENERIC Check+ConsumeToken path - exactly like memory_write/
-// memory_forget (mcp.go's own doc comment names those as the precedent for
-// "kahyad owns both the decision and the execution of this tool in the
-// same process").
+// GENERIC Check+ConsumeToken(+receipt) path - exactly like memory_write/
+// memory_forget.
 //
 // Class is hardcoded W2 (never configurable via the MCP call's own
 // arguments - HANDOFF §5's WYSIWYE posture: a tool's action class is
@@ -35,8 +36,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -64,10 +63,9 @@ type DevStubArgs struct {
 	CounterFile string `json:"counter_file" jsonschema:"tek bir satirin ekleneceği sayaç dosyasının mutlak yolu"`
 }
 
-// DevStubOutput is w2_slow_stub's output (also the exact shape durably
-// persisted in tool_calls.receipt_json - task.Receipts.Execute's own
-// idempotent-replay guarantee returns THIS SAME value, byte-for-byte, on a
-// replay hit).
+// DevStubOutput is w2_slow_stub's output (the structured content of the
+// CallToolResult the generic /v1/mcp path persists in tool_calls.
+// receipt_json - a replay hit returns that SAME result).
 type DevStubOutput struct {
 	CounterFile string `json:"counter_file"`
 	DurationMs  int64  `json:"duration_ms"`
@@ -78,9 +76,15 @@ type DevStubOutput struct {
 // buildMCPHandler (mcp.go) only calls registerDevStubTool when this has
 // been set. Call before Prepare(). main.go calls this ONLY when
 // cfg.Env == config.EnvDev (see its own call-site comment) - never in
-// production, regardless of what any policy.yaml declares.
+// production, regardless of what any policy.yaml declares. FIX-I-4: the
+// stub's receipt is written by the generic /v1/mcp path, so the same
+// receipts also become the server's SetReceipts when none were wired yet -
+// the W2 stub is never registered without a receipt lifecycle around it.
 func (s *Server) SetDevStub(receipts *task.Receipts) {
 	s.devStubReceipts = receipts
+	if s.receipts == nil {
+		s.receipts = receipts
+	}
 }
 
 // registerDevStubTool adds w2_slow_stub onto srv - called from
@@ -120,22 +124,16 @@ func taskIDFromMCPRequest(req *mcp.CallToolRequest) string {
 	return req.Extra.Header.Get(taskHeader)
 }
 
-// HandleDevStub implements w2_slow_stub's whole effect: sleep, append one
-// line to args.CounterFile, then a durable receipt via
-// task.Receipts.Execute - exported so a test can drive it directly, below
-// the MCP transport, matching every other tool handler's convention in
-// this package (mcp/fs.Server.HandleWrite, mcp/shell.Server.Handle*, ...).
-//
-// Deliberately detached from the caller's own request context (uses
-// context.Background() for the Execute call, not the incoming ctx): this
-// is the exact mechanism W4-07 scenario A exercises - once this side
-// effect begins, it must run to completion and its receipt must commit
-// REGARDLESS of whether the calling worker process (or its kahya-mcp
-// bridge) is still alive to ever read the response. Tying the sleep to the
-// request's own context would make the effect abort the moment that
-// connection ever closes for any reason, which would make the tool_calls
-// row strand at 'executing' forever instead of ever reaching 'receipt' -
-// exactly the double-execution hazard this whole gate exists to disprove.
+// HandleDevStub implements w2_slow_stub's whole effect: sleep, then append
+// one line to args.CounterFile - exported so a test can drive it directly,
+// below the MCP transport, matching every other tool handler's convention
+// in this package (mcp/fs.Server.HandleWrite, mcp/shell.Server.Handle*,
+// ...). It takes no context at all: once this side effect begins it runs to
+// completion REGARDLESS of whether the calling worker process (or its
+// kahya-mcp bridge) is still alive - the exact mechanism W4-07 scenario A
+// exercises. The durable receipt around it is written by the generic
+// /v1/mcp path (FIX-I-4: policyGateMiddleware -> Receipts.ExecuteDetached,
+// itself on a context detached from the request), never here.
 func (s *Server) HandleDevStub(traceID, taskID string, args DevStubArgs) (DevStubOutput, error) {
 	if s.devStubReceipts == nil {
 		return DevStubOutput{}, errors.New("w2_slow_stub: bu araç yalnız KAHYA_ENV=dev altında kullanılabilir")
@@ -151,34 +149,14 @@ func (s *Server) HandleDevStub(traceID, taskID string, args DevStubArgs) (DevStu
 		return DevStubOutput{}, fmt.Errorf("w2_slow_stub: duration_ms sınır dışı (0..%d ms)", devStubMaxDuration.Milliseconds())
 	}
 
-	argBytes, err := json.Marshal(args)
-	if err != nil {
-		return DevStubOutput{}, fmt.Errorf("w2_slow_stub: marshal args: %w", err)
+	// The receipt lifecycle around this call (generic /v1/mcp path) holds no
+	// DB transaction or connection (FIX-I-12 / FIX-I-4), so this sleep never
+	// blocks /policy/check or the ledger.
+	time.Sleep(duration)
+	if err := appendCounterLine(args.CounterFile); err != nil {
+		return DevStubOutput{}, fmt.Errorf("w2_slow_stub: append counter file: %w", err)
 	}
-	argsHash := task.HashArgs(argBytes)
-
-	// The effect runs outside any DB transaction (FIX-I-12: Execute hands
-	// external effects a nil tx and checks out no brain.db connection), so
-	// this sleep never blocks /policy/check or the ledger.
-	effect := func(_ context.Context, _ *sql.Tx) (json.RawMessage, error) {
-		time.Sleep(duration)
-		if err := appendCounterLine(args.CounterFile); err != nil {
-			return nil, fmt.Errorf("w2_slow_stub: append counter file: %w", err)
-		}
-		return json.Marshal(DevStubOutput{CounterFile: args.CounterFile, DurationMs: args.DurationMs})
-	}
-
-	resultJSON, _, err := s.devStubReceipts.Execute(context.Background(), task.ExecuteInput{
-		TaskID: taskID, TraceID: traceID, ToolName: devStubToolName, Class: task.ClassW2, ArgsHash: argsHash,
-	}, effect)
-	if err != nil {
-		return DevStubOutput{}, fmt.Errorf("w2_slow_stub: %w", err)
-	}
-	var out DevStubOutput
-	if uerr := json.Unmarshal(resultJSON, &out); uerr != nil {
-		return DevStubOutput{}, fmt.Errorf("w2_slow_stub: decode result: %w", uerr)
-	}
-	return out, nil
+	return DevStubOutput{CounterFile: args.CounterFile, DurationMs: args.DurationMs}, nil
 }
 
 // appendCounterLine appends exactly one "1\n" line to path, creating it

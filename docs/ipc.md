@@ -96,7 +96,7 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
 | `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
 | `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
-| `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). |
+| `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). FIX-I-4: on resume the worker sends `RESUME_CONTINUATION_PROMPT` (worker/kahya_worker/__main__.py; logs JSONL `session_resumed`), never `prompt` again — the resumed transcript already holds the original prompt, and `client.query` always appends a new user turn. The binding double-execution guard is kahyad's receipt replay (see the W4-02 note in §8), not this text. |
 | `intent` | **W4-08.** The §4 routing-table intent bucket (`kahyad/internal/router`'s `Intent*` constants: `plan`, `code_multi_file`, `hard_exec`, `subagent_exec`, `fanout`, `extract`, `writeback`, `route`, `classify`, `reader`, `chat`) — omitted via `omitempty` when empty, so every pre-W4-08 envelope/test still validates unchanged. Informational only (logs/CLI/ledger `intent_classified`/`routing_decision` events) — no enum validation in `Envelope.Validate` (the routing DECISION already happened before this envelope was built; the worker never reads this to choose anything, §4: "karar Go kodunda, istemde değil"). An ordinary `/v1/task` chat prompt with no CLI-declared kind is always `"chat"`, decided deterministically (no model call) — see the W4-08 note below for why. |
 | `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `claude-fable-5` whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being `claude-fable-5`. |
 | `mode` | **W4-03/W6-02.** `""` (ordinary Actor/chat, every pre-W4-03 envelope) \| `"reader"` (toolless cloud-Haiku Reader, `spawn.ModeReader` — requires `schema` non-blank) \| `"stt"` (toolless, CLOUD-LESS local transcription, `spawn.ModeSTT` — requires `input_audio_path` non-blank). See the "W6-02 note" below for the `"stt"` case. |
@@ -1333,6 +1333,45 @@ first boot). `{}` disables it.
   (`task.AnyLive(liveRegistry, receipts)`): a task whose side effect is
   still executing inside kahyad (its worker may already be dead — W4-07
   scenario A) is left alone until the receipt or failure is written.
+  FIX-I-4 (the W4 receipt gap): the REAL side-effectful tools now run
+  through this lifecycle - `fs_write`/`fs_delete` (mcp/fs),
+  `shell_docker`/`shell_host` (mcp/shell), `applescript_run`/`jxa_run`/
+  `shortcuts_run` (mcp/osascript) through the `mcp/fs.ReceiptExecutor` seam
+  (kahyad adapts `*task.Receipts` in-process, so kahyad stays the only
+  brain.db writer), and every non-R tool on the generic `/v1/mcp` path
+  (`memory_write`/`memory_forget`, the dev-only `w2_slow_stub`) in
+  `policyGateMiddleware`. Order inside a tool: its mechanical refusals
+  (deny glob, scan, argv validator, workdir scope) -> `Receipts.Replay`
+  (a durable receipt for the same task, tool and canonical args hash is
+  returned with `replayed:true` — no policy decision, no approval asked for
+  again, no token minted or consumed, nothing executes; ledger
+  `tool.replayed` plus the tool's own `fs_write_replayed` /
+  `fs_delete_replayed` / `shell_docker_replayed` / `hostexec_replayed` /
+  `osascript_replayed` / `shortcuts_replayed`, JSONL `mcp_tool_replayed` on
+  the generic path) -> `Check` -> `ConsumeToken` -> the effect inside
+  `Receipts.ExecuteDetached` (the `tool_calls` intent/executing row is the
+  pre-op journal, the receipt the post-op record; the effect runs on a
+  context detached from the MCP request and holds no brain.db connection).
+  The args hash is sha256 over the canonical bytes the approval token binds
+  to (fs: `{path, content_base64}`; osascript: `{script, target_app}`;
+  shortcuts: `{name, input_path}`), the validated argv (`shell_host`), the
+  full invocation (`shell_docker`: script, canonical workdir, timeout,
+  network, sorted env names — its token binds the script only), or the
+  canonically re-encoded JSON arguments (generic path: sorted keys, no
+  whitespace, numbers verbatim). Consequence: an identical call repeated
+  within ONE task is always answered from its receipt (the
+  `idx_tool_calls_live_unique` index never allowed a second live row for
+  the same key anyway); vary the arguments to run it again. A tool error
+  (an effect error, a generic-path `isError` result) writes no receipt (the
+  row is `failed`; the next identical call may run, with a fresh decision).
+  If the effect ran but its receipt cannot be written,
+  `ExecuteDetached` leaves the row `executing` (never `failed`, which would
+  let the next identical call run it again), ledgers and JSONL-logs
+  `tool.receipt_persist_failed`, and the tool reports the error; the
+  resume scan then applies §6 W4 to that receipt-less row (W1 auto-retry,
+  W2/W3 `blocked_user`). In deny-all mode no stored result is served.
+  Without a task id (a direct Go caller or test) the tools keep the direct
+  path. A resumed worker sends `RESUME_CONTINUATION_PROMPT` (§2 `resume`).
 - **Taint checks in policy decisions** — W4-03.
 - **Intent router / dynamic model routing** — landed in W4-08 (see that
   note above): `model` is now set by `kahyad/internal/router.SelectModel`,

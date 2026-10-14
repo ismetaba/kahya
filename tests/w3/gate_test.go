@@ -201,18 +201,53 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 		t.Fatal("re-approving the same (already-consumed) pending_approval_id must fail")
 	}
 
-	// And the redeemed grant is single-use too: a THIRD identical call is
-	// back to needs_approval, with a fresh pending approval for the human.
+	// And the redeemed grant is single-use too: it is consumed, and no
+	// redeemable grant for this approval is left.
+	var unconsumedGrants int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM approval_tokens WHERE pending_approval_id = ? AND consumed_at IS NULL`, id,
+	).Scan(&unconsumedGrants); err != nil {
+		t.Fatalf("count unconsumed grants: %v", err)
+	}
+	if unconsumedGrants != 0 {
+		t.Fatalf("unconsumed approval_tokens for pending %s = %d, want 0 (the grant is single-use)", id, unconsumedGrants)
+	}
+
+	// FIX-I-4: a THIRD identical call of the SAME task (a resumed session
+	// re-issuing the completed call) is answered from its durable receipt -
+	// nothing executes, no new approval is asked for, no token is consumed.
 	beforeThird := d.existingApprovalIDs(t, "fs_write")
 	res3 := d.mcpCall(t, traceID, taskID, "fs_write", args)
-	if !res3.IsError {
-		t.Fatalf("third identical fs_write = %+v, want needs_approval (the grant is single-use)", res3)
+	if res3.IsError || !strings.Contains(res3.Text, `"replayed":true`) {
+		t.Fatalf("third identical fs_write = %+v, want the stored result replayed", res3)
 	}
-	if fresh := d.newPendingID(t, "fs_write", beforeThird); fresh == id {
-		t.Fatalf("third call reused the consumed pending id %s", id)
+	if after := d.existingApprovalIDs(t, "fs_write"); len(after) != len(beforeThird) {
+		t.Fatalf("pending fs_write approvals %d -> %d: a replay must never ask for approval", len(beforeThird), len(after))
 	}
 	if n := countEventsMatching(t, db, traceID, "fs_write"); n != 1 {
 		t.Fatalf("fs_write ledger events after the third call = %d, want still exactly 1", n)
+	}
+	if n := countEventsMatching(t, db, traceID, "fs_write_replayed"); n != 1 {
+		t.Fatalf("fs_write_replayed ledger events = %d, want 1", n)
+	}
+	var receipts int
+	if err := db.QueryRow(`SELECT count(*) FROM tool_calls WHERE task_id = ? AND tool_name = 'fs_write' AND status = 'receipt'`, taskID).Scan(&receipts); err != nil {
+		t.Fatalf("count fs_write receipts: %v", err)
+	}
+	if receipts != 1 {
+		t.Fatalf("fs_write receipts = %d, want 1", receipts)
+	}
+
+	// A DIFFERENT task asking for the same bytes is a new call: back to
+	// needs_approval, with a fresh pending approval for the human (the
+	// grant was the first task's and is spent).
+	beforeOther := d.existingApprovalIDs(t, "fs_write")
+	res4 := d.mcpCall(t, "trace-gate1-other-task-0001", "task-gate1-other", "fs_write", args)
+	if !res4.IsError {
+		t.Fatalf("identical fs_write of another task = %+v, want needs_approval", res4)
+	}
+	if fresh := d.newPendingID(t, "fs_write", beforeOther); fresh == id {
+		t.Fatalf("the other task reused the consumed pending id %s", id)
 	}
 }
 

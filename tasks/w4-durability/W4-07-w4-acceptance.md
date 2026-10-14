@@ -185,6 +185,13 @@ The gate (HANDOFF §6 W4, quote verbatim):
   a REAL W1/W2/W3 tool interrupted mid-call would still double-execute on resume. This gate
   deliberately exercises a purpose-built dev-only stub (`w2_slow_stub`) instead, per the task
   spec's own explicit instruction.
+  *Post-FIX-I-4 (docs/ipc.md W4-02 note):* the gap is closed. `fs_write`/`fs_delete`/
+  `shell_docker`/`shell_host`/`applescript_run`/`jxa_run`/`shortcuts_run` replay a completed
+  identical call from its receipt before their policy check and run their effect inside
+  `Receipts.ExecuteDetached`; every non-R tool on the generic `/v1/mcp` path does the same in
+  `policyGateMiddleware`. `w2_slow_stub` is now a plain effect - scenario A exercises the
+  GENERIC path's receipt and replay, not a receipt the stub writes itself. A resumed worker
+  sends a fixed continuation prompt instead of the original one.
 
 ## Out of scope
 

@@ -58,6 +58,17 @@
 // never committed leaves the row 'executing' and receipt-less, which the
 // resume scan (resolve.go) handles - W1 auto-retry, W2/W3 never (HANDOFF
 // §6 W4 ⚑); the transaction was never durable across a crash anyway.
+//
+// FIX-I-4 (the W4 receipt gap): the REAL side-effectful tools - fs_write,
+// fs_delete, shell_docker, shell_host, applescript_run, jxa_run,
+// shortcuts_run (mcp/fs, mcp/shell, mcp/osascript, through
+// kahyad/internal/server's receipt adapter) and every non-R tool on the
+// generic /v1/mcp path (memory_write/memory_forget, the dev w2_slow_stub) -
+// now run their effect through ExecuteDetached, keyed on the canonical
+// tool-input bytes, and call Replay BEFORE their policy check: a resumed
+// session re-issuing a completed call gets the stored result, no second
+// execution, no second approval. The tool_calls intent/executing row is the
+// pre-op journal, the receipt the post-op record.
 package task
 
 import (
@@ -73,6 +84,7 @@ import (
 
 	"github.com/mattn/go-sqlite3"
 
+	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
@@ -88,6 +100,21 @@ const (
 // EventReplayed is the ledger event kind an idempotent-replay hit
 // appends (task spec step 4, verbatim: "ledger event tool.replayed").
 const EventReplayed = "tool.replayed"
+
+// EventReceiptPersistFailed is ledgered (and logged as JSONL - the DB the
+// ledger lives in may be the very thing failing) when ExecuteDetached's
+// effect HAS run but its receipt could not be written (FIX-I-4).
+const EventReceiptPersistFailed = "tool.receipt_persist_failed"
+
+// ErrReceiptPersistFailed: ExecuteDetached's effect HAS run but its receipt
+// could not be committed (FIX-I-4). The tool_calls row is deliberately left
+// at 'executing' - never 'failed', which would free the (task_id, tool_name,
+// args_hash) key and let the very next identical call (a model retrying the
+// error, a resumed session re-issuing it) run an effect that already
+// happened. The receipt-less 'executing' row then goes to the resume scan,
+// which applies HANDOFF §6 W4: W1 may be auto-retried (undoable), W2/W3
+// block on the user.
+var ErrReceiptPersistFailed = errors.New("task: effect ran but its receipt could not be persisted")
 
 // ErrReadOnlyClass is returned by Receipts.Execute when called with class
 // R: R-class calls have no side effect to protect and must never get a
@@ -323,12 +350,21 @@ type Receipts struct {
 	// keyedMutexes' own doc comment.
 	locks *keyedMutexes
 
-	// inflight counts, per task id, the Execute/ExecuteInTx calls currently
-	// between their keyed-lock acquisition and their final receipt/failed
-	// write (FIX-I-12) - see IsLive.
+	// inflight counts, per task id, the Execute/ExecuteInTx/ExecuteDetached
+	// calls currently between their keyed-lock acquisition and their final
+	// receipt/failed write (FIX-I-12) - see IsLive.
 	inflightMu sync.Mutex
 	inflight   map[string]int
+
+	// jsonl is the OPTIONAL JSONL sink for EventReceiptPersistFailed
+	// (FIX-I-4): that failure means brain.db did not take a write, so the
+	// ledger row alone may be lost too. nil = ledger only (tests).
+	jsonl *logx.Logger
 }
+
+// SetJSONLLogger wires the JSONL sink ExecuteDetached reports a receipt
+// persistence failure to (FIX-I-4), alongside the ledger row.
+func (r *Receipts) SetJSONLLogger(l *logx.Logger) { r.jsonl = l }
 
 // IsLive reports whether one of taskID's side-effectful tool calls is
 // executing inside THIS kahyad process right now (FIX-I-12). It makes
@@ -407,6 +443,57 @@ func (r *Receipts) nowRFC3339() string { return r.now().UTC().Format(time.RFC333
 // be left stranded at 'executing' with neither a receipt nor a 'failed'
 // row - see failAndReturn's own doc comment.
 func (r *Receipts) Execute(ctx context.Context, in ExecuteInput, effect EffectFunc) (result json.RawMessage, replayed bool, err error) {
+	return r.executeExternal(ctx, in, effect, false)
+}
+
+// DetachedEffectFunc is the effect of a REAL side-effectful tool, run by
+// ExecuteDetached (FIX-I-4): not a brain.db write - a file write or Trash
+// move, a docker run, an osascript, a host command, an MCP tool handler.
+type DetachedEffectFunc func(ctx context.Context) (json.RawMessage, error)
+
+// ExecuteDetached is Execute (nil tx, FIX-I-12 - built on the same
+// executeExternal) for the real kahyad-owned tools (FIX-I-4, C-7): replay ->
+// intent -> executing -> effect with NO transaction and NO brain.db
+// connection held -> receipt in its own short statement, under the same
+// keyed mutex, unique-index claim and IsLive bracket as Execute. The one
+// difference is what happens when the effect HAS run but its receipt cannot
+// be written: Execute marks the row 'failed' (BLOCKER 4), which for an
+// external effect frees the key so the next identical call runs it again;
+// ExecuteDetached leaves the row 'executing', ledgers (and JSONL-logs)
+// EventReceiptPersistFailed and returns the effect's result together with
+// ErrReceiptPersistFailed - the resume scan then applies HANDOFF §6 W4 to
+// the receipt-less row (W1 auto-retry, W2/W3 never). An effect that itself
+// reports an error still marks the row 'failed' (Execute's semantics: the
+// tool said its effect did not complete).
+func (r *Receipts) ExecuteDetached(ctx context.Context, in ExecuteInput, effect DetachedEffectFunc) (result json.RawMessage, replayed bool, err error) {
+	return r.executeExternal(ctx, in, func(ctx context.Context, _ *sql.Tx) (json.RawMessage, error) {
+		return effect(ctx)
+	}, true)
+}
+
+// Replay answers "does a durable receipt already exist for this exact
+// (task_id, tool_name, args_hash) triple?" WITHOUT claiming an intent row
+// (FIX-I-4). A side-effectful tool calls it BEFORE its policy check on every
+// call, so a resumed session re-issuing an already-completed call neither
+// re-executes it nor asks for (and burns) a second approval: a hit returns
+// the stored result and ledgers EventReplayed. A miss writes nothing. Runs
+// under the same keyed mutex as Execute*, so it never observes a
+// half-written attempt of its own process.
+func (r *Receipts) Replay(ctx context.Context, in ExecuteInput) (result json.RawMessage, hit bool, err error) {
+	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
+	defer unlock()
+	res, seq, ok, err := r.checkReplay(ctx, in)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	r.ledgerReplayed(ctx, in, seq)
+	return res, true, nil
+}
+
+// executeExternal is Execute/ExecuteDetached's shared lifecycle (see
+// Execute's doc comment). detached selects ExecuteDetached's handling of a
+// receipt that cannot be persisted after the effect ran.
+func (r *Receipts) executeExternal(ctx context.Context, in ExecuteInput, effect EffectFunc, detached bool) (json.RawMessage, bool, error) {
 	if in.Class == ClassR {
 		return nil, false, ErrReadOnlyClass
 	}
@@ -436,7 +523,37 @@ func (r *Receipts) Execute(ctx context.Context, in ExecuteInput, effect EffectFu
 	if effErr != nil {
 		return nil, false, r.failAndReturn(ctx, row.ID, effErr)
 	}
-	return r.commitReceipt(ctx, row.ID, in, effectResult, nil)
+	if !detached {
+		return r.commitReceipt(ctx, row.ID, in, effectResult, nil)
+	}
+	return r.commitDetachedReceipt(ctx, row, in, effectResult)
+}
+
+// commitDetachedReceipt writes ExecuteDetached's receipt in one autocommit
+// statement. Any failure here happens AFTER the external effect ran: the
+// row stays 'executing' (see ErrReceiptPersistFailed) and the failure is
+// recorded on both channels.
+func (r *Receipts) commitDetachedReceipt(ctx context.Context, row sqlcgen.ToolCall, in ExecuteInput, effectResult json.RawMessage) (json.RawMessage, bool, error) {
+	envJSON, merr := json.Marshal(receiptEnvelope{Result: effectResult, ResultHash: HashArgs(effectResult)})
+	if merr == nil {
+		merr = r.q.MarkToolCallReceipt(ctx, sqlcgen.MarkToolCallReceiptParams{
+			ReceiptJson: sql.NullString{String: string(envJSON), Valid: true},
+			FinishedAt:  sql.NullString{String: r.nowRFC3339(), Valid: true},
+			ID:          row.ID,
+		})
+	}
+	if merr == nil {
+		return effectResult, false, nil
+	}
+	if r.jsonl != nil {
+		r.jsonl.With(in.TraceID).Error(EventReceiptPersistFailed,
+			"task_id", in.TaskID, "tool", in.ToolName, "tool_call_id", row.ID, "seq", row.Seq, "err", merr.Error())
+	}
+	r.ledgerRaw(ctx, in.TraceID, EventReceiptPersistFailed, map[string]any{
+		"event": EventReceiptPersistFailed, "task_id": in.TaskID, "tool": in.ToolName,
+		"tool_call_id": row.ID, "seq": row.Seq, "args_hash": in.ArgsHash, "err": merr.Error(),
+	})
+	return effectResult, false, fmt.Errorf("%w (task=%s tool=%s): %v", ErrReceiptPersistFailed, in.TaskID, in.ToolName, merr)
 }
 
 // ExecuteInTx is Execute for an effect that WRITES brain.db (autonomy_state,
@@ -675,8 +792,9 @@ func (r *Receipts) claimIntent(ctx context.Context, in ExecuteInput) (row sqlcge
 // DB effect with no receipt, only ever a genuinely rolled-back one that a
 // fresh retry can safely re-attempt from scratch. (An Execute effect's
 // side effect lives outside brain.db and was never covered by a
-// transaction - before or after FIX-I-12; G10 I-4's detached path decides
-// how a receipt-persist failure after a real tool's effect is surfaced.) If marking failed ITSELF
+// transaction - before or after FIX-I-12; ExecuteDetached, which every REAL
+// tool uses since FIX-I-4, therefore never calls this after its effect ran:
+// see ErrReceiptPersistFailed.) If marking failed ITSELF
 // errors, that secondary error is wrapped around cause (never silently
 // dropped); otherwise cause is returned completely unwrapped, so a caller
 // checking the effect's own error identity (e.g. errors.Is against a

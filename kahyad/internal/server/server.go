@@ -255,6 +255,12 @@ type Server struct {
 	// the tool onto the shared MCP server at all.
 	devStubReceipts *task.Receipts
 
+	// receipts is the W4-02 receipt lifecycle every side-effectful tool runs
+	// its effect through (FIX-I-4) - the generic /v1/mcp path directly
+	// (policyGateMiddleware), fs/shell/osascript through ReceiptExecutor.
+	// See receipts.go's SetReceipts. nil = no receipts (tests).
+	receipts *task.Receipts
+
 	// sessionTaintDB is the raw *sql.DB handle handleTask's OnSession
 	// callback opens its own transaction against (W4-03 task spec step 1a:
 	// insert this task's session_taint(tier=clean) row in the SAME

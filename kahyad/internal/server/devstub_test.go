@@ -2,10 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -41,42 +41,9 @@ func newDevStubFixture(t *testing.T) (*Server, func(taskID string)) {
 	return srv, insert
 }
 
-// TestHandleDevStubEffectRunsExactlyOnce is the unit-level twin of W4-07
-// scenario A's whole point: calling HandleDevStub TWICE for the exact same
-// (task_id, tool_name, args) must run the underlying effect (append to
-// counter_file) exactly ONCE - the second call is answered entirely from
-// the durable receipt (task.Receipts.Execute's idempotent-replay
-// guarantee), never re-executing.
-func TestHandleDevStubEffectRunsExactlyOnce(t *testing.T) {
-	srv, insertTask := newDevStubFixture(t)
-	insertTask("dev-t1")
-	counterFile := filepath.Join(t.TempDir(), "counter.txt")
-	args := DevStubArgs{DurationMs: 5, CounterFile: counterFile}
-
-	out1, err := srv.HandleDevStub("trace-1", "dev-t1", args)
-	if err != nil {
-		t.Fatalf("first HandleDevStub call: %v", err)
-	}
-	if out1.CounterFile != counterFile {
-		t.Errorf("out1.CounterFile = %q, want %q", out1.CounterFile, counterFile)
-	}
-
-	out2, err := srv.HandleDevStub("trace-1", "dev-t1", args)
-	if err != nil {
-		t.Fatalf("second (replay) HandleDevStub call: %v", err)
-	}
-	if out2 != out1 {
-		t.Errorf("replayed result = %+v, want identical to first result %+v", out2, out1)
-	}
-
-	b, err := os.ReadFile(counterFile)
-	if err != nil {
-		t.Fatalf("read counter file: %v", err)
-	}
-	if got := string(b); got != "1\n" {
-		t.Errorf("counter file content = %q, want exactly one %q line (side effect ran twice)", got, "1\n")
-	}
-}
+// The "effect runs exactly once" twin of W4-07 scenario A now goes through
+// the generic /v1/mcp path that writes the receipt (FIX-I-4):
+// TestDevStubThroughGenericPathRunsEffectExactlyOnce (mcp_receipts_test.go).
 
 // TestHandleDevStubRequiresTaskID guards the fail-closed posture when the
 // kahya-mcp bridge never forwarded X-Kahya-Task-Id at all (empty task_id) -
@@ -102,7 +69,8 @@ func TestHandleDevStubUnwiredIsError(t *testing.T) {
 }
 
 // TestPolicyCheckNotBlockedByInFlightDevStubEffect is I-12 at the server
-// level: while a slow w2_slow_stub effect is in flight (Receipts.Execute),
+// level: while a slow w2_slow_stub effect is in flight (inside
+// Receipts.ExecuteDetached, as the generic /v1/mcp path runs it - FIX-I-4),
 // the worker's POST /policy/check must still answer promptly. Before
 // FIX-I-12 Execute held brain.db's ONE pooled connection in a transaction
 // for the whole effect, Engine.Check waited on it to ledger its
@@ -116,9 +84,23 @@ func TestPolicyCheckNotBlockedByInFlightDevStubEffect(t *testing.T) {
 	// shape) so the expected answer is a plain allow.
 	seedAutonomyState(t, fx.store, "memory_search", string(policy.ClassR), "global", 1)
 
+	// FIX-I-4: the stub's receipt lifecycle is the generic /v1/mcp path's
+	// Receipts.ExecuteDetached around the plain HandleDevStub effect -
+	// driven here exactly that way.
+	receipts := task.NewReceipts(fx.store.DB(), fx.store.Queries, fx.store)
+	args := DevStubArgs{DurationMs: 1500, CounterFile: filepath.Join(t.TempDir(), "c.txt")}
+	argBytes, _ := json.Marshal(args)
 	stubDone := make(chan error, 1)
 	go func() {
-		_, err := fx.srv.HandleDevStub("trace-1", "dev-t1", DevStubArgs{DurationMs: 1500, CounterFile: filepath.Join(t.TempDir(), "c.txt")})
+		_, _, err := receipts.ExecuteDetached(context.Background(), task.ExecuteInput{
+			TaskID: "dev-t1", TraceID: "trace-1", ToolName: devStubToolName, Class: task.ClassW2, ArgsHash: task.HashArgs(argBytes),
+		}, func(context.Context) (json.RawMessage, error) {
+			out, err := fx.srv.HandleDevStub("trace-1", "dev-t1", args)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(out)
+		})
 		stubDone <- err
 	}()
 	var stubErr error

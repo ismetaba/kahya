@@ -40,6 +40,11 @@
 //  6. the ledger event (osascript_exec / osascript_timeout /
 //     osascript_automation_denied / osascript_scan_rejected).
 //
+// FIX-I-4: between steps 1 and 2 a completed identical run of the same task
+// is answered from its durable receipt (no policy decision, osascript does
+// not run), and steps 4-6 run as one effect inside kahyad's tool_calls
+// receipt lifecycle (mcp/fs/receipts.go; Runner.Receipts).
+//
 // PolicyClient, Ledger, and Logger are literal type ALIASES of mcp/fs's
 // own interfaces (mirrors mcp/shell's identical choice, for the identical
 // reason: mcp/fs's own package doc comment already anticipated "a LATER
@@ -68,6 +73,10 @@ type (
 	Ledger         = mcpfs.Ledger
 	Logger         = mcpfs.Logger
 	PolicyDecision = mcpfs.PolicyDecision
+	// ReceiptExecutor / ReceiptInput: mcp/fs's FIX-I-4 receipt seam
+	// (mcp/fs/receipts.go), aliased like mcp/shell's.
+	ReceiptExecutor = mcpfs.ReceiptExecutor
+	ReceiptInput    = mcpfs.ReceiptInput
 )
 
 // Result values, aliased from mcp/fs for the same reason as PolicyClient/
@@ -156,6 +165,10 @@ type ScriptOutput struct {
 	Reason   string             `json:"reason,omitempty"`
 	Reroute  *RerouteSuggestion `json:"reroute,omitempty"`
 	TimedOut bool               `json:"timed_out"`
+	// Replayed is true when this is the stored result of an EARLIER,
+	// identical, completed run of the same task (FIX-I-4 receipt replay):
+	// osascript did not run this call.
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // noopLogger is the default Logger when NewRunner is given none (mirrors
@@ -185,6 +198,13 @@ type Runner struct {
 	Ledger Ledger
 	Log    Logger
 	Exec   Executor
+
+	// Receipts is the FIX-I-4 receipt seam (mcp/fs/receipts.go) shared by
+	// applescript_run/jxa_run/shortcuts_run: a completed identical call of
+	// the same task is replayed before the policy decision, and the run
+	// itself executes inside kahyad's tool_calls lifecycle. nil = direct
+	// path (tests); kahyad always wires it.
+	Receipts ReceiptExecutor
 
 	// timeoutUnit scales hardTimeoutSeconds into a time.Duration
 	// (defaults to time.Second; tests shrink this to time.Millisecond so
@@ -240,6 +260,18 @@ func (r *Runner) run(ctx context.Context, traceID, taskID, tool string, lang Lan
 	}
 
 	toolInput := buildScriptToolInput(in.Script, in.TargetApp)
+
+	// FIX-I-4: after the scan, before the policy decision - a completed
+	// identical run of the same task answers from its receipt. Keyed on the
+	// exact {script, target_app} bytes the token binds to.
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: tool, ArgsHash: mcpfs.ReceiptArgsHash(toolInput)}
+	var stored ScriptOutput
+	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
+		return ScriptOutput{}, fmt.Errorf("%s: %w", tool, err)
+	} else if hit {
+		return replayedScript(ctx, r, traceID, taskID, tool, stored), nil
+	}
+
 	decision, err := r.Policy.Check(ctx, tool, defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return ScriptOutput{}, fmt.Errorf("%s: %w", tool, err)
@@ -250,42 +282,73 @@ func (r *Runner) run(ctx context.Context, traceID, taskID, tool string, lang Lan
 	if err := r.Policy.ConsumeToken(ctx, decision.Token, tool, decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return ScriptOutput{}, fmt.Errorf("%s: onay jetonu tüketilemedi: %w", tool, err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
-	argv := argsForLang(lang)
-	unit := r.timeoutUnit
-	if unit <= 0 {
-		unit = time.Second
-	}
-	timeoutCtx, cancel := context.WithTimeout(ctx, hardTimeoutSeconds*unit)
-	defer cancel()
+	// The run itself (FIX-I-4) is the receipt effect. errOut carries the
+	// partial output a failing run returns alongside its error (timeout,
+	// Automation denied) - a failed effect writes no receipt.
+	var errOut ScriptOutput
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		argv := argsForLang(lang)
+		unit := r.timeoutUnit
+		if unit <= 0 {
+			unit = time.Second
+		}
+		timeoutCtx, cancel := context.WithTimeout(ctx, hardTimeoutSeconds*unit)
+		defer cancel()
 
-	execRes, execErr := r.Exec.Run(timeoutCtx, "osascript", argv, scriptBytes)
-	if errors.Is(execErr, context.DeadlineExceeded) {
-		logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_timeout", map[string]any{
-			"event": "osascript_timeout", "tool": tool, "lang": string(lang), "target_app": in.TargetApp,
-			"task_id": taskID, "trace_id": traceID, "timeout_s": hardTimeoutSeconds,
+		execRes, execErr := r.Exec.Run(timeoutCtx, "osascript", argv, scriptBytes)
+		if errors.Is(execErr, context.DeadlineExceeded) {
+			logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_timeout", map[string]any{
+				"event": "osascript_timeout", "tool": tool, "lang": string(lang), "target_app": in.TargetApp,
+				"task_id": taskID, "trace_id": traceID, "timeout_s": hardTimeoutSeconds,
+			})
+			errOut = ScriptOutput{TimedOut: true}
+			return nil, errors.New(reasonTimeout)
+		}
+		if execErr != nil {
+			return nil, fmt.Errorf("%s: %w", tool, execErr)
+		}
+
+		if automationDenied(execRes.ExitCode, execRes.Stderr) {
+			logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_automation_denied", map[string]any{
+				"event": "osascript_automation_denied", "tool": tool, "lang": string(lang),
+				"target_app": in.TargetApp, "exit_code": execRes.ExitCode, "task_id": taskID, "trace_id": traceID,
+			})
+			errOut = ScriptOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)}
+			return nil, &AutomationDeniedError{App: in.TargetApp}
+		}
+
+		out := ScriptOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)}
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_exec", map[string]any{
+			"event": "osascript_exec", "lang": string(lang), "target_app": in.TargetApp,
+			"exit_code": out.ExitCode, "trace_id": traceID, "task_id": taskID,
 		})
-		return ScriptOutput{TimedOut: true}, errors.New(reasonTimeout)
-	}
-	if execErr != nil {
-		return ScriptOutput{}, fmt.Errorf("%s: %w", tool, execErr)
+		return json.Marshal(out)
 	}
 
-	if automationDenied(execRes.ExitCode, execRes.Stderr) {
-		logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_automation_denied", map[string]any{
-			"event": "osascript_automation_denied", "tool": tool, "lang": string(lang),
-			"target_app": in.TargetApp, "exit_code": execRes.ExitCode, "task_id": taskID, "trace_id": traceID,
-		})
-		return ScriptOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)},
-			&AutomationDeniedError{App: in.TargetApp}
+	raw, replayed, err := mcpfs.ExecuteWithReceipt(ctx, r.Receipts, rin, effect)
+	if err != nil {
+		return errOut, err
 	}
-
-	out := ScriptOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)}
-	logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_exec", map[string]any{
-		"event": "osascript_exec", "lang": string(lang), "target_app": in.TargetApp,
-		"exit_code": out.ExitCode, "trace_id": traceID, "task_id": taskID,
-	})
+	var out ScriptOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return ScriptOutput{}, fmt.Errorf("%s: decode result: %w", tool, err)
+	}
+	if replayed {
+		return replayedScript(ctx, r, traceID, taskID, tool, out), nil
+	}
 	return out, nil
+}
+
+// replayedScript marks a receipt-replayed applescript_run/jxa_run result and
+// ledgers osascript_replayed (task.Receipts itself ledgers tool.replayed).
+func replayedScript(ctx context.Context, r *Runner, traceID, taskID, tool string, out ScriptOutput) ScriptOutput {
+	logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_replayed", map[string]any{
+		"event": "osascript_replayed", "tool": tool, "task_id": taskID, "trace_id": traceID,
+	})
+	out.Replayed = true
+	return out
 }
 
 // argsForLang builds osascript's fixed argv for lang — script bytes

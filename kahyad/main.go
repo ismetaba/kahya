@@ -529,6 +529,20 @@ func run() int {
 	// the server's approval wait, so fs/shell/osascript calls that need
 	// approval park for the human decision too.
 	fsPolicyClient := srv.FSPolicyClient()
+	// FIX-I-4 (the W4 receipt gap): the W4-02 receipt lifecycle every
+	// side-effectful tool runs its effect through - fs_write/fs_delete,
+	// shell_docker/shell_host, applescript_run/jxa_run/shortcuts_run via
+	// recExec (srv.ReceiptExecutor: Replay before the policy check, the
+	// effect inside Receipts.ExecuteDetached), and every non-R tool on the
+	// generic /v1/mcp path (memory_write/memory_forget) via srv.SetReceipts.
+	// A resumed session re-issuing a completed call is answered from its
+	// receipt - never executed twice (HANDOFF §6 W4). Also a resume-scan
+	// LiveChecker below (task.AnyLive): a call still executing inside kahyad
+	// is never mistaken for an interrupted one (FIX-I-12).
+	taskReceipts := task.NewReceipts(st.DB(), st.Queries, st)
+	taskReceipts.SetJSONLLogger(log)
+	srv.SetReceipts(taskReceipts)
+	recExec := srv.ReceiptExecutor()
 	// FIX-B-4: fs_write/fs_delete and the shell_docker workdir check deny
 	// policy.yaml's globs PLUS the profile-aware self-protect globs derived
 	// from this config's own runtime paths (dev/redteam DataDir, KahyaDir,
@@ -551,6 +565,7 @@ func run() int {
 	// peer attribution, G03 / B-14) - the proxy backstop below then refuses
 	// every later model call of that task.
 	fsTool.LaneEscalator = server.NewFSLaneEscalator(st.Queries, st)
+	fsTool.Receipts = recExec
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
 
@@ -589,8 +604,10 @@ func run() int {
 	// starts to its own task's trace_id, via the SAME egressTokens
 	// registry the egress.Proxy listener below consults.
 	shellRunner.SetEgressTokenRegistrar(server.NewEgressTokenRegistrar(egressTokens))
+	shellRunner.Receipts = recExec
 
 	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
+	hostExec.Receipts = recExec
 	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
 	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {
 		log.Warn("docker_unavailable_at_boot", "hint", "make docker-up")
@@ -610,6 +627,7 @@ func run() int {
 	// above (shortcuts_run's --input-path canonicalization needs it;
 	// applescript_run/jxa_run do not).
 	osascriptRunner := mcposascript.NewRunner(home, fsPolicyClient, st, server.NewFSLogger(log))
+	osascriptRunner.Receipts = recExec
 	srv.SetOsascriptTool(mcposascript.New(osascriptRunner))
 
 	// POST /v1/task (W12-07): st.Queries already has exactly the
@@ -716,21 +734,12 @@ func run() int {
 	srv.SetHaltExecutor(haltExecutor)
 
 	// W4-07 acceptance gate: the dev-only w2_slow_stub MCP tool
-	// (kahyad/internal/server/devstub.go) is the ONLY thing that drives the
-	// REAL kahyad/internal/task.Receipts intent->executing->receipt
-	// lifecycle end to end - fs_write/shell_docker/applescript_run do not
-	// (yet) call Receipts.Execute at all (see receipts.go's own doc comment
-	// history; the memory note "kahya-w4-receipt-gap" tracks closing that
-	// gap for the REAL tools separately, before W78-06 dogfood). Registered
-	// onto the shared MCP server ONLY under KAHYA_ENV=dev - never
-	// reachable in production regardless of what a (also dev-only)
-	// policy.yaml overlay declares the tool as.
-	//
-	// taskReceipts itself is built unconditionally: the resume scan below
-	// consults it (task.AnyLive) so a tool call still executing inside
-	// kahyad is never mistaken for an interrupted one (FIX-I-12). With no
-	// caller (production today) it simply never reports anything live.
-	taskReceipts := task.NewReceipts(st.DB(), st.Queries, st)
+	// (kahyad/internal/server/devstub.go), registered onto the shared MCP
+	// server ONLY under KAHYA_ENV=dev - never reachable in production
+	// regardless of what a (also dev-only) policy.yaml overlay declares the
+	// tool as. Its receipt comes from the generic /v1/mcp path (FIX-I-4),
+	// exactly like memory_write's; taskReceipts is built and wired to every
+	// real tool above.
 	if cfg.Env == config.EnvDev {
 		srv.SetDevStub(taskReceipts)
 	}

@@ -150,6 +150,10 @@ type HostExecOutput struct {
 	Stdout   string   `json:"stdout"`
 	Stderr   string   `json:"stderr"`
 	Argv     []string `json:"argv"`
+	// Replayed is true when this is the stored result of an EARLIER,
+	// identical, completed shell_host call of the same task (FIX-I-4
+	// receipt replay): nothing ran this call.
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // HostExec implements shell_host's full gate chain.
@@ -163,6 +167,10 @@ type HostExec struct {
 	Ledger Ledger
 	Log    Logger
 	Exec   Executor
+
+	// Receipts is the FIX-I-4 receipt seam (see Runner.Receipts). nil =
+	// direct path (tests); kahyad always wires it.
+	Receipts ReceiptExecutor
 }
 
 // NewHostExec constructs a production HostExec. exec may be nil (defaults
@@ -197,6 +205,17 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	}
 	argv := plan.argv
 
+	// FIX-I-4: replay a completed identical call (keyed on the exact argv
+	// validate built - canonical paths, our fixed flags) before Check.
+	argvJSON, _ := json.Marshal(argv)
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shell_host", ArgsHash: mcpfs.ReceiptArgsHash(argvJSON)}
+	var stored HostExecOutput
+	if hit, err := mcpfs.ReplayReceipt(ctx, h.Receipts, rin, &stored); err != nil {
+		return HostExecOutput{}, fmt.Errorf("shell_host: %w", err)
+	} else if hit {
+		return h.replayed(ctx, traceID, taskID, stored), nil
+	}
+
 	toolInput := buildHostExecToolInput(in.Command, plan.canonRepo, in.Args)
 	decision, err := h.Policy.Check(ctx, "shell_host", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
@@ -212,13 +231,15 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	if err := h.Policy.ConsumeToken(ctx, decision.Token, "shell_host", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: onay jetonu tüketilemedi: %w", err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
 	// B-4: the repo-config scan is itself an Executor call, so it runs
 	// only AFTER ConsumeToken — a valid argv without a consumed token
 	// still reaches the executor ZERO times (W3-04 acceptance). The cost
 	// of this order: a dangerous config burns the approval token; the
 	// model sees the Turkish refusal and must ask again once the config
-	// is clean (fail-closed). G05/G10 reshape this tail later (C-3).
+	// is clean (fail-closed). It stays OUTSIDE the receipt effect below
+	// (C-3): a refusal is not an execution and claims no tool_calls row.
 	if in.Command == "git" {
 		if reason, derr := h.gitRepoConfigSafe(ctx, plan.repoOp); derr != nil {
 			logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_denied", map[string]any{
@@ -229,17 +250,42 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 		}
 	}
 
-	res, err := h.Exec.RunEnv(ctx, argv[0], argv[1:], nil, plan.env)
-	if err != nil {
-		return HostExecOutput{}, fmt.Errorf("shell_host: %w", err)
+	// FIX-I-4: the command itself runs inside the receipt lifecycle.
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		res, err := h.Exec.RunEnv(ctx, argv[0], argv[1:], nil, plan.env)
+		if err != nil {
+			return nil, fmt.Errorf("shell_host: %w", err)
+		}
+
+		logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_exec", map[string]any{
+			"event": "hostexec_exec", "tool": "shell_host", "argv": argv, "task_id": taskID,
+			"exit_code": res.ExitCode,
+		})
+
+		return json.Marshal(HostExecOutput{ExitCode: res.ExitCode, Stdout: string(res.Stdout), Stderr: string(res.Stderr), Argv: argv})
 	}
+	raw, replayed, err := mcpfs.ExecuteWithReceipt(ctx, h.Receipts, rin, effect)
+	if err != nil {
+		return HostExecOutput{}, err
+	}
+	var out HostExecOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return HostExecOutput{}, fmt.Errorf("shell_host: decode result: %w", err)
+	}
+	if replayed {
+		return h.replayed(ctx, traceID, taskID, out), nil
+	}
+	return out, nil
+}
 
-	logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_exec", map[string]any{
-		"event": "hostexec_exec", "tool": "shell_host", "argv": argv, "task_id": taskID,
-		"exit_code": res.ExitCode,
+// replayed marks a receipt-replayed shell_host result and ledgers
+// hostexec_replayed (task.Receipts itself ledgers tool.replayed).
+func (h *HostExec) replayed(ctx context.Context, traceID, taskID string, out HostExecOutput) HostExecOutput {
+	logAndLedger(ctx, h.Ledger, h.Log, traceID, "hostexec_replayed", map[string]any{
+		"event": "hostexec_replayed", "tool": "shell_host", "argv": out.Argv, "task_id": taskID,
 	})
-
-	return HostExecOutput{ExitCode: res.ExitCode, Stdout: string(res.Stdout), Stderr: string(res.Stderr), Argv: argv}, nil
+	out.Replayed = true
+	return out
 }
 
 // hostExecPlan is validate's result: everything Handle needs to execute

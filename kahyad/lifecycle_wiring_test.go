@@ -168,3 +168,42 @@ func TestHaltWorkerIdentityWiredFromWorkerCmd(t *testing.T) {
 		t.Fatalf("haltExecutor.SetWorkerIdentity calls = %q, want exactly [spawn.NewWorkerIdentity(cfg.WorkerCmd)]", calls)
 	}
 }
+
+// TestRealToolsWiredWithReceipts (FIX-I-4): every real side-effectful tool
+// must run its effect through the W4-02 receipt lifecycle in production -
+// an unwired Receipts field silently falls back to the direct path, which
+// re-executes a completed call on resume.
+func TestRealToolsWiredWithReceipts(t *testing.T) {
+	if calls := mainCalls(t, "srv", "SetReceipts"); len(calls) != 1 || calls[0] != "taskReceipts" {
+		t.Fatalf("srv.SetReceipts calls = %q, want exactly [taskReceipts]", calls)
+	}
+	if calls := mainCalls(t, "taskReceipts", "SetJSONLLogger"); len(calls) != 1 {
+		t.Fatalf("taskReceipts.SetJSONLLogger calls = %q, want exactly 1", calls)
+	}
+	if calls := mainCalls(t, "srv", "ReceiptExecutor"); len(calls) != 1 {
+		t.Fatalf("srv.ReceiptExecutor calls = %q, want exactly 1 (recExec)", calls)
+	}
+	_, f, _ := mainSource(t)
+	wired := map[string]int{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		sel, ok := as.Lhs[0].(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Receipts" {
+			return true
+		}
+		x, ok := sel.X.(*ast.Ident)
+		rhs, rok := as.Rhs[0].(*ast.Ident)
+		if ok && rok && rhs.Name == "recExec" {
+			wired[x.Name]++
+		}
+		return true
+	})
+	for _, tool := range []string{"fsTool", "shellRunner", "hostExec", "osascriptRunner"} {
+		if wired[tool] != 1 {
+			t.Errorf("%s.Receipts = recExec assignments = %d, want exactly 1", tool, wired[tool])
+		}
+	}
+}

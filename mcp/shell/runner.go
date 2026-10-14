@@ -25,6 +25,11 @@
 //  4. the actual execution (docker run / the fixed-argv host command).
 //  5. the ledger event (shell_exec / hostexec_exec or hostexec_denied).
 //
+// FIX-I-4: between steps 1 and 2 a completed identical call of the same
+// task is answered from its durable receipt (no policy decision, nothing
+// executes), and steps 4-5 run as one effect inside kahyad's tool_calls
+// receipt lifecycle (mcp/fs/receipts.go; Runner.Receipts/HostExec.Receipts).
+//
 // PolicyClient, Ledger, and Logger are literal type ALIASES of mcp/fs's
 // own interfaces (see the aliases below) — mcp/fs's package doc comment
 // already anticipated this: "a LATER out-of-process tool (W3-04's shell
@@ -47,6 +52,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -68,6 +74,12 @@ type (
 	Ledger         = mcpfs.Ledger
 	Logger         = mcpfs.Logger
 	PolicyDecision = mcpfs.PolicyDecision
+	// ReceiptExecutor / ReceiptInput are mcp/fs's FIX-I-4 receipt seam
+	// (mcp/fs/receipts.go), aliased for the same reason: kahyad's one
+	// adapter (kahyad/internal/server.NewReceiptExecutor) serves all three
+	// tool packages.
+	ReceiptExecutor = mcpfs.ReceiptExecutor
+	ReceiptInput    = mcpfs.ReceiptInput
 )
 
 // Result values, aliased from mcp/fs for the same reason as PolicyClient/
@@ -154,6 +166,10 @@ type RunOutput struct {
 	Workdir       string `json:"workdir"`
 	ContainerName string `json:"container_name"`
 	TimedOut      bool   `json:"timed_out"`
+	// Replayed is true when this is the stored result of an EARLIER,
+	// identical, completed shell_docker call of the same task (FIX-I-4
+	// receipt replay): no container ran this call.
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // Result is one Executor.Run's outcome.
@@ -363,6 +379,13 @@ type Runner struct {
 	// SetEgressTokenRegistrar.
 	EgressTokenRegistrar EgressTokenRegistrar
 
+	// Receipts is the FIX-I-4 receipt seam (mcp/fs/receipts.go): a completed
+	// identical call of the same task is replayed before any docker/egress
+	// work or policy decision, and the container run itself executes inside
+	// kahyad's tool_calls lifecycle. nil = direct path (tests); kahyad
+	// always wires it.
+	Receipts ReceiptExecutor
+
 	// timeoutUnit scales RunInput.TimeoutS into a time.Duration (defaults
 	// to time.Second; tests shrink this to time.Millisecond so a
 	// timeout/kill test runs in milliseconds, never a real 300s wait —
@@ -475,6 +498,17 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		return RunOutput{}, errors.New(reasonWorkdirContainsDenied)
 	}
 
+	// FIX-I-4: after every mechanical refusal, before any docker/egress work
+	// or policy decision - a completed identical call of the same task
+	// answers from its receipt (needs no daemon, no approval, no token).
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shell_docker", ArgsHash: shellDockerReceiptHash(in, cp.Match, timeoutS)}
+	var stored RunOutput
+	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
+		return RunOutput{}, fmt.Errorf("shell_docker: %w", err)
+	} else if hit {
+		return r.replayedRun(ctx, traceID, taskID, stored), nil
+	}
+
 	// egressToken is the per-task egress-proxy credential this run's
 	// container gets (BLOCKER B/C fix), minted only when an
 	// EgressTokenRegistrar is actually wired — an unminted (empty) token
@@ -541,73 +575,125 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	if err := r.Policy.ConsumeToken(ctx, decision.Token, "shell_docker", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: onay jetonu tüketilemedi: %w", err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
-	containerName := containerNameFor(taskID)
-	spec := dockerRunSpec{
-		ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
-		Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
+	// The container run (FIX-I-4): everything after ConsumeToken is the
+	// effect, executed inside the receipt lifecycle on a context detached
+	// from the MCP request (the hard timeout below still bounds it; a halt
+	// still kills the container by label).
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		containerName := containerNameFor(taskID)
+		spec := dockerRunSpec{
+			ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
+			Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
+		}
+		if in.NeedsNetwork {
+			// W3-05: attach to kahya-egress (an --internal Docker network
+			// with no route out at all) instead of the default --network
+			// none, and point HTTP_PROXY/HTTPS_PROXY at the kahya-egress-fwd
+			// sidecar (this task's spec, verbatim: "HTTP_PROXY=http://
+			// kahya-egress-fwd:3128") — the ONLY route out is through
+			// kahyad's own egress.Gate, which the sidecar dumbly
+			// TCP-forwards every byte to.
+			spec.Network = EgressNetworkName
+			spec.ProxyEnvPairs = egressProxyEnv(egressToken)
+		}
+		args := buildDockerRunArgs(spec)
+
+		// Logged BEFORE execution so the JSONL transcript this task's own
+		// acceptance criteria grep for ("docker run transcript ... shows
+		// --network none", "container labels present") exists regardless
+		// of how the run itself turns out. BLOCKER 2 fix, part b: the argv
+		// LOGGED here (and ledgered) is a REDACTED copy — every "-e
+		// NAME=VALUE" becomes "-e NAME=<redacted>" — args itself
+		// (unredacted) is what r.Exec.Run below actually executes, so the
+		// container still receives the real values; only this
+		// observability trail is scrubbed, since env_allowlist values must
+		// never sit in cleartext in a JSONL log file or the append-only
+		// brain.db ledger.
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_docker_run", map[string]any{
+			"event": "shell_docker_run", "tool": "shell_docker", "task_id": taskID,
+			"container_name": containerName, "image_tag": r.ImageTag, "image_digest": actualDigest,
+			"workdir": cp.Match, "docker_argv": append([]string{"docker"}, redactDockerArgv(args)...),
+		})
+
+		unit := r.timeoutUnit
+		if unit <= 0 {
+			unit = time.Second
+		}
+		timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutS)*unit)
+		defer cancel()
+
+		res, runErr := r.Exec.Run(timeoutCtx, "docker", args, []byte(in.Script))
+		timedOut := errors.Is(runErr, context.DeadlineExceeded)
+		if timedOut {
+			// this task's spec step 7: "on timeout docker kill" — issued on
+			// a fresh, un-timed-out context, since timeoutCtx is already
+			// expired.
+			_, _ = r.Exec.Run(context.Background(), "docker", []string{"kill", containerName}, nil)
+			r.logWith(traceID).Warn("shell_docker_timeout", "container_name", containerName, "task_id", taskID, "timeout_s", timeoutS)
+		} else if runErr != nil {
+			return nil, fmt.Errorf("shell_docker: %w", runErr)
+		}
+
+		out := RunOutput{
+			ExitCode: res.ExitCode, Stdout: string(res.Stdout), Stderr: string(res.Stderr),
+			BytesOut: len(res.Stdout) + len(res.Stderr), ImageDigest: actualDigest,
+			Workdir: cp.Match, ContainerName: containerName, TimedOut: timedOut,
+		}
+
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_exec", map[string]any{
+			"event": "shell_exec", "image_digest": actualDigest, "workdir": cp.Match,
+			"exit_code": out.ExitCode, "bytes_out": out.BytesOut, "trace_id": traceID, "task_id": taskID,
+			"container_name": containerName, "timed_out": timedOut,
+		})
+		return json.Marshal(out)
 	}
-	if in.NeedsNetwork {
-		// W3-05: attach to kahya-egress (an --internal Docker network
-		// with no route out at all) instead of the default --network
-		// none, and point HTTP_PROXY/HTTPS_PROXY at the kahya-egress-fwd
-		// sidecar (this task's spec, verbatim: "HTTP_PROXY=http://
-		// kahya-egress-fwd:3128") — the ONLY route out is through
-		// kahyad's own egress.Gate, which the sidecar dumbly TCP-forwards
-		// every byte to.
-		spec.Network = EgressNetworkName
-		spec.ProxyEnvPairs = egressProxyEnv(egressToken)
+
+	raw, replayed, err := mcpfs.ExecuteWithReceipt(ctx, r.Receipts, rin, effect)
+	if err != nil {
+		return RunOutput{}, err
 	}
-	args := buildDockerRunArgs(spec)
-
-	// Logged BEFORE execution so the JSONL transcript this task's own
-	// acceptance criteria grep for ("docker run transcript ... shows
-	// --network none", "container labels present") exists regardless of
-	// how the run itself turns out. BLOCKER 2 fix, part b: the argv
-	// LOGGED here (and ledgered) is a REDACTED copy — every "-e
-	// NAME=VALUE" becomes "-e NAME=<redacted>" — args itself (unredacted)
-	// is what r.Exec.Run below actually executes, so the container still
-	// receives the real values; only this observability trail is
-	// scrubbed, since env_allowlist values must never sit in cleartext in
-	// a JSONL log file or the append-only brain.db ledger.
-	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_docker_run", map[string]any{
-		"event": "shell_docker_run", "tool": "shell_docker", "task_id": taskID,
-		"container_name": containerName, "image_tag": r.ImageTag, "image_digest": actualDigest,
-		"workdir": cp.Match, "docker_argv": append([]string{"docker"}, redactDockerArgv(args)...),
-	})
-
-	unit := r.timeoutUnit
-	if unit <= 0 {
-		unit = time.Second
+	var out RunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return RunOutput{}, fmt.Errorf("shell_docker: decode result: %w", err)
 	}
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutS)*unit)
-	defer cancel()
-
-	res, runErr := r.Exec.Run(timeoutCtx, "docker", args, []byte(in.Script))
-	timedOut := errors.Is(runErr, context.DeadlineExceeded)
-	if timedOut {
-		// this task's spec step 7: "on timeout docker kill" — issued on a
-		// fresh, un-timed-out context, since timeoutCtx is already
-		// expired.
-		_, _ = r.Exec.Run(context.Background(), "docker", []string{"kill", containerName}, nil)
-		r.logWith(traceID).Warn("shell_docker_timeout", "container_name", containerName, "task_id", taskID, "timeout_s", timeoutS)
-	} else if runErr != nil {
-		return RunOutput{}, fmt.Errorf("shell_docker: %w", runErr)
+	if replayed {
+		return r.replayedRun(ctx, traceID, taskID, out), nil
 	}
-
-	out := RunOutput{
-		ExitCode: res.ExitCode, Stdout: string(res.Stdout), Stderr: string(res.Stderr),
-		BytesOut: len(res.Stdout) + len(res.Stderr), ImageDigest: actualDigest,
-		Workdir: cp.Match, ContainerName: containerName, TimedOut: timedOut,
-	}
-
-	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_exec", map[string]any{
-		"event": "shell_exec", "image_digest": actualDigest, "workdir": cp.Match,
-		"exit_code": out.ExitCode, "bytes_out": out.BytesOut, "trace_id": traceID, "task_id": taskID,
-		"container_name": containerName, "timed_out": timedOut,
-	})
-
 	return out, nil
+}
+
+// shellDockerReceiptEnvelope is shell_docker's receipt key input (FIX-I-4):
+// the FULL invocation - the approval token binds only the script bytes, but
+// a replay must only ever answer the identical call (same script, same
+// canonical workdir, same timeout, same network and env request).
+type shellDockerReceiptEnvelope struct {
+	Script       string   `json:"script"`
+	Workdir      string   `json:"workdir"`
+	TimeoutS     int      `json:"timeout_s"`
+	NeedsNetwork bool     `json:"needs_network"`
+	EnvAllowlist []string `json:"env_allowlist"`
+}
+
+func shellDockerReceiptHash(in RunInput, canonWorkdir string, timeoutS int) string {
+	env := append([]string(nil), in.EnvAllowlist...)
+	sort.Strings(env)
+	b, _ := json.Marshal(shellDockerReceiptEnvelope{
+		Script: in.Script, Workdir: canonWorkdir, TimeoutS: timeoutS, NeedsNetwork: in.NeedsNetwork, EnvAllowlist: env,
+	})
+	return mcpfs.ReceiptArgsHash(b)
+}
+
+// replayedRun marks a receipt-replayed shell_docker result and ledgers
+// shell_docker_replayed (task.Receipts itself ledgers tool.replayed).
+func (r *Runner) replayedRun(ctx context.Context, traceID, taskID string, out RunOutput) RunOutput {
+	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_docker_replayed", map[string]any{
+		"event": "shell_docker_replayed", "tool": "shell_docker", "task_id": taskID,
+		"workdir": out.Workdir, "container_name": out.ContainerName,
+	})
+	out.Replayed = true
+	return out
 }
 
 // KillAllLabeled kills every container carrying the kahya.task_id label

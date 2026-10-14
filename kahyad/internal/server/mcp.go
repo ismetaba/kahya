@@ -20,6 +20,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/traceid"
 	"kahya/mcp/memory"
 )
@@ -279,6 +280,12 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     read the SAME pinned headers; deny-all still fails closed at boot;
 //     every decision is ledgered; an auto-allowed W1 still opens a
 //     5-minute undo window.
+//   - FIX-I-4: with receipts wired (SetReceipts) and a task id, a completed
+//     identical call of the same task is answered from its durable receipt
+//     before the policy check (receipts.go mcpReplayStoredResult), and a
+//     non-R call's handler runs inside Receipts.ExecuteDetached
+//     (mcpExecuteWithReceipt) - a resumed session never executes it twice.
+//     The fs/shell/osascript tools do the same in their own gate chains.
 //   - Residuals (the sanctioned worker does neither): a forked worker
 //     child that calls setsid() is in a fresh, unregistered session and so
 //     unattributable at once - even while its worker's task runs; a child
@@ -375,6 +382,28 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			if callReq.Params.Arguments != nil {
 				argBytes = []byte(callReq.Params.Arguments)
 			}
+
+			// FIX-I-4: with receipts wired and a task to key on, a completed
+			// identical call of the same task (canonical argument bytes) is
+			// answered from its durable receipt BEFORE the policy check - a
+			// resumed session re-issuing it executes nothing and needs no
+			// second approval. R-class tools never have a receipt (no row is
+			// ever written for them), so for them this is always a miss.
+			receiptsOn := s.receipts != nil && taskID != ""
+			var rin task.ExecuteInput
+			if receiptsOn {
+				rin = task.ExecuteInput{TaskID: taskID, TraceID: traceID, ToolName: canonName, ArgsHash: task.HashArgs(canonicalToolArgs(argBytes))}
+				res, hit, err := s.mcpReplayStoredResult(ctx, rin)
+				if err != nil {
+					// Fail-closed: an unanswerable lookup never executes.
+					s.log.With(traceID).Error("mcp_receipt_replay_failed", "tool", canonName, "err", err.Error())
+					return deny(policy.ReasonPolicyStateError)
+				}
+				if hit {
+					return res, nil
+				}
+			}
+
 			// B-1: checkWithApprovalWait (approval_wait.go) parks a
 			// needs_approval call until the human decides, then re-checks -
 			// an approval is redeemed into a fresh token, consumed below,
@@ -414,6 +443,14 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 				}); err != nil {
 					s.log.With(traceID).Error("mcp_consume_token_failed", "tool", canonName, "err", err.Error())
 					return deny(policy.ReasonPolicyStateError)
+				}
+				// FIX-I-4: the handler (the side effect) runs inside the
+				// receipt lifecycle - intent -> executing -> receipt.
+				if receiptsOn {
+					rin.Class, rin.ApprovalToken = decision.Class, decision.Token
+					return s.mcpExecuteWithReceipt(ctx, rin, func(ectx context.Context) (mcp.Result, error) {
+						return next(ectx, method, req)
+					})
 				}
 			}
 			return next(ctx, method, req)

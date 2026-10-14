@@ -38,6 +38,8 @@ type ShortcutOutput struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	TimedOut bool   `json:"timed_out"`
+	// Replayed: see ScriptOutput.Replayed (the shortcut did not run).
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // RunShortcut implements shortcuts_run end to end: validate (mechanical,
@@ -61,6 +63,16 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	}
 
 	toolInput := buildShortcutToolInput(name, canonInputPath)
+
+	// FIX-I-4: same receipt order as applescript_run/jxa_run (runner.go).
+	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shortcuts_run", ArgsHash: mcpfs.ReceiptArgsHash(toolInput)}
+	var stored ShortcutOutput
+	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
+		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: %w", err)
+	} else if hit {
+		return r.replayedShortcut(ctx, traceID, taskID, name, stored), nil
+	}
+
 	decision, err := r.Policy.Check(ctx, "shortcuts_run", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: %w", err)
@@ -71,37 +83,65 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	if err := r.Policy.ConsumeToken(ctx, decision.Token, "shortcuts_run", decision.Class, defaultScope, taskID, traceID, toolInput); err != nil {
 		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: onay jetonu tüketilemedi: %w", err)
 	}
+	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
 
-	argv := []string{"run", name}
-	if canonInputPath != "" {
-		argv = append(argv, "--input-path", canonInputPath)
-	}
+	var errOut ShortcutOutput
+	effect := func(ctx context.Context) (json.RawMessage, error) {
+		argv := []string{"run", name}
+		if canonInputPath != "" {
+			argv = append(argv, "--input-path", canonInputPath)
+		}
 
-	unit := r.timeoutUnit
-	if unit <= 0 {
-		unit = time.Second
-	}
-	timeoutCtx, cancel := context.WithTimeout(ctx, hardTimeoutSeconds*unit)
-	defer cancel()
+		unit := r.timeoutUnit
+		if unit <= 0 {
+			unit = time.Second
+		}
+		timeoutCtx, cancel := context.WithTimeout(ctx, hardTimeoutSeconds*unit)
+		defer cancel()
 
-	execRes, execErr := r.Exec.Run(timeoutCtx, "shortcuts", argv, nil)
-	if errors.Is(execErr, context.DeadlineExceeded) {
-		logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_timeout", map[string]any{
-			"event": "osascript_timeout", "tool": "shortcuts_run", "shortcut_name": name,
-			"task_id": taskID, "trace_id": traceID, "timeout_s": hardTimeoutSeconds,
+		execRes, execErr := r.Exec.Run(timeoutCtx, "shortcuts", argv, nil)
+		if errors.Is(execErr, context.DeadlineExceeded) {
+			logAndLedger(ctx, r.Ledger, r.Log, traceID, "osascript_timeout", map[string]any{
+				"event": "osascript_timeout", "tool": "shortcuts_run", "shortcut_name": name,
+				"task_id": taskID, "trace_id": traceID, "timeout_s": hardTimeoutSeconds,
+			})
+			errOut = ShortcutOutput{TimedOut: true}
+			return nil, errors.New(reasonTimeout)
+		}
+		if execErr != nil {
+			return nil, fmt.Errorf("shortcuts_run: %w", execErr)
+		}
+
+		out := ShortcutOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)}
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shortcuts_exec", map[string]any{
+			"event": "shortcuts_exec", "shortcut_name": name, "input_path": canonInputPath,
+			"exit_code": out.ExitCode, "trace_id": traceID, "task_id": taskID,
 		})
-		return ShortcutOutput{TimedOut: true}, errors.New(reasonTimeout)
-	}
-	if execErr != nil {
-		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: %w", execErr)
+		return json.Marshal(out)
 	}
 
-	out := ShortcutOutput{ExitCode: execRes.ExitCode, Stdout: string(execRes.Stdout), Stderr: string(execRes.Stderr)}
-	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shortcuts_exec", map[string]any{
-		"event": "shortcuts_exec", "shortcut_name": name, "input_path": canonInputPath,
-		"exit_code": out.ExitCode, "trace_id": traceID, "task_id": taskID,
-	})
+	raw, replayed, err := mcpfs.ExecuteWithReceipt(ctx, r.Receipts, rin, effect)
+	if err != nil {
+		return errOut, err
+	}
+	var out ShortcutOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: decode result: %w", err)
+	}
+	if replayed {
+		return r.replayedShortcut(ctx, traceID, taskID, name, out), nil
+	}
 	return out, nil
+}
+
+// replayedShortcut marks a receipt-replayed shortcuts_run result and
+// ledgers shortcuts_replayed (task.Receipts itself ledgers tool.replayed).
+func (r *Runner) replayedShortcut(ctx context.Context, traceID, taskID, name string, out ShortcutOutput) ShortcutOutput {
+	logAndLedger(ctx, r.Ledger, r.Log, traceID, "shortcuts_replayed", map[string]any{
+		"event": "shortcuts_replayed", "shortcut_name": name, "task_id": taskID, "trace_id": traceID,
+	})
+	out.Replayed = true
+	return out
 }
 
 // shortcutToolInputEnvelope is the deterministic JSON shape shortcuts_run

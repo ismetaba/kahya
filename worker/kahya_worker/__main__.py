@@ -438,6 +438,32 @@ def main(argv: list[str] | None = None) -> int:
     return asyncio.run(_run_session(envelope, socket_path, mcp_bridge))
 
 
+# FIX-I-4 (W4-02): a resumed session (ClaudeAgentOptions.resume=<session_id>)
+# already holds the original prompt in its transcript. Re-sending
+# envelope.prompt would append a SECOND user turn and make the model redo the
+# whole task. The SDK has no "re-run the last turn" primitive (client.query
+# always writes a new user message), so a resumed session is continued with
+# this fixed instruction instead. Model-facing (Turkish, like the system
+# prompt). Kahyad's receipt replay (kahyad/internal/task.Receipts: every
+# side-effectful kahyad-owned tool answers an already-completed identical call
+# from its durable receipt) is the BINDING double-execution guard; this text
+# is UX only (HANDOFF §5: security in the executor, never in the prompt).
+RESUME_CONTINUATION_PROMPT = (
+    "Bu oturum yarıda kesildi ve şimdi kaldığı yerden devam ettiriliyor. "
+    "Önceki isteği baştan yapma; tamamlanmış araç çağrılarını tekrar yürütme. "
+    "Yalnız eksik kalan adımları tamamla ve kısa bir sonuç ver. "
+    "Görev zaten tamamlanmışsa bunu tek cümleyle belirt."
+)
+
+
+def _session_prompt(envelope: Envelope) -> str:
+    """The one user turn this run sends: the task's own prompt for a fresh
+    session, RESUME_CONTINUATION_PROMPT for a resumed one (FIX-I-4)."""
+    if envelope.resume:
+        return RESUME_CONTINUATION_PROMPT
+    return envelope.prompt
+
+
 # B-1: the kahya-mcp bridge's per-tools/call budget env var
 # (kahyad/cmd/kahya-mcp toolCallTimeoutEnvVar), forwarded to the bridge by
 # _build_options when kahyad set it.
@@ -552,9 +578,14 @@ async def _run_session(envelope: Envelope, socket_path: str, mcp_bridge: str) ->
     # after the try block).
     saw_result = False
 
+    if envelope.resume:
+        # FIX-I-4: continued with RESUME_CONTINUATION_PROMPT, never the
+        # original prompt (see that constant's comment).
+        wlog.log("info", "session_resumed", session_id=envelope.session_id, task_id=envelope.task_id)
+
     try:
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(envelope.prompt)
+            await client.query(_session_prompt(envelope))
 
             session_emitted = False
             async for message in client.receive_response():

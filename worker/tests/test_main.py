@@ -788,6 +788,60 @@ class TestResumeOptionWiring(unittest.TestCase):
         warning = _get_can_use_tool_shadowed_warning(options.permission_mode, options.allowed_tools)
         self.assertFalse(warning, f"can_use_tool is shadowed on resume and would never fire: {warning!r}")
 
+    # FIX-I-4: a resumed session already holds the original prompt in its
+    # transcript; client.query always appends a NEW user turn, so re-sending
+    # envelope.prompt would make the model redo the whole task.
+
+    def _run_capturing(self, envelope: dict, log_dir: str) -> tuple[int, str, list]:
+        created: list = []
+
+        def capturing_factory(options=None):
+            c = _FakeClaudeSDKClient(options=options, messages=[_ok_result("sess-1")])
+            created.append(c)
+            return c
+
+        code, out = run_main_with(envelope, base_env(log_dir), client_factory=capturing_factory)
+        return code, out, created
+
+    def test_resume_true_sends_continuation_prompt_not_original(self) -> None:
+        d = dict(VALID_ENVELOPE)
+        d["session_id"] = "sess-1"
+        d["resume"] = True
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, out, created = self._run_capturing(d, log_dir)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].queried_prompt, worker_main.RESUME_CONTINUATION_PROMPT)
+        self.assertNotEqual(created[0].queried_prompt, VALID_ENVELOPE["prompt"])
+        self.assertEqual(created[0].options.resume, "sess-1")
+        lines = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertIn({"type": "session", "session_id": "sess-1"}, lines)
+        self.assertEqual(lines[-1], {"type": "result", "status": "ok"})
+
+    def test_resume_false_sends_original_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            code, _, created = self._run_capturing(dict(VALID_ENVELOPE), log_dir)
+        self.assertEqual(code, 0)
+        self.assertEqual(created[0].queried_prompt, VALID_ENVELOPE["prompt"])
+
+    def test_resume_logs_session_resumed_jsonl(self) -> None:
+        d = dict(VALID_ENVELOPE)
+        d["session_id"] = "sess-1"
+        d["resume"] = True
+        with tempfile.TemporaryDirectory() as log_dir:
+            self._run_capturing(d, log_dir)
+            lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+        resumed = [l for l in lines if l.get("event") == "session_resumed"]
+        self.assertEqual(len(resumed), 1, lines)
+        self.assertEqual(resumed[0].get("session_id"), "sess-1")
+        self.assertEqual(resumed[0].get("trace_id"), VALID_ENVELOPE["trace_id"])
+
+    def test_fresh_session_logs_no_session_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            self._run_capturing(dict(VALID_ENVELOPE), log_dir)
+            lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
+        self.assertFalse([l for l in lines if l.get("event") == "session_resumed"])
+
 
 class TestSessionIDCapture(unittest.TestCase):
     """MINOR 4 fix: the init SystemMessage carries session_id inside
