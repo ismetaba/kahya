@@ -35,6 +35,8 @@ type fsWriteToolInput struct {
 // exist / cannot be read — lets the Telegram card render a REAL
 // before/after diff without kahyad having persisted a separate pre-image
 // copy, exactly like the CLI surface's own renderPendingApproval.
+// readCurrentFile output is classified by outboundSecretLane before any
+// send (FIX-P-6): the old content is part of the rendered card.
 func readCurrentFile(home, rawPath string) []byte {
 	cp, err := mcpfs.Canonicalize(home, rawPath)
 	if err != nil {

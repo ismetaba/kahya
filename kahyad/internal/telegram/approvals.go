@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 
 	tele "gopkg.in/telebot.v4"
@@ -112,25 +113,35 @@ func approvalMarkup(id string) (*tele.ReplyMarkup, error) {
 // Telegram send can never delay a policy decision). ClassR never reaches
 // NEEDS_APPROVAL (the engine's own invariant), so only W1/W2/W3 are
 // handled here.
+//
+// Order (FIX-P-6): glob/input gate -> render -> classify the EXACT
+// outbound text -> branch on class. Both redaction gates (redact.go) run
+// BEFORE branching on class and gate all three classes alike: a
+// secret-lane action can be W1, W2 or W3 (an fs_write rule with class: W3
+// is a valid policy.yaml), and HANDOFF §5 safety #5 ⚑ ("gizli-şerit
+// etiketli tek bir bayt Telegram'a gönderilmez") draws no exception for
+// W3, so a secret-lane action of any class gets ONLY the redacted title -
+// no path, no summary, no diff (redact_test.go's
+// TestSecretLaneW3StillRedacted/TestW3NoticeSummaryWithIBANRedacted).
+// Every b.send below carries either a fixed Turkish text or bytes that
+// passed outboundSecretLane.
 func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApprovalInfo) {
 	if !b.Enabled() {
 		return
 	}
-	// BLOCKER fix: the secret-lane check now runs BEFORE branching on
-	// class, and gates ALL three classes alike. A secret-lane-labeled
-	// action can be classified W1, W2, OR W3 (a valid policy.yaml config:
-	// an fs_write/fs_delete rule with class: W3, reversible: false) - this
-	// check used to live ONLY inside the W1/W2 case below, so a
-	// secret-lane W3 action fell straight through to sendW3Notice, which
-	// renders the REAL path via renderPendingApprovalPayload into
-	// msgW3WaitFmt and sends it to Telegram. HANDOFF §5 safety #5 ⚑
-	// ("gizli-şerit etiketli tek bir bayt Telegram'a gönderilmez") draws
-	// no exception for W3, so every class now gets ONLY the redacted
-	// title (redact.go) when secret-lane-labeled - no path, no summary,
-	// no diff, ever, regardless of class. See redact_test.go's
-	// TestSecretLaneW3StillRedacted/TestSecretLaneW3DeleteAlsoRedacted.
-	if isSecretLane(b.home, b.secretLaneGlobs, info.Tool, info.ToolInput) {
-		b.sendRedactedNotice(ctx, info)
+	if secret, reason := inputSecretLane(b.home, b.secretLaneGlobs, info.Tool, info.ToolInput); secret {
+		b.redact(ctx, info, reason)
+		return
+	}
+	payload := renderPendingApprovalPayload(b.home, info.Tool, info.ToolInput)
+	var outbound string
+	if info.Class == policy.ClassW3 {
+		outbound = fmt.Sprintf(msgW3WaitFmt, payload.Summary, info.ID)
+	} else {
+		outbound = payload.Render()
+	}
+	if secret, reason := outboundSecretLane(outbound); secret {
+		b.redact(ctx, info, reason)
 		return
 	}
 	switch info.Class {
@@ -141,45 +152,97 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 		// Engine.Approve) is what actually makes this unbypassable even
 		// under a forged callback — see approvals_test.go's
 		// TestForgedW3CallbackRejectedAtEngine.
-		b.sendW3Notice(ctx, info)
+		b.send(ctx, info.TraceID, outbound, nil) // NEVER a keyboard for W3
 	case policy.ClassW1, policy.ClassW2:
-		b.sendApprovalCard(ctx, info)
+		// The card branch: outbound is already classified, so anything
+		// that decides HOW a W1/W2 card is presented (keyboard or notice)
+		// belongs here, after the classification above.
+		b.sendApprovalCard(ctx, info, payload, outbound)
 	}
 }
 
-func (b *Bot) sendW3Notice(ctx context.Context, info policy.PendingApprovalInfo) {
-	payload := renderPendingApprovalPayload(b.home, info.Tool, info.ToolInput)
-	text := fmt.Sprintf(msgW3WaitFmt, payload.Summary, info.ID)
-	b.send(ctx, info.TraceID, text, nil) // NEVER a keyboard for W3
-}
-
-func (b *Bot) sendRedactedNotice(ctx context.Context, info policy.PendingApprovalInfo) {
+// redact sends the redacted title instead of the card and ledgers why
+// (telegram_card_redacted; reason is local-only and never names content
+// beyond a lexicon keyword or a rule name like "iban").
+func (b *Bot) redact(ctx context.Context, info policy.PendingApprovalInfo, reason string) {
+	b.ledgerEvent(info.TraceID, "telegram_card_redacted", map[string]any{
+		"event": "telegram_card_redacted", "tool": info.Tool, "class": string(info.Class),
+		"reason": reason, "pending_approval_id": info.ID,
+	})
 	b.send(ctx, info.TraceID, redactedNoticeText(info.Tool), nil)
 }
 
-// sendApprovalCard renders info's byte-exact WYSIWYE diff (approval.Render,
-// reused verbatim from W3-06), chunks it for Telegram (approval.
-// ChunkForTelegram, ≤4096 runes per message), and attaches the inline
-// Onayla/Reddet keyboard to ONLY the final chunk (task spec step 3). The
-// final chunk's sent *tele.Message identity is remembered (b.cards) so a
-// later callback/expiry can edit that SAME message rather than send a new
-// one. The entry is bounded (FIX-P-19): every send sweeps first, see
-// sweepCards.
-func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalInfo) {
+// ledgerEvent appends one events row (best-effort, like ledgerUnauthorized)
+// and mirrors it as a JSONL line under the same trace_id.
+func (b *Bot) ledgerEvent(traceID, kind string, payload map[string]any) {
+	if b.log != nil {
+		keys := make([]string, 0, len(payload))
+		for k := range payload {
+			if k != "event" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		args := make([]any, 0, 2*len(keys))
+		for _, k := range keys {
+			args = append(args, k, payload[k])
+		}
+		b.log.With(traceID).Info(kind, args...)
+	}
+	if b.ledger == nil {
+		return
+	}
+	_ = b.ledger.LogEvent(context.Background(), traceID, kind, payload)
+}
+
+// maxCardChunks bounds one approval card's Telegram message count
+// (FIX-P-6, decision G09-2). A diff that needs more is NOT paginated:
+// WYSIWYE means the reviewer must see every byte before the button exists,
+// and a 40-message card is neither reviewable on a phone nor safe against
+// Telegram 429 / the egress byte budget. Such cards get a single notice
+// with NO keyboard; the full diff stays on the local surface (`kahya
+// approve <id>`).
+const maxCardChunks = 8
+
+// Turkish card-delivery notices (FIX-P-6), byte-exact from the handbook.
+const (
+	msgCardTooLargeFmt   = "📄 %s — onay kartı Telegram için çok büyük (%d parça). Tam diff yalnız yerel yüzeyde: 'kahya approve %s'"
+	msgCardIncompleteFmt = "⚠️ Onay kartı eksik gönderildi; yerel yüzeyden inceleyin: 'kahya approve %s'"
+)
+
+// sendApprovalCard sends rendered — info's byte-exact WYSIWYE diff
+// (approval.Render, reused verbatim from W3-06), already classified by
+// OnPendingApproval — chunked for Telegram (approval.ChunkForTelegram,
+// ≤4096 runes per message), with the inline Onayla/Reddet keyboard on ONLY
+// the final chunk (task spec step 3). FIX-P-6: at most maxCardChunks
+// messages, and the keyboard chunk is sent only after every earlier chunk
+// reached Telegram - a reviewer never sees a button without the whole
+// diff. The final chunk's sent *tele.Message identity is remembered
+// (b.cards) so a later callback/expiry can edit that SAME message rather
+// than send a new one. The entry is bounded (FIX-P-19): every send sweeps
+// first, see sweepCards.
+func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalInfo, payload approval.ApprovalPayload, rendered string) {
 	b.sweepCards(b.clock()) // FIX-P-19: bounded even with no sweep loop running
 	// FIX-P-5: while Telegram is unreachable a multi-chunk card would get
 	// one telegram_offline local line PER CHUNK from send - one line for
 	// the whole card instead (the pending_approvals row and `kahya
-	// approvals` stay the real surface; nothing is queued).
+	// approvals` stay the real surface; nothing is queued). This also keeps
+	// an offline card from being ledgered as telegram_card_incomplete.
 	if !b.Online() {
 		b.fallbackLocal(ctx, info.TraceID, "telegram_offline", msgTelegramOffline)
 		return
 	}
-	payload := renderPendingApprovalPayload(b.home, info.Tool, info.ToolInput)
-	rendered := payload.Render()
 	chunks := approval.ChunkForTelegram(rendered, 0)
 	if len(chunks) == 0 {
 		chunks = []string{payload.Summary}
+	}
+	if len(chunks) > maxCardChunks {
+		b.ledgerEvent(info.TraceID, "telegram_card_too_large", map[string]any{
+			"event": "telegram_card_too_large", "tool": info.Tool, "chunks": len(chunks), "pending_approval_id": info.ID,
+		})
+		// payload.Summary is rendered's first line, so it was classified.
+		b.send(ctx, info.TraceID, fmt.Sprintf(msgCardTooLargeFmt, payload.Summary, len(chunks), info.ID), nil)
+		return
 	}
 	markup, err := approvalMarkup(info.ID)
 	if err != nil {
@@ -189,26 +252,27 @@ func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalI
 		return
 	}
 
-	var lastMsg *tele.Message
-	var lastText string
-	for i, chunk := range chunks {
-		var m *tele.ReplyMarkup
-		if i == len(chunks)-1 {
-			m = markup
-		}
-		msg := b.send(ctx, info.TraceID, chunk, m)
-		if i == len(chunks)-1 {
-			lastMsg, lastText = msg, chunk
+	// Every non-final chunk must reach Telegram BEFORE the keyboard chunk
+	// is ever sent.
+	for _, chunk := range chunks[:len(chunks)-1] {
+		if b.send(ctx, info.TraceID, chunk, nil) == nil {
+			b.ledgerEvent(info.TraceID, "telegram_card_incomplete", map[string]any{
+				"event": "telegram_card_incomplete", "tool": info.Tool, "pending_approval_id": info.ID,
+			})
+			b.send(ctx, info.TraceID, fmt.Sprintf(msgCardIncompleteFmt, info.ID), nil) // best effort, no keyboard
+			return
 		}
 	}
-	if lastMsg == nil {
+	last := chunks[len(chunks)-1]
+	msg := b.send(ctx, info.TraceID, last, markup)
+	if msg == nil {
 		return // send failed/blocked - nothing reached Telegram to track
 	}
 
 	b.mu.Lock()
 	b.cards[info.ID] = &cardState{
-		ChatID: lastMsg.Chat.ID, MessageID: lastMsg.ID,
-		Text: lastText, TraceID: info.TraceID, sentAt: b.clock(),
+		ChatID: msg.Chat.ID, MessageID: msg.ID,
+		Text: last, TraceID: info.TraceID, sentAt: b.clock(),
 	}
 	b.mu.Unlock()
 }

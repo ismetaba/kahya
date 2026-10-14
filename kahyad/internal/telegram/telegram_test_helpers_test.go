@@ -41,12 +41,15 @@ type fakeSender struct {
 
 	nextMsgID int
 	failSend  bool
+	// failAfter > 0 fails every Send once that many messages were sent
+	// (FIX-P-6: a card whose middle chunk never reaches Telegram).
+	failAfter int
 }
 
 func (f *fakeSender) Send(to tele.Recipient, what interface{}, opts ...interface{}) (*tele.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.failSend {
+	if f.failSend || (f.failAfter > 0 && len(f.sent) >= f.failAfter) {
 		return nil, fmt.Errorf("fakeSender: forced send failure")
 	}
 	text, _ := what.(string)
@@ -214,11 +217,14 @@ func newPolicyFixture(t *testing.T) policyFixture {
 	// non-local surface (this bot, surface "telegram") approve only a
 	// reversible tool, and these tests drive real Telegram approvals of
 	// them. shell_docker is the irreversible W2 the engine-backstop tests
-	// use (TestForgedIrreversibleW2CallbackRejectedAtEngine).
+	// use (TestForgedIrreversibleW2CallbackRejectedAtEngine); it and
+	// applescript_run (W2, irreversible as in policy.yaml) also carry the
+	// non-fs tool bodies the FIX-P-6 redaction tests classify.
 	tools := []policy.ToolRule{
 		{Name: "fs_write", Class: policy.ClassW2, Reversible: true, Undo: "pre-op git checkpoint restore"},
 		{Name: "fs_delete", Class: policy.ClassW2, Reversible: true, Undo: "move back from Trash"},
 		{Name: "shell_docker", Class: policy.ClassW2},
+		{Name: "applescript_run", Class: policy.ClassW2},
 		{Name: "mail_send", Class: policy.ClassW3},
 	}
 	byName := make(map[string]policy.ToolRule, len(tools))

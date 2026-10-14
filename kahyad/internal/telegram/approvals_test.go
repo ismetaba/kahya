@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/approval"
 	"kahya/kahyad/internal/policy"
 )
 
@@ -91,19 +92,26 @@ func TestW2ApprovalCardByteExactDiff(t *testing.T) {
 	}
 }
 
+// fillerLines is n lines of clean filler text (the deterministic
+// secret-lane pre-pass finds nothing in it).
+func fillerLines(n int) string {
+	var big strings.Builder
+	for i := 0; i < n; i++ {
+		big.WriteString("line of filler content to force chunking across multiple telegram messages\n")
+	}
+	return big.String()
+}
+
 // TestW2ApprovalCardMultiChunkKeyboardOnlyOnLast forces a diff large
-// enough to require multiple Telegram messages and asserts the keyboard
-// is attached to ONLY the final one.
+// enough to require multiple Telegram messages (150 lines, 3-4 chunks,
+// within maxCardChunks - FIX-P-6) and asserts the keyboard is attached to
+// ONLY the final one.
 func TestW2ApprovalCardMultiChunkKeyboardOnlyOnLast(t *testing.T) {
 	sender := &fakeSender{}
 	fix := newPolicyFixture(t)
 	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), fix.Engine, nil)
 
-	var big strings.Builder
-	for i := 0; i < 2000; i++ {
-		big.WriteString("line of filler content to force chunking across multiple telegram messages\n")
-	}
-	toolInput := fsWriteInput(t, "buyuk-dosya.txt", big.String())
+	toolInput := fsWriteInput(t, "buyuk-dosya.txt", fillerLines(150))
 
 	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
 		Tool: "fs_write", TaskID: "task-2", TraceID: "trace-w2-multi", ToolInput: toolInput,
@@ -613,4 +621,135 @@ func TestSweepCardsLoopEvictsAndStopsWithContext(t *testing.T) {
 	waitFor(t, 2*time.Second, "the loop to evict the stale card", func() bool { return cardCount(b) == 0 })
 	cancel()
 	waitReturned(t, done, time.Second, "sweepCardsLoop after cancel")
+}
+
+// ---- FIX-P-6: chunk cap + no keyboard unless every chunk arrived ----
+
+// TestApprovalCardTooLargeSendsNoticeWithoutKeyboard (FIX-P-6): a card
+// that needs more than maxCardChunks messages is not paginated - one
+// keyboard-less notice pointing at the local surface, nothing tracked.
+func TestApprovalCardTooLargeSendsNoticeWithoutKeyboard(t *testing.T) {
+	sender := &fakeSender{}
+	ledger := &fakeLedger{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), fix.Engine, nil)
+
+	toolInput := fsWriteInput(t, "buyuk-dosya.txt", fillerLines(2000))
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "fs_write", TaskID: "task-too-large", TraceID: "trace-too-large", ToolInput: toolInput,
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check = %+v, %v", d, err)
+	}
+	b.OnPendingApproval(context.Background(), policy.PendingApprovalInfo{
+		ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: "trace-too-large",
+	})
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent %d message(s), want exactly 1 notice", len(sender.sent))
+	}
+	msg := sender.sent[0]
+	if !strings.HasPrefix(msg.Text, "📄 fs_write: ") || !strings.Contains(msg.Text, "'kahya approve "+d.PendingApprovalID+"'") {
+		t.Fatalf("notice = %q, want the too-large notice naming the summary and the local command", msg.Text)
+	}
+	if !strings.Contains(msg.Text, " — onay kartı Telegram için çok büyük (") || !strings.Contains(msg.Text, " parça). Tam diff yalnız yerel yüzeyde: ") {
+		t.Fatalf("notice = %q, want the byte-exact Turkish too-large text", msg.Text)
+	}
+	if msg.Markup != nil {
+		t.Fatalf("too-large notice must carry no keyboard, got %+v", msg.Markup)
+	}
+	if n := cardCount(b); n != 0 {
+		t.Fatalf("tracked cards = %d, want 0", n)
+	}
+	if n := ledger.countKind("telegram_card_too_large"); n != 1 {
+		t.Fatalf("telegram_card_too_large rows = %d, want 1", n)
+	}
+}
+
+// TestApprovalCardPartialSendFailureNoKeyboard (FIX-P-6, WYSIWYE): when a
+// non-final chunk fails to reach Telegram, the keyboard chunk is never
+// sent; the card is ledgered incomplete and not tracked.
+func TestApprovalCardPartialSendFailureNoKeyboard(t *testing.T) {
+	sender := &fakeSender{failAfter: 1}
+	ledger := &fakeLedger{}
+	local := &fakeLocalNotifier{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), fix.Engine, local)
+
+	toolInput := fsWriteInput(t, "orta-dosya.txt", fillerLines(150))
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "fs_write", TaskID: "task-partial", TraceID: "trace-partial", ToolInput: toolInput,
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check = %+v, %v", d, err)
+	}
+	b.OnPendingApproval(context.Background(), policy.PendingApprovalInfo{
+		ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: "trace-partial",
+	})
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent %d message(s), want exactly the first chunk", len(sender.sent))
+	}
+	for i, s := range sender.sent {
+		if s.Markup != nil {
+			t.Fatalf("message %d carries a keyboard although the card never fully arrived", i)
+		}
+	}
+	if n := cardCount(b); n != 0 {
+		t.Fatalf("tracked cards = %d, want 0", n)
+	}
+	if n := ledger.countKind("telegram_card_incomplete"); n != 1 {
+		t.Fatalf("telegram_card_incomplete rows = %d, want 1", n)
+	}
+	failed := 0
+	for _, c := range local.calls {
+		if strings.HasPrefix(c, "telegram_send_failed:") {
+			failed++
+		}
+	}
+	if failed < 1 {
+		t.Fatalf("local calls = %q, want at least one telegram_send_failed line", local.calls)
+	}
+}
+
+// TestApprovalCardWithinCapTrackedOnce (FIX-P-6): a card of exactly
+// maxCardChunks messages is still sent in full with the keyboard on the
+// last chunk and tracked.
+func TestApprovalCardWithinCapTrackedOnce(t *testing.T) {
+	sender := &fakeSender{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, nil, newAllowGate(t), fix.Engine, nil)
+
+	// Find a filler size whose rendered card is exactly maxCardChunks
+	// chunks (the renderer is deterministic, so this is stable).
+	var toolInput []byte
+	for n := 300; n < 600; n++ {
+		in := fsWriteInput(t, "sinir-dosya.txt", fillerLines(n))
+		p := renderPendingApprovalPayload(b.home, "fs_write", in)
+		if len(approval.ChunkForTelegram(p.Render(), 0)) == maxCardChunks {
+			toolInput = in
+			break
+		}
+	}
+	if toolInput == nil {
+		t.Fatal("no filler size renders to exactly maxCardChunks chunks")
+	}
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "fs_write", TaskID: "task-at-cap", TraceID: "trace-at-cap", ToolInput: toolInput,
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check = %+v, %v", d, err)
+	}
+	b.OnPendingApproval(context.Background(), policy.PendingApprovalInfo{
+		ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: "trace-at-cap",
+	})
+	if len(sender.sent) != maxCardChunks {
+		t.Fatalf("sent %d message(s), want %d", len(sender.sent), maxCardChunks)
+	}
+	if sender.sent[len(sender.sent)-1].Markup == nil {
+		t.Fatal("final chunk missing its keyboard")
+	}
+	if n := cardCount(b); n != 1 {
+		t.Fatalf("tracked cards = %d, want 1", n)
+	}
 }
