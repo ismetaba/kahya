@@ -211,7 +211,13 @@ func got0(t *testing.T, st *store.Store, id string) sqlcgen.Task {
 	return row
 }
 
-func TestDispatcherLeavesRowUnacknowledgedOnNonZeroExitWithoutTerminalLine(t *testing.T) {
+// TestDispatcherAcksRowOnNonZeroExitWithoutTerminalLine (G10-E1, with
+// FIX-I-3; formerly ...LeavesRowUnacknowledged...): a resumed worker that
+// exits non-zero without a terminal line is a crash - the row is acked with
+// outbox.redispatch_crashed and the task stays 'executing' (no terminal
+// state on a bare exit), so the resume scan's counted path owns the next
+// attempt instead of an uncounted lease-expiry re-claim.
+func TestDispatcherAcksRowOnNonZeroExitWithoutTerminalLine(t *testing.T) {
 	st := testStore(t)
 	insertTaskWithEnvelope(t, st, "t1", "sess-1")
 	enqueueResumeRow(t, st, "t1")
@@ -230,8 +236,11 @@ func TestDispatcherLeavesRowUnacknowledgedOnNonZeroExitWithoutTerminalLine(t *te
 	if err := st.DB().QueryRow(`SELECT dispatched_at FROM outbox LIMIT 1`).Scan(&dispatchedAt); err != nil {
 		t.Fatalf("query outbox: %v", err)
 	}
-	if dispatchedAt.Valid {
-		t.Error("dispatched_at is set, want NULL (row must be left unacknowledged)")
+	if !dispatchedAt.Valid {
+		t.Error("dispatched_at is NULL, want set (a crashed redispatch row is acked, G10-E1)")
+	}
+	if n := countRows(t, st, `SELECT count(*) FROM events WHERE kind = ?`, EventRedispatchCrashed); n != 1 {
+		t.Errorf("%s events = %d, want 1", EventRedispatchCrashed, n)
 	}
 
 	got, err := st.Queries.GetTaskByID(context.Background(), "t1")

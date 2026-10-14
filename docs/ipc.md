@@ -746,6 +746,23 @@ fails it instead of `blocked_user`. A resume row whose task already ended
 illegal `→ executing` attempt; an envelope-less row found parked ends
 `failed` through `bekliyor-yeniden-deneme → executing → failed`.
 
+**A redispatch is bounded and counted (FIX-I-3, G10-E1):** the outbox
+dispatcher runs every redispatched worker under the same
+`task_timeout_min` deadline `POST /v1/task` gives a first spawn
+(`Dispatcher.SetTaskTimeout`; spawn.Run SIGKILLs the process group when it
+passes) — before, one hung resumed worker blocked `ClaimAndDispatch`
+forever (its lease heartbeat kept the row claimed and the overlap guard
+skipped every later tick). Every finished redispatch acks its row: a
+worker that ends without a terminal line (crash, kill, that deadline, or
+kahyad failing to start it) leaves the task `executing` and ledgers
+`outbox.redispatch_crashed` / `outbox.redispatch_timed_out`; the task's
+next attempt comes only from the resume scan, the one path that counts
+`tasks.crash_resumes` against `task_max_crash_resumes` (a lease-expiry
+re-claim would bypass that cap). A resumed worker's own terminal `error`
+line fails the task (`outbox.redispatch_worker_error`), the same rule
+`handleTask` applies at first spawn (FIX-I-2). A row's lease now only
+matters when kahyad itself dies while dispatching it.
+
 All of the above tasks-table/ledger writes after the worker starts use the
 HTTP request's own context (not the per-task timeout context) so that a
 timeout — which cancels the timeout context by design — never prevents

@@ -2,12 +2,23 @@
 // (task spec step 7): it claims due rows kahyad/internal/task's resume
 // scan (or `kahya task resolve <id> --retry`) enqueued, re-spawns the
 // worker with the W12-07 envelope plus the task's own session_id +
-// resume:true, and marks the row delivered once the worker reports
-// success. A crashed/never-acknowledged claim's lease simply expires and
-// gets re-claimed - by this dispatcher or another one, whichever gets
-// there first (ClaimOutboxRow's single atomic UPDATE is what makes two
-// concurrent dispatchers racing on the SAME row safe: only the first ever
-// affects it).
+// resume:true, and acknowledges the row once the redispatch has run. A
+// claim whose processing never finished - kahyad itself died mid-dispatch -
+// keeps its lease, which simply expires and gets re-claimed by this
+// dispatcher or another one, whichever gets there first (ClaimOutboxRow's
+// single atomic UPDATE is what makes two concurrent dispatchers racing on
+// the SAME row safe: only the first ever affects it).
+//
+// FIX-I-3 / G10-E1 (post-G10 deviation from W4-02 step 7): every
+// redispatched worker runs under a per-row deadline (SetTaskTimeout, the
+// same task_timeout_min a first spawn gets), and a redispatch that ends
+// without a terminal line - a crash, a kill, that deadline - is acked too
+// (outbox.redispatch_crashed / outbox.redispatch_timed_out) with the task
+// left 'executing'. Its next attempt comes only from
+// kahyad/internal/task.Resume's scan, the one path that counts
+// tasks.crash_resumes against task_max_crash_resumes; a lease-expiry
+// re-claim would bypass that cap. A worker's own terminal error line fails
+// the task (FIX-I-2's first-spawn rule, server.decidePostSpawn).
 //
 // This package depends on kahyad/internal/task (for the status enum,
 // Machine, and the outbox payload shape), never the other way around -
@@ -73,6 +84,19 @@ const (
 	// envelope's): such a task is answered on-device only and is NEVER
 	// given to a worker (W3-08), so it is failed and the row acked instead.
 	EventResumeRefusedSecretLane = "outbox.resume_refused_secret_lane"
+	// EventRedispatchCrashed (G10-E1) fires when a redispatched worker ended
+	// without a terminal line and nothing moved its task meanwhile (a crash,
+	// a kill, kahyad failing to run it): the row is acked and the task stays
+	// 'executing' - the resume scan's counted path owns the next attempt.
+	EventRedispatchCrashed = "outbox.redispatch_crashed"
+	// EventRedispatchTimedOut (FIX-I-3) is EventRedispatchCrashed's
+	// counterpart for a worker killed by the per-row deadline
+	// (SetTaskTimeout).
+	EventRedispatchTimedOut = "outbox.redispatch_timed_out"
+	// EventRedispatchWorkerError (FIX-I-3) fires when a redispatched worker
+	// reported its own terminal error line: the task is failed (nothing is
+	// left to resume - FIX-I-2's first-spawn rule) and the row acked.
+	EventRedispatchWorkerError = "outbox.redispatch_worker_error"
 )
 
 // defaultBatchSize/defaultLeaseDuration are Dispatcher's own defaults
@@ -81,6 +105,10 @@ const (
 const (
 	defaultBatchSize     = 20
 	defaultLeaseDuration = 2 * time.Minute
+	// defaultTaskTimeout mirrors config.Config.TaskTimeoutMin's default (30)
+	// - kept local, like defaultLeaseDuration; main.go threads the real
+	// value through SetTaskTimeout (FIX-I-3).
+	defaultTaskTimeout = 30 * time.Minute
 )
 
 // Store is the narrow outbox+tasks persistence surface Dispatcher needs.
@@ -168,7 +196,10 @@ type Dispatcher struct {
 
 	batchSize     int
 	leaseDuration time.Duration
-	now           func() time.Time
+	// taskTimeout bounds ONE redispatched worker's run (FIX-I-3) - see
+	// SetTaskTimeout.
+	taskTimeout time.Duration
+	now         func() time.Time
 
 	// inFlight is BLOCKER 2(c)'s overlap guard: true for the entire
 	// duration of a ClaimAndDispatch call THIS Dispatcher instance is
@@ -190,7 +221,8 @@ type Dispatcher struct {
 func NewDispatcher(store Store, ledger Ledger, machine *task.Machine, spawnCfg spawn.Config, live LiveRegistry) *Dispatcher {
 	return &Dispatcher{
 		store: store, ledger: ledger, machine: machine, spawnCfg: spawnCfg, live: live,
-		batchSize: defaultBatchSize, leaseDuration: defaultLeaseDuration, now: time.Now,
+		batchSize: defaultBatchSize, leaseDuration: defaultLeaseDuration,
+		taskTimeout: defaultTaskTimeout, now: time.Now,
 	}
 }
 
@@ -202,6 +234,19 @@ func (d *Dispatcher) SetBatchSize(n int) { d.batchSize = n }
 // it becomes re-claimable again (default 2 minutes). Tests use a much
 // shorter value to exercise lease-expiry re-claim without a real wait.
 func (d *Dispatcher) SetLeaseDuration(d2 time.Duration) { d.leaseDuration = d2 }
+
+// SetTaskTimeout bounds ONE redispatched worker's run - the same
+// task_timeout_min POST /v1/task applies at first spawn (FIX-I-3). spawn.Run
+// has no timeout policy of its own, so without this a hung resumed worker
+// blocked ClaimAndDispatch forever: its lease heartbeat kept the row
+// claimed and the inFlight guard turned every later tick into a no-op.
+// t <= 0 restores the default (30 minutes).
+func (d *Dispatcher) SetTaskTimeout(t time.Duration) {
+	if t <= 0 {
+		t = defaultTaskTimeout
+	}
+	d.taskTimeout = t
+}
 
 // SetAnthproxyOpener wires opener - see AnthproxyOpener's own doc
 // comment. Safe to leave unset (nil is the pre-W4-04 default posture).
@@ -285,9 +330,9 @@ func (d *Dispatcher) processRow(ctx context.Context, row sqlcgen.Outbox) {
 // overridden - task_id/trace_id/prompt/model/lane/category all carried
 // through UNCHANGED, task spec's own "resumed-task envelope carries the
 // original session_id and trace_id" acceptance test), re-spawn the
-// worker, and mark the row delivered on a clean exit 0 (leaving it
-// unacknowledged - lease expiry re-claims - on anything else, per task
-// spec step 7).
+// worker under the per-row deadline (FIX-I-3), and acknowledge the row
+// once the run is over - see the package doc comment (G10-E1) for why a
+// crashed or timed-out redispatch is acked too.
 func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	var payload task.OutboxTaskResumePayload
 	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
@@ -436,7 +481,12 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	defer close(heartbeatDone)
 	go d.renewLeaseWhileRunning(row.ID, heartbeatDone)
 
-	outcome, runErr := spawn.Run(ctx, spawnCfg, env, spawn.Callbacks{
+	// FIX-I-3: the per-row deadline - spawn.Run SIGKILLs the worker's whole
+	// process group once it passes (StatusTimeout, no terminal line).
+	runCtx, cancelRun := context.WithTimeout(ctx, d.taskTimeout)
+	defer cancelRun()
+
+	outcome, runErr := spawn.Run(runCtx, spawnCfg, env, spawn.Callbacks{
 		OnStart: func(pid int) {
 			if d.live != nil {
 				d.live.RegisterWorker(t.ID, t.TraceID, pid, pid)
@@ -465,17 +515,22 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		},
 	})
 
-	d.ledgerRaw(ctx, t.TraceID, EventResumeDispatched, map[string]any{
+	// Every read and write from here on uses recordCtx, a context that
+	// outlives ctx: the run may have ended BECAUSE a context was cancelled,
+	// and a decision that is never recorded would leave the row for an
+	// uncounted lease re-claim.
+	recordCtx := context.WithoutCancel(ctx)
+	d.ledgerRaw(recordCtx, t.TraceID, EventResumeDispatched, map[string]any{
 		"event": EventResumeDispatched, "task_id": t.ID, "session_id": env.SessionID, "resume": env.Resume,
 	})
 
 	if runErr == nil && outcome.Status == spawn.StatusOK {
-		if err := d.machine.Transition(ctx, t.TraceID, t.ID, task.StatusDone); err != nil {
-			d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
+		if err := d.machine.Transition(recordCtx, t.TraceID, t.ID, task.StatusDone); err != nil {
+			d.ledgerRaw(recordCtx, t.TraceID, "outbox.transition_failed", map[string]any{
 				"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
 			})
 		}
-		d.markDelivered(ctx, row.ID)
+		d.markDelivered(recordCtx, row.ID)
 		return
 	}
 
@@ -495,16 +550,21 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	//     and spawning a brand-new stale row on every subsequent failure.
 	//   - done/failed/user_halted/blocked_user (terminal): nothing more to
 	//     redeliver; mark delivered so it is never re-claimed.
-	//   - still executing/intent (a genuine crash - the worker died with
-	//     nothing having parked or failed the task): leave the row
-	//     unacknowledged (task spec step 7) so lease expiry re-claims it,
-	//     the original W4-02 at-least-once recovery path.
-	cur, gerr := d.store.GetTaskByID(ctx, t.ID)
+	//   - still executing/intent, worker's own terminal error line (FIX-I-3,
+	//     FIX-I-2's first-spawn rule): nothing is left to resume - fail the
+	//     task, ack the row.
+	//   - still executing/intent otherwise - a crash, a kill, the per-row
+	//     deadline, kahyad failing to run the worker (G10-E1): ack the row
+	//     with outbox.redispatch_crashed/_timed_out and leave the task
+	//     'executing'. The resume scan's counted, deduped path (capped by
+	//     task_max_crash_resumes) owns the next attempt; a lease-expiry
+	//     re-claim of this row would bypass that cap forever.
+	cur, gerr := d.store.GetTaskByID(recordCtx, t.ID)
 	if gerr != nil {
 		// Can't determine the task's post-run state - leave the row for
 		// lease-expiry re-claim rather than risk dropping a needed
 		// redelivery (fail toward "retry", never toward "silently drop").
-		d.ledgerRaw(ctx, t.TraceID, "outbox.task_reload_failed", map[string]any{
+		d.ledgerRaw(recordCtx, t.TraceID, "outbox.task_reload_failed", map[string]any{
 			"event": "outbox.task_reload_failed", "task_id": t.ID, "outbox_id": row.ID, "err": gerr.Error(),
 		})
 		return
@@ -512,12 +572,31 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	switch cur.Status {
 	case task.StatusRetryWait, task.StatusDone, task.StatusFailed,
 		task.StatusUserHalted, task.StatusBlockedUser:
-		d.markDelivered(ctx, row.ID)
-	default:
-		// still executing/intent: genuine crash, leave unacknowledged for
-		// lease-expiry re-claim (ClaimOutboxRow already bumped
-		// outbox.attempts for THIS claim regardless of outcome).
+		d.markDelivered(recordCtx, row.ID)
+		return
 	}
+
+	if runErr == nil && outcome.Status == spawn.StatusError && outcome.ErrMsg != "" {
+		d.ledgerRaw(recordCtx, t.TraceID, EventRedispatchWorkerError, map[string]any{
+			"event": EventRedispatchWorkerError, "task_id": t.ID, "outbox_id": row.ID, "message": outcome.ErrMsg,
+		})
+		d.failUnresumable(recordCtx, cur)
+		d.markDelivered(recordCtx, row.ID)
+		return
+	}
+
+	kind := EventRedispatchCrashed
+	if outcome.Status == spawn.StatusTimeout {
+		kind = EventRedispatchTimedOut
+	}
+	runErrText := ""
+	if runErr != nil {
+		runErrText = runErr.Error()
+	}
+	d.ledgerRaw(recordCtx, t.TraceID, kind, map[string]any{
+		"event": kind, "task_id": t.ID, "outbox_id": row.ID, "status": outcome.Status, "run_err": runErrText,
+	})
+	d.markDelivered(recordCtx, row.ID)
 }
 
 // refuseSecretLane is processResume's W3-08 refusal (FIX-I-14 review): no

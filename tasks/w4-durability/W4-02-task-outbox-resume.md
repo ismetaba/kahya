@@ -99,6 +99,12 @@ Binding decisions (HANDOFF, quote verbatim):
    exit that did not report a terminal task state: leave the row unacknowledged — lease expiry
    drives the re-claim, `attempts` increments on each claim. Never redeliver
    tasks in `user_halted` or `blocked_user` (guard checked at claim time, not enqueue time).
+   *Post-G10 (FIX-I-3 / G10-E1, docs/ipc.md):* a redispatched worker runs under the
+   `task_timeout_min` deadline, and crashed/timed-out redispatch rows are acked
+   (`outbox.redispatch_crashed` / `outbox.redispatch_timed_out`, task left `executing`); the
+   resume scan (capped by `task_max_crash_resumes`, deduped) owns the next attempt. A worker's
+   own terminal `error` line fails the task. The lease now only covers "kahyad died while
+   dispatching this row".
 8. Worker resume: when envelope has `resume: true`, construct `ClaudeSDKClient` options with
    `resume=<session_id>` (claude-agent-sdk session resume; keep streaming input mode — §4 ⚑:
    hooks and `can_use_tool` do not work with one-shot `query()`).

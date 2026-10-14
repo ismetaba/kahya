@@ -1137,6 +1137,10 @@ func run() int {
 	// (task_max_crash_resumes, owner decision G10-2); past it -> blocked_user.
 	taskResume.SetMaxCrashResumes(cfg.TaskMaxCrashResumes)
 	taskDispatcher := outbox.NewDispatcher(st.Queries, st, taskMachine, dispatcherSpawnCfg, taskLive)
+	// FIX-I-3: a redispatched worker gets the same task_timeout_min deadline
+	// POST /v1/task gives a first spawn - one hung resumed worker can no
+	// longer stall every later redelivery.
+	taskDispatcher.SetTaskTimeout(time.Duration(cfg.TaskTimeoutMin) * time.Minute)
 	// W4-04: a redispatched cloud-lane task needs its OWN fresh Anthropic
 	// forward-proxy listener to make any model call at all - srv.
 	// NewTaskProxy is the EXACT SAME construction handleTask uses at first
