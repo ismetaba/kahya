@@ -270,6 +270,9 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #6 | osascript bodies that load or generate code (run/load/use script, use framework, ObjC.import, Library, eval, Function) rejected as code_loader | `mcp/osascript/TestScanRejectsCodeLoaders` | FIX-B-9 | ci-hermetic |
 | Safety #6 | concatenation-split reject tokens ("NS"+"Task", "do shell" & " script") still rejected | `mcp/osascript/TestScanCollapsedFormCatchesStringConcatenation` | FIX-B-9 | ci-hermetic |
 | Safety #6 | a scan-rejected osascript body never reaches policy or exec, ledgered with its reason_code | `mcp/osascript/TestRunJXAScanRejectedTerminalDoScriptNeverExecutes` | FIX-B-9 | ci-hermetic |
+| Safety #6 | raw Apple event code bodies («event sysoexec», <<event ...>>) rejected as raw_event_code | `mcp/osascript/TestScanRejectsRawAppleEventCode` | FIX-B-9 | ci-hermetic |
+| Safety #6 | Terminal/iTerm named via the `app` abbreviation or a bundle path rejected | `mcp/osascript/TestScanRejectsTerminalAppAbbreviationAndPath` | FIX-B-9 | ci-hermetic |
+| Safety #6 | an aliased JXA ObjC bridge (`var o = ObjC`, `var d = $`) rejected as code_loader | `mcp/osascript/TestScanRejectsAliasedObjCBridge` | FIX-B-9 | ci-hermetic |
 | Safety #6 | model shell defaults to Docker `--network none` (real Docker) | `mcp/shell/TestLive_DefaultNetworkNoneBlocksEgress` | W3-04 | local-integration |
 | Safety #6 | shell_docker workdir: OS temp root itself never mountable (strict descendants only) | `mcp/shell/TestValidateWorkdir_OSTempRootItselfRejected` | FIX-B-10 | ci-hermetic |
 | Safety #6 | shell_docker workdir: a `$TMPDIR` sibling under /var/folders is not carved out (system_dir) | `mcp/shell/TestValidateWorkdir_TempDirSiblingNotCarvedOut` | FIX-B-10 | ci-hermetic |

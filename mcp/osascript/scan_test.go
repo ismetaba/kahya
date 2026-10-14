@@ -357,4 +357,74 @@ func TestScanReasonTextsByteExact(t *testing.T) {
 	if ReasonCodeCodeLoader != "code_loader" {
 		t.Errorf("ReasonCodeCodeLoader = %q", ReasonCodeCodeLoader)
 	}
+	if reasonRawEventCode != "Ham Apple Event kodu («event …» / «class …») içeren script reddedildi — betiği açık AppleScript sözdizimiyle yazın." {
+		t.Errorf("reasonRawEventCode = %q", reasonRawEventCode)
+	}
+	if ReasonCodeRawEventCode != "raw_event_code" {
+		t.Errorf("ReasonCodeRawEventCode = %q", ReasonCodeRawEventCode)
+	}
+}
+
+// TestScanRejectsRawAppleEventCode pins the B-9 review gap: raw Apple event
+// code syntax compiles to any command (here the raw codes of do shell
+// script and run script) under a four-character code the other rules
+// cannot read, so it is refused outright - chevrons or the ASCII digraph.
+func TestScanRejectsRawAppleEventCode(t *testing.T) {
+	for _, c := range []scanCase{
+		{"raw do shell script code", `«event sysoexec» "id"`},
+		{"raw run script code in a tell", `tell application "Finder" to «event sysodsct» "return 1"`},
+		{"ascii digraph raw code", `<<event sysoexec>> "id"`},
+		{"raw class reference", `tell application "System Events" to get every «class prcs»`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeRawEventCode, reasonRawEventCode)
+	}
+	// Terminal automation written with a raw code is still shell-shaped
+	// (that rule runs first).
+	assertScanRejectedAs(t, scanCase{"app Terminal + raw do script code", `tell app "Terminal" to «event coredosc» "id"`}, ReasonCodeShellShaped, reasonShellShaped)
+}
+
+// TestScanRejectsTerminalAppAbbreviationAndPath pins the B-9 review gap:
+// "app" is AppleScript's abbreviation of "application", and an application
+// can also be named by its bundle path.
+func TestScanRejectsTerminalAppAbbreviationAndPath(t *testing.T) {
+	for _, c := range []scanCase{
+		{"app abbreviation", `tell app "Terminal" to activate`},
+		{"app abbreviation iTerm2", `tell app "iTerm2" to activate`},
+		{"app abbreviation concat-split", `tell app "Term" & "inal" to activate`},
+		{"bundle path", `tell application "/System/Applications/Utilities/Terminal.app" to activate`},
+		{"jxa bundle path", `Application("/Applications/iTerm.app").activate()`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeShellShaped, reasonShellShaped)
+	}
+}
+
+// TestScanRejectsAliasedObjCBridge pins the B-9 review gap: binding the JXA
+// ObjC bridge object or its "$" global to a variable got past the
+// call-site rules (ObjC.import / $.system). Owner decision G04-3: any use
+// of the bridge is refused, false positives accepted.
+func TestScanRejectsAliasedObjCBridge(t *testing.T) {
+	for _, c := range []scanCase{
+		{"aliased ObjC and $", `var o = ObjC; o.import("stdlib"); var d = $; d.system("id")`},
+		{"aliased $ only", `var d = $; d.system("id")`},
+		{"$ fetched by bracket name", `var g = this; var d = g["$"]; d.popen("id", "r")`},
+		{"ObjC via globalThis", `const b = globalThis.ObjC; b.import("Foundation")`},
+		{"$ passed as an argument", `run($)`},
+	} {
+		assertScanRejectedAs(t, c, ReasonCodeCodeLoader, reasonCodeLoader)
+	}
+}
+
+// TestScanRawCodeAndBridgeRulesKeepBenignBodies: the new rules leave a
+// dollar amount, a JXA template literal and prose mentioning apps alone.
+func TestScanRawCodeAndBridgeRulesKeepBenignBodies(t *testing.T) {
+	for _, c := range []scanCase{
+		{"dollar amount in a notification", `display notification "Fiyat $5" with title "Kâhya"`},
+		{"jxa template literal", "var app = Application.currentApplication(); app.includeStandardAdditions = true; var n = 3; app.displayNotification(`${n} yeni not`)"},
+		{"prose about apps", `tell application "Notes" to make new note with properties {body:"Mac apps terminology"}`},
+		{"bit shift with numbers", `var x = 1 << 4`},
+	} {
+		if res := Scan([]byte(c.body)); res.Rejected {
+			t.Errorf("%s: Scan(%q) = rejected (%s), want pass", c.name, c.body, res.ReasonCode)
+		}
+	}
 }

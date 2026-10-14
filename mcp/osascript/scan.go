@@ -32,6 +32,15 @@
 //     `ObjC.bindFunction`, JXA `Library(`, `eval(`, the Function
 //     constructor, `fromCharCode(`, `atob(`. Owner decision G04-3: the
 //     ObjC bridge imports are refused outright, false positives accepted.
+//     Since the B-9 review, ANY reference to the bridge counts (a bare
+//     `ObjC` identifier, or `$` used as a value - `var o = ObjC;
+//     o.import(...)`, `var d = $; d.system(...)` would otherwise alias past
+//     the call-site rules).
+//   - raw_event_code (reasonRawEventCode): raw Apple event code syntax
+//     («event sysoexec», «class ...», or the ASCII << >> digraph). It
+//     compiles to any command - `do shell script`, Terminal `do script`,
+//     `run script` - under an opaque four-character code the other rules
+//     cannot read, so it is refused outright.
 //
 // The rules run on flatten(s) and, for tokens a string concatenation can
 // split ("NS"+"Task", "do shell" & " script", Application("Term"+"inal")),
@@ -58,6 +67,7 @@ const (
 	reasonTooLarge     = "Script çok büyük (32KB sınırını aşıyor) — reddedildi."
 	reasonControlChars = "Script görünmez veya çift-yönlü kontrol karakterleri içeriyor — reddedildi."
 	reasonCodeLoader   = "Başka kod yükleyen ya da üreten script reddedildi (run script / load script / use script / ObjC köprüsü / eval) — Docker shell aracını kullanın."
+	reasonRawEventCode = "Ham Apple Event kodu («event …» / «class …») içeren script reddedildi — betiği açık AppleScript sözdizimiyle yazın."
 )
 
 // Reason codes (English, log/ledger-facing — CLAUDE.md language policy:
@@ -68,6 +78,7 @@ const (
 	ReasonCodeControlChars = "control_chars"
 	ReasonCodeShellShaped  = "shell_shaped"
 	ReasonCodeCodeLoader   = "code_loader"
+	ReasonCodeRawEventCode = "raw_event_code"
 )
 
 // RerouteSuggestion is the structured "you could re-request this via
@@ -98,9 +109,9 @@ type ScanResult struct {
 
 // Scan runs every W3-09 static REJECT rule against script, in a fixed
 // order (size, then control code points, then shell-shaped patterns, then
-// code loaders — ANY one of them alone rejects the whole body; the
-// shell-shaped rule runs before the code-loader rule only so that a body
-// like eval("do shell script …") keeps the shell_shaped code).
+// raw event codes, then code loaders — ANY one of them alone rejects the
+// whole body; the shell-shaped rule runs first only so that a body like
+// eval("do shell script …") keeps the shell_shaped code).
 func Scan(script []byte) ScanResult {
 	if len(script) > maxScriptBytes {
 		return ScanResult{Rejected: true, Reason: reasonTooLarge, ReasonCode: ReasonCodeTooLarge}
@@ -116,6 +127,9 @@ func Scan(script []byte) ScanResult {
 			res.Reroute = &RerouteSuggestion{Tool: "shell_docker", Command: cmd}
 		}
 		return res
+	}
+	if isRawEventCode(forms) {
+		return ScanResult{Rejected: true, Reason: reasonRawEventCode, ReasonCode: ReasonCodeRawEventCode}
 	}
 	if isCodeLoader(forms) {
 		return ScanResult{Rejected: true, Reason: reasonCodeLoader, ReasonCode: ReasonCodeCodeLoader}
@@ -223,7 +237,10 @@ var shellShapedFlatRes = []*regexp.Regexp{
 	regexp.MustCompile(`\bdo\s+script\b`),  // Terminal.app
 	regexp.MustCompile(`\bwrite\s+text\b`), // iTerm2
 	regexp.MustCompile(`\.doscript\s*\(`),  // JXA Application("Terminal").doScript(
-	regexp.MustCompile(`application\s*(?:id\s+)?\(?\s*["']?(?:terminal|iterm2?|script editor|automator|com\.apple\.terminal|com\.googlecode\.iterm2)\b`),
+	// "app" is AppleScript's own abbreviation of "application" (B-9 review).
+	regexp.MustCompile(`\b(?:application|app)\s*(?:id\s+)?\(?\s*["']?(?:terminal|iterm2?|script editor|automator|com\.apple\.terminal|com\.googlecode\.iterm2)\b`),
+	// Path form: tell application "/System/Applications/Utilities/Terminal.app".
+	regexp.MustCompile(`\b(?:terminal|iterm2?|script editor|automator)\.app\b`),
 	regexp.MustCompile(`\$\.(?:system|popen|execl|execle|execlp|execv|execve|execvp|posix_spawn|fork)\b`),
 }
 
@@ -235,6 +252,8 @@ var shellShapedJoinedTokens = []string{
 	"nstask", "nsapplescript", "doshellscript",
 	"applicationterminal", "application(terminal", "applicationiterm", "application(iterm",
 	"application(scripteditor", "application(script editor", "application(automator",
+	"appterminal", "appiterm", "appscript editor", "appautomator",
+	"terminal.app", "iterm.app", "iterm2.app", "script editor.app", "automator.app",
 	"com.apple.terminal", "com.googlecode.iterm2",
 	".doscript(", "writetext(", "$.system", "$.popen", "$system(", "$popen(",
 }
@@ -249,7 +268,8 @@ var codeLoaderFlatRes = []*regexp.Regexp{
 	regexp.MustCompile(`\bload\s+script\b`),
 	regexp.MustCompile(`\buse\s+script\b`), // NOT "use scripting additions": \b after "script" fails on "scripting"
 	regexp.MustCompile(`\buse\s+framework\b`),
-	regexp.MustCompile(`\bobjc\.(?:import|bindfunction)\b`),
+	regexp.MustCompile(`\bobjc\b`),                    // any use of the JXA ObjC bridge object (G04-3), aliased or not
+	regexp.MustCompile(`(?:^|[^\w$])\$(?:[^\w{$]|$)`), // "$" used as a value (the bridge global); "${" (template) and "$5" are not
 	regexp.MustCompile(`\blibrary\s*\(`),
 	regexp.MustCompile(`\beval\s*\(`),
 	regexp.MustCompile(`\bnew\s+function\s*\(`),
@@ -268,7 +288,32 @@ var codeLoaderFlatRes = []*regexp.Regexp{
 // `reuseFramework`. Accepted false positive (fail-closed): prose where a
 // word ending in "eval"/"library" is followed by "(" ("retrieval (beta)").
 var codeLoaderJoinedTokens = []string{
-	"objc.import", "objcimport(", "objc.bindfunction", "fromcharcode(", "eval(", "library(",
+	"objc", "fromcharcode(", "eval(", "library(",
+}
+
+// codeLoaderJoinedRes: "$" used as a value in the concatenation-joined
+// form (this["$"] joins to this$, so `var d = this["$"]; d.system()`
+// becomes "this$;d.system(").
+var codeLoaderJoinedRes = []*regexp.Regexp{
+	regexp.MustCompile(`\$(?:[.();,=]|$)`),
+}
+
+// rawEventCodeRes: raw Apple event code syntax - the chevron characters
+// themselves, or the ASCII digraph AppleScript also compiles
+// (<<event sysoexec>>), matched on flatten(s).
+var rawEventCodeRes = []*regexp.Regexp{
+	regexp.MustCompile(`[«»]`),
+	regexp.MustCompile(`<<\s*(?:event|class|constant|property|data|script|keyword|type|enum)\b`),
+}
+
+// isRawEventCode reports a body written with raw Apple event codes.
+func isRawEventCode(f scanForms) bool {
+	for _, re := range rawEventCodeRes {
+		if re.MatchString(f.flat) {
+			return true
+		}
+	}
+	return false
 }
 
 // isShellShaped implements this task's spec step 1's five reject
@@ -321,6 +366,11 @@ func isCodeLoader(f scanForms) bool {
 	}
 	for _, tok := range codeLoaderJoinedTokens {
 		if strings.Contains(f.joined, tok) {
+			return true
+		}
+	}
+	for _, re := range codeLoaderJoinedRes {
+		if re.MatchString(f.joined) {
 			return true
 		}
 	}
