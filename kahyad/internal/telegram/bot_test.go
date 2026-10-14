@@ -30,12 +30,14 @@ import (
 func TestBuildSettingsLongPollOnly(t *testing.T) {
 	settings := buildSettings("fake-token", "")
 
-	poller, ok := settings.Poller.(*tele.LongPoller)
+	// FIX-P-11: this package's own long-polling poller (backoff between
+	// failed getUpdates), never telebot's hot-looping LongPoller.
+	poller, ok := settings.Poller.(*backoffPoller)
 	if !ok {
-		t.Fatalf("Settings.Poller = %T, want *tele.LongPoller", settings.Poller)
+		t.Fatalf("Settings.Poller = %T, want *backoffPoller", settings.Poller)
 	}
 	if poller.Timeout <= 0 {
-		t.Errorf("LongPoller.Timeout = %v, want > 0 (a real long-poll wait)", poller.Timeout)
+		t.Errorf("backoffPoller.Timeout = %v, want > 0 (a real long-poll wait)", poller.Timeout)
 	}
 	if _, isWebhook := settings.Poller.(*tele.Webhook); isWebhook {
 		t.Fatal("Settings.Poller must never be a *tele.Webhook - long-polling only, no inbound network surface")
@@ -558,5 +560,119 @@ func TestOfflineApprovalCardOneLocalLineNoSend(t *testing.T) {
 	}
 	if len(b.cards) != 0 {
 		t.Fatalf("tracked cards = %d, want 0 (nothing reached Telegram)", len(b.cards))
+	}
+}
+
+// ---- FIX-P-11: long-poll failures drive Online; no hot loop ----
+
+// TestPollErrorsFlipBotOfflineAndRecoverySetsOnline (FIX-P-11): over a
+// real New + Start, three getUpdates failures in a row mark the bot not
+// Online (send then stays local) and the next success marks it Online
+// again; every failure, the recovery and both transitions are JSONL lines.
+func TestPollErrorsFlipBotOfflineAndRecoverySetsOnline(t *testing.T) {
+	api := newFakeBotAPI(t, func(method string, n int, w http.ResponseWriter, r *http.Request) {
+		switch method {
+		case "getMe":
+			writeAPI(w, http.StatusOK, apiGetMeOK)
+		case "getUpdates":
+			if n <= 3 {
+				writeAPI(w, http.StatusInternalServerError, apiErr500)
+				return
+			}
+			longPollEmpty(w, r, 50*time.Millisecond)
+		}
+	})
+	log, lines := newJSONLTestLogger(t)
+	b := New(Config{ChatID: 1, UserID: 2, APIURL: api.srv.URL}, staticTokenReader("T"), nil, nil, nil, nil, "", nil, log)
+	p, ok := b.tb.Poller.(*backoffPoller)
+	if !ok {
+		t.Fatalf("tb.Poller = %T, want *backoffPoller", b.tb.Poller)
+	}
+	wiredErr, wiredOK := p.onError, p.onSuccess
+	if wiredErr == nil || wiredOK == nil {
+		t.Fatal("New must wire the poller's onError/onSuccess to the Bot")
+	}
+	var mu sync.Mutex
+	var onlineAfterErr []bool
+	var onlineAfterOK []bool
+	p.onError = func(err error, n int) {
+		wiredErr(err, n)
+		mu.Lock()
+		onlineAfterErr = append(onlineAfterErr, b.Online())
+		mu.Unlock()
+	}
+	p.onSuccess = func(n int) {
+		wiredOK(n)
+		mu.Lock()
+		onlineAfterOK = append(onlineAfterOK, b.Online())
+		mu.Unlock()
+	}
+	p.backoff = func(error, int) time.Duration { return time.Millisecond }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startBot(b, ctx)
+	waitFor(t, 2*time.Second, "the poll recovery", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(onlineAfterOK) == 1
+	})
+	cancel()
+	waitReturned(t, done, 2*time.Second, "Start after cancel")
+
+	mu.Lock()
+	gotErr, gotOK := onlineAfterErr, onlineAfterOK
+	mu.Unlock()
+	if len(gotErr) != 3 || !gotErr[0] || !gotErr[1] || gotErr[2] {
+		t.Fatalf("Online() after each poll error = %v, want [true true false] (offline from the 3rd failure in a row)", gotErr)
+	}
+	if !gotOK[0] || !b.Online() {
+		t.Fatalf("Online() after recovery = %v (now %v), want true", gotOK, b.Online())
+	}
+
+	all := lines()
+	pollErrs := eventsNamed(all, "telegram_poll_error")
+	if len(pollErrs) != 3 {
+		t.Fatalf("telegram_poll_error lines = %d, want 3: %v", len(pollErrs), all)
+	}
+	for i, l := range pollErrs {
+		if l["consecutive"] != float64(i+1) || l["err"] == nil || l["err"] == "" {
+			t.Errorf("telegram_poll_error[%d] = %v, want consecutive=%d and err", i, l, i+1)
+		}
+	}
+	if rec := eventsNamed(all, "telegram_poll_recovered"); len(rec) != 1 || rec[0]["after_errors"] != float64(3) {
+		t.Fatalf("telegram_poll_recovered lines = %v, want one with after_errors=3", rec)
+	}
+	var changes []any
+	for _, l := range eventsNamed(all, "telegram_online_changed") {
+		changes = append(changes, l["online"])
+	}
+	if len(changes) != 3 || changes[0] != true || changes[1] != false || changes[2] != true {
+		t.Fatalf("telegram_online_changed online values = %v, want [true false true] (boot getMe, 3rd poll error, recovery)", changes)
+	}
+}
+
+// TestStartedBotBacksOffWhileGetUpdatesFails (FIX-P-11): the PRODUCTION
+// wiring (New's buildSettings poller, real default backoff) makes at most
+// two getUpdates requests in ~1.5s against a permanently failing API.
+// Before the fix telebot's LongPoller made tens of thousands.
+func TestStartedBotBacksOffWhileGetUpdatesFails(t *testing.T) {
+	api := newFakeBotAPI(t, func(method string, n int, w http.ResponseWriter, r *http.Request) {
+		if method == "getMe" {
+			writeAPI(w, http.StatusOK, apiGetMeOK)
+			return
+		}
+		writeAPI(w, http.StatusInternalServerError, apiErr500)
+	})
+	b := New(Config{ChatID: 1, UserID: 2, APIURL: api.srv.URL}, staticTokenReader("T"), nil, nil, nil, nil, "", nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startBot(b, ctx)
+	waitFor(t, 2*time.Second, "Online()", b.Online)
+	time.Sleep(1500 * time.Millisecond)
+	cancel()
+	waitReturned(t, done, 2*time.Second, "Start after cancel during a backoff sleep")
+	if n := api.count("getUpdates"); n < 1 || n > 2 {
+		t.Fatalf("getUpdates requests in ~1.5s against a failing API = %d, want 1..2 (backoff, no hot loop)", n)
 	}
 }

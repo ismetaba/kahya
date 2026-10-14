@@ -217,11 +217,11 @@ func (s *Server) handleGetMe(w http.ResponseWriter, r *http.Request) {
 
 // handleGetUpdates implements REAL long-polling: it blocks until either a
 // queued update with id >= offset exists, or the requested timeout
-// elapses, whichever comes first — never busy-spinning (telebot's own
-// LongPoller.Poll retries with NO backoff on an empty-but-successful
-// response, so a fast, correct empty-array reply after the honored
-// timeout is what keeps this from pegging a CPU core for the test's whole
-// runtime).
+// elapses, whichever comes first — never busy-spinning (kahyad's
+// backoffPoller, FIX-P-11, backs off only after a FAILED getUpdates and
+// re-polls at once after an empty-but-successful one, so a fast, correct
+// empty-array reply after the honored timeout is what keeps this from
+// pegging a CPU core for the test's whole runtime).
 func (s *Server) handleGetUpdates(w http.ResponseWriter, r *http.Request) {
 	params := decodeStringParams(r)
 	offset, _ := strconv.Atoi(params["offset"])

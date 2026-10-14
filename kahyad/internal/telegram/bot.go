@@ -26,7 +26,8 @@
 //
 // Enabled vs Online (FIX-P-5): Enabled means CONFIGURED (a token was read
 // and telebot was constructed); Online means REACHABLE (Start's getMe
-// succeeded). New never touches the network
+// succeeded and the long-poll loop has not failed offlineAfterPollErrors
+// times in a row since). New never touches the network
 // (Settings{Offline: true}), so a daemon that boots before Wi-Fi is up
 // still gets an Enabled bot; Start retries getMe with capped backoff until
 // it succeeds, and only then starts long-polling. While the bot is not
@@ -151,11 +152,11 @@ var _ EgressGate = (*egress.Gate)(nil)
 // through).
 const telegramAPIHost = "api.telegram.org"
 
-// longPollTimeout is the LongPoller's own per-request long-poll wait.
+// longPollTimeout is the poller's own per-request long-poll wait.
 // Still LONG-POLLING ONLY regardless of this value: no Webhook, no listen
 // address, no inbound network surface of any kind (buildSettings below is
 // the ONE place New constructs telebot.Settings — bot_test.go asserts its
-// Poller is always a *tele.LongPoller, never a *tele.Webhook).
+// Poller is always this package's *backoffPoller, never a *tele.Webhook).
 const longPollTimeout = 10 * time.Second
 
 // cardState is one still-open W1/W2 approval card's Telegram identity —
@@ -196,8 +197,9 @@ type Bot struct {
 	ritual     RitualAnswerer
 
 	// online is FIX-P-5's "reachable" bit: set by Start's waitOnline once
-	// getMe succeeds; false (the zero value) until then - send never dials
-	// while false.
+	// getMe succeeds, cleared after offlineAfterPollErrors consecutive
+	// getUpdates failures and set again on the first success (FIX-P-11);
+	// false (the zero value) until then - send never dials while false.
 	online atomic.Bool
 	// probeBackoff is waitOnline's delay before getMe retry #attempt+1;
 	// nil means defaultProbeBackoff (tests build Bot literals without New).
@@ -212,7 +214,9 @@ type Bot struct {
 // only (a *tele.LongPoller Poller, never a *tele.Webhook, no listen
 // address anywhere in Settings) without needing a live network connection
 // to actually construct a *tele.Bot (task spec step 8: "long-poll config
-// asserted (no webhook)"). apiURL empty means "use telebot's own default
+// asserted (no webhook)"). The Poller is this package's backoffPoller
+// (FIX-P-11, poller.go): telebot's own LongPoller hot-loops on a failing
+// getUpdates. apiURL empty means "use telebot's own default
 // (https://api.telegram.org)" — see Config.APIURL's doc comment for the
 // one (hermetic-testing-only) case it is ever non-empty.
 //
@@ -224,7 +228,7 @@ func buildSettings(token, apiURL string) tele.Settings {
 	return tele.Settings{
 		Token:   token,
 		URL:     apiURL,
-		Poller:  &tele.LongPoller{Timeout: longPollTimeout},
+		Poller:  newBackoffPoller(nil, nil),
 		Offline: true,
 	}
 }
@@ -260,8 +264,33 @@ func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, en
 	}
 	b.tb = tb
 	b.sender = tb
+	if p, ok := tb.Poller.(*backoffPoller); ok {
+		b.wirePoller(p)
+	}
 	b.registerHandlers()
 	return b
+}
+
+// wirePoller hooks the long-poll loop's failure/recovery reports to this
+// Bot (FIX-P-11): every failed getUpdates is a telegram_poll_error JSONL
+// line; offlineAfterPollErrors in a row mark the bot not Online (send then
+// stays local), and the first success after failures logs
+// telegram_poll_recovered and marks it Online again.
+func (b *Bot) wirePoller(p *backoffPoller) {
+	p.onError = func(err error, consecutive int) {
+		if b.log != nil {
+			b.log.Warn("telegram_poll_error", "consecutive", consecutive, "err", err.Error())
+		}
+		if consecutive >= offlineAfterPollErrors {
+			b.setOnline(false)
+		}
+	}
+	p.onSuccess = func(afterErrors int) {
+		if b.log != nil {
+			b.log.Info("telegram_poll_recovered", "after_errors", afterErrors)
+		}
+		b.setOnline(true)
+	}
 }
 
 // Enabled reports whether this Bot is CONFIGURED: a real token was read
@@ -270,7 +299,8 @@ func New(cfg Config, token TokenReader, ledger Ledger, egressGate EgressGate, en
 func (b *Bot) Enabled() bool { return b.tb != nil }
 
 // Online reports whether Telegram was REACHABLE: false until Start's getMe
-// succeeds. send never dials while this is false.
+// succeeds, then kept current by the long-poll loop (FIX-P-11). send never
+// dials while this is false.
 func (b *Bot) Online() bool { return b.online.Load() }
 
 // setOnline records a reachability change, logging only real transitions.
