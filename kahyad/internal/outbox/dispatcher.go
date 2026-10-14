@@ -14,7 +14,10 @@
 // same task_timeout_min a first spawn gets), and a redispatch that ends
 // without a terminal line - a crash, a kill, that deadline - is acked too
 // (outbox.redispatch_crashed / outbox.redispatch_timed_out) with the task
-// left 'executing'. Its next attempt comes only from
+// left 'executing', and so is one whose worker kahyad never started with
+// the task left 'executing' (the per-task anthproxy listener failed to open,
+// the pre-spawn transition failed after its edge landed - ackUnspawned).
+// Its next attempt comes only from
 // kahyad/internal/task.Resume's scan, the one path that counts
 // tasks.crash_resumes against task_max_crash_resumes; a lease-expiry
 // re-claim would bypass that cap. A worker's own terminal error line fails
@@ -492,6 +495,17 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		d.ledgerRaw(ctx, t.TraceID, "outbox.transition_failed", map[string]any{
 			"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
 		})
+		// The transition can fail AFTER its edge landed (Machine.Transition's
+		// attempts bump): a task now 'executing' with no worker is the resume
+		// scan's to re-dispatch, so the row is acked (G10-E1, see
+		// ackUnspawned). Any other outcome - still parked (this row is the
+		// park's own, the only one that will ever redispatch it; the scan
+		// never looks at a parked task), a reload error - leaves the row for
+		// lease-expiry re-claim, as before.
+		recordCtx := context.WithoutCancel(ctx)
+		if cur, gerr := d.store.GetTaskByID(recordCtx, t.ID); gerr == nil && cur.Status == task.StatusExecuting {
+			d.ackUnspawned(recordCtx, t, row, "transition", err)
+		}
 		return
 	}
 
@@ -511,9 +525,13 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	if d.anthproxyOpener != nil {
 		baseURL, apiKey, closeProxy, err := d.anthproxyOpener(ctx, t.ID, t.TraceID)
 		if err != nil {
-			d.ledgerRaw(ctx, t.TraceID, "outbox.anthproxy_open_failed", map[string]any{
+			recordCtx := context.WithoutCancel(ctx)
+			d.ledgerRaw(recordCtx, t.TraceID, "outbox.anthproxy_open_failed", map[string]any{
 				"event": "outbox.anthproxy_open_failed", "task_id": t.ID, "err": err.Error(),
 			})
+			// The task is 'executing' (the transition above) and no worker
+			// ran: G10-E1, the resume scan's counted path owns the retry.
+			d.ackUnspawned(recordCtx, t, row, "anthproxy_open", err)
 			return
 		}
 		spawnCfg.AnthropicBaseURL = baseURL
@@ -669,6 +687,24 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		"shutdown": d.shuttingDown(),
 	})
 	d.markDelivered(recordCtx, row.ID)
+}
+
+// ackUnspawned is G10-E1 for a claimed row whose worker kahyad never started
+// (stage: "anthproxy_open" - the per-task proxy listener failed to open;
+// "transition" - the pre-spawn transition failed with the task left
+// 'executing'): one outbox.redispatch_crashed row (run_err = cause,
+// "spawned": false), the row acked, the task left 'executing'. Left
+// unacked, the claimed row counted as pending in the resume scan's enqueue
+// dedupe (FIX-I-8) and locked out the one path that counts
+// tasks.crash_resumes against task_max_crash_resumes (FIX-I-2): only the
+// dispatcher's uncounted lease-expiry re-claims remained, so the cap never
+// fired and the task retried every lease period forever.
+func (d *Dispatcher) ackUnspawned(ctx context.Context, t sqlcgen.Task, row sqlcgen.Outbox, stage string, cause error) {
+	d.ledgerRaw(ctx, t.TraceID, EventRedispatchCrashed, map[string]any{
+		"event": EventRedispatchCrashed, "task_id": t.ID, "outbox_id": row.ID, "spawned": false,
+		"stage": stage, "run_err": cause.Error(), "shutdown": d.shuttingDown(),
+	})
+	d.markDelivered(ctx, row.ID)
 }
 
 // refuseSecretLane is processResume's W3-08 refusal (FIX-I-14 review): no

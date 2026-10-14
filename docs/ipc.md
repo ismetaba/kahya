@@ -770,8 +770,12 @@ forever (its lease heartbeat kept the row claimed and the overlap guard
 skipped every later tick). Every finished redispatch acks its row: a
 worker that ends without a terminal line (crash, kill, that deadline, or
 kahyad failing to start it) leaves the task `executing` and ledgers
-`outbox.redispatch_crashed` / `outbox.redispatch_timed_out`; the task's
-next attempt comes only from the resume scan, the one path that counts
+`outbox.redispatch_crashed` / `outbox.redispatch_timed_out`. A worker
+kahyad never started — the per-task proxy listener failed to open, or the
+pre-spawn transition failed after moving the task to `executing` — is
+ledgered `outbox.redispatch_crashed` with `"spawned": false`; only a task
+still parked keeps its (the park's) row for re-claim. The task's next
+attempt comes only from the resume scan, the one path that counts
 `tasks.crash_resumes` against `task_max_crash_resumes` (a lease-expiry
 re-claim would bypass that cap). A resumed worker's own terminal `error`
 line fails the task (`outbox.redispatch_worker_error`), the same rule
