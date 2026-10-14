@@ -228,3 +228,38 @@ func TestRenderPendingApproval_ShortcutsRunShowsNameAndPathOnly(t *testing.T) {
 		t.Errorf("Render() = %q, want it to contain the name and input path", rendered)
 	}
 }
+
+// TestPolicyFeedback_NonLocalIrreversibleRefused is B-11's engine backstop
+// end to end over HTTP: a non-local surface (surface="telegram") approving
+// a tool that is not reversible: true (memory_search here - R, no undo
+// recipe) answers ok:false and ledgers nonlocal_irreversible_approval_
+// rejected without consuming the id; the same id then approves locally.
+func TestPolicyFeedback_NonLocalIrreversibleRefused(t *testing.T) {
+	f := newTaskTestFixture(t, []string{"python3", "-c", "pass"}, 5)
+
+	var checkResp policyCheckResponse
+	postJSON(t, f.client, "/policy/check", map[string]any{
+		"trace_id": "trace-b11-http", "task_id": "t1", "tool_name": "memory_search",
+		"tool_input": map[string]any{"query": "ev"},
+	}, &checkResp)
+	if checkResp.Decision != "needs_approval" || checkResp.PendingApprovalID == "" {
+		t.Fatalf("policy/check(memory_search, L0) = %+v, want needs_approval with an id", checkResp)
+	}
+
+	var rejected policyFeedbackResponse
+	resp := postJSON(t, f.client, "/policy/feedback", map[string]any{
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "telegram",
+	}, &rejected)
+	if resp.StatusCode == http.StatusOK || rejected.OK {
+		t.Fatalf("approve(surface=telegram) of an irreversible tool = %d %+v, want refused", resp.StatusCode, rejected)
+	}
+	assertLedgerHasKind(t, f.store, "trace-b11-http", "nonlocal_irreversible_approval_rejected")
+
+	var approved policyFeedbackResponse
+	postJSON(t, f.client, "/policy/feedback", map[string]any{
+		"kind": "approve", "pending_approval_id": checkResp.PendingApprovalID, "surface": "local",
+	}, &approved)
+	if !approved.OK {
+		t.Fatalf("approve(surface=local) after the refused remote attempt = %+v, want ok (id not consumed)", approved)
+	}
+}
