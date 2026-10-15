@@ -1975,6 +1975,26 @@ func TestLoadHafizaGraphDefaultsAndFileOverrides(t *testing.T) {
 	}
 }
 
+// TestLoadSecretLaneMemoryInjectionDefaultOnAndOverride (FIX-MEM-7,
+// decision MEM-7.a): a locally answered task gets its local <hafiza> block
+// by default, and secret_lane_memory_injection is a real config.yaml key.
+func TestLoadSecretLaneMemoryInjectionDefaultOnAndOverride(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.SecretLaneMemoryInjection {
+		t.Fatal("default secret_lane_memory_injection = false, want true (decision MEM-7.a)")
+	}
+	writeConfigYAML(t, home, "secret_lane_memory_injection: false\n")
+	if cfg, err = Load(); err != nil || cfg.SecretLaneMemoryInjection {
+		t.Fatalf("override = %v, %v; want false, nil", cfg.SecretLaneMemoryInjection, err)
+	}
+}
+
 // TestLoadFailsClosedOnInvalidHafizaGraph (FIX-MEM-1): a hop count outside
 // 0..2 or a facts-section bound outside its range fails Load instead of
 // being silently replaced by a default.

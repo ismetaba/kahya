@@ -394,7 +394,9 @@ a cloud model, without changing anything in §2-§6 above:
   `"processed_locally": true` — the `kahya` CLI prints `🔒 yerel işlendi`
   on this). There is no code path through which a secret-lane task's
   content could reach the worker process, let alone the Anthropic proxy —
-  not merely a backstop that blocks it after the fact.
+  not merely a backstop that blocks it after the fact. Since FIX-MEM-7 the
+  local answerer's prompt may carry a `<hafiza>` block kahyad built
+  in-process (see "Local `<hafiza>` for locally answered tasks" below).
 - **Worker-side wiring status:** the `lane`/`category` envelope fields
   above exist in the wire schema for a FUTURE worker-side integration, but
   today's worker (`claude-agent-sdk`) speaks the Anthropic Messages API,
@@ -828,6 +830,43 @@ a cloud model, without changing anything in §2-§6 above:
   %s"`; a 413 prints `"Dosya çok büyük (en fazla %d bayt)."`, the no-local-
   model refusal its handbook text, any other refusal the daemon's Turkish
   text (exit 2).
+- **Local `<hafiza>` for locally answered tasks (FIX-MEM-7, G13; decision
+  MEM-7.a).** A task kahyad answers itself through `handleSecretLaneTask` -
+  a `lane:"secret"` task, and a normal-lane task on the cost governor's
+  local downgrade rung (W4-08, EK-MEM-A) - gets a memory block of its own:
+  config `secret_lane_memory_injection` (default true; false = the bare
+  prompt, no search, no ledger row). kahyad searches memory IN-PROCESS
+  (the same `search.Searcher` - local FTS plus the local MLX embed service,
+  `k` = 6, the hook's 5 s budget), builds the block with the SAME
+  filter/render/ledger core `/v1/memory/search for_injection:true` uses
+  (`buildHafizaBlock`, for the task's REAL lane) and prefixes it to the
+  local answerer's prompt as `<block>\n\n<prompt>`. The block reaches no
+  worker, no Anthropic proxy and no cloud model; the answer stays the
+  `processed_locally` SSE contract. Filters, in Go: the tier quarantine is
+  lane-independent (`factengine.TierInjectionEligible` - no unconfirmed
+  `agent_derived`/`external_doc`/`screen` chunk on the secret lane either,
+  HANDOFF §5 memory #1, safety #3); a secret_lane_globs note
+  (`memlane.PathIsSecret`) is KEPT only in a secret-lane task's block - the
+  hook's cloud-bound block and a downgraded normal task's block (whose
+  answer may still flow on to TTS/Telegram) drop it. The block is ledgered
+  byte-exact like the cloud lane's (`hafiza_injected {task_id, chunk_ids,
+  block_sha256, block, lane[, fact_ids, entity_ids]}`, §5 safety #4), and
+  every `hafiza_injected` row now carries `lane` (`"normal"` for the hook's
+  block); a block whose row could not be written is not injected. JSONL
+  `secretlane_hafiza_injected {task_id, lane, chunk_count, fact_count}`;
+  `secretlane_hafiza_skipped {reason: search_unwired | deny_all |
+  ledger_unwired}` (deny-all: policy is untrusted, so no memory is served -
+  `/v1/memory/search` answers 403 then too); `secretlane_hafiza_failed` (a
+  search or ledger error - memory is an enrichment, the answer goes on with
+  the bare prompt). Memory pressure that blocks the local model still
+  refuses the task with `MsgNoLocalMemory` (HANDOFF §4 FAIL-CLOSED) - the
+  block never adds a cloud fallback. The local answerer's system prompt
+  (`secretlane.answererSystemPrompt`, model-facing English) tells Qwen a
+  leading `<hafiza>` block is the user's own trusted local memory, never to
+  reveal its tags, and that `<olgular>` lines are subject | relation |
+  object facts. The graph facts of this block are cloud-lane for every lane
+  in this phase. A local retrieval/tool loop for Qwen (stage 3) is deferred
+  (decision MEM-7.b).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

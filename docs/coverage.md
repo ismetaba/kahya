@@ -52,7 +52,7 @@
 | Safety #2 · untrusted tier = R-tools + notify only; W-actions from CLEAN seeded session; briefing tainted by design | W4-03, W5-01 | covered |
 | Safety #2 · taint persisted in SQLite by session_id, reloaded on resume, only rises, missing⇒untrusted | W4-03, W78-02 (restart scenario) | covered |
 | Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow), G13 MEM-6.a (external_doc/screen quarantined until confirmed), MEM-5 (note/fact confirm); profile-card builder itself not in MVP | covered |
-| Safety #4: external-anchored ledger; every injected `<hafiza>` block recorded | W4-05 (anchor+verify+separate Keychain item), W12-05/W12-10 (`hafiza_injected` + sha256) | covered |
+| Safety #4: external-anchored ledger; every injected `<hafiza>` block recorded | W4-05 (anchor+verify+separate Keychain item), W12-05/W12-10 (`hafiza_injected` + sha256), FIX-MEM-7 (the secret lane's local block too, `lane` field; a block that cannot be ledgered is not injected) | covered |
 | Safety #5: WYSIWYE (NFC, bidi/zero-width/homoglyph, canonical path/host, hash; executed≠approved ⇒ reject) | W3-06 (+W78-02 homoglyph scenario) | covered |
 | Safety #5 · W3 "onayla" local-surface only (CLI W3–5, Hammerspoon W6+); Telegram notify-only for W3 | W3-06, W3-07, W6-01 (server-stamped surface), FIX-B-11 (Telegram approves only `reversible: true` W1/W2; every other W1/W2 is notify-only too, engine backstop) | covered |
 | Safety #5 · secret-lane bytes never in Telegram diff (redacted title max) | W3-07 (`redact.go`), W5-01 (briefing redaction) | covered |
@@ -68,7 +68,7 @@
 | Schema table list open Day-1 (episodes, chunks, facts+all columns, entities, entity_aliases, evidence, merge_ledger, tasks, events/outbox) | W12-02 | covered |
 | Product principle: W3 permanent written approval | W3-02, W3-06, W3-07, W78-03 | covered |
 | Product principle: safety in executor (static labels, Go check before tool runs) | W12-07, W3-01/W3-02 | covered |
-| Product principle: privacy in code (Go branch, "yerel işlendi" badge) | W3-08, FIX-U-3 (memory_write classified at ingest, secret notes under the `gizli/**` glob, secret-glob chunks never in a cloud `<hafiza>` block or `memory_search` result) | covered |
+| Product principle: privacy in code (Go branch, "yerel işlendi" badge) | W3-08, FIX-U-3 (memory_write classified at ingest, secret notes under the `gizli/**` glob, secret-glob chunks never in a cloud `<hafiza>` block or `memory_search` result), FIX-MEM-7 (a secret-lane task's local `<hafiza>` is built and consumed in kahyad only; the governor's local downgrade route gets a normal-lane block) | covered |
 | Product principle: memory can never lower a permission | W78-03 gap-fill test `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | covered |
 
 ## §6 weekly acceptance gates
@@ -289,6 +289,9 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | the restore drill renders the same deduped block over a real note the real chunker split with its overlap (EK-MEM-B) | `kahyad/internal/restore/TestRunEquivalenceDedupesAdjacentOverlap` | FIX-MEM-8 | ci-hermetic |
 | Safety #4 | the hafiza_injected row carries exactly the facts the block carries (fact_ids after the line cut), the walk's entity_ids, and block_sha256 over the whole block, <olgular> included | `kahyad/internal/server/TestMemorySearchLedgersFactIDsAndEntityIDs` | FIX-MEM-1 | ci-hermetic |
 | Safety #4 | over the real store, indexer, searcher, factengine and graph: the ledgered block is byte-identical to the injected one, <olgular> included | `kahyad/internal/server/TestMemorySearchForInjectionIncludesEligibleFacts` | FIX-MEM-1 | ci-hermetic |
+| Safety #4 | a secret-lane task's local `<hafiza>` block is ledgered byte-exact as hafiza_injected with lane=secret, block_sha256 = sha256(block) and the task's id; the answerer's prompt is that block + the prompt | `kahyad/internal/server/TestSecretLaneTaskInjectsLocalHafiza` | FIX-MEM-7 | ci-hermetic |
+| Safety #4 | every injected local block is ledgered: a block whose hafiza_injected row could not be written is not injected (bare prompt) | `kahyad/internal/server/TestSecretLaneTaskInjectionNotInjectedWhenLedgerFails` | FIX-MEM-7 | ci-hermetic |
+| Safety #4 | the worker hook's cloud-bound block is ledgered with lane=normal; block and block_sha256 are unchanged by the new field | `kahyad/internal/server/TestMemorySearchForInjectionLedgersLaneNormal` | FIX-MEM-7 | ci-hermetic |
 | Safety #5 | homoglyph host normalized/rejected (WYSIWYE) | `kahyad/internal/canon/TestNormalize_HomoglyphHost` | W3-06 | ci-hermetic |
 | Safety #5 | bidi-override filename normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_BidiFilename` | W3-06 | ci-hermetic |
 | Safety #5 | zero-width URL normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_ZeroWidthURL` | W3-06 | ci-hermetic |
@@ -428,6 +431,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #1 | a doc_ingest_v1 answer cannot carry a trust tier: extra `source_tier` / `confirmed` keys are dropped, the validated struct has no field for one | `kahyad/internal/reader/TestValidateDocIngestV1IgnoresExtraKeysButNeverTier` | FIX-MEM-6 | ci-hermetic |
 | Memory #1 | ingested facts carry the call site's external_doc provenance (quarantined); the tiered note writer cannot mint a user tier or a second tier/confirmation key | `mcp/memory/TestHandleWriteTieredRefusesTrustedTierAndBadFields` | FIX-MEM-6 | ci-hermetic |
 | Memory #1 | an ingest writes its validated answer through the extractor mapping under the extraction lock: external_doc facts citing the episode, episode stamped, no run meanwhile | `kahyad/internal/extract/TestWriteValidatedWritesIngestFactsUnderTheHold` | FIX-MEM-6 | ci-hermetic |
+| Memory #1 | quarantine is lane-independent: an agent_derived chunk stays out of the secret lane's local `<hafiza>` block too | `kahyad/internal/server/TestSecretLaneTaskInjectsLocalHafiza` | FIX-MEM-7 | ci-hermetic |
 | Memory #2 | namesakes never auto-merge on name similarity | `kahyad/internal/factengine/TestNamesakeFixtureYieldsTwoDistinctEntitiesNoAutoMerge` | W5-04 | ci-hermetic |
 | Memory #2 | entity merge requires an evidence fact_id | `kahyad/internal/factengine/TestMergeRequiresEvidenceFactID` | W5-04 | ci-hermetic |
 | Memory #2 | merge is splittable, exactly two ledger rows | `kahyad/internal/factengine/TestMergeThenSplitRoundTripsExactlyTwoLedgerRows` | W5-04 | ci-hermetic |
@@ -733,6 +737,9 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product B | `kahya ingest` refusals: the 413 cap line, the no-local-model text, the daemon's Turkish text, local read / usage errors | `kahyad/cmd/kahya/TestIngestCLIRefusals` | FIX-MEM-6 | ci-hermetic |
 | Product B | the CLI's ingest texts stay byte-identical to the daemon's copies; the usage line is the handbook's | `kahyad/cmd/kahya/TestIngestCLIStringsMatchIngestPackage` | FIX-MEM-6 | ci-hermetic |
 | Product B | the ingest note name follows --title, then the source label, then the Reader's title | `kahyad/internal/ingest/TestIngestNoteNameFollowsTheUserLabel` | FIX-MEM-6 | ci-hermetic |
+| Product B | `secret_lane_memory_injection: false` keeps today's local answer: the bare prompt, no memory search, no hafiza_injected row | `kahyad/internal/server/TestSecretLaneTaskInjectionOffWhenDisabled` | FIX-MEM-7 | ci-hermetic |
+| Product B | local memory is an enrichment, never a gate: a search error answers the bare prompt (`secretlane_hafiza_failed`) | `kahyad/internal/server/TestSecretLaneTaskSearchErrorStillAnswers` | FIX-MEM-7 | ci-hermetic |
+| Product B | while policy is untrusted (deny-all) no memory is served to a local answer either | `kahyad/internal/server/TestSecretLaneTaskInjectionSkippedUnderDenyAll` | FIX-MEM-7 | ci-hermetic |
 | Product C | secret-lane fixture ⇒ zero cloud forward-proxy requests | `kahyad/internal/reader/TestNoCloudFallbackSecretLaneFixtureNeverHitsProxy` | W4-03 | ci-hermetic |
 | Product C | a local answer (secret lane / downgrade route) is live for its whole run and stores no envelope: a resume-scan + outbox tick mid-answer never hands it (or the secret prompt) to a worker | `kahyad/internal/server/TestLocalAnswerInFlightIsNeverResumedIntoWorker` | FIX-I-14 | ci-hermetic |
 | Product C | after a kahyad restart mid local answer the boot scan's resume row is refused (secret lane: `outbox.resume_refused_secret_lane`; downgrade: no envelope) and the task fails — never a worker | `kahyad/internal/server/TestLocalAnswerInterruptedByRestartIsFailedNeverSpawned` | FIX-I-14 | ci-hermetic |
@@ -847,4 +854,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product C | a rendered ingest note that trips the deterministic pre-pass is moved to the secret lane; the result and `ingest.done` keep reader_lane normal (the cloud read it) | `kahyad/internal/ingest/TestIngestNoteContentSecretMovesNoteToSecretLane` | FIX-MEM-6 | ci-hermetic |
 | Product C | a secret-lane tiered note lands only under a covering secret glob (missing glob, missing matcher or a glob error = refused before a byte) | `mcp/memory/TestHandleWriteTieredSecretLaneNeedsCoveringGlob` | FIX-MEM-6 | ci-hermetic |
 | Product C | a live worker is refused on POST /v1/ingest even with the control secret; ingest is not an MCP tool | `kahyad/internal/server/TestIngestRouteNotAnMCPTool` | FIX-MEM-6 | ci-hermetic |
+| Product C | secret-lane memory injection never spawns a worker or a proxy: zero Anthropic upstream requests, no model_call | `kahyad/internal/server/TestSecretLaneTaskNoWorkerSpawnWithInjection` | FIX-MEM-7 | ci-hermetic |
+| Product C | memory pressure still refuses a secret-lane task with the exact Turkish message, block or not - never a cloud fallback | `kahyad/internal/server/TestSecretLaneTaskInjectionMemoryPressureStillFailsClosed` | FIX-MEM-7 | ci-hermetic |
+| Product C | the cost governor's local downgrade rung builds the block for the task's real lane: no secret-path note or fact, ledgered lane=normal (EK-MEM-A) | `kahyad/internal/server/TestGovernorDowngradedTaskInjectsLocalHafizaWithoutSecretPathFacts` | FIX-MEM-7 | ci-hermetic |
+| Product C | a secret-lane task's local block keeps the secret_lane_globs note the worker hook's cloud-bound block drops | `kahyad/internal/server/TestSecretLaneTaskInjectionKeepsSecretPathChunksLocally` | FIX-MEM-7 | ci-hermetic |
 | Product D | memory content can never lower a permission / raise autonomy | `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | W78-03 | ci-hermetic |

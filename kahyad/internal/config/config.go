@@ -150,6 +150,16 @@ type Config struct {
 	HafizaFactsMaxLines int `yaml:"hafiza_facts_max_lines"`
 	HafizaFactsMaxRunes int `yaml:"hafiza_facts_max_runes"`
 
+	// SecretLaneMemoryInjection (FIX-MEM-7, G13 secret_lane_memory_injection;
+	// decision MEM-7.a: true) gives a locally answered task - the secret lane
+	// and the cost governor's local downgrade rung - a <hafiza> block of its
+	// own: kahyad searches memory in-process, builds the block for the task's
+	// real lane and prepends it to the local Qwen's prompt. Nothing of it ever
+	// reaches a cloud model or a worker; the block is ledgered
+	// (hafiza_injected, lane secret|normal) like the cloud lane's. false =
+	// the local answer gets the bare prompt, nothing is searched or ledgered.
+	SecretLaneMemoryInjection bool `yaml:"secret_lane_memory_injection"`
+
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
 	// passes through (HANDOFF S5 safety #1). Default 3128 (the
@@ -934,6 +944,7 @@ type fileConfig struct {
 	HafizaGraphHops               *int            `yaml:"hafiza_graph_hops"`
 	HafizaFactsMaxLines           *int            `yaml:"hafiza_facts_max_lines"`
 	HafizaFactsMaxRunes           *int            `yaml:"hafiza_facts_max_runes"`
+	SecretLaneMemoryInjection     *bool           `yaml:"secret_lane_memory_injection"`
 	EgressPort                    *int            `yaml:"egress_port"`
 	DockerImageTag                *string         `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string         `yaml:"docker_image_digest_path"`
@@ -1656,6 +1667,9 @@ func defaults(home, env string) Config {
 		HafizaGraphHops:     DefaultHafizaGraphHops,
 		HafizaFactsMaxLines: DefaultHafizaFactsMaxLines,
 		HafizaFactsMaxRunes: DefaultHafizaFactsMaxRunes,
+		// FIX-MEM-7 (decision MEM-7.a): locally answered tasks get a local
+		// <hafiza> block.
+		SecretLaneMemoryInjection: true,
 		// B-1 approval loop defaults (config.Config's own doc comments).
 		ApprovalWaitSeconds:     300,
 		AutonomyBootstrapLevels: DefaultAutonomyBootstrapLevels(),
@@ -2110,6 +2124,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.HafizaFactsMaxRunes != nil {
 		cfg.HafizaFactsMaxRunes = *fc.HafizaFactsMaxRunes
+	}
+	if fc.SecretLaneMemoryInjection != nil {
+		cfg.SecretLaneMemoryInjection = *fc.SecretLaneMemoryInjection
 	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort

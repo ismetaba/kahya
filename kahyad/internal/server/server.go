@@ -7,9 +7,7 @@ package server
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +25,6 @@ import (
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/egress"
-	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/memlane"
@@ -35,6 +32,7 @@ import (
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/secretlane"
+	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/traceid"
 	mcpfs "kahya/mcp/fs"
@@ -1020,43 +1018,25 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W12-05 step 1a / W5-04: for_injection=true excludes quarantined
-	// (agent_derived; external_doc/screen since G13 MEM-6.a) episodes via
-	// kahyad/internal/factengine.TierInjectionEligible - the
-	// SAME tier-quarantine rule facts.Fact rows are held to
-	// (factengine.InjectionEligible), applied here to CHUNK/episode hits
-	// (which carry only source_tier, never a per-fact confirmed_at) with
-	// confirmed always false - a chunk is confirmed through its NOTE: `kahya
-	// memory confirm <yol>` (G13 MEM-5) rewrites the note's front matter to
-	// user_asserted and reindexes it, so the episode tier itself passes. This
-	// filters BOTH the returned results AND what the renderer/ledger below
+	// W12-05 step 1a / W5-04 / FIX-U-3: for_injection=true builds the block
+	// the worker's UserPromptSubmit hook injects into a CLOUD model's input
+	// (a secret-lane task never spawns a worker), so it is built for the
+	// normal lane: quarantined episodes (agent_derived; external_doc/screen
+	// since G13 MEM-6.a - factengine.TierInjectionEligible, HANDOFF §5 memory
+	// #1, safety #3) and secret_lane_globs paths (memlane.PathIsSecret -
+	// finans*.md, gizli/**, ...; finans/saglik/kimlik stay local-only, HANDOFF
+	// §5 product principle) are dropped, graph facts are cloud-lane, and the
+	// block is ledgered (hafiza_injected, lane "normal") - see
+	// buildHafizaBlock, which the locally answered task path shares (FIX-MEM-7).
+	// This filters BOTH the returned results AND what the renderer/ledger
 	// ever sees - "absent with for_injection:true" means absent from the
 	// response entirely, not merely excluded from hafiza_block.
-	//
-	// FIX-U-3: for_injection:true builds the block a CLOUD model receives
-	// (the worker's UserPromptSubmit hook; a secret-lane task never spawns
-	// one), so a chunk whose note lives under a secret_lane_globs path
-	// (memlane.PathIsSecret - finans*.md, gizli/**, ...) is dropped too,
-	// whatever its tier: finans/saglik/kimlik stay local-only (HANDOFF §5
-	// product principle). for_injection:false is the raw local surface and
-	// is not filtered.
+	// for_injection:false is the raw local surface and is not filtered.
 	filtered := hits
+	var hb hafizaBlock
 	if req.ForInjection {
-		filtered = make([]search.Hit, 0, len(hits))
-		secretDropped := 0
-		for _, h := range hits {
-			if !factengine.TierInjectionEligible(h.SourceTier, false) {
-				continue
-			}
-			if s.memLane != nil && s.memLane.PathIsSecret(h.Path) {
-				secretDropped++
-				continue
-			}
-			filtered = append(filtered, h)
-		}
-		if secretDropped > 0 {
-			s.log.With(traceID).Debug("memory_search_secret_path_dropped", "dropped", secretDropped, "for_injection", true)
-		}
+		hb = s.buildHafizaBlock(r.Context(), traceID, taskID, req.Query, hits, spawn.LaneNormal)
+		filtered = hb.Eligible
 	}
 
 	resp := memorySearchResponse{Results: make([]memorySearchResultItem, 0, len(filtered))}
@@ -1070,65 +1050,10 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 			SourceTier: h.SourceTier,
 		})
 	}
-
 	if req.ForInjection {
-		memHits := make([]memory.Hit, len(filtered))
-		for i, h := range filtered {
-			memHits[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
-		}
-		// FIX-MEM-1: the graph facts about the entities the query names (or
-		// the hits' notes cite) - trust-filtered (factengine.
-		// InjectionEligible) and, this block being the one a CLOUD model
-		// receives, lane-filtered (memlane: a secret-path fact never enters).
-		// An enrichment only: a graph error injects the chunks alone.
-		graphOn := s.graph != nil && s.cfg.HafizaGraphEnabled
-		var factLines []memory.FactLine
-		var entityIDs []int64
-		if graphOn {
-			factLines, entityIDs = s.hafizaGraphFacts(r.Context(), traceID, req.Query, filtered)
-		}
-		// FIX-MEM-8: the chunker's overlap between two consecutive chunks of
-		// one note is rendered once (memory.RenderKeptDedupedWithFacts trims
-		// the later chunk's prefix, never drops a hit - decision MEM-8.a). It
-		// runs after the tier filter above, so no quarantined chunk comes
-		// back (HANDOFF §5 memory #1). The raw results above stay untrimmed.
-		// With no facts the block is byte-identical to the chunk-only one.
-		block, kept, keptFacts := memory.RenderKeptDedupedWithFacts(memHits, factLines, memory.DefaultTopK, indexer.OverlapRunes, s.cfg.HafizaFactsMaxLines, s.cfg.HafizaFactsMaxRunes)
-		resp.HafizaBlock = block
-		factIDs := make([]int64, len(keptFacts))
-		for i, f := range keptFacts {
-			factIDs[i] = f.FactID
+		resp.HafizaBlock = hb.Block
+		for _, f := range hb.Facts {
 			resp.Facts = append(resp.Facts, memorySearchFactItemFrom(f))
-		}
-
-		// W12-05 step 1c/HANDOFF §5 safety #4: ledger the EXACT injected
-		// bytes (forensic poisoning traceability) - chunk_ids is only the
-		// chunks that actually survived RenderKept's top-k/budget trim,
-		// never the broader filtered candidate pool; fact_ids likewise only
-		// the facts the block carries, entity_ids the entities the graph
-		// walk read (both present whenever the graph layer is on).
-		if s.eventLogger != nil {
-			chunkIDs := make([]int64, len(kept))
-			for i, h := range kept {
-				chunkIDs[i] = h.ChunkID
-			}
-			sum := sha256.Sum256([]byte(block))
-			payload := map[string]any{
-				"task_id":      taskID,
-				"chunk_ids":    chunkIDs,
-				"block_sha256": hex.EncodeToString(sum[:]),
-				"block":        block,
-			}
-			if graphOn {
-				if entityIDs == nil {
-					entityIDs = []int64{}
-				}
-				payload["fact_ids"] = factIDs
-				payload["entity_ids"] = entityIDs
-			}
-			if err := s.eventLogger.LogEvent(r.Context(), traceID, "hafiza_injected", payload); err != nil {
-				s.log.With(traceID).Warn("hafiza_injected_ledger_error", "err", err.Error())
-			}
 		}
 	}
 

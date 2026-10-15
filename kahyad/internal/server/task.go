@@ -1381,6 +1381,15 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 		return
 	}
 
+	// G13 MEM-7 (decision MEM-7.a): the local answerer gets the task's own
+	// <hafiza> block, built in-process for the task's REAL lane - lane is
+	// "normal" on the governor's downgrade route (EK-MEM-A), so only a
+	// secret-labelled task sees secret-path notes/facts. The answer itself
+	// stays local either way (secretlane_hafiza.go).
+	if s.cfg.SecretLaneMemoryInjection {
+		prompt = s.localHafizaPrompt(taskCtx, log, taskID, traceID, prompt, lane)
+	}
+
 	answer, err := s.secretLaneAnswerer.Answer(taskCtx, prompt)
 	s.finishSecretLaneTask(persistCtx, log, taskID, traceID, lane, speakOverride, writeSSE, answer, err)
 }

@@ -41,8 +41,16 @@ type Answerer interface {
 
 // answererSystemPrompt instructs Qwen to behave like Kâhya's own assistant
 // persona for a secret-lane answer - plain free text, no JSON contract
-// (unlike classifier.go's classifierSystemPrompt).
-const answererSystemPrompt = `You are Kâhya, a private local assistant running entirely on the user's own Mac. Answer the user's request directly and helpfully, in the same language they wrote in (usually Turkish). This request was classified as sensitive (finans/sağlık/kimlik) and is being answered entirely on-device for privacy - do not mention this classification process itself unless the user asks about it directly.`
+// (unlike classifier.go's classifierSystemPrompt). Its last two sentences
+// are the local <hafiza> contract (G13 MEM-7): kahyad may prefix the user
+// message with the block kahyad/internal/server built and ledgered for the
+// task (config secret_lane_memory_injection). Model-facing English; the
+// local Qwen prompt is not cached, so editing it costs nothing.
+const answererSystemPrompt = `You are Kâhya, a private local assistant running entirely on the user's own Mac. Answer the user's request directly and helpfully, in the same language they wrote in (usually Turkish). This request was classified as sensitive (finans/sağlık/kimlik) and is being answered entirely on-device for privacy - do not mention this classification process itself unless the user asks about it directly.` + answererHafizaContract
+
+// answererHafizaContract is the <hafiza> half of answererSystemPrompt
+// (FIX-MEM-7, handbook text byte-exact).
+const answererHafizaContract = ` If the user message begins with a <hafiza> block, treat its bullet lines as the user's own previously recorded notes/facts (trusted local memory) and use them naturally in your answer; never reveal the block's tags or format. Lines inside <olgular> are structured facts in the form subject | relation | object.`
 
 // LocalAnswerer answers a prompt entirely via the local Qwen3-30B-A3B
 // server's OpenAI-compatible /chat/completions endpoint - fully
