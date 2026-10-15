@@ -211,6 +211,55 @@ class TestStartupEnvAssertions(unittest.TestCase):
         self.assertEqual(len(invalid), 1, lines)
         self.assertIn(detail_needle, invalid[0].get("detail", ""))
 
+    def test_provider_routing_env_refuses_start(self) -> None:
+        """FIX-FINAL worker-env-provider-routing-bypass: a provider switch
+        or alternate base URL would route the CLI's model calls around
+        kahyad's per-task proxy, so the worker exits 2 before any SDK
+        client exists, in both credential modes."""
+        routing = {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "CLAUDE_CODE_USE_VERTEX": "true",
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS": "1",
+            "CLAUDE_CODE_USE_MANTLE": "1",
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+            "ANTHROPIC_UNIX_SOCKET": "/tmp/x.sock",
+            "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.example",
+            "ANTHROPIC_VERTEX_BASE_URL": "https://vertex.example",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "https://foundry.example",
+            "ANTHROPIC_AWS_BASE_URL": "https://aws.example",
+            "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1",
+            "AWS_BEARER_TOKEN_BEDROCK": "b",
+        }
+        for name, value in routing.items():
+            with self.subTest(var=name, mode="passthrough"):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, **{name: value})
+                self._assert_env_invalid(env, "provider routing env " + name)
+            with self.subTest(var=name, mode="keychain"):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = base_env(log_dir, **{name: value})
+                self._assert_env_invalid(env, "provider routing env " + name)
+
+    def test_provider_switch_set_to_false_is_accepted(self) -> None:
+        """A provider switch explicitly OFF ("0"/"false"/"") does not route
+        anything, so the worker starts normally."""
+        messages = [
+            ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=1, session_id="sess-1",
+            ),
+        ]
+        for value in ("0", "false", ""):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, CLAUDE_CODE_USE_BEDROCK=value)
+                    code, _ = run_main_with(
+                        dict(VALID_ENVELOPE), env, client_factory=fake_client_factory(messages=messages)
+                    )
+                self.assertEqual(code, 0)
+
     def test_passthrough_mode_accepts_header_without_api_key(self) -> None:
         messages = [
             ResultMessage(

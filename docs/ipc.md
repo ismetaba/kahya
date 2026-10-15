@@ -146,7 +146,13 @@ bundled CLI send model calls to Bedrock/Vertex/Foundry or a host socket
 without `ANTHROPIC_BASE_URL`, bypassing the per-task proxy (secret-lane
 backstop, model allowlist, governor, egress gate). The worker's only
 upstream is that proxy; `CLAUDE_CODE_OAUTH_TOKEN` is unaffected (owner
-decision G11-1/G11-2).
+decision G11-1/G11-2). The worker checks the same rule itself, fail-closed
+(FIX-FINAL worker-env-provider-routing-bypass,
+`kahya_worker.__main__._check_provider_routing_env`): a truthy
+`CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*_AUTH`, a non-empty
+`ANTHROPIC_UNIX_SOCKET` or `ANTHROPIC_<X>_BASE_URL` (other than
+`ANTHROPIC_BASE_URL`), or one of the host-transport names above makes it
+exit 2 with `worker_env_invalid` before any SDK client exists.
 
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 

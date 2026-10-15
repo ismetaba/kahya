@@ -246,6 +246,48 @@ def _check_real_key_leak() -> str | None:
     return None
 
 
+# FIX-FINAL worker-env-provider-routing-bypass: provider/transport routing
+# variables that make the bundled CLI send model calls somewhere other than
+# ANTHROPIC_BASE_URL (Bedrock/Vertex/Foundry/a host socket). kahyad strips
+# them (spawn.isProviderRoutingEnv); this is the worker's own fail-closed
+# check, mirroring _check_real_key_leak.
+_PROVIDER_ROUTING_EXACT = (
+    "ANTHROPIC_UNIX_SOCKET",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    "CLAUDE_CODE_API_BASE_URL",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+)
+_FALSY_ENV_VALUES = ("", "0", "false", "no", "off")
+
+
+def _check_provider_routing_env() -> str | None:
+    """Returns the name of the first set provider/transport routing
+    variable (a CLAUDE_CODE_USE_* switch or CLAUDE_CODE_SKIP_*_AUTH with a
+    truthy value; any non-empty ANTHROPIC_<X>_BASE_URL other than
+    ANTHROPIC_BASE_URL; any non-empty name in _PROVIDER_ROUTING_EXACT), or
+    None. Any of them would route the CLI's model calls around kahyad's
+    per-task proxy - the secret-lane backstop, allowlist, governor and
+    egress gate - so the worker refuses to start (exit 2)."""
+    for name in sorted(os.environ):
+        value = os.environ.get(name, "")
+        if name.startswith("CLAUDE_CODE_USE_") or (
+            name.startswith("CLAUDE_CODE_SKIP_") and name.endswith("_AUTH")
+        ):
+            if value.strip().lower() not in _FALSY_ENV_VALUES:
+                return name
+            continue
+        if not value.strip():
+            continue
+        if name in _PROVIDER_ROUTING_EXACT:
+            return name
+        if name.startswith("ANTHROPIC_") and name.endswith("_BASE_URL") and name != "ANTHROPIC_BASE_URL":
+            return name
+    return None
+
+
 def _check_credential_env(credential_mode: str, mode: str) -> str | None:
     """Returns a description of the first violated startup env
     invariant (step 6), or None if they all hold. ANTHROPIC_BASE_URL must
@@ -272,6 +314,9 @@ def _check_credential_env(credential_mode: str, mode: str) -> str | None:
         return None
     if not os.environ.get("ANTHROPIC_BASE_URL", "").strip():
         return "ANTHROPIC_BASE_URL is not set"
+    routing = _check_provider_routing_env()
+    if routing is not None:
+        return f"provider routing env {routing} is set; the worker may only reach kahyad's per-task proxy"
     if credential_mode == _CREDENTIAL_MODE_PASSTHROUGH:
         custom = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
         if not any(_CUSTOM_HEADER_LINE_RE.match(line) for line in custom.splitlines()):
