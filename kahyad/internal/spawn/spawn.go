@@ -155,6 +155,20 @@ type Config struct {
 	// (MCP_TOOL_TIMEOUT, ms = (wait+90)*1000) so neither gives up before
 	// kahyad answers. 0 adds neither (today's 4s bridge budget).
 	ApprovalWaitSeconds int
+	// TaskTimeoutSeconds is the task's wall clock (config
+	// task_timeout_min*60). When > 0 it replaces ApprovalWaitSeconds as the
+	// base of both MCP budgets (KAHYA_MCP_TOOLCALL_TIMEOUT_S = task+60,
+	// MCP_TOOL_TIMEOUT = (task+90)*1000), also when the wait is 0
+	// (FIX-FINAL ops-bridge-toolcall-budget-ignores-execution): the wait-
+	// based budget covered the approval wait but not the approved tool's own
+	// run (shell_docker timeout_s defaults to 300, osascript has 120 s), so
+	// a late approval or a long tool hit the bridge deadline - "kahyad
+	// unreachable", the bridge exited and every later MCP tool of the
+	// session was gone while kahyad kept executing the side effect. No
+	// legitimate tools/call outlives its task (config keeps the wait below
+	// task_timeout_min*60), and both budgets still fire after the task
+	// deadline kills the process group, bridge first (B-1 order).
+	TaskTimeoutSeconds int
 }
 
 // Outcome is Run's terminal result. See StatusOK/StatusError/StatusTimeout
@@ -840,14 +854,20 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		// forwards unchanged.
 		extra = append(extra, "ANTHROPIC_API_KEY="+cfg.APIKey)
 	}
-	if cfg.ApprovalWaitSeconds > 0 {
+	budget := cfg.ApprovalWaitSeconds
+	if cfg.TaskTimeoutSeconds > 0 {
+		budget = cfg.TaskTimeoutSeconds
+	}
+	if budget > 0 {
 		extra = append(extra,
 			// B-1: the bridge's per-tools/call budget and the bundled CLI's
 			// own per-MCP-call hard limit (ms) must both outlast an approval
-			// wait, in that order (bridge first, so a wedged kahyad is still
-			// reported as a bridge transport error, not a CLI timeout).
-			"KAHYA_MCP_TOOLCALL_TIMEOUT_S="+strconv.Itoa(cfg.ApprovalWaitSeconds+60),
-			"MCP_TOOL_TIMEOUT="+strconv.Itoa((cfg.ApprovalWaitSeconds+90)*1000),
+			// wait AND the approved tool's own run - so they follow the
+			// task's wall clock when it is known - in that order (bridge
+			// first, so a wedged kahyad is still reported as a bridge
+			// transport error, not a CLI timeout).
+			"KAHYA_MCP_TOOLCALL_TIMEOUT_S="+strconv.Itoa(budget+60),
+			"MCP_TOOL_TIMEOUT="+strconv.Itoa((budget+90)*1000),
 		)
 	}
 	if wd := pythonWorkerDir(cfg.Cmd); wd != "" {

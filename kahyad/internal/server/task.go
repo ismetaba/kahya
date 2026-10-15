@@ -1052,8 +1052,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		// startup env assertions apply (see kahya_worker.__main__).
 		MCPBridgePath:  s.cfg.MCPBridgePath,
 		CredentialMode: s.cfg.CredentialMode,
-		// B-1: the bridge/CLI MCP timeouts must outlast an approval wait.
+		// B-1: the bridge/CLI MCP timeouts must outlast an approval wait -
+		// and the approved tool's run: they follow the task's wall clock
+		// (FIX-FINAL ops-bridge-toolcall-budget-ignores-execution).
 		ApprovalWaitSeconds: int(s.approvalWait / time.Second),
+		TaskTimeoutSeconds:  s.cfg.TaskTimeoutMin * 60,
 	}
 
 	// W4-02: register this task's worker pid with the live registry (if

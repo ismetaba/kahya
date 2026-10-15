@@ -938,6 +938,21 @@ func TestBuildEnvSetsMCPTimeoutsOnlyWhenApprovalWaitSet(t *testing.T) {
 		t.Errorf("MCP_TOOL_TIMEOUT (last value) = %q, want 390000", v)
 	}
 
+	// FIX-FINAL ops-bridge-toolcall-budget-ignores-execution: with the
+	// task's wall clock known, both budgets follow it - also with no
+	// approval wait (the bridge's 4 s used to stand then) - so neither an
+	// approval late in the wait nor the approved tool's own run (shell_docker
+	// up to its timeout_s, osascript 120 s) hits the bridge deadline.
+	for _, wait := range []int{0, 300} {
+		task := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs", ApprovalWaitSeconds: wait, TaskTimeoutSeconds: 1800}, Envelope{TaskID: "t", TraceID: "tr"})
+		if v, _ := lastValue(task, "KAHYA_MCP_TOOLCALL_TIMEOUT_S"); v != "1860" {
+			t.Errorf("wait=%d: KAHYA_MCP_TOOLCALL_TIMEOUT_S = %q, want 1860 (task wall clock + 60)", wait, v)
+		}
+		if v, _ := lastValue(task, "MCP_TOOL_TIMEOUT"); v != "1890000" {
+			t.Errorf("wait=%d: MCP_TOOL_TIMEOUT = %q, want 1890000", wait, v)
+		}
+	}
+
 	t.Setenv("MCP_TOOL_TIMEOUT", "")
 	none := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs"}, Envelope{TaskID: "t", TraceID: "tr"})
 	if v, ok := lastValue(none, "KAHYA_MCP_TOOLCALL_TIMEOUT_S"); ok {

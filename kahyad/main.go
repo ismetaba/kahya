@@ -1434,8 +1434,10 @@ func run() int {
 		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
 		TmpDir: cfg.TmpDir(),
 		// B-1: a redispatched worker's MCP timeouts must outlast an
-		// approval wait too.
+		// approval wait and the approved tool's run too (FIX-FINAL
+		// ops-bridge-toolcall-budget-ignores-execution).
 		ApprovalWaitSeconds: cfg.ApprovalWaitSeconds,
+		TaskTimeoutSeconds:  cfg.TaskTimeoutMin * 60,
 	}
 	// FIX-I-12: a task is "live" for the resume scan while its worker runs
 	// (taskLive) OR while one of its side effects is still executing inside
