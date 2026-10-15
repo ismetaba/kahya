@@ -154,6 +154,27 @@ func (h *HSCli) Notify(ctx context.Context, traceID string, payload []byte) erro
 	return h.exec(ctx, traceID, "hs_notify_failed", luaCall("kahyaNotify", b64))
 }
 
+// stripTraceLine removes the first line that is exactly "trace_id: " +
+// traceID, and one empty line right after it, from text (FIX-FINAL
+// TUX-10). Anything else - including another id - is left untouched.
+func stripTraceLine(text, traceID string) string {
+	if traceID == "" {
+		return text
+	}
+	lines := strings.SplitAfter(text, "\n")
+	for i, l := range lines {
+		if strings.TrimRight(l, "\r\n") != "trace_id: "+traceID {
+			continue
+		}
+		rest := lines[i+1:]
+		if len(rest) > 0 && strings.TrimRight(rest[0], "\r\n") == "" {
+			rest = rest[1:]
+		}
+		return strings.Join(lines[:i], "") + strings.Join(rest, "")
+	}
+	return text
+}
+
 // NotifyText shows text as a local hs.notify banner (its first
 // notifyPreviewLines lines, the trace id as kahyaNotify's own footer) and
 // NEVER speaks it: the banner half of SendNotification, for a notice that
@@ -180,6 +201,12 @@ func (h *HSCli) NotifyText(ctx context.Context, traceID, text string) bool {
 // every caller of this method already ledgered/persisted the complete
 // result before ever reaching here (see this package's own doc comment).
 func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool {
+	// FIX-FINAL TUX-10: a background result (the morning briefing) carries
+	// its own "trace_id: <id>" line for Telegram (W5-01); locally kahyaNotify
+	// already appends "iz: <id>", so the banner showed the id twice under two
+	// labels and lost two of its five preview lines, and Yelda read the 32
+	// hex characters aloud. The local banner and the speech drop that line.
+	text = stripTraceLine(text, traceID)
 	ok := h.NotifyText(ctx, traceID, text)
 
 	// W6-05: speak the SAME full text, AFTER the visual notification

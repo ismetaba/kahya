@@ -253,12 +253,21 @@ func execTask(client *Client, traceID, prompt string, deepThink bool, paletteOpe
 		// answer text, before the trace footer.
 		fmt.Fprintln(stdout, MsgLocallyProcessed)
 	}
+	return finishTask(res, traceID, stderr)
+}
+
+// finishTask prints a non-ok result's reason BEFORE the trace footer -
+// like the exit-2 path and W12-06's "footer after each answer" (FIX-FINAL
+// TUX-10: kahya.lua shows a failed palette run's stderr as the
+// notification, which used to lead with "iz: <hex>") - and maps the
+// status to the exit code.
+func finishTask(res taskResult, traceID string, stderr io.Writer) int {
+	if res.Status != "ok" && res.ErrMsg != "" {
+		fmt.Fprintln(stderr, res.ErrMsg)
+	}
 	printTraceFooter(stderr, traceID)
 	if res.Status == "ok" {
 		return 0
-	}
-	if res.ErrMsg != "" {
-		fmt.Fprintln(stderr, res.ErrMsg)
 	}
 	return 1
 }
@@ -280,14 +289,7 @@ func execTaskAudio(client *Client, traceID, audioPath string, deepThink bool, pa
 	if res.Status == "ok" && res.ProcessedLocally {
 		fmt.Fprintln(stdout, MsgLocallyProcessed)
 	}
-	printTraceFooter(stderr, traceID)
-	if res.Status == "ok" {
-		return 0
-	}
-	if res.ErrMsg != "" {
-		fmt.Fprintln(stderr, res.ErrMsg)
-	}
-	return 1
+	return finishTask(res, traceID, stderr)
 }
 
 // runREPL implements the REPL (W12-06 step 3): a banner, then a
