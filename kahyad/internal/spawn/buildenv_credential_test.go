@@ -128,12 +128,23 @@ func TestBuildEnvPinsCLIAuxiliaryModel(t *testing.T) {
 // test_main.py test_passthrough_refuses_real_claude_code_oauth_token_in_env),
 // so in production the passthrough credential is the CLI's stored
 // `claude /login` session and this variable only carries non-secret seams.
+// It also pins, in the same passthrough env, that the parent's
+// ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN ARE stripped (they would
+// override the CLI's own login) - the half docs/coverage.md's Safety #1 row
+// cites this test for (FIX-FINAL coverage-rows-overclaim).
 func TestBuildEnvKeepsWorkerCLIOwnOAuthToken(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "worker-own-oauth-token")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-parent-api-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-parent-auth-token")
 	cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "http://127.0.0.1:1", APIKey: "kahya-task-abc", CredentialMode: "passthrough"}
-	resolved, _ := resolveEnv(BuildEnv(cfg, Envelope{TaskID: "t", TraceID: "tr"}))
+	resolved, present := resolveEnv(BuildEnv(cfg, Envelope{TaskID: "t", TraceID: "tr"}))
 	if got := resolved["CLAUDE_CODE_OAUTH_TOKEN"]; got != "worker-own-oauth-token" {
 		t.Errorf("CLAUDE_CODE_OAUTH_TOKEN = %q, want the inherited value passed through (owner decision)", got)
+	}
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"} {
+		if present[name] {
+			t.Errorf("passthrough worker env carries the parent's %s=%q, want it stripped (it would override the CLI's own login)", name, resolved[name])
+		}
 	}
 	if secretEnvDenylist["CLAUDE_CODE_OAUTH_TOKEN"] {
 		t.Error("CLAUDE_CODE_OAUTH_TOKEN is in secretEnvDenylist; owner decision G11-1/G11-2 keeps it")
