@@ -74,6 +74,10 @@ func (s *Server) handleJobTrigger(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusNotFound, "unknown job: "+name)
 			return
 		}
+		if errors.Is(err, scheduler.ErrShuttingDown) {
+			writeJSONError(w, http.StatusServiceUnavailable, "kahyad is shutting down")
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

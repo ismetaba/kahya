@@ -64,6 +64,11 @@ const smokeHandlerName = "smoke"
 // handler maps this to a 404.
 var ErrUnknownJob = errors.New("scheduler: unknown job")
 
+// ErrShuttingDown is returned by Trigger once WaitRuns has begun (the
+// daemon is shutting down): no new job run is started. kahyad/internal/
+// server's POST /jobs/trigger/{name} maps it to a 503.
+var ErrShuttingDown = errors.New("scheduler: shutting down")
+
 // Handler is a Go-side job implementation, registered by name via
 // RegisterHandler and referenced from config.Config.Jobs' Handler field.
 // ctx carries the run's trace_id — retrieve it with TraceIDFromContext if
@@ -126,6 +131,50 @@ type Scheduler struct {
 	// eviction.
 	runLocksMu sync.Mutex
 	runLocks   map[string]*sync.Mutex
+
+	// base is the context every triggered run derives from (SetBaseContext;
+	// nil = context.Background()). FIX-I-5 / G00 C-5 (FIX-FINAL
+	// scheduled-jobs-ignore-lifecycle): main.go passes lifecycleCtx, so a
+	// SIGTERM reaches every job handler - a briefing or consolidation
+	// worker is killed through spawn.Run's ctx, a backup or push stops.
+	base context.Context
+	// runsMu guards runsClosed and the runs.Add call; runs counts the
+	// triggered runs still in flight (WaitRuns joins them).
+	runsMu     sync.Mutex
+	runsClosed bool
+	runs       sync.WaitGroup
+}
+
+// SetBaseContext sets the context every triggered job run derives from
+// (FIX-I-5: a triggered run ends with the daemon). The run still never
+// derives from the triggering HTTP request's context. Call before the
+// first Trigger.
+func (s *Scheduler) SetBaseContext(ctx context.Context) {
+	s.runsMu.Lock()
+	defer s.runsMu.Unlock()
+	s.base = ctx
+}
+
+// WaitRuns stops accepting new triggered runs (Trigger then returns
+// ErrShuttingDown) and waits up to d for the in-flight ones to return. It
+// reports whether they all did. main.go calls it at shutdown after
+// cancelling the base context, so every run is told to stop first; the
+// join happens before brain.db closes.
+func (s *Scheduler) WaitRuns(d time.Duration) bool {
+	s.runsMu.Lock()
+	s.runsClosed = true
+	s.runsMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.runs.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // New constructs a Scheduler. log/jsonl may be nil (tests that only
@@ -215,6 +264,17 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 	if !ok {
 		return ErrUnknownJob
 	}
+	s.runsMu.Lock()
+	if s.runsClosed {
+		s.runsMu.Unlock()
+		return ErrShuttingDown
+	}
+	base := s.base
+	s.runs.Add(1)
+	s.runsMu.Unlock()
+	if base == nil {
+		base = context.Background()
+	}
 
 	payload := map[string]any{"job_name": name, "trace_id": traceID}
 	if s.log != nil {
@@ -227,6 +287,7 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 	}
 
 	go func() {
+		defer s.runs.Done()
 		// Serialize same-name invocations (see runLocks' doc comment): a
 		// second concurrent fire of this job blocks here until the first
 		// finishes, then runs - so an idempotent job's own once-per-day (or
@@ -237,13 +298,13 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 		lock.Lock()
 		defer lock.Unlock()
 
-		// A fresh, independent context: the run must survive the
-		// triggering HTTP request's own context being cancelled (the
-		// caller disconnecting must not abort an in-flight job), the same
-		// "detach async work from the request context" posture
-		// kahyad/internal/server's handleTask already uses for its own
-		// worker spawn.
-		runCtx := WithTraceID(context.Background(), traceID)
+		// Derived from the base (daemon lifecycle) context, never from the
+		// triggering HTTP request's: the run must survive the caller
+		// disconnecting (the "detach async work from the request context"
+		// posture kahyad/internal/server's handleTask already uses for its
+		// own worker spawn), but it ends with the daemon (FIX-FINAL
+		// scheduled-jobs-ignore-lifecycle).
+		runCtx := WithTraceID(base, traceID)
 		runErr := s.runHandlerRecovered(runCtx, traceID, name, fn)
 
 		kind := EventJobCompleted
@@ -255,7 +316,9 @@ func (s *Scheduler) Trigger(ctx context.Context, traceID, name string) error {
 			resultPayload["error"] = runErr.Error()
 		}
 		if s.log != nil {
-			if err := s.log.LogEvent(context.Background(), traceID, kind, resultPayload); err != nil && s.jsonl != nil {
+			// WithoutCancel: a run the shutdown cancelled is still ledgered
+			// (WaitRuns joins it before brain.db closes).
+			if err := s.log.LogEvent(context.WithoutCancel(runCtx), traceID, kind, resultPayload); err != nil && s.jsonl != nil {
 				s.jsonl.With(traceID).Warn("job_result_ledger_error", "job_name", name, "err", err.Error())
 			}
 		}

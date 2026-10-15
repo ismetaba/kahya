@@ -144,6 +144,32 @@ func TestLifecycleContextWiring(t *testing.T) {
 	if !stopAfterRun {
 		t.Error("sched.StopTicks() must be called explicitly after srv.Run returns")
 	}
+
+	// FIX-FINAL scheduled-jobs-ignore-lifecycle: every triggered job run
+	// derives from lifecycleCtx, and shutdown joins the runs after the
+	// explicit StopTicks and before the final anchor push (so before qwen
+	// stops and st.Close()).
+	setBase := onlyCallSite(t, "sched", "SetBaseContext", "lifecycleCtx")
+	load := onlyCallSite(t, "sched", "LoadJobs", "cfg.Jobs")
+	if setBase.offset > load.offset {
+		t.Error("sched.SetBaseContext(lifecycleCtx) must be wired before sched.LoadJobs")
+	}
+	wait := onlyCallSite(t, "sched", "WaitRuns", "jobsDrainTimeout")
+	explicitStop := -1
+	for _, c := range mainCallSites(t, "sched", "StopTicks") {
+		if c.offset > run.offset {
+			explicitStop = c.offset
+		}
+	}
+	anchor := -1
+	for _, c := range mainCallSites(t, "anchorPusher", "Run") {
+		if c.offset > run.offset {
+			anchor = c.offset
+		}
+	}
+	if wait.offset < explicitStop || anchor < 0 || wait.offset > anchor {
+		t.Errorf("sched.WaitRuns (offset %d) must run after the explicit StopTicks (%d) and before the shutdown anchor push (%d)", wait.offset, explicitStop, anchor)
+	}
 }
 
 // TestDispatcherTaskTimeoutWiredFromConfig (FIX-I-3): main.go must hand the

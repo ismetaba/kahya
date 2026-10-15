@@ -1415,7 +1415,17 @@ then the HTTP server, Docker containers, socket and control secret go,
 the startup flock last. The outbox dispatcher gets the same lifecycle
 (`SetBaseContext`): it claims nothing once shutdown began and a running
 redispatch is killed (`outbox.redispatch_timed_out` with `shutdown: true`);
-main.go stops the tick scheduler right after `srv.Run` returns. Fail-
+main.go stops the tick scheduler right after `srv.Run` returns. Scheduled
+job runs are lifecycle-bound too (FIX-FINAL
+scheduled-jobs-ignore-lifecycle, `scheduler.SetBaseContext(lifecycleCtx)`):
+the morning briefing's and nightly consolidation's cloud workers, the
+fact-extraction Reader, backup, git push and the truth ritual all see the
+shutdown signal (their `spawn.Run` kills the worker group), a
+`/jobs/trigger` once shutdown began gets 503, and main.go joins the runs
+(`Scheduler.WaitRuns`, the same 15 s bound; JSONL `shutdown_jobs_timeout`
+past it) after `StopTicks`, before the final anchor push, before qwen
+stops and before brain.db closes - so a cancelled run's `job.failed` row
+and any `WithoutCancel` summary write still land. Fail-
 closed: an interrupted task is never `done` and never halted — it stays
 `executing`, and each restart costs it one `crash_resumes`. At boot,
 before the startup resume scan and before the socket is bound,

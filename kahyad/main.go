@@ -1250,7 +1250,8 @@ func run() int {
 	// G13 MEM-3: the 02:30 fact-extraction job (`kahya job run
 	// fact-extraction` too). It ends with the daemon: lifecycleCtx cancels
 	// the run (a Reader worker is killed, the unfinished episodes stay pending
-	// for the next run, the run summary is still written).
+	// for the next run, and the run summary is still written because
+	// shutdown joins the run - Scheduler.WaitRuns - before brain.db closes).
 	sched.RegisterHandler("fact-extraction", func(ctx context.Context) error {
 		runCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -1362,6 +1363,9 @@ func run() int {
 		return err
 	})
 
+	// FIX-FINAL scheduled-jobs-ignore-lifecycle (FIX-I-5 / G00 C-5): every
+	// triggered job run ends with the daemon, and shutdown joins it below.
+	sched.SetBaseContext(lifecycleCtx)
 	sched.LoadJobs(cfg.Jobs)
 	srv.SetScheduler(sched)
 
@@ -1593,6 +1597,14 @@ func run() int {
 	// st.Close() call above (BLOCKER 2).
 	stopSignals()
 	sched.StopTicks()
+	// FIX-FINAL scheduled-jobs-ignore-lifecycle: join the triggered job
+	// runs (briefing / consolidation / fact-extraction workers, backup,
+	// push, ritual) - each was cancelled through lifecycleCtx above - with
+	// the G10-5 drain bound, before the final anchor, before qwen stops and
+	// before the deferred st.Close().
+	if !sched.WaitRuns(jobsDrainTimeout) {
+		log.Warn("shutdown_jobs_timeout", "timeout_s", int(jobsDrainTimeout/time.Second))
+	}
 	reindexDone.Wait()
 	undoSweepDone.Wait()
 	telegramDone.Wait()
@@ -1628,6 +1640,12 @@ func run() int {
 	log.Info("shutdown_complete")
 	return 0
 }
+
+// jobsDrainTimeout bounds the shutdown join of triggered job runs
+// (Scheduler.WaitRuns) - the same 15 s as the in-flight /v1/task drain
+// (owner decision G10-5); the two drain concurrently, both cancelled by
+// the same signal.
+const jobsDrainTimeout = 15 * time.Second
 
 // wiredFSDenyGlobs is the deny-glob list kahyad hands mcp/fs (fs_write/
 // fs_delete) and mcp/shell (shell_docker workdir): policy.yaml's own
