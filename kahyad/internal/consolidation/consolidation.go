@@ -369,11 +369,12 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// (read-only git). Ordering only: a failure degrades to "everything
 	// changed" / "no commit times" with a JSONL warning, never changes what
 	// is sent to which lane.
-	// Phase 3: the files the last night deferred come first tonight.
+	// Phase 3: the files the last night did not send come first tonight,
+	// in the order it left them (the rolling cursor).
 	sel := selection{
-		deferred: c.deferredFromLastRun(ctx, traceID),
-		changed:  c.changedFiles(ctx, traceID, files, memRelToRepo),
-		mtimeOf:  c.commitTimes(ctx, traceID, memRelToRepo),
+		carried: c.carriedFromLastRun(ctx, traceID),
+		changed: c.changedFiles(ctx, traceID, files, memRelToRepo),
+		mtimeOf: c.commitTimes(ctx, traceID, memRelToRepo),
 	}
 
 	baseSHA, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)
@@ -436,7 +437,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 					"completed_batches", lr.completed, "remaining_files", len(lr.remaining))
 				c.notify(ctx, traceID, MsgLocalSkipped)
 				if c.EventLogger != nil {
-					_ = c.EventLogger.LogEvent(ctx, traceID, "consolidation.local_unavailable", map[string]any{
+					_ = c.EventLogger.LogEvent(ctx, traceID, EventLocalUnavailable, map[string]any{
 						"files":             sortedKeys(localFiles),
 						"completed_batches": lr.completed,
 						"remaining_files":   lr.remaining,
@@ -612,8 +613,14 @@ const (
 	// batch_token_budget}.
 	EventFileSkippedTooLarge = "consolidation.file_skipped_too_large"
 	// EventBatchesDeferred: batches beyond max_batches_per_lane, not sent
-	// tonight {lane, batches, files}.
+	// tonight {lane, batches, files}; files in packing order (the rolling
+	// cursor's order, read back by carriedFromLastRun).
 	EventBatchesDeferred = "consolidation.batches_deferred"
+	// EventLocalUnavailable: the local model went away during the secret
+	// lane {files, completed_batches, remaining_files}; remaining_files (the
+	// planned files it did not reach) in packing order, read back by
+	// carriedFromLastRun like the deferred files.
+	EventLocalUnavailable = "consolidation.local_unavailable"
 	// EventBatchDropped: one batch whose response was malformed (a JSON
 	// cut by the output cap), dropped alone - decision G06-7 {lane, batch,
 	// of, files, reason}.
@@ -621,11 +628,12 @@ const (
 )
 
 // selection is the batch-ordering input shared by both lanes (FIX-B-5):
-// orderCandidates' deferred and changed sets and its commit-time lookup.
+// orderCandidates' rolling cursor (ordered), its changed set and its
+// commit-time lookup.
 type selection struct {
-	deferred map[string]bool
-	changed  map[string]bool
-	mtimeOf  func(rel string) int64
+	carried []string
+	changed map[string]bool
+	mtimeOf func(rel string) int64
 }
 
 // laneResult is what runLane did with one lane tonight.
@@ -637,9 +645,9 @@ type laneResult struct {
 	sentFiles   int               // files sent to the model (completed + dropped batches)
 	estTokensIn int               // estimateFilesTokens of every sent batch
 	bytesOut    int               // bytes of rewritten content returned
-	skipped     []string          // too large for max_file_bytes or for one batch
-	deferred    []string          // in batches beyond max_batches_per_lane
-	remaining   []string          // not reached because the local model went away
+	skipped     []string          // too large for max_file_bytes or for one batch (sorted)
+	deferred    []string          // in batches beyond max_batches_per_lane (packing order)
+	remaining   []string          // not reached because the local model went away (packing order)
 }
 
 // runLane consolidates one lane's files batch by batch (FIX-B-5). The lane
@@ -657,7 +665,7 @@ type laneResult struct {
 // fails the night.
 func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess Session, laneFiles map[string]string, budget int, sel selection) (laneResult, error) {
 	res := laneResult{rewrites: make(map[string]string, len(laneFiles))}
-	ordered, overFileCap := orderCandidates(laneFiles, sel.deferred, sel.changed, sel.mtimeOf, c.maxFileBytes())
+	ordered, overFileCap := orderCandidates(laneFiles, sel.carried, sel.changed, sel.mtimeOf, c.maxFileBytes())
 	batches, overBudget := buildBatches(ordered, laneFiles, budget)
 	res.skipped = append(append([]string{}, overFileCap...), overBudget...)
 	sort.Strings(res.skipped)
@@ -665,10 +673,9 @@ func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess S
 	if limit := c.maxBatchesPerLane(); len(batches) > limit {
 		deferred := batches[limit:]
 		batches = batches[:limit]
-		for _, b := range deferred {
-			res.deferred = append(res.deferred, b.paths()...)
-		}
-		sort.Strings(res.deferred)
+		// Packing order, never sorted: it is the next night's cursor
+		// (sorting it made the same head files win every other night).
+		res.deferred = inPackingOrder(ordered, deferred)
 		c.ledgerDeferred(ctx, traceID, lane, len(deferred), res.deferred)
 	}
 	res.planned = len(batches)
@@ -693,10 +700,7 @@ func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess S
 		}
 		if err != nil {
 			if errors.Is(err, mlx.ErrLocalModelUnavailable) {
-				for _, rb := range batches[i:] {
-					res.remaining = append(res.remaining, rb.paths()...)
-				}
-				sort.Strings(res.remaining)
+				res.remaining = inPackingOrder(ordered, batches[i:]) // the next night's cursor starts here
 			}
 			return res, err
 		}
@@ -766,7 +770,7 @@ func nonNil(s []string) []string {
 // files deferred) plus a per-lane breakdown under "cloud" and "local"
 // ({files, sent_files, batches, completed, dropped, est_tokens_in,
 // bytes_out, skipped, deferred, remaining}). The latest row's trace is the
-// "last night" deferredFromLastRun reads back, and the pending night's row
+// "last night" carriedFromLastRun reads back, and the pending night's row
 // is the summary `kahya consolidation show` prints (PendingRunSummary).
 const EventRunSummary = "consolidation.run_summary"
 
@@ -789,7 +793,7 @@ func laneSummary(laneFiles int, r laneResult) map[string]any {
 
 // ledgerRunSummary logs (JSONL consolidation_run_summary) and ledgers the
 // night's EventRunSummary. Best-effort: a failed write never fails the
-// night (the next night then just has no deferred files to start with).
+// night (the next night then just has no carried files to start with).
 func (c *Consolidator) ledgerRunSummary(ctx context.Context, traceID string, cloudFiles int, cloud laneResult, localFiles int, local laneResult) {
 	t := RunTotals{
 		Files:    cloud.sentFiles + local.sentFiles,
@@ -808,43 +812,58 @@ func (c *Consolidator) ledgerRunSummary(ctx context.Context, traceID string, clo
 	}
 }
 
-// deferredFromLastRun is orderCandidates' deferred set (FIX-B-5 phase 3):
-// the files the last night (the latest EventRunSummary's trace) deferred,
-// in either lane. Nothing when that night deferred nothing, so an older
-// night's deferrals - already processed by a later night - are not
-// prioritized again. Ordering only: a ledger read error logs and returns
-// nothing.
-func (c *Consolidator) deferredFromLastRun(ctx context.Context, traceID string) map[string]bool {
+// carriedFromLastRun is orderCandidates' rolling cursor (FIX-B-5 phase 3):
+// the files the last night (the latest EventRunSummary's trace) did not
+// send, NormalizePathKey'd, in the order that night left them - first the
+// secret-lane files the local model did not reach (EventLocalUnavailable
+// remaining_files), then each lane's files beyond max_batches_per_lane
+// (EventBatchesDeferred files), both in packing order. The lanes are
+// disjoint and orderCandidates runs per lane, so one list serves both.
+// Nothing when that night left nothing, so an older night's leftovers -
+// already processed by a later night - are not prioritized again. Ordering
+// only: a ledger read error logs and returns nothing.
+func (c *Consolidator) carriedFromLastRun(ctx context.Context, traceID string) []string {
 	if c.EventReader == nil {
 		return nil
 	}
 	sums, err := c.EventReader.ListEventsByKind(ctx, EventRunSummary)
 	if err != nil {
-		c.logWarn("consolidation_deferred_unavailable", "trace_id", traceID, "err", err.Error())
+		c.logWarn("consolidation_carried_unavailable", "trace_id", traceID, "err", err.Error())
 		return nil
 	}
 	if len(sums) == 0 {
 		return nil
 	}
 	last := sums[len(sums)-1].TraceID
-	rows, err := c.EventReader.ListEventsByKind(ctx, EventBatchesDeferred)
-	if err != nil {
-		c.logWarn("consolidation_deferred_unavailable", "trace_id", traceID, "err", err.Error())
-		return nil
-	}
-	out := make(map[string]bool)
-	for _, r := range rows {
-		if r.TraceID != last {
-			continue
+	var out []string
+	seen := make(map[string]bool)
+	for _, src := range []struct{ kind, field string }{
+		{EventLocalUnavailable, "remaining_files"},
+		{EventBatchesDeferred, "files"},
+	} {
+		rows, err := c.EventReader.ListEventsByKind(ctx, src.kind)
+		if err != nil {
+			c.logWarn("consolidation_carried_unavailable", "trace_id", traceID, "err", err.Error())
+			return nil
 		}
-		var p struct {
-			Files []string `json:"files"`
-		}
-		if json.Unmarshal([]byte(r.Payload), &p) != nil {
-			continue
-		}
-		for _, f := range p.Files {
-			out[NormalizePathKey(f)] = true
+		for _, r := range rows {
+			if r.TraceID != last {
+				continue
+			}
+			var p map[string]json.RawMessage
+			if json.Unmarshal([]byte(r.Payload), &p) != nil {
+				continue
+			}
+			var files []string
+			if json.Unmarshal(p[src.field], &files) != nil {
+				continue
+			}
+			for _, f := range files {
+				if key := NormalizePathKey(f); key != "" && !seen[key] {
+					seen[key] = true
+					out = append(out, key)
+				}
+			}
 		}
 	}
 	return out

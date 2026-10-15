@@ -3,26 +3,32 @@ package consolidation
 import (
 	"context"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 )
 
-// FIX-B-5 phase 3: the batches a night defers come first the next night,
-// so a corpus larger than one night's cap rotates over several nights; each
-// night's numbers are ledgered and shown with the pending suggestion.
+// FIX-B-5 phase 3: the files a night does not send come first the next
+// night, in the order it left them, so a corpus larger than one night's cap
+// rotates over several nights (rolling_cursor_test.go); each night's
+// numbers are ledgered and shown with the pending suggestion.
 
+// TestOrderCandidatesDeferredBeforeChanged: the carried files come first in
+// the cursor's own order - never re-sorted by (dir, name), which would let
+// the same head files win every other night - then the changed files, then
+// the neighbours of both, then the rest. A carried path no longer on disk
+// is ignored, and a duplicate keeps its first place.
 func TestOrderCandidatesDeferredBeforeChanged(t *testing.T) {
 	files := map[string]string{
 		"a/changed.md": "x", "a/other.md": "x", "b/deferred.md": "x", "b/sibling.md": "x", "c/rest.md": "x", "z/also-deferred.md": "x",
+		"kök/günlük.md": "x",
 	}
-	deferred := map[string]bool{NormalizePathKey("b/deferred.md"): true, NormalizePathKey("z/also-deferred.md"): true}
+	carried := []string{"z/also-deferred.md", "gone.md", NormalizePathKey("kök/günlük.md"), "b/deferred.md", "z/also-deferred.md"}
 	changed := map[string]bool{NormalizePathKey("a/changed.md"): true, NormalizePathKey("b/deferred.md"): true}
-	ordered, _ := orderCandidates(files, deferred, changed, nil, 0)
+	ordered, _ := orderCandidates(files, carried, changed, nil, 0)
 	want := []string{
-		"b/deferred.md", "z/also-deferred.md", // deferred last night, first tonight
+		"z/also-deferred.md", "kök/günlük.md", "b/deferred.md", // last night's leftovers, in its order
 		"a/changed.md",               // changed
-		"a/other.md", "b/sibling.md", // neighbours of deferred or changed files
+		"a/other.md", "b/sibling.md", // neighbours of carried or changed files
 		"c/rest.md",
 	}
 	if !reflect.DeepEqual(ordered, want) {
@@ -31,8 +37,9 @@ func TestOrderCandidatesDeferredBeforeChanged(t *testing.T) {
 }
 
 // TestRunDeferredFilesComeFirstNextNight: night 1 can afford one batch and
-// defers the rest; night 2 starts with exactly those deferred files, and
-// the file night 1 did consolidate comes last.
+// defers the rest (ledgered in packing order); night 2 starts with exactly
+// those deferred files in that order, and the file night 1 did consolidate
+// comes last.
 func TestRunDeferredFilesComeFirstNextNight(t *testing.T) {
 	repo := initKahyaRepo(t)
 	corpus := seedCorpus(t, repo, 4, 60)
@@ -71,35 +78,37 @@ func TestRunDeferredFilesComeFirstNextNight(t *testing.T) {
 	for _, call := range night2 {
 		order = append(order, sortedKeys(call)...)
 	}
-	gotFirst := append([]string(nil), order[:len(deferred)]...)
-	sort.Strings(gotFirst)
-	if !reflect.DeepEqual(gotFirst, deferred) {
-		t.Fatalf("night 2 first batches = %q, want night 1's deferred files %q first", order[:len(deferred)], deferred)
+	if !reflect.DeepEqual(order[:len(deferred)], deferred) {
+		t.Fatalf("night 2 first batches = %q, want night 1's deferred files %q first, in that order", order[:len(deferred)], deferred)
 	}
 	if order[len(order)-1] != first {
 		t.Fatalf("night 2 last batch = %q, want night 1's consolidated file %q last", order[len(order)-1], first)
 	}
 }
 
-// TestRunDeferredOnlyFromTheLastNight: deferrals of an older night that a
-// later night (here: without any deferral) already processed are not
-// prioritized again.
+// TestRunDeferredOnlyFromTheLastNight: the cursor is the last night's
+// leftovers only - an older night's, which a later night (here: one that
+// left nothing) already processed, are not prioritized again - and keeps
+// their order: the secret-lane files the local model did not reach first,
+// then the deferred files, each as ledgered (packing order), both lanes.
 func TestRunDeferredOnlyFromTheLastNight(t *testing.T) {
 	logger := &fakeEventStore{}
 	ctx := context.Background()
 	_ = logger.LogEvent(ctx, "trace-old", EventBatchesDeferred, map[string]any{"lane": LaneCloud, "batches": 1, "files": []string{"old.md"}})
+	_ = logger.LogEvent(ctx, "trace-old", EventLocalUnavailable, map[string]any{"completed_batches": 0, "remaining_files": []string{"old-secret.md"}})
 	_ = logger.LogEvent(ctx, "trace-old", EventRunSummary, map[string]any{"files": 1, "batches": 1, "deferred": 1})
 	_ = logger.LogEvent(ctx, "trace-new", EventRunSummary, map[string]any{"files": 2, "batches": 1, "deferred": 0})
 	c := &Consolidator{EventLogger: logger, EventReader: logger}
-	if got := c.deferredFromLastRun(ctx, "trace-tonight"); len(got) != 0 {
-		t.Fatalf("deferred = %v, want none (the last night deferred nothing)", got)
+	if got := c.carriedFromLastRun(ctx, "trace-tonight"); len(got) != 0 {
+		t.Fatalf("carried = %q, want none (the last night left nothing)", got)
 	}
-	_ = logger.LogEvent(ctx, "trace-newer", EventBatchesDeferred, map[string]any{"lane": LaneLocal, "batches": 2, "files": []string{"günlük.md", "x/y.md"}})
-	_ = logger.LogEvent(ctx, "trace-newer", EventBatchesDeferred, map[string]any{"lane": LaneCloud, "batches": 1, "files": []string{"z.md"}})
-	_ = logger.LogEvent(ctx, "trace-newer", EventRunSummary, map[string]any{"files": 2, "batches": 1, "deferred": 3})
-	want := map[string]bool{NormalizePathKey("günlük.md"): true, "x/y.md": true, "z.md": true}
-	if got := c.deferredFromLastRun(ctx, "trace-tonight"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("deferred = %v, want both lanes' files of the last night %v", got, want)
+	_ = logger.LogEvent(ctx, "trace-newer", EventBatchesDeferred, map[string]any{"lane": LaneCloud, "batches": 1, "files": []string{"z.md", "a.md"}})
+	_ = logger.LogEvent(ctx, "trace-newer", EventBatchesDeferred, map[string]any{"lane": LaneLocal, "batches": 2, "files": []string{"x/y.md", "günlük.md"}})
+	_ = logger.LogEvent(ctx, "trace-newer", EventLocalUnavailable, map[string]any{"completed_batches": 1, "remaining_files": []string{"w.md", "b.md"}})
+	_ = logger.LogEvent(ctx, "trace-newer", EventRunSummary, map[string]any{"files": 2, "batches": 1, "deferred": 4})
+	want := []string{"w.md", "b.md", "z.md", "a.md", "x/y.md", NormalizePathKey("günlük.md")}
+	if got := c.carriedFromLastRun(ctx, "trace-tonight"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("carried = %q, want the last night's leftovers in order %q", got, want)
 	}
 }
 

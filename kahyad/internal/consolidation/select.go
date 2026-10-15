@@ -119,18 +119,29 @@ func lastCommitTimes(ctx context.Context, git backup.GitRunner, repoDir, memRelT
 	return times, nil
 }
 
-// orderCandidates orders one lane's files for batching (keys of deferred
-// and changed are NormalizePathKey'd memory-relative paths): the files the
-// last night deferred first (phase 3's rolling cursor: a corpus larger than
-// one night's max_batches_per_lane rotates over several nights instead of
-// starving its tail), then changed files, then the same-directory
-// neighbours of both, then the rest by git commit time, newest first (ties
-// by path). Within the first three tiers files are sorted by (dir, name),
-// so files of one directory stay adjacent and the greedy packing mostly
-// puts a topic's files into the same batch. A file larger than
-// maxFileBytes is left out and reported in skipped (sorted).
-func orderCandidates(files map[string]string, deferred, changed map[string]bool, mtime func(rel string) int64, maxFileBytes int) (ordered, skipped []string) {
-	var carried, first, rest []string
+// orderCandidates orders one lane's files for batching. carried is the
+// rolling cursor (FIX-B-5 phase 3, carriedFromLastRun): the files the last
+// night did not send, NormalizePathKey'd, in the order that night left
+// them. They come first and KEEP that order (never re-sorted), so tonight
+// continues where the last night stopped and the files it did send join
+// the back of the queue: a lane larger than one night's
+// max_batches_per_lane rotates through every file in ceil(files / files
+// per night) nights, none starved - a file changed every day included.
+// Then the changed files (keys NormalizePathKey'd), then the
+// same-directory neighbours of both, then the rest by git commit time,
+// newest first (ties by path). The changed files and the neighbours are
+// sorted by (dir, name), so files of one directory stay adjacent and the
+// greedy packing mostly puts a topic's files into the same batch. A file
+// larger than maxFileBytes is left out and reported in skipped (sorted).
+func orderCandidates(files map[string]string, carried []string, changed map[string]bool, mtime func(rel string) int64, maxFileBytes int) (ordered, skipped []string) {
+	rank := make(map[string]int, len(carried))
+	for i, key := range carried {
+		key = NormalizePathKey(key)
+		if _, dup := rank[key]; !dup {
+			rank[key] = i
+		}
+	}
+	var carry, first, rest []string
 	dirs := make(map[string]bool)
 	for _, rel := range sortedKeys(files) {
 		if maxFileBytes > 0 && len(files[rel]) > maxFileBytes {
@@ -138,12 +149,11 @@ func orderCandidates(files map[string]string, deferred, changed map[string]bool,
 			continue
 		}
 		key := NormalizePathKey(rel)
-		switch {
-		case deferred[key]:
-			carried = append(carried, rel)
-		case changed[key]:
+		if _, ok := rank[key]; ok {
+			carry = append(carry, rel)
+		} else if changed[key] {
 			first = append(first, rel)
-		default:
+		} else {
 			rest = append(rest, rel)
 			continue
 		}
@@ -157,6 +167,9 @@ func orderCandidates(files map[string]string, deferred, changed map[string]bool,
 			others = append(others, rel)
 		}
 	}
+	sort.SliceStable(carry, func(i, j int) bool {
+		return rank[NormalizePathKey(carry[i])] < rank[NormalizePathKey(carry[j])]
+	})
 	byDirName := func(s []string) {
 		sort.SliceStable(s, func(i, j int) bool {
 			di, dj := path.Dir(s[i]), path.Dir(s[j])
@@ -166,7 +179,6 @@ func orderCandidates(files map[string]string, deferred, changed map[string]bool,
 			return path.Base(s[i]) < path.Base(s[j])
 		})
 	}
-	byDirName(carried)
 	byDirName(first)
 	byDirName(neighbours)
 	if mtime == nil {
@@ -179,12 +191,31 @@ func orderCandidates(files map[string]string, deferred, changed map[string]bool,
 		}
 		return others[i] < others[j]
 	})
-	ordered = make([]string, 0, len(carried)+len(first)+len(neighbours)+len(others))
-	ordered = append(ordered, carried...)
+	ordered = make([]string, 0, len(carry)+len(first)+len(neighbours)+len(others))
+	ordered = append(ordered, carry...)
 	ordered = append(ordered, first...)
 	ordered = append(ordered, neighbours...)
 	ordered = append(ordered, others...)
 	return ordered, skipped
+}
+
+// inPackingOrder returns the files of bs in ordered's order - the order
+// buildBatches packed them, which is the order the rolling cursor keeps
+// (a batch's own Files map has none).
+func inPackingOrder(ordered []string, bs []batch) []string {
+	in := make(map[string]bool)
+	for _, b := range bs {
+		for rel := range b.Files {
+			in[rel] = true
+		}
+	}
+	var out []string
+	for _, rel := range ordered {
+		if in[rel] {
+			out = append(out, rel)
+		}
+	}
+	return out
 }
 
 // buildBatches packs ordered greedily into batches whose estimateFilesTokens
