@@ -162,14 +162,15 @@ func parseFilterTime(s string) (time.Time, error) {
 	return t, nil
 }
 
-// toMemoryHits converts the ranked hits, dropping every secret-path note
-// (FIX-U-3).
+// toMemoryHits converts the ranked hits for the CLOUD worker's
+// memory_search tool result, dropping every secret-path note (FIX-U-3) and
+// every content-secret chunk with its overlap neighbours, also when no
+// lane classifier is wired (cloudChunkFilter, FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified).
 func (a mcpSearchAdapter) toMemoryHits(hits []search.Hit) []memory.Hit {
+	hits, _, _ = cloudChunkFilter(a.lane, hits)
 	out := make([]memory.Hit, 0, len(hits))
 	for _, h := range hits {
-		if a.lane != nil && a.lane.PathIsSecret(h.Path) {
-			continue
-		}
 		out = append(out, memory.Hit{
 			ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier,
 			EpisodeCreatedAt: h.EpisodeCreatedAt, Source: h.Source,

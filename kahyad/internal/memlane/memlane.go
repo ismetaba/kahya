@@ -113,6 +113,35 @@ func FactText(f sqlcgen.Fact) string {
 	return strings.TrimSpace(f.Subject + " " + f.Predicate + " " + f.Object)
 }
 
+// ContentIsSecret reports whether a memory chunk's (or file's) TEXT is
+// secret-lane by the deterministic local pre-pass
+// (secretlane.ClassifyDeterministic: IBAN, TCKN, card numbers, the
+// finans/saglik/kimlik lexicon) - the same narrow, Qwen-free contract
+// fs_read and memory_write classify their bytes with. A note at an
+// ordinary path can still carry an IBAN, so the path rule alone is not
+// enough for a cloud-facing lane (FIX-FINAL cloud-hafiza-chunks-not-
+// content-classified, the chunk twin of Classify's content half).
+func ContentIsSecret(text string) bool {
+	return secretlane.ClassifyDeterministic(text).SecretLane
+}
+
+// ChunkCloudEligible is the one chunk rule every cloud-facing memory lane
+// shares (the cloud <hafiza> block, the memory_search tool result): a
+// chunk may reach a cloud model only when its note is not secret-lane by
+// path (PathIsSecret -> ReasonPathGlob) AND its text is not secret-lane by
+// content (ContentIsSecret -> ReasonContentDeterministic). The optional
+// Content (Qwen) seam is deliberately NOT consulted per chunk on the
+// injection hot path.
+func (c Classifier) ChunkCloudEligible(relPath, text string) (ok bool, reason string) {
+	if c.PathIsSecret(relPath) {
+		return false, ReasonPathGlob
+	}
+	if ContentIsSecret(text) {
+		return false, ReasonContentDeterministic
+	}
+	return true, ""
+}
+
 // PathIsSecret reports whether relPath (forward-slash, relative to
 // MemoryDir, as episodes.source_path stores it) matches a secret-lane glob
 // under MatchesSecretGlob: byte-exact OR folded (macOS APFS is case- and

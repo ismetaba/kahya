@@ -3,7 +3,9 @@
 // CLOUD-facing chunk paths apply (G00 U-3): the memory_search tool's result
 // (mcpSearchAdapter, read by a worker - a cloud session by construction)
 // and the for_injection:true <hafiza> block (handleMemorySearch) never carry
-// a chunk whose note lives under a secret_lane_globs path.
+// a chunk whose note lives under a secret_lane_globs path, nor (FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified, cloudChunkFilter) a chunk
+// whose text the deterministic pre-pass classifies secret.
 package server
 
 import (

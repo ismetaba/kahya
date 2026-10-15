@@ -401,3 +401,24 @@ func TestFactText(t *testing.T) {
 		t.Fatalf("FactText = %q", got)
 	}
 }
+
+// TestChunkCloudEligible (FIX-FINAL cloud-hafiza-chunks-not-content-
+// classified): a chunk is cloud-eligible only when neither its path nor
+// its text is secret-lane.
+func TestChunkCloudEligible(t *testing.T) {
+	c := Classifier{MemoryDir: "/m", SecretGlobs: []string{"/m/gizli/**"}, Matcher: policyMatcher{}}
+	cases := []struct {
+		path, text, reason string
+		ok                 bool
+	}{
+		{"notlar/a.md", "Kadıköy'de iki daire gezdik", "", true},
+		{"gizli/a.md", "Kadıköy'de iki daire gezdik", ReasonPathGlob, false},
+		{"notlar/kira.md", "hesap: TR33 0006 1005 1978 6457 8413 26", ReasonContentDeterministic, false},
+	}
+	for _, tc := range cases {
+		ok, reason := c.ChunkCloudEligible(tc.path, tc.text)
+		if ok != tc.ok || reason != tc.reason {
+			t.Errorf("ChunkCloudEligible(%q, %q) = %v %q, want %v %q", tc.path, tc.text, ok, reason, tc.ok, tc.reason)
+		}
+	}
+}

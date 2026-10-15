@@ -126,3 +126,24 @@ func TestPartitionByLaneRealPolicyGlobs(t *testing.T) {
 		t.Errorf("genel-notlar.md should be cloud-lane; cloud=%v", cloud)
 	}
 }
+
+// TestPartitionByLaneContentSecretGoesLocal (FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified): a memory file at an
+// ORDINARY path whose bytes the deterministic pre-pass classifies secret
+// (an IBAN) goes to the local lane, never the cloud one.
+func TestPartitionByLaneContentSecretGoesLocal(t *testing.T) {
+	files := map[string]string{
+		"notlar/kira.md":        "Ahmet'e kira için gönderilecek hesap: TR33 0006 1005 1978 6457 8413 26\n",
+		"properties/kadikoy.md": "Kadıköy'de iki daire gezdik\n",
+	}
+	cloud, local := PartitionByLane(files, "/m", []string{"/m/gizli/**"}, PolicyGlobMatcher{})
+	if _, ok := cloud["notlar/kira.md"]; ok {
+		t.Errorf("content-secret file reached the cloud lane")
+	}
+	if _, ok := local["notlar/kira.md"]; !ok {
+		t.Errorf("content-secret file missing from the local lane")
+	}
+	if _, ok := cloud["properties/kadikoy.md"]; !ok {
+		t.Errorf("clean file missing from the cloud lane")
+	}
+}

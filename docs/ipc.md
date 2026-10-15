@@ -549,9 +549,17 @@ a cloud model, without changing anything in §2-§6 above:
   apply the same path-glob rule (`memlane.PathIsSecret`): the
   `memory_search` tool result and the `for_injection:true` `<hafiza>`
   block never carry a chunk of a secret-glob note (`gizli/**`,
-  `finans*.md`), whatever its tier; `for_injection:false` (the local
-  surface) is unfiltered. Nightly consolidation's
-  `consolidation.PartitionByLane` keeps a `gizli/**` note in the local lane,
+  `finans*.md`), whatever its tier - nor, since FIX-FINAL
+  cloud-hafiza-chunks-not-content-classified, a chunk whose TEXT the
+  deterministic pre-pass classifies secret (`memlane.ContentIsSecret`:
+  IBAN/TCKN/card + the finans/saglik/kimlik lexicon, the rule fs_read and
+  memory_write use; also when no lane classifier is wired), together with
+  that chunk's overlap neighbours (Seq±1 of the same note), JSONL
+  `memory_search_secret_content_dropped`; `for_injection:false` (the local
+  surface) and a secret-lane task's local block are unfiltered by lane.
+  Nightly consolidation's `consolidation.PartitionByLane` keeps a
+  `gizli/**` note - and any file whose content classifies secret - in the
+  local lane,
   and a secret-lane glob it cannot evaluate now counts as a match (local
   lane, fail-closed) instead of "no match" (cloud lane). Both memory-side
   path rules (`memlane.PathIsSecret`, `PartitionByLane`) share

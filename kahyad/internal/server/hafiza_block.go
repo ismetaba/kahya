@@ -13,6 +13,7 @@ import (
 
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/spawn"
 	"kahya/mcp/memory"
@@ -37,6 +38,42 @@ type hafizaBlock struct {
 	Ledgered bool
 }
 
+// cloudChunkFilter keeps only the hits a CLOUD model may receive: a hit
+// whose note is secret-lane by path (lane.PathIsSecret, skipped when lane
+// is nil) or whose text is secret-lane by content (memlane.ContentIsSecret,
+// always - a nil lane still fails closed on content) is dropped, and so
+// are the hits for the chunks either side of a content-dropped one in the
+// same note (Seq±1): the chunker's overlap (indexer.OverlapRunes) means a
+// neighbour can render the leading or trailing part of the same IBAN
+// without classifying itself. Order is preserved. Shared by the cloud
+// <hafiza> block and the memory_search MCP tool result (FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified).
+func cloudChunkFilter(lane *memlane.Classifier, hits []search.Hit) (kept []search.Hit, pathDropped, contentDropped int) {
+	type chunkKey struct {
+		path string
+		seq  int64
+	}
+	contentSecret := make(map[chunkKey]bool)
+	for _, h := range hits {
+		if memlane.ContentIsSecret(h.Text) {
+			contentSecret[chunkKey{h.Path, h.Seq}] = true
+		}
+	}
+	kept = make([]search.Hit, 0, len(hits))
+	for _, h := range hits {
+		if lane != nil && lane.PathIsSecret(h.Path) {
+			pathDropped++
+			continue
+		}
+		if contentSecret[chunkKey{h.Path, h.Seq}] || contentSecret[chunkKey{h.Path, h.Seq - 1}] || contentSecret[chunkKey{h.Path, h.Seq + 1}] {
+			contentDropped++
+			continue
+		}
+		kept = append(kept, h)
+	}
+	return kept, pathDropped, contentDropped
+}
+
 // buildHafizaBlock filters hits for injection into a model input of lane
 // (spawn.LaneNormal / spawn.LaneSecret), renders the <hafiza> block - with
 // its <olgular> graph facts while the graph layer is on - and ledgers it as
@@ -52,8 +89,12 @@ type hafizaBlock struct {
 //   - lane: every lane but the secret lane is cloud-facing (the worker hook's
 //     block reaches a cloud model; a downgraded normal task's local answer
 //     may still flow to other surfaces - TTS, Telegram), so a chunk whose
-//     note matches secret_lane_globs (memlane.PathIsSecret) is dropped there
-//     (FIX-U-3) and the graph walks the cloud lane (memlane.CloudEligible).
+//     note matches secret_lane_globs (memlane.PathIsSecret, FIX-U-3) OR
+//     whose text is secret-lane by content (memlane.ContentIsSecret, the
+//     deterministic pre-pass - FIX-FINAL cloud-hafiza-chunks-not-content-
+//     classified; with its chunker-overlap neighbours, see
+//     cloudChunkFilter) is dropped there, also when no memLane is wired,
+//     and the graph walks the cloud lane (memlane.CloudEligible).
 //     The secret lane keeps the chunk and walks the LOCAL lane: that block is
 //     built and consumed on the machine only (HANDOFF §5 product principle,
 //     decision MEM-7.a).
@@ -66,19 +107,21 @@ type hafizaBlock struct {
 func (s *Server) buildHafizaBlock(ctx context.Context, traceID, taskID, query string, hits []search.Hit, lane string) hafizaBlock {
 	cloudFacing := lane != spawn.LaneSecret
 	eligible := make([]search.Hit, 0, len(hits))
-	secretDropped := 0
 	for _, h := range hits {
 		if !factengine.TierInjectionEligible(h.SourceTier, false) {
 			continue
 		}
-		if cloudFacing && s.memLane != nil && s.memLane.PathIsSecret(h.Path) {
-			secretDropped++
-			continue
-		}
 		eligible = append(eligible, h)
 	}
-	if secretDropped > 0 {
-		s.log.With(traceID).Debug("memory_search_secret_path_dropped", "dropped", secretDropped, "for_injection", true, "lane", lane)
+	if cloudFacing {
+		var pathDropped, contentDropped int
+		eligible, pathDropped, contentDropped = cloudChunkFilter(s.memLane, eligible)
+		if pathDropped > 0 {
+			s.log.With(traceID).Debug("memory_search_secret_path_dropped", "dropped", pathDropped, "for_injection", true, "lane", lane)
+		}
+		if contentDropped > 0 {
+			s.log.With(traceID).Debug("memory_search_secret_content_dropped", "dropped", contentDropped, "for_injection", true, "lane", lane)
+		}
 	}
 
 	memHits := make([]memory.Hit, len(eligible))

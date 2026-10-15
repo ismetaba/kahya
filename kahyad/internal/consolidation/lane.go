@@ -5,15 +5,17 @@
 //	tamamlanmadan bulut modele gitmez. policy.yaml globlari YALNIZ dosya
 //	yollari icin.
 //
-// Memory files are path-addressed, so - unlike content ingested at
-// runtime (mail/web bodies, classified by kahyad/internal/secretlane's
-// content classifier) - a memory file's lane is decided PURELY by
-// matching its path against policy.yaml's secret_lane_globs
-// (kahyad/internal/policy.Policy.SecretLaneGlobs), the exact same
-// PolicyGlobMatcher mechanism kahyad/internal/briefing already uses for
-// its own file collector. PartitionByLane runs BEFORE either the cloud or
-// local session is ever constructed - a file that matches a secret-lane
-// glob is placed in the "local" map and NEVER copied into the "cloud" map,
+// A memory file's lane is decided by its path against policy.yaml's
+// secret_lane_globs (kahyad/internal/policy.Policy.SecretLaneGlobs), the
+// exact same PolicyGlobMatcher mechanism kahyad/internal/briefing already
+// uses for its own file collector, AND - since FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified - by its content: a file at
+// an ordinary path whose bytes the deterministic local pre-pass
+// (memlane.ContentIsSecret: IBAN, TCKN, the finans/saglik/kimlik lexicon)
+// classifies secret goes to the local lane too. PartitionByLane runs
+// BEFORE either the cloud or local session is ever constructed - a file
+// that matches a secret-lane glob (or classifies secret by content) is
+// placed in the "local" map and NEVER copied into the "cloud" map,
 // so it is structurally impossible for the cloud-lane envelope builder
 // (worker.go) to ever see its bytes, regardless of what either session's
 // own call does afterward.
@@ -64,13 +66,17 @@ func (PolicyGlobMatcher) Match(pattern, path string) (bool, error) {
 // local". This is the same rule memlane.Classifier.PathIsSecret applies
 // (memlane.MatchesSecretGlob: byte-exact OR case-/normalisation-folded -
 // FIX-U-3 review: APFS stores "Gizli/" and "gizli/" as one directory).
+// A file whose content memlane.ContentIsSecret classifies secret also goes
+// to localFiles, whatever its path (FIX-FINAL cloud-hafiza-chunks-not-
+// content-classified: the same deterministic rule the cloud <hafiza>
+// block and the memory_search tool apply to chunk text).
 func PartitionByLane(files map[string]string, memoryDir string, secretGlobs []string, matcher GlobMatcher) (cloudFiles, localFiles map[string]string) {
 	cloudFiles = make(map[string]string, len(files))
 	localFiles = make(map[string]string, len(files))
 
 	for relPath, content := range files {
 		absPath := filepath.Join(memoryDir, filepath.FromSlash(relPath))
-		if matchesAnySecretGlob(absPath, secretGlobs, matcher) {
+		if matchesAnySecretGlob(absPath, secretGlobs, matcher) || memlane.ContentIsSecret(content) {
 			localFiles[relPath] = content
 		} else {
 			cloudFiles[relPath] = content
