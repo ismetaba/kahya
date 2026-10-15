@@ -206,6 +206,20 @@ const (
 	// consumed and the approval still waits (%s = the id).
 	MsgApprovalW3TypedMismatchFmt = "Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı. Onay hâlâ bekliyor; tekrar denemek için: kahya approve %s"
 
+	// MsgApprovalLookupFailed frames an English kahyad error when `kahya
+	// approve <id>` / `kahya approvals show <id>` cannot load the pending
+	// approval - typically an id copied from a notice after it expired or
+	// was decided elsewhere (FIX-FINAL TUX-8; %s = the daemon detail).
+	MsgApprovalLookupFailed = "Onay alınamadı (süresi dolmuş ya da zaten karara bağlanmış olabilir): %s"
+
+	// MsgApprovalDecisionFailed frames an English kahyad error when a
+	// decision could not be recorded (FIX-FINAL TUX-8).
+	MsgApprovalDecisionFailed = "Onay kararı kaydedilemedi: %s"
+
+	// MsgTaskResolveFailed frames an English kahyad error from `kahya task
+	// resolve` (FIX-FINAL TUX-8).
+	MsgTaskResolveFailed = "Görev çözümlenemedi: %s"
+
 	// ---- W4-02: kahya task show <id> / kahya task resolve <id> ----
 
 	// MsgTaskUsage is printed when `kahya task` is given anything other

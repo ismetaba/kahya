@@ -340,3 +340,41 @@ func TestEveryFlagSetHelpHasTurkishHeader(t *testing.T) {
 		t.Errorf("kahya task resolve -h still says \"fresh\":\n%s", out)
 	}
 }
+
+// FIX-FINAL TUX-8: common CLI paths printed raw English daemon errors with
+// no Turkish frame (single-id fact confirm/deny, while their bulk forms
+// framed the same error; approve / approvals show on an expired id copied
+// from a notice; task resolve on a task it cannot act on). Each is now
+// framed like the G12-N4(e) commands, keeping the English detail.
+func TestFactSingleIDServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "factengine: fact not found: 999"
+	errorBodyServer(t, http.StatusNotFound, map[string]any{"ok": false, "error": detail})
+	assertWrapped(t, []string{"fact", "confirm", "999"}, "", MsgFactConfirmFailed, detail)
+	assertWrapped(t, []string{"fact", "deny", "999"}, "", MsgFactDenyFailed, detail)
+}
+
+func TestApprovalLookupServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "policy: invalid or unrecognized pending_approval_id"
+	errorBodyServer(t, http.StatusNotFound, map[string]any{"error": detail})
+	assertWrapped(t, []string{"approve", "pa-x"}, "", MsgApprovalLookupFailed, detail)
+	assertWrapped(t, []string{"approvals", "show", "pa-x"}, "", MsgApprovalLookupFailed, detail)
+}
+
+func TestApprovalsDecideServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "policy: invalid or unrecognized pending_approval_id"
+	errorBodyServer(t, http.StatusBadRequest, map[string]any{"ok": false, "error": detail})
+	assertWrapped(t, []string{"approvals", "decide", "pa-x", "--reject"}, "", MsgApprovalDecisionFailed, detail)
+	assertWrapped(t, []string{"approvals", "decide", "pa-x", "--approve"}, "", MsgApprovalDecisionFailed, detail)
+}
+
+func TestTaskResolveServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "task: not in a state kahya task resolve can act on: done"
+	errorBodyServer(t, http.StatusConflict, map[string]any{"error": detail})
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"task", "resolve", "t1", "--retry"}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if want := fmt.Sprintf(MsgTaskResolveFailed, detail) + "\n"; stderr.String() != want {
+		t.Fatalf("stderr = %q, want exactly %q", stderr.String(), want)
+	}
+}

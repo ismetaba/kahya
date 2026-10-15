@@ -487,9 +487,11 @@ func runConsolidationReject(client *Client, stdout, stderr io.Writer) int {
 // English - HANDOFF §3), so the user always learns WHAT failed (G12-N4
 // (e)). The already-Turkish *unreachableError (MsgDaemonUnreachable) is
 // returned as-is, never double-framed. Scoped on purpose to commands whose
-// server errors are English (ledger verify, consolidation, job run, log):
-// routes that already answer in Turkish (e.g. remembered's verbatim
-// ErrUnknownTrace) keep printing err.Error() unframed.
+// server errors are English (ledger verify, consolidation, job run, log;
+// since FIX-FINAL TUX-8 also single-id fact confirm/deny, approve /
+// approvals show / approvals decide and task resolve): routes that already
+// answer in Turkish (e.g. remembered's verbatim ErrUnknownTrace) and undo's
+// handbook-pinned daemon text keep printing err.Error() unframed.
 func wrapServerError(format string, err error) string {
 	var ue *unreachableError
 	if errors.As(err, &ue) {
@@ -731,7 +733,7 @@ func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int
 	switch {
 	case len(ids) == 1:
 		if err := client.ConfirmFact(ctx, trace, ids[0]); err != nil {
-			fmt.Fprintln(stderr, err.Error())
+			fmt.Fprintln(stderr, wrapServerError(MsgFactConfirmFailed, err))
 			return 2
 		}
 		fmt.Fprintf(stdout, MsgFactConfirmed+"\n", ids[0])
@@ -811,7 +813,7 @@ func runFactDeny(client *Client, args []string, stdout, stderr io.Writer) int {
 	ctx, trace := context.Background(), traceid.New()
 	if len(ids) == 1 {
 		if err := client.DenyFact(ctx, trace, ids[0]); err != nil {
-			fmt.Fprintln(stderr, err.Error())
+			fmt.Fprintln(stderr, wrapServerError(MsgFactDenyFailed, err))
 			return 2
 		}
 		fmt.Fprintf(stdout, MsgFactDenied+"\n", ids[0])
@@ -1835,7 +1837,7 @@ func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) i
 
 	detail, err := client.GetApproval(context.Background(), traceid.New(), id)
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgApprovalLookupFailed, err))
 		return 2
 	}
 	if *asJSON {
@@ -1883,7 +1885,7 @@ func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer)
 
 	if *rejectFlag {
 		if _, err := client.ApprovalDecision(context.Background(), traceID, id, false, ""); err != nil {
-			fmt.Fprintln(stderr, err.Error())
+			fmt.Fprintln(stderr, wrapServerError(MsgApprovalDecisionFailed, err))
 			return 2
 		}
 		fmt.Fprintln(stdout, MsgApprovalDenied)
@@ -1898,7 +1900,7 @@ func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer)
 			fmt.Fprintf(stderr, MsgApprovalW3TypedMismatchFmt+"\n", id)
 			return 3
 		}
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgApprovalDecisionFailed, err))
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgApprovalApproved)
@@ -1973,7 +1975,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 
 	detail, err := client.GetApproval(context.Background(), traceID, id)
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgApprovalLookupFailed, err))
 		return 2
 	}
 	fmt.Fprintln(stdout, detail.Rendered)
@@ -2006,7 +2008,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 
 	if decision != approval.DecisionApprove {
 		if _, err := client.PolicyFeedback(context.Background(), traceID, "deny", id, "", ""); err != nil {
-			fmt.Fprintln(stderr, err.Error())
+			fmt.Fprintln(stderr, wrapServerError(MsgApprovalDecisionFailed, err))
 			return 2
 		}
 		fmt.Fprintln(stdout, MsgApprovalDenied)
@@ -2014,7 +2016,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 	}
 
 	if _, err := client.PolicyFeedback(context.Background(), traceID, "approve", id, "local", typed); err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgApprovalDecisionFailed, err))
 		return 2
 	}
 	fmt.Fprintln(stdout, MsgApprovalApproved)
@@ -2111,7 +2113,7 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 		action = "abort"
 	}
 	if err := client.TaskResolve(context.Background(), traceid.New(), id, action); err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, wrapServerError(MsgTaskResolveFailed, err))
 		return 1
 	}
 	if *abort {
