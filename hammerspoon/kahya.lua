@@ -298,6 +298,11 @@ end)
 -- apart from a worker on the same socket; surface="local" is stamped only
 -- for control-authenticated calls. This function never decides anything
 -- on its own; it only relays the human's already-made choice.
+--
+-- Exit codes follow `kahya approve`'s convention: 0 = approved, 1 =
+-- rejected (the rejection WAS delivered), 2 = error. So a --reject that
+-- exits 1 is a delivered decision, not a failure; only anything else is
+-- reported as "not delivered".
 local function sendApprovalDecision(id, approve, typed)
   local args = { "approvals", "decide", id }
   if approve then
@@ -308,7 +313,8 @@ local function sendApprovalDecision(id, approve, typed)
     table.insert(args, "--reject")
   end
   runKahya(args, function(exitCode, stdOut, stdErr)
-    if exitCode ~= 0 then
+    local delivered = (exitCode == 0) or ((not approve) and exitCode == 1)
+    if not delivered then
       -- FAIL-CLOSED DELIVERY: nothing auto-approves just because this
       -- exec failed. The pending approval (if the decision never landed)
       -- stays discoverable via `kahya approvals list`; this notice is

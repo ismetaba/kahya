@@ -99,3 +99,40 @@ func TestHaltSuccessBannerIsOneLine(t *testing.T) {
 		t.Errorf("success branch must not append CLI output to the banner:\n%s", success)
 	}
 }
+
+// approvalDecisionFn returns sendApprovalDecision's source, from its
+// `local function` line to the first top-level "end" that closes it.
+func approvalDecisionFn(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, "local function sendApprovalDecision(")
+	if start < 0 {
+		t.Fatal("sendApprovalDecision not found in kahya.lua")
+	}
+	fn := src[start:]
+	if end := strings.Index(fn, "\nend\n"); end > 0 {
+		fn = fn[:end]
+	}
+	return fn
+}
+
+// TestApprovalDecisionRejectExitOneIsDelivered (FIX-FINAL
+// hammerspoon-approval-cards-broken): `kahya approvals decide <id>
+// --reject` exits 1 on a DELIVERED rejection (kahya approve's 0/1/2
+// convention), so the callback must not report "Onay kararı iletilemedi"
+// for that exit code; it must still report it for every other non-zero
+// exit. The argv keeps the id-first shape the CLI now accepts.
+func TestApprovalDecisionRejectExitOneIsDelivered(t *testing.T) {
+	fn := approvalDecisionFn(t, readLua(t))
+	if !strings.Contains(fn, `local args = { "approvals", "decide", id }`) {
+		t.Errorf("sendApprovalDecision argv changed shape:\n%s", fn)
+	}
+	if strings.Contains(fn, "if exitCode ~= 0 then") {
+		t.Errorf("sendApprovalDecision treats every non-zero exit (incl. a delivered --reject's 1) as a failure:\n%s", fn)
+	}
+	if !strings.Contains(fn, "local delivered = (exitCode == 0) or ((not approve) and exitCode == 1)") {
+		t.Errorf("sendApprovalDecision lacks the reject-exit-1-is-delivered rule:\n%s", fn)
+	}
+	if !strings.Contains(fn, "if not delivered then") || !strings.Contains(fn, `"Onay kararı iletilemedi: "`) {
+		t.Errorf("the not-delivered notice must stay, gated on `not delivered`:\n%s", fn)
+	}
+}

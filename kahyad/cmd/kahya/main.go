@@ -1705,6 +1705,37 @@ func runApprovalsList(client *Client, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// parseIDAndFlags parses a `<id> [flags...]` OR `[flags...] <id>` argv
+// for a subcommand that takes exactly one positional id (FIX-FINAL
+// hammerspoon-approval-cards-broken). Go's flag package stops at the first
+// non-flag argument, so hammerspoon/kahya.lua's id-first argv
+// (`approvals show <id> --json`, `approvals decide <id> --reject`) would
+// otherwise leave the flags unparsed and fail with a usage error. A
+// leading non-flag argument is peeled off as the id before parsing; a
+// leading flag (`-h`, or the flags-first form) parses as before. ok is
+// false only when flag parsing itself failed (the flag package already
+// printed its own message / help); id is "" whenever the argv does not
+// carry exactly one non-blank positional id.
+func parseIDAndFlags(fs *flag.FlagSet, args []string) (id string, ok bool) {
+	rest := args
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		id, rest = strings.TrimSpace(rest[0]), rest[1:]
+		if id == "" {
+			return "", fs.Parse(rest) == nil
+		}
+	}
+	if err := fs.Parse(rest); err != nil {
+		return "", false
+	}
+	switch {
+	case id == "" && fs.NArg() == 1:
+		id = strings.TrimSpace(fs.Arg(0))
+	case fs.NArg() != 0:
+		id = ""
+	}
+	return id, true
+}
+
 // runApprovalsShow implements `kahya approvals show <id> [--json]`
 // (W6-01): GET /policy/approvals?id=<id>'s byte-exact rendered diff,
 // printed WITHOUT any decision prompt - a non-interactive counterpart to
@@ -1715,15 +1746,14 @@ func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) i
 	fs := flag.NewFlagSet("approvals show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
-	if err := fs.Parse(args); err != nil {
+	id, ok := parseIDAndFlags(fs, args)
+	if !ok {
 		return 2
 	}
-	rest := fs.Args()
-	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+	if id == "" {
 		fmt.Fprintln(stderr, MsgApprovalsShowUsage)
 		return 2
 	}
-	id := strings.TrimSpace(rest[0])
 
 	detail, err := client.GetApproval(context.Background(), traceid.New(), id)
 	if err != nil {
@@ -1762,15 +1792,14 @@ func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer)
 	approveFlag := fs.Bool("approve", false, "onayla")
 	rejectFlag := fs.Bool("reject", false, "reddet")
 	typed := fs.String("typed", "", "W3 için yazılı onay metni")
-	if err := fs.Parse(args); err != nil {
+	id, ok := parseIDAndFlags(fs, args)
+	if !ok {
 		return 2
 	}
-	rest := fs.Args()
-	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" || *approveFlag == *rejectFlag {
+	if id == "" || *approveFlag == *rejectFlag {
 		fmt.Fprintln(stderr, MsgApprovalsDecideUsage)
 		return 2
 	}
-	id := strings.TrimSpace(rest[0])
 	traceID := traceid.New()
 
 	if *rejectFlag {
