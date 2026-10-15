@@ -971,9 +971,12 @@ UPDATE episodes SET cooled_at = ? WHERE id = ?;
 -- 0001_init_schema.sql's own header note), evidence cites the raw
 -- episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
 -- never a prior summary.
-INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at;
+-- G13 (0024): subject_entity_id/object_entity_id/quote are written at
+-- insert time too (NULL for every non-extractor call site); confirmed_at
+-- stays out of the INSERT list - it is never set at insert time.
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote;
 
 -- W5-04 (memory-correctness-engine) queries below: the single fact-write
 -- path (kahyad/internal/factengine) is the ONLY caller of InsertFact
@@ -984,7 +987,7 @@ RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence
 -- name: GetFact :one
 -- Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
 -- engine's own recompute-from-evidence path.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE id = ?;
 
@@ -998,7 +1001,7 @@ WHERE id = ?;
 -- than reviving the closed one in place - the retracted row stays exactly
 -- as HANDOFF S5 memory #3 requires (closed, never deleted, never
 -- reopened).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -1088,14 +1091,16 @@ UPDATE entities SET status = ? WHERE id = ?;
 SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ?;
 
 -- name: InsertEntityAlias :one
-INSERT INTO entity_aliases (entity_id, alias, created_at)
-VALUES (?, ?, ?)
-RETURNING id, entity_id, alias, created_at;
+-- alias_folded (0024) is factengine.AliasKey(alias), the Turkish
+-- I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
+INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded)
+VALUES (?, ?, ?, ?)
+RETURNING id, entity_id, alias, created_at, alias_folded;
 
 -- name: ListEntityAliasesByEntity :many
 -- Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
 -- so Split can restore exactly this set back onto the losing entity.
-SELECT id, entity_id, alias, created_at
+SELECT id, entity_id, alias, created_at, alias_folded
 FROM entity_aliases
 WHERE entity_id = ?
 ORDER BY id ASC;
@@ -1134,19 +1139,17 @@ WHERE id = ?;
 -- unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
 -- exclusion/priority policy entirely in Go, never in SQL, so the policy
 -- stays readable/testable as plain code, not buried in a query).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC;
 
 -- name: GetEpisodeByID :one
--- The sampler's fail-closed secret-lane classification read: resolves one
--- evidence row's episode_id to its source_path, matched against
--- policy.yaml's secret_lane_globs - the SAME path-glob mechanism
--- kahyad/internal/consolidation's PartitionByLane already uses for memory
--- files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
--- dosya yollari icin").
-SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at
+-- One full episodes row (the Episode model, 0024's extraction markers
+-- included). The ritual sampler's per-evidence-row secret-lane read used
+-- this until G13 moved that classification to kahyad/internal/memlane,
+-- which reads ListEpisodePathsForFact instead.
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at, extracted_at, extractor_ver
 FROM episodes
 WHERE id = ?;
 
@@ -1219,3 +1222,125 @@ FROM eval_labels el
 JOIN facts f ON f.id = el.fact_id
 WHERE el.label IS NOT NULL
 ORDER BY el.answered_at DESC, el.id DESC;
+
+-- G13 memory v2 queries below (0024_memory_v2_graph). See
+-- kahyad/internal/factengine (entity links, folded aliases),
+-- kahyad/internal/memlane (fail-closed lane classification of facts) and
+-- the later MEM-1/2/3/4/5 work (graph reads, extraction markers, CLI) for
+-- the callers.
+
+-- name: UpdateFactLinksAndValidity :exec
+-- Links an EXISTING active fact (found by GetActiveFactByTriple on a
+-- re-assertion) to entity rows / a quote / a validity window when the
+-- earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
+-- the first link wins).
+UPDATE facts
+SET subject_entity_id = COALESCE(subject_entity_id, ?),
+    object_entity_id  = COALESCE(object_entity_id, ?),
+    quote             = COALESCE(quote, ?),
+    valid_from        = COALESCE(valid_from, ?),
+    valid_to          = COALESCE(valid_to, ?),
+    updated_at        = ?
+WHERE id = ?;
+
+-- name: CountActiveFactsForEntity :one
+-- `kahya entity list` row counter (MEM-2 CLI).
+SELECT count(*) FROM facts
+WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?);
+
+-- name: GetTaskLaneByTrace :one
+-- MEM-4 graph tools: an MCP tools/call carries only X-Kahya-Trace-Id, so the
+-- task's lane is resolved by trace_id, most recently updated row wins (the
+-- same note as GetTaskSessionByTrace above). sql.ErrNoRows => unresolved =>
+-- the caller FAILS CLOSED (cloud filter on).
+SELECT lane FROM tasks
+WHERE trace_id = ?
+ORDER BY updated_at DESC
+LIMIT 1;
+
+-- name: ListEntityIDsByAliasFolded :many
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias_folded = ?;
+
+-- name: ListActiveEntityIDsByAliasFolded :many
+-- Only entities still 'active' (a merged-away entity's aliases were moved to
+-- the survivor by MergeEntities, so this is defensive).
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND e.status = 'active'
+ORDER BY a.entity_id ASC;
+
+-- name: GetEntityAliasByEntityAndAlias :one
+SELECT id, entity_id, alias, created_at, alias_folded
+FROM entity_aliases
+WHERE entity_id = ? AND alias = ?
+ORDER BY id ASC
+LIMIT 1;
+
+-- name: ListFactsByEntityHop :many
+-- One graph hop: every active fact touching entity_id as subject OR object.
+-- Tier/confirmed/threshold eligibility is applied in Go
+-- (factengine.InjectionEligible) so the predicate lives in ONE place.
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+FROM facts
+WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
+ORDER BY confidence DESC, updated_at DESC
+LIMIT ?;
+
+-- name: ListFactsCitingEpisodes :many
+-- Facts whose evidence cites one of the chunk hits' episodes - the second
+-- graph seed source (MEM-1). sqlc.slice expands to an IN (...) list.
+SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id
+FROM evidence ev JOIN facts f ON f.id = ev.fact_id
+WHERE ev.episode_id IN (sqlc.slice('episode_ids')) AND f.status = 'active';
+
+-- name: ListEpisodePathsForFact :many
+-- Every distinct episode source_path cited by a fact's evidence rows -
+-- kahyad/internal/memlane's fail-closed secret-lane classification read
+-- (moved there from kahyad/internal/ritual/select.go's per-row loop).
+SELECT DISTINCT ep.source_path
+FROM evidence ev JOIN episodes ep ON ep.id = ev.episode_id
+WHERE ev.fact_id = ? AND ep.source_path IS NOT NULL;
+
+-- name: ListUnextractedEpisodes :many
+-- Active episodes the nightly fact-extraction job (MEM-3) has not processed
+-- under the current extractor version (NULL or a different version).
+-- Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
+-- parser does not see a parameter after IS NOT and would generate a method
+-- that binds one argument too few.
+SELECT id, source, source_path, source_tier, created_at
+FROM episodes
+WHERE status = 'active'
+  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> ?)
+ORDER BY id ASC
+LIMIT ?;
+
+-- name: MarkEpisodeExtracted :exec
+UPDATE episodes SET extracted_at = ?, extractor_ver = ? WHERE id = ?;
+
+-- name: ResetEpisodeExtraction :exec
+UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE id = ?;
+
+-- name: ListQuarantinedFacts :many
+-- `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
+-- confirmed.
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+FROM facts
+WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
+ORDER BY id DESC
+LIMIT ?;
+
+-- name: ListFactIDsByEpisode :many
+-- `kahya fact confirm --episode <id>` (MEM-5): every active fact evidenced
+-- by that episode.
+SELECT DISTINCT f.id
+FROM evidence ev JOIN facts f ON f.id = ev.fact_id
+WHERE ev.episode_id = ? AND f.status = 'active';
+
+-- name: ListEntitiesByFolded :many
+-- entity_lookup / `kahya entity list <name>` (MEM-2/MEM-4): prefix match on
+-- the folded alias (the caller appends '%' to factengine.AliasKey(query)).
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND e.status = 'active'
+ORDER BY e.id ASC
+LIMIT ?;

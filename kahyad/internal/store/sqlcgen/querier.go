@@ -72,6 +72,8 @@ type Querier interface {
 	// 'approved' (Approve), 'denied' (Deny) or 'invalidated' (the W6-03 halt
 	// executor's InvalidateApprovalsForTask).
 	ConsumePendingApproval(ctx context.Context, arg ConsumePendingApprovalParams) (int64, error)
+	// `kahya entity list` row counter (MEM-2 CLI).
+	CountActiveFactsForEntity(ctx context.Context, arg CountActiveFactsForEntityParams) (int64, error)
 	// Once-per-LOCAL-day idempotency check (W5-01, fixed by G08/P-14): counts
 	// events of kind whose created_at falls in [start_ts, end_ts). The caller
 	// (kahyad/internal/briefing.StoreDedupeChecker) computes the user's local
@@ -133,12 +135,11 @@ type Querier interface {
 	// kahyad/internal/egress/budget.go for the only caller.
 	GetEgressBudget(ctx context.Context, arg GetEgressBudgetParams) (EgressBudget, error)
 	GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
-	// The sampler's fail-closed secret-lane classification read: resolves one
-	// evidence row's episode_id to its source_path, matched against
-	// policy.yaml's secret_lane_globs - the SAME path-glob mechanism
-	// kahyad/internal/consolidation's PartitionByLane already uses for memory
-	// files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
-	// dosya yollari icin").
+	GetEntityAliasByEntityAndAlias(ctx context.Context, arg GetEntityAliasByEntityAndAliasParams) (EntityAlias, error)
+	// One full episodes row (the Episode model, 0024's extraction markers
+	// included). The ritual sampler's per-evidence-row secret-lane read used
+	// this until G13 moved that classification to kahyad/internal/memlane,
+	// which reads ListEpisodePathsForFact instead.
 	GetEpisodeByID(ctx context.Context, id int64) (Episode, error)
 	GetEpisodeByPath(ctx context.Context, sourcePath sql.NullString) (GetEpisodeByPathRow, error)
 	// W12-04 (corpus indexer) queries below. GetEpisodeByPath above does not
@@ -227,6 +228,11 @@ type Querier interface {
 	// updated task for the session.
 	GetTaskBySession(ctx context.Context, sessionID sql.NullString) (GetTaskBySessionRow, error)
 	GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, error)
+	// MEM-4 graph tools: an MCP tools/call carries only X-Kahya-Trace-Id, so the
+	// task's lane is resolved by trace_id, most recently updated row wins (the
+	// same note as GetTaskSessionByTrace above). sql.ErrNoRows => unresolved =>
+	// the caller FAILS CLOSED (cloud filter on).
+	GetTaskLaneByTrace(ctx context.Context, traceID string) (string, error)
 	// W4-03 BLOCKER 1+2 fix: the by-trace_id half of the server-side taint
 	// resolver (kahyad/internal/policy.StoreSessionResolver) - a policy
 	// decision must resolve WHICH session a request belongs to from the
@@ -282,6 +288,8 @@ type Querier interface {
 	// collides with an EXISTING entity's alias; 0 for the first entity ever
 	// seen under a given name.
 	InsertEntity(ctx context.Context, arg InsertEntityParams) (InsertEntityRow, error)
+	// alias_folded (0024) is factengine.AliasKey(alias), the Turkish
+	// I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
 	InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error)
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
 	// One row per fact ASKED about in a single ritual run (W5-03 task spec
@@ -309,6 +317,9 @@ type Querier interface {
 	// 0001_init_schema.sql's own header note), evidence cites the raw
 	// episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
 	// never a prior summary.
+	// G13 (0024): subject_entity_id/object_entity_id/quote are written at
+	// insert time too (NULL for every non-extractor call site); confirmed_at
+	// stays out of the INSERT list - it is never set at insert time.
 	InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error)
 	// One row per merge AND per split (HANDOFF S5 memory #2: "Merge-defteri +
 	// varlik-bolme operasyonu") - never updated, never deleted, matching the
@@ -404,6 +415,9 @@ type Querier interface {
 	// side effect - idx_undo_windows_op_id); scope = that token's real bound
 	// scope, so an undo demotes the real (tool, class, scope) triple.
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
+	// Only entities still 'active' (a merged-away entity's aliases were moved to
+	// the survivor by MergeEntities, so this is defensive).
+	ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
 	// W5-03 (truth-ritual) queries below: the eval_labels durable label store
 	// plus the two small facts/episodes reads kahyad/internal/ritual's sampler
 	// needs beyond what factengine/W5-04 already added above. See that
@@ -465,6 +479,9 @@ type Querier interface {
 	//      InsertOutboxRow's own doc comment) exactly as before this guard
 	//      existed.
 	ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsParams) ([]Outbox, error)
+	// entity_lookup / `kahya entity list <name>` (MEM-2/MEM-4): prefix match on
+	// the folded alias (the caller appends '%' to factengine.AliasKey(query)).
+	ListEntitiesByFolded(ctx context.Context, arg ListEntitiesByFoldedParams) ([]ListEntitiesByFoldedRow, error)
 	// Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
 	// so Split can restore exactly this set back onto the losing entity.
 	ListEntityAliasesByEntity(ctx context.Context, entityID int64) ([]EntityAlias, error)
@@ -473,6 +490,11 @@ type Querier interface {
 	// one or more existing ids means a NEW entity must be created provisional
 	// (HANDOFF S5 memory #2: name similarity alone never auto-merges).
 	ListEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error)
+	ListEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
+	// Every distinct episode source_path cited by a fact's evidence rows -
+	// kahyad/internal/memlane's fail-closed secret-lane classification read
+	// (moved there from kahyad/internal/ritual/select.go's per-row loop).
+	ListEpisodePathsForFact(ctx context.Context, factID int64) ([]sql.NullString, error)
 	// Every eval_labels row one ritual run minted, oldest first - the "all
 	// rows share one trace_id" acceptance criterion's own read path.
 	ListEvalLabelsByTrace(ctx context.Context, traceID string) ([]EvalLabel, error)
@@ -508,6 +530,16 @@ type Querier interface {
 	// clause that loosens 'executing' can never accidentally resume a halted
 	// task without ALSO having to delete this line first.
 	ListExecutingTasks(ctx context.Context) ([]Task, error)
+	// `kahya fact confirm --episode <id>` (MEM-5): every active fact evidenced
+	// by that episode.
+	ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullInt64) ([]int64, error)
+	// One graph hop: every active fact touching entity_id as subject OR object.
+	// Tier/confirmed/threshold eligibility is applied in Go
+	// (factengine.InjectionEligible) so the predicate lives in ONE place.
+	ListFactsByEntityHop(ctx context.Context, arg ListFactsByEntityHopParams) ([]Fact, error)
+	// Facts whose evidence cites one of the chunk hits' episodes - the second
+	// graph seed source (MEM-1). sqlc.slice expands to an IN (...) list.
+	ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.NullInt64) ([]ListFactsCitingEpisodesRow, error)
 	// Per-fact most-recent asked_at, across every ritual run ever run - the
 	// sampler's "never/longest-ago probed" priority tier (select.go): a
 	// fact_id absent from this result set has never been asked and sorts
@@ -533,6 +565,9 @@ type Querier interface {
 	// stale-pending alarm (task spec step 5: "if the oldest pending is older
 	// than 2 x interval_hours, alarm") reads index [0].
 	ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error)
+	// `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
+	// confirmed.
+	ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact, error)
 	// Every tool_calls row for task_id still stuck at 'intent'/'executing' -
 	// i.e. a side-effectful call whose kahyad-side execution was interrupted
 	// (worker died, kahyad crashed) before a receipt (or a failure) was ever
@@ -573,6 +608,12 @@ type Querier interface {
 	// correctly; like CountEventsByKindBetween's instant compare above, it
 	// needs no timezone conversion for the same reason).
 	ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error)
+	// Active episodes the nightly fact-extraction job (MEM-3) has not processed
+	// under the current extractor version (NULL or a different version).
+	// Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
+	// parser does not see a parameter after IS NOT and would generate a method
+	// that binds one argument too few.
+	ListUnextractedEpisodes(ctx context.Context, arg ListUnextractedEpisodesParams) ([]ListUnextractedEpisodesRow, error)
 	// The ONLY statement that sets local_fallback_at - called once the
 	// O_APPEND write to the fallback file has returned without error.
 	MarkAnchorLocalFallback(ctx context.Context, arg MarkAnchorLocalFallbackParams) error
@@ -584,6 +625,7 @@ type Querier interface {
 	// facts (task spec step 6: "only then mark cooled").
 	MarkEpisodeCooled(ctx context.Context, arg MarkEpisodeCooledParams) error
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
+	MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) error
 	// Terminal success: the re-spawned worker exited 0 (task spec step 7).
 	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error
 	MarkToolCallExecuting(ctx context.Context, arg MarkToolCallExecutingParams) error
@@ -625,6 +667,7 @@ type Querier interface {
 	// already marked delivered (or that somehow no longer exists) must never
 	// have its lease resurrected.
 	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
+	ResetEpisodeExtraction(ctx context.Context, id int64) error
 	// Undoes a ClaimEvalLabelAnswer whose evidence write then failed, so the
 	// user can tap again instead of being stuck "answered" with no evidence.
 	ResetEvalLabelAnswer(ctx context.Context, id int64) error
@@ -724,6 +767,16 @@ type Querier interface {
 	// highest positive tier cap represented - never a noisy-OR ratchet) and
 	// writes the result back here after every WriteFact/DenyFact call.
 	UpdateFactConfidence(ctx context.Context, arg UpdateFactConfidenceParams) error
+	// G13 memory v2 queries below (0024_memory_v2_graph). See
+	// kahyad/internal/factengine (entity links, folded aliases),
+	// kahyad/internal/memlane (fail-closed lane classification of facts) and
+	// the later MEM-1/2/3/4/5 work (graph reads, extraction markers, CLI) for
+	// the callers.
+	// Links an EXISTING active fact (found by GetActiveFactByTriple on a
+	// re-assertion) to entity rows / a quote / a validity window when the
+	// earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
+	// the first link wins).
+	UpdateFactLinksAndValidity(ctx context.Context, arg UpdateFactLinksAndValidityParams) error
 	// Persists a worker-reported session_id onto the task row (W12-07 step 3:
 	// kahyad "persists session_id onto the task row" as the worker's
 	// {"type":"session",...} stdout line arrives). Session RESUME itself

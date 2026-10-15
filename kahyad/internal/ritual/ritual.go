@@ -40,10 +40,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"kahya/kahyad/internal/factengine"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
 )
@@ -194,9 +194,11 @@ func (e *Engine) nowRFC3339() string { return e.now().UTC().Format(time.RFC3339N
 // plain-Turkish question body ("Bu dogru mu?\n\n<fact text>"'s own <fact
 // text> half) - a straightforward whitespace join, since every field is
 // already free Turkish text an extractor (or a direct user assertion)
-// produced, not a template needing further grammar.
+// produced, not a template needing further grammar. It IS memlane.FactText,
+// the text the sampler's secret-lane classification checks (FIX-P-17), so
+// the classified text and the sent text can never drift apart.
 func factText(f sqlcgen.Fact) string {
-	return strings.TrimSpace(f.Subject + " " + f.Predicate + " " + f.Object)
+	return memlane.FactText(f)
 }
 
 // Run selects up to MaxQuestionsPerRun eligible facts (select.go) and

@@ -359,3 +359,35 @@ func TestSelectLedgersPathGlobExclusionWithTrace(t *testing.T) {
 		}
 	}
 }
+
+// erroringGlobMatcher fails every glob evaluation.
+type erroringGlobMatcher struct{}
+
+func (erroringGlobMatcher) Match(string, string) (bool, error) {
+	return false, errors.New("glob cannot be evaluated")
+}
+
+// TestSelectExcludesFactWhenSecretGlobErrors (G13 common ground, memlane): a
+// secret-lane glob that cannot be evaluated excludes the fact (fail-closed,
+// ledgered path_glob) - before the classification moved to memlane a match
+// error counted as "no match" and the fact reached Telegram. The same fact
+// is selected when the glob evaluates normally.
+func TestSelectExcludesFactWhenSecretGlobErrors(t *testing.T) {
+	st := newTestStore(t)
+	ep := seedEpisode(t, st, "notlar/gunluk.md")
+	fact := seedFact(t, st, "Emre", "sever", "kahve", "user_asserted", 1.0, false)
+	seedClassifyingEvidence(t, st, fact.ID, ep)
+
+	if ids := selectedIDs(t, NewSampler(st.Queries, testMemoryDir, testSecretGlobs, nil), "trace-glob-ok"); !ids[fact.ID] {
+		t.Fatalf("Select() = %v, want fact %d with a working matcher", ids, fact.ID)
+	}
+	s := NewSampler(st.Queries, testMemoryDir, testSecretGlobs, erroringGlobMatcher{})
+	s.SetLedger(st)
+	if ids := selectedIDs(t, s, "trace-glob-err"); ids[fact.ID] {
+		t.Fatalf("Select() = %v, a glob error must exclude fact %d", ids, fact.ID)
+	}
+	ex := excludedRows(t, st)
+	if len(ex) != 1 || ex[0].factID != fact.ID || ex[0].reason != ExcludeReasonPathGlob || ex[0].traceID != "trace-glob-err" {
+		t.Fatalf("exclusion rows = %+v, want one path_glob row for fact %d", ex, fact.ID)
+	}
+}

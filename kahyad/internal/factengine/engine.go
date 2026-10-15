@@ -180,6 +180,16 @@ const (
 	EventFactConfirmed = "factengine.fact_confirmed"
 	EventEntityMerged  = "factengine.entity_merged"
 	EventEntitySplit   = "factengine.entity_split"
+
+	// EventEntityCreated is ledgered for every entity
+	// ResolveEntityForExtraction creates (G13 MEM-2): payload {entity_id,
+	// canonical_name, kind, provisional, reason}, reason one of the
+	// EntityCreated* constants (entity.go).
+	EventEntityCreated = "factengine.entity_created"
+	// EventAliasSkippedCollision is ledgered when AddAlias refuses an alias
+	// another active entity already answers to: payload {entity_id, alias,
+	// owner_entity_id}.
+	EventAliasSkippedCollision = "factengine.alias_skipped_collision"
 )
 
 // MaxFieldRunes is the S5 safety#2 free-text length cap this package
@@ -189,6 +199,11 @@ const (
 // candidate facts since an extractor is exactly the kind of untrusted-
 // enough-to-validate Go-side producer that rule describes).
 const MaxFieldRunes = 500
+
+// MaxQuoteRunes caps Candidate.Quote, the verbatim span an extractor cites
+// (G13 common ground; the same 300-rune ceiling as the Reader's webpage key
+// points), under the same charclass rule as every other free-text field.
+const MaxQuoteRunes = 300
 
 // Candidate is what an extractor (or kahyad's own deterministic
 // promotion code) proposes to WriteFact. See the package doc for the
@@ -236,6 +251,32 @@ type Candidate struct {
 	// kahyad/internal/consolidation.ValidateSummaryEvidence at the
 	// hot-window call site).
 	Evidence string
+
+	// SubjectEntityID/ObjectEntityID link this candidate to entities rows
+	// (0 = unlinked; G13 common ground, migration 0024). Set ONLY by a Go
+	// call site from ResolveEntityForExtraction's result, never copied from
+	// a model's own JSON (the model names entities by surface string; the
+	// engine decides which row that string resolves to).
+	SubjectEntityID int64
+	ObjectEntityID  int64
+
+	// Quote is the <=MaxQuoteRunes verbatim span the extractor cited. Same
+	// charclass validation as every other free-text field.
+	Quote string
+
+	// ValidFrom/ValidTo are RFC3339 or "" (NULL), stored in UTC
+	// (RFC3339Nano, like every other timestamp this package writes).
+	// Written on insert; on a re-assertion of an existing active triple a
+	// NULL column is filled, a set one is never overwritten (first value
+	// wins).
+	ValidFrom string
+	ValidTo   string
+}
+
+// hasLinkFields reports whether c carries any G13 link/quote/validity value
+// a re-assertion should merge into an existing fact.
+func (c Candidate) hasLinkFields() bool {
+	return c.SubjectEntityID != 0 || c.ObjectEntityID != 0 || c.Quote != "" || c.ValidFrom != "" || c.ValidTo != ""
 }
 
 // Store is the narrow brain.db surface this package needs -
@@ -263,6 +304,11 @@ type Store interface {
 	UpdateEntityAliasEntityByID(ctx context.Context, arg sqlcgen.UpdateEntityAliasEntityByIDParams) error
 	InsertMergeLedger(ctx context.Context, arg sqlcgen.InsertMergeLedgerParams) (sqlcgen.MergeLedger, error)
 	GetMergeLedger(ctx context.Context, id int64) (sqlcgen.MergeLedger, error)
+
+	// G13 common ground (migration 0024).
+	UpdateFactLinksAndValidity(ctx context.Context, arg sqlcgen.UpdateFactLinksAndValidityParams) error
+	ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
+	GetEntityAliasByEntityAndAlias(ctx context.Context, arg sqlcgen.GetEntityAliasByEntityAndAliasParams) (sqlcgen.EntityAlias, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -341,7 +387,42 @@ func validateCandidate(c *Candidate) error {
 	if err := validateFreeText(c.Evidence, MaxFieldRunes); err != nil {
 		return fmt.Errorf("factengine: evidence: %w", err)
 	}
+	if err := validateFreeText(c.Quote, MaxQuoteRunes); err != nil {
+		return fmt.Errorf("factengine: quote: %w", err)
+	}
+	if c.SubjectEntityID < 0 || c.ObjectEntityID < 0 {
+		return errors.New("factengine: entity ids must not be negative")
+	}
+	from, err := normalizeValidity(c.ValidFrom)
+	if err != nil {
+		return fmt.Errorf("factengine: valid_from: %w", err)
+	}
+	to, err := normalizeValidity(c.ValidTo)
+	if err != nil {
+		return fmt.Errorf("factengine: valid_to: %w", err)
+	}
+	if !from.IsZero() && !to.IsZero() && from.After(to) {
+		return errors.New("factengine: valid_from is after valid_to")
+	}
+	if !from.IsZero() {
+		c.ValidFrom = from.Format(time.RFC3339Nano)
+	}
+	if !to.IsZero() {
+		c.ValidTo = to.Format(time.RFC3339Nano)
+	}
 	return nil
+}
+
+// normalizeValidity parses an RFC3339 validity bound ("" = none) into UTC.
+func normalizeValidity(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, errors.New("not RFC3339")
+	}
+	return t.UTC(), nil
 }
 
 // validateFreeText enforces the length+charclass cap (HANDOFF S5
@@ -481,12 +562,32 @@ func (e *Engine) WriteFact(ctx context.Context, traceID string, c Candidate) (in
 			ExtractorVer:  nullString(c.ExtractorVer),
 			UpdatedAt:     now,
 			CreatedAt:     now,
+			// G13 common ground: links/quote/validity (NULL unless set).
+			SubjectEntityID: nullInt64(c.SubjectEntityID),
+			ObjectEntityID:  nullInt64(c.ObjectEntityID),
+			Quote:           nullString(c.Quote),
+			ValidFrom:       nullString(c.ValidFrom),
+			ValidTo:         nullString(c.ValidTo),
 		})
 		if err != nil {
 			return 0, fmt.Errorf("factengine: insert fact: %w", err)
 		}
 	case err != nil:
 		return 0, fmt.Errorf("factengine: lookup fact: %w", err)
+	case c.hasLinkFields():
+		// A re-assertion of an existing active triple: fill a NULL link,
+		// quote or validity bound, never overwrite one (COALESCE in SQL).
+		if err := e.store.UpdateFactLinksAndValidity(ctx, sqlcgen.UpdateFactLinksAndValidityParams{
+			SubjectEntityID: nullInt64(c.SubjectEntityID),
+			ObjectEntityID:  nullInt64(c.ObjectEntityID),
+			Quote:           nullString(c.Quote),
+			ValidFrom:       nullString(c.ValidFrom),
+			ValidTo:         nullString(c.ValidTo),
+			UpdatedAt:       now,
+			ID:              fact.ID,
+		}); err != nil {
+			return 0, fmt.Errorf("factengine: link fact %d: %w", fact.ID, err)
+		}
 	}
 
 	if err := e.addEvidence(ctx, fact.ID, c.EpisodeID, c.SessionID, 1, delta); err != nil {

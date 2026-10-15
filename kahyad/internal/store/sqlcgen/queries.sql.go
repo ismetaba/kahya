@@ -8,6 +8,7 @@ package sqlcgen
 import (
 	"context"
 	"database/sql"
+	"strings"
 )
 
 const advanceLedgerDigestState = `-- name: AdvanceLedgerDigestState :exec
@@ -213,6 +214,24 @@ func (q *Queries) ConsumePendingApproval(ctx context.Context, arg ConsumePending
 	return result.RowsAffected()
 }
 
+const countActiveFactsForEntity = `-- name: CountActiveFactsForEntity :one
+SELECT count(*) FROM facts
+WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
+`
+
+type CountActiveFactsForEntityParams struct {
+	SubjectEntityID sql.NullInt64 `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64 `json:"object_entity_id"`
+}
+
+// `kahya entity list` row counter (MEM-2 CLI).
+func (q *Queries) CountActiveFactsForEntity(ctx context.Context, arg CountActiveFactsForEntityParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActiveFactsForEntity, arg.SubjectEntityID, arg.ObjectEntityID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countEventsByKindBetween = `-- name: CountEventsByKindBetween :one
 SELECT count(*) FROM events
 WHERE kind = ?
@@ -318,7 +337,7 @@ func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) er
 }
 
 const getActiveFactByTriple = `-- name: GetActiveFactByTriple :one
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -360,6 +379,9 @@ func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactBy
 		&i.UpdatedAt,
 		&i.CreatedAt,
 		&i.ConfirmedAt,
+		&i.SubjectEntityID,
+		&i.ObjectEntityID,
+		&i.Quote,
 	)
 	return i, err
 }
@@ -508,18 +530,42 @@ func (q *Queries) GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
 	return i, err
 }
 
+const getEntityAliasByEntityAndAlias = `-- name: GetEntityAliasByEntityAndAlias :one
+SELECT id, entity_id, alias, created_at, alias_folded
+FROM entity_aliases
+WHERE entity_id = ? AND alias = ?
+ORDER BY id ASC
+LIMIT 1
+`
+
+type GetEntityAliasByEntityAndAliasParams struct {
+	EntityID int64  `json:"entity_id"`
+	Alias    string `json:"alias"`
+}
+
+func (q *Queries) GetEntityAliasByEntityAndAlias(ctx context.Context, arg GetEntityAliasByEntityAndAliasParams) (EntityAlias, error) {
+	row := q.db.QueryRowContext(ctx, getEntityAliasByEntityAndAlias, arg.EntityID, arg.Alias)
+	var i EntityAlias
+	err := row.Scan(
+		&i.ID,
+		&i.EntityID,
+		&i.Alias,
+		&i.CreatedAt,
+		&i.AliasFolded,
+	)
+	return i, err
+}
+
 const getEpisodeByID = `-- name: GetEpisodeByID :one
-SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at
+SELECT id, source, source_path, source_hash, source_tier, started_at, ended_at, status, meta, created_at, cooled_at, extracted_at, extractor_ver
 FROM episodes
 WHERE id = ?
 `
 
-// The sampler's fail-closed secret-lane classification read: resolves one
-// evidence row's episode_id to its source_path, matched against
-// policy.yaml's secret_lane_globs - the SAME path-glob mechanism
-// kahyad/internal/consolidation's PartitionByLane already uses for memory
-// files (HANDOFF S4 ordering invariant: "policy.yaml globlari YALNIZ
-// dosya yollari icin").
+// One full episodes row (the Episode model, 0024's extraction markers
+// included). The ritual sampler's per-evidence-row secret-lane read used
+// this until G13 moved that classification to kahyad/internal/memlane,
+// which reads ListEpisodePathsForFact instead.
 func (q *Queries) GetEpisodeByID(ctx context.Context, id int64) (Episode, error) {
 	row := q.db.QueryRowContext(ctx, getEpisodeByID, id)
 	var i Episode
@@ -535,6 +581,8 @@ func (q *Queries) GetEpisodeByID(ctx context.Context, id int64) (Episode, error)
 		&i.Meta,
 		&i.CreatedAt,
 		&i.CooledAt,
+		&i.ExtractedAt,
+		&i.ExtractorVer,
 	)
 	return i, err
 }
@@ -694,7 +742,7 @@ func (q *Queries) GetEvidenceByFactSessionPolarity(ctx context.Context, arg GetE
 
 const getFact = `-- name: GetFact :one
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE id = ?
 `
@@ -726,6 +774,9 @@ func (q *Queries) GetFact(ctx context.Context, id int64) (Fact, error) {
 		&i.UpdatedAt,
 		&i.CreatedAt,
 		&i.ConfirmedAt,
+		&i.SubjectEntityID,
+		&i.ObjectEntityID,
+		&i.Quote,
 	)
 	return i, err
 }
@@ -1086,6 +1137,24 @@ func (q *Queries) GetTaskLane(ctx context.Context, id string) (GetTaskLaneRow, e
 	return i, err
 }
 
+const getTaskLaneByTrace = `-- name: GetTaskLaneByTrace :one
+SELECT lane FROM tasks
+WHERE trace_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`
+
+// MEM-4 graph tools: an MCP tools/call carries only X-Kahya-Trace-Id, so the
+// task's lane is resolved by trace_id, most recently updated row wins (the
+// same note as GetTaskSessionByTrace above). sql.ErrNoRows => unresolved =>
+// the caller FAILS CLOSED (cloud filter on).
+func (q *Queries) GetTaskLaneByTrace(ctx context.Context, traceID string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getTaskLaneByTrace, traceID)
+	var lane string
+	err := row.Scan(&lane)
+	return lane, err
+}
+
 const getTaskSessionByTrace = `-- name: GetTaskSessionByTrace :one
 SELECT session_id FROM tasks
 WHERE trace_id = ?
@@ -1394,25 +1463,34 @@ func (q *Queries) InsertEntity(ctx context.Context, arg InsertEntityParams) (Ins
 }
 
 const insertEntityAlias = `-- name: InsertEntityAlias :one
-INSERT INTO entity_aliases (entity_id, alias, created_at)
-VALUES (?, ?, ?)
-RETURNING id, entity_id, alias, created_at
+INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded)
+VALUES (?, ?, ?, ?)
+RETURNING id, entity_id, alias, created_at, alias_folded
 `
 
 type InsertEntityAliasParams struct {
-	EntityID  int64  `json:"entity_id"`
-	Alias     string `json:"alias"`
-	CreatedAt string `json:"created_at"`
+	EntityID    int64          `json:"entity_id"`
+	Alias       string         `json:"alias"`
+	CreatedAt   string         `json:"created_at"`
+	AliasFolded sql.NullString `json:"alias_folded"`
 }
 
+// alias_folded (0024) is factengine.AliasKey(alias), the Turkish
+// I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
 func (q *Queries) InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error) {
-	row := q.db.QueryRowContext(ctx, insertEntityAlias, arg.EntityID, arg.Alias, arg.CreatedAt)
+	row := q.db.QueryRowContext(ctx, insertEntityAlias,
+		arg.EntityID,
+		arg.Alias,
+		arg.CreatedAt,
+		arg.AliasFolded,
+	)
 	var i EntityAlias
 	err := row.Scan(
 		&i.ID,
 		&i.EntityID,
 		&i.Alias,
 		&i.CreatedAt,
+		&i.AliasFolded,
 	)
 	return i, err
 }
@@ -1611,26 +1689,29 @@ func (q *Queries) InsertEvidence(ctx context.Context, arg InsertEvidenceParams) 
 }
 
 const insertFact = `-- name: InsertFact :one
-INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 `
 
 type InsertFactParams struct {
-	Subject       string         `json:"subject"`
-	Predicate     string         `json:"predicate"`
-	Object        string         `json:"object"`
-	SourceTier    string         `json:"source_tier"`
-	Evidentiality string         `json:"evidentiality"`
-	Confidence    float64        `json:"confidence"`
-	Importance    float64        `json:"importance"`
-	ValidFrom     sql.NullString `json:"valid_from"`
-	ValidTo       sql.NullString `json:"valid_to"`
-	Status        string         `json:"status"`
-	Evidence      sql.NullString `json:"evidence"`
-	ExtractorVer  sql.NullString `json:"extractor_ver"`
-	UpdatedAt     string         `json:"updated_at"`
-	CreatedAt     string         `json:"created_at"`
+	Subject         string         `json:"subject"`
+	Predicate       string         `json:"predicate"`
+	Object          string         `json:"object"`
+	SourceTier      string         `json:"source_tier"`
+	Evidentiality   string         `json:"evidentiality"`
+	Confidence      float64        `json:"confidence"`
+	Importance      float64        `json:"importance"`
+	ValidFrom       sql.NullString `json:"valid_from"`
+	ValidTo         sql.NullString `json:"valid_to"`
+	Status          string         `json:"status"`
+	Evidence        sql.NullString `json:"evidence"`
+	ExtractorVer    sql.NullString `json:"extractor_ver"`
+	UpdatedAt       string         `json:"updated_at"`
+	CreatedAt       string         `json:"created_at"`
+	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
+	Quote           sql.NullString `json:"quote"`
 }
 
 // One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
@@ -1642,6 +1723,9 @@ type InsertFactParams struct {
 // 0001_init_schema.sql's own header note), evidence cites the raw
 // episode/chunk this fact was promoted from (e.g. "episode:12,chunk:34"),
 // never a prior summary.
+// G13 (0024): subject_entity_id/object_entity_id/quote are written at
+// insert time too (NULL for every non-extractor call site); confirmed_at
+// stays out of the INSERT list - it is never set at insert time.
 func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error) {
 	row := q.db.QueryRowContext(ctx, insertFact,
 		arg.Subject,
@@ -1658,6 +1742,9 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		arg.ExtractorVer,
 		arg.UpdatedAt,
 		arg.CreatedAt,
+		arg.SubjectEntityID,
+		arg.ObjectEntityID,
+		arg.Quote,
 	)
 	var i Fact
 	err := row.Scan(
@@ -1677,6 +1764,9 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		&i.UpdatedAt,
 		&i.CreatedAt,
 		&i.ConfirmedAt,
+		&i.SubjectEntityID,
+		&i.ObjectEntityID,
+		&i.Quote,
 	)
 	return i, err
 }
@@ -2073,9 +2163,41 @@ func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowPara
 	return i, err
 }
 
+const listActiveEntityIDsByAliasFolded = `-- name: ListActiveEntityIDsByAliasFolded :many
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND e.status = 'active'
+ORDER BY a.entity_id ASC
+`
+
+// Only entities still 'active' (a merged-away entity's aliases were moved to
+// the survivor by MergeEntities, so this is defensive).
+func (q *Queries) ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveEntityIDsByAliasFolded, aliasFolded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listActiveFacts = `-- name: ListActiveFacts :many
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC
@@ -2115,6 +2237,9 @@ func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
 			&i.UpdatedAt,
 			&i.CreatedAt,
 			&i.ConfirmedAt,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.Quote,
 		); err != nil {
 			return nil, err
 		}
@@ -2472,8 +2597,62 @@ func (q *Queries) ListDueOutboxRows(ctx context.Context, arg ListDueOutboxRowsPa
 	return items, nil
 }
 
+const listEntitiesByFolded = `-- name: ListEntitiesByFolded :many
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND e.status = 'active'
+ORDER BY e.id ASC
+LIMIT ?
+`
+
+type ListEntitiesByFoldedParams struct {
+	AliasFolded sql.NullString `json:"alias_folded"`
+	Limit       int64          `json:"limit"`
+}
+
+type ListEntitiesByFoldedRow struct {
+	ID            int64          `json:"id"`
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+// entity_lookup / `kahya entity list <name>` (MEM-2/MEM-4): prefix match on
+// the folded alias (the caller appends '%' to factengine.AliasKey(query)).
+func (q *Queries) ListEntitiesByFolded(ctx context.Context, arg ListEntitiesByFoldedParams) ([]ListEntitiesByFoldedRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEntitiesByFolded, arg.AliasFolded, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListEntitiesByFoldedRow{}
+	for rows.Next() {
+		var i ListEntitiesByFoldedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CanonicalName,
+			&i.Kind,
+			&i.Status,
+			&i.Provisional,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEntityAliasesByEntity = `-- name: ListEntityAliasesByEntity :many
-SELECT id, entity_id, alias, created_at
+SELECT id, entity_id, alias, created_at, alias_folded
 FROM entity_aliases
 WHERE entity_id = ?
 ORDER BY id ASC
@@ -2495,6 +2674,7 @@ func (q *Queries) ListEntityAliasesByEntity(ctx context.Context, entityID int64)
 			&i.EntityID,
 			&i.Alias,
 			&i.CreatedAt,
+			&i.AliasFolded,
 		); err != nil {
 			return nil, err
 		}
@@ -2530,6 +2710,65 @@ func (q *Queries) ListEntityIDsByAlias(ctx context.Context, alias string) ([]int
 			return nil, err
 		}
 		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEntityIDsByAliasFolded = `-- name: ListEntityIDsByAliasFolded :many
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias_folded = ?
+`
+
+func (q *Queries) ListEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listEntityIDsByAliasFolded, aliasFolded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEpisodePathsForFact = `-- name: ListEpisodePathsForFact :many
+SELECT DISTINCT ep.source_path
+FROM evidence ev JOIN episodes ep ON ep.id = ev.episode_id
+WHERE ev.fact_id = ? AND ep.source_path IS NOT NULL
+`
+
+// Every distinct episode source_path cited by a fact's evidence rows -
+// kahyad/internal/memlane's fail-closed secret-lane classification read
+// (moved there from kahyad/internal/ritual/select.go's per-row loop).
+func (q *Queries) ListEpisodePathsForFact(ctx context.Context, factID int64) ([]sql.NullString, error) {
+	rows, err := q.db.QueryContext(ctx, listEpisodePathsForFact, factID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []sql.NullString{}
+	for rows.Next() {
+		var source_path sql.NullString
+		if err := rows.Scan(&source_path); err != nil {
+			return nil, err
+		}
+		items = append(items, source_path)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -2780,6 +3019,144 @@ func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
 	return items, nil
 }
 
+const listFactIDsByEpisode = `-- name: ListFactIDsByEpisode :many
+SELECT DISTINCT f.id
+FROM evidence ev JOIN facts f ON f.id = ev.fact_id
+WHERE ev.episode_id = ? AND f.status = 'active'
+`
+
+// `kahya fact confirm --episode <id>` (MEM-5): every active fact evidenced
+// by that episode.
+func (q *Queries) ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullInt64) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listFactIDsByEpisode, episodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFactsByEntityHop = `-- name: ListFactsByEntityHop :many
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+FROM facts
+WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
+ORDER BY confidence DESC, updated_at DESC
+LIMIT ?
+`
+
+type ListFactsByEntityHopParams struct {
+	SubjectEntityID sql.NullInt64 `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64 `json:"object_entity_id"`
+	Limit           int64         `json:"limit"`
+}
+
+// One graph hop: every active fact touching entity_id as subject OR object.
+// Tier/confirmed/threshold eligibility is applied in Go
+// (factengine.InjectionEligible) so the predicate lives in ONE place.
+func (q *Queries) ListFactsByEntityHop(ctx context.Context, arg ListFactsByEntityHopParams) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listFactsByEntityHop, arg.SubjectEntityID, arg.ObjectEntityID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Fact{}
+	for rows.Next() {
+		var i Fact
+		if err := rows.Scan(
+			&i.ID,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+			&i.SourceTier,
+			&i.Evidentiality,
+			&i.Confidence,
+			&i.Importance,
+			&i.ValidFrom,
+			&i.ValidTo,
+			&i.Status,
+			&i.Evidence,
+			&i.ExtractorVer,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.ConfirmedAt,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.Quote,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFactsCitingEpisodes = `-- name: ListFactsCitingEpisodes :many
+SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id
+FROM evidence ev JOIN facts f ON f.id = ev.fact_id
+WHERE ev.episode_id IN (/*SLICE:episode_ids*/?) AND f.status = 'active'
+`
+
+type ListFactsCitingEpisodesRow struct {
+	ID              int64         `json:"id"`
+	SubjectEntityID sql.NullInt64 `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64 `json:"object_entity_id"`
+}
+
+// Facts whose evidence cites one of the chunk hits' episodes - the second
+// graph seed source (MEM-1). sqlc.slice expands to an IN (...) list.
+func (q *Queries) ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.NullInt64) ([]ListFactsCitingEpisodesRow, error) {
+	query := listFactsCitingEpisodes
+	var queryParams []interface{}
+	if len(episodeIds) > 0 {
+		for _, v := range episodeIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:episode_ids*/?", strings.Repeat(",?", len(episodeIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:episode_ids*/?", "NULL", 1)
+	}
+	rows, err := q.db.QueryContext(ctx, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListFactsCitingEpisodesRow{}
+	for rows.Next() {
+		var i ListFactsCitingEpisodesRow
+		if err := rows.Scan(&i.ID, &i.SubjectEntityID, &i.ObjectEntityID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLastAskedAtAllFacts = `-- name: ListLastAskedAtAllFacts :many
 SELECT fact_id, MAX(asked_at) AS last_asked_at
 FROM eval_labels
@@ -2984,6 +3361,59 @@ func (q *Queries) ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error
 			&i.RemoteRef,
 			&i.Status,
 			&i.LocalFallbackAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+FROM facts
+WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
+ORDER BY id DESC
+LIMIT ?
+`
+
+// `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
+// confirmed.
+func (q *Queries) ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listQuarantinedFacts, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Fact{}
+	for rows.Next() {
+		var i Fact
+		if err := rows.Scan(
+			&i.ID,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+			&i.SourceTier,
+			&i.Evidentiality,
+			&i.Confidence,
+			&i.Importance,
+			&i.ValidFrom,
+			&i.ValidTo,
+			&i.Status,
+			&i.Evidence,
+			&i.ExtractorVer,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.ConfirmedAt,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.Quote,
 		); err != nil {
 			return nil, err
 		}
@@ -3351,6 +3781,62 @@ func (q *Queries) ListUncooledEpisodesOlderThan(ctx context.Context, createdAt s
 	return items, nil
 }
 
+const listUnextractedEpisodes = `-- name: ListUnextractedEpisodes :many
+SELECT id, source, source_path, source_tier, created_at
+FROM episodes
+WHERE status = 'active'
+  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> ?)
+ORDER BY id ASC
+LIMIT ?
+`
+
+type ListUnextractedEpisodesParams struct {
+	ExtractorVer sql.NullString `json:"extractor_ver"`
+	Limit        int64          `json:"limit"`
+}
+
+type ListUnextractedEpisodesRow struct {
+	ID         int64          `json:"id"`
+	Source     string         `json:"source"`
+	SourcePath sql.NullString `json:"source_path"`
+	SourceTier string         `json:"source_tier"`
+	CreatedAt  string         `json:"created_at"`
+}
+
+// Active episodes the nightly fact-extraction job (MEM-3) has not processed
+// under the current extractor version (NULL or a different version).
+// Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
+// parser does not see a parameter after IS NOT and would generate a method
+// that binds one argument too few.
+func (q *Queries) ListUnextractedEpisodes(ctx context.Context, arg ListUnextractedEpisodesParams) ([]ListUnextractedEpisodesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUnextractedEpisodes, arg.ExtractorVer, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUnextractedEpisodesRow{}
+	for rows.Next() {
+		var i ListUnextractedEpisodesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Source,
+			&i.SourcePath,
+			&i.SourceTier,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markAnchorLocalFallback = `-- name: MarkAnchorLocalFallback :exec
 UPDATE anchor_log
 SET local_fallback_at = ?
@@ -3412,6 +3898,21 @@ WHERE id = ?
 
 func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, markEpisodeDeleted, id)
+	return err
+}
+
+const markEpisodeExtracted = `-- name: MarkEpisodeExtracted :exec
+UPDATE episodes SET extracted_at = ?, extractor_ver = ? WHERE id = ?
+`
+
+type MarkEpisodeExtractedParams struct {
+	ExtractedAt  sql.NullString `json:"extracted_at"`
+	ExtractorVer sql.NullString `json:"extractor_ver"`
+	ID           int64          `json:"id"`
+}
+
+func (q *Queries) MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) error {
+	_, err := q.db.ExecContext(ctx, markEpisodeExtracted, arg.ExtractedAt, arg.ExtractorVer, arg.ID)
 	return err
 }
 
@@ -3564,6 +4065,15 @@ type RenewOutboxLeaseParams struct {
 // have its lease resurrected.
 func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, renewOutboxLease, arg.LeaseUntil, arg.ID)
+	return err
+}
+
+const resetEpisodeExtraction = `-- name: ResetEpisodeExtraction :exec
+UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE id = ?
+`
+
+func (q *Queries) ResetEpisodeExtraction(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, resetEpisodeExtraction, id)
 	return err
 }
 
@@ -3939,6 +4449,50 @@ type UpdateFactConfidenceParams struct {
 // writes the result back here after every WriteFact/DenyFact call.
 func (q *Queries) UpdateFactConfidence(ctx context.Context, arg UpdateFactConfidenceParams) error {
 	_, err := q.db.ExecContext(ctx, updateFactConfidence, arg.Confidence, arg.UpdatedAt, arg.ID)
+	return err
+}
+
+const updateFactLinksAndValidity = `-- name: UpdateFactLinksAndValidity :exec
+
+UPDATE facts
+SET subject_entity_id = COALESCE(subject_entity_id, ?),
+    object_entity_id  = COALESCE(object_entity_id, ?),
+    quote             = COALESCE(quote, ?),
+    valid_from        = COALESCE(valid_from, ?),
+    valid_to          = COALESCE(valid_to, ?),
+    updated_at        = ?
+WHERE id = ?
+`
+
+type UpdateFactLinksAndValidityParams struct {
+	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
+	Quote           sql.NullString `json:"quote"`
+	ValidFrom       sql.NullString `json:"valid_from"`
+	ValidTo         sql.NullString `json:"valid_to"`
+	UpdatedAt       string         `json:"updated_at"`
+	ID              int64          `json:"id"`
+}
+
+// G13 memory v2 queries below (0024_memory_v2_graph). See
+// kahyad/internal/factengine (entity links, folded aliases),
+// kahyad/internal/memlane (fail-closed lane classification of facts) and
+// the later MEM-1/2/3/4/5 work (graph reads, extraction markers, CLI) for
+// the callers.
+// Links an EXISTING active fact (found by GetActiveFactByTriple on a
+// re-assertion) to entity rows / a quote / a validity window when the
+// earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
+// the first link wins).
+func (q *Queries) UpdateFactLinksAndValidity(ctx context.Context, arg UpdateFactLinksAndValidityParams) error {
+	_, err := q.db.ExecContext(ctx, updateFactLinksAndValidity,
+		arg.SubjectEntityID,
+		arg.ObjectEntityID,
+		arg.Quote,
+		arg.ValidFrom,
+		arg.ValidTo,
+		arg.UpdatedAt,
+		arg.ID,
+	)
 	return err
 }
 

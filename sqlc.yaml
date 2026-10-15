@@ -87,6 +87,13 @@ sql:
       # selects) plus a plain CREATE TABLE (ledger_chain_base) and two data
       # statements - same reasoning as 0010/0016.
       - "kahyad/migrations/0023_anchor_local_fallback.sql"
+      # 0024 (G13 common ground, FIX-MEM-2 phase 0) is plain ALTER TABLE ADD
+      # COLUMN (facts.subject_entity_id/object_entity_id/quote,
+      # entity_aliases.alias_folded, episodes.extracted_at/extractor_ver) plus
+      # plain CREATE INDEX - columns the fact/alias/episode queries below
+      # select, so it MUST be here for sqlc to regenerate the Fact,
+      # EntityAlias and Episode models with them.
+      - "kahyad/migrations/0024_memory_v2_graph.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

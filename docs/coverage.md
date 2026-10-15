@@ -211,6 +211,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #2 | worker cannot borrow another live worker's identity via setpgid — attribution keyed on the worker's own session (spawn.Run setsid) | `kahyad/internal/server/TestWorkerSessionAttributionResistsGroupJoin` | FIX-B-14 | ci-hermetic |
 | Safety #2 | a UDS peer that cannot be resolved to a session is refused on worker and control routes, even with the control secret | `kahyad/internal/server/TestUnresolvedPeerRefusedEvenWithSecret` | FIX-B-14 | ci-hermetic |
 | Safety #2 | a worker's in-group child cannot outlive the task's registration — spawn.Run reaps the group on normal exit too, so it never reaches a control route once unregistered | `kahyad/internal/server/TestWorkerGroupReapedClosesOrphanControlAccess` | FIX-B-14 | ci-hermetic |
+| Safety #2 | an extractor candidate's quote is free text under the length/charclass cap (300 runes); a malformed validity date, a reversed window or a bad entity id writes nothing | `kahyad/internal/factengine/TestWriteFactRejectsInvalidLinkFields` | FIX-MEM-2 | ci-hermetic |
 | Safety #3 | agent_derived / untrusted-sourced memory quarantined from injection | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W12-05 | ci-hermetic |
 | Safety #3 | memory search for-injection excludes agent_derived facts | `kahyad/internal/server/TestMemorySearchForInjectionExcludesAgentDerived` | W12-05 | ci-hermetic |
 | Safety #3 | red-team planted-mail-poisons-profile scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |
@@ -337,6 +338,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | the fixed Telegram texts (governor alarms, W3/irreversible/too-large/incomplete notices with a real pending id, ritual frame) never trip the content gate | `kahyad/internal/telegram/TestProductionTelegramTextsPassContentGate` | FIX-U-5 | ci-hermetic |
 | Safety #5 | the approval card's diff text is byte-identical to the pre-FIX-P-10 renderer (the flat LCS table changes no decision) | `kahyad/internal/approval/TestUnifiedDiffSameOutputAsBeforeOnRandomInputs` | FIX-P-10 | ci-hermetic |
 | Safety #5 | the approval diff's LCS table is bounded for every input shape: a tall, narrow diff stays within 4 bytes per cell, a pure create or delete builds no table | `kahyad/internal/approval/TestLCSDiffTableMemoryBoundedForEveryShape` | FIX-P-10 | ci-hermetic |
+| Safety #5 | a fact leaves the machine only if memlane classifies it: no evidence citing a resolvable episode path is no classification record and excludes it (fail-closed) | `kahyad/internal/memlane/TestCloudEligibleNoCitationIsFailClosed` | FIX-MEM-2 | ci-hermetic |
+| Safety #5 | a fact citing any secret-lane path is excluded, whatever else cites it | `kahyad/internal/memlane/TestCloudEligibleSecretGlobExcludes` | FIX-MEM-2 | ci-hermetic |
+| Safety #5 | a secret-lane glob that cannot be evaluated (or no matcher) makes the path secret, never "no match" | `kahyad/internal/memlane/TestPathIsSecretMatcherErrorIsSecret` | FIX-MEM-2 | ci-hermetic |
+| Safety #5 | ritual: a glob error now excludes the fact from the Telegram ritual (ledgered `path_glob`) | `kahyad/internal/ritual/TestSelectExcludesFactWhenSecretGlobErrors` | FIX-MEM-2 | ci-hermetic |
+| Safety #5 | memlane keeps FIX-P-17's content half: the deterministic pre-pass always, an optional local classifier on top, fail-closed on its error | `kahyad/internal/memlane/TestClassifyContentHalf` | FIX-MEM-2 | ci-hermetic |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
 | Safety #6 | git config / .git / ssh / gpg / docker / claude / memory-repo / python-startup paths are mandatory fs write-deny globs | `kahyad/internal/policy/TestMandatoryDenyGlobsIncludeGitAndMemoryFamilies` | FIX-B-4 | ci-hermetic |
@@ -390,6 +396,11 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #2 | namesakes never auto-merge on name similarity | `kahyad/internal/factengine/TestNamesakeFixtureYieldsTwoDistinctEntitiesNoAutoMerge` | W5-04 | ci-hermetic |
 | Memory #2 | entity merge requires an evidence fact_id | `kahyad/internal/factengine/TestMergeRequiresEvidenceFactID` | W5-04 | ci-hermetic |
 | Memory #2 | merge is splittable, exactly two ledger rows | `kahyad/internal/factengine/TestMergeThenSplitRoundTripsExactlyTwoLedgerRows` | W5-04 | ci-hermetic |
+| Memory #2 | exact-alias reuse is identity resolution, not merge; ambiguous names stay provisional | `kahyad/internal/factengine/TestResolveEntityForExtractionTwoMatchesCreatesProvisional` | FIX-MEM-2 | ci-hermetic |
+| Memory #2 | the extractor's resolver reuses one active, non-provisional, kind-compatible entity: the same name 100 times leaves one row and no merge_ledger row | `kahyad/internal/factengine/TestResolveEntityForExtractionReusesUnambiguousExactAlias` | FIX-MEM-2 | ci-hermetic |
+| Memory #2 | a suspected namesake (a single provisional match) is never reused | `kahyad/internal/factengine/TestResolveEntityForExtractionProvisionalMatchNeverReused` | FIX-MEM-2 | ci-hermetic |
+| Memory #2 | same name, different kind ("Mercedes" person vs org) is a new provisional entity | `kahyad/internal/factengine/TestResolveEntityForExtractionKindMismatchCreatesProvisional` | FIX-MEM-2 | ci-hermetic |
+| Memory #2 | an alias another active entity answers to is never added to (or moved from) it: skipped and ledgered | `kahyad/internal/factengine/TestAddAliasSkipsAliasOwnedByAnotherEntity` | FIX-MEM-2 | ci-hermetic |
 | Memory #3 | same-session repeat = one evidence, different session raises log-odds | `kahyad/internal/factengine/TestSameSessionDedupeThenDifferentSessionRaisesLogOdds` | W5-04 | ci-hermetic |
 | Memory #3 | user denial drops fact below injection threshold (negative evidence) | `kahyad/internal/factengine/TestUserDenialDropsFactBelowInjectionThreshold` | W5-04 | ci-hermetic |
 | Memory #3 | retraction closes fact and excludes it from injection | `kahyad/internal/factengine/TestRetractionFixtureClosesFactAndExcludesFromInjection` | W5-04 | ci-hermetic |
@@ -402,6 +413,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #4 | detail-atom promotion before cooling | `kahyad/internal/consolidation/TestPromoteHotWindowPromotesBeforeCooling` | W5-02 | ci-hermetic |
 | Memory #4 | ≥90-day hot window: fresh episode not yet promoted | `kahyad/internal/consolidation/TestPromoteHotWindowSkipsFreshEpisode` | W5-02 | ci-hermetic |
 | Memory #4 | a consolidation batch is the notes' raw file content, byte-exact, never a sub-summary of another batch | `kahyad/internal/consolidation/TestRunBatchesCloudLaneWithinBudget` | FIX-B-5 | ci-hermetic |
+| Memory #4 | a fact keeps the verbatim quote its extractor cited, its entity links and its validity window; a re-assertion fills a missing value, never overwrites one | `kahyad/internal/factengine/TestWriteFactReassertionFillsMissingLinksFirstWins` | FIX-MEM-2 | ci-hermetic |
 | Memory #5 | eval gate refuses on stale result (gate before consolidation) | `kahyad/internal/eval/TestGateRefusesStale` | W78-01 | ci-hermetic |
 | Memory #5 | eval gate fails closed on reader error | `kahyad/internal/eval/TestGateRefusesOnReaderErrorFailClosed` | W78-01 | ci-hermetic |
 | Memory #5 | re-embed gate refuses without a green candidate | `kahyad/internal/eval/TestReEmbedGateRefusesWithoutGreenCandidate` | W78-01 | ci-hermetic |

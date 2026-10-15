@@ -68,24 +68,27 @@ type Entity struct {
 }
 
 type EntityAlias struct {
-	ID        int64  `json:"id"`
-	EntityID  int64  `json:"entity_id"`
-	Alias     string `json:"alias"`
-	CreatedAt string `json:"created_at"`
+	ID          int64          `json:"id"`
+	EntityID    int64          `json:"entity_id"`
+	Alias       string         `json:"alias"`
+	CreatedAt   string         `json:"created_at"`
+	AliasFolded sql.NullString `json:"alias_folded"`
 }
 
 type Episode struct {
-	ID         int64          `json:"id"`
-	Source     string         `json:"source"`
-	SourcePath sql.NullString `json:"source_path"`
-	SourceHash sql.NullString `json:"source_hash"`
-	SourceTier string         `json:"source_tier"`
-	StartedAt  sql.NullString `json:"started_at"`
-	EndedAt    sql.NullString `json:"ended_at"`
-	Status     string         `json:"status"`
-	Meta       sql.NullString `json:"meta"`
-	CreatedAt  string         `json:"created_at"`
-	CooledAt   sql.NullString `json:"cooled_at"`
+	ID           int64          `json:"id"`
+	Source       string         `json:"source"`
+	SourcePath   sql.NullString `json:"source_path"`
+	SourceHash   sql.NullString `json:"source_hash"`
+	SourceTier   string         `json:"source_tier"`
+	StartedAt    sql.NullString `json:"started_at"`
+	EndedAt      sql.NullString `json:"ended_at"`
+	Status       string         `json:"status"`
+	Meta         sql.NullString `json:"meta"`
+	CreatedAt    string         `json:"created_at"`
+	CooledAt     sql.NullString `json:"cooled_at"`
+	ExtractedAt  sql.NullString `json:"extracted_at"`
+	ExtractorVer sql.NullString `json:"extractor_ver"`
 }
 
 type EvalLabel struct {
@@ -120,22 +123,25 @@ type Evidence struct {
 }
 
 type Fact struct {
-	ID            int64          `json:"id"`
-	Subject       string         `json:"subject"`
-	Predicate     string         `json:"predicate"`
-	Object        string         `json:"object"`
-	SourceTier    string         `json:"source_tier"`
-	Evidentiality string         `json:"evidentiality"`
-	Confidence    float64        `json:"confidence"`
-	Importance    float64        `json:"importance"`
-	ValidFrom     sql.NullString `json:"valid_from"`
-	ValidTo       sql.NullString `json:"valid_to"`
-	Status        string         `json:"status"`
-	Evidence      sql.NullString `json:"evidence"`
-	ExtractorVer  sql.NullString `json:"extractor_ver"`
-	UpdatedAt     string         `json:"updated_at"`
-	CreatedAt     string         `json:"created_at"`
-	ConfirmedAt   sql.NullString `json:"confirmed_at"`
+	ID              int64          `json:"id"`
+	Subject         string         `json:"subject"`
+	Predicate       string         `json:"predicate"`
+	Object          string         `json:"object"`
+	SourceTier      string         `json:"source_tier"`
+	Evidentiality   string         `json:"evidentiality"`
+	Confidence      float64        `json:"confidence"`
+	Importance      float64        `json:"importance"`
+	ValidFrom       sql.NullString `json:"valid_from"`
+	ValidTo         sql.NullString `json:"valid_to"`
+	Status          string         `json:"status"`
+	Evidence        sql.NullString `json:"evidence"`
+	ExtractorVer    sql.NullString `json:"extractor_ver"`
+	UpdatedAt       string         `json:"updated_at"`
+	CreatedAt       string         `json:"created_at"`
+	ConfirmedAt     sql.NullString `json:"confirmed_at"`
+	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
+	Quote           sql.NullString `json:"quote"`
 }
 
 type LedgerChainBase struct {

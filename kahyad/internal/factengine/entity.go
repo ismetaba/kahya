@@ -13,6 +13,12 @@
 // existing one - name similarity alone never merges anything (Turkish
 // namesakes: countless Emre/Ahmet).
 //
+// ResolveEntityForExtraction (G13 MEM-2, decision MEM-2.a) is the extractor
+// call sites' resolver: it REUSES an existing entity only when the name's
+// folded alias key (AliasKey) belongs to exactly one active, non-provisional,
+// kind-compatible entity - identity resolution, not a merge - and otherwise
+// falls back to the provisional-new-row rule above.
+//
 // MergeEntities/SplitEntities are the only two operations that ever
 // change that fact: Merge requires a real, existing fact id as its
 // distinguishing evidence (never optional, never name-similarity alone)
@@ -33,7 +39,72 @@ import (
 	"strings"
 
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/textnorm"
 )
+
+// Reasons ledgered with EventEntityCreated (payload "reason").
+const (
+	// EntityCreatedFirstSighting: no active entity answers to the name yet.
+	EntityCreatedFirstSighting = "first_sighting"
+	// EntityCreatedAmbiguousAlias: two or more active entities answer to
+	// the name (unmerged namesakes) - the new entity is provisional.
+	EntityCreatedAmbiguousAlias = "ambiguous_alias"
+	// EntityCreatedProvisionalCollision: the one entity answering to the
+	// name is itself provisional (a suspected namesake) - never reused.
+	EntityCreatedProvisionalCollision = "provisional_collision"
+	// EntityCreatedKindMismatch: the one entity answering to the name has a
+	// different kind ("Mercedes" the person vs the company).
+	EntityCreatedKindMismatch = "kind_mismatch"
+)
+
+// Entity kinds (G13 MEM-2). NormalizeEntityKind folds anything else to
+// EntityKindOther.
+const (
+	EntityKindPerson  = "person"
+	EntityKindOrg     = "org"
+	EntityKindPlace   = "place"
+	EntityKindProject = "project"
+	EntityKindEvent   = "event"
+	EntityKindThing   = "thing"
+	EntityKindOther   = "other"
+)
+
+// NormalizeEntityKind trims and lowercases kind; "" stays "" (unknown,
+// compatible with any kind) and a value outside the fixed vocabulary
+// becomes EntityKindOther (the model's kind is a hint, never a new
+// category).
+func NormalizeEntityKind(kind string) string {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch k {
+	case "", EntityKindPerson, EntityKindOrg, EntityKindPlace, EntityKindProject, EntityKindEvent, EntityKindThing, EntityKindOther:
+		return k
+	default:
+		return EntityKindOther
+	}
+}
+
+// AliasKey is entity_aliases.alias_folded (migration 0024): the lookup key
+// for a name. The surrounding space is trimmed; when the name contains an
+// apostrophe (' or U+2019) after a non-empty part, everything from the
+// first apostrophe on is dropped - Turkish suffixes after a proper noun are
+// written that way ("Emre'nin", "Ankara’da" -> "Emre", "Ankara"); then
+// textnorm.Fold makes it Turkish I/i- and case-insensitive. Only the KEY is
+// normalized: canonical_name and alias keep the surface form. A suffix
+// written without an apostrophe ("Emreyle") stays a different key.
+func AliasKey(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.IndexAny(name, "'\u2019"); i > 0 {
+		if head := strings.TrimSpace(name[:i]); head != "" {
+			name = head
+		}
+	}
+	return textnorm.Fold(name)
+}
+
+// kindCompatible: equal, or either side empty.
+func kindCompatible(a, b string) bool {
+	return a == "" || b == "" || a == b
+}
 
 // ErrMergeRequiresEvidence is returned by MergeEntities when
 // evidenceFactID is 0 or does not name an existing fact - HANDOFF S5
@@ -125,24 +196,156 @@ func (e *Engine) ResolveOrCreateEntity(ctx context.Context, name, kind string) (
 	if err != nil {
 		return 0, false, fmt.Errorf("factengine: lookup alias %q: %w", name, err)
 	}
+	provisional = len(existingIDs) > 0
+	entityID, err = e.insertEntity(ctx, name, kind, provisional)
+	if err != nil {
+		return 0, false, err
+	}
+	return entityID, provisional, nil
+}
+
+// insertEntity creates one active entity named name plus its first alias
+// row (alias_folded = AliasKey(name)).
+func (e *Engine) insertEntity(ctx context.Context, name, kind string, provisional bool) (int64, error) {
 	prov := int64(0)
-	if len(existingIDs) > 0 {
+	if provisional {
 		prov = 1
 	}
-
 	now := e.nowRFC3339()
 	ent, err := e.store.InsertEntity(ctx, sqlcgen.InsertEntityParams{
 		CanonicalName: name, Kind: nullString(kind), Status: "active", Provisional: prov, CreatedAt: now,
 	})
 	if err != nil {
-		return 0, false, fmt.Errorf("factengine: insert entity %q: %w", name, err)
+		return 0, fmt.Errorf("factengine: insert entity %q: %w", name, err)
 	}
 	if _, err := e.store.InsertEntityAlias(ctx, sqlcgen.InsertEntityAliasParams{
-		EntityID: ent.ID, Alias: name, CreatedAt: now,
+		EntityID: ent.ID, Alias: name, AliasFolded: nullString(AliasKey(name)), CreatedAt: now,
 	}); err != nil {
-		return 0, false, fmt.Errorf("factengine: insert alias for entity %d: %w", ent.ID, err)
+		return 0, fmt.Errorf("factengine: insert alias for entity %d: %w", ent.ID, err)
 	}
-	return ent.ID, prov == 1, nil
+	return ent.ID, nil
+}
+
+// ResolveEntityForExtraction is the extractor call sites' entity resolver
+// (G13 MEM-2, decision MEM-2.a). Unlike ResolveOrCreateEntity (which ALWAYS
+// mints a row and marks any name collision provisional), it REUSES an
+// existing entity when the name resolves UNAMBIGUOUSLY: exactly one active,
+// non-provisional entity carries an alias with the same AliasKey and its
+// kind is compatible (equal, or either side empty; kind goes through
+// NormalizeEntityKind first). Otherwise it creates a new entity and ledgers
+// EventEntityCreated with the reason:
+//
+//   - no active entity carries the key -> non-provisional, first_sighting
+//     (provisional, ambiguous_alias, if the byte-exact alias is still on
+//     file under some entity - a key that did not fold the same way);
+//   - two or more -> provisional, ambiguous_alias;
+//   - one provisional entity -> provisional, provisional_collision;
+//   - one entity of another kind -> provisional, kind_mismatch.
+//
+// HANDOFF §5 memory #2: name similarity alone never merges anything -
+// reusing an unambiguous exact alias is identity resolution, nothing is ever
+// joined to anything, and MergeEntities/SplitEntities remain the only way
+// two rows become one. The stored canonical_name/alias keep the surface form.
+func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string) (entityID int64, created, provisional bool, err error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, false, false, errors.New("factengine: entity name is required")
+	}
+	kind = NormalizeEntityKind(kind)
+	key := AliasKey(name)
+	ids, err := e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+	if err != nil {
+		return 0, false, false, fmt.Errorf("factengine: lookup alias key %q: %w", key, err)
+	}
+
+	reason := ""
+	switch len(ids) {
+	case 0:
+		exact, err := e.store.ListEntityIDsByAlias(ctx, name)
+		if err != nil {
+			return 0, false, false, fmt.Errorf("factengine: lookup alias %q: %w", name, err)
+		}
+		if len(exact) > 0 {
+			reason, provisional = EntityCreatedAmbiguousAlias, true
+		} else {
+			reason = EntityCreatedFirstSighting
+		}
+	case 1:
+		ent, err := e.store.GetEntity(ctx, ids[0])
+		if err != nil {
+			return 0, false, false, fmt.Errorf("factengine: entity %d: %w", ids[0], err)
+		}
+		switch {
+		case ent.Provisional != 0:
+			reason, provisional = EntityCreatedProvisionalCollision, true
+		case !kindCompatible(kind, NormalizeEntityKind(ent.Kind.String)):
+			reason, provisional = EntityCreatedKindMismatch, true
+		default:
+			return ent.ID, false, false, nil
+		}
+	default:
+		reason, provisional = EntityCreatedAmbiguousAlias, true
+	}
+
+	entityID, err = e.insertEntity(ctx, name, kind, provisional)
+	if err != nil {
+		return 0, false, false, err
+	}
+	if e.ledger != nil {
+		_ = e.ledger.LogEvent(ctx, traceID, EventEntityCreated, map[string]any{
+			"entity_id": entityID, "canonical_name": name, "kind": kind,
+			"provisional": provisional, "reason": reason,
+		})
+	}
+	return entityID, true, provisional, nil
+}
+
+// AddAlias adds alias to entityID (an active entity) for the extractor's
+// aliases[] list (G13 MEM-2): it returns false with no error when the entity
+// already has exactly that alias, and refuses - false, ledgered
+// EventAliasSkippedCollision - an alias whose AliasKey another active entity
+// already answers to (an alias is never taken from, or shared with, another
+// entity; MergeEntities is the only way names move). An empty alias, or an
+// unknown or non-active entity, is an error.
+func (e *Engine) AddAlias(ctx context.Context, traceID string, entityID int64, alias string) (added bool, err error) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return false, errors.New("factengine: alias is required")
+	}
+	ent, err := e.store.GetEntity(ctx, entityID)
+	if err != nil {
+		return false, fmt.Errorf("factengine: add alias: entity %d: %w", entityID, err)
+	}
+	if ent.Status != "active" {
+		return false, fmt.Errorf("factengine: add alias: entity %d is %s", entityID, ent.Status)
+	}
+	if _, err := e.store.GetEntityAliasByEntityAndAlias(ctx, sqlcgen.GetEntityAliasByEntityAndAliasParams{EntityID: entityID, Alias: alias}); err == nil {
+		return false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("factengine: lookup alias %q on entity %d: %w", alias, entityID, err)
+	}
+	key := AliasKey(alias)
+	owners, err := e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+	if err != nil {
+		return false, fmt.Errorf("factengine: lookup alias key %q: %w", key, err)
+	}
+	for _, owner := range owners {
+		if owner == entityID {
+			continue
+		}
+		if e.ledger != nil {
+			_ = e.ledger.LogEvent(ctx, traceID, EventAliasSkippedCollision, map[string]any{
+				"entity_id": entityID, "alias": alias, "owner_entity_id": owner,
+			})
+		}
+		return false, nil
+	}
+	if _, err := e.store.InsertEntityAlias(ctx, sqlcgen.InsertEntityAliasParams{
+		EntityID: entityID, Alias: alias, AliasFolded: nullString(key), CreatedAt: e.nowRFC3339(),
+	}); err != nil {
+		return false, fmt.Errorf("factengine: insert alias for entity %d: %w", entityID, err)
+	}
+	return true, nil
 }
 
 // MergeEntities merges srcEntityID into dstEntityID: every alias row

@@ -30,20 +30,24 @@
 // Every excluded fact is ledgered (EventFactExcludedSecretLane, with the
 // run's trace_id) when a ledger is wired, so a silently short ritual is
 // explainable from the events table.
+//
+// G13 common ground (G00 C-20): the classification itself lives in
+// kahyad/internal/memlane (memlane.Classifier.Classify), moved there in this
+// post-FIX-P-17 form so the later cloud uses of facts apply the same rule;
+// this file keeps the sampling policy and the exclusion ledger. One change
+// came with the move: a secret-lane glob that cannot be evaluated now
+// excludes the fact (fail-closed) instead of counting as "no match".
 package ritual
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
 	"sort"
 
 	"kahya/kahyad/internal/factengine"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
-	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
 
@@ -53,10 +57,10 @@ const MaxQuestionsPerRun = 10
 
 // SamplerStore is the narrow brain.db read surface the sampler needs.
 // *sqlcgen.Queries (via *store.Store) satisfies it directly, no adapter.
+// memlane.Store (ListEpisodePathsForFact) is the classification read.
 type SamplerStore interface {
+	memlane.Store
 	ListActiveFacts(ctx context.Context) ([]sqlcgen.Fact, error)
-	ListEvidenceByFact(ctx context.Context, factID int64) ([]sqlcgen.ListEvidenceByFactRow, error)
-	GetEpisodeByID(ctx context.Context, id int64) (sqlcgen.Episode, error)
 	ListLastAskedAtAllFacts(ctx context.Context) ([]sqlcgen.ListLastAskedAtAllFactsRow, error)
 }
 
@@ -93,29 +97,27 @@ type FactClassifier interface {
 // secret-lane grounds (payload: fact_id, reason), under the run's trace_id.
 const EventFactExcludedSecretLane = "ritual.fact_excluded_secret_lane"
 
-// Exclusion reasons (EventFactExcludedSecretLane payload "reason").
+// Exclusion reasons (EventFactExcludedSecretLane payload "reason") -
+// memlane's verdict reasons, unchanged.
 const (
-	ExcludeReasonPathGlob             = "path_glob"
-	ExcludeReasonNoClassification     = "no_classification_record"
-	ExcludeReasonContentDeterministic = "content_deterministic"
-	ExcludeReasonContentClassifier    = "content_classifier"
-	ExcludeReasonClassifyFailed       = "classify_failed"
+	ExcludeReasonPathGlob             = memlane.ReasonPathGlob
+	ExcludeReasonNoClassification     = memlane.ReasonNoClassification
+	ExcludeReasonContentDeterministic = memlane.ReasonContentDeterministic
+	ExcludeReasonContentClassifier    = memlane.ReasonContentClassifier
+	ExcludeReasonClassifyFailed       = memlane.ReasonClassifyFailed
 )
 
 // Sampler implements the sampling policy described in this file's own
 // doc comment. Construct one with NewSampler per kahyad process.
 type Sampler struct {
-	store          SamplerStore
-	memoryDir      string
-	secretGlobs    []string
-	matcher        GlobMatcher
-	factClassifier FactClassifier // nil => deterministic pre-pass only
-	ledger         Ledger         // nil => exclusions are not ledgered
+	store  SamplerStore
+	lane   memlane.Classifier
+	ledger Ledger // nil => exclusions are not ledgered
 }
 
 // SetFactClassifier wires an optional content classifier on top of the
 // deterministic pre-pass (see FactClassifier). Production wires none.
-func (s *Sampler) SetFactClassifier(c FactClassifier) { s.factClassifier = c }
+func (s *Sampler) SetFactClassifier(c FactClassifier) { s.lane.Content = c }
 
 // SetLedger wires the exclusion ledger (*store.Store in production).
 func (s *Sampler) SetLedger(l Ledger) { s.ledger = l }
@@ -126,7 +128,9 @@ func NewSampler(store SamplerStore, memoryDir string, secretGlobs []string, matc
 	if matcher == nil {
 		matcher = PolicyGlobMatcher{}
 	}
-	return &Sampler{store: store, memoryDir: memoryDir, secretGlobs: secretGlobs, matcher: matcher}
+	return &Sampler{store: store, lane: memlane.Classifier{
+		Store: store, MemoryDir: memoryDir, SecretGlobs: secretGlobs, Matcher: matcher,
+	}}
 }
 
 // scoredFact is one candidate fact plus the priority-ordering fields
@@ -219,67 +223,20 @@ func (s *Sampler) lastAskedByFact(ctx context.Context) (map[int64]string, error)
 }
 
 // classify implements the fail-closed secret-lane exclusion described in
-// this file's own package doc comment: f is eligible iff it has at least
-// one evidence row citing an episode with a resolvable, non-secret
-// source_path, NONE of its cited episodes' paths match a secret-lane glob,
-// AND its text (factText - exactly what Run sends) is not secret-lane
-// content. Zero resolvable episode citations at all == no classification
-// record == excluded. Every exclusion is ledgered (ledgerExcluded).
+// this file's own package doc comment through memlane.Classifier.Classify:
+// f is eligible iff it has at least one evidence row citing an episode with
+// a resolvable, non-secret source_path, NONE of its cited episodes' paths
+// match a secret-lane glob, AND its text (factText - exactly what Run
+// sends; memlane.FactText is the same string) is not secret-lane content.
+// Every exclusion is ledgered (ledgerExcluded).
 func (s *Sampler) classify(ctx context.Context, traceID string, f sqlcgen.Fact) (eligible bool, err error) {
-	factID := f.ID
-	rows, err := s.store.ListEvidenceByFact(ctx, factID)
+	v, err := s.lane.Classify(ctx, f)
 	if err != nil {
-		return false, fmt.Errorf("ritual: list evidence for fact %d: %w", factID, err)
+		return false, fmt.Errorf("ritual: classify fact %d: %w", f.ID, err)
 	}
-
-	classified := false
-	for _, r := range rows {
-		if !r.EpisodeID.Valid {
-			continue
-		}
-		ep, err := s.store.GetEpisodeByID(ctx, r.EpisodeID.Int64)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return false, fmt.Errorf("ritual: get episode %d: %w", r.EpisodeID.Int64, err)
-		}
-		if !ep.SourcePath.Valid || ep.SourcePath.String == "" {
-			continue
-		}
-		classified = true
-		absPath := filepath.Join(s.memoryDir, filepath.FromSlash(ep.SourcePath.String))
-		if s.matchesAnySecretGlob(absPath) {
-			// secret-lane tagged -> excluded, regardless of any OTHER evidence row
-			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonPathGlob)
-			return false, nil
-		}
-	}
-	if !classified {
-		// no classification record at all -> fail-closed exclude
-		s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonNoClassification)
+	if !v.Eligible {
+		s.ledgerExcluded(ctx, traceID, f.ID, v.Reason)
 		return false, nil
-	}
-
-	// FIX-P-17: the path check above is HANDOFF's file-path rule; this is
-	// the content half, applied to the EXACT text Run would send. The
-	// deterministic pre-pass always runs (no model needed); an optional
-	// FactClassifier runs on top, fail-closed on any error.
-	text := factText(f)
-	if secretlane.ClassifyDeterministic(text).SecretLane {
-		s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonContentDeterministic)
-		return false, nil
-	}
-	if s.factClassifier != nil {
-		secret, cerr := s.factClassifier.ClassifySecretLane(ctx, text)
-		if cerr != nil {
-			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonClassifyFailed)
-			return false, nil
-		}
-		if secret {
-			s.ledgerExcluded(ctx, traceID, factID, ExcludeReasonContentClassifier)
-			return false, nil
-		}
 	}
 	return true, nil
 }
@@ -291,22 +248,4 @@ func (s *Sampler) ledgerExcluded(ctx context.Context, traceID string, factID int
 		return
 	}
 	_ = s.ledger.LogEvent(ctx, traceID, EventFactExcludedSecretLane, map[string]any{"fact_id": factID, "reason": reason})
-}
-
-// matchesAnySecretGlob reports whether absPath matches any entry in
-// s.secretGlobs. A per-glob match error is treated as "no match" - every
-// glob's syntax was already validated at policy.Load time (this mirrors
-// kahyad/internal/consolidation's own matchesAnySecretGlob: over-blocking
-// a path into "excluded" is always the safe direction, never the reverse).
-func (s *Sampler) matchesAnySecretGlob(absPath string) bool {
-	for _, g := range s.secretGlobs {
-		ok, err := s.matcher.Match(g, absPath)
-		if err != nil {
-			continue
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
 }
