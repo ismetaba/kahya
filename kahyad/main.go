@@ -434,7 +434,8 @@ func run() int {
 	// its re-check redeems the grant so exactly the approved bytes execute
 	// (kahyad/internal/server/approval_wait.go).
 	srv.SetApprovalWait(time.Duration(cfg.ApprovalWaitSeconds) * time.Second)
-	policyEngine.SetApprovalDecidedHook(srv.ApprovalDecided)
+	// The approval-decided hook (B-1 waiter + the Telegram card edit) is
+	// registered below, once tgBot exists (FIX-FINAL TUX-3).
 	// B-1, owner decision G01-2 option A: config autonomy_bootstrap_levels
 	// (default memory_search, entity_lookup, fact_query /R/global -> L1)
 	// seeds autonomy_state rows only where none exist yet - a first-run
@@ -551,6 +552,16 @@ func run() int {
 	// kahyad/internal/telegram.Bot.OnApprovalInvalidated's own doc comment.
 	policyEngine.SetInvalidatedHook(func(info policy.PendingApprovalInfo) {
 		go tgBot.OnApprovalInvalidated(context.Background(), info)
+	})
+	// B-1: a human decision resumes the parked call at once
+	// (srv.ApprovalDecided, a non-blocking send). FIX-FINAL TUX-3: a card
+	// Telegram already shows for that id is edited to the decision, so a
+	// stale tap no longer answers "süresi doldu" over a decided action -
+	// in its own goroutine (an egress-checked Telegram edit must never
+	// block a policy decision). Registered before srv.Run serves anything.
+	policyEngine.SetApprovalDecidedHook(func(id string, approved bool) {
+		srv.ApprovalDecided(id, approved)
+		go tgBot.OnApprovalDecided(context.Background(), id, approved)
 	})
 	// FIX-P-5: "online" is always false here - New never dials; the
 	// lifecycle-ctx Start goroutine below brings the bot online (getMe

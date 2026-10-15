@@ -524,6 +524,59 @@ func (b *Bot) OnApprovalInvalidated(ctx context.Context, info policy.PendingAppr
 	b.editCardText(ctx, card, msgApprovalInvalidatedHalt)
 }
 
+// pendingDecisionReader is the optional engine capability OnApprovalDecided
+// uses to tell a halt's invalidation (OnApprovalInvalidated owns that card
+// edit) from a real local deny - *policy.Engine implements it.
+type pendingDecisionReader interface {
+	PendingApprovalDecision(ctx context.Context, id string) (decided bool, decision string, err error)
+}
+
+// OnApprovalDecided is the policy engine's approval-decided hook (main.go
+// fans it out next to the server's B-1 waiter, FIX-FINAL TUX-3): a pending
+// approval this bot sent a card for was decided on ANOTHER surface (`kahya
+// approve`, the Hammerspoon card). Nothing edited the card before, so its
+// buttons stayed live and a later tap answered "Onay süresi doldu, yeniden
+// isteyin." over an action that was actually approved and executed -
+// inviting a duplicate request. The card is now marked resolved and edited
+// with the same byte-exact W3-07 suffix a tap would have stamped
+// (suffixApproved / suffixRejected); a later tap answers "Zaten işlendi.".
+// A halt's invalidation also fires this hook (approved=false): the engine's
+// recorded decision tells it apart and OnApprovalInvalidated's halt text is
+// left alone. A card already resolved (by a tap here, or the halt) and an id
+// with no card are no-ops.
+func (b *Bot) OnApprovalDecided(ctx context.Context, id string, approved bool) {
+	if !b.Enabled() {
+		return
+	}
+	b.mu.Lock()
+	card, ok := b.cards[id]
+	pending := ok && !card.resolved
+	b.mu.Unlock()
+	if !pending {
+		return
+	}
+	suffix := suffixApproved
+	if !approved {
+		suffix = suffixRejected
+		if d, ok := b.engine.(pendingDecisionReader); ok {
+			decided, decision, err := d.PendingApprovalDecision(ctx, id)
+			if err != nil || !decided || decision == policy.PendingDecisionInvalidated {
+				return // the halt (or an unreadable row): not a local deny
+			}
+		}
+	}
+	b.mu.Lock()
+	card, ok = b.cards[id]
+	if !ok || card.resolved {
+		b.mu.Unlock()
+		return
+	}
+	card.resolved = true
+	card.resolvedAt = b.clock()
+	b.mu.Unlock()
+	b.editCard(card, suffix)
+}
+
 // respond answers cb with a short "toast" callback response (Onaylandı /
 // Reddedildi / Zaten işlendi / etc.) — MINOR C fix: this used to call
 // b.sender.Respond directly, the ONE outbound path in this package that

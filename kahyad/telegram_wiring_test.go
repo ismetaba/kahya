@@ -64,3 +64,19 @@ func TestTelegramSessionTaintIsTheEgressGateTracker(t *testing.T) {
 		t.Error("tgBot.SetSessionTaint must run after telegram.New and before the pending-approval hook and tgBot.Start")
 	}
 }
+
+// TestApprovalDecidedHookFansOutToTelegram (FIX-FINAL TUX-3): the engine's
+// approval-decided hook resumes the B-1 waiter AND edits a Telegram card
+// for the decided id (in its own goroutine), so a card decided locally no
+// longer stays live.
+func TestApprovalDecidedHookFansOutToTelegram(t *testing.T) {
+	hook := onlyCallSite(t, "policyEngine", "SetApprovalDecidedHook", "")
+	for _, want := range []string{"srv.ApprovalDecided(id, approved)", "go tgBot.OnApprovalDecided(context.Background(), id, approved)"} {
+		if !strings.Contains(hook.args, want) {
+			t.Errorf("SetApprovalDecidedHook(%s) lacks %q", hook.args, want)
+		}
+	}
+	if run := onlyCallSite(t, "srv", "Run", ""); hook.offset > run.offset {
+		t.Fatal("the decided hook must be registered before srv.Run serves")
+	}
+}
