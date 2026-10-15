@@ -997,3 +997,32 @@ func TestDenyGlobLiteralRoots(t *testing.T) {
 		t.Fatalf("denyGlobLiteralRoots = %v, want %v", got, want)
 	}
 }
+
+// TestShellDockerToolInputBindsEveryInvocationField (FIX-FINAL
+// shell-docker-approval-unbound-workdir): the bytes shell_docker's
+// approval is bound to change whenever anything the container does
+// changes - script, canonical workdir, image digest, timeout, network or
+// env request - and the env allowlist is order-independent.
+func TestShellDockerToolInputBindsEveryInvocationField(t *testing.T) {
+	base := RunInput{Script: "ls\n", Workdir: "~/a", EnvAllowlist: []string{"B", "A"}}
+	ref := string(buildShellDockerToolInput(base, "/h/a", "sha256:x", 300))
+	variants := map[string]string{
+		"script":  string(buildShellDockerToolInput(RunInput{Script: "ls -la\n", EnvAllowlist: base.EnvAllowlist}, "/h/a", "sha256:x", 300)),
+		"workdir": string(buildShellDockerToolInput(base, "/h/b", "sha256:x", 300)),
+		"digest":  string(buildShellDockerToolInput(base, "/h/a", "sha256:y", 300)),
+		"timeout": string(buildShellDockerToolInput(base, "/h/a", "sha256:x", 301)),
+		"network": string(buildShellDockerToolInput(RunInput{Script: "ls\n", NeedsNetwork: true, EnvAllowlist: base.EnvAllowlist}, "/h/a", "sha256:x", 300)),
+		"env":     string(buildShellDockerToolInput(RunInput{Script: "ls\n", EnvAllowlist: []string{"A"}}, "/h/a", "sha256:x", 300)),
+	}
+	for name, v := range variants {
+		if v == ref {
+			t.Errorf("changing %s did not change the approval-bound bytes: %s", name, v)
+		}
+	}
+	if got := string(buildShellDockerToolInput(RunInput{Script: "ls\n", EnvAllowlist: []string{"A", "B"}}, "/h/a", "sha256:x", 300)); got != ref {
+		t.Errorf("env allowlist order changed the bytes:\n%s\n%s", got, ref)
+	}
+	if want := `{"script":"ls\n","workdir":"/h/a","image_digest":"sha256:x","timeout_s":300,"needs_network":false,"env_allowlist":["A","B"]}`; ref != want {
+		t.Errorf("envelope = %s, want %s", ref, want)
+	}
+}

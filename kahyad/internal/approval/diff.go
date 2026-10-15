@@ -190,6 +190,10 @@ func (p ApprovalPayload) Render() string {
 	case KindShellScript:
 		fmt.Fprintf(&b, "image_digest: %s\n", p.ImageDigest)
 		fmt.Fprintf(&b, "workdir:      %s\n", p.Workdir)
+		for _, opt := range p.ShellOptions {
+			b.WriteString(canon.Normalize(opt).Display)
+			b.WriteString("\n")
+		}
 		b.WriteString("script:\n")
 		b.WriteString(renderScriptLines(p.Script))
 	case KindOsascript:

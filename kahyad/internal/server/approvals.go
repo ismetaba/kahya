@@ -115,10 +115,31 @@ func renderPendingApproval(home, tool string, toolInput []byte) approval.Approva
 		if json.Unmarshal(toolInput, &env) == nil {
 			return approval.BuildShortcut(env.Name, env.InputPath)
 		}
+	case "shell_docker":
+		// FIX-FINAL shell-docker-approval-unbound-workdir: show the
+		// directory mounted rw at /work, the network/env/timeout request
+		// and the script - exactly what the approval is bound to. A
+		// non-envelope tool_input (a legacy row) keeps the raw listing.
+		var env shellDockerApprovalInput
+		if json.Unmarshal(toolInput, &env) == nil && env.Script != "" && env.Workdir != "" {
+			return approval.BuildShellDocker(env.ImageDigest, env.Workdir, []byte(env.Script), env.NeedsNetwork, env.EnvAllowlist, env.TimeoutS)
+		}
 	}
 	p := approval.BuildOsascript(toolInput)
 	p.Summary = tool
 	return p
+}
+
+// shellDockerApprovalInput decodes mcp/shell.ShellDockerToolInput, the
+// envelope a shell_docker approval is bound to (FIX-FINAL
+// shell-docker-approval-unbound-workdir).
+type shellDockerApprovalInput struct {
+	Script       string   `json:"script"`
+	Workdir      string   `json:"workdir"`
+	ImageDigest  string   `json:"image_digest"`
+	TimeoutS     int      `json:"timeout_s"`
+	NeedsNetwork bool     `json:"needs_network"`
+	EnvAllowlist []string `json:"env_allowlist"`
 }
 
 // policyApprovalsListRow is one GET /policy/approvals row (this task's

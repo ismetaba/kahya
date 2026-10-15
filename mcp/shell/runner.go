@@ -560,11 +560,17 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		return RunOutput{}, errors.New(reasonDigestMismatch)
 	}
 
-	// WYSIWYE (HANDOFF §5 safety #5, until W3-06's real normalize+hash
-	// pipeline lands): the token/pending-approval is bound to the RAW
-	// SCRIPT BYTES' sha256 — this task's spec, verbatim: "Token binds to
-	// the raw command bytes SHA-256".
-	toolInput := []byte(in.Script)
+	// WYSIWYE (HANDOFF §5 safety #5): the token/pending approval is bound
+	// to the WHOLE invocation the human reviews - script, canonical
+	// workdir (mounted rw at /work), image digest, timeout, network and
+	// env request (ShellDockerToolInput, FIX-FINAL shell-docker-approval-
+	// unbound-workdir). Binding the script bytes alone let a grant given
+	// for one workdir be redeemed by the identical script with ANOTHER
+	// workdir (or needs_network flipped) - the "identical retry" the
+	// approval-wait timeout tells the model to make - and the card never
+	// showed the mounted directory. The same bytes go to Check and
+	// ConsumeToken; the renderers (kahyad server/telegram) decode them.
+	toolInput := buildShellDockerToolInput(in, cp.Match, actualDigest, timeoutS)
 	decision, err := r.Policy.Check(ctx, "shell_docker", defaultScope, taskID, traceID, toolInput)
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: %w", err)
@@ -664,9 +670,33 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	return out, nil
 }
 
+// ShellDockerToolInput is the canonical envelope shell_docker's approval
+// is bound to (Policy.Check / ConsumeToken tool_input, FIX-FINAL
+// shell-docker-approval-unbound-workdir): every field that changes what
+// the container does. JSON field order is fixed by this struct;
+// EnvAllowlist is a sorted copy, never nil.
+type ShellDockerToolInput struct {
+	Script       string   `json:"script"`
+	Workdir      string   `json:"workdir"`      // canonical (cp.Match)
+	ImageDigest  string   `json:"image_digest"` // == PinnedDigest
+	TimeoutS     int      `json:"timeout_s"`
+	NeedsNetwork bool     `json:"needs_network"`
+	EnvAllowlist []string `json:"env_allowlist"`
+}
+
+func buildShellDockerToolInput(in RunInput, canonWorkdir, imageDigest string, timeoutS int) []byte {
+	env := append([]string{}, in.EnvAllowlist...)
+	sort.Strings(env)
+	b, _ := json.Marshal(ShellDockerToolInput{
+		Script: in.Script, Workdir: canonWorkdir, ImageDigest: imageDigest,
+		TimeoutS: timeoutS, NeedsNetwork: in.NeedsNetwork, EnvAllowlist: env,
+	})
+	return b
+}
+
 // shellDockerReceiptEnvelope is shell_docker's receipt key input (FIX-I-4):
-// the FULL invocation - the approval token binds only the script bytes, but
-// a replay must only ever answer the identical call (same script, same
+// the FULL invocation - like the approval binding (ShellDockerToolInput), a
+// replay must only ever answer the identical call (same script, same
 // canonical workdir, same timeout, same network and env request).
 type shellDockerReceiptEnvelope struct {
 	Script       string   `json:"script"`

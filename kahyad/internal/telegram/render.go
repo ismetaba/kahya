@@ -75,8 +75,28 @@ func renderPendingApprovalPayload(home, tool string, toolInput []byte) approval.
 			p.Summary = "fs_delete: " + p.Path
 			return p
 		}
+	case "shell_docker":
+		// FIX-FINAL shell-docker-approval-unbound-workdir: the mounted
+		// workdir and the network/env/timeout request are on the card (a
+		// legacy raw-script tool_input keeps the raw listing).
+		var env shellDockerApprovalInput
+		if json.Unmarshal(toolInput, &env) == nil && env.Script != "" && env.Workdir != "" {
+			return approval.BuildShellDocker(env.ImageDigest, env.Workdir, []byte(env.Script), env.NeedsNetwork, env.EnvAllowlist, env.TimeoutS)
+		}
 	}
 	p := approval.BuildOsascript(toolInput)
 	p.Summary = tool
 	return p
+}
+
+// shellDockerApprovalInput decodes mcp/shell.ShellDockerToolInput, the
+// envelope a shell_docker approval is bound to (FIX-FINAL
+// shell-docker-approval-unbound-workdir).
+type shellDockerApprovalInput struct {
+	Script       string   `json:"script"`
+	Workdir      string   `json:"workdir"`
+	ImageDigest  string   `json:"image_digest"`
+	TimeoutS     int      `json:"timeout_s"`
+	NeedsNetwork bool     `json:"needs_network"`
+	EnvAllowlist []string `json:"env_allowlist"`
 }

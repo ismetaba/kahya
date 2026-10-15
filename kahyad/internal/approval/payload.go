@@ -22,7 +22,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"strconv"
+	"strings"
 
 	"kahya/kahyad/internal/canon"
 )
@@ -73,6 +75,10 @@ type ApprovalPayload struct {
 	ImageDigest string // shell_script only ("" for osascript)
 	Workdir     string // shell_script only (canonicalized display path)
 	Script      []byte // shell_script and osascript
+	// ShellOptions are shell_docker's extra display lines (network, env
+	// allowlist, timeout - BuildShellDocker), rendered after the workdir;
+	// empty for a bare BuildShellScript payload (its text is unchanged).
+	ShellOptions []string
 
 	// ---- egress rendering material ----
 	Method    string
@@ -161,6 +167,30 @@ func BuildShellScript(imageDigest, rawWorkdir string, script []byte) ApprovalPay
 		Summary: "shell_docker: " + workdir,
 		Flags:   append(append([]canon.Flag{}, workdirFlags...), scanTextFlags(string(script))...),
 	}
+}
+
+// BuildShellDocker is BuildShellScript for a shell_docker card (FIX-FINAL
+// shell-docker-approval-unbound-workdir): the canonical workdir mounted rw
+// at /work, the image digest and the script, plus the network / env
+// allowlist / timeout request the approval is bound to, each as a visible
+// Turkish line. The summary names the workdir and the network request.
+func BuildShellDocker(imageDigest, rawWorkdir string, script []byte, needsNetwork bool, envAllowlist []string, timeoutS int) ApprovalPayload {
+	p := BuildShellScript(imageDigest, rawWorkdir, script)
+	network := "hayır"
+	if needsNetwork {
+		network = "evet"
+	}
+	env := "(yok)"
+	if len(envAllowlist) > 0 {
+		env = strings.Join(envAllowlist, ", ")
+	}
+	p.ShellOptions = []string{
+		"ağ erişimi: " + network,
+		"ortam değişkenleri: " + env,
+		fmt.Sprintf("zaman aşımı: %d sn", timeoutS),
+	}
+	p.Summary = "shell_docker: " + p.Workdir + " (ağ: " + network + ")"
+	return p
 }
 
 // BuildOsascript builds an osascript ApprovalPayload: script bytes only

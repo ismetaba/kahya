@@ -2014,7 +2014,11 @@ first boot). `{}` disables it.
   to (fs: `{path, content_base64}`; osascript: `{script, target_app}`;
   shortcuts: `{name, input_path}`), the validated argv (`shell_host`), the
   full invocation (`shell_docker`: script, canonical workdir, timeout,
-  network, sorted env names — its token binds the script only), or the
+  network, sorted env names — since FIX-FINAL
+  shell-docker-approval-unbound-workdir its approval token and pending
+  row bind the same full invocation plus the image digest,
+  `mcp/shell.ShellDockerToolInput`, and its approval card shows the
+  workdir mounted rw at /work, the network, env and timeout request), or the
   canonically re-encoded JSON arguments (generic path: sorted keys, no
   whitespace, numbers verbatim). Consequence: an identical call repeated
   within ONE task is always answered from its receipt (the
