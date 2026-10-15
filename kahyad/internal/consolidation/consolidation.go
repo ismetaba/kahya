@@ -535,7 +535,9 @@ func (c *Consolidator) sweepOrphanBranches(ctx context.Context, traceID, keepBra
 		}
 		// RemoveWorktree passes --force twice, so a LOCKED orphan worktree
 		// (a `git worktree add` killed half-way) does not block the branch
-		// deletion below every night (FIX-P-12-E1).
+		// deletion below every night (FIX-P-12-E1); a worktree stopped
+		// mid-rebase of b (listed as detached) is found by its rebase state
+		// (findWorktreeForBranch, FIX-P-12 review).
 		if err := removeWorktreeForBranchIfAny(ctx, c.Git, c.Cfg.KahyaDir, b); err != nil {
 			c.logWarn("consolidation_orphan_worktree_remove_failed", "trace_id", traceID, "branch", b, "err", err.Error())
 		}
@@ -709,7 +711,14 @@ func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTrac
 		return err
 	}
 	if err := RebaseWorktreeOnto(ctx, c.Git, worktreePath, MainBranch); err != nil {
-		_ = RemoveWorktree(ctx, c.Git, c.Cfg.KahyaDir, worktreePath)
+		// cleanupContext: an approve cancelled mid-rebase still removes the
+		// worktree (the branch and its pending row stay for a retry or
+		// tomorrow's supersede) - FIX-P-12 review.
+		cctx, cancel := cleanupContext(ctx)
+		defer cancel()
+		if rmErr := RemoveWorktree(cctx, c.Git, c.Cfg.KahyaDir, worktreePath); rmErr != nil {
+			c.logWarn("consolidation_worktree_remove_failed", "trace_id", approveTraceID, "err", rmErr.Error())
+		}
 		return err
 	}
 	if err := RemoveWorktree(ctx, c.Git, c.Cfg.KahyaDir, worktreePath); err != nil {
@@ -797,10 +806,12 @@ func (c *Consolidator) cleanupWorktreeAndBranch(ctx context.Context, worktreeDir
 }
 
 // removeWorktreeForBranchIfAny looks up branch's worktree (if any is
-// still registered) and removes it - a no-op (nil error) if none is
-// found, since Run already removes the worktree right after committing in
-// the common case; this exists purely to make Approve/Reject/supersede
-// robust against an interrupted prior run that never reached that step.
+// still registered, including one stopped mid-rebase of branch -
+// FindWorktreePathForBranch) and removes it - a no-op (nil error) if none
+// is found, since Run already removes the worktree right after committing
+// in the common case; this exists purely to make Reject/supersede and the
+// orphan sweep robust against an interrupted prior run that never reached
+// that step.
 func removeWorktreeForBranchIfAny(ctx context.Context, git backup.GitRunner, repoDir, branch string) error {
 	path, found, err := FindWorktreePathForBranch(ctx, git, repoDir, branch)
 	if err != nil {

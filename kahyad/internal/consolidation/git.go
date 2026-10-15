@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"kahya/kahyad/internal/backup"
 )
@@ -325,13 +326,29 @@ func DiffThreeDot(ctx context.Context, git backup.GitRunner, repoDir, base, bran
 //
 // On a conflict, the rebase is aborted INSIDE worktreeDir (leaving branch
 // at its pre-rebase tip) and an error is returned - the caller must not
-// proceed to merge.
+// proceed to merge. The abort runs on cleanupContext, not ctx: a caller
+// cancelled while the rebase ran (Ctrl-C on `kahya consolidation approve`,
+// a kahyad shutdown; exec.CommandContext kills git then) would otherwise
+// leave the worktree stopped mid-rebase (FIX-P-12 review).
 func RebaseWorktreeOnto(ctx context.Context, git backup.GitRunner, worktreeDir, base string) error {
 	if _, stderr, err := git.Run(ctx, worktreeDir, "rebase", base); err != nil {
-		_, _, _ = git.Run(ctx, worktreeDir, "rebase", "--abort")
+		actx, cancel := cleanupContext(ctx)
+		defer cancel()
+		_, _, _ = git.Run(actx, worktreeDir, "rebase", "--abort")
 		return fmt.Errorf("consolidation: git -C %s rebase %s: %w (%s)", worktreeDir, base, err, stderr)
 	}
 	return nil
+}
+
+// cleanupGitTimeout bounds the git calls that put a consolidation worktree
+// back into a removable state after a failure.
+const cleanupGitTimeout = 10 * time.Second
+
+// cleanupContext returns a context for failure-path cleanup git calls
+// (rebase --abort, worktree remove): it keeps ctx's values but not its
+// cancellation, and is bounded by cleanupGitTimeout.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupGitTimeout)
 }
 
 // MergeFastForwardOnly merges branch into repoDir's currently checked-out
@@ -358,12 +375,23 @@ func MergeFastForwardOnly(ctx context.Context, git backup.GitRunner, repoDir, br
 // checkout (RebaseWorktreeOnto) use this rather than assuming the
 // worktree Run() created is still around - it normally still is
 // (suggestion mode never removes it), but this is robust even if a prior
-// process was interrupted after removing it.
+// process was interrupted after removing it. A registered worktree that is
+// stopped in the middle of a rebase of branch (a process killed
+// mid-rebase) is removed and replaced by a fresh one: a stopped rebase
+// never moves the branch ref, so the fresh checkout is the branch's own
+// pre-rebase tip (FIX-P-12 review).
 func EnsureWorktreeForBranch(ctx context.Context, git backup.GitRunner, repoDir, parentDir, branch string) (string, error) {
-	if path, found, err := FindWorktreePathForBranch(ctx, git, repoDir, branch); err != nil {
+	path, rebasing, found, err := findWorktreeForBranch(ctx, git, repoDir, branch)
+	if err != nil {
 		return "", err
-	} else if found {
+	}
+	if found && !rebasing {
 		return path, nil
+	}
+	if found {
+		if err := RemoveWorktree(ctx, git, repoDir, path); err != nil {
+			return "", err
+		}
 	}
 
 	dir, err := os.MkdirTemp(parentDir, "kahya-consolidation-*")
@@ -387,25 +415,101 @@ func EnsureWorktreeForBranch(ctx context.Context, git backup.GitRunner, repoDir,
 // degrades safely (found=false, nil error) if the worktree was already
 // removed by an earlier, interrupted run, since RemoveWorktree is
 // idempotent and a caller that finds nothing simply has nothing left to
-// remove.
+// remove. A linked worktree stopped in the middle of a rebase of branch
+// counts as branch's worktree too (findWorktreeForBranch).
 func FindWorktreePathForBranch(ctx context.Context, git backup.GitRunner, repoDir, branch string) (path string, found bool, err error) {
+	path, _, found, err = findWorktreeForBranch(ctx, git, repoDir, branch)
+	return path, found, err
+}
+
+// worktreeRecord is one `git worktree list --porcelain` record.
+type worktreeRecord struct {
+	path     string
+	ref      string // the "branch" line's ref; "" when detached
+	detached bool
+}
+
+// listWorktrees parses `git worktree list --porcelain`; the main working
+// tree is always the first record.
+func listWorktrees(ctx context.Context, git backup.GitRunner, repoDir string) ([]worktreeRecord, error) {
 	out, stderr, err := git.Run(ctx, repoDir, "worktree", "list", "--porcelain")
 	if err != nil {
-		return "", false, fmt.Errorf("consolidation: git worktree list --porcelain: %w (%s)", err, stderr)
+		return nil, fmt.Errorf("consolidation: git worktree list --porcelain: %w (%s)", err, stderr)
 	}
-	wantRef := "branch refs/heads/" + branch
-	var currentPath string
+	var recs []worktreeRecord
 	for _, line := range strings.Split(out, "\n") {
-		switch {
-		case strings.HasPrefix(line, "worktree "):
-			currentPath = strings.TrimPrefix(line, "worktree ")
-		case line == wantRef:
-			return currentPath, true, nil
-		case line == "":
-			currentPath = ""
+		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+			recs = append(recs, worktreeRecord{path: p})
+			continue
+		}
+		if len(recs) == 0 {
+			continue
+		}
+		cur := &recs[len(recs)-1]
+		if ref, ok := strings.CutPrefix(line, "branch "); ok {
+			cur.ref = ref
+		} else if line == "detached" {
+			cur.detached = true
 		}
 	}
-	return "", false, nil
+	return recs, nil
+}
+
+// findWorktreeForBranch returns the worktree registered for branch:
+// either the one that has it checked out (a "branch refs/heads/<branch>"
+// record), or a linked worktree stopped in the middle of a rebase of
+// branch (rebasing=true). git lists the latter as "detached", with no
+// branch line, yet still refuses `git branch -D <branch>` ("used by
+// worktree") and `git worktree add <dir> <branch>` for it, exactly like a
+// checkout (verified against git 2.54) - so an interrupted rebase would
+// otherwise strand the branch and fail the orphan sweep every night
+// (FIX-P-12 review). The main working tree is never matched by its rebase
+// state (CheckRepoState refuses a stopped rebase there, and `git worktree
+// remove` refuses the main working tree anyway).
+func findWorktreeForBranch(ctx context.Context, git backup.GitRunner, repoDir, branch string) (path string, rebasing, found bool, err error) {
+	recs, err := listWorktrees(ctx, git, repoDir)
+	if err != nil {
+		return "", false, false, err
+	}
+	wantRef := "refs/heads/" + branch
+	for _, r := range recs {
+		if r.ref == wantRef {
+			return r.path, false, true, nil
+		}
+	}
+	for i, r := range recs {
+		if i == 0 || !r.detached {
+			continue
+		}
+		if worktreeRebasingRef(ctx, git, r.path, wantRef) {
+			return r.path, true, true, nil
+		}
+	}
+	return "", false, false, nil
+}
+
+// worktreeRebasingRef reports whether the worktree at wtPath is stopped in
+// the middle of a rebase of wantRef: its own git dir's rebase-merge (the
+// default backend) or rebase-apply head-name names wantRef - the same
+// files git reads to refuse deleting a branch that is being rebased. A
+// worktree whose directory is gone (its git dir cannot be resolved) is not
+// matched; `git worktree prune` drops such a registration.
+func worktreeRebasingRef(ctx context.Context, git backup.GitRunner, wtPath, wantRef string) bool {
+	out, _, err := git.Run(ctx, wtPath, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimSpace(out)
+	if gitDir == "" {
+		return false
+	}
+	for _, state := range []string{"rebase-merge", "rebase-apply"} {
+		b, err := os.ReadFile(filepath.Join(gitDir, state, "head-name"))
+		if err == nil && strings.TrimSpace(string(b)) == wantRef {
+			return true
+		}
+	}
+	return false
 }
 
 // writeFileInWorktree writes content to relPath, resolved against
