@@ -99,3 +99,35 @@ func TestLiveRegistryInProcessSessionIsLiveWithoutPID(t *testing.T) {
 		t.Fatalf("worker w1 lost after its in-process session ended: pid=%d ok=%v", pid, ok)
 	}
 }
+
+// TestLiveRegistryMarkHaltedOrdersWithRegistration (FIX-FINAL
+// halt-window-worker-still-spawned): a halt mark made BEFORE a worker
+// registers is visible to the registering spawn site (Halted), one made
+// AFTER returns the registered pid to the halt; Unregister clears the
+// mark, and so does the end of the task's last in-process session.
+func TestLiveRegistryMarkHaltedOrdersWithRegistration(t *testing.T) {
+	l := NewLiveRegistry()
+	if pid, ok := l.MarkHalted("t1"); ok || pid != 0 {
+		t.Fatalf("MarkHalted with no worker = %d %v, want none", pid, ok)
+	}
+	l.RegisterWorker("t1", "tr", 4242, 4242)
+	if !l.Halted("t1") {
+		t.Fatal("a worker registering after the mark must see Halted")
+	}
+	l.Unregister("t1")
+	if l.Halted("t1") {
+		t.Fatal("Unregister must clear the halt mark")
+	}
+
+	l.RegisterWorker("t2", "tr2", 5151, 5151)
+	if pid, ok := l.MarkHalted("t2"); !ok || pid != 5151 {
+		t.Fatalf("MarkHalted after registration = %d %v, want 5151 true", pid, ok)
+	}
+
+	end := l.BeginInProcess("t3")
+	l.MarkHalted("t3")
+	end()
+	if l.Halted("t3") {
+		t.Fatal("the end of the last in-process session must clear the halt mark")
+	}
+}

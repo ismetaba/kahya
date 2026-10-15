@@ -106,6 +106,18 @@ type LiveRegistry interface {
 
 var _ LiveRegistry = (*task.LiveRegistry)(nil)
 
+// haltMarker is the optional part of a LiveRegistry that records the halt
+// itself (FIX-FINAL halt-window-worker-still-spawned): MarkHalted returns
+// the live pid under the same lock RegisterWorker takes, so a worker that
+// registers after the mark sees it (task.LiveRegistry.Halted) and kills
+// itself. *task.LiveRegistry implements it; a plain PID lookup (tests)
+// keeps the old read.
+type haltMarker interface {
+	MarkHalted(taskID string) (pid int, ok bool)
+}
+
+var _ haltMarker = (*task.LiveRegistry)(nil)
+
 // ApprovalInvalidator is the narrow approval-invalidation surface
 // Executor needs - *kahyad/internal/policy.Engine satisfies this
 // directly via InvalidateApprovalsForTask (that method's own doc comment
@@ -457,7 +469,14 @@ func (x *Executor) killProcessGroup(traceID string, t sqlcgen.Task) {
 	pgid := 0
 	source := ""
 	if x.live != nil {
-		if pid, ok := x.live.PID(t.ID); ok && pid > 0 {
+		var pid int
+		var ok bool
+		if m, isMarker := x.live.(haltMarker); isMarker {
+			pid, ok = m.MarkHalted(t.ID)
+		} else {
+			pid, ok = x.live.PID(t.ID)
+		}
+		if ok && pid > 0 {
 			pgid, source = pid, "memory"
 		}
 	}

@@ -50,6 +50,12 @@ type LiveRegistry struct {
 	// inProcess counts the open BeginInProcess sessions per task_id
 	// (FIX-I-14 review) - see the package doc comment above.
 	inProcess map[string]int
+	// halted records the tasks a halt marked (MarkHalted, FIX-FINAL
+	// halt-window-worker-still-spawned): a worker that registers AFTER the
+	// mark must kill itself (Halted), one that registered before it is
+	// returned to the halt to kill. Cleared by Unregister and by the end of
+	// an in-process session.
+	halted map[string]struct{}
 }
 
 // liveEntry is one live worker: its pid, its session id, and the trace_id
@@ -62,7 +68,34 @@ type liveEntry struct {
 
 // NewLiveRegistry constructs an empty LiveRegistry.
 func NewLiveRegistry() *LiveRegistry {
-	return &LiveRegistry{entries: make(map[string]liveEntry), inProcess: make(map[string]int)}
+	return &LiveRegistry{entries: make(map[string]liveEntry), inProcess: make(map[string]int), halted: make(map[string]struct{})}
+}
+
+// MarkHalted records that taskID is being halted and returns its live
+// worker's pid, if one is registered (FIX-FINAL halt-window-worker-still-
+// spawned). Both happen under the registry's write lock, so with
+// RegisterWorker + Halted they give a Dekker-style ordering: either the
+// worker registered first (the halt sees and kills its pid) or the mark
+// came first (the registering spawn site sees Halted and kills the worker
+// itself before the envelope is written). Before this a halt landing
+// between a task's intent/executing transition and its worker's
+// registration found no pid, reported the task halted, and the worker was
+// spawned anyway.
+func (l *LiveRegistry) MarkHalted(taskID string) (pid int, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.halted[taskID] = struct{}{}
+	e, ok := l.entries[taskID]
+	return e.pid, ok
+}
+
+// Halted reports whether a halt marked taskID (MarkHalted) and the mark
+// has not been cleared yet.
+func (l *LiveRegistry) Halted(taskID string) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	_, ok := l.halted[taskID]
+	return ok
 }
 
 // Register records that taskID's worker is running as pid, with
@@ -92,6 +125,7 @@ func (l *LiveRegistry) Unregister(taskID string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.entries, taskID)
+	delete(l.halted, taskID)
 }
 
 // BeginInProcess records that taskID's session is running inside kahyad
@@ -114,6 +148,12 @@ func (l *LiveRegistry) BeginInProcess(taskID string) (end func()) {
 			defer l.mu.Unlock()
 			if l.inProcess[taskID] <= 1 {
 				delete(l.inProcess, taskID)
+				// The task's last in-process session is over (its terminal
+				// transition already ran): the halt mark has nothing left
+				// to guard.
+				if _, worker := l.entries[taskID]; !worker {
+					delete(l.halted, taskID)
+				}
 				return
 			}
 			l.inProcess[taskID]--

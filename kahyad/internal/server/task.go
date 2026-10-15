@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"kahya/kahyad/internal/anthproxy"
@@ -64,6 +65,10 @@ const (
 	// lifecycleCancel), not because the task deadline was reached
 	// (%s = task id). The task stays 'executing' for the restarted kahyad's
 	// resume scan (FIX-FINAL shutdown-reported-as-timeout).
+	// MsgTaskHaltedBeforeStart is the answer for a task a halt reached
+	// before its worker started (FIX-FINAL halt-window-worker-still-
+	// spawned): nothing was spawned.
+	MsgTaskHaltedBeforeStart      = "⛔ Görev başlamadan durduruldu (user_halted)."
 	MsgTaskShutdownInterruptedFmt = "Görev kahyad kapandığı için durduruldu; kahyad yeniden başlayınca devam ettirilir. Durum: kahya task show %s"
 	// MsgTaskUnexpectedExit is the SSE "error" event message when the
 	// worker process ends (any exit code) without ever sending a terminal
@@ -911,6 +916,30 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	if s.taskMachine != nil {
 		if err := s.taskMachine.Transition(dbCtx, traceID, taskID, task.StatusExecuting); err != nil {
 			log.Warn("task_transition_executing_failed", "task_id", taskID, "err", err.Error())
+			// FIX-FINAL halt-window-worker-still-spawned: a halt that
+			// landed between InsertTask and this transition moved the row
+			// to user_halted - the failed edge must not be shrugged off and
+			// the worker spawned anyway. Fail closed whenever the row is
+			// readable and not 'executing' (or unreadable with the store
+			// wired): no proxy, no worker.
+			if cur, serr := s.taskDurabilityStatus(persistCtx, taskID); s.taskDurabilityStore != nil && (serr != nil || cur != task.StatusExecuting) {
+				msg := fmt.Sprintf(MsgTaskUnexpectedExit, traceID)
+				if cur == task.StatusUserHalted {
+					msg = MsgTaskHaltedBeforeStart
+				}
+				log.Warn("task_not_started", "task_id", taskID, "status", cur)
+				if uerr := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+					State: "error", UpdatedAt: rfc3339Now(), ID: taskID,
+				}); uerr != nil {
+					log.Error("task_state_update_failed", "task_id", taskID, "err", uerr.Error())
+				}
+				if writeSSE != nil {
+					writeSSE("error", map[string]string{"message": msg})
+					return
+				}
+				writeJSONError(w, http.StatusConflict, msg)
+				return
+			}
 		}
 	}
 
@@ -1061,6 +1090,16 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 				// session) are attributed to - and their correlation ids
 				// pinned to - THIS task.
 				s.taskLiveRegistry.RegisterWorker(taskID, traceID, pid, pid)
+				// FIX-FINAL halt-window-worker-still-spawned: a halt that
+				// marked this task BEFORE the registration above found no
+				// pid to kill; the worker kills itself here, synchronously,
+				// before spawn.Run writes the envelope - it never sees the
+				// prompt and never reaches the proxy.
+				if h, ok := s.taskLiveRegistry.(interface{ Halted(string) bool }); ok && h.Halted(taskID) {
+					log.Warn("task_worker_killed_halted", "task_id", taskID, "pid", pid)
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+					return
+				}
 			}
 			// W6-03: persist the worker's process-group id (spawn.Run always
 			// starts it as its own new session and group leader via

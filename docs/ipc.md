@@ -1336,7 +1336,17 @@ the same registry to the resume scan and the outbox dispatcher), so a
 resume-scan tick in the middle never takes the running session for a
 crashed worker (`PID`/`BySID` still report only real workers). A cloud
 task holds one too, from its `executing` transition until `handleTask`
-returns, covering the window before its worker registers. A locally
+returns, covering the window before its worker registers. A halt in
+that window (FIX-FINAL halt-window-worker-still-spawned) is never a
+relabel only: `halt.Executor` reads the live pid through
+`LiveRegistry.MarkHalted`, which also records the halt under the
+registry's lock, and the spawn sites (`handleTask`, the outbox
+dispatcher) check `Halted` right after `RegisterWorker` and SIGKILL the
+worker's group before `spawn.Run` writes its envelope (JSONL
+`task_worker_killed_halted` / ledger `outbox.worker_killed_halted`). A
+halt that wins the `intent` edge makes `handleTask`'s `->executing`
+transition fail, and it then fails closed - no proxy, no worker, 409
+`"⛔ Görev başlamadan durduruldu (user_halted)."`. A locally
 answered task — secret lane or downgrade route — stores **no**
 `tasks.envelope` (it is never given to a worker), and the outbox
 dispatcher never gives a secret-lane row (row lane or stored envelope

@@ -56,6 +56,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"kahya/kahyad/internal/spawn"
@@ -602,6 +603,18 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 			workerPID = pid
 			if d.live != nil {
 				d.live.RegisterWorker(t.ID, t.TraceID, pid, pid)
+				// FIX-FINAL halt-window-worker-still-spawned: a halt that
+				// marked this task before the registration (it landed
+				// between the ->executing transition and here) found no
+				// pid; the redispatched worker kills itself before spawn.Run
+				// writes the envelope.
+				if h, ok := d.live.(interface{ Halted(string) bool }); ok && h.Halted(t.ID) {
+					d.ledgerRaw(context.WithoutCancel(ctx), t.TraceID, "outbox.worker_killed_halted", map[string]any{
+						"event": "outbox.worker_killed_halted", "task_id": t.ID, "pid": pid,
+					})
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+					return
+				}
 			}
 			// W6-03: persist the redispatched worker's process-group id
 			// ALONGSIDE the in-memory registry above - see
