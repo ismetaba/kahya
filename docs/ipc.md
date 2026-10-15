@@ -903,7 +903,16 @@ a cloud model, without changing anything in §2-§6 above:
   (`extract.Runner.TryHold`; a running extraction = 409 `in_progress`); a
   document whose SHA-256 an `ingest.done` row names while that note is
   still an active episode is a 409 `"ingest: bu belge zaten alınmış:
-  <note>"`. The lane is decided LOCALLY before any cloud byte. First the
+  <note>"`. An interrupted earlier ingest of the same document (its note
+  committed - ledger `ingest.note_written {sha256, file, episode_id,
+  commit_sha, lane, lane_reason}`, written right after the commit - but no
+  `ingest.done`, e.g. a failed facts write or a cancellation) is resumed
+  on that note: no `-2` duplicate, `ingest.done` gains `resumed: true`;
+  a normal-lane orphan is superseded by a fresh secret-lane note when the
+  retry is secret-lane (`superseded`). After the commit the remaining
+  local steps run under `context.WithoutCancel` (2 min bound), so a client
+  disconnect or shutdown no longer strands the note (FIX-FINAL
+  ingest-retry-after-midpipeline-failure-duplicates-note). The lane is decided LOCALLY before any cloud byte. First the
   Go-enforced path rule (FIX-MEM-6 review): every `source_paths` entry (at
   most 4 absolute paths, <= 4096 bytes each, one line - anything else is a
   400) and `source_ref` when it is an absolute path, each also in its

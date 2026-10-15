@@ -1019,6 +1019,10 @@ func run() int {
 		Store:   st.Queries,
 		Ledger:  st,
 		Log:     log,
+		// a retry resuming on an interrupted ingest indexes its committed
+		// but unindexed note (FIX-FINAL ingest-retry-after-midpipeline-
+		// failure-duplicates-note)
+		Index: idx,
 		Cfg: ingest.Config{
 			MaxBytes: cfg.IngestMaxBytes,
 			KeepRaw:  cfg.IngestKeepRaw,
