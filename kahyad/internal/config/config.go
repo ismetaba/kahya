@@ -31,7 +31,8 @@ const (
 	// EnvRestore is the W78-05 restore drill's scratch profile
 	// (scripts/restore-drill.sh): a daemon booted on a restored COPY of
 	// prod's brain.db while prod keeps running. Its ledger is a fork of
-	// prod's by construction, so it never anchors (Load).
+	// prod's by construction, so it never anchors (Load), and its boot is
+	// passive (PassiveBoot).
 	EnvRestore = "restore"
 )
 
@@ -1238,6 +1239,17 @@ func Load() (Config, error) {
 
 	return cfg, nil
 }
+
+// PassiveBoot reports whether this daemon must boot passively (FIX-FINAL
+// ops-restore-scratch-kills-prod-workers): the restore drill's scratch
+// profile runs on a VACUUM copy of a LIVE prod brain.db, so tasks.
+// worker_pgid names prod's running workers, 'executing' tasks and pending
+// outbox rows are prod's, and config.yaml names prod's Telegram bot and
+// LaunchAgents. Such a daemon kills no worker, resumes / dispatches no
+// task, runs no Telegram poller, syncs no launchd job, anchors nothing and
+// refuses POST /v1/task - it serves only what the drill needs (/health,
+// /v1/reindex, /v1/memory/search). Prod and dev are unchanged.
+func (c Config) PassiveBoot() bool { return c.Env == EnvRestore }
 
 // reconcileConfigDrivenJobCalendars rewrites the CalendarSpec of the
 // "truth-ritual" and "morning-briefing" cfg.Jobs entries (if present) from

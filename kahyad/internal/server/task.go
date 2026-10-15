@@ -512,6 +512,13 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "anthropic forward-proxy not available")
 		return
 	}
+	// FIX-FINAL ops-restore-scratch-kills-prod-workers: a passive (restore
+	// drill) boot runs on a copy of prod's brain.db and never spawns a
+	// worker or makes a cloud call.
+	if s.cfg.PassiveBoot() {
+		writeJSONError(w, http.StatusServiceUnavailable, "passive restore profile: tasks are not run")
+		return
+	}
 	// FIX-I-5: the whole request is one in-flight run of the daemon - the
 	// worker it spawns (cloud or STT) or the local answer it computes, plus
 	// the bookkeeping that records the outcome. Shutdown cancels it through

@@ -2139,3 +2139,13 @@ func TestRestoreProfileNeverAnchors(t *testing.T) {
 		})
 	}
 }
+
+// TestPassiveBootOnlyForRestore (FIX-FINAL ops-restore-scratch-kills-prod-
+// workers): only the restore drill's scratch profile boots passively.
+func TestPassiveBootOnlyForRestore(t *testing.T) {
+	for env, want := range map[string]bool{EnvRestore: true, EnvProd: false, EnvDev: false, "redteam": false} {
+		if got := (Config{Env: env}).PassiveBoot(); got != want {
+			t.Errorf("Config{Env: %q}.PassiveBoot() = %v, want %v", env, got, want)
+		}
+	}
+}

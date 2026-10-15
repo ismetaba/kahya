@@ -499,6 +499,12 @@ func run() int {
 	// other in-process caller uses (HANDOFF §5 safety #1: approval cards
 	// are egress too).
 	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID, APIURL: cfg.TelegramAPIURL}
+	if cfg.PassiveBoot() {
+		// FIX-FINAL ops-restore-scratch-kills-prod-workers: the restore
+		// scratch shares prod's config.yaml - a second long-poller on
+		// prod's bot could consume prod's approval callbacks. Disabled.
+		tgCfg = telegram.Config{}
+	}
 	tgBot := telegram.New(tgCfg, buildTelegramTokenSource(cfg, log), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
 	// FIX-U-5: the SAME tracker egressGate consults (sessions, above) is
 	// what tgBot asks before any content-carrying byte leaves for Telegram
@@ -1484,29 +1490,43 @@ func run() int {
 	// Identity-checked (FIX-I-13): a pgid that no longer looks like our
 	// worker is only cleared. Otherwise the scan below would hand a still
 	// running orphan's task to a SECOND worker on the same session.
-	if n, err := haltExecutor.KillOrphanedWorkersAtBoot(context.Background()); err != nil {
-		log.Error("orphan_sweep_failed", "err", err.Error())
+	//
+	// FIX-FINAL ops-restore-scratch-kills-prod-workers: a passive (restore
+	// drill) boot runs on a VACUUM copy of a LIVE prod brain.db - its
+	// worker_pgid rows are prod's running workers (identity-checked as
+	// ours, so they would be SIGKILLed), its 'executing' tasks and pending
+	// outbox rows are prod's (a resume would re-run them: duplicate cloud
+	// calls and W1 effects on prod's login). No sweep, no scan, no
+	// dispatcher.
+	if cfg.PassiveBoot() {
+		log.Info("orphan_sweep_skipped", "reason", "passive_restore_profile")
+		log.Info("task_resume_scan_skipped", "reason", "passive_restore_profile")
 	} else {
-		log.Info("orphan_sweep_done", "killed", n)
-	}
-	// Startup scan: every task.go's own comment on "no live worker PID"
-	// applies in its strongest form here - taskLive is still EMPTY (no
-	// spawn has registered into it yet this process), so every
-	// tasks.status='executing' row left over from a previous kahyad
-	// process (crash, SIGKILL, machine restart) is correctly treated as
-	// interrupted - and since FIX-I-5 its worker is really gone.
-	runResumeScan(context.Background())
-	// W4-07: the tick intervals themselves are now cfg-driven (default 30s/
-	// 5s, unchanged from the literal specs this replaced) so a hermetic
-	// acceptance gate (tests/acceptance/w4, scripts/accept_w4.sh) can
-	// override them down to a couple of seconds via config.yaml, instead of
-	// a CI-speed run having to wait out the full production cadence for the
-	// resume scan/outbox dispatcher to notice a crashed/killed worker.
-	if err := sched.RegisterTick("task_resume_scan", fmt.Sprintf("@every %ds", cfg.ResumeScanIntervalSeconds), runResumeScan); err != nil {
-		log.Error("task_resume_scan_tick_register_failed", "err", err.Error())
-	}
-	if err := sched.RegisterTick("outbox_dispatch", fmt.Sprintf("@every %ds", cfg.OutboxDispatchIntervalSeconds), runOutboxDispatch); err != nil {
-		log.Error("outbox_dispatch_tick_register_failed", "err", err.Error())
+		if n, err := haltExecutor.KillOrphanedWorkersAtBoot(context.Background()); err != nil {
+			log.Error("orphan_sweep_failed", "err", err.Error())
+		} else {
+			log.Info("orphan_sweep_done", "killed", n)
+		}
+		// Startup scan: every task.go's own comment on "no live worker PID"
+		// applies in its strongest form here - taskLive is still EMPTY (no
+		// spawn has registered into it yet this process), so every
+		// tasks.status='executing' row left over from a previous kahyad
+		// process (crash, SIGKILL, machine restart) is correctly treated as
+		// interrupted - and since FIX-I-5 its worker is really gone.
+		runResumeScan(context.Background())
+		// W4-07: the tick intervals themselves are now cfg-driven (default
+		// 30s/5s, unchanged from the literal specs this replaced) so a
+		// hermetic acceptance gate (tests/acceptance/w4,
+		// scripts/accept_w4.sh) can override them down to a couple of
+		// seconds via config.yaml, instead of a CI-speed run having to wait
+		// out the full production cadence for the resume scan/outbox
+		// dispatcher to notice a crashed/killed worker.
+		if err := sched.RegisterTick("task_resume_scan", fmt.Sprintf("@every %ds", cfg.ResumeScanIntervalSeconds), runResumeScan); err != nil {
+			log.Error("task_resume_scan_tick_register_failed", "err", err.Error())
+		}
+		if err := sched.RegisterTick("outbox_dispatch", fmt.Sprintf("@every %ds", cfg.OutboxDispatchIntervalSeconds), runOutboxDispatch); err != nil {
+			log.Error("outbox_dispatch_tick_register_failed", "err", err.Error())
+		}
 	}
 
 	// W4-05: the ledger external anchor (HANDOFF §5 safety #4 flag). Both
@@ -1571,7 +1591,12 @@ func run() int {
 		JobLogDir:       filepath.Join(home, "Library", "Logs", "Kahya"),
 		TriggerBinPath:  cfg.TriggerBinPath,
 	}
-	if err := scheduler.Sync(cfg.Jobs, schedSyncOpts, scheduler.NewExecRunner(), log); err != nil {
+	// FIX-FINAL ops-restore-scratch-kills-prod-workers: a passive boot
+	// shares prod's config.yaml and HOME - it must never rewrite prod's
+	// ~/Library/LaunchAgents job plists.
+	if cfg.PassiveBoot() {
+		log.Info("job_sync_skipped", "reason", "passive_restore_profile")
+	} else if err := scheduler.Sync(cfg.Jobs, schedSyncOpts, scheduler.NewExecRunner(), log); err != nil {
 		log.Error("job_sync_failed", "err", err.Error())
 	}
 

@@ -24,6 +24,14 @@
 #     live writer), and -- on success -- POSTing the counts/hashes-only result
 #     back over the prod UDS so PRODUCTION kahyad (the sole brain.db writer)
 #     records the restore.drill.result row.
+#   - The scratch boot is PASSIVE (config.Config.PassiveBoot, FIX-FINAL
+#     ops-restore-scratch-kills-prod-workers): it runs on a copy of a LIVE
+#     prod brain.db and prod's config.yaml, so it kills no worker (the copy's
+#     worker_pgid rows are prod's running workers), resumes / dispatches no
+#     task, runs no Telegram poller, syncs no LaunchAgent, refuses POST
+#     /v1/task and never anchors (FIX-FINAL
+#     ops-restore-scratch-pollutes-prod-anchor-remote) - it never touches
+#     prod's processes, bot or anchor remote.
 #   - A guard refuses to run if the scratch target resolves to the production
 #     App Support dir or ~/Kahya (mirrors kahyad/internal/restore.GuardNotProd
 #     and config.refuseNonProdProfileOpeningProdDB).
