@@ -529,10 +529,26 @@ func run() int {
 	// notifier is the SAME shared Notifier every other alarm/notification
 	// call in this function already uses - the voice-missing notification
 	// is exactly one more JSONL+ledger sink call, nothing Speaker-specific.
+	// FIX-FINAL TUX-5: the voice-missing / voice-probe notices tell the
+	// user to act (install Yelda), so they also reach the LOCAL banner -
+	// hsCli.NotifyText, never SendNotification (which re-enters the
+	// Speaker) and never Telegram (the voice is this machine's matter).
+	speakerNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, text string) {
+		hsCli.NotifyText(ctx, traceID, text)
+	}, notify.EventVoiceMissing, notify.EventVoiceProbeFailed)
 	speaker := notify.NewSpeaker(notify.SpeakerConfig{
 		Enabled: cfg.TTSEnabled, Voice: cfg.TTSVoice, SayBin: cfg.TTSSayBin,
 		MaxChars: cfg.TTSMaxChars, SpeakSecretLane: cfg.TTSSpeakSecretLane,
-	}, log, st, notifier)
+	}, log, st, speakerNotifier)
+	// FIX-FINAL TUX-5: the resume scan's and the cloud retry's user-action
+	// notices (a task parked in blocked_user - "kahya task resolve <id> ile
+	// karar ver" -, a cloud give-up / permanent failure) were only logged
+	// and ledgered. They now also go out on the background-result channel
+	// (HANDOFF §4 IPC: Hammerspoon + Telegram, localDelivery; fixed text
+	// with ids only, behind tgBot's FIX-U-5 session gate), asynchronously.
+	taskNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, text string) {
+		localDelivery.SendNotification(ctx, traceID, text)
+	}, task.EventResumeCapExceeded, task.EventW1RetryCapExceeded, task.EventW2W3Receiptless, task.EventCloudTaskFailed)
 	hsCli.Speaker = speaker
 	srv.SetSpeaker(speaker)
 
@@ -881,7 +897,7 @@ func run() int {
 		log.Error("cloud_retry_give_up_after_invalid", "value", cfg.CloudRetryGiveUpAfter, "err", err.Error())
 		return 1
 	}
-	taskCloudRetry := task.NewCloudRetry(st.Queries, st.Queries, taskMachine, st, notifier, cloudRetrySchedule, cloudRetryGiveUpAfter)
+	taskCloudRetry := task.NewCloudRetry(st.Queries, st.Queries, taskMachine, st, taskNotifier, cloudRetrySchedule, cloudRetryGiveUpAfter)
 	srv.SetTaskCloudRetry(taskMachine, taskCloudRetry)
 
 	// POST /v1/task's per-task Anthropic forward-proxy + cost governor
@@ -1421,7 +1437,7 @@ func run() int {
 	// FIX-I-14 review: taskLive also reports a session running inside
 	// kahyad itself (BeginInProcess - a local answer via srv, a briefing
 	// run) live, for the scan and for taskDispatcher alike.
-	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, notifier, task.AnyLive(taskLive, taskReceipts), cfg.TaskRetryW1MaxAuto)
+	taskResume := task.NewResume(st.Queries, st.Queries, st.Queries, taskMachine, taskNotifier, task.AnyLive(taskLive, taskReceipts), cfg.TaskRetryW1MaxAuto)
 	// FIX-I-2: the resume scan's crash re-dispatches are capped per task
 	// (task_max_crash_resumes, owner decision G10-2); past it -> blocked_user.
 	taskResume.SetMaxCrashResumes(cfg.TaskMaxCrashResumes)

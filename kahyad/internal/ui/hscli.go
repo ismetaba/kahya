@@ -154,6 +154,21 @@ func (h *HSCli) Notify(ctx context.Context, traceID string, payload []byte) erro
 	return h.exec(ctx, traceID, "hs_notify_failed", luaCall("kahyaNotify", b64))
 }
 
+// NotifyText shows text as a local hs.notify banner (its first
+// notifyPreviewLines lines, the trace id as kahyaNotify's own footer) and
+// NEVER speaks it: the banner half of SendNotification, for a notice that
+// must not re-enter the Speaker - the Speaker's own voice-missing /
+// voice-probe notices (FIX-FINAL TUX-5) - or reach Telegram.
+func (h *HSCli) NotifyText(ctx context.Context, traceID, text string) bool {
+	payload, err := json.Marshal(map[string]string{
+		"title": kahyaNotifyTitle, "message": firstLines(text, notifyPreviewLines), "trace_id": traceID,
+	})
+	if err != nil {
+		return false
+	}
+	return h.Notify(ctx, traceID, payload) == nil
+}
+
 // SendNotification implements kahyad/internal/briefing.Delivery's exact
 // interface shape (SendNotification(ctx, traceID, text) bool) so an HSCli
 // can be wired directly as (or fanned out alongside, see FanOutDelivery)
@@ -165,13 +180,7 @@ func (h *HSCli) Notify(ctx context.Context, traceID string, payload []byte) erro
 // every caller of this method already ledgered/persisted the complete
 // result before ever reaching here (see this package's own doc comment).
 func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool {
-	payload, err := json.Marshal(map[string]string{
-		"title": kahyaNotifyTitle, "message": firstLines(text, notifyPreviewLines), "trace_id": traceID,
-	})
-	if err != nil {
-		return false
-	}
-	ok := h.Notify(ctx, traceID, payload) == nil
+	ok := h.NotifyText(ctx, traceID, text)
 
 	// W6-05: speak the SAME full text, AFTER the visual notification
 	// above has already been dispatched - regardless of whether that

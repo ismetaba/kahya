@@ -1255,7 +1255,14 @@ and capped by `task_max_crash_resumes` (config, default 3, ≥ 1): at the cap
 the task moves to `blocked_user` with the notice `"Görev %s: işçi süreci %d
 kez yarıda kesildi, otomatik devam limiti doldu — 'kahya task resolve %s'
 ile karar ver."` (`task.resume_cap_exceeded`). Cloud-park redispatches never
-count, and `kahya task resolve <id> --retry` resets the count. A status a
+count, and `kahya task resolve <id> --retry` resets the count. That notice,
+the W1-cap and W2/W3 receipt-less blocked_user notices and the cloud
+give-up / permanent-failure notice (`task.failed`) are delivered on the
+background-result channel too (Hammerspoon + Telegram, `ui.FanOutDelivery`;
+Telegram behind its FIX-U-5 gate), not only logged and ledgered; the
+Speaker's `tts.voice_missing` / `tts.voice_probe_failed` notices go to the
+local banner only (`notify.DeliveringNotifier`, asynchronous - FIX-FINAL
+TUX-5). A status a
 proxy callback, the budget pause or a halt already set mid-run is never
 overridden. A **budget block** (task token ceiling, daily or monthly budget)
 moves the task to `blocked_user` too (owner decision G10-1: resumed only by
