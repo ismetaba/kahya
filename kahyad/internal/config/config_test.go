@@ -2149,3 +2149,80 @@ func TestPassiveBootOnlyForRestore(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveSocketMatchesLoad (FIX-FINAL ops-config-load-gates-halt-and-
+// jobs): ResolveSocket shares Load's layering, so for every valid config
+// they name the same socket.
+func TestResolveSocketMatchesLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml string
+		env        map[string]string
+	}{
+		{"defaults", "", nil},
+		{"data_dir", "data_dir: ~/alt-data\n", nil},
+		{"explicit_socket", "socket: /tmp/kahya-explicit.sock\n", nil},
+		{"dev_profile", "", map[string]string{"KAHYA_ENV": "dev"}},
+		{"env_data_dir", "", map[string]string{"KAHYA_DATA_DIR": "~/env-data"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got, err := ResolveSocket()
+			if err != nil {
+				t.Fatalf("ResolveSocket: %v", err)
+			}
+			if want := ExpandHome(cfg.Socket); got != want {
+				t.Fatalf("ResolveSocket = %q, Load().Socket = %q", got, want)
+			}
+		})
+	}
+}
+
+// TestResolveSocketIgnoresUnrelatedValidators: a config.yaml value one of
+// Load's validators rejects (written while kahyad runs) made `kahya halt`,
+// ⌥⎋ and every job trigger exit without dialing the live daemon.
+// ResolveSocket still names the socket; what the socket itself depends on
+// (KAHYA_ENV, a parseable config.yaml) still fails.
+func TestResolveSocketIgnoresUnrelatedValidators(t *testing.T) {
+	for _, yaml := range []string{
+		"timezone: Europe/Istanbull\n",
+		"log_level: verbose\n",
+		"approval_wait_seconds: 300\ntask_timeout_min: 5\n",
+	} {
+		clearEnv(t)
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		writeConfigYAML(t, home, yaml)
+		if _, err := Load(); err == nil {
+			t.Fatalf("%q: Load accepted it; pick a value a validator rejects", yaml)
+		}
+		got, err := ResolveSocket()
+		want := filepath.Join(home, "Library", "Application Support", "Kahya", "kahyad.sock")
+		if err != nil || got != want {
+			t.Fatalf("%q: ResolveSocket = %q, %v; want %q", yaml, got, err, want)
+		}
+	}
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "bad env")
+	if _, err := ResolveSocket(); err == nil {
+		t.Error("an invalid KAHYA_ENV (it names the socket file) resolved")
+	}
+	t.Setenv("KAHYA_ENV", "")
+	writeConfigYAML(t, home, "socket: [unterminated\n")
+	if _, err := ResolveSocket(); err == nil {
+		t.Error("an unparseable config.yaml resolved a socket")
+	}
+}

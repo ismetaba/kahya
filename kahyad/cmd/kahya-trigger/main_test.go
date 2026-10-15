@@ -140,3 +140,43 @@ func TestRunSendsControlSecretHeader(t *testing.T) {
 		t.Fatalf("%s values seen = %q, want [\"\" %q]", config.ControlSecretHeader, got, secret)
 	}
 }
+
+// writeInvalidButSocketedConfig writes, under a fresh HOME, a config.yaml
+// that names sock as the socket and carries a timezone typo config.Load
+// rejects (FIX-FINAL ops-config-load-gates-halt-and-jobs).
+func writeInvalidButSocketedConfig(t *testing.T, sock string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_SOCKET", "")
+	t.Setenv("KAHYA_ENV", "")
+	dir := filepath.Join(home, "Library", "Application Support", "Kahya")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("socket: "+sock+"\ntimezone: Europe/Istanbull\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(); err == nil {
+		t.Fatal("config.Load accepted the timezone typo")
+	}
+}
+
+// TestRunReachesDaemonDespiteUnrelatedConfigError: a config.yaml value
+// config.Load rejects, written while kahyad runs on its old validated
+// config, made every launchd job trigger fail silently ("resolve socket:
+// config: timezone ..."). The trigger now resolves only the socket and
+// reaches the daemon.
+func TestRunReachesDaemonDespiteUnrelatedConfigError(t *testing.T) {
+	var hits int
+	sock := startFakeKahyad(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte(`{"trace_id":"abc"}`)) //nolint:errcheck
+	})
+	writeInvalidButSocketedConfig(t, sock)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"backup-nightly"}, &out, &errOut); code != 0 || hits != 1 {
+		t.Fatalf("run() = %d, daemon hits = %d, stderr=%s; want 0 and 1", code, hits, errOut.String())
+	}
+}

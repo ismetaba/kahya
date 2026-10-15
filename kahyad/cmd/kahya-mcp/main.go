@@ -329,11 +329,11 @@ func resolveSocket() (string, error) {
 	if v := os.Getenv("KAHYA_SOCKET"); v != "" {
 		return config.ExpandHome(v), nil
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return "", err
-	}
-	return config.ExpandHome(cfg.Socket), nil
+	// FIX-FINAL ops-config-load-gates-halt-and-jobs: only the socket's own
+	// inputs, never config.Load's unrelated validators - a config.yaml typo
+	// written while kahyad runs must not stop `kahya halt` / ⌥⎋ / a job
+	// trigger from reaching the live daemon.
+	return config.ResolveSocket()
 }
 
 // logLine writes one hand-rolled JSONL diagnostic line to w (stderr) -

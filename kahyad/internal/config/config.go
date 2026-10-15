@@ -1054,12 +1054,20 @@ type fileConfig struct {
 // claude-sonnet-5-5).
 const DefaultModelID = "claude-sonnet-5-5"
 
-// Load resolves Config from defaults, an optional config.yaml, and
-// environment overrides, in that precedence order (lowest to highest).
-func Load() (Config, error) {
+// layered is resolveLayers' result: the defaults + config.yaml + env
+// layers applied, before any derivation or validation.
+type layered struct {
+	cfg                                                                  Config
+	home                                                                 string
+	explicitSocket, explicitLogDir, explicitDBPath, explicitApprovalWait bool
+}
+
+// resolveLayers is Load's layering prefix, shared with ResolveSocket so the
+// two can never drift: home, KAHYA_ENV, defaults, config.yaml, env.
+func resolveLayers() (layered, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return Config{}, fmt.Errorf("config: resolve home dir: %w", err)
+		return layered{}, fmt.Errorf("config: resolve home dir: %w", err)
 	}
 
 	// W4-07 dev-profile plumbing: KAHYA_ENV is read HERE, before defaults()
@@ -1105,13 +1113,60 @@ func Load() (Config, error) {
 	var explicitApprovalWait bool
 
 	if fc, ok, err := loadFile(fileCfgPath); err != nil {
-		return Config{}, err
+		return layered{}, err
 	} else if ok {
 		applyFile(&cfg, fc, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
 		explicitApprovalWait = fc.ApprovalWaitSeconds != nil
 	}
 
 	applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
+
+	return layered{cfg: cfg, home: home, explicitSocket: explicitSocket, explicitLogDir: explicitLogDir,
+		explicitDBPath: explicitDBPath, explicitApprovalWait: explicitApprovalWait}, nil
+}
+
+// ResolveSocket returns the control socket a client (kahya, kahya-trigger,
+// kahya-mcp) must dial, resolved exactly as Load resolves Config.Socket but
+// WITHOUT Load's unrelated validators (FIX-FINAL ops-config-load-gates-
+// halt-and-jobs): a config.yaml value one of them rejects - a timezone
+// typo, approval_wait_seconds >= task_timeout_min*60, ritual_max_questions:
+// 0, ... - written while kahyad runs made `kahya halt`, Hammerspoon's ⌥⎋
+// and every launchd job trigger exit without ever dialing the live daemon,
+// which keeps running on its own already-validated config. Only what the
+// socket path itself depends on is still checked: KAHYA_ENV (it names the
+// socket file), an ASCII path, and a readable, parseable config.yaml (else
+// the socket really is unknown). The daemon still refuses to boot on an
+// invalid config (Load).
+func ResolveSocket() (string, error) {
+	l, err := resolveLayers()
+	if err != nil {
+		return "", err
+	}
+	cfg := l.cfg
+	if err := validateEnv(cfg.Env); err != nil {
+		return "", err
+	}
+	if !l.explicitSocket {
+		cfg.Socket = filepath.Join(cfg.DataDir, socketFileName(cfg.Env))
+	}
+	sock := ExpandHome(cfg.Socket)
+	for _, r := range sock {
+		if r > 0x7f {
+			return "", fmt.Errorf("config: socket path %q must be ASCII", sock)
+		}
+	}
+	return sock, nil
+}
+
+// Load resolves Config from defaults, an optional config.yaml, and
+// environment overrides, in that precedence order (lowest to highest).
+func Load() (Config, error) {
+	l, err := resolveLayers()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg, home := l.cfg, l.home
+	explicitSocket, explicitLogDir, explicitDBPath, explicitApprovalWait := l.explicitSocket, l.explicitLogDir, l.explicitDBPath, l.explicitApprovalWait
 
 	// Sync the config-field-driven schedules into cfg.Jobs. The
 	// "truth-ritual" and "morning-briefing" job entries are seeded in
