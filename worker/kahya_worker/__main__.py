@@ -117,9 +117,14 @@ _CLOUD_UNREACHABLE_FALLBACK_MARKERS = (
 # tainted KAHYA_TRACE_ID value itself.
 _SAFE_TRACE_ID_PLACEHOLDER = "redacted"
 
-# The exact 5 memory MCP tool names this worker's "kahya_memory" MCP server
-# exposes (kahyad's own /policy/check policy table keys off these same
-# SDK-prefixed names - see hooks.make_can_use_tool). Kept as documentation/
+# The 5 memory MCP tool names (memory_* + the G13 graph tools) among the
+# tools kahyad's shared /v1/mcp server exposes to this worker under the
+# "kahya_memory" server name. That same server also registers the fs_*,
+# shell_*, applescript_run/jxa_run/shortcuts_run tools (and w2_slow_stub
+# under KAHYA_ENV=dev) - see kahyad/internal/server/mcp.go buildMCPHandler -
+# so this list is NOT the full tool surface. kahyad's /policy/check
+# canonicalizes these SDK-prefixed names to the bare policy.yaml names
+# (policy.Canonicalize) - see hooks.make_can_use_tool. Kept as documentation/
 # cross-check reference only as of the BLOCKER 2 fix in _build_options
 # below: this list is DELIBERATELY NOT passed to
 # ClaudeAgentOptions.allowed_tools anymore. See _build_options's own
@@ -146,7 +151,8 @@ ALLOWED_TOOLS = [
 # The pinned CLI never routes the read-only built-ins (Read/Glob/Grep/LS
 # inside cwd) through can_use_tool at all - its own permission model
 # auto-allows them - so omission + policy gate was NOT enough: the only tools
-# this session may ever call are the kahya_memory MCP tools, every one of
+# this session may ever call are the kahyad-served MCP tools
+# (mcp__kahya_memory__*: memory, graph, fs, shell, osascript), every one of
 # which goes through kahyad's /policy/check (HANDOFF §5 ⚑). Never add an
 # mcp__ name here. A future need for a WebFetch-like capability is a
 # kahyad-owned MCP tool (taint + egress gate), never a removal from this list.

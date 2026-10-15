@@ -96,8 +96,10 @@ class Envelope:
     resume: bool = False
     # mode/schema (W4-03): mode="" (default) is an ordinary Actor/chat
     # session, unchanged from every pre-W4-03 envelope. mode="reader" spawns
-    # a TOOLLESS session (no MCP servers, no memory-injection hook, no
-    # can_use_tool wiring at all - kahya_worker.__main__._run_reader_session)
+    # a TOOLLESS session (no MCP servers, no built-in tools, no
+    # memory-injection hook; its can_use_tool never consults kahyad - it is
+    # kahya_worker.__main__._reader_deny_all_tools, which unconditionally
+    # denies - see _run_reader_session/_build_reader_options)
     # for the W4-03 Reader/Actor split's cloud-Haiku half; schema then names
     # the registered Go-side struct (kahyad/internal/reader.
     # JobTypeMailSummary/JobTypeWebpageExtract) the caller will parse this
