@@ -48,7 +48,7 @@ func (s *Server) memoryServer() *memory.Server {
 		}
 		var searcher memory.Searcher
 		if s.search != nil {
-			searcher = mcpSearchAdapter{inner: s.search, lane: s.memLane}
+			searcher = mcpSearchAdapter{inner: s.search, lane: s.memLane, chunks: s.chunks}
 		}
 		m := memory.New(s.mcpMemoryDir, searcher, s.mcpIndexer, s.eventLogger, s.log)
 		// FIX-U-1: the default inbox day file follows the configured calendar

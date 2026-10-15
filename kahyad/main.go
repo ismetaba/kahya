@@ -629,6 +629,10 @@ func run() int {
 	// later G13 graph/extract/ingest steps reuse it.
 	laneClassifier := memlane.Classifier{Store: st.Queries, MemoryDir: cfg.MemoryDir, SecretGlobs: pol.SecretLaneGlobs, Matcher: ritual.PolicyGlobMatcher{}}
 	srv.SetMemoryLane(&laneClassifier)
+	// FIX-FINAL cloud-chunk-filter-neighbour-drop-needs-coretrieval: the
+	// cloud-facing chunk filter reads a hit's stored Seq±1 neighbours, so a
+	// neighbour returned without its content-secret chunk is still dropped.
+	srv.SetChunkReader(st.Queries)
 	// G13 MEM-1: the retrieval graph layer - the for_injection <hafiza>
 	// block's <olgular> section (config hafiza_graph_enabled, decision
 	// MEM-1.a: on, one hop) - and MEM-4's entity_lookup / fact_query MCP

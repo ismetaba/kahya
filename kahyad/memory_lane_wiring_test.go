@@ -62,3 +62,15 @@ func TestSecretLaneMemoryDirDefaultMatchesMemoryPackage(t *testing.T) {
 			config.DefaultSecretLaneMemoryDir, memory.DefaultSecretLaneDir)
 	}
 }
+
+// TestChunkNeighbourReaderWired (FIX-FINAL cloud-chunk-filter-neighbour-
+// drop-needs-coretrieval): the cloud-facing chunk filter reads a hit's
+// stored Seq±1 neighbours from brain.db, wired before srv.Run (Prepare
+// builds the /v1/mcp handler and its memory_search adapter).
+func TestChunkNeighbourReaderWired(t *testing.T) {
+	set := onlyCallSite(t, "srv", "SetChunkReader", "st.Queries")
+	run := onlyCallSite(t, "srv", "Run", "")
+	if set.offset > run.offset {
+		t.Fatal("SetChunkReader must run before srv.Run")
+	}
+}

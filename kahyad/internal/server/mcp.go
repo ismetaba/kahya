@@ -107,6 +107,9 @@ func (s *Server) SetMCPMemory(memoryDir string, idx memory.Indexer) {
 type mcpSearchAdapter struct {
 	inner Searcher
 	lane  *memlane.Classifier
+	// chunks is cloudChunkFilter's neighbour reader (FIX-FINAL
+	// cloud-chunk-filter-neighbour-drop-needs-coretrieval); nil = tests.
+	chunks ChunkNeighbourReader
 }
 
 func (a mcpSearchAdapter) Search(ctx context.Context, traceID, query string, k int) ([]memory.Hit, error) {
@@ -114,7 +117,7 @@ func (a mcpSearchAdapter) Search(ctx context.Context, traceID, query string, k i
 	if err != nil {
 		return nil, err
 	}
-	return a.toMemoryHits(hits), nil
+	return a.toMemoryHits(ctx, hits), nil
 }
 
 // FilteredSearcher is the optional filtered search (FIX-MEM-4,
@@ -148,7 +151,7 @@ func (a mcpSearchAdapter) SearchFiltered(ctx context.Context, traceID, query str
 	if err != nil {
 		return nil, err
 	}
-	return a.toMemoryHits(hits), nil
+	return a.toMemoryHits(ctx, hits), nil
 }
 
 func parseFilterTime(s string) (time.Time, error) {
@@ -164,11 +167,12 @@ func parseFilterTime(s string) (time.Time, error) {
 
 // toMemoryHits converts the ranked hits for the CLOUD worker's
 // memory_search tool result, dropping every secret-path note (FIX-U-3) and
-// every content-secret chunk with its overlap neighbours, also when no
-// lane classifier is wired (cloudChunkFilter, FIX-FINAL
+// every content-secret chunk with its overlap neighbours (read from the
+// stored chunks when a.chunks is wired; a read error drops the hit), also
+// when no lane classifier is wired (cloudChunkFilter, FIX-FINAL
 // cloud-hafiza-chunks-not-content-classified).
-func (a mcpSearchAdapter) toMemoryHits(hits []search.Hit) []memory.Hit {
-	hits, _, _ = cloudChunkFilter(a.lane, hits)
+func (a mcpSearchAdapter) toMemoryHits(ctx context.Context, hits []search.Hit) []memory.Hit {
+	hits, _, _, _ = cloudChunkFilter(ctx, a.lane, a.chunks, hits)
 	out := make([]memory.Hit, 0, len(hits))
 	for _, h := range hits {
 		out = append(out, memory.Hit{

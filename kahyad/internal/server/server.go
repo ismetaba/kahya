@@ -120,6 +120,8 @@ type Server struct {
 	// memory_lane.go's SetMCPMemorySecretLane / SetMemoryLane.
 	mcpSecretLane memory.SecretLaneSeam
 	memLane       *memlane.Classifier
+	// chunks is cloudChunkFilter's stored-neighbour reader (SetChunkReader).
+	chunks ChunkNeighbourReader
 
 	// graph is the retrieval graph layer (G13 MEM-1, memory_graph.go): the
 	// for_injection <hafiza> block's <olgular> section. nil until SetGraph.

@@ -16,6 +16,7 @@ import (
 	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/spawn"
+	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/mcp/memory"
 )
 
@@ -38,17 +39,41 @@ type hafizaBlock struct {
 	Ledgered bool
 }
 
+// ChunkNeighbourReader reads one episode's stored chunks in seq order
+// (sqlcgen.Queries.ListChunksByEpisode) - cloudChunkFilter's source for a
+// hit's Seq±1 neighbours that are not themselves among the hits.
+type ChunkNeighbourReader interface {
+	ListChunksByEpisode(ctx context.Context, episodeID int64) ([]sqlcgen.Chunk, error)
+}
+
+// SetChunkReader wires cloudChunkFilter's neighbour reader (FIX-FINAL
+// cloud-chunk-filter-neighbour-drop-needs-coretrieval). nil (tests) = only
+// the neighbours among the hits are checked; production always wires it.
+// Call before Prepare().
+func (s *Server) SetChunkReader(r ChunkNeighbourReader) { s.chunks = r }
+
 // cloudChunkFilter keeps only the hits a CLOUD model may receive: a hit
 // whose note is secret-lane by path (lane.PathIsSecret, skipped when lane
 // is nil) or whose text is secret-lane by content (memlane.ContentIsSecret,
 // always - a nil lane still fails closed on content) is dropped, and so
-// are the hits for the chunks either side of a content-dropped one in the
+// are the hits for the chunks either side of a content-secret one in the
 // same note (Seq±1): the chunker's overlap (indexer.OverlapRunes) means a
 // neighbour can render the leading or trailing part of the same IBAN
 // without classifying itself. Order is preserved. Shared by the cloud
 // <hafiza> block and the memory_search MCP tool result (FIX-FINAL
 // cloud-hafiza-chunks-not-content-classified).
-func cloudChunkFilter(lane *memlane.Classifier, hits []search.Hit) (kept []search.Hit, pathDropped, contentDropped int) {
+//
+// The neighbour decision is made from the STORED chunks, not from the hit
+// set (FIX-FINAL cloud-chunk-filter-neighbour-drop-needs-coretrieval): a
+// query matching only the neighbour's own paragraph returned it alone, so
+// its secret Seq-1/Seq+1 chunk was never seen and the partial IBAN reached
+// the cloud. With a reader wired, each kept hit's episode chunks are read
+// once per call and the hit is dropped when its Seq-1 or Seq+1 text is
+// content-secret; a read error drops the hit (fail-closed) and is
+// returned as readErr. Seq±1 is enough: the 200-rune overlap is wider than
+// any secret token the deterministic pre-pass matches, so a token cut by
+// a chunk boundary lies whole in an adjacent chunk.
+func cloudChunkFilter(ctx context.Context, lane *memlane.Classifier, chunks ChunkNeighbourReader, hits []search.Hit) (kept []search.Hit, pathDropped, contentDropped int, readErr error) {
 	type chunkKey struct {
 		path string
 		seq  int64
@@ -58,6 +83,31 @@ func cloudChunkFilter(lane *memlane.Classifier, hits []search.Hit) (kept []searc
 		if memlane.ContentIsSecret(h.Text) {
 			contentSecret[chunkKey{h.Path, h.Seq}] = true
 		}
+	}
+	type episodeChunks struct {
+		secretSeq map[int64]bool
+		err       error
+	}
+	episodes := make(map[int64]episodeChunks)
+	storedNeighbourSecret := func(h search.Hit) (bool, error) {
+		if chunks == nil {
+			return false, nil
+		}
+		ep, ok := episodes[h.EpisodeID]
+		if !ok {
+			rows, err := chunks.ListChunksByEpisode(ctx, h.EpisodeID)
+			ep = episodeChunks{secretSeq: make(map[int64]bool), err: err}
+			for _, c := range rows {
+				if memlane.ContentIsSecret(c.Text) {
+					ep.secretSeq[c.Seq] = true
+				}
+			}
+			episodes[h.EpisodeID] = ep
+		}
+		if ep.err != nil {
+			return true, ep.err
+		}
+		return ep.secretSeq[h.Seq-1] || ep.secretSeq[h.Seq] || ep.secretSeq[h.Seq+1], nil
 	}
 	kept = make([]search.Hit, 0, len(hits))
 	for _, h := range hits {
@@ -69,9 +119,16 @@ func cloudChunkFilter(lane *memlane.Classifier, hits []search.Hit) (kept []searc
 			contentDropped++
 			continue
 		}
+		if secret, err := storedNeighbourSecret(h); secret {
+			if err != nil && readErr == nil {
+				readErr = err
+			}
+			contentDropped++
+			continue
+		}
 		kept = append(kept, h)
 	}
-	return kept, pathDropped, contentDropped
+	return kept, pathDropped, contentDropped, readErr
 }
 
 // buildHafizaBlock filters hits for injection into a model input of lane
@@ -115,7 +172,11 @@ func (s *Server) buildHafizaBlock(ctx context.Context, traceID, taskID, query st
 	}
 	if cloudFacing {
 		var pathDropped, contentDropped int
-		eligible, pathDropped, contentDropped = cloudChunkFilter(s.memLane, eligible)
+		var readErr error
+		eligible, pathDropped, contentDropped, readErr = cloudChunkFilter(ctx, s.memLane, s.chunks, eligible)
+		if readErr != nil {
+			s.log.With(traceID).Warn("memory_search_secret_content_dropped", "reason", "read_error", "for_injection", true, "lane", lane, "err", readErr.Error())
+		}
 		if pathDropped > 0 {
 			s.log.With(traceID).Debug("memory_search_secret_path_dropped", "dropped", pathDropped, "for_injection", true, "lane", lane)
 		}

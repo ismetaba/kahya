@@ -579,7 +579,10 @@ a cloud model, without changing anything in §2-§6 above:
   deterministic pre-pass classifies secret (`memlane.ContentIsSecret`:
   IBAN/TCKN/card + the finans/saglik/kimlik lexicon, the rule fs_read and
   memory_write use; also when no lane classifier is wired), together with
-  that chunk's overlap neighbours (Seq±1 of the same note), JSONL
+  that chunk's overlap neighbours (Seq±1 of the same note - read from the
+  STORED chunks, `Server.SetChunkReader`, so a neighbour returned without
+  its secret chunk is dropped too; a chunk read error drops the hit,
+  FIX-FINAL cloud-chunk-filter-neighbour-drop-needs-coretrieval), JSONL
   `memory_search_secret_content_dropped`; `for_injection:false` (the local
   surface) and a secret-lane task's local block are unfiltered by lane.
   Nightly consolidation's `consolidation.PartitionByLane` keeps a
