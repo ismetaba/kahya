@@ -15,8 +15,16 @@
 package egress
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"net/http"
 )
+
+// anthproxyMaxBodyBytes mirrors kahyad/internal/anthproxy's
+// proxyRequestMaxBytes (this package must not import anthproxy): a body of
+// unknown length larger than this is refused before it is ever sized.
+const anthproxyMaxBodyBytes = 16 << 20
 
 // TerminalEgressReason is the reason id GateDenial.TerminalEgressReason
 // reports for a deterministic denial (FIX-U-4); it equals
@@ -57,9 +65,15 @@ func (d *GateDenial) TerminalEgressReason() string {
 // Anthropic upstream's own host:port, resolved once at boot
 // (kahyad/main.go's hostPortFromURL) — for every request THIS task's
 // worker sends through its own per-task anthproxy listener, with
-// nbytes taken from the request's Content-Length (clamped to 0 when
-// absent/chunked, matching Gate.Check's own pre-admission-estimate
-// convention) and session keyed on traceID: SessionInfo{SessionID:
+// nbytes taken from the request's Content-Length - or, for a body of
+// unknown length (chunked, ContentLength -1), from its REAL byte count:
+// the hook buffers it (capped at anthproxyMaxBodyBytes; a read error or an
+// oversized body is refused, fail-closed) and restores r.Body/
+// ContentLength so the proxy forwards the same bytes. This is the
+// anthproxy counterpart of egress/proxy.go's MINOR F counting reader;
+// before it a chunked model call was admitted as 0 bytes and the per-host
+// daily byte budget (HANDOFF §5 #1 "hacim bütçesi") never moved
+// (FIX-FINAL egress-budget-chunked-bypass). Session keyed on traceID: SessionInfo{SessionID:
 // traceID, TaskID: taskID, TraceID: traceID}. Keying SessionID on
 // traceID (never left empty, never a caller-supplied/model-supplied
 // value) is the fix itself — it is the SAME identity mcp/fs's fs_read
@@ -75,6 +89,19 @@ func NewAnthproxyEgressGateHook(gate *Gate, host string, port int) func(taskID, 
 			nbytes := r.ContentLength
 			if nbytes < 0 {
 				nbytes = 0
+				if r.Body != nil && r.Body != http.NoBody {
+					b, err := io.ReadAll(io.LimitReader(r.Body, anthproxyMaxBodyBytes+1))
+					if err != nil {
+						return fmt.Errorf("egress: read model-call body of unknown length: %w", err)
+					}
+					if len(b) > anthproxyMaxBodyBytes {
+						return fmt.Errorf("egress: model-call body of unknown length exceeds %d bytes", anthproxyMaxBodyBytes)
+					}
+					_ = r.Body.Close()
+					r.Body = io.NopCloser(bytes.NewReader(b))
+					r.ContentLength = int64(len(b))
+					nbytes = int64(len(b))
+				}
 			}
 			decision, err := gate.Check(r.Context(), Target{Host: host, Port: port}, nbytes,
 				SessionInfo{SessionID: traceID, TaskID: taskID, TraceID: traceID})

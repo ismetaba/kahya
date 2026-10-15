@@ -1,7 +1,9 @@
 package egress
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -155,4 +157,67 @@ func TestNewAnthproxyEgressGateHook_DenialCarriesTerminalReason(t *testing.T) {
 	if TerminalEgressReason != "egress_blocked" {
 		t.Fatalf("TerminalEgressReason = %q, must equal anthproxy.ReasonEgressBlocked %q", TerminalEgressReason, "egress_blocked")
 	}
+}
+
+// TestNewAnthproxyEgressGateHook_ChunkedBodyCountsRealBytes (FIX-FINAL
+// egress-budget-chunked-bypass): a body of unknown length (chunked,
+// ContentLength -1) used to be admitted as 0 bytes, so the per-host daily
+// byte budget never moved. It is now sized by its real byte count, its
+// bytes are restored unchanged for the proxy to forward, and an oversized
+// one is refused.
+func TestNewAnthproxyEgressGateHook_ChunkedBodyCountsRealBytes(t *testing.T) {
+	budget := newFakeBudget()
+	gate := NewGate(policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "api.anthropic.com"}},
+		DefaultDailyByteBudget: 1000,
+	}, NewSensitiveTracker(), budget, &fakeLedger{}, nil, nil)
+	hook := NewAnthproxyEgressGateHook(gate, "api.anthropic.com", 443)("task-1", "trace-1")
+	chunked := func(body []byte) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "http://ignored/v1/messages", io.NopCloser(bytes.NewReader(body)))
+		r.ContentLength = -1
+		return r
+	}
+	recorded := func() int64 {
+		var total int64
+		for _, v := range budget.m {
+			total += v
+		}
+		return total
+	}
+
+	body := bytes.Repeat([]byte("a"), 600)
+	r := chunked(body)
+	if err := hook(r); err != nil {
+		t.Fatalf("first 600-byte chunked call refused: %v", err)
+	}
+	if got := recorded(); got != 600 {
+		t.Fatalf("budget recorded %d bytes, want 600", got)
+	}
+	forwarded, err := io.ReadAll(r.Body)
+	if err != nil || !bytes.Equal(forwarded, body) {
+		t.Fatalf("restored body = %d bytes (err %v), want the original %d bytes unchanged", len(forwarded), err, len(body))
+	}
+	if r.ContentLength != 600 {
+		t.Fatalf("ContentLength = %d, want 600 after sizing", r.ContentLength)
+	}
+
+	err = hook(chunked(bytes.Repeat([]byte("b"), 600)))
+	if d, ok := err.(*GateDenial); !ok || d.Rule != EventBlockedBudget {
+		t.Fatalf("second 600-byte chunked call = %v, want a budget denial", err)
+	}
+
+	big := httptest.NewRequest(http.MethodPost, "http://ignored/v1/messages", io.NopCloser(io.LimitReader(zeroReader{}, anthproxyMaxBodyBytes+10)))
+	big.ContentLength = -1
+	if err := hook(big); err == nil {
+		t.Fatal("an oversized chunked body was admitted, want a fail-closed refusal")
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
