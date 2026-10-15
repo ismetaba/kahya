@@ -115,8 +115,9 @@ func TestLoadRetrievalDatasetSHAChangesWithBytes(t *testing.T) {
 
 // --- injectedSet (the injection filter) ---
 
-// TestInjectedSetTierAndTopK: injectedSet mirrors the live injection exactly -
-// a tier filter (agent_derived dropped) + a top-K cap, in the score-desc order
+// TestInjectedSetTierAndTopK: injectedSet mirrors the live injection's tier
+// filter + top-K cap (the cloud lane's FIX-U-3 secret-path drop is out of
+// scope - see injectedSet's doc) - a tier filter (agent_derived dropped) + a top-K cap, in the score-desc order
 // Search delivers, and DELIBERATELY no numeric score floor (a low-scoring but
 // tier-eligible hit is NOT dropped: the fused Score is min-max normalized, so a
 // floor on it cannot distinguish relevant from nearest-but-irrelevant - see

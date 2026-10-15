@@ -132,10 +132,12 @@ type RetrievalSearcher interface {
 	Search(ctx context.Context, traceID, query string, k int) ([]search.Hit, error)
 }
 
-// injectedSet reproduces the <hafiza> chunk-injection filter for scoring
-// EXACTLY: tier-eligible (factengine.TierInjectionEligible, confirmed=false -
-// a chunk carries no per-item human confirmation, exactly as
-// server.handleMemorySearch applies it), taking the top-k. There is
+// injectedSet applies the LANE-INDEPENDENT part of the <hafiza>
+// chunk-injection filter for scoring: tier-eligible
+// (factengine.TierInjectionEligible, confirmed=false - a chunk carries no
+// per-item human confirmation), taking the top-k. That is exactly the chunk
+// filter of the secret-lane / local block (server.buildHafizaBlock with
+// spawn.LaneSecret, FIX-MEM-7). There is
 // deliberately NO numeric score floor: the live chunk-injection path applies
 // none (it filters by tier, then memory.RenderKept caps at top-6 / a
 // 4000-rune budget), and - critically - the fused search.Hit.Score is
@@ -150,7 +152,21 @@ type RetrievalSearcher interface {
 // A relevance-calibrated abstention floor for the hybrid vector path (an
 // absolute cosine/BM25 signal, not the min-max-normalized fused score) is
 // future reranker work (HANDOFF §8, "only if eval precision falls short");
-// this eval measures exactly what the live path injects today.
+// this eval measures what the live path's tier + top-k filter injects
+// (see the secret_lane_globs note below).
+//
+// Since FIX-U-3 the cloud-facing block (handleMemorySearch
+// for_injection:true, spawn.LaneNormal) and the memory_search MCP tool also
+// drop chunks whose note matches secret_lane_globs (memlane.PathIsSecret:
+// finans*.md, gizli/**, ...) - and, since FIX-FINAL
+// cloud-hafiza-chunks-not-content-classified, chunks whose text the
+// deterministic pre-pass classifies secret. This policy-free scorer does
+// not. An item whose expected ref sits under a secret glob (or in a
+// content-secret chunk) is therefore scored as the local secret-lane block
+// would carry it, not the cloud block; keep such items out of the dataset
+// when cloud-lane precision is what you want to measure. `kahya eval
+// export-ritual` drafts never contain them: ritual.Sampler excludes
+// secret-lane facts. (FIX-FINAL eval-injectedset-misses-u3-path-filter.)
 //
 // The live block also removes the chunker's overlap between two consecutive
 // chunks of one note (FIX-MEM-8, memory.RenderKeptDeduped). That only trims
@@ -197,7 +213,9 @@ func expectedAppears(expected []ExpectedRef, injected []search.Hit) bool {
 //   - unanswerable -> correct iff the expected (corpus-absent) answer does
 //     NOT appear (retrieval correctly declined to surface a false answer).
 //
-// This mirrors the live injection (tier-eligible top-K, no numeric floor):
+// This mirrors the live injection's tier-eligible top-K (no numeric floor;
+// the cloud lane's secret_lane_globs / content drop is not applied - see
+// injectedSet):
 // answerable=fail-to-surface and unanswerable=falsely-surface both score
 // wrong. abstained (surfaced in the API response) reports whether the
 // expected evidence was NOT surfaced - the good outcome for an unanswerable
