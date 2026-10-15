@@ -109,6 +109,98 @@ func TestPathIsSecretFoldsCaseAndNormalization(t *testing.T) {
 	}
 }
 
+// rawOnlySecretCases are secret-lane globs whose meaning depends on the
+// exact spelling: the byte-exact match holds, the folded one does not.
+// A negated character class stops excluding the folded rune ("X" folds
+// into [a-z]; dotted capital I folds to "i"), and a '?' standing for the
+// combining mark of a decomposed (NFD) sequence has no rune left to stand
+// for once NFC composes it.
+var rawOnlySecretCases = []struct{ glob, rel string }{
+	{"/m/[!a-z]*.md", "X.md"},
+	{"/m/[!a-z]*.md", "İ.md"},
+	{"/m/gizli/[!a-z]*/**", "gizli/Q/x.md"},
+	{"/m/e?.md", "é.md"},
+}
+
+// TestPathIsSecretKeepsEveryByteExactMatch (FIX-U-3 review, round 2): the
+// folded match is ORed onto the byte-exact one, never in its place. Each
+// case's glob matches the raw path but not the folded one; a folded-only
+// rule called such a path normal and handed it to the cloud lane.
+func TestPathIsSecretKeepsEveryByteExactMatch(t *testing.T) {
+	for _, tc := range rawOnlySecretCases {
+		abs := filepath.Join(testMemoryDir, filepath.FromSlash(tc.rel))
+		if raw, err := policy.MatchGlob(tc.glob, abs); err != nil || !raw {
+			t.Fatalf("precondition: byte-exact MatchGlob(%q, %q) = %v, %v; want true", tc.glob, abs, raw, err)
+		}
+		if folded, err := policy.MatchGlob(FoldForSecretGlob(tc.glob), FoldForSecretGlob(abs)); err != nil || folded {
+			t.Fatalf("precondition: folded MatchGlob(%q, %q) = %v, %v; want false (case no longer exercises the raw-only match)", tc.glob, abs, folded, err)
+		}
+		c := Classifier{MemoryDir: testMemoryDir, SecretGlobs: []string{tc.glob}, Matcher: policyMatcher{}}
+		if !c.PathIsSecret(tc.rel) {
+			t.Errorf("PathIsSecret(%q) under glob %q = false, want true (the byte-exact match holds)", tc.rel, tc.glob)
+		}
+	}
+}
+
+// TestPathIsSecretIsSupersetOfByteExactMatch: over a cross product of
+// globs and stored spellings, every path the byte-exact policy.MatchGlob
+// covers is secret - folding only ever adds secret paths.
+func TestPathIsSecretIsSupersetOfByteExactMatch(t *testing.T) {
+	globs := []string{
+		"/m/finans*.md", "/m/gizli/**", "/m/[A-Z]*/**", "/m/Gizli/**", "/m/?.md",
+		"/m/[!g]*/**", "/m/[!a-z]*.md", "/m/gizli/[!a-z]*/**", "/m/e?.md",
+	}
+	rels := []string{
+		"X.md", "x.md", "İ.md", "i.md", "é.md", "é.md",
+		"Gizli/a.md", "gizli/a.md", "GİZLİ/a.md", "gizli/Q/x.md", "gizli/q/x.md",
+		"finans.md", "FINANS.md", "notes/ev.md", "Notes/ev.md",
+	}
+	for _, g := range globs {
+		c := Classifier{MemoryDir: testMemoryDir, SecretGlobs: []string{g}, Matcher: policyMatcher{}}
+		for _, rel := range rels {
+			raw, err := policy.MatchGlob(g, filepath.Join(testMemoryDir, filepath.FromSlash(rel)))
+			if err != nil {
+				t.Fatalf("MatchGlob(%q, %q): %v", g, rel, err)
+			}
+			if raw && !c.PathIsSecret(rel) {
+				t.Errorf("glob %q byte-exact-matches %q but PathIsSecret = false", g, rel)
+			}
+		}
+	}
+}
+
+// TestMatchesSecretGlobFailsClosed: no matcher, or an error from either
+// the byte-exact or the folded match, counts as a match.
+func TestMatchesSecretGlobFailsClosed(t *testing.T) {
+	if !MatchesSecretGlob(nil, "/m/gizli/**", "/m/notes/ev.md") {
+		t.Error("MatchesSecretGlob(nil matcher) = false, want true")
+	}
+	if !MatchesSecretGlob(erroringMatcher{}, "/m/gizli/**", "/m/notes/ev.md") {
+		t.Error("MatchesSecretGlob(erroring matcher) = false, want true")
+	}
+	second := &failOnCall{n: 2}
+	if !MatchesSecretGlob(second, "/m/Gizli/**", "/m/notes/ev.md") {
+		t.Error("MatchesSecretGlob(folded match errors) = false, want true")
+	}
+	if second.calls != 2 {
+		t.Errorf("matcher calls = %d, want 2 (byte-exact, then folded)", second.calls)
+	}
+	if MatchesSecretGlob(policyMatcher{}, "/m/gizli/**", "/m/notes/ev.md") {
+		t.Error("MatchesSecretGlob(ordinary path) = true, want false")
+	}
+}
+
+// failOnCall answers "no match" until its n-th call, which errors.
+type failOnCall struct{ n, calls int }
+
+func (f *failOnCall) Match(string, string) (bool, error) {
+	f.calls++
+	if f.calls == f.n {
+		return false, errors.New("bad glob")
+	}
+	return false, nil
+}
+
 type erroringMatcher struct{}
 
 func (erroringMatcher) Match(string, string) (bool, error) { return false, errors.New("bad glob") }

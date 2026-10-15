@@ -151,8 +151,9 @@ func (s *Server) secretLaneTarget(requested string) string {
 // write unless some glob provably covers the target (fail-closed in the
 // direction that matters - an uncovered secret note would look normal to
 // every path-based rule downstream). It is deliberately byte-exact, i.e.
-// stricter than the case-/normalisation-folded downstream rules
-// (memlane.PathIsSecret, consolidation.PartitionByLane): a note this
+// stricter than the downstream rules (memlane.PathIsSecret,
+// consolidation.PartitionByLane - memlane.MatchesSecretGlob: byte-exact
+// OR case-/normalisation-folded, a superset of this check): a note this
 // package places is covered for a byte-exact consumer too.
 func (s *Server) secretGlobCovers(relPath string) bool {
 	abs := filepath.Join(s.MemoryDir, filepath.FromSlash(relPath))

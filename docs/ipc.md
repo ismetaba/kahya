@@ -508,11 +508,16 @@ a cloud model, without changing anything in §2-§6 above:
   `consolidation.PartitionByLane` keeps a `gizli/**` note in the local lane,
   and a secret-lane glob it cannot evaluate now counts as a match (local
   lane, fail-closed) instead of "no match" (cloud lane). Both memory-side
-  path rules (`memlane.PathIsSecret`, `PartitionByLane`) fold glob and path
-  first (`memlane.FoldForSecretGlob`: NFC, Turkish I family, lowercase), so
-  a case or normalisation variant of a secret path (`Gizli/banka.md`,
-  `FINANS.md`) is local-lane too; over-matching only keeps a note on the
-  machine.
+  path rules (`memlane.PathIsSecret`, `PartitionByLane`) share
+  `memlane.MatchesSecretGlob`: a path is secret when the byte-exact match
+  OR the match of the folded glob against the folded path holds
+  (`memlane.FoldForSecretGlob`: NFC, Turkish I family, lowercase), so a
+  case or normalisation variant of a secret path (`Gizli/banka.md`,
+  `FINANS.md`) is local-lane too. The byte-exact match is never dropped:
+  folding can change a glob's meaning (a negated class `[!a-z]`, a `?` for
+  one rune of an NFD name), so only the OR makes folding a pure superset -
+  it only ever adds secret paths, and over-matching only keeps a note on
+  the machine.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/secretlane"
 	"kahya/mcp/memory"
 )
@@ -135,6 +136,39 @@ func TestPartitionByLaneCaseVariantSecretPathsGoLocal(t *testing.T) {
 		_, isLocal := local[rel]
 		if wantLocal := content == "user secret"; isLocal != wantLocal {
 			t.Errorf("%s: local = %v, want %v (cloud = %v)", rel, isLocal, wantLocal, keys(cloud))
+		}
+	}
+}
+
+// TestPartitionByLaneKeepsByteExactSecretMatch (FIX-U-3 review, round 2):
+// the folded match is ORed onto the byte-exact one, never in its place. A
+// user glob whose meaning depends on the exact spelling - a negated
+// character class ("X" folds into [a-z], dotted capital I folds to "i") or
+// a '?' standing for the combining mark of a decomposed (NFD) name - byte-
+// exact-matches the stored path but not the folded one. Such a file stays
+// in the LOCAL lane; the folded-only rule put it in the cloud lane.
+func TestPartitionByLaneKeepsByteExactSecretMatch(t *testing.T) {
+	const memDir = "/m"
+	for _, tc := range []struct{ glob, rel string }{
+		{"/m/[!a-z]*.md", "X.md"},
+		{"/m/[!a-z]*.md", "İ.md"},
+		{"/m/gizli/[!a-z]*/**", "gizli/Q/x.md"},
+		{"/m/e?.md", "e\u0301.md"},
+	} {
+		abs := filepath.Join(memDir, filepath.FromSlash(tc.rel))
+		if raw, err := (PolicyGlobMatcher{}).Match(tc.glob, abs); err != nil || !raw {
+			t.Fatalf("precondition: byte-exact Match(%q, %q) = %v, %v; want true", tc.glob, abs, raw, err)
+		}
+		if folded, err := (PolicyGlobMatcher{}).Match(memlane.FoldForSecretGlob(tc.glob), memlane.FoldForSecretGlob(abs)); err != nil || folded {
+			t.Fatalf("precondition: folded Match(%q, %q) = %v, %v; want false", tc.glob, abs, folded, err)
+		}
+		files := map[string]string{tc.rel: "user secret", "notes.md": "ordinary"}
+		cloud, local := PartitionByLane(files, memDir, []string{tc.glob}, PolicyGlobMatcher{})
+		if _, ok := local[tc.rel]; !ok {
+			t.Errorf("%q under glob %q: not in the local lane (cloud = %v)", tc.rel, tc.glob, keys(cloud))
+		}
+		if _, ok := cloud["notes.md"]; !ok {
+			t.Errorf("notes.md under glob %q: not in the cloud lane (local = %v)", tc.glob, keys(local))
 		}
 	}
 }
