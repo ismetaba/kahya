@@ -28,10 +28,16 @@ import (
 // JobTypeFactExtract (G13 MEM-3) is the knowledge extractor's schema: the
 // (subject, predicate, object) facts and entities one or more memory
 // chunks state, each fact citing a verbatim span of a chunk it was shown.
+//
+// JobTypeDocIngest (G13 MEM-6) is `kahya ingest`'s schema: one external
+// document's title, summary, key points, dates/amounts and the entities and
+// facts it states (each fact citing a verbatim span of the document,
+// chunk_id 0).
 const (
 	JobTypeMailSummary    = "mail_summary_v1"
 	JobTypeWebpageExtract = "webpage_extract_v1"
 	JobTypeFactExtract    = "fact_extract_v1"
+	JobTypeDocIngest      = "doc_ingest_v1"
 )
 
 // Field length ceilings (task spec step 5, verbatim char counts - RUNE
@@ -405,4 +411,94 @@ func RenderExtractInput(chunks []ExtractChunk) string {
 		fmt.Fprintf(&b, "### CHUNK %d\n%s\n\n", c.ID, c.Text)
 	}
 	return b.String()
+}
+
+// doc_ingest_v1 field ceilings (rune counts; the handbook's G13 MEM-6
+// values, the date/amount list caps added to bound the note).
+const (
+	ingestTitleMaxLen    = 200
+	ingestSummaryMaxLen  = 1000
+	ingestKeyPointMaxLen = 300
+	ingestKeyPointsMax   = 20
+	ingestDatesMax       = 20
+	ingestAmountsMax     = 20
+)
+
+// DocIngestChunkID is the chunk id every doc_ingest_v1 fact cites: the
+// whole document is one "chunk".
+const DocIngestChunkID = 0
+
+// DocIngestV1 is the registered Go struct for JobTypeDocIngest. Like
+// FactExtractV1 it has NO trust-level field: an ingested document's tier is
+// the call site's external_doc (kahyad/internal/ingest), never the model's
+// say-so; unknown keys are dropped by the decoder.
+type DocIngestV1 struct {
+	Title     string            `json:"title"`
+	Summary   string            `json:"summary"`
+	KeyPoints []string          `json:"key_points"`
+	Dates     []string          `json:"dates"`
+	Amounts   []string          `json:"amounts"`
+	Entities  []ExtractEntityV1 `json:"entities"`
+	Facts     []ExtractFactV1   `json:"facts"`
+}
+
+// ValidateDocIngestV1 sanitizes and validates every field of v against the
+// document it was extracted from and returns a NEW, fully validated
+// DocIngestV1 - or the first failure, with no partial output. title (<= 200
+// runes, may be empty), summary (<= 1000), key points (<= 20 of <= 300
+// runes, blank ones dropped) are single-line sanitized fields; dates are
+// RFC3339 and amounts match the mail schema's amount pattern (<= 20 each);
+// entities and facts follow ValidateFactExtractV1's rules with the document
+// as the only chunk (DocIngestChunkID): a fact citing another chunk, or
+// whose quote is not a verbatim span of the document, rejects the answer.
+func ValidateDocIngestV1(v DocIngestV1, docText string) (DocIngestV1, error) {
+	title, err := sanitizeField("title", strings.TrimSpace(v.Title), ingestTitleMaxLen)
+	if err != nil {
+		return DocIngestV1{}, err
+	}
+	summary, err := sanitizeField("summary", strings.TrimSpace(v.Summary), ingestSummaryMaxLen)
+	if err != nil {
+		return DocIngestV1{}, err
+	}
+	if len(v.KeyPoints) > ingestKeyPointsMax {
+		return DocIngestV1{}, fmt.Errorf("key_points: %d entries exceeds max %d", len(v.KeyPoints), ingestKeyPointsMax)
+	}
+	points := make([]string, 0, len(v.KeyPoints))
+	for i, p := range v.KeyPoints {
+		sanitized, err := sanitizeField(fmt.Sprintf("key_points[%d]", i), strings.TrimSpace(p), ingestKeyPointMaxLen)
+		if err != nil {
+			return DocIngestV1{}, err
+		}
+		if sanitized != "" {
+			points = append(points, sanitized)
+		}
+	}
+	if len(v.Dates) > ingestDatesMax {
+		return DocIngestV1{}, fmt.Errorf("dates: %d entries exceeds max %d", len(v.Dates), ingestDatesMax)
+	}
+	dates := make([]string, 0, len(v.Dates))
+	for i, d := range v.Dates {
+		if _, err := time.Parse(time.RFC3339, d); err != nil {
+			return DocIngestV1{}, fmt.Errorf("dates[%d]: %q is not RFC3339: %w", i, d, err)
+		}
+		dates = append(dates, d)
+	}
+	if len(v.Amounts) > ingestAmountsMax {
+		return DocIngestV1{}, fmt.Errorf("amounts: %d entries exceeds max %d", len(v.Amounts), ingestAmountsMax)
+	}
+	amounts := make([]string, 0, len(v.Amounts))
+	for i, a := range v.Amounts {
+		if !amountRe.MatchString(a) {
+			return DocIngestV1{}, fmt.Errorf("amounts[%d]: %q does not match ^[0-9.,]+ ?(TL|USD|EUR)$", i, a)
+		}
+		amounts = append(amounts, a)
+	}
+	graph, err := ValidateFactExtractV1(FactExtractV1{Entities: v.Entities, Facts: v.Facts}, map[int64]string{DocIngestChunkID: docText})
+	if err != nil {
+		return DocIngestV1{}, err
+	}
+	return DocIngestV1{
+		Title: title, Summary: summary, KeyPoints: points, Dates: dates, Amounts: amounts,
+		Entities: graph.Entities, Facts: graph.Facts,
+	}, nil
 }
