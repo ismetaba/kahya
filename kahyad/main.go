@@ -727,6 +727,8 @@ func run() int {
 	// /v1/fact*, /v1/entity* routes (SetFactEngine).
 	factEngine := factengine.New(st.Queries, taintTracker, st)
 	srv.SetFactEngine(factEngine)
+	// G13 MEM-2 phase 2: `kahya entity list|show` read the same engine.
+	srv.SetEntityReader(factEngine)
 
 	// W5-03: the "hatirladi ani" (remembered-moment) marking flow's single
 	// write path - shared by POST /v1/remembered (`kahya remembered

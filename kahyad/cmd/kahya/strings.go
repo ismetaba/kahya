@@ -298,7 +298,7 @@ const (
 
 	// MsgEntityUsage is printed when `kahya entity` is given anything
 	// other than a recognized "merge"/"split" subcommand. Exit 2.
-	MsgEntityUsage = "kullanım: kahya entity merge <a> <b> --evidence <olgu_id> | kahya entity split <birleştirme_defteri_id>"
+	MsgEntityUsage = "kullanım: kahya entity list [<ad>] [--provisional] | kahya entity show <id> | kahya entity merge <a> <b> --evidence <olgu_id> | kahya entity split <birleştirme_defteri_id>"
 
 	// MsgEntityMergeUsage is printed when `kahya entity merge` is missing
 	// its two entity-id positional args or its required --evidence flag.
@@ -597,4 +597,29 @@ const (
 	// /v1/memory/extract (an unknown episode/file, a run already in
 	// progress, a store error - the daemon's English detail).
 	MsgMemoryExtractFailed = "Hafıza çıkarımı başarısız: %s"
+
+	// `kahya entity list|show` (G13 MEM-2 phase 2; the handbook's byte-exact
+	// texts). MsgEntityListHeader %d = rows; MsgEntityListRow: id,
+	// canonical name, kind, MsgEntityProvisionalSuffix or "", active fact
+	// count.
+	MsgEntityListHeader        = "Varlıklar (%d):"
+	MsgEntityListRow           = "#%d  %s  [%s]%s  olgu:%d"
+	MsgEntityProvisionalSuffix = " (geçici)"
+	// MsgEntityShowHeader: id, canonical name, kind; MsgEntityAliases: the
+	// aliases joined with ", "; MsgEntityFactsHeader %d = facts shown;
+	// MsgEntityFactRow: fact id, subject, predicate, object, p, source tier,
+	// MsgEntityFactUnconfirmedSuffix or "".
+	MsgEntityShowHeader            = "Varlık #%d: %s [%s]"
+	MsgEntityAliases               = "Takma adlar: %s"
+	MsgEntityFactsHeader           = "Olgular (%d):"
+	MsgEntityFactRow               = "  #%d  %s | %s | %s  (p=%.2f, %s%s)"
+	MsgEntityFactUnconfirmedSuffix = ", onaysız"
+	// MsgEntityNone: no entity matched the list prefix, or `show` named an
+	// unknown id.
+	MsgEntityNone = "Eşleşen varlık yok."
+	// MsgEntityKindUnknown stands in for an entity with no kind on file.
+	MsgEntityKindUnknown = "-"
+	// MsgEntityQueryFailed wraps a kahyad-side failure of GET
+	// /v1/entity/list|show/{id} (the daemon's English detail).
+	MsgEntityQueryFailed = "Varlık sorgusu başarısız: %s"
 )

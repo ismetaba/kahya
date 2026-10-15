@@ -251,3 +251,114 @@ func TestMemoryExtractServerErrorIsWrappedInTurkish(t *testing.T) {
 	errorBodyServer(t, http.StatusNotFound, map[string]any{"error": detail})
 	assertWrapped(t, []string{"memory", "extract", "--episode", "99"}, "", MsgMemoryExtractFailed, detail)
 }
+
+// entityReadFakeServer answers GET /v1/entity/list and
+// GET /v1/entity/show/{id} (G13 MEM-2 phase 2).
+type entityReadFakeServer struct {
+	listQuery string
+	list      []map[string]any
+	detail    map[string]any
+}
+
+func (f *entityReadFakeServer) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/entity/list", func(w http.ResponseWriter, r *http.Request) {
+		f.listQuery = r.URL.RawQuery
+		json.NewEncoder(w).Encode(map[string]any{"entities": f.list})
+	})
+	mux.HandleFunc("GET /v1/entity/show/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if f.detail == nil || r.PathValue("id") != "7" {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": "factengine: entity not found: " + r.PathValue("id")})
+			return
+		}
+		json.NewEncoder(w).Encode(f.detail)
+	})
+	return mux
+}
+
+func TestEntityListPrintsTurkishRows(t *testing.T) {
+	fake := &entityReadFakeServer{list: []map[string]any{
+		{"id": 7, "canonical_name": "Emre", "kind": "person", "provisional": false, "aliases": []string{"Emre", "Emre Bey"}, "active_facts": 3},
+		{"id": 9, "canonical_name": "EMRE", "kind": "", "provisional": true, "aliases": []string{"EMRE"}, "active_facts": 0},
+	}}
+	t.Setenv("KAHYA_SOCKET", startFakeServer(t, fake.handler()))
+	for _, args := range [][]string{{"entity", "list", "em", "--provisional"}, {"entity", "list", "--provisional", "em"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr.String())
+		}
+		want := "Varlıklar (2):\n#7  Emre  [person]  olgu:3\n#9  EMRE  [-] (geçici)  olgu:0\n"
+		if stdout.String() != want {
+			t.Fatalf("%v: stdout = %q, want %q", args, stdout.String(), want)
+		}
+		if fake.listQuery != "provisional=1&q=em" {
+			t.Fatalf("%v: query = %q, want provisional=1&q=em", args, fake.listQuery)
+		}
+	}
+}
+
+func TestEntityListEmptyPrintsNone(t *testing.T) {
+	fake := &entityReadFakeServer{}
+	t.Setenv("KAHYA_SOCKET", startFakeServer(t, fake.handler()))
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"entity", "list"}, strings.NewReader(""), &stdout, &stderr); code != 0 || stdout.String() != "Eşleşen varlık yok.\n" {
+		t.Fatalf("exit %d, stdout %q", code, stdout.String())
+	}
+	if fake.listQuery != "" {
+		t.Fatalf("query = %q, want none", fake.listQuery)
+	}
+}
+
+func TestEntityShowPrintsAliasesAndFacts(t *testing.T) {
+	fake := &entityReadFakeServer{detail: map[string]any{
+		"id": 7, "canonical_name": "Emre", "kind": "person", "provisional": false, "aliases": []string{"Emre", "Emre Bey"}, "active_facts": 2,
+		"facts": []map[string]any{
+			{"fact_id": 12, "subject": "Emre", "predicate": "works_at", "object": "Acme", "source_tier": "user_asserted", "confidence_p": 0.95, "quarantined": false},
+			{"fact_id": 13, "subject": "Emre", "predicate": "lives_in", "object": "Kadıköy", "source_tier": "agent_derived", "confidence_p": 0.4, "quarantined": true},
+		},
+	}}
+	t.Setenv("KAHYA_SOCKET", startFakeServer(t, fake.handler()))
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"entity", "show", "7"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	want := "Varlık #7: Emre [person]\n" +
+		"Takma adlar: Emre, Emre Bey\n" +
+		"Olgular (2):\n" +
+		"  #12  Emre | works_at | Acme  (p=0.95, user_asserted)\n" +
+		"  #13  Emre | lives_in | Kadıköy  (p=0.40, agent_derived, onaysız)\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestEntityShowUnknownPrintsNone(t *testing.T) {
+	t.Setenv("KAHYA_SOCKET", startFakeServer(t, (&entityReadFakeServer{}).handler()))
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"entity", "show", "99"}, strings.NewReader(""), &stdout, &stderr); code != 1 || stdout.String() != "Eşleşen varlık yok.\n" {
+		t.Fatalf("exit %d, stdout %q, want 1 + MsgEntityNone", code, stdout.String())
+	}
+}
+
+func TestEntityListAndShowUsageErrors(t *testing.T) {
+	noDaemonSocket(t)
+	for _, args := range [][]string{
+		{"entity", "show"},
+		{"entity", "show", "x"},
+		{"entity", "show", "0"},
+		{"entity", "show", "1", "2"},
+		{"entity", "list", "a", "b"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), MsgEntityUsage) {
+			t.Errorf("%v: exit %d, stderr %q; want 2 + the usage line", args, code, stderr.String())
+		}
+	}
+}
+
+func TestEntityListServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "factengine: list entities: database is locked"
+	errorBodyServer(t, http.StatusInternalServerError, map[string]any{"error": detail})
+	assertWrapped(t, []string{"entity", "list"}, "", MsgEntityQueryFailed, detail)
+}

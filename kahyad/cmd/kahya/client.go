@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -923,6 +924,98 @@ func (c *Client) SplitEntities(ctx context.Context, traceID string, mergeLedgerI
 	return c.factAction(ctx, traceID, "/v1/entity/split", map[string]any{
 		"merge_ledger_id": mergeLedgerID, "actor": actor,
 	})
+}
+
+// entityRow mirrors kahyad/internal/factengine.EntitySummary (GET
+// /v1/entity/list, G13 MEM-2).
+type entityRow struct {
+	ID            int64    `json:"id"`
+	CanonicalName string   `json:"canonical_name"`
+	Kind          string   `json:"kind"`
+	Status        string   `json:"status"`
+	Provisional   bool     `json:"provisional"`
+	Aliases       []string `json:"aliases"`
+	ActiveFacts   int64    `json:"active_facts"`
+}
+
+// entityFactRow mirrors kahyad/internal/factengine.EntityFact.
+type entityFactRow struct {
+	FactID        int64   `json:"fact_id"`
+	Subject       string  `json:"subject"`
+	Predicate     string  `json:"predicate"`
+	Object        string  `json:"object"`
+	SourceTier    string  `json:"source_tier"`
+	Evidentiality string  `json:"evidentiality"`
+	ConfidenceP   float64 `json:"confidence_p"`
+	Quarantined   bool    `json:"quarantined"`
+	ValidFrom     string  `json:"valid_from"`
+	ValidTo       string  `json:"valid_to"`
+}
+
+// entityDetail mirrors kahyad/internal/factengine.EntityDetail (GET
+// /v1/entity/show/{id}).
+type entityDetail struct {
+	entityRow
+	Facts []entityFactRow `json:"facts"`
+}
+
+// errEntityNotFound is ShowEntity's 404 (an unknown entity id).
+var errEntityNotFound = errors.New("entity not found")
+
+// ListEntities calls GET /v1/entity/list?q=<prefix>[&provisional=1]
+// (`kahya entity list`).
+func (c *Client) ListEntities(ctx context.Context, traceID, prefix string, provisionalOnly bool) ([]entityRow, error) {
+	v := url.Values{}
+	if prefix != "" {
+		v.Set("q", prefix)
+	}
+	if provisionalOnly {
+		v.Set("provisional", "1")
+	}
+	path := "/v1/entity/list"
+	if len(v) > 0 {
+		path += "?" + v.Encode()
+	}
+	var out struct {
+		Entities []entityRow `json:"entities"`
+	}
+	if err := c.getEntityJSON(ctx, traceID, path, &out); err != nil {
+		return nil, err
+	}
+	return out.Entities, nil
+}
+
+// ShowEntity calls GET /v1/entity/show/{id} (`kahya entity show <id>`);
+// an unknown id is errEntityNotFound.
+func (c *Client) ShowEntity(ctx context.Context, traceID string, id int64) (entityDetail, error) {
+	var d entityDetail
+	err := c.getEntityJSON(ctx, traceID, "/v1/entity/show/"+strconv.FormatInt(id, 10), &d)
+	return d, err
+}
+
+func (c *Client) getEntityJSON(ctx context.Context, traceID, path string, out any) error {
+	req, err := c.newRequest(ctx, http.MethodGet, path, traceID, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errEntityNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return fmt.Errorf("%s", msg)
+		}
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
+	}
+	return nil
 }
 
 // memoryExtractResult mirrors kahyad's POST /v1/memory/extract JSON body

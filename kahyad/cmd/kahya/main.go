@@ -515,14 +515,19 @@ func runFactRetract(client *Client, args []string, stdout, stderr io.Writer) int
 	return 0
 }
 
-// runEntity implements `kahya entity merge <a> <b> --evidence <fact_id>`
-// and `kahya entity split <merge_ledger_id>` (W5-04).
+// runEntity implements `kahya entity list [<ad>] [--provisional]`, `kahya
+// entity show <id>` (G13 MEM-2 phase 2), `kahya entity merge <a> <b>
+// --evidence <fact_id>` and `kahya entity split <merge_ledger_id>` (W5-04).
 func runEntity(client *Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, MsgEntityUsage)
 		return 2
 	}
 	switch args[0] {
+	case "list":
+		return runEntityList(client, args[1:], stdout, stderr)
+	case "show":
+		return runEntityShow(client, args[1:], stdout, stderr)
 	case "merge":
 		return runEntityMerge(client, args[1:], stdout, stderr)
 	case "split":
@@ -531,6 +536,92 @@ func runEntity(client *Client, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, MsgEntityUsage)
 		return 2
 	}
+}
+
+// runEntityList implements `kahya entity list [<ad>] [--provisional]`: the
+// active entities whose name or alias starts with <ad> (Turkish case and a
+// trailing apostrophe suffix folded, server-side), one Turkish row each.
+// The name may come before or after the flag.
+func runEntityList(client *Client, args []string, stdout, stderr io.Writer) int {
+	prefix := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		prefix, args = args[0], args[1:]
+	}
+	fs := flag.NewFlagSet("entity list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	provisional := fs.Bool("provisional", false, "yalnız geçici (adaş şüphesi) varlıkları listele")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	switch {
+	case fs.NArg() == 1 && prefix == "":
+		prefix = fs.Arg(0)
+	case fs.NArg() > 0:
+		fmt.Fprintln(stderr, MsgEntityUsage)
+		return 2
+	}
+	rows, err := client.ListEntities(context.Background(), traceid.New(), prefix, *provisional)
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgEntityQueryFailed, err))
+		return 2
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(stdout, MsgEntityNone)
+		return 0
+	}
+	fmt.Fprintf(stdout, MsgEntityListHeader+"\n", len(rows))
+	for _, r := range rows {
+		suffix := ""
+		if r.Provisional {
+			suffix = MsgEntityProvisionalSuffix
+		}
+		fmt.Fprintf(stdout, MsgEntityListRow+"\n", r.ID, r.CanonicalName, entityKindLabel(r.Kind), suffix, r.ActiveFacts)
+	}
+	return 0
+}
+
+// runEntityShow implements `kahya entity show <id>`: the entity, its
+// aliases and its active facts (an unconfirmed agent_derived fact is
+// marked ", onaysız" - this is the user's local surface). An unknown id
+// prints MsgEntityNone and exits 1.
+func runEntityShow(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, MsgEntityUsage)
+		return 2
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
+	if err != nil || id < 1 {
+		fmt.Fprintln(stderr, MsgEntityUsage)
+		return 2
+	}
+	d, err := client.ShowEntity(context.Background(), traceid.New(), id)
+	if errors.Is(err, errEntityNotFound) {
+		fmt.Fprintln(stdout, MsgEntityNone)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgEntityQueryFailed, err))
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgEntityShowHeader+"\n", d.ID, d.CanonicalName, entityKindLabel(d.Kind))
+	fmt.Fprintf(stdout, MsgEntityAliases+"\n", strings.Join(d.Aliases, ", "))
+	fmt.Fprintf(stdout, MsgEntityFactsHeader+"\n", len(d.Facts))
+	for _, f := range d.Facts {
+		suffix := ""
+		if f.Quarantined {
+			suffix = MsgEntityFactUnconfirmedSuffix
+		}
+		fmt.Fprintf(stdout, MsgEntityFactRow+"\n", f.FactID, f.Subject, f.Predicate, f.Object, f.ConfidenceP, f.SourceTier, suffix)
+	}
+	return 0
+}
+
+// entityKindLabel is an entity's kind for display ("" -> MsgEntityKindUnknown).
+func entityKindLabel(kind string) string {
+	if kind == "" {
+		return MsgEntityKindUnknown
+	}
+	return kind
 }
 
 // runEntityMerge implements `kahya entity merge <a> <b> --evidence

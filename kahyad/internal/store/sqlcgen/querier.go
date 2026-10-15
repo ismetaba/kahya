@@ -565,6 +565,10 @@ type Querier interface {
 	// stale-pending alarm (task spec step 5: "if the oldest pending is older
 	// than 2 x interval_hours, alarm") reads index [0].
 	ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error)
+	// `kahya entity list [<name>] --provisional` (MEM-2): ListEntitiesByFolded
+	// restricted to provisional (suspected namesake) entities, so the LIMIT
+	// applies after the filter.
+	ListProvisionalEntitiesByFolded(ctx context.Context, arg ListProvisionalEntitiesByFoldedParams) ([]ListProvisionalEntitiesByFoldedRow, error)
 	// `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
 	// confirmed.
 	ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact, error)

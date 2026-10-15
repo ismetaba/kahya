@@ -309,6 +309,12 @@ type Store interface {
 	UpdateFactLinksAndValidity(ctx context.Context, arg sqlcgen.UpdateFactLinksAndValidityParams) error
 	ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
 	GetEntityAliasByEntityAndAlias(ctx context.Context, arg sqlcgen.GetEntityAliasByEntityAndAliasParams) (sqlcgen.EntityAlias, error)
+
+	// G13 MEM-2 phase 2 reads (entity_read.go: `kahya entity list/show`).
+	ListEntitiesByFolded(ctx context.Context, arg sqlcgen.ListEntitiesByFoldedParams) ([]sqlcgen.ListEntitiesByFoldedRow, error)
+	ListProvisionalEntitiesByFolded(ctx context.Context, arg sqlcgen.ListProvisionalEntitiesByFoldedParams) ([]sqlcgen.ListProvisionalEntitiesByFoldedRow, error)
+	CountActiveFactsForEntity(ctx context.Context, arg sqlcgen.CountActiveFactsForEntityParams) (int64, error)
+	ListFactsByEntityHop(ctx context.Context, arg sqlcgen.ListFactsByEntityHopParams) ([]sqlcgen.Fact, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)

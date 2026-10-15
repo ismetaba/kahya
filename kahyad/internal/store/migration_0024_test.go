@@ -196,6 +196,18 @@ func TestMemoryV2QueriesBindEveryParameter(t *testing.T) {
 	if ents, err := q.ListEntitiesByFolded(ctx, sqlcgen.ListEntitiesByFoldedParams{AliasFolded: ns("em%"), Limit: 10}); err != nil || len(ents) != 1 || ents[0].ID != emre.ID {
 		t.Fatalf("ListEntitiesByFolded = %+v, %v", ents, err)
 	}
+	// FIX-MEM-2 phase 2: the provisional-only listing binds both parameters
+	// and filters before the limit (the merged provisional row is not active).
+	prov, err := q.InsertEntity(ctx, sqlcgen.InsertEntityParams{CanonicalName: "Emre", Kind: ns("org"), Status: "active", Provisional: 1, CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.InsertEntityAlias(ctx, sqlcgen.InsertEntityAliasParams{EntityID: prov.ID, Alias: "Emre", AliasFolded: ns("emre"), CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if ents, err := q.ListProvisionalEntitiesByFolded(ctx, sqlcgen.ListProvisionalEntitiesByFoldedParams{AliasFolded: ns("em%"), Limit: 1}); err != nil || len(ents) != 1 || ents[0].ID != prov.ID {
+		t.Fatalf("ListProvisionalEntitiesByFolded = %+v, %v; want only the active provisional entity", ents, err)
+	}
 
 	f, err := q.InsertFact(ctx, sqlcgen.InsertFactParams{
 		Subject: "Emre", Predicate: "çalışır", Object: "gold-token", SourceTier: "agent_derived", Evidentiality: "inferred",

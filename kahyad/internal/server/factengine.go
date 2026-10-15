@@ -5,13 +5,21 @@
 // split <merge_ledger_id>`). All four are plain, narrow HTTP <-> Go
 // wrappers over kahyad/internal/factengine.Engine - exactly mirroring
 // consolidation.go's identical "thin HTTP wrapper" shape (that file's own
-// doc comment).
+// doc comment). G13 MEM-2 phase 2 adds the read side: GET /v1/entity/list
+// (`kahya entity list [<ad>] [--provisional]`) and GET /v1/entity/show/{id}
+// (`kahya entity show <id>`) - "show/" because a method-restricted
+// "/v1/entity/{id}" conflicts with the any-method /v1/entity/merge|split
+// patterns in Go's ServeMux. All are control routes (G03).
 package server
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
+
+	"kahya/kahyad/internal/factengine"
 )
 
 // FactEngineRunner is the narrow kahyad/internal/factengine.Engine
@@ -193,4 +201,87 @@ func writeFactActionError(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnprocessableEntity)
 	_ = json.NewEncoder(w).Encode(factActionResponse{OK: false, Error: err.Error()})
+}
+
+// EntityReader is the read side of the entity layer the GET /v1/entity/*
+// routes need (G13 MEM-2) - *factengine.Engine satisfies it.
+type EntityReader interface {
+	ListEntities(ctx context.Context, prefix string, provisionalOnly bool, limit int) ([]factengine.EntitySummary, error)
+	ShowEntity(ctx context.Context, id int64) (factengine.EntityDetail, error)
+}
+
+var _ EntityReader = (*factengine.Engine)(nil)
+
+// SetEntityReader wires GET /v1/entity/list and GET /v1/entity/show/{id}.
+// Call before Prepare(); both answer 503 until it is set.
+func (s *Server) SetEntityReader(r EntityReader) {
+	s.entityReader = r
+}
+
+type entityListResponse struct {
+	Entities []factengine.EntitySummary `json:"entities"`
+}
+
+// handleEntityList answers GET /v1/entity/list?q=<name prefix>&
+// provisional=1&limit=<n>: active entities whose folded alias starts with
+// the folded q (factengine.ListEntities; limit default 50, at most 200).
+func (s *Server) handleEntityList(w http.ResponseWriter, r *http.Request) {
+	if s.entityReader == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "entity reads not available")
+		return
+	}
+	q := r.URL.Query()
+	limit := 0
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeJSONError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	provisional := q.Get("provisional") == "1" || q.Get("provisional") == "true"
+	ents, err := s.entityReader.ListEntities(r.Context(), q.Get("q"), provisional, limit)
+	if err != nil {
+		s.log.With(traceIDFromContext(r)).Error("entity_list_failed", "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ents == nil {
+		ents = []factengine.EntitySummary{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(entityListResponse{Entities: ents})
+}
+
+// handleEntityShow answers GET /v1/entity/show/{id}: the entity, its
+// aliases and the active facts touching it (quarantined ones labelled -
+// a local surface, never Telegram or a prompt).
+func (s *Server) handleEntityShow(w http.ResponseWriter, r *http.Request) {
+	if s.entityReader == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "entity reads not available")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeJSONError(w, http.StatusBadRequest, "entity id must be a positive integer")
+		return
+	}
+	d, err := s.entityReader.ShowEntity(r.Context(), id)
+	if errors.Is(err, factengine.ErrEntityNotFound) {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.log.With(traceIDFromContext(r)).Error("entity_show_failed", "entity_id", id, "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if d.Facts == nil {
+		d.Facts = []factengine.EntityFact{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(d)
 }

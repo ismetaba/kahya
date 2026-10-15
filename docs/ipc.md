@@ -568,7 +568,17 @@ a cloud model, without changing anything in §2-§6 above:
   Reader's local model is `reader.NewLocalModel(qwenSup)` and its cloud
   model a `reader.WorkerCloudModel` whose `ProxyOpener` (srv.NewTaskProxy)
   gives every call its own task proxy - cost governor, egress gate, and in
-  passthrough the per-call token only in `X-Kahya-Task-Token`.
+  passthrough the per-call token only in `X-Kahya-Task-Token`. What the
+  extractor resolved is visible locally (FIX-MEM-2 phase 2): `kahya entity
+  list [<ad>] [--provisional]` → `GET /v1/entity/list?q=&provisional=1&limit=`
+  (folded name/alias prefix; `{"entities": [{id, canonical_name, kind,
+  status, provisional, aliases, active_facts}]}`) and `kahya entity show
+  <id>` → `GET /v1/entity/show/{id}` (aliases + up to 100 active facts,
+  an unconfirmed agent_derived one `quarantined: true`, printed
+  `", onaysız"`; 404 → `"Eşleşen varlık yok."`). `show/` because a
+  GET-only `/v1/entity/{id}` pattern conflicts with the any-method
+  `/v1/entity/merge|split` patterns in Go's ServeMux. Both are control
+  routes.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

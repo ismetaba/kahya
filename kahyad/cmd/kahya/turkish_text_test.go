@@ -84,6 +84,8 @@ func TestFlagHelpTextsAreNotAsciiFolded(t *testing.T) {
 		// G13 MEM-3.
 		{[]string{"memory", "extract", "-h"}, "tüm bölümlerin çıkarım işaretini sıfırla ve yeniden çıkar (yeni çıkarıcı sürümü için)", "tum bolumlerin"},
 		{[]string{"memory", "extract", "-h"}, "yalnız bu notu çıkar (hafıza dizinine göre yol)", "yalniz bu notu"},
+		// G13 MEM-2 phase 2.
+		{[]string{"entity", "list", "-h"}, "yalnız geçici (adaş şüphesi) varlıkları listele", "yalniz gecici"},
 	}
 	for _, c := range cases {
 		t.Run(strings.Join(c.args, "_"), func(t *testing.T) {

@@ -314,6 +314,11 @@ type Server struct {
 	// "unwired dependency" convention as factEngine above.
 	memoryExtractor MemoryExtractor
 
+	// entityReader wires GET /v1/entity/list and GET /v1/entity/show/{id}
+	// (G13 MEM-2 phase 2, factengine.go); nil until SetEntityReader is
+	// called.
+	entityReader EntityReader
+
 	// remembered wires POST /v1/remembered (W5-03, remembered.go's own doc
 	// comment); nil until SetRememberedMarker is called - same "unwired
 	// dependency" convention as factEngine above.
@@ -623,6 +628,9 @@ func (s *Server) routeTable() []route {
 		{"/v1/fact/retract", h(s.handleFactRetract)},
 		{"/v1/entity/merge", h(s.handleEntityMerge)},
 		{"/v1/entity/split", h(s.handleEntitySplit)},
+		// G13 MEM-2 phase 2: `kahya entity list|show` (factengine.go).
+		{"GET /v1/entity/list", h(s.handleEntityList)},
+		{"GET /v1/entity/show/{id}", h(s.handleEntityShow)},
 		{"/v1/remembered", h(s.handleRemembered)},
 		// W78-04: read-only metrics reporting over the events ledger (`kahya
 		// metrics`) - see metrics.go's own doc comment.

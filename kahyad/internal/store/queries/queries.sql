@@ -1352,3 +1352,13 @@ FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
 WHERE a.alias_folded LIKE ? AND e.status = 'active'
 ORDER BY e.id ASC
 LIMIT ?;
+
+-- name: ListProvisionalEntitiesByFolded :many
+-- `kahya entity list [<name>] --provisional` (MEM-2): ListEntitiesByFolded
+-- restricted to provisional (suspected namesake) entities, so the LIMIT
+-- applies after the filter.
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND e.status = 'active' AND e.provisional = 1
+ORDER BY e.id ASC
+LIMIT ?;

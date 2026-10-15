@@ -3375,6 +3375,61 @@ func (q *Queries) ListPendingAnchorLogs(ctx context.Context) ([]AnchorLog, error
 	return items, nil
 }
 
+const listProvisionalEntitiesByFolded = `-- name: ListProvisionalEntitiesByFolded :many
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND e.status = 'active' AND e.provisional = 1
+ORDER BY e.id ASC
+LIMIT ?
+`
+
+type ListProvisionalEntitiesByFoldedParams struct {
+	AliasFolded sql.NullString `json:"alias_folded"`
+	Limit       int64          `json:"limit"`
+}
+
+type ListProvisionalEntitiesByFoldedRow struct {
+	ID            int64          `json:"id"`
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+// `kahya entity list [<name>] --provisional` (MEM-2): ListEntitiesByFolded
+// restricted to provisional (suspected namesake) entities, so the LIMIT
+// applies after the filter.
+func (q *Queries) ListProvisionalEntitiesByFolded(ctx context.Context, arg ListProvisionalEntitiesByFoldedParams) ([]ListProvisionalEntitiesByFoldedRow, error) {
+	rows, err := q.db.QueryContext(ctx, listProvisionalEntitiesByFolded, arg.AliasFolded, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProvisionalEntitiesByFoldedRow{}
+	for rows.Next() {
+		var i ListProvisionalEntitiesByFoldedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CanonicalName,
+			&i.Kind,
+			&i.Status,
+			&i.Provisional,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
 SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
 FROM facts
