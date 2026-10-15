@@ -438,6 +438,10 @@ type Querier interface {
 	// exclusion/priority policy entirely in Go, never in SQL, so the policy
 	// stays readable/testable as plain code, not buried in a query).
 	ListActiveFacts(ctx context.Context) ([]Fact, error)
+	// `kahya fact list` without --quarantined (MEM-5): every active fact created
+	// at or after created_since (same text bound as ListQuarantinedFacts),
+	// newest first.
+	ListActiveFactsCreatedSince(ctx context.Context, arg ListActiveFactsCreatedSinceParams) ([]Fact, error)
 	// The aliases a LOCAL-lane call added (0025). A local-lane resolution
 	// prefers the entities named this way: once a cloud-lane call has created
 	// its own twin of a name only a local note gave an entity (it cannot see
@@ -599,9 +603,14 @@ type Querier interface {
 	// restricted to provisional (suspected namesake) entities, so the LIMIT
 	// applies after the filter.
 	ListProvisionalEntitiesByFolded(ctx context.Context, arg ListProvisionalEntitiesByFoldedParams) ([]ListProvisionalEntitiesByFoldedRow, error)
-	// `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
-	// confirmed.
-	ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact, error)
+	// `kahya fact list --quarantined` and `kahya fact confirm --all-quarantined
+	// --since` (MEM-5): the active facts a human still has to confirm - the
+	// tiers factengine.TierInjectionEligible quarantines, unconfirmed (pinned to
+	// that predicate by factengine/TestListQuarantinedFactsMatchesTierPredicate)
+	// - created at or after created_since, newest first. created_since is
+	// compared as text: the caller passes a UTC "YYYY-MM-DDTHH:MM:SS" prefix
+	// ('' = no bound), which orders correctly against the stored RFC3339Nano.
+	ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedFactsParams) ([]Fact, error)
 	// Every tool_calls row for task_id still stuck at 'intent'/'executing' -
 	// i.e. a side-effectful call whose kahyad-side execution was interrupted
 	// (worker died, kahyad crashed) before a receipt (or a failure) was ever

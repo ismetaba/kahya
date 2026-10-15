@@ -285,8 +285,9 @@ const (
 	// ---- W5-04: kahya fact confirm|retract, kahya entity merge|split ----
 
 	// MsgFactUsage is printed when `kahya fact` is given anything other
-	// than a recognized "confirm"/"retract" subcommand. Exit 2.
-	MsgFactUsage = "kullanım: kahya fact confirm <id> | kahya fact retract <özne> <yüklem> <nesne> [oturum_id]"
+	// than a recognized list/confirm/deny/retract/query subcommand. Exit 2.
+	// G13 MEM-5: the handbook's byte-exact text.
+	MsgFactUsage = "kullanım: kahya fact list [--quarantined] [--entity <ad>] [--since <RFC3339>] | kahya fact confirm <id>... | --episode <id> | --all-quarantined --since <RFC3339> | kahya fact deny <id>... | kahya fact retract <özne> <yüklem> <nesne> [oturum_id] | kahya fact query ..."
 
 	// MsgFactConfirmed is `kahya fact confirm <id>`'s success line: %d =
 	// the fact id.
@@ -636,4 +637,29 @@ const (
 	// (a bad RFC3339 time, an unknown tier, a store error - the daemon's
 	// English detail).
 	MsgFactQueryFailed = "Olgu sorgusu başarısız: %s"
+
+	// `kahya fact list|confirm|deny` (G13 MEM-5 phase 1; the handbook's
+	// byte-exact texts). MsgFactListRow: fact id, subject, predicate, object,
+	// p, source tier, MsgEntityFactUnconfirmedSuffix (or ""), the first
+	// evidence note (MsgFactEvidenceUnknown when none).
+	MsgFactListHeader           = "Olgular (%d):"
+	MsgFactListNone             = "Olgu yok."
+	MsgFactListRow              = "#%d  %s | %s | %s  (p=%.2f, %s%s)  ← %s"
+	MsgFactConfirmedMany        = "%d olgu onaylandı."
+	MsgFactConfirmAllNeedsSince = "--all-quarantined için --since <RFC3339> zorunlu (yanlışlıkla her şeyi onaylamayı önler)."
+	MsgFactConfirmAllPrompt     = "%d olgu onaylanacak; devam için komutu --yes ile tekrarla."
+	MsgFactDenied               = "Olgu reddedildi (güven düşürüldü): %d"
+	MsgFactDeniedMany           = "%d olgu reddedildi."
+	// MsgFactEvidenceUnknown stands in for a fact no evidence row ties to a
+	// memory note.
+	MsgFactEvidenceUnknown = "-"
+	// MsgFactItemFailed is one id a bulk confirm/deny could not act on (the
+	// daemon's English detail); the command then exits 1.
+	MsgFactItemFailed = "Olgu #%d işlenemedi: %s"
+	// MsgFactListFailed / MsgFactConfirmFailed / MsgFactDenyFailed wrap a
+	// kahyad-side failure of GET /v1/fact/list, POST /v1/fact/confirm (bulk)
+	// and POST /v1/fact/deny (bulk).
+	MsgFactListFailed    = "Olgu listesi alınamadı: %s"
+	MsgFactConfirmFailed = "Olgu onayı başarısız: %s"
+	MsgFactDenyFailed    = "Olgu reddi başarısız: %s"
 )

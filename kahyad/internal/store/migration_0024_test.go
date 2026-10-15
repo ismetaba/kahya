@@ -237,8 +237,25 @@ func TestMemoryV2QueriesBindEveryParameter(t *testing.T) {
 	if hop, err := q.ListFactsByEntityHop(ctx, sqlcgen.ListFactsByEntityHopParams{SubjectEntityID: ni(emre.ID), ObjectEntityID: ni(emre.ID), Limit: 10}); err != nil || len(hop) != 1 || hop[0].ID != f.ID {
 		t.Fatalf("ListFactsByEntityHop = %+v, %v", hop, err)
 	}
-	if qf, err := q.ListQuarantinedFacts(ctx, 10); err != nil || len(qf) != 1 {
+	if qf, err := q.ListQuarantinedFacts(ctx, sqlcgen.ListQuarantinedFactsParams{RowLimit: 10}); err != nil || len(qf) != 1 {
 		t.Fatalf("ListQuarantinedFacts = %+v, %v", qf, err)
+	}
+	// MEM-5: both created-since list queries bind the bound AND the limit (a
+	// bound after the row's created_at and a zero limit each empty the list).
+	if qf, err := q.ListQuarantinedFacts(ctx, sqlcgen.ListQuarantinedFactsParams{CreatedSince: "9999", RowLimit: 10}); err != nil || len(qf) != 0 {
+		t.Fatalf("ListQuarantinedFacts(future bound) = %+v, %v; want none", qf, err)
+	}
+	if qf, err := q.ListQuarantinedFacts(ctx, sqlcgen.ListQuarantinedFactsParams{RowLimit: 0}); err != nil || len(qf) != 0 {
+		t.Fatalf("ListQuarantinedFacts(limit 0) = %+v, %v; want none", qf, err)
+	}
+	if af, err := q.ListActiveFactsCreatedSince(ctx, sqlcgen.ListActiveFactsCreatedSinceParams{CreatedSince: now[:19], RowLimit: 10}); err != nil || len(af) != 1 || af[0].ID != f.ID {
+		t.Fatalf("ListActiveFactsCreatedSince = %+v, %v", af, err)
+	}
+	if af, err := q.ListActiveFactsCreatedSince(ctx, sqlcgen.ListActiveFactsCreatedSinceParams{CreatedSince: "9999", RowLimit: 10}); err != nil || len(af) != 0 {
+		t.Fatalf("ListActiveFactsCreatedSince(future bound) = %+v, %v; want none", af, err)
+	}
+	if af, err := q.ListActiveFactsCreatedSince(ctx, sqlcgen.ListActiveFactsCreatedSinceParams{RowLimit: 0}); err != nil || len(af) != 0 {
+		t.Fatalf("ListActiveFactsCreatedSince(limit 0) = %+v, %v; want none", af, err)
 	}
 
 	ep, err := q.InsertEpisode(ctx, sqlcgen.InsertEpisodeParams{Source: "memory_file", SourcePath: ns("notes/ev.md"), SourceTier: "user_asserted", Status: "active", CreatedAt: now})

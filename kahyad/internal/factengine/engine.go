@@ -340,6 +340,12 @@ type Store interface {
 	ListProvisionalEntitiesByFolded(ctx context.Context, arg sqlcgen.ListProvisionalEntitiesByFoldedParams) ([]sqlcgen.ListProvisionalEntitiesByFoldedRow, error)
 	CountActiveFactsForEntity(ctx context.Context, arg sqlcgen.CountActiveFactsForEntityParams) (int64, error)
 	ListFactsByEntityHop(ctx context.Context, arg sqlcgen.ListFactsByEntityHopParams) ([]sqlcgen.Fact, error)
+
+	// G13 MEM-5 review reads (fact_list.go: `kahya fact list`, bulk confirm).
+	ListQuarantinedFacts(ctx context.Context, arg sqlcgen.ListQuarantinedFactsParams) ([]sqlcgen.Fact, error)
+	ListActiveFactsCreatedSince(ctx context.Context, arg sqlcgen.ListActiveFactsCreatedSinceParams) ([]sqlcgen.Fact, error)
+	ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullInt64) ([]int64, error)
+	ListEpisodePathsForFact(ctx context.Context, factID int64) ([]sql.NullString, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -753,8 +759,13 @@ func (e *Engine) recomputeConfidence(ctx context.Context, factID int64) error {
 // Dogru answer): lifts the agent_derived quarantine half of
 // InjectionEligible. Deliberately never touches source_tier/confidence -
 // an agent_derived fact's confidence stays capped at that tier's ceiling
-// forever (HANDOFF S5 memory #1).
+// forever (HANDOFF S5 memory #1). An id that names no fact is
+// ErrFactNotFound (G13 MEM-5: a bulk confirm reports it instead of
+// counting a no-op UPDATE as a confirmation).
 func (e *Engine) ConfirmFact(ctx context.Context, traceID string, factID int64) error {
+	if _, err := e.requireFact(ctx, factID); err != nil {
+		return err
+	}
 	if err := e.store.ConfirmFact(ctx, sqlcgen.ConfirmFactParams{
 		ConfirmedAt: sql.NullString{String: e.nowRFC3339(), Valid: true},
 		UpdatedAt:   e.nowRFC3339(),
@@ -773,8 +784,11 @@ func (e *Engine) ConfirmFact(ctx context.Context, traceID string, factID int64) 
 // recomputes confidence - it does NOT close the fact (unlike RetractFact
 // in retract.go): a denied-but-still-active fact can still be reasserted
 // later and its confidence can recover, whereas a RETRACTED fact is
-// closed for good.
+// closed for good. An id that names no fact is ErrFactNotFound.
 func (e *Engine) DenyFact(ctx context.Context, traceID string, factID int64, sessionID string) error {
+	if _, err := e.requireFact(ctx, factID); err != nil {
+		return err
+	}
 	if err := e.addEvidence(ctx, factID, 0, sessionID, -1, DenialLogOdds); err != nil {
 		return fmt.Errorf("factengine: deny fact %d: %w", factID, err)
 	}

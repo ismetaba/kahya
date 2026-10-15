@@ -1393,13 +1393,29 @@ UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE id = ?;
 UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE status = 'active';
 
 -- name: ListQuarantinedFacts :many
--- `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
--- confirmed.
+-- `kahya fact list --quarantined` and `kahya fact confirm --all-quarantined
+-- --since` (MEM-5): the active facts a human still has to confirm - the
+-- tiers factengine.TierInjectionEligible quarantines, unconfirmed (pinned to
+-- that predicate by factengine/TestListQuarantinedFactsMatchesTierPredicate)
+-- - created at or after created_since, newest first. created_since is
+-- compared as text: the caller passes a UTC "YYYY-MM-DDTHH:MM:SS" prefix
+-- ('' = no bound), which orders correctly against the stored RFC3339Nano.
 SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
+  AND created_at >= sqlc.arg(created_since)
 ORDER BY id DESC
-LIMIT ?;
+LIMIT sqlc.arg(row_limit);
+
+-- name: ListActiveFactsCreatedSince :many
+-- `kahya fact list` without --quarantined (MEM-5): every active fact created
+-- at or after created_since (same text bound as ListQuarantinedFacts),
+-- newest first.
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+FROM facts
+WHERE status = 'active' AND created_at >= sqlc.arg(created_since)
+ORDER BY id DESC
+LIMIT sqlc.arg(row_limit);
 
 -- name: ListFactIDsByEpisode :many
 -- `kahya fact confirm --episode <id>` (MEM-5): every active fact evidenced

@@ -9,15 +9,23 @@
 // (`kahya entity list [<ad>] [--provisional]`) and GET /v1/entity/show/{id}
 // (`kahya entity show <id>`) - "show/" because a method-restricted
 // "/v1/entity/{id}" conflicts with the any-method /v1/entity/merge|split
-// patterns in Go's ServeMux. All are control routes (G03).
+// patterns in Go's ServeMux. G13 MEM-5 phase 1 adds the human review side:
+// bulk POST /v1/fact/confirm (fact_ids | episode_id | all_quarantined_since),
+// POST /v1/fact/deny (`kahya fact deny <id>...`) and GET /v1/fact/list
+// (`kahya fact list`). All are control routes (G03): a worker can never lift
+// a quarantine or lower a fact's confidence (HANDOFF §5 memory #1).
 package server
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"kahya/kahyad/internal/factengine"
 )
@@ -30,7 +38,14 @@ type FactEngineRunner interface {
 	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error)
 	MergeEntities(ctx context.Context, traceID string, dstEntityID, srcEntityID, evidenceFactID int64, actor string) (int64, error)
 	SplitEntities(ctx context.Context, traceID string, mergeLedgerID int64, actor string) (int64, error)
+	// G13 MEM-5 phase 1.
+	DenyFact(ctx context.Context, traceID string, factID int64, sessionID string) error
+	ListFacts(ctx context.Context, q factengine.FactListQuery) ([]factengine.FactListItem, bool, error)
+	FactIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
+	QuarantinedFactIDsSince(ctx context.Context, since time.Time) ([]int64, error)
 }
+
+var _ FactEngineRunner = (*factengine.Engine)(nil)
 
 // SetFactEngine wires the four /v1/fact* and /v1/entity* routes to e.
 // Call before Prepare(); every route answers 503 until this is set,
@@ -46,14 +61,46 @@ type factActionResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// factConfirmRequest is POST /v1/fact/confirm's body: {"fact_id": <id>}.
+// factConfirmRequest is POST /v1/fact/confirm's body - exactly one
+// selector: {"fact_id": N} (W5-04, answered {"ok":true,"id":N} as before),
+// {"fact_ids": [...]}, {"episode_id": E} (every active fact that episode
+// evidences) or {"all_quarantined_since": "<RFC3339>"} (every quarantined
+// fact created since then; all_quarantined:true without the bound is
+// refused - confirming everything by accident is the failure mode the bound
+// exists for). A bulk answer is {"ok":true,"confirmed":[...],"failed":{...}}.
 type factConfirmRequest struct {
-	FactID int64 `json:"fact_id"`
+	FactID              int64   `json:"fact_id"`
+	FactIDs             []int64 `json:"fact_ids"`
+	EpisodeID           int64   `json:"episode_id"`
+	AllQuarantined      bool    `json:"all_quarantined"`
+	AllQuarantinedSince string  `json:"all_quarantined_since"`
 }
 
-// handleFactConfirm implements `kahya fact confirm <id>` (lifts the
-// agent_derived quarantine half of factengine.InjectionEligible - see
-// that predicate's own doc comment).
+// factDenyRequest is POST /v1/fact/deny's body: {"fact_id": N} or
+// {"fact_ids": [...]}, plus the session the denial is attributed to ("" =
+// "cli:<trace_id>", one evidence session per CLI call: the same id twice in
+// one call is one denial - HANDOFF §5 memory #3).
+type factDenyRequest struct {
+	FactID    int64   `json:"fact_id"`
+	FactIDs   []int64 `json:"fact_ids"`
+	SessionID string  `json:"session_id"`
+}
+
+// factBulkResponse is the bulk confirm/deny answer: the ids acted on (in
+// request order, each once) and the per-id failures.
+type factBulkResponse struct {
+	OK        bool              `json:"ok"`
+	Confirmed []int64           `json:"confirmed,omitempty"`
+	Denied    []int64           `json:"denied,omitempty"`
+	Failed    map[string]string `json:"failed"`
+	TraceID   string            `json:"trace_id"`
+}
+
+// handleFactConfirm implements `kahya fact confirm <id>... | --episode <id>
+// | --all-quarantined --since <RFC3339>` (lifts the quarantine half of
+// factengine.InjectionEligible - see that predicate's own doc comment).
+// Every confirmation is its own fact_confirmed ledger row; at most
+// factengine.MaxFactBatch facts per call.
 func (s *Server) handleFactConfirm(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -64,16 +111,225 @@ func (s *Server) handleFactConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req factConfirmRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.FactID == 0 {
-		writeJSONError(w, http.StatusBadRequest, "fact_id is required")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	selectors := 0
+	for _, set := range []bool{req.FactID != 0, req.FactIDs != nil, req.EpisodeID != 0, req.AllQuarantined || req.AllQuarantinedSince != ""} {
+		if set {
+			selectors++
+		}
+	}
+	if selectors != 1 {
+		writeJSONError(w, http.StatusBadRequest, "give exactly one of fact_id, fact_ids, episode_id, all_quarantined_since")
 		return
 	}
 	traceID := traceIDFromContext(r)
-	if err := s.factEngine.ConfirmFact(r.Context(), traceID, req.FactID); err != nil {
-		writeFactActionError(w, err)
+	ctx := r.Context()
+	if req.FactID != 0 {
+		if err := s.factEngine.ConfirmFact(ctx, traceID, req.FactID); err != nil {
+			writeFactActionError(w, err)
+			return
+		}
+		writeFactActionOK(w, req.FactID)
 		return
 	}
-	writeFactActionOK(w, req.FactID)
+	var ids []int64
+	var err error
+	switch {
+	case req.FactIDs != nil:
+		ids, err = bulkFactIDs(req.FactIDs)
+	case req.EpisodeID != 0:
+		if req.EpisodeID < 0 {
+			writeJSONError(w, http.StatusBadRequest, "episode_id must be a positive integer")
+			return
+		}
+		ids, err = s.factEngine.FactIDsByEpisode(ctx, req.EpisodeID)
+	default:
+		if req.AllQuarantinedSince == "" {
+			writeJSONError(w, http.StatusBadRequest, "all_quarantined_since (RFC3339) is required")
+			return
+		}
+		since, perr := time.Parse(time.RFC3339, req.AllQuarantinedSince)
+		if perr != nil {
+			writeJSONError(w, http.StatusBadRequest, "all_quarantined_since must be RFC3339")
+			return
+		}
+		ids, err = s.factEngine.QuarantinedFactIDsSince(ctx, since)
+	}
+	if err != nil {
+		writeFactSelectionError(w, err)
+		return
+	}
+	resp := factBulkResponse{OK: true, Confirmed: []int64{}, Failed: map[string]string{}, TraceID: traceID}
+	for _, id := range ids {
+		if err := s.factEngine.ConfirmFact(ctx, traceID, id); err != nil {
+			resp.Failed[strconv.FormatInt(id, 10)] = err.Error()
+			continue
+		}
+		resp.Confirmed = append(resp.Confirmed, id)
+	}
+	writeFactBulk(w, resp)
+}
+
+// handleFactDeny implements `kahya fact deny <id>...`: each fact gets one
+// fixed -2.94 user-denial evidence row (factengine.DenyFact - it is not
+// closed, unlike a retraction), at most factengine.MaxFactBatch per call.
+func (s *Server) handleFactDeny(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.factEngine == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "fact engine not available")
+		return
+	}
+	var req factDenyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if (req.FactID != 0) == (req.FactIDs != nil) {
+		writeJSONError(w, http.StatusBadRequest, "give exactly one of fact_id, fact_ids")
+		return
+	}
+	traceID := traceIDFromContext(r)
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		sessionID = "cli:" + traceID
+	}
+	ctx := r.Context()
+	if req.FactID != 0 {
+		if err := s.factEngine.DenyFact(ctx, traceID, req.FactID, sessionID); err != nil {
+			writeFactActionError(w, err)
+			return
+		}
+		writeFactActionOK(w, req.FactID)
+		return
+	}
+	ids, err := bulkFactIDs(req.FactIDs)
+	if err != nil {
+		writeFactSelectionError(w, err)
+		return
+	}
+	resp := factBulkResponse{OK: true, Denied: []int64{}, Failed: map[string]string{}, TraceID: traceID}
+	for _, id := range ids {
+		if err := s.factEngine.DenyFact(ctx, traceID, id, sessionID); err != nil {
+			resp.Failed[strconv.FormatInt(id, 10)] = err.Error()
+			continue
+		}
+		resp.Denied = append(resp.Denied, id)
+	}
+	writeFactBulk(w, resp)
+}
+
+// errBadFactID is a non-positive id in a fact_ids list.
+var errBadFactID = errors.New("fact_ids must be positive integers")
+
+// bulkFactIDs validates a fact_ids list: non-empty, positive ids, each kept
+// once in request order, at most factengine.MaxFactBatch.
+func bulkFactIDs(raw []int64) ([]int64, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("fact_ids must not be empty")
+	}
+	seen := make(map[int64]bool, len(raw))
+	ids := make([]int64, 0, len(raw))
+	for _, id := range raw {
+		if id < 1 {
+			return nil, errBadFactID
+		}
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > factengine.MaxFactBatch {
+		return nil, factengine.ErrFactBatchTooLarge
+	}
+	return ids, nil
+}
+
+// writeFactSelectionError answers a selection that could not be resolved:
+// 400 for a malformed or oversized selection, 500 otherwise.
+func writeFactSelectionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, factengine.ErrFactBatchTooLarge) {
+		writeJSONError(w, http.StatusBadRequest, factengine.ErrFactBatchTooLarge.Error())
+		return
+	}
+	if errors.Is(err, errBadFactID) || strings.HasPrefix(err.Error(), "fact_ids") {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, err.Error())
+}
+
+func writeFactBulk(w http.ResponseWriter, resp factBulkResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// factListResponse is GET /v1/fact/list's answer; truncated reports that
+// more matching facts exist beyond the limit.
+type factListResponse struct {
+	Facts     []factengine.FactListItem `json:"facts"`
+	Truncated bool                      `json:"truncated"`
+	TraceID   string                    `json:"trace_id"`
+}
+
+// handleFactList answers GET /v1/fact/list?quarantined=1&since=<RFC3339>&
+// entity=<id|ad>&limit=<n> (`kahya fact list`): active facts newest first -
+// only the ones still waiting for a human confirmation with quarantined=1 -
+// each with its first evidence note. A LOCAL surface (control route): secret
+// -lane facts are listed too.
+func (s *Server) handleFactList(w http.ResponseWriter, r *http.Request) {
+	if s.factEngine == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "fact engine not available")
+		return
+	}
+	v := r.URL.Query()
+	q := factengine.FactListQuery{QuarantinedOnly: v.Get("quarantined") == "1" || v.Get("quarantined") == "true"}
+	if raw := strings.TrimSpace(v.Get("since")); raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "since must be RFC3339")
+			return
+		}
+		q.CreatedSince = t
+	}
+	if e := strings.TrimSpace(v.Get("entity")); e != "" {
+		if id, err := strconv.ParseInt(e, 10, 64); err == nil {
+			if id < 1 {
+				writeJSONError(w, http.StatusBadRequest, "entity id must be a positive integer")
+				return
+			}
+			q.EntityID = id
+		} else {
+			q.EntityName = e
+		}
+	}
+	if l := v.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 1 || n > factengine.MaxFactBatch {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit must be 1..%d", factengine.MaxFactBatch))
+			return
+		}
+		q.Limit = n
+	}
+	traceID := traceIDFromContext(r)
+	facts, truncated, err := s.factEngine.ListFacts(r.Context(), q)
+	if err != nil {
+		s.log.With(traceID).Error("fact_list_failed", "err", err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if facts == nil {
+		facts = []factengine.FactListItem{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(factListResponse{Facts: facts, Truncated: truncated, TraceID: traceID})
 }
 
 // factRetractRequest is POST /v1/fact/retract's body: the (subject,

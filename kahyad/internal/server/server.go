@@ -630,6 +630,11 @@ func (s *Server) routeTable() []route {
 		{"/v1/restore/drill-result", h(s.handleRestoreDrillResult)},
 		{"/v1/fact/confirm", h(s.handleFactConfirm)},
 		{"/v1/fact/retract", h(s.handleFactRetract)},
+		// G13 MEM-5 phase 1: `kahya fact deny|list` (factengine.go). A literal
+		// any-method /v1/fact/deny and a GET-only literal /v1/fact/list, so
+		// neither overlaps /v1/fact/confirm|retract|query.
+		{"/v1/fact/deny", h(s.handleFactDeny)},
+		{"GET /v1/fact/list", h(s.handleFactList)},
 		{"/v1/entity/merge", h(s.handleEntityMerge)},
 		{"/v1/entity/split", h(s.handleEntitySplit)},
 		// G13 MEM-2 phase 2: `kahya entity list|show` (factengine.go).

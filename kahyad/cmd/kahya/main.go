@@ -455,16 +455,21 @@ func wrapServerError(format string, err error) string {
 }
 
 // runFact implements `kahya fact confirm <id>` and `kahya fact retract
-// <özne> <yüklem> <nesne> [oturum_id]` (W5-04), and `kahya fact query ...`
-// (G13 MEM-4).
+// <özne> <yüklem> <nesne> [oturum_id]` (W5-04), `kahya fact query ...`
+// (G13 MEM-4) and the human review forms (G13 MEM-5): `kahya fact list`,
+// bulk `kahya fact confirm` and `kahya fact deny`.
 func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
 	switch args[0] {
+	case "list":
+		return runFactList(client, args[1:], stdout, stderr)
 	case "confirm":
 		return runFactConfirm(client, args[1:], stdout, stderr)
+	case "deny":
+		return runFactDeny(client, args[1:], stdout, stderr)
 	case "retract":
 		return runFactRetract(client, args[1:], stdout, stderr)
 	case "query":
@@ -473,6 +478,100 @@ func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
+}
+
+// runFactList implements `kahya fact list [--quarantined] [--entity
+// <ad|id>] [--since RFC3339] [--limit N]` (G13 MEM-5) over GET
+// /v1/fact/list: active facts newest first - with --quarantined only the
+// ones waiting for a confirmation, marked ", onaysız" - each with the note
+// its evidence cites.
+func runFactList(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("fact list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	quarantined := fs.Bool("quarantined", false, "yalnız onay bekleyen (karantinadaki) olgular")
+	entity := fs.String("entity", "", "varlık id'si ya da adı")
+	since := fs.String("since", "", "RFC3339: bu tarihten sonra kaydedilen olgular")
+	limit := fs.Int("limit", 0, "en fazla kaç olgu (varsayılan 50, en çok 500)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	v := url.Values{}
+	if *quarantined {
+		v.Set("quarantined", "1")
+	}
+	if e := strings.TrimSpace(*entity); e != "" {
+		v.Set("entity", e)
+	}
+	if t := strings.TrimSpace(*since); t != "" {
+		v.Set("since", t)
+	}
+	if *limit != 0 {
+		v.Set("limit", strconv.Itoa(*limit))
+	}
+	rows, _, err := client.ListFacts(context.Background(), traceid.New(), v)
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgFactListFailed, err))
+		return 2
+	}
+	printFactList(stdout, rows)
+	return 0
+}
+
+// printFactList prints MsgFactListNone, or the header and one row per fact.
+func printFactList(stdout io.Writer, rows []factListRow) {
+	if len(rows) == 0 {
+		fmt.Fprintln(stdout, MsgFactListNone)
+		return
+	}
+	fmt.Fprintf(stdout, MsgFactListHeader+"\n", len(rows))
+	for _, f := range rows {
+		suffix := ""
+		if f.Quarantined {
+			suffix = MsgEntityFactUnconfirmedSuffix
+		}
+		path := f.EvidencePath
+		if path == "" {
+			path = MsgFactEvidenceUnknown
+		}
+		fmt.Fprintf(stdout, MsgFactListRow+"\n", f.FactID, f.Subject, f.Predicate, f.Object, f.ConfidenceP, f.SourceTier, suffix, path)
+	}
+}
+
+// parseFactIDs parses positional fact ids (each a positive integer).
+func parseFactIDs(args []string) ([]int64, bool) {
+	ids := make([]int64, 0, len(args))
+	for _, a := range args {
+		id, err := strconv.ParseInt(strings.TrimSpace(a), 10, 64)
+		if err != nil || id < 1 {
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+// printFactBulk prints a bulk confirm/deny result: the count line, then one
+// stderr line per id the daemon could not act on (exit 1 when any).
+func printFactBulk(stdout, stderr io.Writer, countFmt string, done []int64, failed map[string]string) int {
+	fmt.Fprintf(stdout, countFmt+"\n", len(done))
+	if len(failed) == 0 {
+		return 0
+	}
+	ids := make([]int64, 0, len(failed))
+	for k := range failed {
+		if id, err := strconv.ParseInt(k, 10, 64); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		fmt.Fprintf(stderr, MsgFactItemFailed+"\n", id, failed[strconv.FormatInt(id, 10)])
+	}
+	return 1
 }
 
 // runFactQuery implements `kahya fact query [--subject S] [--predicate P]
@@ -549,25 +648,110 @@ func factQueryValidity(from, to string) string {
 	return ", " + trim(from) + "→" + trim(to)
 }
 
-// runFactConfirm implements `kahya fact confirm <id>`: lifts an
-// agent_derived fact's quarantine (kahyad/internal/factengine.Engine.
-// ConfirmFact) - the human confirmation half of HANDOFF S5 memory #1.
+// runFactConfirm implements `kahya fact confirm <id> [<id>...] | --episode
+// <id> | --all-quarantined --since <RFC3339> [--yes]`: lifts facts'
+// quarantine (kahyad/internal/factengine.Engine.ConfirmFact, one ledger row
+// each) - the human confirmation half of HANDOFF S5 memory #1. One id keeps
+// the W5-04 answer line; several ids, an episode or the quarantined window
+// print the count. --all-quarantined without --yes only lists what it would
+// confirm (the user sees every fact before confirming it); without --since
+// it is refused outright.
 func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) != 1 {
+	fs := flag.NewFlagSet("fact confirm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	episode := fs.Int64("episode", 0, "bu bölümün (episode id) kanıtladığı tüm olguları onayla")
+	allQuarantined := fs.Bool("all-quarantined", false, "--since tarihinden beri kaydedilen tüm onaysız olguları onayla")
+	since := fs.String("since", "", "RFC3339: --all-quarantined için alt sınır (zorunlu)")
+	yes := fs.Bool("yes", false, "listelenen onaysız olguları gerçekten onayla (önce --yes olmadan çalıştırıp listeyi gör)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ids, ok := parseFactIDs(fs.Args())
+	selectors := 0
+	for _, set := range []bool{len(ids) > 0, *episode != 0, *allQuarantined} {
+		if set {
+			selectors++
+		}
+	}
+	if !ok || selectors != 1 || *episode < 0 || (!*allQuarantined && (*since != "" || *yes)) {
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
-	id, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
-	if err != nil || id == 0 {
+	ctx, trace := context.Background(), traceid.New()
+	switch {
+	case len(ids) == 1:
+		if err := client.ConfirmFact(ctx, trace, ids[0]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		fmt.Fprintf(stdout, MsgFactConfirmed+"\n", ids[0])
+		return 0
+	case *allQuarantined:
+		bound := strings.TrimSpace(*since)
+		if bound == "" {
+			fmt.Fprintln(stderr, MsgFactConfirmAllNeedsSince)
+			return 2
+		}
+		if !*yes {
+			rows, truncated, err := client.ListFacts(ctx, trace, url.Values{"quarantined": {"1"}, "since": {bound}, "limit": {strconv.Itoa(maxFactBatch)}})
+			if err != nil {
+				fmt.Fprintln(stderr, wrapServerError(MsgFactListFailed, err))
+				return 2
+			}
+			printFactList(stdout, rows)
+			if truncated {
+				fmt.Fprintf(stderr, MsgFactConfirmFailed+"\n", fmt.Sprintf("en fazla %d olgu", maxFactBatch))
+				return 2
+			}
+			if len(rows) > 0 {
+				fmt.Fprintf(stdout, MsgFactConfirmAllPrompt+"\n", len(rows))
+			}
+			return 0
+		}
+		res, err := client.ConfirmFacts(ctx, trace, nil, 0, bound)
+		if err != nil {
+			fmt.Fprintln(stderr, wrapServerError(MsgFactConfirmFailed, err))
+			return 2
+		}
+		return printFactBulk(stdout, stderr, MsgFactConfirmedMany, res.Confirmed, res.Failed)
+	default:
+		res, err := client.ConfirmFacts(ctx, trace, ids, *episode, "")
+		if err != nil {
+			fmt.Fprintln(stderr, wrapServerError(MsgFactConfirmFailed, err))
+			return 2
+		}
+		return printFactBulk(stdout, stderr, MsgFactConfirmedMany, res.Confirmed, res.Failed)
+	}
+}
+
+// maxFactBatch mirrors kahyad/internal/factengine.MaxFactBatch: the most
+// facts one bulk confirm/deny call may touch (the daemon enforces it).
+const maxFactBatch = 500
+
+// runFactDeny implements `kahya fact deny <id> [<id>...]`: a fixed -2.94
+// user-denial evidence row per fact (HANDOFF §5 memory #3 - lowers the
+// confidence; the fact stays active, unlike `kahya fact retract`).
+func runFactDeny(client *Client, args []string, stdout, stderr io.Writer) int {
+	ids, ok := parseFactIDs(args)
+	if !ok || len(ids) == 0 {
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
-	if err := client.ConfirmFact(context.Background(), traceid.New(), id); err != nil {
-		fmt.Fprintln(stderr, err.Error())
+	ctx, trace := context.Background(), traceid.New()
+	if len(ids) == 1 {
+		if err := client.DenyFact(ctx, trace, ids[0]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+		fmt.Fprintf(stdout, MsgFactDenied+"\n", ids[0])
+		return 0
+	}
+	res, err := client.DenyFacts(ctx, trace, ids)
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgFactDenyFailed, err))
 		return 2
 	}
-	fmt.Fprintf(stdout, MsgFactConfirmed+"\n", id)
-	return 0
+	return printFactBulk(stdout, stderr, MsgFactDeniedMany, res.Denied, res.Failed)
 }
 
 // runFactRetract implements `kahya fact retract <özne> <yüklem> <nesne>

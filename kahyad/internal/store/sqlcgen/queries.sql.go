@@ -2310,6 +2310,67 @@ func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
 	return items, nil
 }
 
+const listActiveFactsCreatedSince = `-- name: ListActiveFactsCreatedSince :many
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+FROM facts
+WHERE status = 'active' AND created_at >= ?1
+ORDER BY id DESC
+LIMIT ?2
+`
+
+type ListActiveFactsCreatedSinceParams struct {
+	CreatedSince string `json:"created_since"`
+	RowLimit     int64  `json:"row_limit"`
+}
+
+// `kahya fact list` without --quarantined (MEM-5): every active fact created
+// at or after created_since (same text bound as ListQuarantinedFacts),
+// newest first.
+func (q *Queries) ListActiveFactsCreatedSince(ctx context.Context, arg ListActiveFactsCreatedSinceParams) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveFactsCreatedSince, arg.CreatedSince, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Fact{}
+	for rows.Next() {
+		var i Fact
+		if err := rows.Scan(
+			&i.ID,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+			&i.SourceTier,
+			&i.Evidentiality,
+			&i.Confidence,
+			&i.Importance,
+			&i.ValidFrom,
+			&i.ValidTo,
+			&i.Status,
+			&i.Evidence,
+			&i.ExtractorVer,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.ConfirmedAt,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.Quote,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listActiveLocalEntityIDsByAliasFolded = `-- name: ListActiveLocalEntityIDsByAliasFolded :many
 SELECT DISTINCT a.entity_id
 FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
@@ -3685,14 +3746,25 @@ const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
 SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
+  AND created_at >= ?1
 ORDER BY id DESC
-LIMIT ?
+LIMIT ?2
 `
 
-// `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
-// confirmed.
-func (q *Queries) ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact, error) {
-	rows, err := q.db.QueryContext(ctx, listQuarantinedFacts, limit)
+type ListQuarantinedFactsParams struct {
+	CreatedSince string `json:"created_since"`
+	RowLimit     int64  `json:"row_limit"`
+}
+
+// `kahya fact list --quarantined` and `kahya fact confirm --all-quarantined
+// --since` (MEM-5): the active facts a human still has to confirm - the
+// tiers factengine.TierInjectionEligible quarantines, unconfirmed (pinned to
+// that predicate by factengine/TestListQuarantinedFactsMatchesTierPredicate)
+// - created at or after created_since, newest first. created_since is
+// compared as text: the caller passes a UTC "YYYY-MM-DDTHH:MM:SS" prefix
+// (” = no bound), which orders correctly against the stored RFC3339Nano.
+func (q *Queries) ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedFactsParams) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listQuarantinedFacts, arg.CreatedSince, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

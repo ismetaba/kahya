@@ -901,6 +901,102 @@ func (c *Client) ConfirmFact(ctx context.Context, traceID string, factID int64) 
 	return err
 }
 
+// DenyFact calls POST /v1/fact/deny with one id (`kahya fact deny <id>`).
+func (c *Client) DenyFact(ctx context.Context, traceID string, factID int64) error {
+	_, err := c.factAction(ctx, traceID, "/v1/fact/deny", map[string]any{"fact_id": factID})
+	return err
+}
+
+// factBulkResult mirrors kahyad's bulk POST /v1/fact/confirm|deny answer
+// (kahyad/internal/server.factBulkResponse, G13 MEM-5).
+type factBulkResult struct {
+	OK        bool              `json:"ok"`
+	Confirmed []int64           `json:"confirmed"`
+	Denied    []int64           `json:"denied"`
+	Failed    map[string]string `json:"failed"`
+	Error     string            `json:"error"`
+}
+
+// ConfirmFacts calls POST /v1/fact/confirm with a bulk selection: ids
+// (non-empty), or episodeID (non-zero), or since (non-empty RFC3339: every
+// quarantined fact created since then).
+func (c *Client) ConfirmFacts(ctx context.Context, traceID string, ids []int64, episodeID int64, since string) (factBulkResult, error) {
+	body := map[string]any{}
+	switch {
+	case len(ids) > 0:
+		body["fact_ids"] = ids
+	case episodeID != 0:
+		body["episode_id"] = episodeID
+	default:
+		body["all_quarantined_since"] = since
+	}
+	return c.factBulk(ctx, traceID, "/v1/fact/confirm", body)
+}
+
+// DenyFacts calls POST /v1/fact/deny with several ids (`kahya fact deny
+// <id> <id>...`).
+func (c *Client) DenyFacts(ctx context.Context, traceID string, ids []int64) (factBulkResult, error) {
+	return c.factBulk(ctx, traceID, "/v1/fact/deny", map[string]any{"fact_ids": ids})
+}
+
+func (c *Client) factBulk(ctx context.Context, traceID, path string, body any) (factBulkResult, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return factBulkResult{}, fmt.Errorf("%s: marshal request: %w", path, err)
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, path, traceID, bytes.NewReader(b))
+	if err != nil {
+		return factBulkResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return factBulkResult{}, err
+	}
+	defer resp.Body.Close()
+	var res factBulkResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return factBulkResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
+	}
+	if resp.StatusCode != http.StatusOK || !res.OK {
+		if res.Error != "" {
+			return factBulkResult{}, fmt.Errorf("%s", res.Error)
+		}
+		return factBulkResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
+	}
+	return res, nil
+}
+
+// factListRow mirrors kahyad/internal/factengine.FactListItem (GET
+// /v1/fact/list, G13 MEM-5).
+type factListRow struct {
+	FactID       int64   `json:"fact_id"`
+	Subject      string  `json:"subject"`
+	Predicate    string  `json:"predicate"`
+	Object       string  `json:"object"`
+	SourceTier   string  `json:"source_tier"`
+	ConfidenceP  float64 `json:"confidence_p"`
+	Quarantined  bool    `json:"quarantined"`
+	CreatedAt    string  `json:"created_at"`
+	EvidencePath string  `json:"evidence_path"`
+}
+
+// ListFacts calls GET /v1/fact/list?<params> (`kahya fact list`);
+// truncated reports more matching facts beyond the limit.
+func (c *Client) ListFacts(ctx context.Context, traceID string, params url.Values) (rows []factListRow, truncated bool, err error) {
+	path := "/v1/fact/list"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	var out struct {
+		Facts     []factListRow `json:"facts"`
+		Truncated bool          `json:"truncated"`
+	}
+	if err := c.getEntityJSON(ctx, traceID, path, &out); err != nil {
+		return nil, false, err
+	}
+	return out.Facts, out.Truncated, nil
+}
+
 // RetractFact calls POST /v1/fact/retract (`kahya fact retract <özne>
 // <yüklem> <nesne> [oturum_id]`), returning the retracted fact's id.
 func (c *Client) RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error) {

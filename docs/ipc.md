@@ -688,6 +688,40 @@ a cloud model, without changing anything in §2-§6 above:
   object_entity_id}], "trace_id"}`, printed `"Olgular (%d):"` /
   `"#%d  %s | %s | %s  (p=%.2f, %s%s%s)"` (e.g. `(p=0.80, user_asserted,
   2026-05-01→, onaysız)`) / `"Eşleşen olgu yok."`.
+- **Human review of facts (FIX-MEM-5 phase 1, G13).** Control routes only
+  (G03; a live worker is refused even with the control secret, G00 C-16):
+  `POST /v1/fact/confirm` takes exactly one of `{"fact_id": N}` (answered
+  `{"ok":true,"id":N}` as in W5-04), `{"fact_ids": [...]}`, `{"episode_id":
+  E}` (every active fact that episode's evidence cites) or
+  `{"all_quarantined_since": "<RFC3339>"}` (every quarantined fact created
+  at or after it; `all_quarantined:true` without the bound is a 400). A bulk
+  answer is `{"ok":true,"confirmed":[ids],"failed":{"<id>":"<err>"},
+  "trace_id"}`; one call touches at most 500 facts (more is a 400 `"en fazla
+  500 olgu"` and confirms nothing); an id that names no fact fails
+  (`factengine.ErrFactNotFound`, a 422 for the single form). Each
+  confirmation is its own `fact_confirmed` ledger row. `POST /v1/fact/deny
+  {fact_id | fact_ids, session_id?}` records the fixed -2.94 user denial per
+  fact (`DenyFact`; session `cli:<trace_id>` by default, so the same id
+  twice in one call is one evidence row) → `{"ok":true,"id":N}` or
+  `{"ok":true,"denied":[...],"failed":{...}}`. `GET
+  /v1/fact/list?quarantined=1&since=<RFC3339>&entity=<id|ad>&limit=<1..500>`
+  → `{"facts": [{fact_id, subject, predicate, object, source_tier,
+  evidentiality, confidence_p, quarantined, created_at, evidence_path}],
+  "truncated", "trace_id"}`, newest first; "quarantined" is
+  `factengine.FactQuarantined` (a tier `TierInjectionEligible` keeps out,
+  unconfirmed - the SQL filter of `ListQuarantinedFacts` is pinned to it);
+  `since` bounds `created_at` (inclusive, second precision); `entity`
+  matches every alias (local view). CLI: `kahya fact list [--quarantined]
+  [--entity <ad|id>] [--since T] [--limit N]` (`"Olgular (%d):"`,
+  `"#%d  %s | %s | %s  (p=%.2f, %s%s)  ← %s"`, `"Olgu yok."`), `kahya fact
+  confirm <id>... | --episode <id> | --all-quarantined --since T [--yes]`
+  (one id keeps `"Olgu onaylandı: %d"`, otherwise `"%d olgu onaylandı."`;
+  `--all-quarantined` without `--since` is a usage error, without `--yes`
+  it only lists and prints `"%d olgu onaylanacak; devam için komutu --yes
+  ile tekrarla."`), `kahya fact deny <id>...` (`"Olgu reddedildi (güven
+  düşürüldü): %d"` / `"%d olgu reddedildi."`); a failed id is one stderr
+  line and exit 1. No "N confirmations => auto-inject" shortcut exists
+  (decision MEM-5.a).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

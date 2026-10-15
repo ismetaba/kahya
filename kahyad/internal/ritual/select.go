@@ -173,7 +173,7 @@ func (s *Sampler) Select(ctx context.Context, traceID string) ([]sqlcgen.Fact, e
 		}
 		candidates = append(candidates, scoredFact{
 			fact:          f,
-			quarantined:   f.SourceTier == factengine.TierAgentDerived && !f.ConfirmedAt.Valid,
+			quarantined:   factengine.FactQuarantined(f),
 			thresholdDist: math.Abs(f.Confidence - factengine.InjectionThresholdLogOdds),
 			lastAskedAt:   lastAsked[f.ID],
 		})

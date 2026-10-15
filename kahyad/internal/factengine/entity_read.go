@@ -42,8 +42,9 @@ type EntitySummary struct {
 
 // EntityFact is one fact on an entity, as `kahya entity show` prints it.
 // ConfidenceP is the probability form of the log-odds confidence;
-// Quarantined marks an agent_derived fact nobody confirmed yet (HANDOFF §5
-// memory #1 - never injected, but the user may look at it).
+// Quarantined marks a fact in a quarantined tier nobody confirmed yet
+// (FactQuarantined; HANDOFF §5 memory #1 - never injected, but the user may
+// look at it).
 type EntityFact struct {
 	FactID        int64   `json:"fact_id"`
 	Subject       string  `json:"subject"`
@@ -138,7 +139,7 @@ func (e *Engine) ShowEntity(ctx context.Context, id int64) (EntityDetail, error)
 			FactID: f.ID, Subject: f.Subject, Predicate: f.Predicate, Object: f.Object,
 			SourceTier: f.SourceTier, Evidentiality: f.Evidentiality,
 			ConfidenceP: LogOddsToProbability(f.Confidence),
-			Quarantined: f.SourceTier == TierAgentDerived && !f.ConfirmedAt.Valid,
+			Quarantined: FactQuarantined(f),
 			ValidFrom:   f.ValidFrom.String, ValidTo: f.ValidTo.String,
 		})
 	}

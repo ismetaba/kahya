@@ -265,6 +265,9 @@ var controlProbes = []controlProbe{
 	{http.MethodGet, "/v1/entity/list", ""},
 	{http.MethodGet, "/v1/entity/show/1", ""},
 	{http.MethodGet, "/v1/fact/query?predicate=works_at", ""},
+	{http.MethodGet, "/v1/fact/list?quarantined=1", ""},
+	{http.MethodPost, "/v1/fact/deny", `{"fact_id":1}`},
+	{http.MethodPost, "/v1/fact/confirm", `{"fact_ids":[1]}`},
 	{http.MethodGet, "/nope", ""},
 }
 
