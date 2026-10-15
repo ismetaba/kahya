@@ -2039,11 +2039,22 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 // either way, per the task spec's own "pressing ⌥⎋ with nothing running
 // is not an error" instruction - a --task <id> that does not exist, or is
 // already terminal, is likewise 0 halted, never an error.
+//
+// A stray positional argument (`kahya halt <id>`, or `kahya halt <id>
+// --task <id>`, whose --task the flag package never parses because it
+// stops at the first positional) is a usage error with nothing sent:
+// silently dropping it would halt EVERY task instead of the one meant -
+// user_halted is terminal, so that destroys the user's other in-flight
+// work (FIX-FINAL cli-halt-positional-halts-all).
 func runHalt(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("halt", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	taskID := fs.String("task", "", "yalnız bu görevi durdur (boş = tüm aktif görevler)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, MsgHaltUsage)
 		return 2
 	}
 

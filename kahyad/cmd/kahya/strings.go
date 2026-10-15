@@ -216,6 +216,10 @@ const (
 	// terminal/does not exist). Exit 0 either way (this task's spec:
 	// "pressing ⌥⎋ with nothing running is not an error").
 	MsgHaltNone = "Durdurulacak görev yok."
+	// MsgHaltUsage is printed (exit 2, nothing sent) when `kahya halt` is
+	// given a positional argument: `kahya halt <id>` would otherwise drop
+	// the id and halt EVERY task (FIX-FINAL cli-halt-positional-halts-all).
+	MsgHaltUsage = "kullanım: kahya halt [--task <id>]"
 
 	// ---- W4-05: kahya ledger verify ----
 

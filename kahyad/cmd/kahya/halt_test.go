@@ -88,3 +88,32 @@ func TestHaltDaemonDownIsUnreachable(t *testing.T) {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
 }
+
+// TestHaltRejectsPositionalArgument (FIX-FINAL cli-halt-positional-halts-
+// all): `kahya halt <id>` used to drop the id and send {"all":true},
+// halting every task. It is now a local usage error and nothing is sent.
+func TestHaltRejectsPositionalArgument(t *testing.T) {
+	for _, args := range [][]string{
+		{"halt", "t_0123"},
+		{"halt", "t_0123", "--task", "t_0123"},
+		{"halt", "--task", "t_0123", "extra"},
+	} {
+		sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("%v: unexpected request %s %s", args, r.Method, r.URL.Path)
+			json.NewEncoder(w).Encode(map[string]int{"halted": 3})
+		}))
+		t.Setenv("KAHYA_SOCKET", sock)
+
+		var stdout, stderr bytes.Buffer
+		code := run(args, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 {
+			t.Errorf("%v: exit code = %d, want 2", args, code)
+		}
+		if !strings.Contains(stderr.String(), MsgHaltUsage) {
+			t.Errorf("%v: stderr = %q, want %q", args, stderr.String(), MsgHaltUsage)
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("%v: stdout = %q, want empty", args, stdout.String())
+		}
+	}
+}
