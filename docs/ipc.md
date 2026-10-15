@@ -1877,9 +1877,12 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
    call answers at once with `"⏳ Yerel onay bekleniyor (onay kimliği:
    <id>). …"`). Ledger `approval_wait_started`. A `kahya ask` stream of the
    same task gets the delta line `"⏳ Onay bekleniyor (onay kimliği: <id>)
-   — başka bir terminalde 'kahya approve <id>' çalıştır."` and an SSE
-   comment keepalive (`: keepalive`) every 10 s while it waits (the CLI
-   drops a stream idle for 30 s).
+   — başka bir terminalde 'kahya approve <id>' çalıştır."` - except a
+   palette run (`palette_opened_at` set: ⌥Space or push-to-talk, where
+   Hammerspoon shows the card and only reads stdout when the task ends;
+   FIX-FINAL TUX-6) - and an SSE comment keepalive (`: keepalive`) every
+   10 s while it waits, palette runs included (the CLI drops a stream idle
+   for 30 s).
 3. The human answers (`kahya approve <id>` / `kahya approvals decide`,
    Hammerspoon, or a Telegram tap for a `reversible: true` tool —
    `Engine.Approve` refuses an irreversible tool from any non-local

@@ -1002,6 +1002,9 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// the CLI's 30s idle-read limit - so every write is serialized, and
 	// none happens once this handler has returned.
 	sse := newTaskSSE(w, flusher, writeSSE)
+	// FIX-FINAL TUX-6: a palette run (⌥Space text or push-to-talk) gets
+	// keepalives but no approval-wait notice in its answer stream.
+	sse.quietNotice = req.PaletteOpenedAt != nil
 	writeSSE = sse.write
 	defer sse.close()
 	defer s.registerApprovalNotice(taskID, sse)()

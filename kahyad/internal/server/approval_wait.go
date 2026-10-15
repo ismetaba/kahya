@@ -402,6 +402,13 @@ type taskSSE struct {
 	w       io.Writer
 	flusher http.Flusher
 	inner   func(event string, payload any)
+	// quietNotice drops the approval-wait notice delta but keeps the
+	// keepalives (FIX-FINAL TUX-6): a palette run (palette_opened_at set)
+	// shows its stdout only when the task ends, and Hammerspoon already
+	// showed the card where the user decides - the "run kahya approve <id>
+	// in another terminal" line only pushed the real answer out of the
+	// 5-line preview.
+	quietNotice bool
 }
 
 func newTaskSSE(w io.Writer, flusher http.Flusher, inner func(event string, payload any)) *taskSSE {
@@ -418,6 +425,9 @@ func (t *taskSSE) write(event string, payload any) {
 }
 
 func (t *taskSSE) notice(id string) {
+	if t.quietNotice {
+		return
+	}
 	t.write("delta", map[string]string{"text": fmt.Sprintf(MsgApprovalPendingNoticeFmt, id, id)})
 }
 
