@@ -380,10 +380,10 @@ a cloud model, without changing anything in §2-§6 above:
   `secretlane.Classifier` (deterministic pre-pass + Qwen3-30B-A3B
   fallback, `kahyad/internal/mlx.Supervisor`-backed, fully implemented and
   unit/live-tested) that `kahyad/internal/secretlane.Escalate` exists for
-  at the memory_write / mail-web-Reader ingestion points — see that
-  package's own doc comments for the full rationale. `fs_read` is an
-  ingestion point too and escalates deterministically since FIX-B-6 (see
-  "Mid-task escalation" below).
+  at the mail-web-Reader ingestion point — see that
+  package's own doc comments for the full rationale. `fs_read` and
+  `memory_write` are ingestion points too and escalate deterministically
+  since FIX-B-6 / FIX-U-3 (see "Mid-task escalation" below).
 - **A `lane:"secret"` task is answered ENTIRELY on-device — the worker is
   never spawned at all.** `kahyad/internal/server`'s `handleSecretLaneTask`
   calls `secretlane.Answerer` (backed by the same local Qwen3-30B-A3B
@@ -467,6 +467,36 @@ a cloud model, without changing anything in §2-§6 above:
   task is left non-terminal, and a resume respawns it; every respawn is
   refused the same way (zero bytes upstream) and the notice is still
   raised only once per kahyad process.
+- **Mid-task escalation at `memory_write` (FIX-U-3, G00 U-3).** The agent's
+  `memory_write` content is classified LOCALLY before a single byte is
+  written (`mcp/memory.SecretLaneSeam`, the SAME deterministic
+  `secretlane.ClassifyDeterministic` adapter `fs_read` uses, no Qwen). On a
+  hit, in this fixed order: durable sensitive-read mark of the request's
+  trace (FIX-B-7 tracker), sticky `tasks.lane='secret'` via
+  `kahyad/internal/server.NewMemoryLaneEscalator` (the same
+  attribution-pinned resolution as `fs_read`; ledger
+  `secret_lane_escalated{source:"memory_write"}`), then the note is
+  redirected to `<secret_lane_memory_dir>/notes/<requested path>`
+  (config `secret_lane_memory_dir`, default `gizli`:
+  `inbox/2026-10-13.md` → `gizli/notes/inbox/2026-10-13.md`; a path
+  already under `gizli/` is kept) and the target must be covered by a
+  `secret_lane_globs` entry (`policy.yaml`: `~/Kahya/memory/gizli/**`,
+  decision MEM-6.b). Every failure refuses the write, nothing on disk or in
+  git: mark/escalate/no matcher → `"Gizli-şerit not kaydedilemedi; not güvenlik gereği yazılmadı (fail-closed)."`,
+  no covering glob →
+  `"memory_write: gizli şerit için hafıza globu tanımlı değil (policy.yaml secret_lane_globs: ~/Kahya/memory/gizli/**); not yazılmadı."`
+  (ledger `memory_write.secret_lane_refused{reason}`, reasons
+  `sensitive_mark_failed` / `lane_escalate_failed` / `matcher_unwired` /
+  `secret_glob_missing`). A redirected write ledgers `memory_write`
+  (`secret_lane:true`, `task_id`) and `memory_write.secret_lane_redirected
+  {requested_file, file, category, task_id, commit_sha}`; the tool output
+  gains `secret_lane` and returns the path the note actually landed on.
+  The front matter stays `agent_derived`. The cloud-facing chunk paths
+  apply the same path-glob rule (`memlane.PathIsSecret`): the
+  `memory_search` tool result and the `for_injection:true` `<hafiza>`
+  block never carry a chunk of a secret-glob note (`gizli/**`,
+  `finans*.md`), whatever its tier; `for_injection:false` (the local
+  surface) is unfiltered.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
@@ -1498,7 +1528,7 @@ first boot). `{}` disables it.
   Reader ingestion** — W4-03 wires the W4-03 Reader path (see that
   package's own doc comment); fs_read escalates the calling task's lane
   since FIX-B-6 (see the W3-08 note above); memory_write escalation
-  remains future work (G13, G00 U-3). W3-08 (see its own note above) exposes the full
+  landed with FIX-U-3 (`mcp/memory.SecretLaneSeam`, same note). W3-08 (see its own note above) exposes the full
   `secretlane.Classifier` (deterministic + Qwen fallback, now also
   returning `intent`, W4-08) and `secretlane.Escalate` (sticky lane
   widening) for those tasks to call; `POST /v1/task`'s own classification

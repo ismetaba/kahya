@@ -35,6 +35,7 @@ import (
 	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/metrics"
 	"kahya/kahyad/internal/mlx"
 	"kahya/kahyad/internal/mlxsup"
@@ -58,6 +59,7 @@ import (
 	"kahya/kahyad/internal/traceid"
 	"kahya/kahyad/internal/ui"
 	mcpfs "kahya/mcp/fs"
+	"kahya/mcp/memory"
 	mcposascript "kahya/mcp/osascript"
 	mcpshell "kahya/mcp/shell"
 )
@@ -603,6 +605,28 @@ func run() int {
 	fsTool.Receipts = recExec
 	policyEngine.SetUndoExpiryHook(fsTool.PurgeExpired)
 	srv.SetFSTool(fsTool)
+
+	// FIX-U-3 (G00 U-3, H-7): memory_write is an ingestion point too. Its
+	// content is classified LOCALLY (the same deterministic adapter fs_read
+	// uses) before a byte is written; a secret hit marks the session
+	// sensitive (the same durable egress-gate tracker), stickily escalates
+	// the CALLING task's lane (attribution-pinned, like fs_read) and lands
+	// the note under cfg.SecretLaneMemoryDir, which policy.yaml's
+	// ~/Kahya/memory/gizli/** glob covers (no covering glob = the write is
+	// refused). laneClassifier is the ONE path-glob lane rule for the
+	// memory side: here it keeps secret-glob notes out of the memory_search
+	// tool result and the for_injection <hafiza> block (both reach a cloud
+	// model); the later G13 graph/extract/ingest steps reuse it.
+	laneClassifier := memlane.Classifier{Store: st.Queries, MemoryDir: cfg.MemoryDir, SecretGlobs: pol.SecretLaneGlobs, Matcher: ritual.PolicyGlobMatcher{}}
+	srv.SetMemoryLane(&laneClassifier)
+	srv.SetMCPMemorySecretLane(memory.SecretLaneSeam{
+		Classifier: server.NewMemoryContentClassifier(),
+		Marker:     server.NewMemorySensitiveMarker(egressGate),
+		Escalator:  server.NewMemoryLaneEscalator(st.Queries, st),
+		Dir:        cfg.SecretLaneMemoryDir,
+		Globs:      pol.SecretLaneGlobs,
+		Matcher:    ritual.PolicyGlobMatcher{},
+	})
 
 	// W3-04: shell_docker/shell_host, registered onto the SAME shared
 	// /v1/mcp server as memory's/fs's own tools (server.SetShellTool's doc

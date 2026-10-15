@@ -1838,3 +1838,52 @@ func TestLoadFailsClosedOnInvalidSearchRecency(t *testing.T) {
 		t.Fatalf("Load() at the bounds error = %v, want nil", err)
 	}
 }
+
+// TestLoadSecretLaneMemoryDirDefaultAndOverride (FIX-U-3): memory_write's
+// secret-lane redirect dir defaults to "gizli" (policy.yaml's
+// ~/Kahya/memory/gizli/** glob covers it) and is a real config.yaml key.
+func TestLoadSecretLaneMemoryDirDefaultAndOverride(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SecretLaneMemoryDir != "gizli" || DefaultSecretLaneMemoryDir != "gizli" {
+		t.Fatalf("default secret_lane_memory_dir = %q (const %q), want gizli", cfg.SecretLaneMemoryDir, DefaultSecretLaneMemoryDir)
+	}
+	writeConfigYAML(t, home, "secret_lane_memory_dir: ozel/notlar\n")
+	if cfg, err = Load(); err != nil || cfg.SecretLaneMemoryDir != "ozel/notlar" {
+		t.Fatalf("override = %q, %v; want ozel/notlar, nil", cfg.SecretLaneMemoryDir, err)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidSecretLaneMemoryDir (FIX-U-3): a redirect
+// dir that could land a secret note outside memory_dir, under an unindexed
+// dot-directory, or under a non-ASCII name fails Load.
+func TestLoadFailsClosedOnInvalidSecretLaneMemoryDir(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"empty", `""`},
+		{"blank", `"  "`},
+		{"absolute", `/tmp/gizli`},
+		{"dotdot", `../gizli`},
+		{"inner_dotdot", `gizli/../../x`},
+		{"dot_dir", `.gizli`},
+		{"trash", `.trash/x`},
+		{"trailing_slash", `gizli/`},
+		{"dot_segment", `./gizli`},
+		{"backslash", `'gizli\notlar'`},
+		{"non_ascii", `"özel"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, "secret_lane_memory_dir: "+tc.value+"\n")
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "secret_lane_memory_dir") {
+				t.Fatalf("Load() error = %v, want a secret_lane_memory_dir validation error", err)
+			}
+		})
+	}
+}

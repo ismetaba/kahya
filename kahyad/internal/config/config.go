@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -121,6 +122,17 @@ type Config struct {
 	// eval run score the candidate too. Outside the bounds Load fails.
 	SearchRecencyWeight       float64 `yaml:"search_recency_weight"`
 	SearchRecencyHalfLifeDays int     `yaml:"search_recency_half_life_days"`
+
+	// SecretLaneMemoryDir (FIX-U-3; G13 secret_lane_memory_dir) is the
+	// memory subdirectory - relative to MemoryDir, forward-slash, ASCII -
+	// where memory_write lands content its local classifier flagged
+	// secret-lane (<dir>/notes/<requested path>; MEM-6 ingest later uses
+	// <dir>/ingest/). A secret_lane_globs entry MUST cover it
+	// (policy.yaml: ~/Kahya/memory/gizli/**): memory_write refuses a secret
+	// note it cannot land under a covering glob. Default "gizli". Load
+	// fails on an absolute path, a ".." component, a dot-directory (the
+	// indexer and consolidation skip those) or a non-ASCII rune.
+	SecretLaneMemoryDir string `yaml:"secret_lane_memory_dir"`
 
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
@@ -860,6 +872,7 @@ type fileConfig struct {
 	EvalRetrievalDatasetPath      *string         `yaml:"eval_retrieval_dataset_path"`
 	SearchRecencyWeight           *float64        `yaml:"search_recency_weight"`
 	SearchRecencyHalfLifeDays     *int            `yaml:"search_recency_half_life_days"`
+	SecretLaneMemoryDir           *string         `yaml:"secret_lane_memory_dir"`
 	EgressPort                    *int            `yaml:"egress_port"`
 	DockerImageTag                *string         `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string         `yaml:"docker_image_digest_path"`
@@ -1036,6 +1049,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSearchRecency(cfg.SearchRecencyWeight, cfg.SearchRecencyHalfLifeDays); err != nil {
+		return Config{}, err
+	}
+	if err := validateSecretLaneMemoryDir(cfg.SecretLaneMemoryDir); err != nil {
 		return Config{}, err
 	}
 
@@ -1318,6 +1334,46 @@ func validateSearchRecency(weight float64, halfLifeDays int) error {
 	return nil
 }
 
+// DefaultSecretLaneMemoryDir is secret_lane_memory_dir's default
+// (FIX-U-3); it equals kahya/mcp/memory.DefaultSecretLaneDir (pinned by
+// kahyad's TestSecretLaneMemoryDirDefaultMatchesMemoryPackage).
+const DefaultSecretLaneMemoryDir = "gizli"
+
+// validateSecretLaneMemoryDir fails Load closed (FIX-U-3) on a
+// secret_lane_memory_dir that is empty, absolute, escapes MemoryDir (a
+// ".." component), names a dot-directory (the indexer and consolidation
+// skip those, so a redirected note would vanish from local recall), is not
+// in clean forward-slash form, or contains a non-ASCII rune (CLAUDE.md:
+// directory names are ASCII).
+func validateSecretLaneMemoryDir(dir string) error {
+	bad := func(why string) error {
+		return fmt.Errorf("config: secret_lane_memory_dir %q: %s", dir, why)
+	}
+	if strings.TrimSpace(dir) == "" {
+		return bad("must not be empty")
+	}
+	for _, r := range dir {
+		if r > 127 {
+			return bad("must be ASCII (HANDOFF §7: directory names are ASCII)")
+		}
+	}
+	if strings.Contains(dir, "\\") || strings.HasPrefix(dir, "/") || filepath.IsAbs(dir) {
+		return bad("must be a forward-slash path relative to memory_dir")
+	}
+	if path.Clean(dir) != dir {
+		return bad("must be in clean form (no trailing slash, no . or empty components)")
+	}
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == ".." {
+			return bad("must not escape memory_dir")
+		}
+		if strings.HasPrefix(seg, ".") {
+			return bad("must not name a dot-directory (never indexed)")
+		}
+	}
+	return nil
+}
+
 // validateTimezone fails Load closed on an unknown timezone name
 // (FIX-P-14): kahyad must never silently run its day boundaries in a zone
 // the operator did not ask for. Empty = time.Local (see Config.Timezone).
@@ -1386,6 +1442,8 @@ func defaults(home, env string) Config {
 		// retrieval eval covers the recency config.
 		SearchRecencyWeight:       0,
 		SearchRecencyHalfLifeDays: DefaultSearchRecencyHalfLifeDays,
+		// FIX-U-3: memory_write's secret-lane redirect target.
+		SecretLaneMemoryDir: DefaultSecretLaneMemoryDir,
 		// B-1 approval loop defaults (config.Config's own doc comments).
 		ApprovalWaitSeconds:     300,
 		AutonomyBootstrapLevels: map[string]int{"memory_search/R/global": 1},
@@ -1809,6 +1867,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.SearchRecencyHalfLifeDays != nil {
 		cfg.SearchRecencyHalfLifeDays = *fc.SearchRecencyHalfLifeDays
+	}
+	if fc.SecretLaneMemoryDir != nil {
+		cfg.SecretLaneMemoryDir = *fc.SecretLaneMemoryDir
 	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort

@@ -903,7 +903,8 @@ func TestGate5_SecretLaneCannotReachCloud(t *testing.T) {
 	// typed chat prompt is never routed through the full/Qwen-fallback
 	// classifier — only the three W4-03 ingestion points — memory_write,
 	// fs reads flagged for model consumption, mail/web Reader input — are
-	// meant to; fs_read is wired since FIX-B-6, deterministic-only, see
+	// meant to; fs_read is wired since FIX-B-6 and memory_write since
+	// FIX-U-3, both deterministic-only, see
 	// TestGate5_FsReadSecretContentEscalatesAndBlocksCloud). There
 	// is consequently NO currently-wired HTTP-reachable call site where
 	// "classification is hanging on Qwen" is an observable state at all —

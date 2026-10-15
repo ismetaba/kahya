@@ -516,7 +516,7 @@ func TestMCPGateBoundaryIsKahyadSideBelowGatePerformsWrite(t *testing.T) {
 	log := testLogger(t)
 	idx := indexer.New(f.store.DB(), f.memoryDir, log)
 	searcher := search.New(f.store.DB(), log, search.DefaultConfig())
-	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{searcher}, idx, f.store, log)
+	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{inner: searcher}, idx, f.store, log)
 
 	out, err := memSrv.HandleWrite(context.Background(), "tid-direct", memory.MemoryWriteArgs{
 		Content: "dogrudan yazim", File: "inbox/gate.md",
@@ -546,7 +546,7 @@ func TestMCPDirectHandlerWriteEndToEndFindableBySearch(t *testing.T) {
 	log := testLogger(t)
 	idx := indexer.New(f.store.DB(), f.memoryDir, log)
 	searcher := search.New(f.store.DB(), log, search.DefaultConfig())
-	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{searcher}, idx, f.store, log)
+	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{inner: searcher}, idx, f.store, log)
 
 	_, err := memSrv.HandleWrite(context.Background(), "tid-direct", memory.MemoryWriteArgs{
 		Content: "Kadıköy'de iki daire gezdik", File: "notes/kadikoy.md",
@@ -603,7 +603,7 @@ func TestMCPDirectHandlerForgetHeadingRemovesOnlyThatSection(t *testing.T) {
 	log := testLogger(t)
 	idx := indexer.New(f.store.DB(), f.memoryDir, log)
 	searcher := search.New(f.store.DB(), log, search.DefaultConfig())
-	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{searcher}, idx, f.store, log)
+	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{inner: searcher}, idx, f.store, log)
 
 	if _, err := idx.ReindexFile(context.Background(), "tid-seed", "notes.md"); err != nil {
 		t.Fatalf("seed reindex: %v", err)
@@ -646,7 +646,7 @@ func TestMCPDirectHandlerForgetFileMakesTextUnsearchableButKeepsGitHistory(t *te
 	log := testLogger(t)
 	idx := indexer.New(f.store.DB(), f.memoryDir, log)
 	searcher := search.New(f.store.DB(), log, search.DefaultConfig())
-	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{searcher}, idx, f.store, log)
+	memSrv := memory.New(f.memoryDir, mcpSearchAdapter{inner: searcher}, idx, f.store, log)
 
 	if _, err := idx.ReindexFile(context.Background(), "tid-seed", "notes.md"); err != nil {
 		t.Fatalf("seed reindex: %v", err)

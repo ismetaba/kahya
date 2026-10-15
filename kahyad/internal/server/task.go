@@ -259,11 +259,11 @@ func (s *Server) SetAnthproxy(governor *anthproxy.Governor, notifier notify.Noti
 // trace_id" convention kahyad/internal/egress.NewAnthproxyEgressGateHook
 // already uses; may be nil (best-effort, matching every other optional
 // hook in this file). classifier itself is stored for a future ingestion
-// point (memory_write, G13 / G00 U-3) to consult via
+// point (the W4-03 mail/web Reader) to consult via
 // kahyad/internal/secretlane.Escalate - not read by handleTask today.
-// fs_read's escalation does not need it: since FIX-B-6 its deterministic
-// content hit (or path glob) lands via NewFSLaneEscalator
-// (secretlane.EscalateVerdict).
+// fs_read and memory_write do not need it: their deterministic content hit
+// (or, for fs_read, a path glob) lands via NewFSLaneEscalator (FIX-B-6) and
+// NewMemoryLaneEscalator (FIX-U-3) - both secretlane.EscalateVerdict.
 func (s *Server) SetSecretLane(classifier *secretlane.Classifier, answerer secretlane.Answerer, markSensitiveRead func(ctx context.Context, sessionKey, traceID string) error) {
 	s.secretLaneClassifier = classifier
 	s.secretLaneAnswerer = answerer

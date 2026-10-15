@@ -68,7 +68,7 @@
 | Schema table list open Day-1 (episodes, chunks, facts+all columns, entities, entity_aliases, evidence, merge_ledger, tasks, events/outbox) | W12-02 | covered |
 | Product principle: W3 permanent written approval | W3-02, W3-06, W3-07, W78-03 | covered |
 | Product principle: safety in executor (static labels, Go check before tool runs) | W12-07, W3-01/W3-02 | covered |
-| Product principle: privacy in code (Go branch, "yerel işlendi" badge) | W3-08 | covered |
+| Product principle: privacy in code (Go branch, "yerel işlendi" badge) | W3-08, FIX-U-3 (memory_write classified at ingest, secret notes under the `gizli/**` glob, secret-glob chunks never in a cloud `<hafiza>` block or `memory_search` result) | covered |
 | Product principle: memory can never lower a permission | W78-03 gap-fill test `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | covered |
 
 ## §6 weekly acceptance gates
@@ -201,6 +201,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #1 | an unwired Telegram session gate redacts every body (fail-closed, decision U5-2) | `kahyad/internal/telegram/TestSendWithoutSessionTaintFailsClosed` | FIX-U-5 | ci-hermetic |
 | Safety #1 | the redacted Telegram notice is itself egress-checked under the same session key | `kahyad/internal/telegram/TestRedactedNoticeItselfIsEgressChecked` | FIX-U-5 | ci-hermetic |
 | Safety #1 | main.go hands the Telegram bot the SAME durable sensitive-read tracker the egress gate uses | `kahyad/TestTelegramSessionTaintIsTheEgressGateTracker` | FIX-U-5 | ci-hermetic |
+| Safety #1 | a secret `memory_write` whose sensitive-read mark cannot be persisted is refused — no file, no commit, no escalation | `mcp/memory/TestHandleWriteSecretSensitiveMarkFailureRefusesWrite` | FIX-U-3 | ci-hermetic |
 | Safety #2 | missing taint record ⇒ untrusted (fail-closed) | `kahyad/internal/taint/TestGetMissingRowIsTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint read error ⇒ fail-closed to tainted | `kahyad/internal/taint/TestGetOnReadErrorFailsClosedToTainted` | W4-03 | ci-hermetic |
 | Safety #2 | taint only rises (clean-after-tainted rejected) | `kahyad/internal/taint/TestRaiseThenInsertCleanFails` | W4-03 | ci-hermetic |
@@ -393,6 +394,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #1 | below the diff's cell cap the user-edit-wins edit script and result are byte-identical to the pre-FIX-P-10 algorithm on random inputs; the trimmed path above the cap is a valid, minimal script | `kahyad/internal/consolidation/TestDiffLinesTrimmedMatchesExactOnRandomSmallInputs` | FIX-P-10 | ci-hermetic |
 | Memory #1 | an oversized changed region falls back to one coarse hunk that stays conservative: a user-touched line anywhere in it keeps the whole region original; a touched line only in the unchanged prefix/suffix does not block it | `kahyad/internal/consolidation/TestApplyUserEditWinsCoarseFallbackIsConservative` | FIX-P-10 | ci-hermetic |
 | Memory #1 | through Run + Approve, a note on the coarse path keeps today's user line byte-exact while the other note's change lands; the fallback is logged per file | `kahyad/internal/consolidation/TestRunUserEditWinsOnCoarseFallbackFile` | FIX-P-10 | ci-hermetic |
+| Memory #1 | a `memory_write` redirected to the secret-lane dir keeps the `agent_derived` front matter (the redirect changes the path, never the tier) | `mcp/memory/TestHandleWriteSecretContentLandsUnderGizli` | FIX-U-3 | ci-hermetic |
 | Memory #2 | namesakes never auto-merge on name similarity | `kahyad/internal/factengine/TestNamesakeFixtureYieldsTwoDistinctEntitiesNoAutoMerge` | W5-04 | ci-hermetic |
 | Memory #2 | entity merge requires an evidence fact_id | `kahyad/internal/factengine/TestMergeRequiresEvidenceFactID` | W5-04 | ci-hermetic |
 | Memory #2 | merge is splittable, exactly two ledger rows | `kahyad/internal/factengine/TestMergeThenSplitRoundTripsExactlyTwoLedgerRows` | W5-04 | ci-hermetic |
@@ -657,4 +659,13 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Product C | a file returned by two batches (batch 1 rewrote it, batch 2 returns it again) rejects the night, nothing committed; the cross-batch duplicate check still holds if the per-batch bound were widened | `kahyad/internal/consolidation/TestRunBatchPathReturnedByTwoBatchesRejected` | FIX-B-5 | ci-hermetic |
 | Product C | a malformed answer never masks a foreign path: the night is rejected, never a dropped batch | `kahyad/internal/consolidation/TestRunMalformedBatchNeverMasksUnknownPath` | FIX-B-5 | ci-hermetic |
 | Product C | the rewrite-key bound covers `"unchanged"` entries too: naming a path outside the batch, even as unchanged, is a contract breach (`ErrRewriteUnknownPath`) | `kahyad/internal/consolidation/TestParseRewriteResponseV2UnchangedForeignPathRejected` | FIX-B-5 | ci-hermetic |
+| Product C | `memory_write` content is classified LOCALLY at ingest (deterministic pre-pass, before any byte is written): a secret note lands under `gizli/notes/<requested path>` (front matter still `agent_derived`), the calling task's lane is escalated first, and the redirect is ledgered | `mcp/memory/TestHandleWriteSecretContentLandsUnderGizli` | FIX-U-3 | ci-hermetic |
+| Product C | a secret `memory_write` whose lane escalation cannot be persisted is refused — nothing on disk, nothing committed | `mcp/memory/TestHandleWriteSecretEscalateFailureRefusesWrite` | FIX-U-3 | ci-hermetic |
+| Product C | a secret `memory_write` whose target no `secret_lane_globs` entry covers (or whose glob cannot be evaluated) is refused with the Turkish glob-missing error; the task is still escalated | `mcp/memory/TestHandleWriteSecretWithoutGlobFailsClosed` | FIX-U-3 | ci-hermetic |
+| Product C | over /v1/mcp: IBAN content -> `gizli/notes/`, `tasks.lane=secret/finans` (the proxy backstop then 403s), `secret_lane_escalated{source: memory_write}` | `kahyad/internal/server/TestMCPMemoryWriteSecretContentRedirectsAndEscalatesTask` | FIX-U-3 | ci-hermetic |
+| Product C | `memory_write` escalation hits the live worker's OWN task (UDS peer attribution), never a task id it declared or omitted | `kahyad/internal/server/TestMCPMemoryWriteSecretContentLiveWorkerEscalatesOwnTask` | FIX-U-3 | ci-hermetic |
+| Product C | secret-glob chunks (`gizli/**`, `finans*.md`) never enter a cloud-lane `<hafiza>` block, whatever their tier; the ledgered block matches; the local `for_injection:false` surface is unfiltered | `kahyad/internal/server/TestMemorySearchForInjectionExcludesSecretPathChunks` | FIX-U-3 | ci-hermetic |
+| Product C | the `memory_search` tool (a worker's view) never returns a chunk of a secret-glob note | `kahyad/internal/server/TestMCPMemorySearchNeverReturnsSecretPathChunks` | FIX-U-3 | ci-hermetic |
+| Product C | main.go wires the memory_write seam with the production adapters (deterministic classifier, the egress gate's durable mark, the attribution-pinned escalator, `cfg.secret_lane_memory_dir`, `pol.SecretLaneGlobs`) and the one memory lane classifier before `srv.Run` | `kahyad/TestMemoryWriteSecretLaneSeamWired` | FIX-U-3 | ci-hermetic |
+| Product C | both committed policy files declare `~/Kahya/memory/gizli/**` secret-lane (decision MEM-6.b): it matches a redirected `gizli/notes/inbox/` note, never the ordinary inbox note | `kahyad/internal/policy/TestLoadRealPolicyYAMLHasGizliSecretGlob` | FIX-MEM-6 | ci-hermetic |
 | Product D | memory content can never lower a permission / raise autonomy | `kahyad/internal/policy/TestMemoryContentCannotLowerAPermission` | W78-03 | ci-hermetic |

@@ -30,6 +30,7 @@ import (
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/search"
@@ -114,6 +115,13 @@ type Server struct {
 	eventLogger  EventLogger
 	mcpMemoryDir string
 	mcpIndexer   memory.Indexer
+
+	// mcpSecretLane is memory_write's FIX-U-3 ingest-time secret-lane seam,
+	// memLane the path-glob lane classifier the cloud-facing chunk paths
+	// (memory_search tool, for_injection:true) filter with - see
+	// memory_lane.go's SetMCPMemorySecretLane / SetMemoryLane.
+	mcpSecretLane memory.SecretLaneSeam
+	memLane       *memlane.Classifier
 
 	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
 	// 4). See SetTaskStore's doc comment.
@@ -973,14 +981,30 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	// filters BOTH the returned results AND what the renderer/ledger below
 	// ever sees - "absent with for_injection:true" means absent from the
 	// response entirely, not merely excluded from hafiza_block.
+	//
+	// FIX-U-3: for_injection:true builds the block a CLOUD model receives
+	// (the worker's UserPromptSubmit hook; a secret-lane task never spawns
+	// one), so a chunk whose note lives under a secret_lane_globs path
+	// (memlane.PathIsSecret - finans*.md, gizli/**, ...) is dropped too,
+	// whatever its tier: finans/saglik/kimlik stay local-only (HANDOFF §5
+	// product principle). for_injection:false is the raw local surface and
+	// is not filtered.
 	filtered := hits
 	if req.ForInjection {
 		filtered = make([]search.Hit, 0, len(hits))
+		secretDropped := 0
 		for _, h := range hits {
 			if !factengine.TierInjectionEligible(h.SourceTier, false) {
 				continue
 			}
+			if s.memLane != nil && s.memLane.PathIsSecret(h.Path) {
+				secretDropped++
+				continue
+			}
 			filtered = append(filtered, h)
+		}
+		if secretDropped > 0 {
+			s.log.With(traceID).Debug("memory_search_secret_path_dropped", "dropped", secretDropped, "for_injection", true)
 		}
 	}
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/traceid"
@@ -94,8 +95,15 @@ func (s *Server) SetMCPMemory(memoryDir string, idx memory.Indexer) {
 // memory_search reuses the EXACT SAME ranking call /v1/memory/search does
 // without mcp/memory needing to import kahyad/internal/search (which it
 // cannot - see that package's doc comment on the import boundary).
+//
+// FIX-U-3: lane drops every hit whose note lives under a secret_lane_globs
+// path (memlane.PathIsSecret). The memory_search tool's result goes to a
+// WORKER - a cloud session by construction (a secret-lane task never spawns
+// one) - so a finans/saglik/kimlik note never leaves the machine through
+// it, whatever its tier. nil lane = no path filter (tests only).
 type mcpSearchAdapter struct {
 	inner Searcher
+	lane  *memlane.Classifier
 }
 
 func (a mcpSearchAdapter) Search(ctx context.Context, traceID, query string, k int) ([]memory.Hit, error) {
@@ -103,9 +111,12 @@ func (a mcpSearchAdapter) Search(ctx context.Context, traceID, query string, k i
 	if err != nil {
 		return nil, err
 	}
-	out := make([]memory.Hit, len(hits))
-	for i, h := range hits {
-		out[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
+	out := make([]memory.Hit, 0, len(hits))
+	for _, h := range hits {
+		if a.lane != nil && a.lane.PathIsSecret(h.Path) {
+			continue
+		}
+		out = append(out, memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier})
 	}
 	return out, nil
 }
@@ -131,10 +142,14 @@ func (s *Server) buildMCPHandler() http.Handler {
 		})
 	}
 
-	memSrv := memory.New(s.mcpMemoryDir, mcpSearchAdapter{s.search}, s.mcpIndexer, s.eventLogger, s.log)
+	memSrv := memory.New(s.mcpMemoryDir, mcpSearchAdapter{inner: s.search, lane: s.memLane}, s.mcpIndexer, s.eventLogger, s.log)
 	// FIX-U-1: the default inbox day file follows the configured calendar
 	// zone (SetLocation, cfg.Location()).
 	memSrv.Location = s.location()
+	// FIX-U-3: memory_write classifies its content locally before any byte
+	// lands; a secret hit is redirected under the secret-lane memory dir and
+	// escalates the attributed task's lane (memory_lane.go).
+	memSrv.SetSecretLaneSeam(s.mcpSecretLane)
 	mcpServer := memSrv.MCPServer(nil)
 	// W3-03: fs_read/fs_write/fs_delete, registered onto this SAME shared
 	// server (one MCP session/tool surface for the worker) - see
@@ -283,6 +298,10 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     read the SAME pinned headers; deny-all still fails closed at boot;
 //     every decision is ledgered; an auto-allowed W1 still opens a
 //     5-minute undo window.
+//   - FIX-U-3: memory_write content is ALSO classified at ingest, and a
+//     secret hit escalates the attributed task's lane (NewMemoryLaneEscalator
+//     takes the task from the same pinned attribution) - independent of the
+//     taint gate above.
 //   - FIX-I-4: with receipts wired (SetReceipts) and a task id, a completed
 //     identical call of the same task is answered from its durable receipt
 //     before the policy check (receipts.go mcpReplayStoredResult), and a

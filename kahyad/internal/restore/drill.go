@@ -132,7 +132,10 @@ type InjectionResult struct {
 // inject/ledger for the same query against the same db when the server runs
 // the committed default fusion config with the embedder down (the drill
 // wires no embedder, and a recency weight the server activated through
-// search.Searcher.ActivateFusionConfig - FIX-MEM-8 - is not applied here).
+// search.Searcher.ActivateFusionConfig - FIX-MEM-8 - is not applied here),
+// for a query that retrieves no note under a secret_lane_globs path: since
+// FIX-U-3 the server's cloud-facing block also drops such chunks
+// (memlane.PathIsSecret), which this pure, policy-free function does not.
 // Both sides of the drill's compare go through this function, so the
 // production-vs-restored byte-compare (after Normalize) stays a faithful
 // equivalence proof. traceID "" is fine - it only scopes a

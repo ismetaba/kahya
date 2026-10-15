@@ -82,6 +82,10 @@ type Server struct {
 	// one configured calendar zone (FIX-U-1, G00 C-22); nil = time.Local.
 	Location *time.Location
 
+	// secretLane is memory_write's FIX-U-3 ingest-time secret-lane seam
+	// (secretlane.go, SetSecretLaneSeam). Zero value = no classification.
+	secretLane SecretLaneSeam
+
 	// mu serializes the ENTIRE mutate sequence of HandleWrite/HandleForget
 	// (path validation through file write, git add/mv, git commit,
 	// ReindexFile, ledger). brain.db is single-writer and the memory
@@ -136,11 +140,15 @@ type MemoryWriteArgs struct {
 }
 
 // MemoryWriteOutput is memory_write's output: {file, episode_id,
-// commit_sha} (W12-05 step 4, exact shape).
+// commit_sha} (W12-05 step 4) plus secret_lane (FIX-U-3, mirroring
+// mcp/fs.FsReadOutput.SecretLane): true when the content was classified
+// secret-lane and the note was redirected under the secret-lane memory dir
+// - File is then the path it actually landed on.
 type MemoryWriteOutput struct {
-	File      string `json:"file"`
-	EpisodeID int64  `json:"episode_id"`
-	CommitSHA string `json:"commit_sha"`
+	File       string `json:"file"`
+	EpisodeID  int64  `json:"episode_id"`
+	CommitSHA  string `json:"commit_sha"`
+	SecretLane bool   `json:"secret_lane"`
 }
 
 // MemoryForgetArgs is memory_forget's input: {file, heading?}.
@@ -197,15 +205,84 @@ func (s *Server) HandleSearch(ctx context.Context, traceID string, args MemorySe
 // write (git add/commit) triggers a best-effort restore of the prior
 // on-disk state before returning the error, so a losing/failing call never
 // leaves bytes on disk that are not also committed+reindexed+ledgered.
+//
+// FIX-U-3: content is classified locally BEFORE the write; a secret hit
+// lands under <secret_lane_memory_dir>/notes/ and escalates the task's lane
+// (HandleWriteForTask). HandleWrite keeps the pre-FIX-U-3 signature for
+// direct Go callers and tests: with no task id, kahyad's escalator then
+// uses the caller's attribution, or ledgers secret_lane_escalate_no_task.
 func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWriteArgs) (MemoryWriteOutput, error) {
+	return s.HandleWriteForTask(ctx, traceID, "", args)
+}
+
+// HandleWriteForTask implements memory_write for a known task (FIX-U-3;
+// the MCP tool closure passes the pinned X-Kahya-Task-Id). ORDER (HANDOFF
+// §4 ordering invariant, "classified at ingest"): validate the requested
+// path, classify the content locally, and on a secret hit - durable
+// sensitive mark, sticky lane escalation, target path under the
+// secret-lane dir, glob coverage check - ALL before a single byte is
+// written, each failure refusing the write (fail-closed). The front matter
+// stays agent_derived (HANDOFF §5 memory #1): a redirect changes the path,
+// never the tier.
+func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string, args MemoryWriteArgs) (MemoryWriteOutput, error) {
 	// Serialize the whole mutate sequence below - see the Server.mu doc
 	// comment for why (concurrent git index races + orphaned writes).
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	relPath := filepath.ToSlash(strings.TrimSpace(args.File))
-	if relPath == "" {
-		relPath = defaultInboxFile(time.Now(), s.Location)
+	requested := filepath.ToSlash(strings.TrimSpace(args.File))
+	if requested == "" {
+		requested = defaultInboxFile(time.Now(), s.Location)
+	}
+	// Validate the AGENT-REQUESTED path first (absolute / ".." escape /
+	// symlink), exactly as before - so a secret redirect below joins an
+	// already-contained path and can never climb out of the secret dir.
+	if _, err := resolveMemoryPath(s.MemoryDir, requested); err != nil {
+		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
+	}
+
+	relPath := requested
+	secretLane, category := false, ""
+	if s.secretLane.Classifier != nil {
+		secretLane, category = s.secretLane.Classifier.ClassifySecretLane(args.Content)
+	}
+	if secretLane {
+		relPath = s.secretLaneTarget(requested)
+		refuse := func(reason, msg string, err error) (MemoryWriteOutput, error) {
+			payload := map[string]any{
+				"requested_file": requested, "file": relPath, "category": category, "task_id": taskID, "reason": reason,
+			}
+			if err != nil {
+				payload["err"] = err.Error()
+			}
+			s.ledgerEvent(ctx, traceID, EventMemoryWriteSecretLaneRefused, payload)
+			s.Log.Warn("memory_write_secret_lane_refused", "request_trace_id", traceID, "task_id", taskID, "reason", reason)
+			return MemoryWriteOutput{}, errors.New(msg)
+		}
+		// FIX-B-7 twin: the producing session is marked sensitive, durably,
+		// keyed on the request's own server-assigned trace_id.
+		if s.secretLane.Marker != nil && traceID != "" {
+			if err := s.secretLane.Marker.MarkSensitiveRead(ctx, traceID, traceID); err != nil {
+				return refuse("sensitive_mark_failed", MsgMemoryWriteSecretLaneRefused, err)
+			}
+		}
+		// FIX-B-6 twin: sticky tasks.lane='secret' BEFORE any byte lands.
+		if s.secretLane.Escalator != nil {
+			if err := s.secretLane.Escalator.EscalateSecretLane(ctx, taskID, traceID, category); err != nil {
+				return refuse("lane_escalate_failed", MsgMemoryWriteSecretLaneRefused, err)
+			}
+		}
+		// The target MUST be covered by a secret_lane_globs entry, or every
+		// path-based lane rule downstream (consolidation PartitionByLane,
+		// ritual, graph, the injection/tool filter, MEM-3's forced local
+		// lane) would treat the note as normal. The task was escalated
+		// above regardless - the agent already holds the bytes.
+		if s.secretLane.Matcher == nil {
+			return refuse("matcher_unwired", MsgMemoryWriteSecretLaneRefused, nil)
+		}
+		if !s.secretGlobCovers(relPath) {
+			return refuse("secret_glob_missing", MsgMemoryWriteSecretGlobMissing, nil)
+		}
 	}
 
 	abs, err := resolveMemoryPath(s.MemoryDir, relPath)
@@ -239,14 +316,20 @@ func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWri
 		if info, statErr := os.Stat(abs); statErr == nil {
 			size = info.Size()
 		}
-		if err := s.Ledger.LogEvent(ctx, traceID, "memory_write", map[string]any{
-			"file": relPath, "bytes": size, "commit_sha": commitSHA,
-		}); err != nil {
-			s.Log.Warn("memory_write_ledger_error", "err", err.Error())
+		s.ledgerEvent(ctx, traceID, "memory_write", map[string]any{
+			"file": relPath, "bytes": size, "commit_sha": commitSHA, "task_id": taskID, "secret_lane": secretLane,
+		})
+		if secretLane {
+			s.ledgerEvent(ctx, traceID, EventMemoryWriteSecretLaneRedirected, map[string]any{
+				"requested_file": requested, "file": relPath, "category": category, "task_id": taskID, "commit_sha": commitSHA,
+			})
 		}
 	}
+	if secretLane {
+		s.Log.Info("memory_write_secret_lane_redirected", "request_trace_id", traceID, "file", relPath, "category", category, "task_id", taskID)
+	}
 
-	return MemoryWriteOutput{File: relPath, EpisodeID: episodeID, CommitSHA: commitSHA}, nil
+	return MemoryWriteOutput{File: relPath, EpisodeID: episodeID, CommitSHA: commitSHA, SecretLane: secretLane}, nil
 }
 
 // HandleForget implements memory_forget (W12-05 step 5): with heading,
@@ -385,7 +468,7 @@ func (s *Server) MCPServer(impl *mcp.Implementation) *mcp.Server {
 		Name:        "memory_write",
 		Description: "Kâhya hafızasına yeni bir not yazar (markdown + git commit); yazılan içerik her zaman 'agent_derived' güven katmanında kaydedilir.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args MemoryWriteArgs) (*mcp.CallToolResult, MemoryWriteOutput, error) {
-		out, err := s.HandleWrite(ctx, traceIDFromRequest(req), args)
+		out, err := s.HandleWriteForTask(ctx, traceIDFromRequest(req), taskIDFromRequest(req), args)
 		return nil, out, err
 	})
 
