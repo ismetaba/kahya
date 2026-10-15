@@ -851,9 +851,6 @@ func pythonVenvDir(argv0 string) string {
 	return venv
 }
 
-// selfProtectForms returns p (cleaned) and, when it differs, p with its
-// deepest existing ancestor's symlinks resolved. Empty or relative p
-// yields nothing.
 // IngestRawSecretLaneGlobs returns the secret-lane path globs covering the
 // raw ingest store (IngestRawDir/**, in its as-given and symlink-resolved
 // forms; nil when IngestRawDir is unset). `kahya ingest` keeps a raw copy
@@ -875,6 +872,9 @@ func (c Config) IngestRawSecretLaneGlobs() []string {
 	return globs
 }
 
+// selfProtectForms returns p (cleaned) and, when it differs, p with its
+// deepest existing ancestor's symlinks resolved. Empty or relative p
+// yields nothing.
 func selfProtectForms(p string) []string {
 	if p == "" || !filepath.IsAbs(p) {
 		return nil

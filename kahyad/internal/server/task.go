@@ -60,15 +60,15 @@ const (
 	// MsgTaskTimeout is the SSE "error" event message when task_timeout_min
 	// elapses before the worker finishes (%d = cfg.task_timeout_min).
 	MsgTaskTimeout = "Görev zaman aşımına uğradı (%d dk)."
+	// MsgTaskHaltedBeforeStart is the answer for a task a halt reached
+	// before its worker started (FIX-FINAL halt-window-worker-still-
+	// spawned): nothing was spawned.
+	MsgTaskHaltedBeforeStart = "⛔ Görev başlamadan durduruldu (user_halted)."
 	// MsgTaskShutdownInterruptedFmt replaces MsgTaskTimeout when the worker
 	// was stopped because kahyad itself is shutting down (FIX-I-5
 	// lifecycleCancel), not because the task deadline was reached
 	// (%s = task id). The task stays 'executing' for the restarted kahyad's
 	// resume scan (FIX-FINAL shutdown-reported-as-timeout).
-	// MsgTaskHaltedBeforeStart is the answer for a task a halt reached
-	// before its worker started (FIX-FINAL halt-window-worker-still-
-	// spawned): nothing was spawned.
-	MsgTaskHaltedBeforeStart      = "⛔ Görev başlamadan durduruldu (user_halted)."
 	MsgTaskShutdownInterruptedFmt = "Görev kahyad kapandığı için durduruldu; kahyad yeniden başlayınca devam ettirilir. Durum: kahya task show %s"
 	// MsgTaskUnexpectedExit is the SSE "error" event message when the
 	// worker process ends (any exit code) without ever sending a terminal
