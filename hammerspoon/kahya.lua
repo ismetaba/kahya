@@ -433,13 +433,13 @@ end
 -- ---------------------------------------------------------------------
 
 -- ⌥⎋ -> `kahyaBin halt` (no --task: halts EVERY non-terminal task) ->
--- notify "Acil durdurma — tüm görevler durduruldu" (task spec step 7,
--- byte-exact). Every actual halt decision — process-group SIGKILL, docker
--- kill, the terminal user_halted transition, outbox cancel, approval
--- invalidation + token revocation — happens server-side in kahyad
--- (kahyad/internal/halt.Executor); this binding only fires the CLI call
--- and shows the notification, exactly like every other binding in this
--- file.
+-- the byte-exact task-spec step 7 banner, but ONLY when `kahya halt`
+-- exited 0 (FIX-P-21). Every actual halt decision — process-group SIGKILL,
+-- docker kill, the terminal user_halted transition, outbox cancel,
+-- approval invalidation + token revocation — happens server-side in
+-- kahyad (kahyad/internal/halt.Executor); this binding only fires the CLI
+-- call and reflects its outcome, exactly like every other binding in this
+-- file. hammerspoon/kahya_lua_test.go pins the branch structure.
 --
 -- Works while the palette (kahyaChooser) or an approval dialog
 -- (hs.dialog.textPrompt/blockAlert in openApprovalDialog) is open:
@@ -450,20 +450,23 @@ end
 -- this is an ordinary hs.hotkey.bind exactly like the ⌥Space one above.
 hs.hotkey.bind({ "alt" }, "escape", function()
   runKahya({ "halt" }, function(exitCode, stdOut, stdErr)
-    hs.notify.new({
-      title = "Kâhya",
-      informativeText = "Acil durdurma — tüm görevler durduruldu",
-      autoWithdraw = true,
-    }):send()
-    if exitCode ~= 0 then
-      -- kahyaBin halt itself only ever exits 0 (task spec: "exit 0 both
-      -- ways") - a non-zero exit here means the CLI could not even reach
-      -- kahyad (dial failure), which the user should still know about
-      -- alongside the notification above.
+    if exitCode == 0 then
+      -- Only a confirmed server-side halt earns the banner (task spec step
+      -- 7, byte-exact). `kahya halt` exits 0 both for n>=1 and for n==0.
       hs.notify.new({
         title = "Kâhya",
-        informativeText = "Durdurma komutu kahyad'a ulaşamadı: " .. (stdErr ~= "" and stdErr or stdOut),
+        informativeText = "Acil durdurma — tüm görevler durduruldu",
         autoWithdraw = true,
+      }):send()
+    else
+      -- Non-zero means the CLI could not even reach kahyad (dial failure,
+      -- exit 1) or was misinvoked (exit 2): NOTHING was halted server-side.
+      -- Sticky (autoWithdraw = false): the user must not miss this one.
+      local detail = firstLines((stdErr ~= "" and stdErr or stdOut), 2)
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = "⛔ Durdurma komutu kahyad'a ulaşamadı — görevler DURDURULMADI: " .. detail,
+        autoWithdraw = false,
       }):send()
     end
   end)

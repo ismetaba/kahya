@@ -22,7 +22,7 @@ After this task `⌥⎋` is a real emergency stop: every running worker (whole p
 - Worker spawn (W12-07 code): `syscall.SysProcAttr{Setpgid: true}`; kahyad records the pgid per task in memory **and** persists it (`tasks.worker_pgid` column, new goose migration) so workers orphaned by a daemon crash/restart can still be halted.
 - Docker shell tool (W3-04 code): containers launched with `--label kahya.task_id=<id> --label kahya.trace_id=<tid>` (only if not already done).
 - `kahyad/cmd/kahya/`: `kahya halt [--task <id>]` (no flag = halt all active tasks).
-- `hammerspoon/kahya.lua`: `⌥⎋` binding → `kahya halt` via `hs.task`, then `hs.notify` `Acil durdurma — tüm görevler durduruldu`.
+- `hammerspoon/kahya.lua`: `⌥⎋` binding → `kahya halt` via `hs.task`, then `hs.notify` `Acil durdurma — tüm görevler durduruldu`. **Post-review note (FIX-P-21, decision G09-7):** the banner is shown only when `kahya halt` exits 0 (one line, nothing appended); any other exit (kahyad unreachable, misuse) shows only the sticky `⛔ Durdurma komutu kahyad'a ulaşamadı — görevler DURDURULMADI: <ilk 2 satır>` notification. Pinned by `hammerspoon/kahya_lua_test.go`.
 - Ledger event kinds: `task.user_halted`, `approval.invalidated` (with `trace_id`).
 - Tests (Go, in `make test`): process-group kill, terminal-state exclusion, container kill, token revocation.
 
