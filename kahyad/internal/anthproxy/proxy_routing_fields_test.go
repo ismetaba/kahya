@@ -23,6 +23,10 @@ func TestProxyRejectsUnallowlistedRoutingFields(t *testing.T) {
 		{"opus_fallbacks_default", `{"model":"claude-opus-5-5","max_tokens":1,"fallbacks":"default"}`, "fallbacks"},
 		{"opus_speed_fast", `{"model":"claude-opus-5-5","max_tokens":1,"speed":"fast"}`, "speed"},
 		{"fable_speed_fast", `{"model":"` + router.ModelFable + `","max_tokens":1,"speed":"fast"}`, "speed"},
+		// FIX-FINAL proxy-inference-geo-unpriced-routing-field: "us" data
+		// residency is a 1.1x premium the pricing table does not carry.
+		{"opus_inference_geo_us", `{"model":"claude-opus-5-5","max_tokens":1,"inference_geo":"us"}`, "inference_geo"},
+		{"sonnet_inference_geo_null", `{"model":"claude-sonnet-5-5","max_tokens":1,"Inference_Geo":null}`, "inference_geo"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := newJSONUpstream(t, 200, `{"usage":{}}`)
@@ -51,6 +55,7 @@ func TestProxyRejectsUnallowlistedRoutingFields(t *testing.T) {
 func TestProxyAllowsStandardSpeedAndShapedFableFallbacks(t *testing.T) {
 	for _, body := range []string{
 		`{"model":"claude-sonnet-5-5","max_tokens":1,"speed":"standard"}`,
+		`{"model":"claude-sonnet-5-5","max_tokens":1,"inference_geo":"global"}`,
 		`{"model":"` + router.ModelFable + `","max_tokens":1,"fallbacks":[{"model":"claude-opus-4-1"}]}`,
 	} {
 		upstream := newJSONUpstream(t, 200, `{"usage":{}}`)

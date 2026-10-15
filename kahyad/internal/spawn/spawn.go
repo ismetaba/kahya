@@ -685,6 +685,12 @@ var providerRoutingExactNames = map[string]bool{
 	// BuildEnv pins it to 0 itself (FIX-FINAL worker-cli-loads-claudeai-
 	// connectors); an inherited value must not ride along before it.
 	"ENABLE_CLAUDEAI_MCP_SERVERS": true,
+	// The CLI merges it into every request body as top-level members
+	// (e.g. an unpriced "inference_geo"/"speed"): request shaping is Go's
+	// decision, never an inherited variable's (FIX-FINAL
+	// proxy-inference-geo-unpriced-routing-field; the proxy still refuses
+	// such members as the backstop).
+	"CLAUDE_CODE_EXTRA_BODY": true,
 }
 
 // isProviderRoutingEnv reports whether an inherited variable could route

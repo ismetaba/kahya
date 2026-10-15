@@ -186,6 +186,7 @@ func TestBuildEnvStripsProviderRouting(t *testing.T) {
 		"CLAUDE_CODE_HOST_AUTH_ENV_VAR":            "X",
 		"CLAUDE_CODE_HOST_CREDS_FILE":              "/tmp/c",
 		"AWS_BEARER_TOKEN_BEDROCK":                 "b",
+		"CLAUDE_CODE_EXTRA_BODY":                   `{"inference_geo":"us"}`,
 	}
 	for name, v := range routing {
 		t.Setenv(name, v)

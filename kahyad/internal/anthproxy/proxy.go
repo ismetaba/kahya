@@ -204,7 +204,8 @@ const (
 	MsgPathNotAllowed  = "Izin verilmeyen uc nokta - istek reddedildi."
 	// MsgRoutingFieldNotAllowed is the 400 body for a request carrying a
 	// model-routing field the proxy does not allowlist and price (a
-	// client "fallbacks" on a non-Fable body, a non-standard "speed").
+	// client "fallbacks" on a non-Fable body, a non-standard "speed", an
+	// "inference_geo" other than "global").
 	MsgRoutingFieldNotAllowed = "Izin verilmeyen model yonlendirme alani - istek reddedildi."
 )
 
@@ -216,17 +217,22 @@ const (
 // model's server-side fallback could name an un-allowlisted model and
 // would be billed at the requested model's row), or a "speed" member
 // other than the JSON string "standard" (fast mode is a 2x price the
-// pricing table does not carry). Member names are matched the way
-// encoding/json folds them. A body topLevelFields cannot read returns ""
-// - the model allowlist refuses it anyway.
+// pricing table does not carry), or an "inference_geo" member other than
+// the JSON string "global" (FIX-FINAL proxy-inference-geo-unpriced-
+// routing-field: "us" data residency is billed at a 1.1x premium the
+// pricing table does not carry, so the governor's USD ceiling would
+// under-count; JSON null and non-strings are refused like for speed).
+// Member names are matched the way encoding/json folds them. A body
+// topLevelFields cannot read returns "" - the model allowlist refuses it
+// anyway.
 func disallowedRoutingField(body []byte) string {
 	doc, ok := topLevelFields(body)
 	if !ok {
 		return ""
 	}
 	var model string
-	var speed json.RawMessage
-	var hasFallbacks, hasSpeed bool
+	var speed, geo json.RawMessage
+	var hasFallbacks, hasSpeed, hasGeo bool
 	for k, v := range doc {
 		switch foldJSONName(k) {
 		case foldJSONName("model"):
@@ -235,6 +241,8 @@ func disallowedRoutingField(body []byte) string {
 			hasFallbacks = true
 		case foldJSONName("speed"):
 			speed, hasSpeed = v, true
+		case foldJSONName("inference_geo"):
+			geo, hasGeo = v, true
 		}
 	}
 	if hasFallbacks && !fable5Models[model] {
@@ -244,6 +252,12 @@ func disallowedRoutingField(body []byte) string {
 		var v string
 		if json.Unmarshal(speed, &v) != nil || v != "standard" {
 			return "speed"
+		}
+	}
+	if hasGeo {
+		var v string
+		if json.Unmarshal(geo, &v) != nil || v != "global" {
+			return "inference_geo"
 		}
 	}
 	return ""

@@ -293,7 +293,11 @@ keychain 503 → upstream):
   member on a body whose model is not a Fable id (a Fable body's own value
   is always overwritten with `[{"model":"claude-opus-4-8"}]`), or a
   `speed` member other than `"standard"` (fast mode is a 2x price the
-  table does not carry), is `400` with `"Izin verilmeyen model yonlendirme
+  table does not carry), or an `inference_geo` member other than
+  `"global"` (FIX-FINAL proxy-inference-geo-unpriced-routing-field: `"us"`
+  data residency is a 1.1x premium the table does not carry; the worker
+  env never inherits `CLAUDE_CODE_EXTRA_BODY`, the CLI's raw body
+  override), is `400` with `"Izin verilmeyen model yonlendirme
   alani - istek reddedildi."` and ledger `proxy.model_rejected` `{task_id,
   model, field}`, before any reservation.
 - **Per-attempt billing:** when a response carries `usage.iterations`
