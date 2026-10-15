@@ -521,9 +521,15 @@ a cloud model, without changing anything in §2-§6 above:
   attribution-pinned escalator, ledger `secret_lane_escalated{source:
   shell_host | shell_docker | osascript}`) before the result is returned,
   on the fresh and the receipt-replay path. A path hit: a `shell_host` git
-  repo that is, or holds, a secret-glob directory (its history carries the
-  notes - `git -C ~/Kahya log -p`), a git path argument (a `<rev>:`
-  prefix stripped) or an `ls`/`stat` target under a secret glob, a
+  `-C` path inside, or whose discovered repository (toplevel, gitdir,
+  linked-worktree common dir, gitfile target - resolved exec-free the way
+  git's own discovery walks up, `mcp/shell.gitRepoRoots`) is or holds, a
+  secret-glob directory (its history carries the notes - `git -C ~/Kahya
+  log -p`, and equally `-C ~/Kahya/memory/inbox`, `-C ~/Kahya/backups` or
+  `-C ~/Kahya/.git`; a resolution error or an alternate object store is a
+  hit), a git path argument (a `<rev>:` prefix stripped, checked against
+  the `-C` dir and every resolved root since `<rev>:<path>` is
+  toplevel-relative) or an `ls`/`stat` target under a secret glob, a
   `shell_docker` workdir under or holding one (escalated BEFORE the
   container runs, so a `needs_network` run's egress is already
   sensitive-marked), a `shortcuts_run --input-path` under one; otherwise

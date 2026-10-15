@@ -175,7 +175,8 @@ type HostExec struct {
 
 	// SecretLaneGlobs and OutputGate (FIX-FINAL tool-output-secret-lane-
 	// unclassified): shell_host's output (git show / log -p, ls, stat) can
-	// carry secret-lane file bytes. A repo that is or holds a secret-glob
+	// carry secret-lane file bytes. A repository (as git discovers it from
+	// the -C directory, gitRepoRoots) that is or holds a secret-glob
 	// directory, an ls/stat target under one, or a git path argument under
 	// one is a path hit; otherwise stdout+stderr are classified. A hit runs
 	// fs_read's mark + escalation before the output is returned - on the
@@ -305,26 +306,58 @@ func (h *HostExec) gateOutput(ctx context.Context, traceID, taskID string, plan 
 }
 
 // pathHit reports whether the validated command reads below a secret-lane
-// path: the git repo is or holds a secret-glob directory (its history can
-// carry every note under it), a git path argument (a "<rev>:" prefix
-// stripped) lands under a secret glob, or an ls/stat target does.
+// path: the repository git opens for the -C directory is or holds a
+// secret-glob directory (its history can carry every note under it), a
+// git path argument (a "<rev>:" prefix stripped) lands under a secret
+// glob, or an ls/stat target does.
+//
+// The repository is resolved the way git discovers it (gitRepoRoots), not
+// from the -C string (FIX-FINAL shell-host-subdir-or-gitdir-bypasses-
+// secret-repo-path-hit): `-C ~/Kahya/memory/inbox`, `-C ~/Kahya/backups`,
+// `-C ~/Kahya/.git` or a directory whose .git file points at ~/Kahya/.git
+// all open the ~/Kahya repository. A `<rev>:<path>` argument is
+// toplevel-relative in git (cwd-relative only with ./ or ../), so every
+// path argument is checked against the -C directory AND every resolved
+// root. A resolution error is a hit (fail-closed).
 func (h *HostExec) pathHit(plan hostExecPlan) bool {
 	if len(h.SecretLaneGlobs) == 0 {
 		return false
 	}
 	if plan.canonRepo != "" {
-		if mcpfs.PathCoversSecretGlob(h.Home, plan.canonRepo, h.SecretLaneGlobs) {
+		bases := []string{plan.canonRepo}
+		roots, err := gitRepoRoots(plan.repoOp)
+		if err != nil {
 			return true
+		}
+		for _, r := range roots {
+			cp, cerr := mcpfs.Canonicalize(h.Home, r)
+			if cerr != nil {
+				return true
+			}
+			bases = append(bases, cp.Match)
+		}
+		for _, b := range bases {
+			if mcpfs.PathCoversSecretGlob(h.Home, b, h.SecretLaneGlobs) {
+				return true
+			}
 		}
 		for _, a := range plan.gitArgs {
 			if i := strings.Index(a, ":"); i >= 0 {
 				a = a[i+1:]
 			}
+			// pathspec magic ":(top)x" / ":(glob)x": the path follows ")"
+			if strings.HasPrefix(a, "(") {
+				if j := strings.Index(a, ")"); j >= 0 {
+					a = a[j+1:]
+				}
+			}
 			if a == "" {
 				continue
 			}
-			if hit, err := mcpfs.MatchesAnyGlobCI(filepath.Join(plan.canonRepo, a), h.SecretLaneGlobs); err != nil || hit {
-				return true
+			for _, b := range bases {
+				if hit, err := mcpfs.MatchesAnyGlobCI(filepath.Join(b, a), h.SecretLaneGlobs); err != nil || hit {
+					return true
+				}
 			}
 		}
 	}
@@ -352,8 +385,9 @@ type hostExecPlan struct {
 	// argv is the FIXED argv to exec (never derived from anything but
 	// validate's own explicit construction).
 	argv []string
-	// canonRepo is git's canonicalized repo path in Match form, used only
-	// to build the WYSIWYE tool-input hash ("" for ls/stat).
+	// canonRepo is git's canonicalized -C path in Match form: the WYSIWYE
+	// tool-input hash and one base of the secret-lane path check ("" for
+	// ls/stat).
 	canonRepo string
 	// repoOp is the same repo path in OS-ready Op form — the exact `-C`
 	// value in argv, which gitRepoConfigSafe scans ("" for ls/stat).

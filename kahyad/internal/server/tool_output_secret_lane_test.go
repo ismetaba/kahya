@@ -115,3 +115,117 @@ func TestShellHostCleanOutputStaysNormal(t *testing.T) {
 		t.Errorf("task lane = %q, want normal", lane)
 	}
 }
+
+// kahyaRepoFixture is the production layout (HANDOFF: `cd ~/Kahya && git
+// init`): a repository at ~/Kahya whose history holds a benign-bodied note
+// memory/gizli/not.md (the deterministic classifier misses it - it is
+// secret by PATH only), memory/inbox/a.md, a gitignored backups/ and a
+// directory whose .git FILE points at ~/Kahya/.git.
+func kahyaRepoFixture(t *testing.T) (home string, globs []string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	h, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home = h
+	repo := filepath.Join(home, "Kahya")
+	for _, d := range []string{"memory/inbox", "memory/gizli", "backups"} {
+		if err := os.MkdirAll(filepath.Join(repo, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range map[string]string{
+		"memory/gizli/not.md": "Annemin randevu takvimi: ikinci ziyaret 3 Kasım.\n",
+		"memory/inbox/a.md":   "Market listesi: elma\n",
+		".gitignore":          "backups/\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if secretlane.ClassifyDeterministic("Annemin randevu takvimi: ikinci ziyaret 3 Kasım.").SecretLane {
+		t.Fatal("fixture note is content-secret; it must be secret by path only")
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"}} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	wt := filepath.Join(home, "elsewhere", "wt")
+	if err := os.MkdirAll(wt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+filepath.Join(repo, ".git")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clean := filepath.Join(home, "code", "x")
+	if err := os.MkdirAll(clean, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clean, "a.md"), []byte("temiz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"}} {
+		if out, err := exec.Command("git", append([]string{"-C", clean}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	return home, []string{filepath.Join(home, "Kahya/memory/finans*.md"), filepath.Join(home, "Kahya/memory/gizli/**")}
+}
+
+// TestShellHostRepoIdentityEscalatesLane (FIX-FINAL shell-host-subdir-or-
+// gitdir-bypasses-secret-repo-path-hit): the path check ran on the -C
+// string, so a work-tree subdirectory, a gitignored subdirectory, the
+// gitdir, a directory inside it or a gitfile directory opened the ~/Kahya
+// repository and returned a gizli/** note at lane=normal. The check now
+// resolves the repository git opens: every case ends lane=secret, marked,
+// backstop refusing - and a clean repository outside ~/Kahya stays normal.
+func TestShellHostRepoIdentityEscalatesLane(t *testing.T) {
+	for _, tc := range []struct {
+		name, repo string
+		args       []string
+		secret     bool
+	}{
+		{"toplevel", "~/Kahya", []string{"show", "HEAD:memory/gizli/not.md"}, true},
+		{"worktree_subdir", "~/Kahya/memory/inbox", []string{"show", "HEAD:memory/gizli/not.md"}, true},
+		{"worktree_subdir_whole_commit", "~/Kahya/memory/inbox", []string{"show", "HEAD"}, true},
+		{"gitignored_subdir", "~/Kahya/backups", []string{"show", "HEAD"}, true},
+		{"gitdir", "~/Kahya/.git", []string{"show", "HEAD:memory/gizli/not.md"}, true},
+		{"inside_gitdir", "~/Kahya/.git/refs", []string{"show", "HEAD"}, true},
+		{"gitfile_dir", "~/elsewhere/wt", []string{"show", "HEAD:memory/gizli/not.md"}, true},
+		{"clean_repo", "~/code/x", []string{"show", "HEAD:a.md"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, st, pc, tracker, gate := shellHostSecretFixture(t)
+			home, globs := kahyaRepoFixture(t)
+			host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+			host.SecretLaneGlobs = globs
+			host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+			out, err := host.Handle(context.Background(), "trace-sh", "task-sh", mcpshell.HostExecArgs{
+				Command: "git", RepoPath: tc.repo, Args: tc.args,
+			})
+			if err != nil {
+				t.Fatalf("shell_host: %v", err)
+			}
+			if out.ExitCode != 0 {
+				t.Fatalf("git exit %d: %s", out.ExitCode, out.Stderr)
+			}
+			lane, _ := taskLane(t, st, "task-sh")
+			marked, _ := tracker.IsMarkedCtx(context.Background(), "trace-sh")
+			backstop := secretlane.NewProxyBackstopHook(NewSecretLaneStoreAdapter(st.Queries), st)("task-sh", "trace-sh")
+			refused := backstop(httptest.NewRequest("POST", "/v1/messages", nil)) != nil
+			if !tc.secret {
+				if lane != "normal" || marked || refused {
+					t.Fatalf("clean repo: lane=%q marked=%v refused=%v, want normal/unmarked/open", lane, marked, refused)
+				}
+				return
+			}
+			if lane != "secret" || !marked || !refused {
+				t.Fatalf("lane=%q marked=%v backstop refused=%v, want secret/marked/refused (stdout %q)", lane, marked, refused, out.Stdout)
+			}
+		})
+	}
+}
