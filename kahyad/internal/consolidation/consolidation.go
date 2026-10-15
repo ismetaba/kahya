@@ -1250,11 +1250,22 @@ func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTrac
 	if err != nil {
 		return err
 	}
-	if err := DeleteBranch(ctx, c.Git, c.Cfg.KahyaDir, branch); err != nil {
-		c.logWarn("consolidation_branch_delete_failed", "trace_id", approveTraceID, "branch", branch, "err", err.Error())
-	}
+	// FIX-FINAL consolidation-approved-ledger-loss-strands-pending: the
+	// approved row is written BEFORE the branch is deleted, and a failed
+	// write is returned. Deleting first (and only logging the ledger error)
+	// left FindPending reporting the merged suggestion as outstanding with
+	// no branch behind it: show/approve/reject failed with raw git errors
+	// until the next nightly run ledgered the merge as "superseded". Now a
+	// failed write keeps the branch, so a retried approve (a no-op rebase
+	// and an "Already up to date" ff-merge) ledgers it; a crash between
+	// the row and the delete leaves an orphan branch the next Run's
+	// sweepOrphanBranches removes.
+	var ledgerErr error
 	if err := LedgerApproved(ctx, c.EventLogger, approveTraceID, pendingTraceID, mergeCommit); err != nil {
-		c.logWarn("consolidation_approved_ledger_failed", "trace_id", approveTraceID, "err", err.Error())
+		c.logError("consolidation_approved_ledger_failed", "trace_id", approveTraceID, "err", err.Error())
+		ledgerErr = fmt.Errorf("consolidation: ledger approved: %w", err)
+	} else if err := DeleteBranch(ctx, c.Git, c.Cfg.KahyaDir, branch); err != nil {
+		c.logWarn("consolidation_branch_delete_failed", "trace_id", approveTraceID, "branch", branch, "err", err.Error())
 	}
 
 	// The SQLite reindex is a SEPARATE, kahyad-triggered step, observed
@@ -1273,7 +1284,7 @@ func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTrac
 			c.logWarn("consolidation_push_failed", "trace_id", approveTraceID, "err", err.Error())
 		}
 	}
-	return nil
+	return ledgerErr
 }
 
 // Reject deletes the pending suggestion's branch/worktree and ledgers the
