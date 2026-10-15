@@ -102,13 +102,16 @@ const (
 	// no second ledger row, callback or notification.
 	EventCloudUnreachableRepeat = "proxy.cloud_unreachable_repeat"
 	// EventEgressBlockedTerminal (FIX-U-4) fires ONCE per Proxy the first
-	// time THIS proxy's own egress gate refuses a request with the
-	// secret-lane verdict (secretlane.ErrCloudBlocked: the task's sticky
-	// tasks.lane is secret). That is kahyad's own decision - never retried,
+	// time THIS proxy's own egress gate refuses a request with a terminal
+	// verdict: the secret-lane verdict (secretlane.ErrCloudBlocked: the
+	// task's sticky tasks.lane is secret; reason
+	// ReasonSecretLaneCloudBlocked) or a deterministic W3-05 allowlist /
+	// sensitive-read denial (a terminalEgressDenial; reason
+	// ReasonEgressBlocked). That is kahyad's own decision - never retried,
 	// never parked - so the task is failed through OnNonRetryableFailure
-	// exactly as an upstream NonRetryable 4xx would be. Every individual 403
-	// is still ledgered by the hook itself (secretlane_cloud_blocked per
-	// request); this event marks the one task-level decision.
+	// exactly as an upstream NonRetryable 4xx would be. Every individual
+	// 403 is still ledgered by the hook itself (per request); this event
+	// marks the one task-level decision.
 	EventEgressBlockedTerminal = "proxy.egress_blocked_terminal"
 )
 
@@ -117,6 +120,20 @@ const (
 // the call because the task is secret-lane (FIX-U-4). English, stable,
 // never shown to the user on its own.
 const ReasonSecretLaneCloudBlocked = "secret_lane_cloud_blocked"
+
+// ReasonEgressBlocked is the <sebep> id OnNonRetryableFailure receives when
+// THIS proxy's own egress gate refused the call with a deterministic W3-05
+// allowlist or sensitive-read denial (FIX-U-4). The server fails the task
+// with the regular MsgCloudNonRetryableFmt notice.
+const ReasonEgressBlocked = "egress_blocked"
+
+// terminalEgressDenial is implemented by an EgressGate error that is a
+// deterministic, terminal refusal (egress.GateDenial for an allowlist or
+// sensitive-read rule). An interface, so this package never imports
+// kahyad/internal/egress.
+type terminalEgressDenial interface {
+	TerminalEgressReason() string
+}
 
 // MsgCloudUnreachableMarker is embedded in the Anthropic-shaped error
 // body the proxy returns to the worker once inline retries are exhausted
@@ -357,9 +374,10 @@ type ProxyConfig struct {
 	// status (task spec step 6: task -> failed immediately). reasonID is
 	// cloudretry.ReasonForStatus(status) - a short English API error id.
 	// Also fired, once per Proxy, by onEgressBlocked when THIS proxy's own
-	// EgressGate refuses the call with secretlane.ErrCloudBlocked
-	// (FIX-U-4): reasonID is then ReasonSecretLaneCloudBlocked, never a
-	// cloudretry.ReasonForStatus value. May be nil.
+	// EgressGate refuses the call with a terminal verdict (FIX-U-4):
+	// reasonID is then ReasonSecretLaneCloudBlocked (secretlane.
+	// ErrCloudBlocked) or ReasonEgressBlocked (an allowlist / sensitive-
+	// read denial), never a cloudretry.ReasonForStatus value. May be nil.
 	OnNonRetryableFailure func(ctx context.Context, taskID, reasonID string) error
 }
 
@@ -824,34 +842,45 @@ func (p *Proxy) onBudgetBlocked(ctx context.Context, message string) {
 }
 
 // onEgressBlocked is the FIX-U-4 twin of wrapResponseBody's NonRetryable
-// hook for kahyad's OWN 403. Only the secret-lane verdict
-// (errors.Is(gateErr, secretlane.ErrCloudBlocked)) is terminal: tasks.lane
-// is sticky, so a retry could never succeed - the task fails now, exactly
-// once per Proxy (every repeat still gets its 403 body and the hook's own
-// per-request ledger row, never a second task failure). Every other gate
-// error stays a plain 403: secretlane.ErrCloudBlockedLookupFailed is a
-// TRANSIENT lane-read failure (the next call may read the lane fine), and
-// the W3-05 allowlist / sensitive-read / volume-budget hook's denials and
-// lookup errors are not a statement about the task's lane - the worker's
-// explicit error line still ends the task (FIX-I-2). Writes ignore the
-// inbound request's cancellation: the verdict must be recorded whatever
-// the worker's connection state (the posture of onNoUpstreamCredential).
+// branch for kahyad's OWN egress-gate refusals: a terminal verdict fails
+// the task through OnNonRetryableFailure exactly once per Proxy (every
+// repeat still gets its 403 body and the hook's own per-request ledger
+// row, never a second task failure). Terminal verdicts are the secret-lane
+// verdict (secretlane.ErrCloudBlocked -> ReasonSecretLaneCloudBlocked) and
+// a deterministic W3-05 allowlist / sensitive-read denial (an error
+// implementing terminalEgressDenial -> ReasonEgressBlocked): the model-call
+// target is the fixed Anthropic upstream and the gate has no reload, so
+// such a denial would only 403 every resume spawn until the crash-resume
+// cap. Every other gate error stays a plain 403:
+// secretlane.ErrCloudBlockedLookupFailed is a TRANSIENT lane-read failure
+// (the next call may read the lane fine), a volume-budget denial is daily,
+// and a gate lookup error is transient - the worker's explicit error line
+// still ends the task (FIX-I-2). Writes ignore the inbound request's
+// cancellation: the verdict must be recorded whatever the worker's
+// connection state (the posture of onNoUpstreamCredential).
 func (p *Proxy) onEgressBlocked(ctx context.Context, gateErr error) {
-	if !errors.Is(gateErr, secretlane.ErrCloudBlocked) {
+	var reason string
+	var denial terminalEgressDenial
+	switch {
+	case errors.Is(gateErr, secretlane.ErrCloudBlocked):
+		reason = ReasonSecretLaneCloudBlocked
+	case errors.As(gateErr, &denial) && denial.TerminalEgressReason() == ReasonEgressBlocked:
+		reason = ReasonEgressBlocked
+	default:
 		return
 	}
 	p.egressBlockedOnce.Do(func() {
 		ctx := context.WithoutCancel(ctx)
 		if p.cfg.EventLedger != nil {
 			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventEgressBlockedTerminal, map[string]any{
-				"task_id": p.cfg.TaskID, "reason": ReasonSecretLaneCloudBlocked, "gate_error": gateErr.Error(),
+				"task_id": p.cfg.TaskID, "reason": reason, "gate_error": gateErr.Error(),
 			})
 		}
 		if p.cfg.JSONLLog != nil {
-			p.cfg.JSONLLog.With(p.cfg.TraceID).Warn(EventEgressBlockedTerminal, "task_id", p.cfg.TaskID, "reason", ReasonSecretLaneCloudBlocked)
+			p.cfg.JSONLLog.With(p.cfg.TraceID).Warn(EventEgressBlockedTerminal, "task_id", p.cfg.TaskID, "reason", reason)
 		}
 		if p.cfg.OnNonRetryableFailure != nil {
-			_ = p.cfg.OnNonRetryableFailure(ctx, p.cfg.TaskID, ReasonSecretLaneCloudBlocked)
+			_ = p.cfg.OnNonRetryableFailure(ctx, p.cfg.TaskID, reason)
 		}
 	})
 }

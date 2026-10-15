@@ -102,3 +102,57 @@ func TestNewAnthproxyEgressGateHook_DifferentTaskUnaffected(t *testing.T) {
 		t.Fatalf("expected egress_blocked_allowlist (task B's trace_id must not inherit task A's taint), got Allow=%v Rule=%q Reason=%q", d.Allow, d.Rule, d.Reason)
 	}
 }
+
+// TestNewAnthproxyEgressGateHook_DenialCarriesTerminalReason (FIX-U-4,
+// FIX-FINAL u4-allowlist-sensitive-403-not-terminal): the hook's deny is a
+// *GateDenial whose Error() is the decision's Turkish Reason byte-for-byte
+// (the worker's 403 body is unchanged). An allowlist or sensitive-read
+// denial carries TerminalEgressReason "egress_blocked" (deterministic: the
+// model-call target is fixed); a budget denial carries "" (daily, not
+// terminal).
+func TestNewAnthproxyEgressGateHook_DenialCarriesTerminalReason(t *testing.T) {
+	req := func(n int64) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "http://ignored/v1/messages", nil)
+		r.ContentLength = n
+		return r
+	}
+	check := func(t *testing.T, err error, wantRule, wantTerminal string, ledger *fakeLedger) {
+		t.Helper()
+		d, ok := err.(*GateDenial)
+		if !ok {
+			t.Fatalf("hook error = %T %v, want *GateDenial", err, err)
+		}
+		if d.Rule != wantRule || d.TerminalEgressReason() != wantTerminal {
+			t.Fatalf("denial = %+v terminal=%q, want rule %q terminal %q", d, d.TerminalEgressReason(), wantRule, wantTerminal)
+		}
+		if d.Error() != d.Reason || d.Reason == "" {
+			t.Fatalf("Error() = %q, want the decision Reason %q byte-for-byte", d.Error(), d.Reason)
+		}
+	}
+
+	t.Run("allowlist", func(t *testing.T) {
+		cfg := policy.EgressConfig{Allowlist: []policy.EgressAllowEntry{{Host: "other.example"}}, DefaultDailyByteBudget: 1 << 20}
+		gate := NewGate(cfg, NewSensitiveTracker(), newFakeBudget(), &fakeLedger{}, nil, nil)
+		err := NewAnthproxyEgressGateHook(gate, "api.anthropic.com", 443)("t1", "tr1")(req(10))
+		check(t, err, EventBlockedAllowlist, TerminalEgressReason, nil)
+	})
+	t.Run("sensitive", func(t *testing.T) {
+		cfg := policy.EgressConfig{Allowlist: []policy.EgressAllowEntry{{Host: "other.example"}}, DefaultDailyByteBudget: 1 << 20}
+		sessions := NewSensitiveTracker()
+		gate := NewGate(cfg, sessions, newFakeBudget(), &fakeLedger{}, nil, nil)
+		if err := gate.MarkSensitiveRead(context.Background(), "tr1", "tr1"); err != nil {
+			t.Fatalf("MarkSensitiveRead: %v", err)
+		}
+		err := NewAnthproxyEgressGateHook(gate, "api.anthropic.com", 443)("t1", "tr1")(req(10))
+		check(t, err, EventBlockedSensitive, TerminalEgressReason, nil)
+	})
+	t.Run("budget", func(t *testing.T) {
+		cfg := policy.EgressConfig{Allowlist: []policy.EgressAllowEntry{{Host: "api.anthropic.com"}}, DefaultDailyByteBudget: 100}
+		gate := NewGate(cfg, NewSensitiveTracker(), newFakeBudget(), &fakeLedger{}, nil, nil)
+		err := NewAnthproxyEgressGateHook(gate, "api.anthropic.com", 443)("t1", "tr1")(req(1000))
+		check(t, err, EventBlockedBudget, "", nil)
+	})
+	if TerminalEgressReason != "egress_blocked" {
+		t.Fatalf("TerminalEgressReason = %q, must equal anthproxy.ReasonEgressBlocked %q", TerminalEgressReason, "egress_blocked")
+	}
+}

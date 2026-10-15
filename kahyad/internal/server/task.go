@@ -468,6 +468,10 @@ func (s *Server) NewTaskProxy(taskID, traceID string) (baseURL, apiKey string, c
 				// never notify the user a second time.
 				return s.taskCloudRetry.FailNonRetryableAlreadyNotified(ctx, traceID, tid, reasonID)
 			}
+			// anthproxy.ReasonEgressBlocked (FIX-U-4: a deterministic
+			// allowlist / sensitive-read denial) takes this regular path: the
+			// task fails with the MsgCloudNonRetryableFmt "(egress_blocked)"
+			// notice, once.
 			return s.taskCloudRetry.FailNonRetryable(ctx, traceID, tid, reasonID)
 		},
 	})

@@ -15,9 +15,41 @@
 package egress
 
 import (
-	"errors"
 	"net/http"
 )
+
+// TerminalEgressReason is the reason id GateDenial.TerminalEgressReason
+// reports for a deterministic denial (FIX-U-4); it equals
+// anthproxy.ReasonEgressBlocked (this package must not import anthproxy).
+const TerminalEgressReason = "egress_blocked"
+
+// GateDenial is the error NewAnthproxyEgressGateHook returns for a
+// Gate.Check deny (FIX-U-4). Error() is the decision's Turkish Reason
+// byte-for-byte, so the 403 body the worker sees is unchanged.
+// TerminalEgressReason marks the deterministic denials - the allowlist and
+// the sensitive-read rule: the model-call target is the FIXED Anthropic
+// upstream host:port and the Gate has no reload, so such a denial holds
+// for the daemon's lifetime and the task is failed once (egress_blocked)
+// instead of re-403ing every resume. A volume-budget denial is daily (and
+// already raises the gate's own Alarm), so it stays non-terminal; a
+// gate.Check ERROR is returned unwrapped and stays non-terminal too
+// (transient).
+type GateDenial struct {
+	Rule   string
+	Reason string
+}
+
+func (d *GateDenial) Error() string { return d.Reason }
+
+// TerminalEgressReason returns TerminalEgressReason for an allowlist or
+// sensitive-read denial, "" for anything else (budget).
+func (d *GateDenial) TerminalEgressReason() string {
+	switch d.Rule {
+	case EventBlockedAllowlist, EventBlockedSensitive:
+		return TerminalEgressReason
+	}
+	return ""
+}
 
 // NewAnthproxyEgressGateHook builds the per-task egress-gate hook
 // kahyad/internal/server.Server.SetAnthproxy's egressGateFactory returns:
@@ -53,7 +85,7 @@ func NewAnthproxyEgressGateHook(gate *Gate, host string, port int) func(taskID, 
 				return err
 			}
 			if !decision.Allow {
-				return errors.New(decision.Reason)
+				return &GateDenial{Rule: decision.Rule, Reason: decision.Reason}
 			}
 			return nil
 		}

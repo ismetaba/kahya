@@ -443,10 +443,19 @@ a cloud model, without changing anything in §2-§6 above:
   "secret_lane_cloud_blocked", notified_by: "egress_gate"}` and no second
   user message besides the one `secretlane_cloud_blocked_notice`),
   regardless of what the worker's own terminal line later says (a worker
-  printing `result ok` after the 403 only sets the free-text state). A
-  lane READ failure (`ErrCloudBlockedLookupFailed`, transient) and the
-  W3-05 allowlist/sensitive-read/budget hook's denials still answer 403
-  without failing the task from the proxy (the worker's error line does).
+  printing `result ok` after the 403 only sets the free-text state). The
+  W3-05 hook's deterministic denials are terminal the same way (FIX-FINAL
+  u4-allowlist-sensitive-403-not-terminal): an allowlist or sensitive-read
+  denial (`egress.GateDenial` whose `TerminalEgressReason()` is
+  `egress_blocked` - the model-call target is the fixed upstream and the
+  gate has no reload) fires `OnNonRetryableFailure(ReasonEgressBlocked)`
+  once per proxy (`proxy.egress_blocked_terminal{reason:
+  "egress_blocked"}`), and the task fails through the regular
+  `FailNonRetryable` path with the `MsgCloudNonRetryableFmt`
+  "(egress_blocked)" notice. A lane READ failure
+  (`ErrCloudBlockedLookupFailed`, transient), a volume-budget denial
+  (daily) and a gate lookup error still answer 403 without failing the
+  task from the proxy (the worker's error line does).
 - **Sticky, persisted lane:** `tasks.lane`/`tasks.secret_category`
   (`kahyad/migrations/0006_secret_lane.sql`) are set on `InsertTask` (the
   classification above already ran) and only ever WIDEN thereafter
@@ -485,11 +494,8 @@ a cloud model, without changing anything in §2-§6 above:
   `secretlane.CloudBlockedNotices`). A lane lookup ERROR at the backstop
   still refuses with the same 403 body but is a distinct sentinel
   (`secretlane.ErrCloudBlockedLookupFailed`, not `ErrCloudBlocked`) and
-  raises no notice. Known limit until G10 (G00 U-4): a refused task is
-  not yet ended terminally — the real worker exits non-zero on the 403, the
-  task is left non-terminal, and a resume respawns it; every respawn is
-  refused the same way (zero bytes upstream) and the notice is still
-  raised only once per kahyad process.
+  raises no notice. Since FIX-U-4 the secret-lane refusal ends the task
+  terminally (`failed`, see layer 2 above), so no resume respawns it.
 - **Mid-task escalation at `memory_write` (FIX-U-3, G00 U-3).** The agent's
   `memory_write` content is classified LOCALLY before a single byte is
   written (`mcp/memory.SecretLaneSeam`, the SAME deterministic

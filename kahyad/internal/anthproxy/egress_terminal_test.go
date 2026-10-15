@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"kahya/kahyad/internal/egress"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -55,19 +57,63 @@ func TestProxyEgress403FailsTaskExactlyOnce(t *testing.T) {
 	}
 }
 
+// fakeGateDenial mimics egress.GateDenial (anthproxy never imports
+// egress; TestNewAnthproxyEgressGateHook_DenialCarriesTerminalReason pins
+// the real type's TerminalEgressReason values).
+type fakeGateDenial struct{ reason, terminal string }
+
+func (d *fakeGateDenial) Error() string                { return d.reason }
+func (d *fakeGateDenial) TerminalEgressReason() string { return d.terminal }
+
+// TestProxyEgressAllowlistDenialUsesEgressBlockedReason (FIX-U-4 acceptance,
+// FIX-FINAL u4-allowlist-sensitive-403-not-terminal): a deterministic W3-05
+// allowlist / sensitive-read denial is terminal too - every request still
+// gets its 403 carrying the Turkish reason, but the task fails exactly
+// once with ReasonEgressBlocked, and nothing reaches the upstream.
+func TestProxyEgressAllowlistDenialUsesEgressBlockedReason(t *testing.T) {
+	for _, name := range []string{"allowlist", "sensitive"} {
+		t.Run(name, func(t *testing.T) {
+			upstream := newStatusSequenceUpstream(t, []int{200, 200})
+			ledger := &fakeLedger{}
+			cfg := retryCfg(t, upstream.srv.URL, generousGovernor(), ledger, &fakeSleeper{})
+			rec := &nonRetryableRecorder{}
+			cfg.OnNonRetryableFailure = rec.hook
+			denial := &fakeGateDenial{reason: "Egress engellendi (" + name + ")", terminal: ReasonEgressBlocked}
+			cfg.EgressGate = func(*http.Request) error { return denial }
+			baseURL, _ := startTestProxy(t, cfg)
+			for i := 0; i < 2; i++ {
+				if status, body := egressRequest(t, baseURL); status != http.StatusForbidden || !strings.Contains(body, denial.reason) {
+					t.Fatalf("#%d status=%d body=%s, want 403 carrying the gate reason", i, status, body)
+				}
+			}
+			reasons := rec.snapshot()
+			if len(reasons) != 1 || reasons[0] != ReasonEgressBlocked {
+				t.Fatalf("OnNonRetryableFailure reasons = %v, want exactly [%q]", reasons, ReasonEgressBlocked)
+			}
+			if got := ledger.countKind(EventEgressBlockedTerminal); got != 1 {
+				t.Fatalf("%s = %d, want 1", EventEgressBlockedTerminal, got)
+			}
+			if got := upstream.hits(); got != 0 {
+				t.Fatalf("upstream hits = %d, want 0", got)
+			}
+		})
+	}
+}
+
 // TestProxyEgressNonSecretDenialIsNotTerminal: only the secret-lane verdict
-// is terminal. A lane-lookup failure (ErrCloudBlockedLookupFailed -
-// transient: the next call may read the lane fine) and an allowlist /
-// sensitive-read / budget denial of the W3-05 hook still get their 403 but
-// never fail the task from here (the worker's explicit error line does,
-// FIX-I-2).
+// and a deterministic allowlist / sensitive-read denial are terminal. A
+// lane-lookup failure (ErrCloudBlockedLookupFailed - transient: the next
+// call may read the lane fine), a volume-budget denial (daily) and a plain
+// gate error still get their 403 but never fail the task from here (the
+// worker's explicit error line does, FIX-I-2).
 func TestProxyEgressNonSecretDenialIsNotTerminal(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
 		{"lane lookup failed", secretlane.ErrCloudBlockedLookupFailed},
-		{"allowlist denial", errors.New("egress_blocked_allowlist: host not in allowlist")},
+		{"budget denial", &fakeGateDenial{reason: "Egress bütçesi aşıldı", terminal: ""}},
+		{"plain gate error", errors.New("egress gate: budget lookup failed")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := newStatusSequenceUpstream(t, []int{200})
@@ -136,5 +182,37 @@ func TestProxyEgress403WithNilCallbackStillLedgers(t *testing.T) {
 	}
 	if got := ledger.countKind(EventEgressBlockedTerminal); got != 1 {
 		t.Fatalf("%s = %d, want 1", EventEgressBlockedTerminal, got)
+	}
+}
+
+// TestProxyEgressRealAllowlistHookIsTerminal wires the REAL production
+// hook (egress.NewAnthproxyEgressGateHook) with an allowlist that does not
+// cover the upstream: the deny it returns must be recognised as terminal
+// here (ReasonEgressBlocked == egress.TerminalEgressReason).
+func TestProxyEgressRealAllowlistHookIsTerminal(t *testing.T) {
+	if egress.TerminalEgressReason != ReasonEgressBlocked {
+		t.Fatalf("egress.TerminalEgressReason %q != ReasonEgressBlocked %q", egress.TerminalEgressReason, ReasonEgressBlocked)
+	}
+	upstream := newStatusSequenceUpstream(t, []int{200})
+	ledger := &fakeLedger{}
+	cfg := retryCfg(t, upstream.srv.URL, generousGovernor(), ledger, &fakeSleeper{})
+	rec := &nonRetryableRecorder{}
+	cfg.OnNonRetryableFailure = rec.hook
+	gate := egress.NewGate(policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "other.example"}},
+		DefaultDailyByteBudget: 1 << 20,
+	}, egress.NewSensitiveTracker(), nil, nil, nil, nil)
+	cfg.EgressGate = egress.NewAnthproxyEgressGateHook(gate, "api.anthropic.com", 443)(cfg.TaskID, cfg.TraceID)
+	baseURL, _ := startTestProxy(t, cfg)
+	for i := 0; i < 2; i++ {
+		if status, _ := egressRequest(t, baseURL); status != http.StatusForbidden {
+			t.Fatalf("#%d status=%d, want 403", i, status)
+		}
+	}
+	if got := rec.snapshot(); len(got) != 1 || got[0] != ReasonEgressBlocked {
+		t.Fatalf("OnNonRetryableFailure reasons = %v, want exactly [%q]", got, ReasonEgressBlocked)
+	}
+	if got := upstream.hits(); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
 	}
 }
