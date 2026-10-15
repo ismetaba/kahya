@@ -53,8 +53,10 @@ type hafizaBlock struct {
 //     block reaches a cloud model; a downgraded normal task's local answer
 //     may still flow to other surfaces - TTS, Telegram), so a chunk whose
 //     note matches secret_lane_globs (memlane.PathIsSecret) is dropped there
-//     (FIX-U-3). The secret lane keeps it: that block is built and consumed
-//     on the machine only (HANDOFF §5 product principle, decision MEM-7.a).
+//     (FIX-U-3) and the graph walks the cloud lane (memlane.CloudEligible).
+//     The secret lane keeps the chunk and walks the LOCAL lane: that block is
+//     built and consumed on the machine only (HANDOFF §5 product principle,
+//     decision MEM-7.a).
 //
 // query seeds the graph walk. ctx bounds the graph read; the ledger row is
 // written under context.WithoutCancel(ctx), so a block that was built is
@@ -84,14 +86,16 @@ func (s *Server) buildHafizaBlock(ctx context.Context, traceID, taskID, query st
 		memHits[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
 	}
 	// FIX-MEM-1: the graph facts about the entities the query names (or the
-	// hits' notes cite) - trust-filtered (factengine.InjectionEligible) and
-	// lane-filtered (memlane). An enrichment only: a graph error injects the
-	// chunks alone.
+	// hits' notes cite) - trust-filtered (factengine.InjectionEligible) on
+	// every lane, and lane-filtered (memlane.CloudEligible, cloud-lane
+	// identity) on every lane but the secret lane (FIX-MEM-7 phase 2: a
+	// secret-lane task's local block walks the LOCAL lane). An enrichment
+	// only: a graph error injects the chunks alone.
 	graphOn := s.graph != nil && s.cfg.HafizaGraphEnabled
 	var factLines []memory.FactLine
 	var entityIDs []int64
 	if graphOn {
-		factLines, entityIDs = s.hafizaGraphFacts(ctx, traceID, query, eligible)
+		factLines, entityIDs = s.hafizaGraphFacts(ctx, traceID, query, eligible, cloudFacing)
 	}
 	// FIX-MEM-8: the chunker's overlap between two consecutive chunks of one
 	// note is rendered once (memory.RenderKeptDedupedWithFacts trims the

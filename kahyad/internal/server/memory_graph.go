@@ -42,12 +42,19 @@ func (s *Server) SetGraph(g GraphReader) { s.graph = g }
 // hafizaGraphPerHopLimit is the facts read per entity of the walk.
 const hafizaGraphPerHopLimit = 50
 
-// hafizaGraphFacts walks the graph for a for_injection request: seeded by
-// the query and the filtered chunk hits' episodes, cloud lane (this block
-// reaches a cloud model - the worker's UserPromptSubmit hook), bounded by
-// the config hafiza_graph_* / hafiza_facts_* keys. A graph error is logged
-// (hafiza_graph_failed) and yields no facts: the chunks are still injected.
-func (s *Server) hafizaGraphFacts(ctx context.Context, traceID, query string, hits []search.Hit) ([]memory.FactLine, []int64) {
+// hafizaGraphFacts walks the graph for one <hafiza> block (buildHafizaBlock):
+// seeded by the query and the filtered chunk hits' episodes, bounded by the
+// config hafiza_graph_* / hafiza_facts_* keys. cloudLane is true for every
+// block but a secret-lane task's local one (FIX-MEM-7): the worker hook's
+// block reaches a cloud model, and a downgraded normal task's local answer
+// may flow on to other surfaces (EK-MEM-A), so both walk in the cloud lane
+// (memlane.CloudEligible facts, cloud-lane identity only); a secret-lane
+// task's block is built and consumed on the machine, so its walk is the
+// LOCAL lane - secret-path facts and the content-secret extraction's facts
+// (no episode citation, reached through an alias) included. A graph error
+// is logged (hafiza_graph_failed) and yields no facts: the chunks are still
+// injected.
+func (s *Server) hafizaGraphFacts(ctx context.Context, traceID, query string, hits []search.Hit, cloudLane bool) ([]memory.FactLine, []int64) {
 	epIDs := make([]int64, 0, len(hits))
 	for _, h := range hits {
 		epIDs = append(epIDs, h.EpisodeID)
@@ -56,7 +63,7 @@ func (s *Server) hafizaGraphFacts(ctx context.Context, traceID, query string, hi
 		Hops:        s.cfg.HafizaGraphHops,
 		MaxFacts:    s.cfg.HafizaFactsMaxLines,
 		PerHopLimit: hafizaGraphPerHopLimit,
-		CloudLane:   true,
+		CloudLane:   cloudLane,
 	})
 	if err != nil {
 		s.log.With(traceID).Warn("hafiza_graph_failed", "err", err.Error())

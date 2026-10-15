@@ -644,7 +644,9 @@ a cloud model, without changing anything in §2-§6 above:
   {seed_entities, hop0_facts, hop1_facts, hop2_facts, kept, cloud_lane,
   duration_ms}` (the query text at debug only). The restore drill's
   `RunEquivalence` proves the chunk half only (`<olgular>` is facts-table
-  state, not retrieval).
+  state, not retrieval). A locally answered task's block uses the same walk
+  (FIX-MEM-7); only a secret-lane task's walks the local lane (see "Local
+  `<hafiza>` for locally answered tasks" below).
 - **Structured memory tools and filters (FIX-MEM-4, G13).** `/v1/mcp`
   lists five memory tools. `memory_search` gains optional filters
   (`since`/`until` RFC3339 on the note's first-index time, `source`
@@ -864,9 +866,16 @@ a cloud model, without changing anything in §2-§6 above:
   (`secretlane.answererSystemPrompt`, model-facing English) tells Qwen a
   leading `<hafiza>` block is the user's own trusted local memory, never to
   reveal its tags, and that `<olgular>` lines are subject | relation |
-  object facts. The graph facts of this block are cloud-lane for every lane
-  in this phase. A local retrieval/tool loop for Qwen (stage 3) is deferred
-  (decision MEM-7.b).
+  object facts. Graph facts (phase 2): the `<olgular>` walk
+  (`graph.Neighbourhood`, same `hafiza_graph_*`/`hafiza_facts_*` bounds) is
+  told the task's real lane - `CloudLane:false` (the LOCAL lane: no
+  `memlane` filter, every alias and link) only for a secret-lane task, so
+  the facts citing secret-path notes and those of a content-secret
+  extraction call (whose evidence cites no episode, reached through an
+  alias) reach that block and its `fact_ids`; the hook's block and the
+  downgraded normal task's keep `CloudLane:true`. The trust filter
+  (`factengine.InjectionEligible`) is the same in both lanes. A local
+  retrieval/tool loop for Qwen (stage 3) is deferred (decision MEM-7.b).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

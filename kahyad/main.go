@@ -621,13 +621,18 @@ func run() int {
 	// refused). laneClassifier is the ONE path-glob lane rule for the
 	// memory side: here it keeps secret-glob notes out of the memory_search
 	// tool result and the for_injection <hafiza> block (both reach a cloud
-	// model); the later G13 graph/extract/ingest steps reuse it.
+	// model) and out of a governor-downgraded normal task's local block -
+	// only a secret-lane task's local block keeps them (FIX-MEM-7); the
+	// later G13 graph/extract/ingest steps reuse it.
 	laneClassifier := memlane.Classifier{Store: st.Queries, MemoryDir: cfg.MemoryDir, SecretGlobs: pol.SecretLaneGlobs, Matcher: ritual.PolicyGlobMatcher{}}
 	srv.SetMemoryLane(&laneClassifier)
 	// G13 MEM-1: the retrieval graph layer - the for_injection <hafiza>
 	// block's <olgular> section (config hafiza_graph_enabled, decision
 	// MEM-1.a: on, one hop) - and MEM-4's entity_lookup / fact_query MCP
 	// tools (always the cloud lane) and GET /v1/fact/query (local CLI).
+	// MEM-7: a locally answered task's block (config
+	// secret_lane_memory_injection) walks it too - the LOCAL lane only for
+	// a secret-lane task, whose block never leaves the machine.
 	// Read-only over brain.db; every cloud-bound fact passes
 	// factengine.InjectionEligible (fact_query's labelled
 	// include_quarantined aside, decision MEM-4.a) and laneClassifier (a

@@ -471,9 +471,12 @@ func (f localHafizaFixture) fact(t *testing.T, subj string, subjID int64, pred, 
 }
 
 // emreMemory seeds the shared memory of the real-stack tests: an ordinary
-// note and a secret-path note (finans-emre.md) about Emre, and one fact
-// citing each - the secret one extracted by the local model.
-func (f localHafizaFixture) emreMemory(t *testing.T) (worksAt, secretFact int64) {
+// note and a secret-path note (finans-emre.md) about Emre, one fact citing
+// each - the secret one extracted by the local model - and a fact from a
+// content-secret extraction call (an ordinary path whose text the local
+// classifier flagged: its evidence cites no episode, kahyad/internal/
+// extract), reachable only through the alias "Emre".
+func (f localHafizaFixture) emreMemory(t *testing.T) (worksAt, secretFact, contentSecretFact int64) {
 	t.Helper()
 	ep := f.note(t, "people/emre.md", "Emre Acme'de çalışıyor.\n")
 	secretEp := f.note(t, "finans-emre.md", "Emre'nin BankX kredi borcu var.\n")
@@ -483,7 +486,8 @@ func (f localHafizaFixture) emreMemory(t *testing.T) (worksAt, secretFact int64)
 	}
 	worksAt = f.fact(t, "Emre", emre, "works_at", "Acme", ep, true)
 	secretFact = f.fact(t, "Emre", emre, "has_loan_at", "BankX", secretEp, false)
-	return worksAt, secretFact
+	contentSecretFact = f.fact(t, "Emre", emre, "has_diagnosis", "Migren", 0, false)
+	return worksAt, secretFact, contentSecretFact
 }
 
 // downgradedGovernor is a governor at exactly 80% of its daily budget:
@@ -512,7 +516,7 @@ func downgradedGovernor(t *testing.T) *anthproxy.Governor {
 // searcher, factengine and graph.
 func TestGovernorDowngradedTaskInjectsLocalHafizaWithoutSecretPathFacts(t *testing.T) {
 	f := newLocalHafizaFixture(t, downgradedGovernor(t))
-	worksAt, secretFact := f.emreMemory(t)
+	worksAt, secretFact, contentSecretFact := f.emreMemory(t)
 
 	const prompt = "Emre nerede çalışıyor?"
 	traceID := "trace-mem7-downgrade-00000000001"
@@ -521,13 +525,13 @@ func TestGovernorDowngradedTaskInjectsLocalHafizaWithoutSecretPathFacts(t *testi
 	if !strings.Contains(block, "[people/emre.md#0] Emre Acme'de çalışıyor.") || !strings.Contains(block, "] Emre | works_at | Acme (") {
 		t.Fatalf("block lacks the ordinary note or its fact:\n%s", block)
 	}
-	if strings.Contains(block, "finans-emre.md") || strings.Contains(block, "BankX") {
-		t.Fatalf("a secret-path note/fact reached the downgraded normal task's block:\n%s", block)
+	if strings.Contains(block, "finans-emre.md") || strings.Contains(block, "BankX") || strings.Contains(block, "Migren") {
+		t.Fatalf("a secret-path note/fact or a content-secret fact reached the downgraded normal task's block:\n%s", block)
 	}
 	p := onlyHafizaRow(t, f.store, traceID)
 	assertBlockLedgered(t, p, block, spawn.LaneNormal, taskID)
 	if ids := jsonIDs(p["fact_ids"]); !reflect.DeepEqual(ids, []int64{worksAt}) {
-		t.Fatalf("fact_ids = %v, want [%d] (never the secret fact %d)", ids, worksAt, secretFact)
+		t.Fatalf("fact_ids = %v, want [%d] (never the secret facts %d, %d)", ids, worksAt, secretFact, contentSecretFact)
 	}
 	row, err := f.store.Queries.GetTaskLane(context.Background(), taskID)
 	if err != nil || row.Lane != spawn.LaneNormal {
@@ -555,5 +559,77 @@ func TestSecretLaneTaskInjectionKeepsSecretPathChunksLocally(t *testing.T) {
 	cloud := postInjection(t, f.client, `{"query":"Emre'nin banka hesabındaki kredi borcu ne kadar?","for_injection":true,"task_id":"t-cloud","trace_id":"tid-mem7-cloud"}`)
 	if !strings.HasPrefix(cloud.HafizaBlock, "<hafiza>\n") || strings.Contains(cloud.HafizaBlock, "finans-emre.md") || strings.Contains(cloud.HafizaBlock, "BankX") {
 		t.Fatalf("the cloud-bound block = %q, want a block without the secret-path note", cloud.HafizaBlock)
+	}
+}
+
+// TestSecretLaneTaskInjectionIncludesSecretPathFactsLocally (FIX-MEM-7 phase
+// 2, decision MEM-7.a): a secret-lane task's local block walks the graph in
+// the LOCAL lane (graph.Options.CloudLane false) - the fact citing the
+// secret-path note and the content-secret extraction's fact (no episode
+// citation, reached through the alias "Emre") are in its <olgular> section
+// and its ledgered fact_ids. The same query's cloud-bound block (the worker
+// hook) carries neither.
+func TestSecretLaneTaskInjectionIncludesSecretPathFactsLocally(t *testing.T) {
+	f := newLocalHafizaFixture(t, nil)
+	worksAt, secretFact, contentSecretFact := f.emreMemory(t)
+
+	const prompt = "Emre'nin banka hesabındaki kredi borcu ne kadar?"
+	traceID := "trace-mem7-secretfacts-000000001"
+	taskID := runLocalTask(t, f.client, traceID, prompt)
+	block := splitInjectedPrompt(t, f.rec.only(t), prompt)
+	for _, want := range []string{"] Emre | has_loan_at | BankX (", "] Emre | has_diagnosis | Migren (", "] Emre | works_at | Acme ("} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("the secret-lane block lacks the fact %q:\n%s", want, block)
+		}
+	}
+	p := onlyHafizaRow(t, f.store, traceID)
+	assertBlockLedgered(t, p, block, spawn.LaneSecret, taskID)
+	got := map[int64]bool{}
+	for _, id := range jsonIDs(p["fact_ids"]) {
+		got[id] = true
+	}
+	if len(got) != 3 || !got[worksAt] || !got[secretFact] || !got[contentSecretFact] {
+		t.Fatalf("fact_ids = %v, want {%d %d %d}", jsonIDs(p["fact_ids"]), worksAt, secretFact, contentSecretFact)
+	}
+
+	cloud := postInjection(t, f.client, `{"query":"Emre'nin banka hesabındaki kredi borcu ne kadar?","for_injection":true,"task_id":"t-cloud","trace_id":"tid-mem7-cloud-facts"}`)
+	if strings.Contains(cloud.HafizaBlock, "BankX") || strings.Contains(cloud.HafizaBlock, "Migren") {
+		t.Fatalf("the cloud-bound block carries a secret fact:\n%s", cloud.HafizaBlock)
+	}
+	if len(cloud.Facts) != 1 || cloud.Facts[0].FactID != worksAt {
+		t.Fatalf("cloud-bound facts = %+v, want only %d", cloud.Facts, worksAt)
+	}
+}
+
+// TestLocalHafizaGraphLaneFollowsTaskLane (FIX-MEM-7 phase 2, EK-MEM-A): the
+// graph walk of a local block is told the task's real lane - CloudLane false
+// only for a secret-lane task; the governor's downgraded normal-lane task
+// keeps CloudLane true (its answer may flow on to TTS/Telegram), with the
+// same config bounds the hook's walk gets.
+func TestLocalHafizaGraphLaneFollowsTaskLane(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		governor  func(*testing.T) *anthproxy.Governor
+		prompt    string
+		cloudLane bool
+	}{
+		{"secret_lane", func(*testing.T) *anthproxy.Governor { return generousTestGovernor() }, secretInjectionPrompt, false},
+		{"downgraded_normal", downgradedGovernor, "Emre nerede çalışıyor?", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &fakeGraph{}
+			rec := &promptRecorder{}
+			f := newInjectionTaskFixture(t, "https://upstream.invalid", tc.governor(t), &fakeSearcher{hits: injectionTestHits}, rec, true, func(srv *Server, _ *store.Store) {
+				srv.SetGraph(g)
+				srv.cfg.HafizaGraphEnabled = true
+				srv.cfg.HafizaGraphHops = 1
+				srv.cfg.HafizaFactsMaxLines = 7
+			})
+			runLocalTask(t, f.client, "trace-mem7-graphlane-"+tc.name, tc.prompt)
+			want := graph.Options{Hops: 1, MaxFacts: 7, PerHopLimit: hafizaGraphPerHopLimit, CloudLane: tc.cloudLane}
+			if g.calls != 1 || g.opts != want || g.q != tc.prompt || !reflect.DeepEqual(g.eps, []int64{1}) {
+				t.Fatalf("graph called %d times q=%q eps=%v opts=%+v; want once, the prompt, eps [1] (the quarantined hit's episode left out), %+v", g.calls, g.q, g.eps, g.opts, want)
+			}
+		})
 	}
 }
