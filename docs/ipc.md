@@ -1511,9 +1511,15 @@ the task stays `bekliyor-yeniden-deneme` (`available_at` and
 `next_retry_at` are both fixed-width `FixedNanoRFC3339` text, so the
 comparison is chronological). The resume scan enqueues nothing — and
 bumps neither `attempts` nor `crash_resumes` — while an undelivered,
-uncanceled resume row for the task exists. `kahya task resolve <id>
---retry` cancels every pending row of the task (the park's future one
-included), clears `next_retry_at` and writes one fresh row.
+uncanceled resume row for the task exists, and the crash-resume cap is not
+decided either until that row is delivered (FIX-FINAL
+resume-scan-blocks-redispatch-in-not-live-window; the dispatcher also
+marks the task live in-process for the whole redispatch). `kahya task
+resolve <id> --retry` cancels every pending row of the task (the park's
+future one included), resets `crash_resumes` and clears `next_retry_at`
+while the task is still blocked / parked, then moves it to `executing` and
+writes one fresh row unless a resume scan landing in between already did
+(FIX-FINAL resume-scan-reblocks-during-task-retry).
 
 **Shutdown kills in-flight workers; boot kills recorded orphans (FIX-I-5):**
 `http.Server.Shutdown` never cancels an active request, so a worker (its

@@ -69,12 +69,34 @@ func (rs *Resolver) SetClock(now func() time.Time) { rs.now = now }
 // task - a parked task's future row at next_retry_at included - is canceled
 // and next_retry_at is cleared before the one fresh row is written; the
 // task is never redispatched a second time by a leftover row.
+//
+// FIX-FINAL resume-scan-reblocks-during-task-retry: the old order
+// (transition first, then cancel / reset / write) left a window in which
+// the task was 'executing', not live, with no pending row and
+// crash_resumes still at the cap - a resume-scan tick there re-blocked it
+// with a second cap notice, and Retry then wrote a row the dispatcher's
+// redelivery guard dropped ("retry ok" for a task that never ran). The
+// state the scan reads is now made right while the task is still blocked /
+// parked (never a scan candidate), then it moves to 'executing', and the
+// fresh row is written only when no row is pending yet (a scan landing
+// after the transition enqueues the single row itself). Deliberate
+// departure from the handbook's I-2/I-8 statement order.
 func (rs *Resolver) Retry(ctx context.Context, traceID, taskID string) error {
-	if err := rs.machine.Transition(ctx, traceID, taskID, StatusExecuting); err != nil {
-		if errors.Is(err, ErrIllegalTransition) {
-			return fmt.Errorf("%w: %v", ErrTaskNotResolvable, err)
+	cur, err := rs.store.GetTaskByID(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("task: load task %s: %w", taskID, err)
+	}
+	if cur.Status != StatusExecuting && !IsLegalTransition(cur.Status, StatusExecuting) {
+		// Machine.Transition ledgers the illegal attempt; nothing is reset.
+		if err := rs.machine.Transition(ctx, traceID, taskID, StatusExecuting); err != nil {
+			if errors.Is(err, ErrIllegalTransition) {
+				return fmt.Errorf("%w: %v", ErrTaskNotResolvable, err)
+			}
+			return err
 		}
-		return err
+		// only a terminal status has no edge into executing, so this is
+		// unreachable; if it ever happened, the steps below still run (the
+		// second transition is a from==to no-op)
 	}
 	now := rs.now().UTC().Format(time.RFC3339Nano)
 	if _, err := rs.outbox.CancelOutboxRowsByTask(ctx, sqlcgen.CancelOutboxRowsByTaskParams{
@@ -92,6 +114,19 @@ func (rs *Resolver) Retry(ctx context.Context, traceID, taskID string) error {
 		NextRetryAt: sql.NullString{}, UpdatedAt: now, ID: taskID,
 	}); err != nil {
 		return fmt.Errorf("task: clear next_retry_at (task %s): %w", taskID, err)
+	}
+	if err := rs.machine.Transition(ctx, traceID, taskID, StatusExecuting); err != nil {
+		if errors.Is(err, ErrIllegalTransition) {
+			return fmt.Errorf("%w: %v", ErrTaskNotResolvable, err)
+		}
+		return err
+	}
+	pending, err := rs.outbox.CountPendingOutboxRowsByTask(ctx, sql.NullString{String: taskID, Valid: true})
+	if err != nil {
+		return fmt.Errorf("task: count pending outbox rows (task %s): %w", taskID, err)
+	}
+	if pending > 0 {
+		return nil // a resume scan landing after the transition already enqueued it
 	}
 	return writeOutboxResumeRow(ctx, rs.outbox, rs.now, traceID, taskID)
 }

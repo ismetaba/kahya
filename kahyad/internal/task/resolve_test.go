@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // TestResolverAbortMovesBlockedUserToFailed is the acceptance test (b)'s
@@ -124,5 +126,78 @@ func TestResolverRetryCancelsPendingRowsAndClearsNextRetryAt(t *testing.T) {
 	}
 	if row.NextRetryAt.Valid {
 		t.Errorf("next_retry_at = %q, want NULL", row.NextRetryAt.String)
+	}
+}
+
+// scanningOutbox runs a resume scan once inside the named call, before it
+// executes - a scan tick landing at that point of Resolver.Retry.
+type scanningOutbox struct {
+	OutboxEnqueuer
+	at   string
+	scan func()
+	done bool
+}
+
+func (o *scanningOutbox) hit(name string) {
+	if !o.done && o.at == name {
+		o.done = true
+		o.scan()
+	}
+}
+
+func (o *scanningOutbox) CancelOutboxRowsByTask(ctx context.Context, arg sqlcgen.CancelOutboxRowsByTaskParams) (int64, error) {
+	o.hit("cancel")
+	return o.OutboxEnqueuer.CancelOutboxRowsByTask(ctx, arg)
+}
+
+func (o *scanningOutbox) CountPendingOutboxRowsByTask(ctx context.Context, taskID sql.NullString) (int64, error) {
+	o.hit("count")
+	return o.OutboxEnqueuer.CountPendingOutboxRowsByTask(ctx, taskID)
+}
+
+// TestResolverRetryRacingResumeScanDoesNotReblock (FIX-FINAL resume-scan-
+// reblocks-during-task-retry): Retry moved blocked_user -> executing first
+// and only then reset crash_resumes and wrote its row, so a resume-scan
+// tick in between saw an executing, not-live task still at the cap,
+// re-blocked it with a second cap notice, and Retry "succeeded" for a task
+// that never ran. A scan landing anywhere in Retry now either skips the
+// task or enqueues the single row itself; Retry always leaves it executing
+// with exactly one pending row and no second notice.
+func TestResolverRetryRacingResumeScanDoesNotReblock(t *testing.T) {
+	for _, at := range []string{"cancel", "count"} {
+		t.Run(at, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			insertTask(t, st, "t1")
+			m := NewMachine(st.Queries, st)
+			mustTransition(t, m, ctx, "t1", StatusExecuting)
+			mustTransition(t, m, ctx, "t1", StatusBlockedUser)
+			if _, err := st.DB().Exec(`UPDATE tasks SET crash_resumes = 3 WHERE id = 't1'`); err != nil {
+				t.Fatal(err)
+			}
+			notifier := &fakeNotifier{}
+			r := NewResume(st.Queries, st.Queries, st.Queries, m, notifier, nil, 3)
+			r.SetMaxCrashResumes(3)
+			ob := &scanningOutbox{OutboxEnqueuer: st.Queries, at: at, scan: func() {
+				if _, err := r.Scan(ctx); err != nil {
+					t.Errorf("scan inside Retry: %v", err)
+				}
+			}}
+			if err := NewResolver(st.Queries, ob, m).Retry(ctx, "trace", "t1"); err != nil {
+				t.Fatalf("Retry: %v", err)
+			}
+			if !ob.done {
+				t.Fatalf("the scan hook at %q never ran", at)
+			}
+			if got := taskStatus(t, st, "t1"); got != StatusExecuting {
+				t.Fatalf("status = %q, want executing (a racing scan must not re-block a retried task)", got)
+			}
+			if n := pendingOutboxRows(t, st, "t1"); n != 1 {
+				t.Errorf("pending resume rows = %d, want exactly 1", n)
+			}
+			if len(notifier.calls) != 0 {
+				t.Errorf("notices = %+v, want none", notifier.calls)
+			}
+		})
 	}
 }
