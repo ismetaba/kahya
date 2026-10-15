@@ -26,4 +26,9 @@ func TestByteExactTurkishStrings(t *testing.T) {
 	if MsgRewriteRejected != wantRewriteRejected {
 		t.Errorf("MsgRewriteRejected = %q, want %q", MsgRewriteRejected, wantRewriteRejected)
 	}
+	// FIX-P-24 (handbook G06 P-24 text, byte-exact).
+	wantRepoStateUnsafe := "Hafıza deposu (~/Kahya) beklenmedik git durumunda — konsolidasyon atlandı; 'git -C ~/Kahya status' ile kontrol et"
+	if MsgRepoStateUnsafe != wantRepoStateUnsafe {
+		t.Errorf("MsgRepoStateUnsafe = %q, want %q", MsgRepoStateUnsafe, wantRepoStateUnsafe)
+	}
 }

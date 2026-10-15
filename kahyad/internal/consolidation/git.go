@@ -40,6 +40,92 @@ const ConsolidationBranchPrefix = "kahya/consolidation-"
 // (HANDOFF §6 backup: snapshots travel via Time Machine, never git).
 var ErrBackupPathStaged = errors.New("consolidation: backup dir path staged for commit")
 
+// Repo-state refusals (FIX-P-24): the nightly run and finalize only ever
+// touch ~/Kahya while it is checked out on main with no git operation in
+// progress and no unmerged index entries.
+var (
+	ErrRepoNotOnMain           = errors.New("consolidation: memory repo is not checked out on main")
+	ErrRepoOperationInProgress = errors.New("consolidation: a git merge/rebase/cherry-pick/revert/bisect is in progress")
+	ErrRepoHasConflicts        = errors.New("consolidation: memory repo has unmerged (conflicted) paths")
+)
+
+// RepoState is what CheckRepoState observed (logged and ledgered on a
+// refusal).
+type RepoState struct {
+	Head       string   // symbolic branch name, "" when detached
+	Detached   bool     // HEAD is not a symbolic ref (or could not be read)
+	InProgress []string // MERGE_HEAD, REBASE_HEAD, rebase-merge, ...
+	Unmerged   int      // unmerged index entries (stage 1/2/3 records, not files)
+}
+
+// inProgressRefs and inProgressPaths are the markers git leaves while an
+// operation is stopped half-way (a conflicted merge, rebase, am,
+// cherry-pick, revert, or a bisect session).
+var (
+	inProgressRefs  = []string{"MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"}
+	inProgressPaths = []string{"rebase-merge", "rebase-apply", "BISECT_LOG"}
+)
+
+// CheckRepoState fails closed unless repoDir is on MainBranch, has no
+// in-progress git operation and no unmerged index entries (FIX-P-24). It
+// runs read-only git commands only. Callers that commit to, merge into or
+// branch from repoDir (Run, finalize) MUST call it first: IsDirtyUnder sees
+// a conflicted path as an ordinary edit, `git add` would mark it resolved
+// with its conflict markers, and MergeFastForwardOnly advances whatever is
+// checked out, not main.
+//
+// The in-progress markers are checked BEFORE the branch, so a stopped
+// rebase (whose HEAD is detached) reports ErrRepoOperationInProgress, not
+// ErrRepoNotOnMain. Verified against git 2.54: `symbolic-ref --quiet`
+// exits 1 when detached; `rev-parse --verify --quiet MERGE_HEAD` exits 1
+// when absent; `rev-parse --git-path rebase-merge` prints a path relative
+// to repoDir (it is run with -C repoDir); `ls-files -u -z` prints one
+// NUL-terminated record per unmerged stage (3 for a two-sided conflict).
+func CheckRepoState(ctx context.Context, git backup.GitRunner, repoDir string) (RepoState, error) {
+	var st RepoState
+	out, _, err := git.Run(ctx, repoDir, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		st.Detached = true
+	} else {
+		st.Head = strings.TrimSpace(out)
+	}
+	for _, ref := range inProgressRefs {
+		if _, _, err := git.Run(ctx, repoDir, "rev-parse", "--verify", "--quiet", ref); err == nil {
+			st.InProgress = append(st.InProgress, ref)
+		}
+	}
+	for _, p := range inProgressPaths {
+		pOut, _, err := git.Run(ctx, repoDir, "rev-parse", "--git-path", p)
+		if err != nil {
+			continue
+		}
+		gp := strings.TrimSpace(pOut)
+		if gp == "" {
+			continue
+		}
+		if !filepath.IsAbs(gp) {
+			gp = filepath.Join(repoDir, gp)
+		}
+		if _, serr := os.Lstat(gp); serr == nil {
+			st.InProgress = append(st.InProgress, p)
+		}
+	}
+	if len(st.InProgress) > 0 {
+		return st, fmt.Errorf("%w: %s", ErrRepoOperationInProgress, strings.Join(st.InProgress, ","))
+	}
+	if st.Detached || st.Head != MainBranch {
+		return st, fmt.Errorf("%w (head=%q detached=%v)", ErrRepoNotOnMain, st.Head, st.Detached)
+	}
+	uOut, stderr, err := git.Run(ctx, repoDir, "ls-files", "-u", "-z")
+	if err != nil {
+		return st, fmt.Errorf("consolidation: git ls-files -u: %w (%s)", err, stderr)
+	}
+	if st.Unmerged = len(splitNUL(uOut)); st.Unmerged > 0 {
+		return st, fmt.Errorf("%w: %d index entries", ErrRepoHasConflicts, st.Unmerged)
+	}
+	return st, nil
+}
+
 // literalPathspec turns a repo-relative, forward-slash directory into a git
 // pathspec that matches that directory and everything under it, with glob
 // characters taken literally.
@@ -246,7 +332,10 @@ func RebaseWorktreeOnto(ctx context.Context, git backup.GitRunner, worktreeDir, 
 // commit (already authored KahyaCommitAuthor by CommitPaths during Run). A
 // non-fast-forward state (main advanced with commits branch does not
 // contain, and RebaseOnto was somehow skipped or itself did not fully
-// catch up) fails closed: an error, main untouched.
+// catch up) fails closed: an error, main untouched. Callers MUST run
+// CheckRepoState first (FIX-P-24): the merge targets whatever repoDir has
+// checked out, so on a detached HEAD or another branch main would never
+// advance and the branch deletion after it would orphan the commit.
 func MergeFastForwardOnly(ctx context.Context, git backup.GitRunner, repoDir, branch string) error {
 	if _, stderr, err := git.Run(ctx, repoDir, "merge", "--ff-only", branch); err != nil {
 		return fmt.Errorf("consolidation: git merge --ff-only %s: %w (%s)", branch, err, stderr)

@@ -244,6 +244,17 @@ func (c *Consolidator) notify(ctx context.Context, traceID, text string) {
 // (scheduler.TraceIDFromContext's value, for the "nightly-consolidation"
 // job handler).
 func (c *Consolidator) Run(ctx context.Context, traceID string) error {
+	// FIX-P-24: before anything else (the gitignore write and the author=user
+	// pre-commit included), ~/Kahya must be on main with no git operation in
+	// progress and no unmerged paths - otherwise a conflicted file would be
+	// committed with its markers as a "user edit", or the merge would advance
+	// a detached HEAD instead of main. Nothing is touched; the run is retried
+	// the next night.
+	if st, err := CheckRepoState(ctx, c.Git, c.Cfg.KahyaDir); err != nil {
+		c.refuseRepoState(ctx, traceID, st, err)
+		return err
+	}
+
 	now := c.now()
 
 	// memRelToRepo is MemoryDir's own path RELATIVE TO KahyaDir (normally
@@ -532,6 +543,24 @@ func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, 
 	return CommitPaths(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage, memRel)
 }
 
+// EventRepoStateUnsafe is ledgered whenever Run or finalize refused to touch
+// ~/Kahya because CheckRepoState failed (FIX-P-24).
+const EventRepoStateUnsafe = "consolidation.repo_state_unsafe"
+
+// refuseRepoState logs, ledgers and notifies one repo-state refusal.
+// Decision G06-4: the notice goes out on every refused night (the user may
+// be working on another branch for days; consolidation is main-only).
+func (c *Consolidator) refuseRepoState(ctx context.Context, traceID string, st RepoState, cause error) {
+	c.logError("consolidation_repo_state_unsafe", "trace_id", traceID, "head", st.Head, "detached", st.Detached,
+		"in_progress", strings.Join(st.InProgress, ","), "unmerged", st.Unmerged, "err", cause.Error())
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventRepoStateUnsafe, map[string]any{
+			"head": st.Head, "detached": st.Detached, "in_progress": st.InProgress, "unmerged": st.Unmerged, "reason": cause.Error(),
+		})
+	}
+	c.notify(ctx, traceID, MsgRepoStateUnsafe)
+}
+
 // EventRewriteRejected is ledgered when a lane's rewrite named a path
 // outside its input set and the night was rejected (FIX-P-7). The payload's
 // reason carries the offending path (local ledger only); the Telegram
@@ -587,6 +616,13 @@ func (c *Consolidator) Approve(ctx context.Context, traceID string) error {
 // event resolves (may be the SAME value as approveTraceID for auto mode,
 // where there was never a separate pending event to resolve).
 func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTraceID, branch string) error {
+	// FIX-P-24: the same repo-state gate as Run (the user may have switched
+	// branch or started a merge since the nightly run). A refusal leaves the
+	// pending suggestion and its branch exactly as they are.
+	if st, err := CheckRepoState(ctx, c.Git, c.Cfg.KahyaDir); err != nil {
+		c.refuseRepoState(ctx, approveTraceID, st, err)
+		return err
+	}
 	// Rebase happens INSIDE the branch's own worktree (RebaseWorktreeOnto's
 	// doc comment explains why this must never run as a two-arg `git
 	// rebase <upstream> <branch>` from kahyaDir directly - it would

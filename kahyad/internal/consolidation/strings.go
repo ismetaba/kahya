@@ -26,3 +26,9 @@ const MsgBackupDirStaged = "Konsolidasyon durduruldu — yedek dizini git'e ekle
 // handbook text, em-dash). It deliberately names no path: a secret-lane
 // file name must not leave the machine; the path is in the local ledger.
 const MsgRewriteRejected = "Konsolidasyon bu gece iptal edildi — model kendisine verilmeyen bir dosya yolu döndürdü"
+
+// MsgRepoStateUnsafe is the Telegram notice sent when ~/Kahya is not on main,
+// has a git operation in progress or has unmerged paths, so the nightly run
+// (or an approve) touched nothing (FIX-P-24; byte-exact handbook text,
+// em-dash). Decision G06-4: it is sent on every refused night.
+const MsgRepoStateUnsafe = "Hafıza deposu (~/Kahya) beklenmedik git durumunda — konsolidasyon atlandı; 'git -C ~/Kahya status' ile kontrol et"
