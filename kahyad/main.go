@@ -1220,6 +1220,10 @@ func run() int {
 			ChangedFilesFirst:     cfg.ConsolidationChangedFilesFirst,
 		},
 		Git: backup.NewExecGitRunner(),
+		// FIX-FINAL precommit-claims-kahyad-written-note-as-user: the
+		// author=user pre-commit and the merge hold the memory tools' repo
+		// mutex.
+		RepoLock: srv,
 		Cloud: consolidation.CloudSession{Spawner: consolidation.ProcessSpawner{
 			Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
 			MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,

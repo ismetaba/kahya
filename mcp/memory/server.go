@@ -103,6 +103,19 @@ type Server struct {
 	mu sync.Mutex
 }
 
+// LockRepo takes the memory-repo mutex every HandleWrite/HandleForget/
+// HandleConfirm/HandleWriteTiered mutation holds, and returns its unlock.
+// Every out-of-package git mutation of the memory repo that must not
+// interleave with a tool's write-then-commit sequence holds it too -
+// consolidation's author=user pre-commit (FIX-FINAL precommit-claims-
+// kahyad-written-note-as-user): without it, a note kahyad had written but
+// not yet committed could be committed as the user's own edit (user_edit,
+// the top tier).
+func (s *Server) LockRepo() (unlock func()) {
+	s.mu.Lock()
+	return s.mu.Unlock
+}
+
 // New constructs a Server. log may be nil (defaults to a no-op Logger).
 func New(memoryDir string, search Searcher, index Indexer, ledger Ledger, log Logger) *Server {
 	if log == nil {

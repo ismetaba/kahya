@@ -187,8 +187,22 @@ type Config struct {
 // with HotWindow left nil and proves Run still fully completes the
 // markdown/git pipeline with ZERO brain.db access anywhere else in this
 // struct).
+// RepoLocker serializes consolidation's own memory-repo git mutations with
+// kahyad's memory tools (mcp/memory.Server's mutex, through
+// kahyad/internal/server.Server.LockMemoryRepo): LockMemoryRepo blocks
+// until no memory_write / memory_forget / memory confirm / ingest write
+// is between its file write and its commit, and returns the unlock.
+type RepoLocker interface {
+	LockMemoryRepo() (unlock func())
+}
+
 type Consolidator struct {
 	Cfg Config
+
+	// RepoLock, when set, is held around the author=user pre-commit and
+	// the merge into main (FIX-FINAL precommit-claims-kahyad-written-note-
+	// as-user). nil = no locking (tests only; main.go always wires it).
+	RepoLock RepoLocker
 
 	Git     backup.GitRunner
 	Matcher GlobMatcher // defaults to PolicyGlobMatcher{} when nil
@@ -1013,6 +1027,15 @@ func memoryPathspec(kahyaDir, memoryDir string) (string, error) {
 // commit), then commit the memory changes as author=user. A dirty tree
 // outside memRel is not a memory edit and is never committed or un-staged.
 func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, backupRel string) error {
+	// FIX-FINAL precommit-claims-kahyad-written-note-as-user: memory_write
+	// and ingest write a note BEFORE they commit it (as kahyad). Without
+	// the memory-repo lock, a pre-commit landing in that window committed
+	// kahyad's agent_derived/external_doc note as author=user, which the
+	// indexer upgrades to user_edit.
+	if c.RepoLock != nil {
+		unlock := c.RepoLock.LockMemoryRepo()
+		defer unlock()
+	}
 	dirty, err := IsDirtyUnder(ctx, c.Git, c.Cfg.KahyaDir, memRel)
 	if err != nil {
 		return err
@@ -1047,6 +1070,17 @@ func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, 
 		return nil // e.g. an edit reverted to HEAD's content: nothing to commit
 	}
 	return CommitPaths(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage, memRel)
+}
+
+// mergeLocked fast-forwards main onto branch under the memory-repo lock
+// (RepoLock), so the merge never moves HEAD under a memory tool's
+// write-then-commit sequence.
+func (c *Consolidator) mergeLocked(ctx context.Context, branch string) error {
+	if c.RepoLock != nil {
+		unlock := c.RepoLock.LockMemoryRepo()
+		defer unlock()
+	}
+	return MergeFastForwardOnly(ctx, c.Git, c.Cfg.KahyaDir, branch)
 }
 
 // EventOrphanCleaned is ledgered for every kahya/consolidation-* branch the
@@ -1192,7 +1226,7 @@ func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTrac
 	if err := RemoveWorktree(ctx, c.Git, c.Cfg.KahyaDir, worktreePath); err != nil {
 		c.logWarn("consolidation_worktree_remove_failed", "trace_id", approveTraceID, "err", err.Error())
 	}
-	if err := MergeFastForwardOnly(ctx, c.Git, c.Cfg.KahyaDir, branch); err != nil {
+	if err := c.mergeLocked(ctx, branch); err != nil {
 		return err
 	}
 	mergeCommit, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)

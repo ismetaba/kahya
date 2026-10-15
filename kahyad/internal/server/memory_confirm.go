@@ -19,6 +19,20 @@ import (
 	"kahya/mcp/memory"
 )
 
+// LockMemoryRepo takes the memory-repo mutex of the ONE mcp/memory.Server
+// (memoryServer) and returns its unlock - consolidation.RepoLocker, so the
+// nightly author=user pre-commit and merge never interleave with a memory
+// tool's write-then-commit (FIX-FINAL precommit-claims-kahyad-written-
+// note-as-user). The server is resolved at lock time, after every Set*
+// wiring. With no memory server there is no concurrent writer: a no-op.
+func (s *Server) LockMemoryRepo() func() {
+	m := s.memoryServer()
+	if m == nil {
+		return func() {}
+	}
+	return m.LockRepo()
+}
+
 // memoryServer returns the ONE mcp/memory.Server this kahyad process writes
 // the memory repo through: the /v1/mcp memory tools (buildMCPHandler) and
 // the control routes (memory confirm; kahya ingest through
