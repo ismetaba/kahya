@@ -115,6 +115,40 @@ func TestJournalModeIsWAL(t *testing.T) {
 	}
 }
 
+// TestOpenDurabilityPragmas (FIX-FINAL sqlite-synchronous-normal-not-
+// durable): brain.db ran synchronous=NORMAL with fullfsync off, so in WAL a
+// committed transaction - the W4-02 pre-op journal, a sticky lane
+// escalation, an anchored ledger event - could roll back after a kernel
+// panic or power loss. Every handle now runs synchronous=FULL with
+// checkpoint F_FULLFSYNC, and cfg.DBFullFsync (every config.Load) adds
+// per-commit F_FULLFSYNC; a connection the pool opens later gets them too.
+func TestOpenDurabilityPragmas(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		cfg := testCfg(t)
+		cfg.DBFullFsync = full
+		s, err := Open(cfg)
+		if err != nil {
+			t.Fatalf("Open(DBFullFsync=%v): %v", full, err)
+		}
+		want := map[string]int{"synchronous": 2, "checkpoint_fullfsync": 1, "fullfsync": 0}
+		if full {
+			want["fullfsync"] = 1
+		}
+		// a fresh pool connection, not only the one Open used
+		s.DB().SetMaxIdleConns(0)
+		for pragma, w := range want {
+			var got int
+			if err := s.DB().QueryRow("PRAGMA " + pragma).Scan(&got); err != nil {
+				t.Fatalf("PRAGMA %s: %v", pragma, err)
+			}
+			if got != w {
+				t.Errorf("DBFullFsync=%v: PRAGMA %s = %d, want %d", full, pragma, got, w)
+			}
+		}
+		s.Close()
+	}
+}
+
 func TestUserVersionMatchesLatestMigration(t *testing.T) {
 	s, err := Open(testCfg(t))
 	if err != nil {

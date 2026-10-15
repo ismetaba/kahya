@@ -56,6 +56,11 @@ func TestLoadDefaults(t *testing.T) {
 	if want := filepath.Join(wantDataDir, "logs"); cfg.LogDir != want {
 		t.Errorf("LogDir = %q, want %q", cfg.LogDir, want)
 	}
+	if !cfg.DBFullFsync {
+		// FIX-FINAL sqlite-synchronous-normal-not-durable: every loaded
+		// config opens brain.db with per-commit F_FULLFSYNC.
+		t.Error("DBFullFsync = false, want true for every loaded config")
+	}
 	if want := filepath.Join(wantDataDir, "brain.db"); cfg.DBPath != want {
 		t.Errorf("DBPath = %q, want %q", cfg.DBPath, want)
 	}

@@ -17,7 +17,7 @@ import (
 	"time"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
-	_ "github.com/mattn/go-sqlite3" // registers the "sqlite3" driver
+	sqlite3 "github.com/mattn/go-sqlite3" // also registers the "sqlite3" driver
 	"github.com/pressly/goose/v3"
 
 	"kahya/kahyad/internal/config"
@@ -53,16 +53,60 @@ var ErrSQLiteFeatureMissing = fmt.Errorf("store: required sqlite feature missing
 // binaries that never touch a real vec0 table.
 func init() {
 	sqlite_vec.Auto()
+	// FIX-FINAL sqlite-synchronous-normal-not-durable: brain.db's own
+	// read/write handle runs every connection with F_FULLFSYNC for
+	// checkpoints and - with cfg.DBFullFsync, i.e. every config.Load - for
+	// every commit too: plain fsync on macOS does not flush the drive
+	// cache, so without it a committed row can still vanish on power loss.
+	// A connect hook (not a one-off Exec after Open) so a connection the
+	// pool replaces gets the pragmas too.
+	sql.Register(durableDriverName, pragmaDriver("PRAGMA checkpoint_fullfsync = ON"))
+	sql.Register(fullFsyncDriverName, pragmaDriver("PRAGMA checkpoint_fullfsync = ON", "PRAGMA fullfsync = ON"))
+}
+
+// durableDriverName / fullFsyncDriverName are the database/sql drivers Open
+// uses for brain.db: the mattn driver with checkpoint F_FULLFSYNC, and
+// with per-commit F_FULLFSYNC as well (cfg.DBFullFsync).
+const (
+	durableDriverName   = "sqlite3_kahya_durable"
+	fullFsyncDriverName = "sqlite3_kahya_fullfsync"
+)
+
+func pragmaDriver(pragmas ...string) *sqlite3.SQLiteDriver {
+	return &sqlite3.SQLiteDriver{ConnectHook: func(c *sqlite3.SQLiteConn) error {
+		for _, p := range pragmas {
+			if _, err := c.Exec(p, nil); err != nil {
+				return fmt.Errorf("store: %s: %w", p, err)
+			}
+		}
+		return nil
+	}}
 }
 
 // dsnPragmas are applied by the mattn/go-sqlite3 driver on every new
 // connection via DSN query parameters (HANDOFF §4 stack; W12-02 step 2):
 // WAL journal, a 5s busy timeout so concurrent readers/writers back off
-// instead of failing immediately, foreign key enforcement on, and NORMAL
-// synchronous (safe under WAL). recursive_triggers must be ON or the
-// implicit row-delete performed by INSERT OR REPLACE skips the events
-// append-only DELETE trigger, silently overwriting ledger rows (§5 #4).
-const dsnPragmas = "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=NORMAL&_recursive_triggers=on"
+// instead of failing immediately, foreign key enforcement on, and FULL
+// synchronous. recursive_triggers must be ON or the implicit row-delete
+// performed by INSERT OR REPLACE skips the events append-only DELETE
+// trigger, silently overwriting ledger rows (§5 #4).
+//
+// FULL, not NORMAL (FIX-FINAL sqlite-synchronous-normal-not-durable;
+// deviation from W12-02 step 2's NORMAL): WAL with NORMAL is corruption-
+// safe but NOT durable across a kernel panic or power loss - it syncs only
+// at checkpoints, so a committed transaction can roll back. Several
+// guarantees rest on a commit being durable before an external effect:
+// the W4-02 pre-op journal (the tool_calls intent/executing rows written
+// before a W2/W3 effect - lost, the resume scan would re-run the effect),
+// the sticky tasks.lane / sensitive_reads writes made before secret bytes
+// are returned (the proxy backstop reads them), and the ledger event the
+// anchor pusher anchors (lost locally, event ids are reused and verify
+// raises a permanent false tamper alarm). FULL fsyncs the WAL on every
+// commit, which closes the kernel-panic / OS-crash window; the connect hook
+// adds F_FULLFSYNC for checkpoints always and for every commit under
+// cfg.DBFullFsync (production), which closes the power-loss window (init).
+// Open verifies them.
+const dsnPragmas = "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=FULL&_recursive_triggers=on"
 
 // walAutocheckpointPages matches the step-2 checkpoint policy: run an
 // automatic passive checkpoint every 1000 WAL pages so the WAL file never
@@ -89,7 +133,11 @@ type Store struct {
 // error here — including a migration failure — must stop the caller from
 // serving (HANDOFF §4 ⚑: no serving on a half-migrated DB).
 func Open(cfg config.Config) (*Store, error) {
-	db, err := sql.Open("sqlite3", cfg.DBPath+dsnPragmas)
+	driver := durableDriverName
+	if cfg.DBFullFsync {
+		driver = fullFsyncDriverName
+	}
+	db, err := sql.Open(driver, cfg.DBPath+dsnPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", cfg.DBPath, err)
 	}
@@ -131,8 +179,44 @@ func Open(cfg config.Config) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: set wal_autocheckpoint: %w", err)
 	}
+	if err := assertDurable(db, cfg.DBFullFsync); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return &Store{db: db, Queries: sqlcgen.New(db), schemaVersion: version}, nil
+}
+
+// ErrNotDurable is returned by Open when brain.db's connection does not
+// run with synchronous=FULL and fullfsync/checkpoint_fullfsync on: kahyad
+// must not serve on a database whose commits may roll back after a crash.
+var ErrNotDurable = fmt.Errorf("store: brain.db durability pragmas not in effect")
+
+// assertDurable reads back the durability pragmas (FIX-FINAL
+// sqlite-synchronous-normal-not-durable): synchronous must be FULL (2),
+// checkpoint_fullfsync ON (1) and, when fullFsync was requested, fullfsync
+// ON (1), or Open fails.
+func assertDurable(db *sql.DB, fullFsync bool) error {
+	want := []struct {
+		pragma string
+		want   int
+	}{{"synchronous", 2}, {"checkpoint_fullfsync", 1}}
+	if fullFsync {
+		want = append(want, struct {
+			pragma string
+			want   int
+		}{"fullfsync", 1})
+	}
+	for _, p := range want {
+		var got int
+		if err := db.QueryRow("PRAGMA " + p.pragma).Scan(&got); err != nil {
+			return fmt.Errorf("%w: read %s: %v", ErrNotDurable, p.pragma, err)
+		}
+		if got != p.want {
+			return fmt.Errorf("%w: %s = %d, want %d", ErrNotDurable, p.pragma, got, p.want)
+		}
+	}
+	return nil
 }
 
 // migrate runs every pending goose migration from the embedded FS against

@@ -675,6 +675,14 @@ type Config struct {
 	// NOT touch the §5 lane routing itself (the bytes stay local either
 	// way) - purely whether they are ALSO read aloud.
 	TTSSpeakSecretLane bool `yaml:"tts_speak_secret_lane"`
+	// DBFullFsync makes every brain.db commit an F_FULLFSYNC (macOS plain
+	// fsync does not flush the drive cache, so a commit can still vanish on
+	// power loss): FIX-FINAL sqlite-synchronous-normal-not-durable. Not a
+	// YAML key - defaults() (every Load) sets it true; a hand-built test
+	// Config leaves it false and keeps synchronous=FULL +
+	// checkpoint_fullfsync only (~4 ms per commit would add minutes to the
+	// hermetic suite).
+	DBFullFsync bool `yaml:"-"`
 }
 
 // TmpDir is W6-02's push-to-talk temp-audio directory: `<data_dir>/tmp`
@@ -1668,6 +1676,7 @@ func defaults(home, env string) Config {
 		Socket:                   filepath.Join(dataDir, socketFileName(env)),
 		LogDir:                   filepath.Join(dataDir, "logs"),
 		DBPath:                   filepath.Join(dataDir, "brain.db"),
+		DBFullFsync:              true,
 		MemoryDir:                filepath.Join(kahyaDir, "memory"),
 		EvalRetrievalDatasetPath: filepath.Join(kahyaDir, "eval", "retrieval", "dataset.jsonl"),
 		AnthropicUpstreamURL:     "https://api.anthropic.com",
