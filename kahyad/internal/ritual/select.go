@@ -113,6 +113,21 @@ type Sampler struct {
 	store  SamplerStore
 	lane   memlane.Classifier
 	ledger Ledger // nil => exclusions are not ledgered
+	// maxQuestions caps Select (SetMaxQuestions); <= 0 = MaxQuestionsPerRun.
+	maxQuestions int
+}
+
+// SetMaxQuestions sets the per-run sample cap (config ritual_max_questions,
+// G13 MEM-5.b); n <= 0 restores MaxQuestionsPerRun. A larger sample only
+// asks more questions - every answer is still one human confirmation or
+// denial per fact (decision MEM-5.a: no automatic promotion).
+func (s *Sampler) SetMaxQuestions(n int) { s.maxQuestions = n }
+
+func (s *Sampler) questionCap() int {
+	if s.maxQuestions <= 0 {
+		return MaxQuestionsPerRun
+	}
+	return s.maxQuestions
 }
 
 // SetFactClassifier wires an optional content classifier on top of the
@@ -142,7 +157,8 @@ type scoredFact struct {
 	lastAskedAt   string // "" == never asked (sorts first)
 }
 
-// Select returns up to MaxQuestionsPerRun eligible facts, in priority
+// Select returns up to the question cap (SetMaxQuestions; default
+// MaxQuestionsPerRun) eligible facts, in priority
 // order: (1) quarantined agent_derived facts first, (2) among the rest,
 // facts nearest the 0.3 injection threshold, (3) facts never probed or
 // probed longest ago. Every tie (including a fact appearing in more than
@@ -194,8 +210,8 @@ func (s *Sampler) Select(ctx context.Context, traceID string) ([]sqlcgen.Fact, e
 	})
 
 	n := len(candidates)
-	if n > MaxQuestionsPerRun {
-		n = MaxQuestionsPerRun
+	if limit := s.questionCap(); n > limit {
+		n = limit
 	}
 	out := make([]sqlcgen.Fact, n)
 	for i := 0; i < n; i++ {

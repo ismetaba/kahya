@@ -721,7 +721,27 @@ a cloud model, without changing anything in §2-§6 above:
   ile tekrarla."`), `kahya fact deny <id>...` (`"Olgu reddedildi (güven
   düşürüldü): %d"` / `"%d olgu reddedildi."`); a failed id is one stderr
   line and exit 1. No "N confirmations => auto-inject" shortcut exists
-  (decision MEM-5.a).
+  (decision MEM-5.a). **Notes (FIX-MEM-5 phase 2):** `POST
+  /v1/memory/confirm {"file": "<path relative to the memory dir, or absolute
+  inside it>"}` (control route; deliberately NOT an MCP tool - tools/list
+  stays five) runs `mcp/memory` `HandleConfirm`: a note whose front matter
+  says `agent_derived`, `external_doc` or `screen` is rewritten to
+  `kahya_source_tier: user_asserted` + `kahya_confirmed_at: <RFC3339 UTC>`
+  (other keys kept, body byte-identical), committed by `kahyad
+  <kahyad@local>` as `memory_confirm: <path>` (never `user` - a review is
+  user_asserted, not user_edit), reindexed (its chunks then pass the
+  for_injection tier filter) and ledgered `memory_confirm {file,
+  previous_tier, commit_sha}`; a failing commit restores the bytes. Answers:
+  200 `{ok, file, episode_id, commit_sha, previous_tier, trace_id}`, 400
+  path outside the memory dir, 404 no such note, 409 `"memory_confirm: not
+  zaten onaylı (<tier>)"` (a note with no front matter is the indexer's
+  user_asserted default), 503 unwired. The memory_write tools and this route
+  share ONE `mcp/memory.Server` (its mutex serializes every memory-repo
+  write). CLI `kahya memory confirm <yol>` → `"Not onaylandı (user_asserted
+  katmanına yükseltildi): %s"`. A note under the secret-lane dir stays
+  path-secret: the tier changes, never the lane. The weekly ritual's sample
+  size is config `ritual_max_questions` (default 10, 1..50; decision
+  MEM-5.b).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

@@ -199,19 +199,9 @@ func (s *Server) buildMCPHandler() http.Handler {
 		})
 	}
 
-	memSrv := memory.New(s.mcpMemoryDir, mcpSearchAdapter{inner: s.search, lane: s.memLane}, s.mcpIndexer, s.eventLogger, s.log)
-	// FIX-U-1: the default inbox day file follows the configured calendar
-	// zone (SetLocation, cfg.Location()).
-	memSrv.Location = s.location()
-	// FIX-U-3: memory_write classifies its content locally before any byte
-	// lands; a secret hit is redirected under the secret-lane memory dir and
-	// escalates the attributed task's lane (memory_lane.go).
-	memSrv.SetSecretLaneSeam(s.mcpSecretLane)
-	// FIX-MEM-4: entity_lookup / fact_query read the graph layer, always in
-	// the cloud lane (mcpGraphAdapter). Unwired = ErrGraphUnavailable.
-	if s.graph != nil {
-		memSrv.SetGraph(mcpGraphAdapter{g: s.graph})
-	}
+	// G13 MEM-5: the memory server is the process-wide one the control
+	// routes (memory confirm, ingest) write through too (memoryServer).
+	memSrv := s.memoryServer()
 	mcpServer := memSrv.MCPServer(nil)
 	// W3-03: fs_read/fs_write/fs_delete, registered onto this SAME shared
 	// server (one MCP session/tool surface for the worker) - see

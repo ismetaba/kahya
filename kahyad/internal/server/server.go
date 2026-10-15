@@ -127,6 +127,12 @@ type Server struct {
 	// for_injection <hafiza> block's <olgular> section. nil until SetGraph.
 	graph GraphReader
 
+	// memSrv is the ONE mcp/memory.Server this process writes the memory
+	// repo through (memory_confirm.go memoryServer): the /v1/mcp tools and
+	// the control routes share it, so its mutex serializes them.
+	memSrvOnce sync.Once
+	memSrv     *memory.Server
+
 	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
 	// 4). See SetTaskStore's doc comment.
 	taskStore TaskStore
@@ -595,6 +601,9 @@ func (s *Server) routeTable() []route {
 		// G13 MEM-3: `kahya memory extract` (memory_extract.go). A control
 		// route: a worker never triggers extraction.
 		{"POST /v1/memory/extract", h(s.handleMemoryExtract)},
+		// G13 MEM-5 phase 2: `kahya memory confirm` (memory_confirm.go) - the
+		// human gate on an agent note; a control route, never an MCP tool.
+		{"POST /v1/memory/confirm", h(s.handleMemoryConfirm)},
 		{"/v1/reindex", h(s.handleReindex)},
 		{"/v1/log", h(s.handleLog)},
 		{"/v1/mcp", s.buildMCPHandler()},
@@ -1008,8 +1017,9 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	// SAME tier-quarantine rule facts.Fact rows are held to
 	// (factengine.InjectionEligible), applied here to CHUNK/episode hits
 	// (which carry only source_tier, never a per-fact confirmed_at) with
-	// confirmed always false - a chunk has no per-item human confirmation
-	// mechanism of its own, only facts do (kahya fact confirm). This
+	// confirmed always false - a chunk is confirmed through its NOTE: `kahya
+	// memory confirm <yol>` (G13 MEM-5) rewrites the note's front matter to
+	// user_asserted and reindexes it, so the episode tier itself passes. This
 	// filters BOTH the returned results AND what the renderer/ledger below
 	// ever sees - "absent with for_injection:true" means absent from the
 	// response entirely, not merely excluded from hafiza_block.

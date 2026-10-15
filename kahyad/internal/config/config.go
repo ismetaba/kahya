@@ -590,6 +590,12 @@ type Config struct {
 	RitualWeeklyWeekday int `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour    int `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute  int `yaml:"ritual_weekly_minute"`
+	// RitualMaxQuestions caps one ritual run's sample (G13 MEM-5.b; default
+	// DefaultRitualMaxQuestions = ritual.MaxQuestionsPerRun, 10). It is the
+	// ritual's throughput, never a trust shortcut: N confirmations never
+	// auto-inject anything (decision MEM-5.a). Load fails outside
+	// 1..MaxRitualMaxQuestions.
+	RitualMaxQuestions int `yaml:"ritual_max_questions"`
 
 	// --- W6-01 Hammerspoon palette + local approval cards ---
 
@@ -964,6 +970,7 @@ type fileConfig struct {
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute            *int            `yaml:"ritual_weekly_minute"`
+	RitualMaxQuestions            *int            `yaml:"ritual_max_questions"`
 	HsCliPath                     *string         `yaml:"ui_hs_cli"`
 	TTSEnabled                    *bool           `yaml:"tts_enabled"`
 	TTSVoice                      *string         `yaml:"tts_voice"`
@@ -1098,6 +1105,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateExtraction(cfg.ExtractionBatchMaxEpisodes, cfg.ExtractionChunksPerCall); err != nil {
+		return Config{}, err
+	}
+	if err := validateRitualMaxQuestions(cfg.RitualMaxQuestions); err != nil {
 		return Config{}, err
 	}
 
@@ -1385,6 +1395,26 @@ func validateExtraction(batchMaxEpisodes, chunksPerCall int) error {
 	}
 	if chunksPerCall < 1 || chunksPerCall > MaxExtractionChunksPerCall {
 		return fmt.Errorf("config: extraction_chunks_per_call must be 1..%d, got %d", MaxExtractionChunksPerCall, chunksPerCall)
+	}
+	return nil
+}
+
+// DefaultRitualMaxQuestions / MaxRitualMaxQuestions bound
+// ritual_max_questions (G13 MEM-5.b). The default equals
+// kahyad/internal/ritual.MaxQuestionsPerRun (pinned by kahyad's
+// TestRitualMaxQuestionsWiredFromConfig); the ceiling keeps one weekly run a
+// handful of Telegram questions, not a flood.
+const (
+	DefaultRitualMaxQuestions = 10
+	MaxRitualMaxQuestions     = 50
+)
+
+// validateRitualMaxQuestions fails Load closed (FIX-MEM-5) on a ritual cap
+// outside 1..MaxRitualMaxQuestions: a zero would otherwise silently mean the
+// package default.
+func validateRitualMaxQuestions(n int) error {
+	if n < 1 || n > MaxRitualMaxQuestions {
+		return fmt.Errorf("config: ritual_max_questions must be 1..%d, got %d", MaxRitualMaxQuestions, n)
 	}
 	return nil
 }
@@ -1708,6 +1738,7 @@ func defaults(home, env string) Config {
 		RitualWeeklyWeekday: defaultRitualWeekday,
 		RitualWeeklyHour:    defaultRitualWeeklyHour,
 		RitualWeeklyMinute:  defaultRitualWeeklyMinute,
+		RitualMaxQuestions:  DefaultRitualMaxQuestions,
 
 		// W6-01 Hammerspoon palette default (task spec, verbatim).
 		HsCliPath: defaultHsCliPath,
@@ -2180,6 +2211,9 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.RitualWeeklyMinute != nil {
 		cfg.RitualWeeklyMinute = *fc.RitualWeeklyMinute
+	}
+	if fc.RitualMaxQuestions != nil {
+		cfg.RitualMaxQuestions = *fc.RitualMaxQuestions
 	}
 	if fc.TTSEnabled != nil {
 		cfg.TTSEnabled = *fc.TTSEnabled

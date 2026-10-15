@@ -1195,6 +1195,45 @@ func (c *Client) MemoryExtract(ctx context.Context, traceID string, episodeID in
 	return res, nil
 }
 
+// memoryConfirmResult mirrors kahyad's POST /v1/memory/confirm answer
+// (kahyad/internal/server.memoryConfirmResponse, G13 MEM-5).
+type memoryConfirmResult struct {
+	OK           bool   `json:"ok"`
+	File         string `json:"file"`
+	EpisodeID    int64  `json:"episode_id"`
+	CommitSHA    string `json:"commit_sha"`
+	PreviousTier string `json:"previous_tier"`
+}
+
+// MemoryConfirm calls POST /v1/memory/confirm (`kahya memory confirm
+// <yol>`): the note's front matter is promoted to user_asserted.
+func (c *Client) MemoryConfirm(ctx context.Context, traceID, file string) (memoryConfirmResult, error) {
+	b, err := json.Marshal(map[string]string{"file": file})
+	if err != nil {
+		return memoryConfirmResult{}, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/memory/confirm", traceID, bytes.NewReader(b))
+	if err != nil {
+		return memoryConfirmResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return memoryConfirmResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return memoryConfirmResult{}, fmt.Errorf("%s", msg)
+		}
+		return memoryConfirmResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("memory confirm: status %d", resp.StatusCode)}
+	}
+	var res memoryConfirmResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return memoryConfirmResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("memory confirm: decode response: %w", err)}
+	}
+	return res, nil
+}
+
 // rememberedResponse mirrors kahyad's POST /v1/remembered JSON body
 // (kahyad/internal/server.rememberedResponse, W5-03).
 type rememberedResponse struct {

@@ -598,6 +598,13 @@ const (
 	// /v1/memory/extract (an unknown episode/file, a run already in
 	// progress, a store error - the daemon's English detail).
 	MsgMemoryExtractFailed = "Hafıza çıkarımı başarısız: %s"
+	// MsgMemoryConfirmed is `kahya memory confirm <yol>`'s success line (G13
+	// MEM-5 phase 2; handbook byte-exact): %s = the note path.
+	MsgMemoryConfirmed = "Not onaylandı (user_asserted katmanına yükseltildi): %s"
+	// MsgMemoryConfirmFailed wraps a kahyad-side refusal of POST
+	// /v1/memory/confirm (already confirmed, no such note, a path outside the
+	// memory dir - the daemon's detail).
+	MsgMemoryConfirmFailed = "Not onaylanamadı: %s"
 
 	// `kahya entity list|show` (G13 MEM-2 phase 2; the handbook's byte-exact
 	// texts). MsgEntityListHeader %d = rows; MsgEntityListRow: id,

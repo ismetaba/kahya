@@ -391,3 +391,27 @@ func TestSelectExcludesFactWhenSecretGlobErrors(t *testing.T) {
 		t.Fatalf("exclusion rows = %+v, want one path_glob row for fact %d", ex, fact.ID)
 	}
 }
+
+// TestSelectRespectsSetMaxQuestions (G13 MEM-5.b): the per-run cap comes
+// from config (ritual_max_questions) through SetMaxQuestions; a
+// non-positive value restores MaxQuestionsPerRun. The priority order is
+// unchanged - a larger sample is just more of the same queue.
+func TestSelectRespectsSetMaxQuestions(t *testing.T) {
+	st := newTestStore(t)
+	ep := seedEpisode(t, st, "notlar/gunluk.md")
+	for i := 0; i < 15; i++ {
+		fact := seedFact(t, st, fmt.Sprintf("olgu-%d", i), "yuklem", "nesne", "user_asserted", 1.0, false)
+		seedClassifyingEvidence(t, st, fact.ID, ep)
+	}
+	sampler := NewSampler(st.Queries, testMemoryDir, testSecretGlobs, nil)
+	for cap, want := range map[int]int{12: 12, 3: 3, 0: MaxQuestionsPerRun, -1: MaxQuestionsPerRun, 40: 15} {
+		sampler.SetMaxQuestions(cap)
+		got, err := sampler.Select(context.Background(), "trace-select")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != want {
+			t.Fatalf("SetMaxQuestions(%d): Select returned %d facts, want %d", cap, len(got), want)
+		}
+	}
+}

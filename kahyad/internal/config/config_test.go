@@ -2005,3 +2005,26 @@ func TestLoadFailsClosedOnInvalidHafizaGraph(t *testing.T) {
 		t.Fatalf("Load() at the bounds error = %v, want nil", err)
 	}
 }
+
+// TestLoadRitualMaxQuestionsDefaultAndBounds (FIX-MEM-5, decision MEM-5.b):
+// the ritual's per-run cap is a real config key, default 10, and a value
+// outside 1..MaxRitualMaxQuestions fails Load instead of being replaced.
+func TestLoadRitualMaxQuestionsDefaultAndBounds(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil || cfg.RitualMaxQuestions != 10 || DefaultRitualMaxQuestions != 10 {
+		t.Fatalf("default = %d (%v), want 10", cfg.RitualMaxQuestions, err)
+	}
+	writeConfigYAML(t, home, fmt.Sprintf("ritual_max_questions: %d\n", MaxRitualMaxQuestions))
+	if cfg, err = Load(); err != nil || cfg.RitualMaxQuestions != MaxRitualMaxQuestions {
+		t.Fatalf("override = %d (%v)", cfg.RitualMaxQuestions, err)
+	}
+	for _, bad := range []int{0, -3, MaxRitualMaxQuestions + 1} {
+		writeConfigYAML(t, home, fmt.Sprintf("ritual_max_questions: %d\n", bad))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ritual_max_questions") {
+			t.Fatalf("ritual_max_questions %d: Load() error = %v, want a validation error", bad, err)
+		}
+	}
+}

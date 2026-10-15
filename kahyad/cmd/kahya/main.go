@@ -947,7 +947,8 @@ func runEntitySplit(client *Client, args []string, stdout, stderr io.Writer) int
 // runMemory implements `kahya memory extract [--episode <id> | --file <yol>
 // | --all]` (G13 MEM-3): a manual run of the knowledge extractor - one
 // episode, one note, every episode reset and re-extracted, or (no flag) one
-// pending batch like the nightly fact-extraction job.
+// pending batch like the nightly fact-extraction job - and `kahya memory
+// confirm <yol>` (G13 MEM-5).
 func runMemory(client *Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, MsgMemoryUsage)
@@ -956,10 +957,31 @@ func runMemory(client *Client, args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "extract":
 		return runMemoryExtract(client, args[1:], stdout, stderr)
+	case "confirm":
+		return runMemoryConfirm(client, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, MsgMemoryUsage)
 		return 2
 	}
+}
+
+// runMemoryConfirm implements `kahya memory confirm <yol>` (G13 MEM-5 phase
+// 2): the human gate on a quarantined note (agent_derived, or an ingested
+// external_doc one) - its front matter becomes user_asserted, committed by
+// kahyad and reindexed, so its chunks may enter the <hafiza> block. <yol> is
+// relative to the memory dir (or absolute inside it).
+func runMemoryConfirm(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(stderr, MsgMemoryUsage)
+		return 2
+	}
+	res, err := client.MemoryConfirm(context.Background(), traceid.New(), strings.TrimSpace(args[0]))
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgMemoryConfirmFailed, err))
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgMemoryConfirmed+"\n", res.File)
+	return 0
 }
 
 func runMemoryExtract(client *Client, args []string, stdout, stderr io.Writer) int {

@@ -771,6 +771,9 @@ func run() int {
 	// G02-4 (no SetFactClassifier: memory pressure on the local model must
 	// never empty the weekly ritual).
 	ritualSampler.SetLedger(st)
+	// G13 MEM-5.b: the sample size is config (ritual_max_questions, default
+	// 10) - more questions per week, never an automatic promotion (MEM-5.a).
+	ritualSampler.SetMaxQuestions(cfg.RitualMaxQuestions)
 	ritualEngine := ritual.New(ritualSampler, st.Queries, factEngine, taintTracker, st, tgBot)
 	tgBot.SetRitualAnswerer(ritualEngine)
 

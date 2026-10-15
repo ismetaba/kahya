@@ -791,3 +791,31 @@ func TestFullReindexOfUnchangedContentKeepsExtractionMarker(t *testing.T) {
 		t.Fatalf("extraction marker after a full reindex of unchanged bytes = %v / %v, want kept", at, ver)
 	}
 }
+
+// TestStripFrontMatterIgnoresConfirmedAtKey (G13 MEM-5): the front matter
+// `kahya memory confirm` writes (kahya_source_tier: user_asserted +
+// kahya_confirmed_at, plus an ingested note's provenance keys) keeps the
+// tier the indexer reads, and none of the extra keys reaches the body (so
+// never a chunk): the confirmed note is indexed as user_asserted.
+func TestStripFrontMatterIgnoresConfirmedAtKey(t *testing.T) {
+	note := "---\nkahya_source_tier: user_asserted\nkahya_confirmed_at: 2026-10-08T10:00:00Z\nkahya_source_ref: \"rapor.txt\"\n---\nEmre Acme'de çalışıyor.\n"
+	tier, body, err := StripFrontMatter(note)
+	if err != nil || tier != "user_asserted" || body != "Emre Acme'de çalışıyor.\n" {
+		t.Fatalf("StripFrontMatter = %q, %q, %v", tier, body, err)
+	}
+	memDir := t.TempDir()
+	writeFixture(t, memDir, "inbox/onayli.md", note)
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+	if _, err := idx.ReindexFile(context.Background(), "tr", "inbox/onayli.md"); err != nil {
+		t.Fatal(err)
+	}
+	var gotTier string
+	var chunkText string
+	if err := st.DB().QueryRow(`SELECT e.source_tier, c.text FROM episodes e JOIN chunks c ON c.episode_id = e.id WHERE e.source_path = 'inbox/onayli.md'`).Scan(&gotTier, &chunkText); err != nil {
+		t.Fatal(err)
+	}
+	if gotTier != "user_asserted" || strings.Contains(chunkText, "kahya_confirmed_at") || strings.Contains(chunkText, "kahya_source_ref") {
+		t.Fatalf("indexed tier %q, chunk %q", gotTier, chunkText)
+	}
+}
