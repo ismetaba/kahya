@@ -28,8 +28,16 @@
 // SITE's provenance (agent_derived for memory notes - the extractor is a
 // model reading a note - external_doc for MEM-6 ingest), never anything the
 // model said; the per-episode session id makes a re-extraction of the same
-// episode one evidence row (no confidence inflation); every fact carries the
-// verbatim quote the Reader validated against the cited chunk.
+// episode one evidence row (no confidence inflation); a fact a cloud-lane
+// call wrote carries the verbatim quote the Reader validated against the
+// cited chunk.
+//
+// A call that ran on the LOCAL model (secret path, secret content, no path)
+// writes the triple, its entity links and the raw citation, never its quote
+// or validity window: the fact row it lands on can become cloud-eligible
+// through ANOTHER note's citation (memlane classifies the triple; the
+// row's quote travels with it), so only text a cloud-lane call was cleared
+// to send may sit on a row (FIX-MEM-3 review).
 package extract
 
 import (
@@ -483,7 +491,16 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 		if c.lane == router.LaneSecret && !pathSecret {
 			evidenceEpisode = 0
 		}
-		cs, err := r.apply(ctx, traceID, episodeID, evidenceEpisode, sessionID, prov, c.out)
+		// Only a call that went to the cloud (ordinary path, content
+		// classified normal) may put free text on the fact row. Every other
+		// call's quote and validity window stay off it: the row is shared by
+		// every note stating the same triple, an ordinary note's citation can
+		// make it cloud-eligible later (in either order: insert, or COALESCE
+		// filling a NULL), and a citation-less or path-less evidence row - or
+		// one deduped away by the per-episode session after a glob change -
+		// cannot keep it local.
+		cloudLane := c.lane == router.LaneNormal && !pathSecret
+		cs, err := r.apply(ctx, traceID, episodeID, evidenceEpisode, sessionID, prov, cloudLane, c.out)
 		st.add(cs)
 		if err != nil {
 			sk := r.skip(ctx, traceID, episodeID, SkipWriteFailed, c.lane, err, nil)
@@ -529,8 +546,9 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 // apply writes one Reader answer: entities first (ResolveEntityForExtraction
 // + AddAlias, MEM-2), then each fact (WriteFact, or RetractFact for a
 // retraction), linking a fact's subject/object to an entity only when the
-// string is byte-equal to an entity name or alias in the SAME answer.
-func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceEpisode int64, sessionID string, prov factengine.Provenance, out reader.FactExtractV1) (Stats, error) {
+// string is byte-equal to an entity name or alias in the SAME answer. A
+// local-lane answer (cloudLane false) writes no quote and no validity window.
+func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceEpisode int64, sessionID string, prov factengine.Provenance, cloudLane bool, out reader.FactExtractV1) (Stats, error) {
 	var st Stats
 	byName := map[string]int64{}
 	ambiguous := map[string]bool{}
@@ -583,9 +601,9 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 			Importance:      f.Importance,
 			ExtractorVer:    ExtractorVersion,
 			Evidence:        fmt.Sprintf("episode:%d,chunk:%d", episodeID, f.ChunkID),
-			Quote:           f.Quote,
-			ValidFrom:       f.ValidFrom,
-			ValidTo:         f.ValidTo,
+			Quote:           cloudLaneOnly(cloudLane, f.Quote),
+			ValidFrom:       cloudLaneOnly(cloudLane, f.ValidFrom),
+			ValidTo:         cloudLaneOnly(cloudLane, f.ValidTo),
 			SubjectEntityID: entityFor(f.Subject),
 			ObjectEntityID:  entityFor(f.Object),
 		}); err != nil {
@@ -594,6 +612,15 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 		st.Facts++
 	}
 	return st, nil
+}
+
+// cloudLaneOnly is v for a cloud-lane call's answer and "" for a local-lane
+// one (see extractEpisode: a local call's free text never lands on a row).
+func cloudLaneOnly(cloudLane bool, v string) string {
+	if !cloudLane {
+		return ""
+	}
+	return v
 }
 
 // retract closes the active (subject, predicate, object) fact the model

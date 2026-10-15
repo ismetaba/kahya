@@ -536,13 +536,19 @@ a cloud model, without changing anything in §2-§6 above:
   stays NULL, retried next run) - never the cloud. Facts are written
   `agent_derived` (the call site's provenance; `external_doc` for a later
   ingest) with session `extract:fact_extract_v1:episode:<id>` (a
-  re-extraction is one evidence row), the verbatim `quote`, the evidence
+  re-extraction is one evidence row), the verbatim `quote` (cloud-lane calls
+  only, see below), the evidence
   string `episode:<id>,chunk:<id>` and the entity links of
   `ResolveEntityForExtraction`/`AddAlias` (a subject/object is linked only
   when byte-equal to a name or alias of the same answer). A call that went
   local on its CONTENT (ordinary path) writes its evidence rows without the
   episode citation, so `memlane` never lets those facts into a cloud
-  `<hafiza>` block or a Telegram card. A retraction closes only an
+  `<hafiza>` block or a Telegram card. Only a cloud-lane call (ordinary
+  path, content classified normal) puts its `quote` and validity window on
+  a fact row; a local-lane call (secret path, secret content, no path)
+  writes the triple, entity links and raw citation only, because the row is
+  shared by every note stating the same triple and another note's citation
+  can make it cloud-eligible later. A retraction closes only an
   unconfirmed fact of no more trust than the extraction's provenance (else
   `extract.retraction_skipped`). An edited note is pending again (the
   indexer resets `extracted_at` when the content hash changes; a `reindex
