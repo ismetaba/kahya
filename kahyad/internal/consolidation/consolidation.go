@@ -400,7 +400,10 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		if !ok {
 			proposed = original
 		}
-		final := ApplyUserEditWins(original, proposed, userTouched[toRepoRelPath(relPath)])
+		// FIX-P-2: the user-touched map is keyed NormalizePathKey (NFC);
+		// relPath is the disk walk's spelling. The write below keeps the
+		// real on-disk name.
+		final := ApplyUserEditWins(original, proposed, userTouched[NormalizePathKey(toRepoRelPath(relPath))])
 		if final == original {
 			continue // nothing changed for this file - no need to touch the worktree
 		}

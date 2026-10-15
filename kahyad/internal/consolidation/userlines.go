@@ -16,10 +16,13 @@ package consolidation
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 
 	"kahya/kahyad/internal/backup"
 )
@@ -67,7 +70,8 @@ const emptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 var hunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
 // ComputeUserTouchedLines returns, per file (git-relative path, forward-
-// slash separated), the set of 1-based HEAD line numbers any
+// slash separated, NormalizePathKey'd - callers MUST look up with
+// NormalizePathKey(path)), the set of 1-based HEAD line numbers any
 // author="user <user@kahya.local>" commit changed since since. An empty/
 // nil-valued result for a file (or the whole map) means no protection is
 // needed - ApplyUserEditWins treats "not in the map" identically to "empty
@@ -94,15 +98,21 @@ func ComputeUserTouchedLines(ctx context.Context, git backup.GitRunner, repoDir 
 		}
 	}
 
-	namesOut, stderr, err := git.Run(ctx, repoDir, "diff", "--name-only", baseRef, "HEAD")
+	// FIX-P-2: -z prints every name as raw bytes. The plain form C-quotes a
+	// name with bytes above 0x7f ("memory/g\303\274nl\303\274k.md"), and that
+	// quoted string, handed back as a pathspec, matched nothing - so every
+	// Turkish-named note silently lost its user-edit-wins protection.
+	namesOut, stderr, err := git.Run(ctx, repoDir, "diff", "--name-only", "-z", baseRef, "HEAD")
 	if err != nil {
-		return nil, fmt.Errorf("consolidation: git diff --name-only %s HEAD: %w (%s)", baseRef, err, stderr)
+		return nil, fmt.Errorf("consolidation: git diff --name-only -z %s HEAD: %w (%s)", baseRef, err, stderr)
 	}
-	files := splitNonEmptyLines(namesOut)
+	files := splitNUL(namesOut)
 
 	result := make(map[string]map[int]bool, len(files))
 	for _, f := range files {
-		diffOut, _, derr := git.Run(ctx, repoDir, "diff", "--unified=0", baseRef, "HEAD", "--", f)
+		// ":(literal)" (FIX-P-2-E1): a note named "n[ab].md" must not be read
+		// as a glob that also pulls in na.md's and nb.md's hunks.
+		diffOut, _, derr := git.Run(ctx, repoDir, "diff", "--unified=0", baseRef, "HEAD", "--", literalPathspec(f))
 		if derr != nil {
 			// Fail-safe (not fail-closed): a per-file diff error here only
 			// means THIS file gets no user-edit-wins protection this run -
@@ -110,11 +120,31 @@ func ComputeUserTouchedLines(ctx context.Context, git backup.GitRunner, repoDir 
 			continue
 		}
 		touched := parseAddedLineNumbers(diffOut)
-		if len(touched) > 0 {
-			result[f] = touched
+		if len(touched) == 0 {
+			continue
 		}
+		key := NormalizePathKey(f)
+		if prev, ok := result[key]; ok {
+			// Two spellings that normalize to one key: protect the union.
+			for l := range touched {
+				prev[l] = true
+			}
+			continue
+		}
+		result[key] = touched
 	}
 	return result, nil
+}
+
+// NormalizePathKey is the ONE normalization applied to every key of the
+// user-touched-line map and to every lookup into it (FIX-P-2): forward
+// slashes + Unicode NFC. git on macOS records NFC names
+// (core.precomposeunicode) while filepath.WalkDir may hand back the NFD
+// bytes of the same file, and git on Linux reports whatever bytes are on
+// disk. Only the lookup key is normalized; files are always written under
+// their real on-disk name.
+func NormalizePathKey(p string) string {
+	return norm.NFC.String(filepath.ToSlash(p))
 }
 
 // parseAddedLineNumbers scans unifiedDiff's hunk headers and returns the

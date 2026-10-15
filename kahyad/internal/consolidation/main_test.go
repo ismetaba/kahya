@@ -9,11 +9,11 @@ import (
 // (same shape as kahyad/internal/anchor's): the runGit helper and the
 // production backup.NewExecGitRunner both build the child environment from
 // os.Environ(), so pinning it here covers both. Without this the host's
-// system/global git config leaks in - e.g. a developer's core.quotePath=false
-// would hide the FIX-P-2 C-quoting bug, Xcode's system gitconfig sets
-// init.defaultBranch=main, and ~/.gitconfig supplies a commit identity that
-// masks a missing one. Every repo here lives under t.TempDir(); nothing
-// reaches the network.
+// system/global git config leaks in - e.g. a developer's global setting that
+// turns off git's path quoting would hide the FIX-P-2 bug, Xcode's system
+// gitconfig sets init.defaultBranch=main, and ~/.gitconfig supplies a commit
+// identity that masks a missing one. Every repo here lives under
+// t.TempDir(); nothing reaches the network.
 func TestMain(m *testing.M) {
 	for _, kv := range [][2]string{
 		{"GIT_CONFIG_NOSYSTEM", "1"},
