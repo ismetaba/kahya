@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -227,5 +228,86 @@ func TestShellHostRepoIdentityEscalatesLane(t *testing.T) {
 				t.Fatalf("lane=%q marked=%v backstop refused=%v, want secret/marked/refused (stdout %q)", lane, marked, refused, out.Stdout)
 			}
 		})
+	}
+}
+
+// TestShellHostStatMetadataNeverEscalates (FIX-FINAL shell-host-stat-
+// output-false-secret-escalation): macOS `stat` prints device and inode
+// separated by one space, which the card-number rule joins into a Luhn-
+// passing candidate about one time in ten, so plain `stat` calls on
+// ordinary files escalated normal coding tasks and the proxy backstop then
+// refused their next cloud call. The fixture keeps creating ordinary files
+// until several whose RAW stat stdout classifies secret exist (so the test
+// is red on the old gate), then stats each through the production gate
+// under its own normal task: every task stays normal and unmarked.
+func TestShellHostStatMetadataNeverEscalates(t *testing.T) {
+	home, st, pc, tracker, gate := shellHostSecretFixture(t)
+	dir := filepath.Join(home, "Documents", "code")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var tripping []string
+	for i := 0; i < 3000 && len(tripping) < 4; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("f%d.go", i))
+		if err := os.WriteFile(p, []byte("package x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("stat", p).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secretlane.ClassifyDeterministic(string(out)).SecretLane {
+			tripping = append(tripping, p)
+		}
+	}
+	if len(tripping) == 0 {
+		t.Skip("no stat output tripped the card rule on this filesystem")
+	}
+	for i, p := range tripping {
+		taskID, traceID := fmt.Sprintf("task-stat-%d", i), fmt.Sprintf("trace-stat-%d", i)
+		insertLaneTask(t, st, taskID, traceID, "normal")
+		host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+		host.SecretLaneGlobs = []string{filepath.Join(home, "Documents", "saglik", "**")}
+		host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+		out, err := host.Handle(context.Background(), traceID, taskID, mcpshell.HostExecArgs{Command: "stat", Args: []string{p}})
+		if err != nil || out.ExitCode != 0 {
+			t.Fatalf("stat %s: %+v %v", p, out, err)
+		}
+		if lane, _ := taskLane(t, st, taskID); lane != "normal" {
+			t.Errorf("stat %s (stdout %q) escalated the task to %q", p, out.Stdout, lane)
+		}
+		if marked, _ := tracker.IsMarkedCtx(context.Background(), traceID); marked {
+			t.Errorf("stat %s marked the session sensitive", p)
+		}
+	}
+}
+
+// TestShellHostStatSecretPathOrNameStillEscalates: a stat target under a
+// secret glob is still a path hit, and a target whose NAME carries a
+// lexicon keyword still escalates through the classified argv text.
+func TestShellHostStatSecretPathOrNameStillEscalates(t *testing.T) {
+	home, st, pc, tracker, gate := shellHostSecretFixture(t)
+	named := filepath.Join(home, "Documents", "kan tahlili.pdf")
+	if err := os.WriteFile(named, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !secretlane.ClassifyDeterministic(named).SecretLane {
+		t.Fatal("fixture file name is not content-secret; pick a lexicon word")
+	}
+	for i, p := range []string{filepath.Join(home, "Documents", "saglik", "tahlil.md"), named} {
+		taskID, traceID := fmt.Sprintf("task-statsec-%d", i), fmt.Sprintf("trace-statsec-%d", i)
+		insertLaneTask(t, st, taskID, traceID, "normal")
+		host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+		host.SecretLaneGlobs = []string{filepath.Join(home, "Documents", "saglik", "**")}
+		host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+		if _, err := host.Handle(context.Background(), traceID, taskID, mcpshell.HostExecArgs{Command: "stat", Args: []string{p}}); err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if lane, _ := taskLane(t, st, taskID); lane != "secret" {
+			t.Errorf("stat %s: lane %q, want secret", p, lane)
+		}
+		if marked, _ := tracker.IsMarkedCtx(context.Background(), traceID); !marked {
+			t.Errorf("stat %s: session not marked", p)
+		}
 	}
 }

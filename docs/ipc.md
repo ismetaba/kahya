@@ -552,7 +552,10 @@ a cloud model, without changing anything in §2-§6 above:
   `shell_docker` workdir under or holding one (escalated BEFORE the
   container runs, so a `needs_network` run's egress is already
   sensitive-marked), a `shortcuts_run --input-path` under one; otherwise
-  stdout+stderr are classified. The globs are policy.yaml's plus the raw
+  stdout+stderr are classified - for `stat` the argv paths and stderr
+  instead, its stdout being filesystem metadata whose space-separated
+  device/inode pair the card rule read as a Luhn-valid number about one
+  time in ten (FIX-FINAL shell-host-stat-output-false-secret-escalation). The globs are policy.yaml's plus the raw
   ingest store (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
   G02-2) the task is escalated, the output still returned; a hit that
   cannot be marked or escalated returns no output

@@ -298,10 +298,26 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 
 // gateOutput runs the secret-lane output gate (FIX-FINAL
 // tool-output-secret-lane-unclassified) for one shell_host result.
+//
+// `stat` is the one exception to classifying stdout (FIX-FINAL
+// shell-host-stat-output-false-secret-escalation): its stdout is
+// filesystem-generated metadata (device, inode, mode, links, owner,
+// group, rdev, size, the four dates, blksize, blocks, flags) plus %N,
+// which is exactly the argv path validate built. macOS prints device and
+// inode separated by one space ("16777232 9083813"), which the card-number
+// rule joins into a 15-16 digit candidate that passes Luhn about one time
+// in ten - so ~10% of plain `stat` calls escalated an ordinary coding
+// task. For stat the classified texts are therefore the argv paths (every
+// non-metadata byte stat can echo) and stderr; the path half of the gate
+// (pathHit) is unchanged.
 func (h *HostExec) gateOutput(ctx context.Context, traceID, taskID string, plan hostExecPlan, out HostExecOutput) error {
+	texts := []string{out.Stdout, out.Stderr}
+	if len(plan.argv) > 0 && plan.argv[0] == "stat" {
+		texts = append(append([]string(nil), plan.argv[1:]...), out.Stderr)
+	}
 	_, err := h.OutputGate.Check(ctx, traceID, taskID, "shell_host", h.pathHit(plan),
 		func(kind string, payload map[string]any) { logAndLedger(ctx, h.Ledger, h.Log, traceID, kind, payload) },
-		out.Stdout, out.Stderr)
+		texts...)
 	return err
 }
 
