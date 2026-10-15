@@ -302,8 +302,15 @@ end)
 -- Exit codes follow `kahya approve`'s convention: 0 = approved, 1 =
 -- rejected (the rejection WAS delivered), 2 = error. So a --reject that
 -- exits 1 is a delivered decision, not a failure; only anything else is
--- reported as "not delivered".
-local function sendApprovalDecision(id, approve, typed)
+-- reported as "not delivered". 3 (FIX-FINAL TUX-4) = a W3 approval whose
+-- typed word was not exactly "onayla" (the dialog's button also reads
+-- "Onayla", so typing that is natural): nothing was consumed, the id
+-- still waits, so the CLI's Turkish reason is shown and the dialog opens
+-- again. Every other not-delivered notice carries the CLI's own first
+-- lines too, instead of the bare id.
+local openApprovalDialog -- forward declaration (defined below)
+
+local function sendApprovalDecision(id, approve, typed, detail)
   local args = { "approvals", "decide", id }
   if approve then
     table.insert(args, "--approve")
@@ -313,15 +320,31 @@ local function sendApprovalDecision(id, approve, typed)
     table.insert(args, "--reject")
   end
   runKahya(args, function(exitCode, stdOut, stdErr)
+    local reason = firstLines(stdErr ~= "" and stdErr or stdOut, 2) or ""
+    if approve and exitCode == 3 then
+      hs.notify.new({
+        title = "Kâhya",
+        informativeText = reason,
+        autoWithdraw = true,
+      }):send()
+      if detail then
+        openApprovalDialog(detail)
+      end
+      return
+    end
     local delivered = (exitCode == 0) or ((not approve) and exitCode == 1)
     if not delivered then
       -- FAIL-CLOSED DELIVERY: nothing auto-approves just because this
       -- exec failed. The pending approval (if the decision never landed)
       -- stays discoverable via `kahya approvals list`; this notice is
       -- purely informational.
+      local text = "Onay kararı iletilemedi: " .. id
+      if reason ~= "" then
+        text = text .. "\n" .. reason
+      end
       hs.notify.new({
         title = "Kâhya",
-        informativeText = "Onay kararı iletilemedi: " .. id,
+        informativeText = text,
         autoWithdraw = true,
       }):send()
     end
@@ -332,7 +355,7 @@ end
 -- (kahyad's own byte-exact W3-06 diff, already rendered server-side —
 -- this file never re-renders or re-verifies it, only displays it
 -- verbatim).
-local function openApprovalDialog(detail)
+openApprovalDialog = function(detail)
   local id = detail.id
   local class = detail.class
   local rendered = detail.rendered or ""
@@ -349,7 +372,7 @@ local function openApprovalDialog(detail)
       "Onayla",
       "Reddet"
     )
-    sendApprovalDecision(id, button == "Onayla", typed)
+    sendApprovalDecision(id, button == "Onayla", typed, detail)
   else
     local button = hs.dialog.blockAlert(
       string.format("Onay gerekiyor (%s): %s", class, detail.tool),
@@ -357,7 +380,7 @@ local function openApprovalDialog(detail)
       "Onayla",
       "Reddet"
     )
-    sendApprovalDecision(id, button == "Onayla", nil)
+    sendApprovalDecision(id, button == "Onayla", nil, detail)
   end
 end
 

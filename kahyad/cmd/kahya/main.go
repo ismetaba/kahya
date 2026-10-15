@@ -1891,6 +1891,13 @@ func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer)
 	}
 
 	if _, err := client.ApprovalDecision(context.Background(), traceID, id, true, *typed); err != nil {
+		if errors.Is(err, errW3TypedMismatch) {
+			// FIX-FINAL TUX-4: the English policy error used to reach the
+			// user (exit 2), and Hammerspoon showed only "iletilemedi". A
+			// distinct exit 3 + Turkish next step; the id still waits.
+			fmt.Fprintf(stderr, MsgApprovalW3TypedMismatchFmt+"\n", id)
+			return 3
+		}
 		fmt.Fprintln(stderr, err.Error())
 		return 2
 	}

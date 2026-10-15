@@ -214,6 +214,20 @@ func TestApprovalsDecisionW3RequiresTyped(t *testing.T) {
 	if resp.StatusCode == 200 && rejected.OK {
 		t.Fatalf("decision(typed=evet) succeeded, want rejected")
 	}
+	// FIX-FINAL TUX-4: the refusal carries a stable code a UI can act on
+	// (the CLI's Turkish exit 3, Hammerspoon's re-prompt); "Onayla" (the
+	// dialog's own button label) is refused the same way and consumes
+	// nothing either.
+	if resp.StatusCode != http.StatusBadRequest || rejected.Code != "w3_typed_onayla_required" {
+		t.Fatalf("decision(typed=evet) = %d %+v, want 400 code w3_typed_onayla_required", resp.StatusCode, rejected)
+	}
+	var capital approvalDecisionResponse
+	resp = postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{
+		"approve": true, "typed": "Onayla",
+	}, &capital)
+	if resp.StatusCode != http.StatusBadRequest || capital.Code != "w3_typed_onayla_required" {
+		t.Fatalf("decision(typed=Onayla) = %d %+v, want 400 code w3_typed_onayla_required", resp.StatusCode, capital)
+	}
 
 	var approved approvalDecisionResponse
 	postJSON(t, f.client, "/approvals/"+checkResp.PendingApprovalID+"/decision", map[string]any{

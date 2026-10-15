@@ -27,6 +27,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -55,7 +56,16 @@ type approvalDecisionRequest struct {
 type approvalDecisionResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+	// Code is a stable English reason code for a refusal a UI acts on
+	// (FIX-FINAL TUX-4): approvalCodeW3TypedOnaylaRequired.
+	Code string `json:"code,omitempty"`
 }
+
+// approvalCodeW3TypedOnaylaRequired is Code for a W3 approve whose typed
+// word was not exactly "onayla" (policy.ErrW3RequiresTypedOnayla): nothing
+// was consumed, the id still waits, and the CLI / Hammerspoon can ask
+// again in Turkish instead of surfacing the English policy error.
+const approvalCodeW3TypedOnaylaRequired = "w3_typed_onayla_required"
 
 // handleApprovalsPending implements GET /approvals/pending (W6-01): the
 // exact same pending-approval list handlePolicyApprovals' own list branch
@@ -106,7 +116,11 @@ func (s *Server) handleApprovalsDecision(w http.ResponseWriter, r *http.Request)
 	// package doc comment and the type's own field list (there is no
 	// Surface field to read one from in the first place).
 	if _, err := s.policyEngine.Approve(r.Context(), id, approvalsDecisionSurface, req.Typed); err != nil {
-		writeJSON(w, http.StatusBadRequest, approvalDecisionResponse{OK: false, Error: err.Error()})
+		resp := approvalDecisionResponse{OK: false, Error: err.Error()}
+		if errors.Is(err, policy.ErrW3RequiresTypedOnayla) {
+			resp.Code = approvalCodeW3TypedOnaylaRequired
+		}
+		writeJSON(w, http.StatusBadRequest, resp)
 		return
 	}
 	writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true})

@@ -136,3 +136,30 @@ func TestApprovalDecisionRejectExitOneIsDelivered(t *testing.T) {
 		t.Errorf("the not-delivered notice must stay, gated on `not delivered`:\n%s", fn)
 	}
 }
+
+// TestApprovalDecisionW3TypedMismatchReprompts (FIX-FINAL TUX-4): a W3
+// card whose typed word was not exactly "onayla" (the dialog's button also
+// reads "Onayla") failed silently with "Onay kararı iletilemedi: <id>",
+// the card already consumed. `kahya approvals decide` now exits 3 for it
+// (the id still waits): the callback shows the CLI's Turkish reason and
+// re-opens the dialog; every other not-delivered notice carries the CLI's
+// first lines.
+func TestApprovalDecisionW3TypedMismatchReprompts(t *testing.T) {
+	src := readLua(t)
+	fn := approvalDecisionFn(t, src)
+	if !strings.Contains(fn, "local function sendApprovalDecision(id, approve, typed, detail)") {
+		t.Errorf("sendApprovalDecision does not take the dialog detail:\n%s", fn)
+	}
+	if !strings.Contains(fn, "if approve and exitCode == 3 then") || !strings.Contains(fn, "openApprovalDialog(detail)") {
+		t.Errorf("no exit-3 re-prompt branch:\n%s", fn)
+	}
+	if !strings.Contains(fn, `local reason = firstLines(stdErr ~= "" and stdErr or stdOut, 2) or ""`) || !strings.Contains(fn, `text = text .. "\n" .. reason`) {
+		t.Errorf("the not-delivered notice does not carry the CLI's reason:\n%s", fn)
+	}
+	if !strings.Contains(src, "local openApprovalDialog -- forward declaration") || !strings.Contains(src, "openApprovalDialog = function(detail)") {
+		t.Error("openApprovalDialog must be forward-declared and assigned (sendApprovalDecision calls it)")
+	}
+	if strings.Count(src, "sendApprovalDecision(id, button == \"Onayla\"") != 2 || strings.Count(src, ", detail)\n") < 2 {
+		t.Error("both dialog branches must pass detail to sendApprovalDecision")
+	}
+}

@@ -524,6 +524,15 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 // kahyad/internal/server's handleApprovalsDecision doc comment); there is
 // no wire field on this route for a caller to forge one through. Like
 // PolicyFeedback, the returned legacy token string is always "" since B-1.
+// approvalCodeW3TypedOnaylaRequired mirrors kahyad/internal/server's stable
+// decision refusal code for a W3 approve whose typed word was not exactly
+// "onayla" (FIX-FINAL TUX-4).
+const approvalCodeW3TypedOnaylaRequired = "w3_typed_onayla_required"
+
+// errW3TypedMismatch is ApprovalDecision's sentinel for that refusal: the
+// pending approval was NOT consumed and still waits.
+var errW3TypedMismatch = errors.New("approvals/decision: W3 typed confirmation word mismatch")
+
 func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, approve bool, typed string) (string, error) {
 	body, err := json.Marshal(map[string]any{"approve": approve, "typed": typed})
 	if err != nil {
@@ -542,11 +551,15 @@ func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, appro
 		OK    bool   `json:"ok"`
 		Token string `json:"token,omitempty"`
 		Error string `json:"error,omitempty"`
+		Code  string `json:"code,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&fr); err != nil {
 		return "", &unreachableError{sock: c.sock, err: fmt.Errorf("approvals/decision: decode response: %w", err)}
 	}
 	if !fr.OK {
+		if fr.Code == approvalCodeW3TypedOnaylaRequired {
+			return "", errW3TypedMismatch
+		}
 		if fr.Error != "" {
 			return "", fmt.Errorf("%s", fr.Error)
 		}

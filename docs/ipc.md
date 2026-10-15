@@ -1911,7 +1911,13 @@ that call's own parked re-check, never by a hash-matched retry.
 `POST /policy/feedback` and `POST /approvals/{id}/decision` answer
 `{ok, error?}` — **no raw token** any more: the grant is redeemed
 server-side, so a raw value on the wire could only be presented to
-`/policy/consume-token` by some other process.
+`/policy/consume-token` by some other process. A W3 approve whose typed
+word is not exactly `onayla` is a 400 with the stable code
+`"code": "w3_typed_onayla_required"` (nothing consumed, the id still
+waits): `kahya approvals decide` exits 3 with the Turkish
+`"Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı. Onay
+hâlâ bekliyor; tekrar denemek için: kahya approve <id>"`, and the
+Hammerspoon card shows it and re-opens the dialog (FIX-FINAL TUX-4).
 
 **First-run autonomy (`autonomy_bootstrap_levels`):** at boot kahyad seeds
 the configured `"tool/class/scope": level` rows (default

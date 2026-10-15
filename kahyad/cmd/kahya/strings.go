@@ -189,6 +189,12 @@ const (
 	// the ladder (W3-02), never silently doing nothing. Exit 1.
 	MsgApprovalDenied = "Reddedildi."
 
+	// MsgApprovalW3TypedMismatchFmt is `kahya approvals decide <id>
+	// --approve --typed <word>`'s stderr line (exit 3) when the word was not
+	// exactly "onayla" for a W3 approval (FIX-FINAL TUX-4): nothing was
+	// consumed and the approval still waits (%s = the id).
+	MsgApprovalW3TypedMismatchFmt = "Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı. Onay hâlâ bekliyor; tekrar denemek için: kahya approve %s"
+
 	// ---- W4-02: kahya task show <id> / kahya task resolve <id> ----
 
 	// MsgTaskUsage is printed when `kahya task` is given anything other
