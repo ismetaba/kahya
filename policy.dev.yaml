@@ -98,9 +98,16 @@ tools:
 # gizli/** is where memory_write (FIX-U-3) and kahya ingest (MEM-6) land
 # content the LOCAL classifier flagged - path-glob so every path-based
 # lane rule (consolidation, ritual, graph, injection) sees it.
+# The dev profile's own memory dir is ~/Kahya-dev/memory (KAHYA_ENV=dev):
+# without its entries every dev memory_write of a secret note was refused
+# and no path rule saw a dev note as secret (FIX-FINAL
+# ops-secret-lane-memory-dir-uncovered-dev-profile). The ~/Kahya entries
+# stay (the committed-policy tests pin them).
 secret_lane_globs:
   - "~/Kahya/memory/finans*.md"
   - "~/Kahya/memory/gizli/**"
+  - "~/Kahya-dev/memory/finans*.md"
+  - "~/Kahya-dev/memory/gizli/**"
   - "~/Documents/saglik/**"
   - "~/Documents/kimlik/**"
 

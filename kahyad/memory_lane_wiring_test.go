@@ -91,3 +91,17 @@ func TestBootRecoversPendingMemoryWritesBeforeTicks(t *testing.T) {
 		}
 	}
 }
+
+// TestSecretLaneMemoryDirUncoveredWarnsAtBoot (FIX-FINAL ops-secret-lane-
+// memory-dir-uncovered-dev-profile): a secret-lane memory dir no
+// secret_lane_globs entry covers is reported at boot; a covered one is not.
+func TestSecretLaneMemoryDirUncoveredWarnsAtBoot(t *testing.T) {
+	globs := []string{"/u/Kahya/memory/gizli/**", "/u/Kahya/memory/finans*.md"}
+	if secretLaneMemoryDirUncovered(nil, "/u/Kahya/memory", "gizli", globs) {
+		t.Error("a covered secret-lane dir was reported uncovered")
+	}
+	if !secretLaneMemoryDirUncovered(nil, "/u/Kahya-dev/memory", "gizli", globs) {
+		t.Error("the dev memory dir under a prod-only policy was not reported")
+	}
+	onlyCallSite(t, "", "secretLaneMemoryDirUncovered", "log, cfg.MemoryDir, cfg.SecretLaneMemoryDir, pol.SecretLaneGlobs")
+}

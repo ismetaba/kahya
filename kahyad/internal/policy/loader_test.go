@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"kahya/kahyad/internal/config"
 )
 
 // repoRoot locates the repository root from this test file's own path
@@ -375,5 +377,47 @@ func TestPolicyFixturesCarryGizliSecretGlob(t *testing.T) {
 	}
 	if len(doc.SecretLaneGlobs) != 0 {
 		t.Errorf("%s: secret_lane_globs = %v, want empty (Gate 3 keeps it empty on purpose)", w3, doc.SecretLaneGlobs)
+	}
+}
+
+// TestDevPolicyCoversDevMemoryDir (FIX-FINAL ops-secret-lane-memory-dir-
+// uncovered-dev-profile): policy.dev.yaml covered only ~/Kahya/memory,
+// while the dev profile's memory dir is ~/Kahya-dev/memory - so in dev
+// every secret-classified memory_write was refused and no path rule saw a
+// dev note as secret. Under KAHYA_ENV=dev the dev policy's globs cover the
+// loaded config's own secret-lane memory dir and its finans*.md family.
+func TestDevPolicyCoversDevMemoryDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("KAHYA_ENV", "dev")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	pol, err := Load(filepath.Join(repoRoot(t), "policy.dev.yaml"))
+	if err != nil {
+		t.Fatalf("Load(policy.dev.yaml): %v", err)
+	}
+	covered := func(p string) bool {
+		for _, g := range pol.SecretLaneGlobs {
+			if ok, err := MatchGlob(g, p); err == nil && ok {
+				return true
+			}
+		}
+		return false
+	}
+	for _, p := range []string{
+		filepath.Join(cfg.MemoryDir, filepath.FromSlash(cfg.SecretLaneMemoryDir), "notes", "inbox", "2026-10-15.md"),
+		filepath.Join(cfg.MemoryDir, "finans-2026.md"),
+	} {
+		if !covered(p) {
+			t.Errorf("%s is not covered by policy.dev.yaml's secret_lane_globs %v", p, pol.SecretLaneGlobs)
+		}
+	}
+	if ordinary := filepath.Join(cfg.MemoryDir, "inbox", "2026-10-15.md"); covered(ordinary) {
+		t.Errorf("an ordinary dev note %s is covered", ordinary)
 	}
 }

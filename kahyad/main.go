@@ -661,6 +661,12 @@ func run() int {
 	// only a secret-lane task's local block keeps them (FIX-MEM-7); the
 	// later G13 graph/extract/ingest steps reuse it.
 	laneClassifier := memlane.Classifier{Store: st.Queries, MemoryDir: cfg.MemoryDir, SecretGlobs: pol.SecretLaneGlobs, Matcher: ritual.PolicyGlobMatcher{}}
+	// FIX-FINAL ops-secret-lane-memory-dir-uncovered-dev-profile: a
+	// relocated memory_dir / secret_lane_memory_dir (or a profile whose
+	// policy names another tree) leaves the secret-lane memory dir
+	// uncovered - memory_write then refuses every secret note (fail-closed)
+	// and no path rule sees a note there as secret. Say so at boot.
+	secretLaneMemoryDirUncovered(log, cfg.MemoryDir, cfg.SecretLaneMemoryDir, pol.SecretLaneGlobs)
 	srv.SetMemoryLane(&laneClassifier)
 	// FIX-FINAL cloud-chunk-filter-neighbour-drop-needs-coretrieval: the
 	// cloud-facing chunk filter reads a hit's stored Seq±1 neighbours, so a
@@ -1917,4 +1923,21 @@ func bootFailLine(traceID, event string, err error) {
 		"error":    err.Error(),
 	})
 	fmt.Fprintln(os.Stderr, string(line))
+}
+
+// secretLaneMemoryDirUncovered logs secret_lane_memory_dir_uncovered (warn,
+// JSONL with the boot trace) and reports true when no secret_lane_globs
+// entry covers a note under memoryDir/secretDir. Log-only: memory_write
+// already refuses such a write (fail-closed).
+func secretLaneMemoryDirUncovered(log *logx.Logger, memoryDir, secretDir string, globs []string) bool {
+	probe := filepath.Join(memoryDir, filepath.FromSlash(secretDir), "notes", "probe.md")
+	for _, g := range globs {
+		if ok, err := (ritual.PolicyGlobMatcher{}).Match(g, probe); err == nil && ok {
+			return false
+		}
+	}
+	if log != nil {
+		log.Warn("secret_lane_memory_dir_uncovered", "memory_dir", memoryDir, "secret_lane_memory_dir", secretDir)
+	}
+	return true
 }
