@@ -3,6 +3,7 @@ package consolidation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -13,6 +14,9 @@ import (
 // applied to the events ledger instead of git.
 type fakeEventStore struct {
 	rows []fakeEventRow
+	// failKind, when set, makes LogEvent fail (recording nothing) for that
+	// event kind - a ledger write failure.
+	failKind string
 }
 
 type fakeEventRow struct {
@@ -22,6 +26,9 @@ type fakeEventRow struct {
 }
 
 func (f *fakeEventStore) LogEvent(ctx context.Context, traceID, kind string, payload map[string]any) error {
+	if f.failKind != "" && kind == f.failKind {
+		return errors.New("fake ledger: simulated write failure")
+	}
 	f.rows = append(f.rows, fakeEventRow{traceID: traceID, kind: kind, payload: payload})
 	return nil
 }

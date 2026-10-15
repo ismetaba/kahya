@@ -32,3 +32,9 @@ const MsgRewriteRejected = "Konsolidasyon bu gece iptal edildi — model kendisi
 // (or an approve) touched nothing (FIX-P-24; byte-exact handbook text,
 // em-dash). Decision G06-4: it is sent on every refused night.
 const MsgRepoStateUnsafe = "Hafıza deposu (~/Kahya) beklenmedik git durumunda — konsolidasyon atlandı; 'git -C ~/Kahya status' ile kontrol et"
+
+// MsgAutoCommitFailedPending is the Telegram notice sent when an auto-mode
+// night could not merge its consolidation: the suggestion is ledgered as
+// pending first, so it waits for `kahya consolidation approve` (FIX-P-12;
+// byte-exact handbook text, em-dash).
+const MsgAutoCommitFailedPending = "Otomatik konsolidasyon birleştirilemedi — öneri bekliyor: kahya consolidation show"

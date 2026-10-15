@@ -358,7 +358,10 @@ else
 		deferred "konsolidasyon-onay-commit" "yukarıdaki hataya bağlı"
 		deferred "konsolidasyon-reindex" "yukarıdaki hataya bağlı"
 		deferred "mini-baseline-sonra" "yukarıdaki hataya bağlı"
-	elif [ "$(db_event_count "$TRACE3" consolidation.pending)" -gt 0 ]; then
+	elif [ "$(db_event_count "$TRACE3" consolidation.pending)" -gt 0 ] && [ "$(db_event_count "$TRACE3" consolidation.approved)" -eq 0 ]; then
+		# FIX-P-12: auto-commit modu da önce consolidation.pending yazar,
+		# sonra aynı $TRACE3 altında consolidation.approved ile çözer - bu
+		# yüzden bekleyen öneri dalı yalnız $TRACE3 altında approved YOKKEN.
 		SHOW_OUT="$("$KAHYA_BIN" consolidation show 2>&1)"
 		if [ -z "$SHOW_OUT" ] || printf '%s' "$SHOW_OUT" | grep -q 'Bekleyen konsolidasyon önerisi yok'; then
 			fail "konsolidasyon-diff" "kahya consolidation show boş döndü ama consolidation.pending ledgerlanmıştı"

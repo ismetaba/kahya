@@ -266,8 +266,16 @@ func CreateWorktree(ctx context.Context, git backup.GitRunner, repoDir, worktree
 // aborting a supersede/approve/reject flow over worktree bookkeeping - the
 // branch deletion (DeleteBranch) is what actually matters for the "never
 // merged" guarantee.
+//
+// --force is passed twice so a LOCKED registration is removed too
+// (FIX-P-12-E1): a `git worktree add` killed half-way leaves its "locked"
+// marker behind, a single --force refuses a locked tree and prune never
+// touches one, so its branch could never be deleted and the orphan sweep
+// would fail every night. Consolidation worktrees are throwaway (only
+// FindWorktreePathForBranch's kahya/consolidation-* registrations reach
+// here; the user's own ~/Kahya checkout is never a linked worktree).
 func RemoveWorktree(ctx context.Context, git backup.GitRunner, repoDir, worktreeDir string) error {
-	_, _, err1 := git.Run(ctx, repoDir, "worktree", "remove", worktreeDir, "--force")
+	_, _, err1 := git.Run(ctx, repoDir, "worktree", "remove", worktreeDir, "--force", "--force")
 	_, _, err2 := git.Run(ctx, repoDir, "worktree", "prune")
 	if err1 != nil {
 		return fmt.Errorf("consolidation: git worktree remove %s: %w", worktreeDir, err1)

@@ -312,6 +312,13 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 			return err
 		}
 	}
+	// FIX-P-12: after supersede every kahya/consolidation-* branch is
+	// garbage (an earlier auto-mode merge failure, a failed pending ledger
+	// write, a process killed mid-run); sweep them so tonight's
+	// CreateWorktree cannot collide with a same-day leftover.
+	if err := c.sweepOrphanBranches(ctx, traceID, ""); err != nil {
+		return err
+	}
 
 	// Step 4: read the corpus, partition by secret-lane glob (lane.go) -
 	// BEFORE either session is ever constructed, so a secret-lane file's
@@ -467,18 +474,73 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// must happen inside the branch's own worktree, never from kahyaDir's
 	// primary one) before it can safely remove it.
 
-	// Step 8/auto-mode switch (task spec step 7): suggestion mode is the
-	// default; auto mode merges directly, but ONLY when the runtime guard
-	// (auto_commit config AND a fresh green eval.retrieval.result matching the
-	// current index+dataset) allows it.
-	if c.autoCommitAllowed(ctx, traceID) {
-		return c.finalize(ctx, traceID, traceID, branch)
+	// Step 8 (task spec step 7): the suggestion is ledgered as pending in
+	// BOTH modes, before any merge (FIX-P-12): a branch never exists without
+	// a ledger trail, and an auto-mode merge failure stays a recoverable
+	// suggestion (`kahya consolidation approve`, or tomorrow's supersede).
+	// A failed ledger write removes tonight's branch and worktree.
+	if err := LedgerPending(ctx, c.EventLogger, traceID, branch, baseSHA, skippedSecretLane); err != nil {
+		c.logError("consolidation_pending_ledger_failed", "trace_id", traceID, "err", err.Error())
+		c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
+		return fmt.Errorf("consolidation: ledger pending: %w", err)
 	}
 
-	if err := LedgerPending(ctx, c.EventLogger, traceID, branch, baseSHA, skippedSecretLane); err != nil {
-		c.logWarn("consolidation_pending_ledger_failed", "trace_id", traceID, "err", err.Error())
+	// Auto-mode switch: suggestion mode is the default; auto mode merges
+	// directly, but ONLY when the runtime guard (auto_commit config AND a
+	// fresh green eval.retrieval.result matching the current index+dataset)
+	// allows it. finalize's consolidation.approved row resolves the pending
+	// row just written.
+	if c.autoCommitAllowed(ctx, traceID) {
+		if err := c.finalize(ctx, traceID, traceID, branch); err != nil {
+			c.logError("consolidation_auto_finalize_failed", "trace_id", traceID, "branch", branch, "err", err.Error())
+			c.notify(ctx, traceID, MsgAutoCommitFailedPending)
+			return err
+		}
+		return nil
 	}
+
 	c.notify(ctx, traceID, MsgSuggestionReady)
+	return nil
+}
+
+// sweepOrphanBranches deletes EVERY kahya/consolidation-* branch (and its
+// worktree registration, if any) except keepBranch (FIX-P-12). Run calls it
+// right after supersede with keepBranch == "": at that point every such
+// branch is garbage by construction - this package is the only creator of
+// the prefix (decision G06-5: no author check on the branch tip), and the
+// one branch a ledgered pending suggestion referred to was just superseded.
+// A branch that cannot be deleted fails the run closed: tonight's
+// CreateWorktree would collide with it anyway. for-each-ref needs the glob
+// form "refs/heads/kahya/consolidation-*" (a bare prefix matches nothing;
+// verified against git 2.54).
+func (c *Consolidator) sweepOrphanBranches(ctx context.Context, traceID, keepBranch string) error {
+	_, _, _ = c.Git.Run(ctx, c.Cfg.KahyaDir, "worktree", "prune") // drop registrations whose dir is gone
+	// The full refname, not %(refname:short): the short form turns into
+	// "heads/<name>" when a tag of the same name exists.
+	out, stderr, err := c.Git.Run(ctx, c.Cfg.KahyaDir, "for-each-ref", "--format=%(refname)", "refs/heads/"+ConsolidationBranchPrefix+"*")
+	if err != nil {
+		return fmt.Errorf("consolidation: git for-each-ref: %w (%s)", err, stderr)
+	}
+	for _, ref := range splitNonEmptyLines(out) {
+		b, ok := strings.CutPrefix(ref, "refs/heads/")
+		if !ok || b == keepBranch || !strings.HasPrefix(b, ConsolidationBranchPrefix) {
+			continue
+		}
+		// RemoveWorktree passes --force twice, so a LOCKED orphan worktree
+		// (a `git worktree add` killed half-way) does not block the branch
+		// deletion below every night (FIX-P-12-E1).
+		if err := removeWorktreeForBranchIfAny(ctx, c.Git, c.Cfg.KahyaDir, b); err != nil {
+			c.logWarn("consolidation_orphan_worktree_remove_failed", "trace_id", traceID, "branch", b, "err", err.Error())
+		}
+		if err := DeleteBranch(ctx, c.Git, c.Cfg.KahyaDir, b); err != nil {
+			c.logError("consolidation_orphan_sweep_failed", "trace_id", traceID, "branch", b, "err", err.Error())
+			return err
+		}
+		c.logWarn("consolidation_orphan_cleaned", "trace_id", traceID, "branch", b)
+		if c.EventLogger != nil {
+			_ = c.EventLogger.LogEvent(ctx, traceID, EventOrphanCleaned, map[string]any{"branch": b})
+		}
+	}
 	return nil
 }
 
@@ -542,6 +604,11 @@ func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, 
 	}
 	return CommitPaths(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage, memRel)
 }
+
+// EventOrphanCleaned is ledgered for every kahya/consolidation-* branch the
+// nightly sweep deleted because no ledgered pending suggestion referred to
+// it (FIX-P-12).
+const EventOrphanCleaned = "consolidation.orphan_cleaned"
 
 // EventRepoStateUnsafe is ledgered whenever Run or finalize refused to touch
 // ~/Kahya because CheckRepoState failed (FIX-P-24).
@@ -613,8 +680,8 @@ func (c *Consolidator) Approve(ctx context.Context, traceID string) error {
 // own guarded auto-mode path use - approveTraceID is this call's own
 // trace_id (the CLI approve command's, or the nightly run's own for auto
 // mode); pendingTraceID is the trace_id the consolidation.approved ledger
-// event resolves (may be the SAME value as approveTraceID for auto mode,
-// where there was never a separate pending event to resolve).
+// event resolves (the SAME value as approveTraceID for auto mode, which
+// resolves the pending row Run ledgered just before - FIX-P-12).
 func (c *Consolidator) finalize(ctx context.Context, approveTraceID, pendingTraceID, branch string) error {
 	// FIX-P-24: the same repo-state gate as Run (the user may have switched
 	// branch or started a merge since the nightly run). A refusal leaves the
@@ -711,13 +778,14 @@ func (c *Consolidator) supersede(ctx context.Context, newTraceID string, pending
 // cleanupWorktreeAndBranch is the error-path teardown used whenever Run
 // aborts partway through (a session failure, a write failure) - the
 // half-built worktree/branch must never survive as a stray pending
-// suggestion.
+// suggestion. A branch that cannot be deleted here is logged as an error;
+// the next run's orphan sweep deletes it (FIX-P-12).
 func (c *Consolidator) cleanupWorktreeAndBranch(ctx context.Context, worktreeDir, branch string) {
 	if err := RemoveWorktree(ctx, c.Git, c.Cfg.KahyaDir, worktreeDir); err != nil {
 		c.logWarn("consolidation_cleanup_worktree_remove_failed", "branch", branch, "err", err.Error())
 	}
 	if err := DeleteBranch(ctx, c.Git, c.Cfg.KahyaDir, branch); err != nil {
-		c.logWarn("consolidation_cleanup_branch_delete_failed", "branch", branch, "err", err.Error())
+		c.logError("consolidation_cleanup_branch_delete_failed", "branch", branch, "err", err.Error(), "retry", "next run's orphan sweep")
 	}
 }
 

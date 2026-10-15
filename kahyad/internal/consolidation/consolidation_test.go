@@ -746,6 +746,17 @@ func TestRunAutoCommitProceedsWhenGateGreen(t *testing.T) {
 	if reindexer.calls != 1 {
 		t.Fatalf("Reindexer.calls = %d, want 1 (auto-mode merge also triggers reindex)", reindexer.calls)
 	}
+	// FIX-P-12: the auto path ledgers the suggestion as pending BEFORE it
+	// merges, so a failed merge leaves a recoverable pending suggestion; the
+	// approved row then resolves it.
+	pendingRows, _ := logger.ListEventsByKind(context.Background(), EventPending)
+	approvedRows, _ := logger.ListEventsByKind(context.Background(), EventApproved)
+	if len(pendingRows) != 1 || len(approvedRows) != 1 {
+		t.Fatalf("pending rows = %d, approved rows = %d, want 1 each", len(pendingRows), len(approvedRows))
+	}
+	if pendingRows[0].ID >= approvedRows[0].ID {
+		t.Fatalf("pending row id %d >= approved row id %d, want pending ledgered first", pendingRows[0].ID, approvedRows[0].ID)
+	}
 }
 
 // --- (h) push after approve ---

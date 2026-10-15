@@ -31,4 +31,9 @@ func TestByteExactTurkishStrings(t *testing.T) {
 	if MsgRepoStateUnsafe != wantRepoStateUnsafe {
 		t.Errorf("MsgRepoStateUnsafe = %q, want %q", MsgRepoStateUnsafe, wantRepoStateUnsafe)
 	}
+	// FIX-P-12 (handbook G06 P-12 text, byte-exact).
+	wantAutoCommitFailedPending := "Otomatik konsolidasyon birleştirilemedi — öneri bekliyor: kahya consolidation show"
+	if MsgAutoCommitFailedPending != wantAutoCommitFailedPending {
+		t.Errorf("MsgAutoCommitFailedPending = %q, want %q", MsgAutoCommitFailedPending, wantAutoCommitFailedPending)
+	}
 }
