@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -108,6 +109,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 }
 
+// setTurkishUsage swaps the flag package's English "Usage of <name>:"
+// header for the subcommand's Turkish usage line, and its " (default %q)"
+// suffix for " (varsayılan ...)" (FIX-FINAL cli-flag-help-english-stdlib-
+// header; HANDOFF §3: user-facing CLI text is Turkish). Every FlagSet in
+// this file calls it right after SetOutput.
+func setTurkishUsage(fs *flag.FlagSet, w io.Writer, header string) {
+	fs.Usage = func() {
+		fmt.Fprintln(w, header)
+		var buf bytes.Buffer
+		fs.SetOutput(&buf)
+		fs.PrintDefaults()
+		fs.SetOutput(w)
+		io.WriteString(w, strings.ReplaceAll(buf.String(), " (default ", " (varsayılan "))
+	}
+}
+
 // isHelpArg reports whether s is one of the flag package's help flags.
 // Argument-only subcommands (approve, task show, job run, health) check it
 // themselves so `-h` prints their usage instead of being sent to kahyad as
@@ -145,6 +162,7 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 func runAsk(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgAskUsage)
 	derin := fs.Bool("derin", false, "derin düşün (en güçlü bulut modelini kullanır, ek maliyetlidir)")
 	paletteOpenedAt := fs.Float64("palette-opened-at", 0, "palet açılış zaman damgası (unix saniye, ondalıklı) - hammerspoon/kahya.lua kullanır")
 	audio := fs.String("audio", "", "ses dosyası yolu (wav) - transkript kahyad tarafından yerelde çıkarılır (hammerspoon/kahya.lua basılı-tut kullanır)")
@@ -334,6 +352,7 @@ func runHealth(client *Client, args []string, stdout, stderr io.Writer) int {
 func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reindex", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgReindexUsage)
 	full := fs.Bool("full", false, "tam yeniden indeksleme")
 	reEmbed := fs.Bool("re-embed", false, "tüm parçaları aktif embed modeline göre yeniden göm (model_ver değişiminde kullanılır)")
 	if err := fs.Parse(args); err != nil {
@@ -513,6 +532,7 @@ func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
 func runFactList(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fact list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgFactUsage)
 	quarantined := fs.Bool("quarantined", false, "yalnız onay bekleyen (karantinadaki) olgular")
 	entity := fs.String("entity", "", "varlık id'si ya da adı")
 	since := fs.String("since", "", "RFC3339: bu tarihten sonra kaydedilen olgular")
@@ -609,6 +629,7 @@ func printFactBulk(stdout, stderr io.Writer, countFmt string, done []int64, fail
 func runFactQuery(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fact query", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgFactUsage)
 	subject := fs.String("subject", "", "özne (bayt-tam; yoksa büyük/küçük harf ve Türkçe I katlanmış eşitlik)")
 	predicate := fs.String("predicate", "", "yüklem, örn. works_at")
 	object := fs.String("object", "", "nesne")
@@ -684,6 +705,7 @@ func factQueryValidity(from, to string) string {
 func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fact confirm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgFactUsage)
 	episode := fs.Int64("episode", 0, "bu bölümün (episode id) kanıtladığı tüm olguları onayla")
 	allQuarantined := fs.Bool("all-quarantined", false, "--since tarihinden beri kaydedilen tüm onaysız olguları onayla")
 	since := fs.String("since", "", "RFC3339: --all-quarantined için alt sınır (zorunlu)")
@@ -836,6 +858,7 @@ func runEntityList(client *Client, args []string, stdout, stderr io.Writer) int 
 	}
 	fs := flag.NewFlagSet("entity list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgEntityUsage)
 	provisional := fs.Bool("provisional", false, "yalnız geçici (adaş şüphesi) varlıkları listele")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -927,6 +950,7 @@ func runEntityMerge(client *Client, args []string, stdout, stderr io.Writer) int
 
 	fs := flag.NewFlagSet("merge", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgEntityMergeUsage)
 	evidence := fs.Int64("evidence", 0, "ayırt edici kanıt olgu id'si (zorunlu)")
 	if err := fs.Parse(args[2:]); err != nil {
 		return 2
@@ -1012,6 +1036,7 @@ func runMemoryConfirm(client *Client, args []string, stdout, stderr io.Writer) i
 func runMemoryExtract(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("memory extract", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgMemoryUsage)
 	episode := fs.Int64("episode", 0, "yalnız bu bölümü (episode id) çıkar")
 	file := fs.String("file", "", "yalnız bu notu çıkar (hafıza dizinine göre yol)")
 	all := fs.Bool("all", false, "tüm bölümlerin çıkarım işaretini sıfırla ve yeniden çıkar (yeni çıkarıcı sürümü için)")
@@ -1053,6 +1078,7 @@ func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io
 	}
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgIngestUsage)
 	title := fs.String("title", "", "notun başlığı (verilmezse belgeden)")
 	source := fs.String("source", "", "kaynak: URL ya da etiket (verilmezse dosya yolu)")
 	secret := fs.Bool("secret", false, "belgeyi gizli şerit olarak işle (yalnız yerel model)")
@@ -1151,6 +1177,7 @@ func ingestSourcePaths(path string) ([]string, error) {
 func runRemembered(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("remembered", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgRememberedUsage)
 	trace := fs.String("trace", "", "hatırladı anı olarak işaretlenecek trace_id")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1296,6 +1323,7 @@ func runEvalMini(client *Client, stdout, stderr io.Writer) int {
 func runMetrics(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("metrics", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgMetricsUsage)
 	since := fs.String("since", "14d", "pencere: süre (14d, 36h) veya tarih (2026-07-01)")
 	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
 	if err := fs.Parse(args); err != nil {
@@ -1420,6 +1448,7 @@ func northStarMark(ok bool) string {
 func runReadiness(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("readiness", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgReadinessUsage)
 	phase := fs.String("phase", "start", "start | complete")
 	since := fs.String("since", "14d", "pencere: süre (14d, 36h) veya tarih (2026-07-01)")
 	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
@@ -1638,6 +1667,7 @@ func runAutonomyPromote(client *Client, args []string, stdout, stderr io.Writer)
 func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("undo", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgUndoUsage)
 	trace := fs.String("trace", "", "geri al: bu trace_id'nin açık geri-alma pencerelerini tetikle")
 	last := fs.Bool("last", false, "yalnız en yeni işlemi geri al (varsayılan: trace'teki tüm açık işlemler, yeniden eskiye)")
 	if err := fs.Parse(args); err != nil {
@@ -1768,6 +1798,7 @@ func parseIDAndFlags(fs *flag.FlagSet, args []string) (id string, ok bool) {
 func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("approvals show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgApprovalsShowUsage)
 	asJSON := fs.Bool("json", false, "makine-okunur JSON çıktısı")
 	id, ok := parseIDAndFlags(fs, args)
 	if !ok {
@@ -1812,6 +1843,7 @@ func runApprovalsShow(client *Client, args []string, stdout, stderr io.Writer) i
 func runApprovalsDecide(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("approvals decide", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgApprovalsDecideUsage)
 	approveFlag := fs.Bool("approve", false, "onayla")
 	rejectFlag := fs.Bool("reject", false, "reddet")
 	typed := fs.String("typed", "", "W3 için yazılı onay metni")
@@ -1867,6 +1899,7 @@ func runDebug(client *Client, args []string, stdout, stderr io.Writer) int {
 func runDebugEmitApproval(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("debug emit-approval", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgDebugEmitApprovalUsage)
 	class := fs.String("class", "", "W2 veya W3")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -2031,7 +2064,8 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 
 	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	retry := fs.Bool("retry", false, "yarıda kesilen aracı yeniden dene (fresh onay ile)")
+	setTurkishUsage(fs, stderr, MsgTaskResolveUsage)
+	retry := fs.Bool("retry", false, "yarıda kesilen aracı yeniden dene (yeni onay ile)")
 	abort := fs.Bool("abort", false, "görevi durdur (failed)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
@@ -2072,6 +2106,7 @@ func runTaskResolve(client *Client, args []string, stdout, stderr io.Writer) int
 func runHalt(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("halt", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgHaltUsage)
 	taskID := fs.String("task", "", "yalnız bu görevi durdur (boş = tüm aktif görevler)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -2138,10 +2173,7 @@ func runLedgerVerify(client *Client, stdout, stderr io.Writer) int {
 func runLog(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("log", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		fmt.Fprintln(stderr, MsgLogUsage)
-		fs.PrintDefaults()
-	}
+	setTurkishUsage(fs, stderr, MsgLogUsage)
 	trace := fs.String("trace", "", "bu trace_id'nin log satırlarını göster")
 	raw := fs.Bool("raw", false, "biçimli çıktı yerine ham JSONL satırlarını bas")
 	if err := fs.Parse(args); err != nil {

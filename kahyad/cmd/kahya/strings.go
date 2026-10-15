@@ -28,6 +28,14 @@ const (
 	// health` is given any argument (e.g. -h).
 	MsgHealthUsage = "kullanım: kahya health"
 
+	// Usage lines for the flag sets that had none (FIX-FINAL cli-flag-help-
+	// english-stdlib-header): printed by setTurkishUsage in place of the flag
+	// package's English "Usage of <name>:" header.
+	MsgAskUsage     = "kullanım: kahya ask [--derin] [--speak] [--audio <yol>] <soru...>"
+	MsgReindexUsage = "kullanım: kahya reindex [--full] [--re-embed]"
+	MsgUndoUsage    = "kullanım: kahya undo --trace <id> [--last]"
+	MsgMetricsUsage = "kullanım: kahya metrics [--since <pencere>] [--json]"
+
 	// MsgAudioAndTextMutuallyExclusive is printed when `kahya ask --audio
 	// <path>` is combined with trailing typed question text (W6-02) -
 	// rejected locally, before any dial, since the audio IS the prompt in

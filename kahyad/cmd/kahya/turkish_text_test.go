@@ -288,3 +288,55 @@ func TestDashPrefixedQuestionStillOneShot(t *testing.T) {
 		t.Errorf("prompt = %q, want the dash-prefixed question sent as-is", gotPrompt)
 	}
 }
+
+// TestEveryFlagSetHelpHasTurkishHeader (FIX-FINAL cli-flag-help-english-
+// stdlib-header): only `kahya log` had a Turkish fs.Usage; every other
+// flag set printed Go's English "Usage of <name>:" header and the
+// " (default %q)" suffix. Each now starts with its Turkish usage line and
+// uses "(varsayılan ...)".
+func TestEveryFlagSetHelpHasTurkishHeader(t *testing.T) {
+	cases := []struct {
+		args   []string
+		header string
+	}{
+		{[]string{"ask", "-h"}, MsgAskUsage},
+		{[]string{"reindex", "-h"}, MsgReindexUsage},
+		{[]string{"fact", "list", "-h"}, MsgFactUsage},
+		{[]string{"fact", "query", "-h"}, MsgFactUsage},
+		{[]string{"fact", "confirm", "-h"}, MsgFactUsage},
+		{[]string{"entity", "list", "-h"}, MsgEntityUsage},
+		{[]string{"entity", "merge", "1", "2", "-h"}, MsgEntityMergeUsage},
+		{[]string{"memory", "extract", "-h"}, MsgMemoryUsage},
+		{[]string{"ingest", "-h"}, MsgIngestUsage},
+		{[]string{"remembered", "-h"}, MsgRememberedUsage},
+		{[]string{"metrics", "-h"}, MsgMetricsUsage},
+		{[]string{"readiness", "-h"}, MsgReadinessUsage},
+		{[]string{"undo", "-h"}, MsgUndoUsage},
+		{[]string{"approvals", "show", "-h"}, MsgApprovalsShowUsage},
+		{[]string{"approvals", "decide", "-h"}, MsgApprovalsDecideUsage},
+		{[]string{"approvals", "decide", "x", "-h"}, MsgApprovalsDecideUsage},
+		{[]string{"debug", "emit-approval", "-h"}, MsgDebugEmitApprovalUsage},
+		{[]string{"task", "resolve", "x", "-h"}, MsgTaskResolveUsage},
+		{[]string{"halt", "-h"}, MsgHaltUsage},
+		{[]string{"log", "-h"}, MsgLogUsage},
+	}
+	for _, c := range cases {
+		t.Run(strings.Join(c.args, "_"), func(t *testing.T) {
+			out := runHelp(t, c.args...)
+			if !strings.HasPrefix(out, c.header+"\n") {
+				t.Errorf("kahya %s: help does not start with %q:\n%s", strings.Join(c.args, " "), c.header, out)
+			}
+			for _, english := range []string{"Usage of", " (default "} {
+				if strings.Contains(out, english) {
+					t.Errorf("kahya %s: help still carries English %q:\n%s", strings.Join(c.args, " "), english, out)
+				}
+			}
+		})
+	}
+	if out := runHelp(t, "metrics", "-h"); !strings.Contains(out, `(varsayılan "14d")`) {
+		t.Errorf("kahya metrics -h lacks the Turkish default suffix:\n%s", out)
+	}
+	if out := runHelp(t, "task", "resolve", "x", "-h"); strings.Contains(out, "fresh") {
+		t.Errorf("kahya task resolve -h still says \"fresh\":\n%s", out)
+	}
+}
