@@ -407,3 +407,42 @@ func TestSnapshotterFailWrapsNotifierError(t *testing.T) {
 		t.Fatal("Run() error = nil, want error")
 	}
 }
+
+// TestRunSweepsStaleStagingFromEarlierDays (FIX-FINAL backup-stale-
+// staging-never-removed): a run killed mid-VACUUM INTO leaves a partial
+// brain-YYYYMMDD.db.staging; Run removed only TODAY's staging name and
+// prune matches verified snapshots only, so an earlier day's partial copy
+// of brain.db lived on forever. Run now sweeps every staging file first,
+// and never touches a verified snapshot.
+func TestRunSweepsStaleStagingFromEarlierDays(t *testing.T) {
+	st := testStore(t)
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(backupDir, "brain-20261014.db.staging")
+	if err := os.WriteFile(stale, []byte("partial vacuum"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	older := filepath.Join(backupDir, "brain-20261013.db")
+	if err := os.WriteFile(older, []byte("an older verified snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap := NewSnapshotter(st, &fakeNotifier{}, backupDir)
+	snap.SetClock(func() time.Time { return time.Date(2026, 10, 15, 3, 0, 0, 0, time.Local) })
+	if err := snap.Run(context.Background(), "trace-staging"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale staging from an earlier day survived the run (stat err %v)", err)
+	}
+	for _, keep := range []string{older, filepath.Join(backupDir, "brain-20261015.db")} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("%s: %v, want it kept", filepath.Base(keep), err)
+		}
+	}
+	left, _ := filepath.Glob(filepath.Join(backupDir, "*.staging"))
+	if len(left) != 0 {
+		t.Errorf("staging files left: %v", left)
+	}
+}

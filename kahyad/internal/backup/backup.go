@@ -27,6 +27,11 @@ const retentionCount = 7
 // (a stray file, a .gitignore, a directory) is ignored by prune.
 var brainFileNamePattern = regexp.MustCompile(`^brain-(\d{8})\.db$`)
 
+// stagingFileNamePattern matches Run's own unverified staging copies
+// ("brain-YYYYMMDD.db.staging"): Run removes every one of them before its
+// VACUUM INTO (FIX-FINAL backup-stale-staging-never-removed).
+var stagingFileNamePattern = regexp.MustCompile(`^brain-\d{8}\.db\.staging$`)
+
 // Store is the narrow kahyad/internal/store.Store dependency Snapshotter
 // needs: the raw *sql.DB to run VACUUM INTO against (kahyad is brain.db's
 // only writer, so this connection's own VACUUM INTO is a consistent online
@@ -133,12 +138,28 @@ func (s *Snapshotter) Run(ctx context.Context, traceID string) error {
 	target := filepath.Join(s.backupDir, fmt.Sprintf("brain-%s.db", date))
 	staging := target + ".staging"
 
-	// Remove only a leftover STAGING file from an earlier crashed run — a
+	// Remove every leftover STAGING file from an earlier crashed run - a
 	// staging file is by definition never a verified-good copy, so deleting
-	// it can never lose good data (unlike target). VACUUM INTO also refuses
-	// to overwrite an existing file, so staging must not pre-exist.
-	if err := os.Remove(staging); err != nil && !os.IsNotExist(err) {
-		return s.fail(ctx, traceID, staging, target, fmt.Errorf("remove stale staging %s: %w", staging, err))
+	// it can never lose good data (unlike a target). VACUUM INTO also
+	// refuses to overwrite an existing file, so today's staging must not
+	// pre-exist. Every day's, not only today's (FIX-FINAL
+	// backup-stale-staging-never-removed): a run killed mid-VACUUM (SIGKILL,
+	// panic, power loss) is not retried that day, so its partial copy of
+	// brain.db - possibly with secret-lane rows - was never removed, and
+	// prune only matches verified snapshots. Safe: Run only executes under
+	// the scheduler's per-job-name lock, so no concurrent Run owns a live
+	// staging file.
+	entries, err := os.ReadDir(s.backupDir)
+	if err != nil {
+		return s.fail(ctx, traceID, staging, target, fmt.Errorf("list %s: %w", s.backupDir, err))
+	}
+	for _, e := range entries {
+		if e.IsDir() || !stagingFileNamePattern.MatchString(e.Name()) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.backupDir, e.Name())); err != nil && !os.IsNotExist(err) {
+			return s.fail(ctx, traceID, staging, target, fmt.Errorf("remove stale staging %s: %w", e.Name(), err))
+		}
 	}
 
 	if _, err := s.store.DB().ExecContext(ctx, "VACUUM INTO ?", staging); err != nil {
