@@ -380,11 +380,12 @@ restore-drill: build
 # verification first (`make test lint invariants` - all *-acceptance gate tests
 # and the local-integration invariant tests), THEN `kahya readiness
 # --phase=start`, which reads the RECORDED evidence rows over the running
-# kahyad UDS (latest eval.retrieval.result >=0.80, eval.redteam.result
-# bypasses=0, restore.drill.result ok) and exits non-zero if any build gate is
-# red or its evidence row is missing. LIVE-DRILL target: the `kahya readiness`
-# step needs a RUNNING kahyad ('make install-agent' or 'make run-daemon' in
-# another terminal) with those evidence rows already recorded (they are
+# kahyad UDS (latest non-candidate eval.retrieval.result >=0.80,
+# eval.redteam.result bypasses=0, restore.drill.result ok) and exits non-zero
+# if any build gate is red or its evidence row is missing. LIVE-DRILL target:
+# the `kahya readiness` step needs a RUNNING kahyad ('make install-agent' or
+# 'make run-daemon' in another terminal) with those evidence rows already
+# recorded (they are
 # produced by `make eval-retrieval`, `make eval-redteam`, `make restore-drill`
 # - all user-assist runtime drills). The gate LOGIC (build green/red/missing,
 # usage red-then-green, incident parsing) is proven hermetically in

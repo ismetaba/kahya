@@ -12,7 +12,8 @@
 //
 // Two gate classes (task spec step 4):
 //   - BUILD gates: tests/evals that must be green NOW to START dogfood -
-//     latest eval.retrieval.result (precision>=0.80, W78-01), latest
+//     latest serving-config eval.retrieval.result (precision>=0.80, W78-01;
+//     a FIX-MEM-8 candidate pass, candidate: true, never counts), latest
 //     eval.redteam.result (bypasses=0, W78-02), latest restore.drill.result
 //     (ok, W78-05). A MISSING row is always red ("veri yok").
 //   - USAGE gates: the §9 MVP-done set, only satisfiable DURING a real dogfood
@@ -119,7 +120,8 @@ type BuildGate struct {
 
 // BuildGates is the three recorded-evidence build gates.
 type BuildGates struct {
-	// Retrieval: latest eval.retrieval.result with precision>=0.80 (W78-01).
+	// Retrieval: latest non-candidate eval.retrieval.result with
+	// precision>=0.80 (W78-01; see latestServingRetrieval).
 	Retrieval BuildGate `json:"retrieval"`
 	Precision *float64  `json:"precision"`
 	// Redteam: latest eval.redteam.result with bypasses==0 (W78-02).
@@ -184,9 +186,13 @@ type DayCount struct {
 }
 
 // retrievalPayload / redteamPayload / restorePayload are the subsets of each
-// evidence row's payload the green predicates read.
+// evidence row's payload the green predicates read. Candidate marks a
+// FIX-MEM-8 candidate pass (eval.RetrievalRunner scoring a configured fusion
+// config the eval gate has not activated yet); decoding it here too means a
+// row whose flag is not a bool fails to decode and reads red.
 type retrievalPayload struct {
 	Precision float64 `json:"precision"`
+	Candidate bool    `json:"candidate"`
 }
 type redteamPayload struct {
 	Bypasses int `json:"bypasses"`
@@ -211,8 +217,8 @@ func EvaluateBuildGates(ctx context.Context, r EventReader, now time.Time) (Buil
 		return bg, nil
 	}
 
-	// Retrieval.
-	row, found, err := latestOfKind(ctx, r, kindRetrievalResult)
+	// Retrieval: the serving config's newest result, never a candidate pass.
+	row, found, err := latestServingRetrieval(ctx, r)
 	if err != nil {
 		return BuildGates{}, err
 	}
@@ -296,6 +302,30 @@ func evalRestore(row EventRow, found bool, now time.Time) (BuildGate, *bool) {
 // ordered id ASC, so the last element is newest; we scan for max id defensively
 // rather than assuming order.
 func latestOfKind(ctx context.Context, r EventReader, kind string) (EventRow, bool, error) {
+	return latestOfKindExcept(ctx, r, kind, nil)
+}
+
+// latestServingRetrieval returns the newest eval.retrieval.result that is NOT
+// a candidate pass (FIX-MEM-8 review). While a configured recency weight is
+// not active yet, every retrieval eval ledgers the serving config's result
+// and then the candidate's (candidate: true, its own fusion_sha256), so the
+// candidate is the newest row of the kind. It describes a config that was
+// not serving when it was recorded: counting it would let a green candidate
+// turn a red serving config's build gate green (fail-open) and a red
+// candidate hide a green one. Only rows that decode with candidate: true are
+// skipped; a row whose payload does not decode stays eligible, so
+// evalRetrieval reads it red ("kanıt çözümlenemedi") rather than skipping
+// past it to an older green row.
+func latestServingRetrieval(ctx context.Context, r EventReader) (EventRow, bool, error) {
+	return latestOfKindExcept(ctx, r, kindRetrievalResult, func(row EventRow) bool {
+		var p retrievalPayload
+		return json.Unmarshal([]byte(row.Payload), &p) == nil && p.Candidate
+	})
+}
+
+// latestOfKindExcept is latestOfKind over the rows skip does not reject (nil
+// skips nothing).
+func latestOfKindExcept(ctx context.Context, r EventReader, kind string, skip func(EventRow) bool) (EventRow, bool, error) {
 	rows, err := r.ListEventsByKind(ctx, kind)
 	if err != nil {
 		return EventRow{}, false, err
@@ -303,6 +333,9 @@ func latestOfKind(ctx context.Context, r EventReader, kind string) (EventRow, bo
 	var best EventRow
 	found := false
 	for _, row := range rows {
+		if skip != nil && skip(row) {
+			continue
+		}
 		if !found || row.ID >= best.ID {
 			best = row
 			found = true

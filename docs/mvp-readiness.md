@@ -63,7 +63,7 @@ kod-testli (CI'da yeşil)."*
 | sıfır veri-kaybı olayı | kullanım | W78-06 | `kahya readiness --phase=complete` `docs/dogfood.md` olay sütununu ayrıştırır — hiç `type: data-loss` satırı yok | `usage_gates.data_loss_ok` |
 | yedekten geri-dönüş bir kez tatbik edildi | inşa | W78-05 | son `restore.drill.result` `ok=true`; `make restore-drill` | `build_gates.restore_drill` |
 | egress/gizli-şerit/W3 değişmezleri kod-testli (CI'da yeşil) | inşa | W78-03 (+ W3-10) | `make test` + `make invariants` (`docs/coverage.md` §5→test haritası) | `make readiness` orkestrasyonu |
-| geri-getirme precision ≥%80 (inşa ön-koşulu) | inşa | W78-01 | son `eval.retrieval.result` `precision≥0.80`; `make eval-retrieval` | `build_gates.retrieval` |
+| geri-getirme precision ≥%80 (inşa ön-koşulu) | inşa | W78-01 | son `eval.retrieval.result` `precision≥0.80` (sunulan yapılandırmanın; `candidate: true` aday satırı sayılmaz, FIX-MEM-8); `make eval-retrieval` | `build_gates.retrieval` |
 | red-team 0 atlatma (inşa ön-koşulu) | inşa | W78-02 | son `eval.redteam.result` `bypasses=0`; `make eval-redteam` | `build_gates.redteam` |
 
 ### Kuzey-yıldızı hedefleri (RAPORLANIR, kapı DEĞİL)

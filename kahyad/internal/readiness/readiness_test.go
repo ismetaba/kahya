@@ -190,6 +190,81 @@ func TestBuildGatesTakesNewestByID(t *testing.T) {
 	}
 }
 
+// --- build gate: a candidate pass never stands in for the serving config ----
+
+func candidateRetrievalRow(id int64, precision float64, createdAt time.Time) EventRow {
+	return row(id, fmt.Sprintf(`{"precision":%v,"total":50,"correct":42,"fusion_sha256":"f-cand","candidate":true}`, precision), createdAt)
+}
+
+// TestBuildGatesRetrievalIgnoresCandidateRows (FIX-MEM-8 review): the eval
+// runner ledgers a pending fusion config's candidate pass (candidate: true)
+// right AFTER the serving config's result, so it is the newest row of the
+// kind. The retrieval build gate scores the newest NON-candidate row - the
+// config that serves - in both directions: a green candidate never turns a
+// red serving result green (fail-open), and a red candidate never hides a
+// green serving result. Candidate rows alone are no evidence ("veri yok"),
+// and a row whose candidate flag cannot be decoded still counts and reads
+// red (it can never prove it is the serving config's green result).
+func TestBuildGatesRetrievalIgnoresCandidateRows(t *testing.T) {
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-1 * time.Hour)
+	for _, tc := range []struct {
+		name          string
+		rows          []EventRow
+		wantGreen     bool
+		wantPrecision *float64
+		wantReason    string
+	}{
+		{
+			name:          "red_serving_green_candidate",
+			rows:          []EventRow{retrievalRow(1, 0.15, recent), candidateRetrievalRow(2, 1.0, recent)},
+			wantGreen:     false,
+			wantPrecision: ptrF(0.15),
+			wantReason:    "precision eşik altında (<0.80)",
+		},
+		{
+			name:          "green_serving_red_candidate",
+			rows:          []EventRow{retrievalRow(1, 0.90, recent), candidateRetrievalRow(2, 0.10, recent)},
+			wantGreen:     true,
+			wantPrecision: ptrF(0.90),
+		},
+		{
+			name:       "only_candidate_rows",
+			rows:       []EventRow{candidateRetrievalRow(1, 1.0, recent), candidateRetrievalRow(2, 0.95, recent)},
+			wantGreen:  false,
+			wantReason: "veri yok",
+		},
+		{
+			name: "undecodable_candidate_flag_counts_and_is_red",
+			rows: []EventRow{
+				retrievalRow(1, 0.90, recent),
+				row(2, `{"precision":0.95,"candidate":"maybe"}`, recent),
+			},
+			wantGreen:  false,
+			wantReason: "kanıt çözümlenemedi",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := fakeEventReader{byKind: map[string][]EventRow{kindRetrievalResult: tc.rows}}
+			bg, err := EvaluateBuildGates(context.Background(), r, now)
+			if err != nil {
+				t.Fatalf("EvaluateBuildGates: %v", err)
+			}
+			if bg.Retrieval.Green != tc.wantGreen || bg.Retrieval.Reason != tc.wantReason {
+				t.Fatalf("retrieval = %+v, want green=%v reason=%q", bg.Retrieval, tc.wantGreen, tc.wantReason)
+			}
+			switch {
+			case tc.wantPrecision == nil && bg.Precision != nil:
+				t.Fatalf("precision = %v, want none", *bg.Precision)
+			case tc.wantPrecision != nil && (bg.Precision == nil || *bg.Precision != *tc.wantPrecision):
+				t.Fatalf("precision = %v, want %v (the serving config's)", bg.Precision, *tc.wantPrecision)
+			}
+		})
+	}
+}
+
+func ptrF(f float64) *float64 { return &f }
+
 // --- build gate: nil reader is fail-closed (all red) ------------------------
 
 func TestBuildGatesNilReaderIsRed(t *testing.T) {

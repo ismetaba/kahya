@@ -299,7 +299,9 @@ type RetrievalRunner struct {
 	// result). Run scores it too and ledgers its result under the
 	// candidate's own fusion_sha256, so a green run lets the next boot
 	// activate it through search.Searcher.ActivateFusionConfig. The active
-	// config's outcome (what the gates and the CLI read) is unchanged.
+	// config's outcome (what the gates and the CLI read) is unchanged, and
+	// the readiness build gate skips the candidate row (readiness.
+	// latestServingRetrieval), although it is the newest of the kind.
 	Candidate *RetrievalCandidate
 }
 
@@ -375,8 +377,10 @@ func (r *RetrievalRunner) Run(ctx context.Context, traceID string) (RetrievalOut
 }
 
 // ledgerResult writes one eval.retrieval.result event; a candidate result
-// carries candidate: true (the gate matches on fusion_sha256 alone, the flag
-// is for the reader).
+// carries candidate: true. EvalGate matches on fusion_sha256 alone; the flag
+// is for the readers that take the newest row of the kind - the W78-06
+// readiness build gate skips flagged rows, so a candidate pass never
+// stands in for the serving config's result.
 func (r *RetrievalRunner) ledgerResult(ctx context.Context, traceID string, rep RetrievalReport, datasetSHA, fusionSHA string, candidate bool) error {
 	payload := map[string]any{
 		"trace_id":       traceID,

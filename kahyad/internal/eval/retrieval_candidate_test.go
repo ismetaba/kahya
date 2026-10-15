@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"kahya/kahyad/internal/readiness"
 	"kahya/kahyad/internal/search"
 )
 
@@ -126,6 +127,73 @@ func TestRetrievalCandidateGreenUnlocksOnlyItsOwnActivation(t *testing.T) {
 			// sha is never unlocked by the candidate's result.
 			if allowed, _ := g.CheckFusionActivation("f-active"); allowed {
 				t.Fatal("the candidate result must not unlock the active fusion sha")
+			}
+		})
+	}
+}
+
+// readinessRows serves the runner's ledgered rows to readiness, the way
+// kahyad's readinessEvidenceReader does over the events table.
+type readinessRows []readiness.EventRow
+
+func (r readinessRows) ListEventsByKind(_ context.Context, kind string) ([]readiness.EventRow, error) {
+	if kind != EventRetrievalResult {
+		return nil, nil
+	}
+	return r, nil
+}
+
+// TestRetrievalCandidateNeverDrivesReadinessGate (FIX-MEM-8 review): the
+// candidate pass is ledgered after the serving config's result, so it is the
+// newest eval.retrieval.result. kahya readiness / GET /readiness (the W78-06
+// build gate) must still score the serving config - what this run's CLI
+// output and the consolidation gate report - in both directions: a red
+// serving config with a green candidate stays red, a green serving config
+// with a red candidate stays green. This pins the writer's candidate payload
+// to the reader that skips it (readiness keeps its own kind constant).
+func TestRetrievalCandidateNeverDrivesReadinessGate(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name          string
+		servingGreen  bool
+		candidateGood bool
+	}{{"red_serving_green_candidate", false, true}, {"green_serving_red_candidate", true, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			good, _ := synthFixture(t)
+			empty := &fakeRetrievalSearcher{byQuery: map[string][]search.Hit{}}
+			var serving, cand RetrievalSearcher = empty, empty
+			if tc.servingGreen {
+				serving = good
+			}
+			if tc.candidateGood {
+				cand = good
+			}
+			logger := &recordingLogger{}
+			r := &RetrievalRunner{
+				DatasetPath: "testdata/dataset.synth.jsonl", ModelVer: "m1", FusionSHA256: "f-active",
+				Searcher: serving, EventLogger: logger,
+				Candidate: &RetrievalCandidate{FusionSHA256: "f-cand", Searcher: cand},
+			}
+			out, err := r.Run(context.Background(), "trace-readiness")
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if (out.Report.Precision >= MinPrecision) != tc.servingGreen || (out.Candidate.Report.Precision >= MinPrecision) != tc.candidateGood {
+				t.Fatalf("fixture: serving precision %v, candidate precision %v", out.Report.Precision, out.Candidate.Report.Precision)
+			}
+			var rows readinessRows
+			for _, er := range eventRowsFrom(t, logger.events, now) {
+				rows = append(rows, readiness.EventRow{ID: er.ID, Payload: er.Payload, CreatedAt: er.CreatedAt})
+			}
+			bg, err := readiness.EvaluateBuildGates(context.Background(), rows, now)
+			if err != nil {
+				t.Fatalf("EvaluateBuildGates: %v", err)
+			}
+			if bg.Retrieval.Green != tc.servingGreen {
+				t.Fatalf("readiness retrieval green = %v, want %v (the serving config's verdict, precision %v)", bg.Retrieval.Green, tc.servingGreen, out.Report.Precision)
+			}
+			if bg.Precision == nil || *bg.Precision != out.Report.Precision {
+				t.Fatalf("readiness precision = %v, want the serving config's %v", bg.Precision, out.Report.Precision)
 			}
 		})
 	}
