@@ -205,7 +205,7 @@ func TestIngestFileWritesExternalDocNoteAndFacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	if res.File != "ingest/2026-10-08-acme-tasinma.md" || res.Lane != "normal" || res.SourceTier != "external_doc" ||
+	if res.File != "ingest/2026-10-08-acme-tasinma.md" || res.Lane != "normal" || res.ReaderLane != "normal" || res.SourceTier != "external_doc" ||
 		res.Facts != 1 || res.Entities != 2 || res.Chunks < 1 || res.EpisodeID == 0 || res.CommitSHA == "" {
 		t.Fatalf("result = %+v", res)
 	}
@@ -279,7 +279,7 @@ func TestIngestSecretLaneWritesUnderGizliAndNeverCloud(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	if res.Lane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/2026-10-08-") || f.cloudCalls != 0 || f.localCalls != 1 {
+	if res.Lane != "secret" || res.ReaderLane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/2026-10-08-") || f.cloudCalls != 0 || f.localCalls != 1 {
 		t.Fatalf("result = %+v (cloud %d, local %d)", res, f.cloudCalls, f.localCalls)
 	}
 	note, _ := os.ReadFile(filepath.Join(f.memDir, res.File))
@@ -322,6 +322,12 @@ func TestIngestNoteContentSecretMovesNoteToSecretLane(t *testing.T) {
 	}
 	if res.Lane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/") || f.lastPayload(EventDone)["lane_reason"] != "note_content" {
 		t.Fatalf("result = %+v, done = %v", res, f.lastPayload(EventDone))
+	}
+	// FIX-MEM-6 review: the document WAS read by the cloud Reader - the
+	// result and the ledger say so (the CLI then never claims "yalnız yerel
+	// model").
+	if res.ReaderLane != "normal" || f.cloudCalls != 1 || f.localCalls != 0 || f.lastPayload(EventDone)["reader_lane"] != "normal" {
+		t.Fatalf("reader lane = %q (cloud %d, local %d), done = %v", res.ReaderLane, f.cloudCalls, f.localCalls, f.lastPayload(EventDone))
 	}
 	var quote sql.NullString
 	if err := f.st.DB().QueryRow(`SELECT quote FROM facts`).Scan(&quote); err != nil || quote.Valid {
@@ -617,7 +623,7 @@ func TestIngestSecretGlobSourcePathForcesLocal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Ingest: %v", err)
 			}
-			if f.cloudCalls != 0 || f.localCalls != 1 || res.Lane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/") {
+			if f.cloudCalls != 0 || f.localCalls != 1 || res.Lane != "secret" || res.ReaderLane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/") {
 				t.Fatalf("result = %+v (cloud %d, local %d)", res, f.cloudCalls, f.localCalls)
 			}
 			if r := f.lastPayload(EventDone)["lane_reason"]; r != LaneReasonPathGlob {

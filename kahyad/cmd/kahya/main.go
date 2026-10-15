@@ -1088,8 +1088,15 @@ func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io
 		lane = MsgIngestLaneSecret
 	}
 	fmt.Fprintf(stdout, MsgIngestDone+"\n", res.File, res.Chunks, res.Facts, res.Entities, res.SourceTier, lane)
-	if res.Lane == "secret" {
+	// The lock badge says "yalnız yerel model": only when the LOCAL model
+	// read the document (reader_lane). A note stored secret-lane after the
+	// cloud Reader read it (its summary looked sensitive) says so instead;
+	// an answer without reader_lane claims nothing about the model.
+	switch {
+	case res.Lane == "secret" && res.ReaderLane == "secret":
 		fmt.Fprintf(stdout, MsgIngestSecretBadge+"\n", res.File)
+	case res.Lane == "secret" && res.ReaderLane == "normal":
+		fmt.Fprintf(stdout, MsgIngestSecretAfterCloudRead+"\n", res.File)
 	}
 	fmt.Fprintf(stdout, MsgIngestQuarantineHint+"\n", res.File)
 	return 0

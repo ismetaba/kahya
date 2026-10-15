@@ -803,10 +803,14 @@ a cloud model, without changing anything in §2-§6 above:
   after `backup.EnsureDirIgnored` wrote its anchored `.gitignore` line under
   kahya_dir; the raw store is never indexed and is self-protected from
   worker writes. Ledger `ingest.done {file, episode_id, lane, lane_reason
-  (reader | path_glob | forced | note_content), source_ref, sha256, facts, entities, chunks, raw_kept, commit_sha,
+  (reader | path_glob | forced | note_content), reader_lane, source_ref,
+  sha256, facts, entities, chunks, raw_kept, commit_sha,
   source_tier}` / `ingest.failed {reason, sha256, source_ref, ...}`. 200 →
-  `{ok, file, episode_id, commit_sha, lane, chunks, facts, entities,
-  source_tier, raw_path, sha256, trace_id}`. Everything ingested is
+  `{ok, file, episode_id, commit_sha, lane, reader_lane, chunks, facts,
+  entities, source_tier, raw_path, sha256, trace_id}` - `lane` is where the
+  note is stored, `reader_lane` which model read the document (`secret` =
+  the local model only, `normal` = the cloud Reader); they differ only for
+  `note_content` (FIX-MEM-6 review). Everything ingested is
   quarantined (external_doc, decision MEM-6.a) until `kahya memory confirm`
   / `kahya fact confirm`. URL ingest (`--url`, `x/net/html`) is deferred
   (decision MEM-6.d: `curl … | kahya ingest -`). CLI (FIX-MEM-6 phase 3):
@@ -815,8 +819,11 @@ a cloud model, without changing anything in §2-§6 above:
   source, and that path plus its symlink-resolved form are always sent as
   `source_paths`, even under `--source`; the note's name follows --title, then the source label, then the
   Reader's title) prints `"Belge alındı: %s (%d parça, %d olgu, %d varlık;
-  katman: %s, şerit: %s)"`, on the secret lane `"🔒 Belge gizli şerit olarak
-  işlendi (yalnız yerel model); not: %s"`, then `"Not ve olgular onaysız
+  katman: %s, şerit: %s)"`, when the local model read it (`reader_lane`
+  secret) `"🔒 Belge gizli şerit olarak işlendi (yalnız yerel model); not:
+  %s"`, when the cloud Reader read it and the note was stored secret-lane
+  (`note_content`) `"Belge bulut modeliyle okundu; özeti hassas göründüğü
+  için not gizli şeride kaydedildi: %s"` instead, then `"Not ve olgular onaysız
   (external_doc); otomatik hatırlatmaya girmesi için: kahya memory confirm
   %s"`; a 413 prints `"Dosya çok büyük (en fazla %d bayt)."`, the no-local-
   model refusal its handbook text, any other refusal the daemon's Turkish

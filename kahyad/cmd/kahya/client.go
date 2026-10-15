@@ -1242,6 +1242,7 @@ type ingestResult struct {
 	File       string `json:"file"`
 	EpisodeID  int64  `json:"episode_id"`
 	Lane       string `json:"lane"`
+	ReaderLane string `json:"reader_lane"`
 	Chunks     int    `json:"chunks"`
 	Facts      int    `json:"facts"`
 	Entities   int    `json:"entities"`

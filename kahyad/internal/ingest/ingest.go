@@ -36,9 +36,11 @@
 //  7. the raw bytes are kept, when configured, in Config.RawDir (outside
 //     the memory dir, never indexed; its anchored .gitignore line under
 //     kahya_dir is ensured first - no line, no raw copy);
-//  8. ingest.done {file, episode_id, lane, source_ref, sha256, facts,
-//     entities, raw_kept, ...} is ledgered; every refusal or failure
-//     ledgers ingest.failed {reason, ...}.
+//  8. ingest.done {file, episode_id, lane, reader_lane, lane_reason,
+//     source_ref, sha256, facts, entities, raw_kept, ...} is ledgered
+//     (lane = where the note is stored, reader_lane = which model read the
+//     document); every refusal or failure ledgers ingest.failed {reason,
+//     ...}.
 //
 // Every ingested note and fact is quarantined (external_doc, unconfirmed):
 // nothing reaches reflex injection until the user confirms it (`kahya
@@ -237,10 +239,17 @@ type Request struct {
 
 // Result is a completed ingest.
 type Result struct {
-	File       string `json:"file"`
-	EpisodeID  int64  `json:"episode_id"`
-	CommitSHA  string `json:"commit_sha"`
+	File      string `json:"file"`
+	EpisodeID int64  `json:"episode_id"`
+	CommitSHA string `json:"commit_sha"`
+	// Lane is where the note is stored ("secret" = under the secret-lane
+	// dir). ReaderLane is the model that READ the document: "secret" = the
+	// local model only, "normal" = the cloud Reader. They differ only for
+	// lane_reason note_content (a cloud-read answer whose note looked
+	// sensitive is stored secret-lane) - "yalnız yerel model" may be said
+	// only when ReaderLane is "secret".
 	Lane       string `json:"lane"`
+	ReaderLane string `json:"reader_lane"`
 	Chunks     int    `json:"chunks"`
 	Facts      int    `json:"facts"`
 	Entities   int    `json:"entities"`
@@ -334,7 +343,9 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 		return fail(ingestError(ReasonCloudFailed, fmt.Sprintf(MsgIngestCloudFailedFmt, err.Error()), err), map[string]any{"lane": lane})
 	}
 
-	// Step 4: the note, from validated fields only.
+	// Step 4: the note, from validated fields only. readerLane keeps which
+	// model read the document; lane may still move to secret below.
+	readerLane := lane
 	title := firstNonEmpty(req.Title, out.Title, labelTitle(req.SourceRef), "Belge")
 	body := renderNoteBody(title, out)
 	if lane == router.LaneNormal && secretlane.ClassifyDeterministic(body).SecretLane {
@@ -389,11 +400,11 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 		chunks = len(cs)
 	}
 	res := Result{
-		File: note.File, EpisodeID: note.EpisodeID, CommitSHA: note.CommitSHA, Lane: lane, Chunks: chunks,
+		File: note.File, EpisodeID: note.EpisodeID, CommitSHA: note.CommitSHA, Lane: lane, ReaderLane: readerLane, Chunks: chunks,
 		Facts: st.Facts, Entities: st.Entities, SourceTier: factengine.TierExternalDoc, RawPath: rawPath, SHA256: digest,
 	}
 	payload := map[string]any{
-		"file": res.File, "episode_id": res.EpisodeID, "lane": lane, "lane_reason": laneReason,
+		"file": res.File, "episode_id": res.EpisodeID, "lane": lane, "lane_reason": laneReason, "reader_lane": readerLane,
 		"source_ref": req.SourceRef, "sha256": digest, "facts": st.Facts, "entities": st.Entities,
 		"chunks": chunks, "raw_kept": rawPath != "", "commit_sha": note.CommitSHA, "source_tier": res.SourceTier,
 	}
@@ -401,7 +412,7 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 		payload["raw_skipped"] = rawSkip
 	}
 	r.ledger(ctx, traceID, EventDone, payload)
-	r.logInfo(traceID, "ingest_done", "file", res.File, "lane", lane, "facts", st.Facts, "entities", st.Entities, "raw_kept", rawPath != "")
+	r.logInfo(traceID, "ingest_done", "file", res.File, "lane", lane, "reader_lane", readerLane, "facts", st.Facts, "entities", st.Entities, "raw_kept", rawPath != "")
 	return res, nil
 }
 

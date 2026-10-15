@@ -16,10 +16,12 @@ import (
 // ingestFake records the POST /v1/ingest body and answers a fixture (or a
 // refusal).
 type ingestFake struct {
-	body     map[string]any
-	lane     string
-	status   int
-	errorRes map[string]any
+	body map[string]any
+	lane string
+	// readerLane is the answer's reader_lane ("" = omitted).
+	readerLane string
+	status     int
+	errorRes   map[string]any
 }
 
 func (f *ingestFake) handler() http.Handler {
@@ -36,8 +38,12 @@ func (f *ingestFake) handler() http.Handler {
 		if f.lane == "secret" {
 			file = "gizli/ingest/2026-10-08-not.md"
 		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "file": file, "episode_id": 3, "lane": f.lane,
-			"chunks": 1, "facts": 2, "entities": 3, "source_tier": "external_doc"})
+		res := map[string]any{"ok": true, "file": file, "episode_id": 3, "lane": f.lane,
+			"chunks": 1, "facts": 2, "entities": 3, "source_tier": "external_doc"}
+		if f.readerLane != "" {
+			res["reader_lane"] = f.readerLane
+		}
+		json.NewEncoder(w).Encode(res)
 	})
 	return mux
 }
@@ -86,9 +92,10 @@ func TestIngestCLIReadsStdinAndPrintsTurkish(t *testing.T) {
 }
 
 // TestIngestCLISecretBadge: --secret asks for the local lane, and a
-// secret-lane result prints the lock badge naming the note.
+// result the LOCAL model read (reader_lane secret) prints the lock badge
+// naming the note.
 func TestIngestCLISecretBadge(t *testing.T) {
-	fake := &ingestFake{lane: "secret"}
+	fake := &ingestFake{lane: "secret", readerLane: "secret"}
 	code, out, _ := runIngestCLI(t, fake, "tahlil sonuçları\n", "-", "--secret")
 	if code != 0 || fake.body["lane_hint"] != "secret" {
 		t.Fatalf("exit = %d body = %v", code, fake.body)
@@ -186,5 +193,28 @@ func TestIngestCLISendsTheSourceFilePaths(t *testing.T) {
 	}
 	if code, _, _ := runIngestCLI(t, fake, "x\n", "-"); code != 0 || fake.body["source_paths"] != nil {
 		t.Fatalf("stdin source_paths = %v, want none", fake.body["source_paths"])
+	}
+}
+
+// TestIngestCLINoteMovedToSecretAfterCloudReadIsHonest (FIX-MEM-6 review):
+// a note stored on the secret lane although the CLOUD Reader read the
+// document (its summary tripped the deterministic pre-pass) never gets the
+// "yalnız yerel model" badge - the CLI says the cloud read it. An answer
+// without reader_lane claims nothing about the model either.
+func TestIngestCLINoteMovedToSecretAfterCloudReadIsHonest(t *testing.T) {
+	fake := &ingestFake{lane: "secret", readerLane: "normal"}
+	code, out, errOut := runIngestCLI(t, fake, "Annual checkup notes.\n", "-")
+	if code != 0 {
+		t.Fatalf("exit = %d %q", code, errOut)
+	}
+	want := "Belge alındı: gizli/ingest/2026-10-08-not.md (1 parça, 2 olgu, 3 varlık; katman: external_doc, şerit: gizli)\n" +
+		"Belge bulut modeliyle okundu; özeti hassas göründüğü için not gizli şeride kaydedildi: gizli/ingest/2026-10-08-not.md\n" +
+		"Not ve olgular onaysız (external_doc); otomatik hatırlatmaya girmesi için: kahya memory confirm gizli/ingest/2026-10-08-not.md\n"
+	if out != want {
+		t.Fatalf("stdout =\n%q\nwant\n%q", out, want)
+	}
+	fake = &ingestFake{lane: "secret"}
+	if code, out, _ := runIngestCLI(t, fake, "x\n", "-"); code != 0 || strings.Contains(out, "yalnız yerel model") || strings.Contains(out, "bulut modeliyle") {
+		t.Fatalf("no reader_lane: exit %d, stdout %q - want no claim about the model", code, out)
 	}
 }

@@ -82,7 +82,7 @@ func ingestBody(doc, source string) string {
 func TestIngestRouteHappyPath(t *testing.T) {
 	f, cloudCalls := newIngestFixture(t, 1<<20)
 	status, res := postIngest(t, f.client, ingestBody(ingestRouteDoc, "not"))
-	if status != http.StatusOK || res["ok"] != true || res["lane"] != "normal" || res["source_tier"] != "external_doc" || res["facts"] != float64(1) || *cloudCalls != 1 {
+	if status != http.StatusOK || res["ok"] != true || res["lane"] != "normal" || res["reader_lane"] != "normal" || res["source_tier"] != "external_doc" || res["facts"] != float64(1) || *cloudCalls != 1 {
 		t.Fatalf("ingest = %d %v (cloud calls %d)", status, res, *cloudCalls)
 	}
 	file, _ := res["file"].(string)
@@ -210,7 +210,7 @@ func TestIngestRouteSourcePathSecretGlobStaysLocal(t *testing.T) {
 		return string(b)
 	}
 	status, res := postIngest(t, f.client, body("/Users/x/Documents/kimlik/zeynep.txt"))
-	if status != http.StatusOK || res["lane"] != "secret" || !strings.HasPrefix(res["file"].(string), "gizli/ingest/") || *cloudCalls != 0 || *localCalls != 1 {
+	if status != http.StatusOK || res["lane"] != "secret" || res["reader_lane"] != "secret" || !strings.HasPrefix(res["file"].(string), "gizli/ingest/") || *cloudCalls != 0 || *localCalls != 1 {
 		t.Fatalf("ingest = %d %v (cloud %d, local %d)", status, res, *cloudCalls, *localCalls)
 	}
 	if status, res := postIngest(t, f.client, body("Documents/kimlik/zeynep.txt")); status != http.StatusBadRequest || res["reason"] != ingest.ReasonBadRequest {

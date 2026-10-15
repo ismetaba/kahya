@@ -690,4 +690,9 @@ const (
 	// labels.
 	MsgIngestLaneSecret = "gizli"
 	MsgIngestLaneNormal = "normal"
+	// MsgIngestSecretAfterCloudRead (FIX-MEM-6 review; replaces the lock
+	// badge, which says "yalnız yerel model", when it would be false): the
+	// CLOUD Reader read the document and the note was stored on the secret
+	// lane only because its summary looked sensitive (%s = the note).
+	MsgIngestSecretAfterCloudRead = "Belge bulut modeliyle okundu; özeti hassas göründüğü için not gizli şeride kaydedildi: %s"
 )
