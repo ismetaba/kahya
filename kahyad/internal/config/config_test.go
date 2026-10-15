@@ -2103,3 +2103,39 @@ func TestLoadIngestDefaultsAndValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestRestoreProfileNeverAnchors (FIX-FINAL ops-restore-scratch-pollutes-
+// prod-anchor-remote): every profile reads prod's config.yaml, so the
+// restore drill's scratch daemon inherited prod's anchor_remote and pushed
+// its forked ledger's checkpoint there - a permanent false tamper alarm on
+// prod's next verify. Under KAHYA_ENV=restore the remote and the local
+// fallback file are cleared (file and env layers alike); dev keeps them
+// (the hermetic harnesses rely on that).
+func TestRestoreProfileNeverAnchors(t *testing.T) {
+	for _, env := range []string{EnvRestore, EnvDev} {
+		t.Run(env, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("KAHYA_ENV", env)
+			writeConfigYAML(t, home, "anchor_remote: git@example.invalid:kahya/anchor.git\nanchor_local_fallback_path: /tmp/kahya-anchor-fallback.jsonl\n")
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if env == EnvRestore {
+				if cfg.AnchorRemote != "" || cfg.AnchorLocalFallbackPath != "" {
+					t.Fatalf("restore: remote=%q fallback=%q, want both empty", cfg.AnchorRemote, cfg.AnchorLocalFallbackPath)
+				}
+				t.Setenv("KAHYA_ANCHOR_REMOTE", "git@example.invalid:kahya/env.git")
+				if cfg, err = Load(); err != nil || cfg.AnchorRemote != "" {
+					t.Fatalf("restore with KAHYA_ANCHOR_REMOTE: remote=%q err=%v, want empty", cfg.AnchorRemote, err)
+				}
+				return
+			}
+			if cfg.AnchorRemote == "" {
+				t.Fatalf("dev: remote=%q, want the remote kept", cfg.AnchorRemote)
+			}
+		})
+	}
+}

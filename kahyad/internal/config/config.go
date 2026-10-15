@@ -28,6 +28,11 @@ import (
 const (
 	EnvProd = "prod"
 	EnvDev  = "dev"
+	// EnvRestore is the W78-05 restore drill's scratch profile
+	// (scripts/restore-drill.sh): a daemon booted on a restored COPY of
+	// prod's brain.db while prod keeps running. Its ledger is a fork of
+	// prod's by construction, so it never anchors (Load).
+	EnvRestore = "restore"
 )
 
 // CredentialMode values accepted for Config.CredentialMode (W12-08).
@@ -1214,6 +1219,21 @@ func Load() (Config, error) {
 	// above) has already had its say.
 	if err := refuseNonProdProfileOpeningProdDB(cfg, home); err != nil {
 		return Config{}, err
+	}
+
+	// FIX-FINAL ops-restore-scratch-pollutes-prod-anchor-remote: every
+	// profile reads prod's config.yaml, so the restore drill's scratch
+	// daemon inherited prod's anchor_remote (and fallback file) and pushed
+	// its own diverged ledger checkpoint there at boot and at shutdown -
+	// with FIX-P-3's authoritative remote lines, prod's next `kahya ledger
+	// verify` then failed with a permanent digest_mismatch / remote_ahead
+	// false tamper alarm. A restore scratch ledger is a fork of prod by
+	// construction: with no remote, Pusher.Run is a no-op and the Verifier
+	// checks local consistency only. Restore-only: the dev harnesses rely
+	// on anchor_remote under KAHYA_ENV=dev.
+	if cfg.Env == EnvRestore {
+		cfg.AnchorRemote = ""
+		cfg.AnchorLocalFallbackPath = ""
 	}
 
 	return cfg, nil

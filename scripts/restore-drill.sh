@@ -256,6 +256,18 @@ R_EPISODES="${R_COUNTS##*,}"
 [ "$R_EPISODES" -ge "$REF_EPISODES" ] || fail "restored episodes $R_EPISODES < reference $REF_EPISODES (episodes did not survive)"
 echo "    ledger survives: events $R_EVENTS>=$REF_EVENTS, episodes $R_EPISODES>=$REF_EPISODES"
 
+# --- 9b. the scratch daemon never anchored -----------------------------------
+# FIX-FINAL ops-restore-scratch-pollutes-prod-anchor-remote: a restore
+# profile clears anchor_remote / anchor_local_fallback_path (config.Load), so
+# its forked ledger can never land a checkpoint on prod's anchor remote. Stop
+# it (the graceful-shutdown push included) and prove nothing was pushed.
+cleanup
+trap - EXIT
+if grep -q -e '"anchor_pushed"' -e 'anchor_local_fallback_written' /tmp/kahyad-restore-drill.log; then
+	fail "the scratch kahyad anchored its forked ledger (see /tmp/kahyad-restore-drill.log) -- prod's anchor remote may now hold a diverged checkpoint"
+fi
+echo "    scratch daemon stopped; it never anchored"
+
 # --- 10. report the result to PRODUCTION kahyad over its UDS ------------------
 # kahyad (the sole brain.db writer) records restore.drill.result; this script
 # never writes SQL to production brain.db itself.
