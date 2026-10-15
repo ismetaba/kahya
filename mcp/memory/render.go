@@ -10,7 +10,9 @@
 // already uses for Searcher/Reindexer).
 //
 // render.go implements only the <hafiza> block renderer (W12-05 step 2);
-// server.go implements the three tool registrations/handlers.
+// dedupe.go removes the chunker's overlap between consecutive chunks before
+// rendering (FIX-MEM-8); server.go implements the three tool
+// registrations/handlers.
 package memory
 
 import (

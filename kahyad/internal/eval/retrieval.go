@@ -151,6 +151,14 @@ type RetrievalSearcher interface {
 // absolute cosine/BM25 signal, not the min-max-normalized fused score) is
 // future reranker work (HANDOFF §8, "only if eval precision falls short");
 // this eval measures exactly what the live path injects today.
+//
+// The live block also removes the chunker's overlap between two consecutive
+// chunks of one note (FIX-MEM-8, memory.RenderKeptDeduped). That only trims
+// the later chunk's prefix - text the earlier chunk shows in full in the
+// same block - and never drops a hit (decision MEM-8.a), so the injected SET
+// is unchanged and injectedSet needs no dedupe of its own. (Only a substring
+// that spans the trim point - the chunker's "\n\n" piece separator - is no
+// longer contiguous in the block.)
 func injectedSet(hits []search.Hit, k int) []search.Hit {
 	if k <= 0 {
 		k = DefaultRetrievalK

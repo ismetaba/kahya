@@ -1001,7 +1001,12 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		for i, h := range filtered {
 			memHits[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
 		}
-		block, kept := memory.RenderKept(memHits, memory.DefaultTopK)
+		// FIX-MEM-8: the chunker's overlap between two consecutive chunks of
+		// one note is rendered once (memory.RenderKeptDeduped trims the later
+		// chunk's prefix, never drops a hit - decision MEM-8.a). It runs
+		// after the tier filter above, so no quarantined chunk comes back
+		// (HANDOFF §5 memory #1). The raw results above stay untrimmed.
+		block, kept := memory.RenderKeptDeduped(memHits, memory.DefaultTopK, indexer.OverlapRunes)
 		resp.HafizaBlock = block
 
 		// W12-05 step 1c/HANDOFF §5 safety #4: ledger the EXACT injected

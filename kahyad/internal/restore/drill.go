@@ -9,7 +9,8 @@
 //
 //   - RunEquivalence: replicates kahyad/internal/server.handleMemorySearch's
 //     for_injection=true path in-process (search.Searcher over brain.db ->
-//     factengine.TierInjectionEligible filter -> mcp/memory.RenderKept), so a
+//     factengine.TierInjectionEligible filter -> mcp/memory.RenderKeptDeduped,
+//     the overlap-deduping renderer, FIX-MEM-8), so a
 //     test (drill_test.go) can build the whole BUILD -> BACKUP -> RESTORE ->
 //     REINDEX -> COMPARE cycle hermetically over temp/scratch dbs without
 //     booting a child kahyad. The block RunEquivalence returns is byte-exact
@@ -41,6 +42,7 @@ import (
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/factengine"
+	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/search"
 
@@ -121,14 +123,18 @@ type InjectionResult struct {
 //     (factengine.TierInjectionEligible with confirmed=false - a chunk has no
 //     per-item human confirmation, only facts do), i.e. quarantine
 //     'agent_derived' episodes (HANDOFF S5 memory #1);
-//  3. mcp/memory.RenderKept(hits, memory.DefaultTopK) - the identical renderer
-//     (DefaultTopK=6, MaxBlockRunes=4000) the server uses.
+//  3. mcp/memory.RenderKeptDeduped(hits, memory.DefaultTopK,
+//     indexer.OverlapRunes) - the identical renderer (DefaultTopK=6,
+//     MaxBlockRunes=4000, the chunker overlap between consecutive chunks
+//     rendered once - FIX-MEM-8 / EK-MEM-B) the server uses.
 //
 // The returned Block is therefore byte-identical to what the server would
-// inject/ledger for the same query against the same db, which is what makes a
-// production-vs-restored byte-compare (after Normalize) a faithful equivalence
-// proof. traceID "" is fine - it only scopes a JSONL log line here, never the
-// block content.
+// inject/ledger for the same query against the same db when the server runs
+// the committed default fusion config with the embedder down (the drill
+// wires no embedder). Both sides of the drill's compare go through this
+// function, so the production-vs-restored byte-compare (after Normalize)
+// stays a faithful equivalence proof. traceID "" is fine - it only scopes a
+// JSONL log line here, never the block content.
 func RunEquivalence(ctx context.Context, db *sql.DB, log *logx.Logger, query string, k int) (InjectionResult, error) {
 	searcher := search.New(db, log, search.DefaultConfig())
 	hits, err := searcher.Search(ctx, "", query, k)
@@ -151,7 +157,7 @@ func RunEquivalence(ctx context.Context, db *sql.DB, log *logx.Logger, query str
 		})
 	}
 
-	block, kept := memory.RenderKept(memHits, memory.DefaultTopK)
+	block, kept := memory.RenderKeptDeduped(memHits, memory.DefaultTopK, indexer.OverlapRunes)
 	chunkIDs := make([]int64, len(kept))
 	for i, h := range kept {
 		chunkIDs[i] = h.ChunkID
