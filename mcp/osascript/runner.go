@@ -206,6 +206,15 @@ type Runner struct {
 	// path (tests); kahyad always wires it.
 	Receipts ReceiptExecutor
 
+	// OutputGate and SecretLaneGlobs (FIX-FINAL tool-output-secret-lane-
+	// unclassified): an AppleScript `read POSIX file ...` or a shortcut's
+	// output can carry secret-lane file bytes. stdout+stderr are classified
+	// (and a shortcuts_run --input-path under a secret glob is a path hit)
+	// before the result is returned, on the fresh and the replay path. Zero
+	// values = no gate (tests).
+	OutputGate      mcpfs.OutputGate
+	SecretLaneGlobs []string
+
 	// timeoutUnit scales hardTimeoutSeconds into a time.Duration
 	// (defaults to time.Second; tests shrink this to time.Millisecond so
 	// a timeout/kill test runs in milliseconds, never a real 120s wait —
@@ -269,6 +278,9 @@ func (r *Runner) run(ctx context.Context, traceID, taskID, tool string, lang Lan
 	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
 		return ScriptOutput{}, fmt.Errorf("%s: %w", tool, err)
 	} else if hit {
+		if err := r.gateOutput(ctx, traceID, taskID, tool, false, stored.Stdout, stored.Stderr); err != nil {
+			return ScriptOutput{}, err
+		}
 		return replayedScript(ctx, r, traceID, taskID, tool, stored), nil
 	}
 
@@ -335,10 +347,22 @@ func (r *Runner) run(ctx context.Context, traceID, taskID, tool string, lang Lan
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return ScriptOutput{}, fmt.Errorf("%s: decode result: %w", tool, err)
 	}
+	if err := r.gateOutput(ctx, traceID, taskID, tool, false, out.Stdout, out.Stderr); err != nil {
+		return ScriptOutput{}, err
+	}
 	if replayed {
 		return replayedScript(ctx, r, traceID, taskID, tool, out), nil
 	}
 	return out, nil
+}
+
+// gateOutput runs the secret-lane output gate (FIX-FINAL
+// tool-output-secret-lane-unclassified) for one osascript/shortcuts result.
+func (r *Runner) gateOutput(ctx context.Context, traceID, taskID, tool string, pathHit bool, texts ...string) error {
+	_, err := r.OutputGate.Check(ctx, traceID, taskID, tool, pathHit,
+		func(kind string, payload map[string]any) { logAndLedger(ctx, r.Ledger, r.Log, traceID, kind, payload) },
+		texts...)
+	return err
 }
 
 // replayedScript marks a receipt-replayed applescript_run/jxa_run result and

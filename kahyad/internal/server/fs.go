@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 
+	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/secretlane"
@@ -165,7 +166,34 @@ const (
 const (
 	laneSourceFSRead      = "fs_read"
 	laneSourceMemoryWrite = "memory_write"
+	// FIX-FINAL tool-output-secret-lane-unclassified: the tool-output
+	// ingestion points (mcp/fs.OutputGate).
+	LaneSourceShellHost   = "shell_host"
+	LaneSourceShellDocker = "shell_docker"
+	LaneSourceOsascript   = "osascript"
 )
+
+// NewToolLaneEscalator is NewFSLaneEscalator for a tool whose OUTPUT can
+// carry file bytes (FIX-FINAL tool-output-secret-lane-unclassified):
+// shell_host, shell_docker and the osascript tools escalate the calling
+// task through the identical attribution-pinned resolution, ledgered with
+// source naming the tool (LaneSource*).
+func NewToolLaneEscalator(q TaskLaneQueries, ledger EventLogger, source string) mcpfs.LaneEscalator {
+	return laneEscalator{lanes: NewSecretLaneStoreAdapter(q), ledger: ledger, source: source}
+}
+
+// NewToolOutputGate builds the mcp/fs.OutputGate main.go wires into
+// shell_host, shell_docker and the osascript runner: the SAME
+// deterministic classifier, durable egress mark and escalator fs_read uses
+// (FIX-FINAL tool-output-secret-lane-unclassified). gate may be nil (no
+// mark - tests only).
+func NewToolOutputGate(q TaskLaneQueries, ledger EventLogger, gate *egress.Gate, source string) mcpfs.OutputGate {
+	g := mcpfs.OutputGate{Classifier: NewFSContentClassifier(), Escalator: NewToolLaneEscalator(q, ledger, source)}
+	if gate != nil {
+		g.Marker = NewEgressSensitiveMarker(gate)
+	}
+	return g
+}
 
 // laneEscalator adapts kahyad/internal/secretlane.EscalateVerdict to
 // mcp/fs.LaneEscalator (FIX-B-6) and mcp/memory.LaneEscalator (FIX-U-3) -

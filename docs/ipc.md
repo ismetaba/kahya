@@ -513,6 +513,25 @@ a cloud model, without changing anything in §2-§6 above:
   (`secretlane.ErrCloudBlockedLookupFailed`, not `ErrCloudBlocked`) and
   raises no notice. Since FIX-U-4 the secret-lane refusal ends the task
   terminally (`failed`, see layer 2 above), so no resume respawns it.
+- **Mid-task escalation at `shell_host` / `shell_docker` / the osascript
+  tools (FIX-FINAL tool-output-secret-lane-unclassified).** A tool whose
+  RESULT can carry file bytes runs fs_read's seam (`mcp/fs.OutputGate`,
+  wired in main.go through `server.NewToolOutputGate`: the same
+  deterministic classifier, durable sensitive-read mark and
+  attribution-pinned escalator, ledger `secret_lane_escalated{source:
+  shell_host | shell_docker | osascript}`) before the result is returned,
+  on the fresh and the receipt-replay path. A path hit: a `shell_host` git
+  repo that is, or holds, a secret-glob directory (its history carries the
+  notes - `git -C ~/Kahya log -p`), a git path argument (a `<rev>:`
+  prefix stripped) or an `ls`/`stat` target under a secret glob, a
+  `shell_docker` workdir under or holding one (escalated BEFORE the
+  container runs, so a `needs_network` run's egress is already
+  sensitive-marked), a `shortcuts_run --input-path` under one; otherwise
+  stdout+stderr are classified. The globs are policy.yaml's plus the raw
+  ingest store (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
+  G02-2) the task is escalated, the output still returned; a hit that
+  cannot be marked or escalated returns no output
+  (`mcp/fs.MsgSecretLaneOutputRefused`, ledger `secret_lane_read_refused`).
 - **Mid-task escalation at `memory_write` (FIX-U-3, G00 U-3).** The agent's
   `memory_write` content is classified LOCALLY before a single byte is
   written (`mcp/memory.SecretLaneSeam`, the SAME deterministic

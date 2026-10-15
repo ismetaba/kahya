@@ -386,6 +386,15 @@ type Runner struct {
 	// always wires it.
 	Receipts ReceiptExecutor
 
+	// SecretLaneGlobs and OutputGate (FIX-FINAL tool-output-secret-lane-
+	// unclassified): a workdir that is under, or holds, a secret-glob
+	// directory is a path hit - escalated BEFORE the container runs, so a
+	// needs_network run's egress is already sensitive-marked - and every
+	// other run's stdout+stderr are classified before they are returned, on
+	// the fresh and the receipt-replay path. Zero values = no gate (tests).
+	SecretLaneGlobs []string
+	OutputGate      mcpfs.OutputGate
+
 	// timeoutUnit scales RunInput.TimeoutS into a time.Duration (defaults
 	// to time.Second; tests shrink this to time.Millisecond so a
 	// timeout/kill test runs in milliseconds, never a real 300s wait —
@@ -506,6 +515,9 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: %w", err)
 	} else if hit {
+		if _, err := r.OutputGate.Check(ctx, traceID, taskID, "shell_docker", r.workdirSecret(cp.Match), r.recorder(ctx, traceID), stored.Stdout, stored.Stderr); err != nil {
+			return RunOutput{}, err
+		}
 		return r.replayedRun(ctx, traceID, taskID, stored), nil
 	}
 
@@ -582,6 +594,16 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		return RunOutput{}, fmt.Errorf("shell_docker: onay jetonu tüketilemedi: %w", err)
 	}
 	rin.Class, rin.ApprovalToken = decision.Class, decision.Token
+
+	// FIX-FINAL tool-output-secret-lane-unclassified: a secret-lane workdir
+	// escalates the task BEFORE the container can read (or, with
+	// needs_network, send) a byte of it.
+	workdirSecret := r.workdirSecret(cp.Match)
+	if workdirSecret {
+		if _, err := r.OutputGate.Check(ctx, traceID, taskID, "shell_docker", true, r.recorder(ctx, traceID)); err != nil {
+			return RunOutput{}, err
+		}
+	}
 
 	// The container run (FIX-I-4): everything after ConsumeToken is the
 	// effect, executed inside the receipt lifecycle on a context detached
@@ -664,10 +686,27 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return RunOutput{}, fmt.Errorf("shell_docker: decode result: %w", err)
 	}
+	if !workdirSecret {
+		if _, err := r.OutputGate.Check(ctx, traceID, taskID, "shell_docker", false, r.recorder(ctx, traceID), out.Stdout, out.Stderr); err != nil {
+			return RunOutput{}, err
+		}
+	}
 	if replayed {
 		return r.replayedRun(ctx, traceID, taskID, out), nil
 	}
 	return out, nil
+}
+
+// workdirSecret reports whether a canonical workdir is under, or holds, a
+// secret-lane glob directory (FIX-FINAL tool-output-secret-lane-
+// unclassified).
+func (r *Runner) workdirSecret(canonWorkdir string) bool {
+	return len(r.SecretLaneGlobs) > 0 && mcpfs.PathCoversSecretGlob(r.Home, canonWorkdir, r.SecretLaneGlobs)
+}
+
+// recorder is the output gate's ledger + JSONL sink for one request.
+func (r *Runner) recorder(ctx context.Context, traceID string) func(string, map[string]any) {
+	return func(kind string, payload map[string]any) { logAndLedger(ctx, r.Ledger, r.Log, traceID, kind, payload) }
 }
 
 // ShellDockerToolInput is the canonical envelope shell_docker's approval

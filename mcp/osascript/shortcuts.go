@@ -63,6 +63,14 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	}
 
 	toolInput := buildShortcutToolInput(name, canonInputPath)
+	// FIX-FINAL tool-output-secret-lane-unclassified: a shortcut fed a
+	// secret-lane file is a path hit for the output gate.
+	inputSecret := false
+	if canonInputPath != "" && len(r.SecretLaneGlobs) > 0 {
+		if hit, gerr := mcpfs.MatchesAnyGlobCI(canonInputPath, r.SecretLaneGlobs); gerr != nil || hit {
+			inputSecret = true
+		}
+	}
 
 	// FIX-I-4: same receipt order as applescript_run/jxa_run (runner.go).
 	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shortcuts_run", ArgsHash: mcpfs.ReceiptArgsHash(toolInput)}
@@ -70,6 +78,9 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
 		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: %w", err)
 	} else if hit {
+		if err := r.gateOutput(ctx, traceID, taskID, "shortcuts_run", inputSecret, stored.Stdout, stored.Stderr); err != nil {
+			return ShortcutOutput{}, err
+		}
 		return r.replayedShortcut(ctx, traceID, taskID, name, stored), nil
 	}
 
@@ -127,6 +138,9 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	var out ShortcutOutput
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return ShortcutOutput{}, fmt.Errorf("shortcuts_run: decode result: %w", err)
+	}
+	if err := r.gateOutput(ctx, traceID, taskID, "shortcuts_run", inputSecret, out.Stdout, out.Stderr); err != nil {
+		return ShortcutOutput{}, err
 	}
 	if replayed {
 		return r.replayedShortcut(ctx, traceID, taskID, name, out), nil

@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -171,6 +172,16 @@ type HostExec struct {
 	// Receipts is the FIX-I-4 receipt seam (see Runner.Receipts). nil =
 	// direct path (tests); kahyad always wires it.
 	Receipts ReceiptExecutor
+
+	// SecretLaneGlobs and OutputGate (FIX-FINAL tool-output-secret-lane-
+	// unclassified): shell_host's output (git show / log -p, ls, stat) can
+	// carry secret-lane file bytes. A repo that is or holds a secret-glob
+	// directory, an ls/stat target under one, or a git path argument under
+	// one is a path hit; otherwise stdout+stderr are classified. A hit runs
+	// fs_read's mark + escalation before the output is returned - on the
+	// fresh AND the receipt-replay path. Both nil/zero = no gate (tests).
+	SecretLaneGlobs []string
+	OutputGate      mcpfs.OutputGate
 }
 
 // NewHostExec constructs a production HostExec. exec may be nil (defaults
@@ -213,6 +224,9 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	if hit, err := mcpfs.ReplayReceipt(ctx, h.Receipts, rin, &stored); err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: %w", err)
 	} else if hit {
+		if err := h.gateOutput(ctx, traceID, taskID, plan, stored); err != nil {
+			return HostExecOutput{}, err
+		}
 		return h.replayed(ctx, traceID, taskID, stored), nil
 	}
 
@@ -272,10 +286,54 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return HostExecOutput{}, fmt.Errorf("shell_host: decode result: %w", err)
 	}
+	if err := h.gateOutput(ctx, traceID, taskID, plan, out); err != nil {
+		return HostExecOutput{}, err
+	}
 	if replayed {
 		return h.replayed(ctx, traceID, taskID, out), nil
 	}
 	return out, nil
+}
+
+// gateOutput runs the secret-lane output gate (FIX-FINAL
+// tool-output-secret-lane-unclassified) for one shell_host result.
+func (h *HostExec) gateOutput(ctx context.Context, traceID, taskID string, plan hostExecPlan, out HostExecOutput) error {
+	_, err := h.OutputGate.Check(ctx, traceID, taskID, "shell_host", h.pathHit(plan),
+		func(kind string, payload map[string]any) { logAndLedger(ctx, h.Ledger, h.Log, traceID, kind, payload) },
+		out.Stdout, out.Stderr)
+	return err
+}
+
+// pathHit reports whether the validated command reads below a secret-lane
+// path: the git repo is or holds a secret-glob directory (its history can
+// carry every note under it), a git path argument (a "<rev>:" prefix
+// stripped) lands under a secret glob, or an ls/stat target does.
+func (h *HostExec) pathHit(plan hostExecPlan) bool {
+	if len(h.SecretLaneGlobs) == 0 {
+		return false
+	}
+	if plan.canonRepo != "" {
+		if mcpfs.PathCoversSecretGlob(h.Home, plan.canonRepo, h.SecretLaneGlobs) {
+			return true
+		}
+		for _, a := range plan.gitArgs {
+			if i := strings.Index(a, ":"); i >= 0 {
+				a = a[i+1:]
+			}
+			if a == "" {
+				continue
+			}
+			if hit, err := mcpfs.MatchesAnyGlobCI(filepath.Join(plan.canonRepo, a), h.SecretLaneGlobs); err != nil || hit {
+				return true
+			}
+		}
+	}
+	for _, p := range plan.paths {
+		if hit, err := mcpfs.MatchesAnyGlobCI(p, h.SecretLaneGlobs); err != nil || hit {
+			return true
+		}
+	}
+	return false
 }
 
 // replayed marks a receipt-replayed shell_host result and ledgers
@@ -303,6 +361,11 @@ type hostExecPlan struct {
 	// env is the child's environment: gitScrubbedEnv() for git, nil
 	// (inherited, unchanged behavior) for ls/stat, which run no config.
 	env []string
+	// gitArgs are git's trailing arguments after the subcommand, and paths
+	// ls/stat's canonical targets in Match form - the secret-lane output
+	// gate's path inputs (FIX-FINAL tool-output-secret-lane-unclassified).
+	gitArgs []string
+	paths   []string
 }
 
 // validate is shell_host's ENTIRE security boundary for argv shape. Any
@@ -333,21 +396,23 @@ func (h *HostExec) validate(in HostExecArgs) (hostExecPlan, error) {
 		}
 		argv = append(argv, gitNoSubmoduleRecursionFlag) // all four subcommands
 		argv = append(argv, in.Args[1:]...)
-		return hostExecPlan{argv: argv, canonRepo: cp.Match, repoOp: cp.Op, env: gitScrubbedEnv()}, nil
+		return hostExecPlan{argv: argv, canonRepo: cp.Match, repoOp: cp.Op, env: gitScrubbedEnv(), gitArgs: append([]string(nil), in.Args[1:]...)}, nil
 
 	case "ls", "stat":
 		if err := validatePlainPaths(in.Args); err != nil {
 			return hostExecPlan{}, err
 		}
 		canonArgs := make([]string, 0, len(in.Args))
+		matchPaths := make([]string, 0, len(in.Args))
 		for _, a := range in.Args {
 			cp, cerr := mcpfs.Canonicalize(h.Home, a)
 			if cerr != nil {
 				return hostExecPlan{}, errHostExecDenied
 			}
 			canonArgs = append(canonArgs, cp.Op)
+			matchPaths = append(matchPaths, cp.Match)
 		}
-		return hostExecPlan{argv: append([]string{in.Command}, canonArgs...)}, nil
+		return hostExecPlan{argv: append([]string{in.Command}, canonArgs...), paths: matchPaths}, nil
 
 	default:
 		return hostExecPlan{}, errHostExecDenied

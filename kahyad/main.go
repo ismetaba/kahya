@@ -687,9 +687,18 @@ func run() int {
 	// registry the egress.Proxy listener below consults.
 	shellRunner.SetEgressTokenRegistrar(server.NewEgressTokenRegistrar(egressTokens))
 	shellRunner.Receipts = recExec
+	// FIX-FINAL tool-output-secret-lane-unclassified: shell_docker,
+	// shell_host and the osascript tools classify the bytes they return
+	// (and their secret-lane path inputs) with fs_read's seam - escalate,
+	// mark, never release on an unrecorded hit.
+	toolSecretGlobs := wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg)
+	shellRunner.SecretLaneGlobs = toolSecretGlobs
+	shellRunner.OutputGate = server.NewToolOutputGate(st.Queries, st, egressGate, server.LaneSourceShellDocker)
 
 	hostExec := mcpshell.NewHostExec(home, fsPolicyClient, st, server.NewFSLogger(log), nil)
 	hostExec.Receipts = recExec
+	hostExec.SecretLaneGlobs = toolSecretGlobs
+	hostExec.OutputGate = server.NewToolOutputGate(st.Queries, st, egressGate, server.LaneSourceShellHost)
 	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
 	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {
 		log.Warn("docker_unavailable_at_boot", "hint", "make docker-up")
@@ -710,6 +719,8 @@ func run() int {
 	// applescript_run/jxa_run do not).
 	osascriptRunner := mcposascript.NewRunner(home, fsPolicyClient, st, server.NewFSLogger(log))
 	osascriptRunner.Receipts = recExec
+	osascriptRunner.SecretLaneGlobs = toolSecretGlobs
+	osascriptRunner.OutputGate = server.NewToolOutputGate(st.Queries, st, egressGate, server.LaneSourceOsascript)
 	srv.SetOsascriptTool(mcposascript.New(osascriptRunner))
 
 	// POST /v1/task (W12-07): st.Queries already has exactly the
