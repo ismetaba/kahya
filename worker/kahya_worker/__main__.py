@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import plistlib
+import pwd
 import re
 import sys
 import time
@@ -294,6 +296,152 @@ def _check_provider_routing_env() -> str | None:
     return None
 
 
+# FIX-FINAL worker-cli-config-env-reintroduces-provider-routing: the bundled
+# CLI (2.1.202) re-applies an `env` map from its global config and from its
+# managed policySettings on top of the process environment, even under
+# `--setting-sources ""` (that flag only drops user/project/local settings;
+# flagSettings and policySettings are always loaded). So an
+# ANTHROPIC_BASE_URL or CLAUDE_CODE_USE_BEDROCK in ~/.claude.json, in
+# managed-settings.json, in the MDM plist or in the org's remote settings
+# would send the worker's model calls around kahyad's per-task proxy after
+# every check above passed on os.environ. The worker reads the same files
+# the CLI applies and refuses to start (exit 2) when any of them sets a
+# routing name. The path constants are module-level so tests can point
+# them at a temp tree.
+_MANAGED_SETTINGS_DIR = "/Library/Application Support/ClaudeCode"
+_MANAGED_PREFERENCES_DIR = "/Library/Managed Preferences"
+_MDM_PLIST_NAME = "com.anthropic.claudecode.plist"
+
+# Names a config-file env map must not set, besides isProviderRoutingEnv's
+# rules (any ANTHROPIC_*, CLAUDE_CODE_USE_*, CLAUDE_CODE_SKIP_*_AUTH and
+# _PROVIDER_ROUTING_EXACT): proxy and config redirection, a Node preload,
+# and the CLI's raw request-body override (unpriced routing fields).
+_CONFIG_ENV_REFUSED_EXACT = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "NODE_OPTIONS",
+        "CLAUDE_CODE_EXTRA_BODY",
+    }
+    | set(_PROVIDER_ROUTING_EXACT)
+)
+
+
+def _config_env_name_refused(name: str) -> bool:
+    """True when a config-file env key could reroute or reshape the CLI's
+    model calls (compared case-insensitively: the CLI's own filters fold
+    case, and a lowercase http_proxy is honored too)."""
+    upper = name.upper()
+    if upper.startswith("ANTHROPIC_") or upper.startswith("CLAUDE_CODE_USE_"):
+        return True
+    if upper.startswith("CLAUDE_CODE_SKIP_") and upper.endswith("_AUTH"):
+        return True
+    return upper in _CONFIG_ENV_REFUSED_EXACT
+
+
+def _cli_config_dir() -> str:
+    """The CLI's config dir: $CLAUDE_CONFIG_DIR, else ~/.claude."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def _cli_global_config_path() -> str:
+    """The CLI's global config file, resolved the way it does: <cfg>/
+    .config.json when present, else ${CLAUDE_CONFIG_DIR or HOME}/
+    .claude<suffix>.json (suffix "-custom-oauth" under
+    CLAUDE_CODE_CUSTOM_OAUTH_URL, "" for the prod build)."""
+    legacy = os.path.join(_cli_config_dir(), ".config.json")
+    if os.path.exists(legacy):
+        return legacy
+    suffix = "-custom-oauth" if os.environ.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    return os.path.join(base, f".claude{suffix}.json")
+
+
+def _cli_config_sources() -> list[tuple[str, str]]:
+    """(label, path) of every file whose `env` map the pinned CLI applies
+    regardless of --setting-sources. Raises ValueError when the
+    managed-settings.d drop-in directory exists but cannot be listed."""
+    sources = [("globalConfig", _cli_global_config_path())]
+    sources.append(("managed-settings.json", os.path.join(_MANAGED_SETTINGS_DIR, "managed-settings.json")))
+    drop_in = os.path.join(_MANAGED_SETTINGS_DIR, "managed-settings.d")
+    try:
+        names = sorted(n for n in os.listdir(drop_in) if n.endswith(".json") and not n.startswith("."))
+    except (FileNotFoundError, NotADirectoryError):
+        names = []
+    except OSError as e:
+        raise ValueError(f"managed-settings.d: {e}") from e
+    for n in names:
+        sources.append(("managed-settings.d/" + n, os.path.join(drop_in, n)))
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        user = os.environ.get("USER", "")
+    if user:
+        sources.append(("per-user managed preferences", os.path.join(_MANAGED_PREFERENCES_DIR, user, _MDM_PLIST_NAME)))
+    sources.append(("device managed preferences", os.path.join(_MANAGED_PREFERENCES_DIR, _MDM_PLIST_NAME)))
+    sources.append(("remote-settings.json", os.path.join(_cli_config_dir(), "remote-settings.json")))
+    return sources
+
+
+def _read_config_env(path: str) -> tuple[bool, dict[str, Any] | None]:
+    """Returns (exists, env map) for one source; raises ValueError for a
+    file that exists but cannot be read or parsed, or whose env is not an
+    object (fail-closed). One retry rides out a concurrent rewrite of
+    ~/.claude.json by an interactive CLI."""
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return False, None
+        except OSError as e:
+            last_err = e
+        else:
+            try:
+                if path.endswith(".plist"):
+                    doc = plistlib.loads(raw)
+                else:
+                    doc = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+            except (ValueError, UnicodeDecodeError, plistlib.InvalidFileException) as e:
+                last_err = e
+            else:
+                if not isinstance(doc, dict):
+                    raise ValueError("top level is not an object")
+                env = doc.get("env")
+                if env is None:
+                    return True, None
+                if not isinstance(env, dict):
+                    raise ValueError("env is not an object")
+                return True, env
+        if attempt == 0:
+            time.sleep(0.05)
+    raise ValueError(str(last_err))
+
+
+def _check_cli_config_env() -> str | None:
+    """Returns a description naming the source label and the variable (never
+    its value) of the first CLI config-file env entry that would reroute
+    the worker's model calls, or None."""
+    try:
+        sources = _cli_config_sources()
+    except ValueError as e:
+        return f"CLI config source {e}; refusing to start"
+    for label, path in sources:
+        try:
+            _, env = _read_config_env(path)
+        except ValueError as e:
+            return f"CLI config source {label} is unreadable ({e}); refusing to start"
+        for name in sorted(env or {}):
+            if _config_env_name_refused(str(name)):
+                return f"CLI config source {label} sets env {name}; the worker may only reach kahyad's per-task proxy"
+    return None
+
+
 def _check_credential_env(credential_mode: str, mode: str) -> str | None:
     """Returns a description of the first violated startup env
     invariant (step 6), or None if they all hold. ANTHROPIC_BASE_URL must
@@ -323,6 +471,9 @@ def _check_credential_env(credential_mode: str, mode: str) -> str | None:
     routing = _check_provider_routing_env()
     if routing is not None:
         return f"provider routing env {routing} is set; the worker may only reach kahyad's per-task proxy"
+    config_env = _check_cli_config_env()
+    if config_env is not None:
+        return config_env
     if credential_mode == _CREDENTIAL_MODE_PASSTHROUGH:
         custom = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
         if not any(_CUSTOM_HEADER_LINE_RE.match(line) for line in custom.splitlines()):

@@ -119,8 +119,33 @@ def run_main_with(
     return code, out.getvalue()
 
 
+# FIX-FINAL worker-cli-config-env-reintroduces-provider-routing: the worker
+# now reads the CLI's config files (~/.claude.json, the managed settings,
+# the MDM plists, remote-settings.json) before it starts. Every test runs
+# against an EMPTY hermetic home and empty managed-settings trees, never the
+# real machine's.
+_HERMETIC_ROOT = tempfile.mkdtemp(prefix="kahya-worker-test-")
+_HERMETIC_HOME = os.path.join(_HERMETIC_ROOT, "home")
+os.makedirs(_HERMETIC_HOME, exist_ok=True)
+_MODULE_PATCHES = [
+    mock.patch.object(worker_main, "_MANAGED_SETTINGS_DIR", os.path.join(_HERMETIC_ROOT, "ClaudeCode")),
+    mock.patch.object(worker_main, "_MANAGED_PREFERENCES_DIR", os.path.join(_HERMETIC_ROOT, "Managed Preferences")),
+]
+
+
+def setUpModule() -> None:
+    for p in _MODULE_PATCHES:
+        p.start()
+
+
+def tearDownModule() -> None:
+    for p in _MODULE_PATCHES:
+        p.stop()
+
+
 def base_env(log_dir: str, **overrides: str) -> dict[str, str]:
     env = {
+        "HOME": _HERMETIC_HOME,
         "KAHYA_TASK_ID": VALID_ENVELOPE["task_id"],
         "KAHYA_TRACE_ID": VALID_ENVELOPE["trace_id"],
         "KAHYA_SOCKET": "/tmp/does-not-matter.sock",
@@ -133,6 +158,24 @@ def base_env(log_dir: str, **overrides: str) -> dict[str, str]:
     }
     env.update(overrides)
     return env
+
+
+def pwd_name() -> str:
+    import pwd
+
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def write_config(path: str, doc: dict) -> None:
+    """Writes one CLI config source: a plist for .plist paths, else JSON."""
+    import plistlib
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        if path.endswith(".plist"):
+            plistlib.dump(doc, f)
+        else:
+            f.write(json.dumps(doc).encode("utf-8"))
 
 
 def read_jsonl(path: str) -> list[dict]:
@@ -241,6 +284,83 @@ class TestStartupEnvAssertions(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as log_dir:
                     env = base_env(log_dir, **{name: value})
                 self._assert_env_invalid(env, "provider routing env " + name)
+
+    def test_cli_config_env_routing_refuses_start(self) -> None:
+        """FIX-FINAL worker-cli-config-env-reintroduces-provider-routing:
+        the bundled CLI re-applies the `env` map of its global config and of
+        every managed policy source on top of the process environment, even
+        under --setting-sources "" - so a routing name in any of them would
+        send model calls around kahyad's per-task proxy. The worker reads
+        the same files and exits 2 before any SDK client exists; the log
+        names the source and the variable, never the value."""
+        bad_env = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:47702"}}
+        cases = [
+            ("globalConfig", lambda h, cfg, root: (os.path.join(h, ".claude.json"), bad_env)),
+            ("globalConfig", lambda h, cfg, root: (os.path.join(cfg, ".claude.json"), {"env": {"CLAUDE_CODE_USE_BEDROCK": "sentinel-bedrock-on"}})),
+            ("globalConfig", lambda h, cfg, root: (os.path.join(cfg, ".config.json"), {"env": {"https_proxy": "http://sentinel-proxy"}})),
+            ("managed-settings.json", lambda h, cfg, root: (os.path.join(root, "ClaudeCode", "managed-settings.json"), {"env": {"ANTHROPIC_UNIX_SOCKET": "/tmp/sentinel.sock"}})),
+            ("managed-settings.d/10-org.json", lambda h, cfg, root: (os.path.join(root, "ClaudeCode", "managed-settings.d", "10-org.json"), {"env": {"anthropic_custom_headers": "X-Sentinel: y"}})),
+            ("device managed preferences", lambda h, cfg, root: (os.path.join(root, "Managed Preferences", "com.anthropic.claudecode.plist"), {"env": {"CLAUDE_CODE_USE_VERTEX": "sentinel-vertex-on"}})),
+            ("per-user managed preferences", lambda h, cfg, root: (os.path.join(root, "Managed Preferences", pwd_name(), "com.anthropic.claudecode.plist"), {"env": {"NODE_OPTIONS": "--require sentinel.js"}})),
+            ("remote-settings.json", lambda h, cfg, root: (os.path.join(cfg, "remote-settings.json"), {"env": {"CLAUDE_CODE_EXTRA_BODY": "{\"sentinel\": 1}"}})),
+        ]
+        for label, make in cases:
+            with self.subTest(source=label, file=make("H", "C", "R")[0]):
+                with tempfile.TemporaryDirectory() as root:
+                    home = os.path.join(root, "home")
+                    cfg = os.path.join(root, "cfg")
+                    path, doc = make(home, cfg, root)
+                    write_config(path, doc)
+                    use_cfg = path.startswith(cfg)
+                    overrides = {"HOME": home}
+                    if use_cfg:
+                        overrides["CLAUDE_CONFIG_DIR"] = cfg
+                    with mock.patch.object(worker_main, "_MANAGED_SETTINGS_DIR", os.path.join(root, "ClaudeCode")), \
+                            mock.patch.object(worker_main, "_MANAGED_PREFERENCES_DIR", os.path.join(root, "Managed Preferences")):
+                        with tempfile.TemporaryDirectory() as log_dir:
+                            env = self._passthrough_env(log_dir, **overrides)
+                        self._assert_env_invalid(env, "CLI config source " + label)
+                        name = next(iter(doc["env"]))
+                        with tempfile.TemporaryDirectory() as log_dir:
+                            env = dict(env, KAHYA_LOG_DIR=log_dir)
+                            run_main_with(dict(VALID_ENVELOPE), env, client_factory=lambda options=None: None)
+                            raw = open(os.path.join(log_dir, "worker.jsonl"), encoding="utf-8").read()
+                        self.assertIn(name, raw)
+                        self.assertNotIn(str(doc["env"][name]), raw, "the refused value must never be logged")
+
+    def test_cli_config_unreadable_refuses_start(self) -> None:
+        """A config source that exists but cannot be parsed, or whose env
+        is not an object, refuses the start (fail-closed)."""
+        for body in (b"{not json", b'{"env": ["ANTHROPIC_BASE_URL"]}', b"[1, 2]"):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as root:
+                    home = os.path.join(root, "home")
+                    os.makedirs(home)
+                    with open(os.path.join(home, ".claude.json"), "wb") as f:
+                        f.write(body)
+                    with tempfile.TemporaryDirectory() as log_dir:
+                        env = self._passthrough_env(log_dir, HOME=home)
+                    self._assert_env_invalid(env, "CLI config source globalConfig is unreadable")
+
+    def test_cli_config_clean_env_is_accepted(self) -> None:
+        """A config env map without routing names (and a .config.json that
+        shadows a dirty .claude.json, as the CLI's own precedence does)
+        starts normally."""
+        messages = [
+            ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=1, session_id="sess-1",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            cfg = os.path.join(root, "cfg")
+            write_config(os.path.join(cfg, ".config.json"), {"env": {"FOO": "1"}, "theme": "dark"})
+            write_config(os.path.join(cfg, ".claude.json"), {"env": {"ANTHROPIC_BASE_URL": "http://x"}})
+            write_config(os.path.join(root, "home", ".claude.json"), {"numStartups": 3})
+            with tempfile.TemporaryDirectory() as log_dir:
+                env = self._passthrough_env(log_dir, HOME=os.path.join(root, "home"), CLAUDE_CONFIG_DIR=cfg)
+                code, _ = run_main_with(dict(VALID_ENVELOPE), env, client_factory=fake_client_factory(messages=messages))
+        self.assertEqual(code, 0)
 
     def test_provider_switch_set_to_false_is_accepted(self) -> None:
         """A provider switch explicitly OFF ("0"/"false"/"") does not route

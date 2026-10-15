@@ -144,15 +144,34 @@ Foundry, Anthropic-AWS, Mantle, Gateway, and any future one),
 `AWS_BEARER_TOKEN_BEDROCK` are stripped. Any of them would make the
 bundled CLI send model calls to Bedrock/Vertex/Foundry or a host socket
 without `ANTHROPIC_BASE_URL`, bypassing the per-task proxy (secret-lane
-backstop, model allowlist, governor, egress gate). The worker's only
-upstream is that proxy; `CLAUDE_CODE_OAUTH_TOKEN` is unaffected (owner
-decision G11-1/G11-2). The worker checks the same rule itself, fail-closed
-(FIX-FINAL worker-env-provider-routing-bypass,
+backstop, model allowlist, governor, egress gate).
+`CLAUDE_CODE_OAUTH_TOKEN` is unaffected (owner decision G11-1/G11-2). The
+worker checks the same rule itself, fail-closed (FIX-FINAL
+worker-env-provider-routing-bypass,
 `kahya_worker.__main__._check_provider_routing_env`): a truthy
 `CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*_AUTH`, a non-empty
 `ANTHROPIC_UNIX_SOCKET` or `ANTHROPIC_<X>_BASE_URL` (other than
 `ANTHROPIC_BASE_URL`), or one of the host-transport names above makes it
 exit 2 with `worker_env_invalid` before any SDK client exists.
+
+The process environment is not the CLI's only env source: the bundled CLI
+(2.1.202) re-applies the `env` map of its global config and of its managed
+policySettings on top of it, even under `--setting-sources ""` (which only
+drops user/project/local settings). So the worker also reads, before it
+starts, every such file and refuses (exit 2, `worker_env_invalid` naming
+the source and the variable, never the value) when one sets an
+`ANTHROPIC_*`, `CLAUDE_CODE_USE_*`, `CLAUDE_CODE_SKIP_*_AUTH` or
+host-transport name, `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `NODE_OPTIONS` or
+`CLAUDE_CODE_EXTRA_BODY` (case-insensitive), or exists but cannot be
+parsed (FIX-FINAL worker-cli-config-env-reintroduces-provider-routing,
+`_check_cli_config_env`): the global config (`<cfg>/.config.json` when
+present, else `${CLAUDE_CONFIG_DIR or HOME}/.claude.json`),
+`/Library/Application Support/ClaudeCode/managed-settings.json` and
+`managed-settings.d/*.json`, the `com.anthropic.claudecode` MDM plists
+(per-user and device) and `<cfg>/remote-settings.json`. With the env
+strip and this check together, the worker's only upstream is the
+per-task proxy.
 
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 
