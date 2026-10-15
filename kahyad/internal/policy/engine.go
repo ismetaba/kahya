@@ -532,8 +532,10 @@ type CheckInput struct {
 	// degil"): decide and ledger (payload preflight:true), but NEVER mint a
 	// pending_approvals row, a token or an undo window, and never redeem a
 	// grant. Only POST /policy/check sets it (kahyad/internal/server/
-	// task.go) - the binding decision, and the only pending approval a human
-	// ever answers, comes from the tool-side gate on /v1/mcp.
+	// task.go), and it forces it for every caller attributed to a live
+	// worker whatever the body says - the binding decision, and the only
+	// pending approval a human ever answers, comes from the tool-side gate
+	// on /v1/mcp.
 	Preflight bool
 	// NoMintPending (B-1) is the tool-side post-wait re-check
 	// (kahyad/internal/server.checkWithApprovalWait): redeem an approval

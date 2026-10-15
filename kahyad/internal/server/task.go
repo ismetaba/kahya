@@ -1638,7 +1638,12 @@ type policyCheckRequest struct {
 	// NOTHING is minted - no pending approval, token or undo window: the
 	// tool-side gate on /v1/mcp is the binding one and the only one a
 	// human is ever asked to approve (HANDOFF S5: can_use_tool is not a
-	// security boundary).
+	// security boundary). B-1 x B-14 (FIX-FINAL worker-controls-
+	// preflight): the body's value is honored ONLY for an unattributed,
+	// control-secret caller (a script); a caller attributed to a live
+	// worker always gets preflight semantics, whatever it sends, so a
+	// worker can never mint a pending approval, redeem a grant or receive
+	// a raw token through this route.
 	Preflight bool `json:"preflight,omitempty"`
 }
 
@@ -1762,9 +1767,20 @@ func (s *Server) handlePolicyCheck(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID != nil {
 		sessionID = *req.SessionID
 	}
+	// B-1 x B-14 (FIX-FINAL worker-controls-preflight): a live worker's
+	// /policy/check is never binding - its tool-side gate on /v1/mcp is.
+	// Preflight is forced from the caller attribution, not the body; only
+	// an unattributed, control-secret caller may opt out of it.
+	preflight := req.Preflight
+	if att, ok := callerAttributionFromContext(r.Context()); ok && att.TaskID != "" {
+		if !req.Preflight {
+			s.log.With(traceID).Warn("policy_check_preflight_forced", "tool", req.ToolName, "task_id", taskID)
+		}
+		preflight = true
+	}
 	decision, err := s.policyEngine.Check(r.Context(), policy.CheckInput{
 		Tool: req.ToolName, Scope: req.Scope, TaskID: taskID, TraceID: traceID,
-		SessionID: sessionID, ToolInput: req.ToolInput, Preflight: req.Preflight,
+		SessionID: sessionID, ToolInput: req.ToolInput, Preflight: preflight,
 	})
 	if err != nil {
 		// Engine.Check already returned a fail-closed Deny decision AND

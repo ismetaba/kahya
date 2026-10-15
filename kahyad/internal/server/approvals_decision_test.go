@@ -80,16 +80,20 @@ func TestApprovalsDecisionRequiresControlSecret(t *testing.T) {
 	f := newApprovalsDecisionFixture(t, "prod")
 	reg := task.NewLiveRegistry()
 	f.srv.SetTaskLiveRegistry(reg)
-	reg.RegisterWorker("t-self", "trace-g03-self", os.Getpid(), testProcessSID(t))
 
+	// The pending approval is minted by an unattributed, control-secret
+	// caller (a script) BEFORE the worker registers: since FIX-FINAL
+	// worker-controls-preflight a live worker's /policy/check is always
+	// preflight and can never mint one itself.
 	var checkResp policyCheckResponse
-	resp := postJSON(t, f.noSecret, "/policy/check", map[string]any{
+	resp := postJSON(t, f.client, "/policy/check", map[string]any{
 		"trace_id": "trace-g03-self", "task_id": "t-self", "tool_name": "mail_send",
 		"tool_input": map[string]any{"to": "a@b.com", "body": "merhaba"},
 	}, &checkResp)
 	if resp.StatusCode != http.StatusOK || checkResp.Decision != "needs_approval" || checkResp.PendingApprovalID == "" {
 		t.Fatalf("policy/check(mail_send) = %d %+v, want needs_approval with a pending id", resp.StatusCode, checkResp)
 	}
+	reg.RegisterWorker("t-self", "trace-g03-self", os.Getpid(), testProcessSID(t))
 
 	stolen := readSecretFile(t, f.srv.cfg.Socket)
 	for _, c := range []struct {

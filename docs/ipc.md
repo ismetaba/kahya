@@ -1583,9 +1583,13 @@ tool-side gate on `/v1/mcp` (§6a). The worker maps `needs_approval` for
 one of kahyad's own MCP tools (`mcp__kahya_memory__*`) to "allow — defer
 to the binding gate" (`event=tool_gate decision=defer`) and denies it for
 any SDK built-in tool, which has no kahyad-side executor (`"Bu araç için
-onay gerekiyor ancak bu yüzeyden onaylanamaz (reddedildi)."`). A
-non-preflight call (a script with the control secret) keeps the original
-behavior below.
+onay gerekiyor ancak bu yüzeyden onaylanamaz (reddedildi)."`). A caller
+attributed to a live worker (§5a) always gets preflight semantics, whatever
+its body says (FIX-FINAL worker-controls-preflight; a missing `preflight`
+is JSONL-logged `policy_check_preflight_forced`): a worker can never mint a
+pending approval, redeem a grant or receive a raw token here. Only an
+unattributed, control-secret caller (a script) can make a non-preflight
+call, which keeps the original behavior below.
 
 `task_id`/`trace_id` stay in the body (backward compatibility), but for a
 call from a live worker kahyad spawned the **authority is the UDS peer's
