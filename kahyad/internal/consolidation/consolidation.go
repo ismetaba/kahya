@@ -13,6 +13,8 @@
 //     Show.
 //   - lane.go: the secret-lane ORDERING INVARIANT (path-glob partition,
 //     BEFORE any session is built).
+//   - select.go: per-lane ordering and budgeted batching (FIX-B-5) - after
+//     the partition, so a batch only ever holds one lane's files.
 //   - session.go/worker.go/localsession.go: the cloud (router.ModelHaiku)
 //     and local (Qwen3-30B-A3B) whole-file-rewrite transports - neither
 //     ever touches brain.db (WRITE BOUNDARY invariant).
@@ -33,6 +35,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -152,6 +155,25 @@ type Config struct {
 	// (branch name, hot-window cutoff, user-touched-lines midnight) to a
 	// fixed instant.
 	Now func() time.Time
+
+	// FIX-B-5 batching (cfg.consolidation_*): each lane is consolidated in
+	// batches whose estimateFilesTokens stays under its budget, never as
+	// one whole-lane call. A zero value means the package default
+	// (defaultCloudBatchTokenBudget, defaultLocalBatchTokenBudget,
+	// defaultMaxFileBytes, defaultMaxBatchesPerLane); tokens.go documents
+	// the arithmetic behind them.
+	CloudBatchTokenBudget int
+	LocalBatchTokenBudget int
+	// MaxFileBytes: a larger file is sent to no lane
+	// (consolidation.file_skipped_too_large).
+	MaxFileBytes int
+	// MaxBatchesPerLane caps the model calls per lane per night; the
+	// batches beyond it are deferred (consolidation.batches_deferred).
+	MaxBatchesPerLane int
+	// ChangedFilesFirst orders each lane's files: changed since the last
+	// approved consolidation first, then their same-directory neighbours,
+	// then the rest by commit time. false = commit time only.
+	ChangedFilesFirst bool
 }
 
 // Consolidator is the W5-02 nightly consolidation orchestrator. Every
@@ -342,6 +364,13 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	c.ledgerLaneStats(ctx, traceID, LaneCloud, cloudFiles)
 	c.ledgerLaneStats(ctx, traceID, LaneLocal, localFiles)
 
+	// FIX-B-5 phase 1: the batch-ordering inputs, read once for both lanes
+	// (read-only git). Ordering only: a failure degrades to "everything
+	// changed" / "no commit times" with a JSONL warning, never changes what
+	// is sent to which lane.
+	changed := c.changedFiles(ctx, traceID, files, memRelToRepo)
+	mtimeOf := c.commitTimes(ctx, traceID, memRelToRepo)
+
 	baseSHA, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)
 	if err != nil {
 		return err
@@ -365,17 +394,16 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	rewrites := make(map[string]string, len(files))
 	skippedSecretLane := false
 
-	// FIX-P-7: each lane's rewrite may only name files from that lane's own
-	// input (validated here as well as inside the production sessions'
-	// parseRewriteResponse, since a Session may be any implementation). An
-	// unknown key rejects the night (decision G06-3: hard reject) - a cloud
-	// rewrite naming a secret-lane path would otherwise be applied whenever
-	// the local lane is skipped.
+	// FIX-P-7 + FIX-B-5: each lane is consolidated in batches (runLane); a
+	// batch's rewrite may only name files from that batch's own input
+	// (validated per batch inside runLane as well as in the production
+	// sessions' parseRewriteResponse, since a Session may be any
+	// implementation). An unknown key rejects the night (decision G06-3:
+	// hard reject) - a cloud rewrite naming a secret-lane path would
+	// otherwise be applied whenever the local lane is skipped. A batch whose
+	// response is merely malformed is dropped alone (decision G06-7).
 	if len(cloudFiles) > 0 {
-		cr, err := c.Cloud.Consolidate(ctx, traceID, cloudFiles)
-		if err == nil {
-			err = validateRewriteKeys(LaneCloud, cloudFiles, cr)
-		}
+		cr, err := c.runLane(ctx, traceID, LaneCloud, c.Cloud, cloudFiles, c.cloudBatchTokenBudget(), changed, mtimeOf)
 		if err != nil {
 			c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
 			if errors.Is(err, ErrRewriteUnknownPath) {
@@ -383,27 +411,30 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 			}
 			return fmt.Errorf("consolidation: cloud-lane session: %w", err)
 		}
-		mergeRewrites(rewrites, cr)
+		mergeRewrites(rewrites, cr.rewrites)
 	}
 
 	if len(localFiles) > 0 {
-		lr, localErr := c.Local.Consolidate(ctx, traceID, localFiles)
-		if localErr == nil {
-			localErr = validateRewriteKeys(LaneLocal, localFiles, lr)
-		}
+		lr, localErr := c.runLane(ctx, traceID, LaneLocal, c.Local, localFiles, c.localBatchTokenBudget(), changed, mtimeOf)
 		if localErr != nil {
 			if errors.Is(localErr, mlx.ErrLocalModelUnavailable) {
 				// FAIL-CLOSED, NEVER a cloud fallback (HANDOFF §4 ⚑): the
-				// secret-lane files simply keep their original content this
-				// run (rewrites has no entries for them at all).
+				// secret-lane files the local model did not get to keep their
+				// original content this run (rewrites has no entries for
+				// them). Batches validated before the model went away are
+				// kept (FIX-B-5).
 				skippedSecretLane = true
-				c.logWarn("consolidation_local_lane_skipped", "trace_id", traceID, "err", localErr.Error())
+				c.logWarn("consolidation_local_lane_skipped", "trace_id", traceID, "err", localErr.Error(),
+					"completed_batches", lr.completed, "remaining_files", len(lr.remaining))
 				c.notify(ctx, traceID, MsgLocalSkipped)
 				if c.EventLogger != nil {
 					_ = c.EventLogger.LogEvent(ctx, traceID, "consolidation.local_unavailable", map[string]any{
-						"files": sortedKeys(localFiles),
+						"files":             sortedKeys(localFiles),
+						"completed_batches": lr.completed,
+						"remaining_files":   lr.remaining,
 					})
 				}
+				mergeRewrites(rewrites, lr.rewrites)
 			} else {
 				c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
 				if errors.Is(localErr, ErrRewriteUnknownPath) {
@@ -412,7 +443,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 				return fmt.Errorf("consolidation: local-lane session: %w", localErr)
 			}
 		} else {
-			mergeRewrites(rewrites, lr)
+			mergeRewrites(rewrites, lr.rewrites)
 		}
 	}
 
@@ -521,6 +552,223 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 
 	c.notify(ctx, traceID, MsgSuggestionReady)
 	return nil
+}
+
+// Batch defaults (FIX-B-5), used when the matching Config field is zero.
+// The arithmetic behind the budgets is in tokens.go; config.go's defaults
+// for the consolidation_* keys carry the same values.
+const (
+	defaultCloudBatchTokenBudget = 24000
+	defaultLocalBatchTokenBudget = 5000
+	defaultMaxFileBytes          = 262144
+	defaultMaxBatchesPerLane     = 20
+)
+
+func (c *Consolidator) cloudBatchTokenBudget() int {
+	if c.Cfg.CloudBatchTokenBudget > 0 {
+		return c.Cfg.CloudBatchTokenBudget
+	}
+	return defaultCloudBatchTokenBudget
+}
+
+func (c *Consolidator) localBatchTokenBudget() int {
+	if c.Cfg.LocalBatchTokenBudget > 0 {
+		return c.Cfg.LocalBatchTokenBudget
+	}
+	return defaultLocalBatchTokenBudget
+}
+
+func (c *Consolidator) maxFileBytes() int {
+	if c.Cfg.MaxFileBytes > 0 {
+		return c.Cfg.MaxFileBytes
+	}
+	return defaultMaxFileBytes
+}
+
+func (c *Consolidator) maxBatchesPerLane() int {
+	if c.Cfg.MaxBatchesPerLane > 0 {
+		return c.Cfg.MaxBatchesPerLane
+	}
+	return defaultMaxBatchesPerLane
+}
+
+// FIX-B-5 ledger kinds (events.kind is free text; no migration).
+const (
+	// EventFileSkippedTooLarge: files sent to no model tonight because they
+	// are above max_file_bytes or alone above the lane's batch budget
+	// {lane, paths, over_max_file_bytes, over_batch_budget, max_file_bytes,
+	// batch_token_budget}.
+	EventFileSkippedTooLarge = "consolidation.file_skipped_too_large"
+	// EventBatchesDeferred: batches beyond max_batches_per_lane, not sent
+	// tonight {lane, batches, files}.
+	EventBatchesDeferred = "consolidation.batches_deferred"
+	// EventBatchDropped: one batch whose response was malformed (a JSON
+	// cut by the output cap), dropped alone - decision G06-7 {lane, batch,
+	// of, files, reason}.
+	EventBatchDropped = "consolidation.batch_dropped"
+)
+
+// laneResult is what runLane did with one lane tonight.
+type laneResult struct {
+	rewrites    map[string]string // merged rewrites of every completed batch
+	planned     int               // batches planned (after the per-lane cap)
+	completed   int               // batches whose validated rewrite was merged
+	dropped     int               // batches dropped for a malformed response
+	sentFiles   int               // files sent to the model (completed + dropped batches)
+	estTokensIn int               // estimateFilesTokens of every sent batch
+	bytesOut    int               // bytes of rewritten content returned
+	skipped     []string          // too large for max_file_bytes or for one batch
+	deferred    []string          // in batches beyond max_batches_per_lane
+	remaining   []string          // not reached because the local model went away
+}
+
+// runLane consolidates one lane's files batch by batch (FIX-B-5). The lane
+// partition has already run, so every batch holds this lane's files only.
+// Files are ordered (orderCandidates), packed under budget (buildBatches)
+// and capped at maxBatchesPerLane; each batch is one Session call.
+//
+// Errors: ErrRewriteUnknownPath (a batch naming a path outside its own
+// input, or two batches returning one path) rejects the night - the caller
+// ledgers it. A malformed response (ErrRewriteMalformed) drops that batch
+// only, ledgered as EventBatchDropped, and the loop goes on (decision
+// G06-7). Any other error stops the lane and is returned with the result so
+// far: for mlx.ErrLocalModelUnavailable the caller keeps the completed
+// batches (res.remaining lists the files not reached); everything else
+// fails the night.
+func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess Session, laneFiles map[string]string, budget int, changed map[string]bool, mtimeOf func(rel string) int64) (laneResult, error) {
+	res := laneResult{rewrites: make(map[string]string, len(laneFiles))}
+	ordered, overFileCap := orderCandidates(laneFiles, changed, mtimeOf, c.maxFileBytes())
+	batches, overBudget := buildBatches(ordered, laneFiles, budget)
+	res.skipped = append(append([]string{}, overFileCap...), overBudget...)
+	sort.Strings(res.skipped)
+	c.ledgerSkipped(ctx, traceID, lane, res.skipped, overFileCap, overBudget, budget)
+	if limit := c.maxBatchesPerLane(); len(batches) > limit {
+		deferred := batches[limit:]
+		batches = batches[:limit]
+		for _, b := range deferred {
+			res.deferred = append(res.deferred, b.paths()...)
+		}
+		sort.Strings(res.deferred)
+		c.ledgerDeferred(ctx, traceID, lane, len(deferred), res.deferred)
+	}
+	res.planned = len(batches)
+
+	for i, b := range batches {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		if b.EstTokens > budget { // structural: buildBatches never packs one
+			return res, fmt.Errorf("consolidation: lane=%s batch %d estimate %d over budget %d", lane, i+1, b.EstTokens, budget)
+		}
+		r, err := sess.Consolidate(ctx, traceID, b.Files)
+		if err == nil {
+			err = validateRewriteKeys(lane, b.Files, r) // FIX-P-7, per batch
+		}
+		if err != nil && !errors.Is(err, ErrRewriteUnknownPath) && errors.Is(err, ErrRewriteMalformed) {
+			res.dropped++
+			res.sentFiles += len(b.Files)
+			res.estTokensIn += b.EstTokens
+			c.ledgerBatchDropped(ctx, traceID, lane, i+1, len(batches), b, err)
+			continue
+		}
+		if err != nil {
+			if errors.Is(err, mlx.ErrLocalModelUnavailable) {
+				for _, rb := range batches[i:] {
+					res.remaining = append(res.remaining, rb.paths()...)
+				}
+				sort.Strings(res.remaining)
+			}
+			return res, err
+		}
+		for k, v := range r {
+			if _, dup := res.rewrites[k]; dup {
+				return res, fmt.Errorf("%w: lane=%s path=%q returned by two batches", ErrRewriteUnknownPath, lane, k)
+			}
+			res.rewrites[k] = v
+			res.bytesOut += len(v)
+		}
+		res.completed++
+		res.sentFiles += len(b.Files)
+		res.estTokensIn += b.EstTokens
+		c.logInfo("consolidation_batch_done", "trace_id", traceID, "lane", lane, "batch", i+1, "of", len(batches),
+			"files", len(b.Files), "est_tokens", b.EstTokens)
+	}
+	return res, nil
+}
+
+// ledgerSkipped records the files sent to no model tonight (nothing when
+// there are none).
+func (c *Consolidator) ledgerSkipped(ctx context.Context, traceID, lane string, paths, overFileCap, overBudget []string, budget int) {
+	if len(paths) == 0 {
+		return
+	}
+	c.logWarn("consolidation_file_skipped_too_large", "trace_id", traceID, "lane", lane, "files", len(paths),
+		"max_file_bytes", c.maxFileBytes(), "batch_token_budget", budget)
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventFileSkippedTooLarge, map[string]any{
+			"lane": lane, "paths": paths,
+			"over_max_file_bytes": nonNil(overFileCap), "over_batch_budget": nonNil(overBudget),
+			"max_file_bytes": c.maxFileBytes(), "batch_token_budget": budget,
+		})
+	}
+}
+
+// ledgerDeferred records the batches beyond max_batches_per_lane.
+func (c *Consolidator) ledgerDeferred(ctx context.Context, traceID, lane string, batches int, files []string) {
+	c.logWarn("consolidation_batches_deferred", "trace_id", traceID, "lane", lane, "batches", batches, "files", len(files),
+		"max_batches_per_lane", c.maxBatchesPerLane())
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventBatchesDeferred, map[string]any{"lane": lane, "batches": batches, "files": files})
+	}
+}
+
+// ledgerBatchDropped records one batch dropped for a malformed response.
+func (c *Consolidator) ledgerBatchDropped(ctx context.Context, traceID, lane string, n, of int, b batch, cause error) {
+	c.logWarn("consolidation_batch_dropped", "trace_id", traceID, "lane", lane, "batch", n, "of", of,
+		"files", len(b.Files), "est_tokens", b.EstTokens, "err", cause.Error())
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventBatchDropped, map[string]any{
+			"lane": lane, "batch": n, "of": of, "files": b.paths(), "reason": cause.Error(),
+		})
+	}
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// changedFiles is orderCandidates' changed set (FIX-B-5): the files changed
+// since the last approved consolidation, or every file when there is none
+// (or it cannot be read). nil when ChangedFilesFirst is off.
+func (c *Consolidator) changedFiles(ctx context.Context, traceID string, files map[string]string, memRelToRepo string) map[string]bool {
+	if !c.Cfg.ChangedFilesFirst {
+		return nil
+	}
+	changed, ok, err := changedSinceLastApproved(ctx, c.Git, c.EventReader, c.Cfg.KahyaDir, memRelToRepo)
+	if err != nil {
+		c.logWarn("consolidation_changed_files_unavailable", "trace_id", traceID, "err", err.Error())
+	}
+	if err == nil && ok {
+		return changed
+	}
+	all := make(map[string]bool, len(files))
+	for rel := range files {
+		all[NormalizePathKey(rel)] = true
+	}
+	return all
+}
+
+// commitTimes is orderCandidates' commit-time lookup (FIX-B-5); every file
+// is 0 when git log fails.
+func (c *Consolidator) commitTimes(ctx context.Context, traceID, memRelToRepo string) func(rel string) int64 {
+	times, err := lastCommitTimes(ctx, c.Git, c.Cfg.KahyaDir, memRelToRepo)
+	if err != nil {
+		c.logWarn("consolidation_commit_times_unavailable", "trace_id", traceID, "err", err.Error())
+	}
+	return func(rel string) int64 { return times[NormalizePathKey(rel)] }
 }
 
 // sweepOrphanBranches deletes EVERY kahya/consolidation-* branch (and its

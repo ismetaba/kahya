@@ -43,10 +43,12 @@ const CloudModelName = router.ModelHaiku
 // that Go-side enforcement).
 const RewriteJobType = "consolidation_rewrite_v1"
 
-// defaultSpawnTimeout bounds one cloud-lane consolidation call when
-// ProcessSpawner.Timeout is unset - mirrors kahyad/internal/briefing/
-// worker.go's identical constant.
-const defaultSpawnTimeout = 2 * time.Minute
+// defaultSpawnTimeout bounds one cloud-lane consolidation call (one batch,
+// FIX-B-5) when ProcessSpawner.Timeout is unset. It was 2 minutes, copied
+// from kahyad/internal/briefing/worker.go, whose answers are short; a
+// consolidation batch may answer with up to the CLI's 32000-token output
+// cap (tokens.go), which takes about 5 minutes at ~110 tokens/s.
+const defaultSpawnTimeout = 5 * time.Minute
 
 // BuildEnvelope builds the toolless cloud-lane consolidation envelope for
 // one run: Kind="chat" (unchanged, frozen contract - spawn/envelope.go/

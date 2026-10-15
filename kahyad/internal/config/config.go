@@ -489,6 +489,36 @@ type Config struct {
 	// intent once the guard would actually pass.
 	ConsolidationAutoCommit bool `yaml:"consolidation_auto_commit"`
 
+	// ConsolidationCloudBatchTokenBudget / ConsolidationLocalBatchTokenBudget
+	// (FIX-B-5): the nightly consolidation sends each lane to its model in
+	// batches whose estimated prompt tokens (kahyad/internal/consolidation
+	// estimateFilesTokens: 1 token per 2 JSON-encoded bytes) stay under
+	// this budget, never the whole lane in one call. A whole-file rewrite
+	// answers with about as many tokens as it was given, so the budgets are
+	// sized against each model's OUTPUT cap (consolidation/tokens.go has
+	// the arithmetic): cloud 24000 (claude-haiku-5-5; the pinned CLI's
+	// max_tokens is 32000; the prompt stays far below Haiku 5.5's 100K
+	// price tier), local 5000 (Qwen3-30B-A3B, localMaxTokens 8192).
+	// Bounds: cloud 1..MaxConsolidationCloudBatchTokenBudget, local
+	// 1..MaxConsolidationLocalBatchTokenBudget; outside them Load fails.
+	ConsolidationCloudBatchTokenBudget int `yaml:"consolidation_cloud_batch_token_budget"`
+	ConsolidationLocalBatchTokenBudget int `yaml:"consolidation_local_batch_token_budget"`
+	// ConsolidationMaxFileBytes (FIX-B-5): a memory file larger than this
+	// is sent to no lane that night (ledger
+	// consolidation.file_skipped_too_large). Default 262144; Load fails
+	// below MinConsolidationMaxFileBytes.
+	ConsolidationMaxFileBytes int `yaml:"consolidation_max_file_bytes"`
+	// ConsolidationMaxBatchesPerLane (FIX-B-5): at most this many model
+	// calls per lane per night (the nightly cost/time cap); the batches
+	// beyond it are deferred to the next night, which takes them first.
+	// Default 20; Load fails below 1.
+	ConsolidationMaxBatchesPerLane int `yaml:"consolidation_max_batches_per_lane"`
+	// ConsolidationChangedFilesFirst (FIX-B-5): order each lane's files as
+	// changed since the last approved consolidation first, then their
+	// same-directory neighbours, then the rest by git commit time. false =
+	// commit time only. Default true.
+	ConsolidationChangedFilesFirst bool `yaml:"consolidation_changed_files_first"`
+
 	// --- W5-03 weekly truth ritual ---
 
 	// RitualWeeklyWeekday/Hour/Minute are cfg.ritual.weekly_at's three
@@ -858,6 +888,11 @@ type fileConfig struct {
 	BriefingMaxFileItems          *int            `yaml:"briefing_max_file_items"`
 	Timezone                      *string         `yaml:"timezone"`
 	ConsolidationAutoCommit       *bool           `yaml:"consolidation_auto_commit"`
+	ConsolidationCloudBatchTokens *int            `yaml:"consolidation_cloud_batch_token_budget"`
+	ConsolidationLocalBatchTokens *int            `yaml:"consolidation_local_batch_token_budget"`
+	ConsolidationMaxFileBytes     *int            `yaml:"consolidation_max_file_bytes"`
+	ConsolidationMaxBatches       *int            `yaml:"consolidation_max_batches_per_lane"`
+	ConsolidationChangedFirst     *bool           `yaml:"consolidation_changed_files_first"`
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
 	RitualWeeklyMinute            *int            `yaml:"ritual_weekly_minute"`
@@ -977,6 +1012,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateBriefingMaxFileItems(cfg.BriefingMaxFileItems); err != nil {
+		return Config{}, err
+	}
+	if err := validateConsolidationBatching(cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateTimezone(cfg.Timezone); err != nil {
@@ -1201,6 +1239,49 @@ func validateBriefingMaxFileItems(n int) error {
 	return nil
 }
 
+// FIX-B-5 nightly-consolidation batching defaults and bounds. The defaults
+// equal kahyad/internal/consolidation's package defaults (pinned by
+// consolidation's TestBatchBudgetsFitModelLimits, which also checks the
+// bounds against the model limits in consolidation/tokens.go).
+const (
+	DefaultConsolidationCloudBatchTokenBudget = 24000
+	DefaultConsolidationLocalBatchTokenBudget = 5000
+	DefaultConsolidationMaxFileBytes          = 262144
+	DefaultConsolidationMaxBatchesPerLane     = 20
+
+	// MaxConsolidationCloudBatchTokenBudget keeps one cloud batch's prompt
+	// (the batch plus the fixed rewrite instructions) under
+	// claude-haiku-5-5's 100K-token price tier: above it the whole call is
+	// billed at 5x ($0.50/$2.50 instead of $0.10/$0.50).
+	MaxConsolidationCloudBatchTokenBudget = 90000
+	// MaxConsolidationLocalBatchTokenBudget keeps one local batch plus its
+	// 8192-token answer inside Qwen3-30B-A3B's native 32,768-token context.
+	MaxConsolidationLocalBatchTokenBudget = 23000
+	// MinConsolidationMaxFileBytes: a smaller cap would skip ordinary notes.
+	MinConsolidationMaxFileBytes = 4096
+)
+
+// validateConsolidationBatching fails Load closed (FIX-B-5) on a batch
+// budget outside its bounds, a max_file_bytes below 4096 or a
+// max_batches_per_lane below 1: a zero would otherwise be silently replaced
+// by the package default, and an over-large budget would leave the price
+// tier or the context window.
+func validateConsolidationBatching(cfg Config) error {
+	if b := cfg.ConsolidationCloudBatchTokenBudget; b < 1 || b > MaxConsolidationCloudBatchTokenBudget {
+		return fmt.Errorf("config: consolidation_cloud_batch_token_budget must be 1..%d, got %d", MaxConsolidationCloudBatchTokenBudget, b)
+	}
+	if b := cfg.ConsolidationLocalBatchTokenBudget; b < 1 || b > MaxConsolidationLocalBatchTokenBudget {
+		return fmt.Errorf("config: consolidation_local_batch_token_budget must be 1..%d, got %d", MaxConsolidationLocalBatchTokenBudget, b)
+	}
+	if n := cfg.ConsolidationMaxFileBytes; n < MinConsolidationMaxFileBytes {
+		return fmt.Errorf("config: consolidation_max_file_bytes must be >= %d, got %d", MinConsolidationMaxFileBytes, n)
+	}
+	if n := cfg.ConsolidationMaxBatchesPerLane; n < 1 {
+		return fmt.Errorf("config: consolidation_max_batches_per_lane must be >= 1, got %d", n)
+	}
+	return nil
+}
+
 // validateTimezone fails Load closed on an unknown timezone name
 // (FIX-P-14): kahyad must never silently run its day boundaries in a zone
 // the operator did not ask for. Empty = time.Local (see Config.Timezone).
@@ -1384,6 +1465,12 @@ func defaults(home, env string) Config {
 		// so an operator must opt in explicitly even once that gate would
 		// pass.
 		ConsolidationAutoCommit: false,
+		// FIX-B-5 batching defaults (see the fields' doc comments).
+		ConsolidationCloudBatchTokenBudget: DefaultConsolidationCloudBatchTokenBudget,
+		ConsolidationLocalBatchTokenBudget: DefaultConsolidationLocalBatchTokenBudget,
+		ConsolidationMaxFileBytes:          DefaultConsolidationMaxFileBytes,
+		ConsolidationMaxBatchesPerLane:     DefaultConsolidationMaxBatchesPerLane,
+		ConsolidationChangedFilesFirst:     true,
 
 		// W5-03 weekly truth ritual defaults (task spec: Sunday 18:00 -
 		// HANDOFF §6 W5 flag).
@@ -1805,6 +1892,21 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.ConsolidationAutoCommit != nil {
 		cfg.ConsolidationAutoCommit = *fc.ConsolidationAutoCommit
+	}
+	if fc.ConsolidationCloudBatchTokens != nil {
+		cfg.ConsolidationCloudBatchTokenBudget = *fc.ConsolidationCloudBatchTokens
+	}
+	if fc.ConsolidationLocalBatchTokens != nil {
+		cfg.ConsolidationLocalBatchTokenBudget = *fc.ConsolidationLocalBatchTokens
+	}
+	if fc.ConsolidationMaxFileBytes != nil {
+		cfg.ConsolidationMaxFileBytes = *fc.ConsolidationMaxFileBytes
+	}
+	if fc.ConsolidationMaxBatches != nil {
+		cfg.ConsolidationMaxBatchesPerLane = *fc.ConsolidationMaxBatches
+	}
+	if fc.ConsolidationChangedFirst != nil {
+		cfg.ConsolidationChangedFilesFirst = *fc.ConsolidationChangedFirst
 	}
 	if fc.RitualWeeklyWeekday != nil {
 		cfg.RitualWeeklyWeekday = *fc.RitualWeeklyWeekday

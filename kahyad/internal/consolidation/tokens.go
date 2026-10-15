@@ -18,6 +18,45 @@ import "encoding/json"
 // (model_call rows) if it diverges.
 const estimateBytesPerToken = 2
 
+// Batch sizing (FIX-B-5, decision G06-8). A whole-file rewrite answers with
+// about as many tokens as it is given (phase 2's "unchanged" markers make
+// the typical answer much smaller, but a batch whose every file is
+// rewritten still answers in full), so each lane's batch budget is sized
+// against its model's OUTPUT cap, and checked against its price tier and
+// context window:
+//
+// Cloud lane, claude-haiku-5-5 via the pinned claude CLI (reader mode: no
+// CLI system prompt, the rewrite instructions are the whole prompt):
+//   - output cap: the CLI sends max_tokens 32000 for Haiku (cliMaxOutputTokens,
+//     seen by the FIX-G12-N2 hermetic probe); adaptive thinking and the JSON
+//     answer share it.
+//   - defaultCloudBatchTokenBudget 24000 estimated tokens = at most 48 KB of
+//     JSON-encoded files. On Turkish text Haiku 5.5 counts ~2.3 bytes per
+//     token, so that is ~21K real tokens in, ~21K out for a full rewrite,
+//     leaving ~11K of the 32K cap for thinking. A cut answer is a dropped
+//     batch (decision G06-7), never a lost night.
+//   - price tier: the prompt is the batch plus ~600 tokens of instructions,
+//     far below the 100K-token split (haikuPromptTierTokens) where Haiku 5.5
+//     bills the whole call at $0.50/$2.50 instead of $0.10/$0.50. config caps
+//     the budget at 90000 for the same reason. Context (1M) is not a limit.
+//   - cost ceiling: max_batches_per_lane 20 x (24K in at $0.10 + 32K out at
+//     $0.50 per MTok) is at most ~$0.37 per night.
+//
+// Local lane, Qwen3-30B-A3B (thinking disabled, see secretlane.PostChatJSON):
+//   - output cap: localMaxTokens 8192.
+//   - defaultLocalBatchTokenBudget 5000 = at most 10 KB of JSON, ~4.3K real
+//     tokens in and out for a full rewrite: under 8192 with ~45% margin.
+//   - context: input + 8192 out stays far inside Qwen3's native 32,768
+//     tokens; config caps the local budget at 23000 for that reason.
+//
+// Time per call: defaultSpawnTimeout (cloud) and localWarmBudget (local)
+// are sized so a batch that fills its output cap can finish.
+const (
+	haikuPromptTierTokens = 100_000
+	cliMaxOutputTokens    = 32_000
+	qwenContextTokens     = 32_768
+)
+
 // jsonOverheadTokens is the per-file JSON framing allowance (quotes, colon,
 // comma) of estimateFilesTokens.
 const jsonOverheadTokens = 8

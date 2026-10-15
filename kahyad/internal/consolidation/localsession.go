@@ -35,16 +35,17 @@ type LocalRunner interface {
 
 // localWarmBudget bounds one ALREADY-WARM local call (Supervisor.Do's own
 // "no bound at all on a cold load" contract - see that method's doc
-// comment). A whole lane's worth of markdown files is a much bigger
-// payload than a classification call, so this is far more generous than
-// kahyad/internal/secretlane.DefaultBudget's 300ms classification budget.
-const localWarmBudget = 60 * time.Second
+// comment). One batch (FIX-B-5) may answer with up to localMaxTokens; at a
+// conservative ~30 tokens/s for Qwen3-30B-A3B on MLX that is about 4.5
+// minutes, so the budget is 5 minutes (it was 60 seconds, which a full
+// local rewrite could not meet and which failed the whole night).
+const localWarmBudget = 5 * time.Minute
 
 // localMaxTokens is the max_tokens budget for one local-lane consolidation
-// call - generous enough for a lane's worth of whole-file rewrites within
-// Qwen3-30B-A3B's context window; the exact figure is not safety-relevant
-// (a too-small budget just means a truncated/invalid JSON response, which
-// parseRewriteResponse already fails closed on).
+// call (one batch, FIX-B-5: the local batch budget is sized against it, see
+// tokens.go). The exact figure is not safety-relevant: a too-small budget
+// just means a truncated/invalid JSON response, which parseRewriteResponse
+// rejects (ErrRewriteMalformed) and the orchestrator drops that batch only.
 const localMaxTokens = 8192
 
 // LocalSession is the production Session for the secret lane.

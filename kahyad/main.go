@@ -1074,6 +1074,13 @@ func run() int {
 			EvalModelVer:      cfg.ActiveEmbedModelVer,
 			EvalFusionSHA256:  fusionSHA,
 			EvalGateMaxAge:    consolidation.DefaultEvalGateMaxAge,
+			// FIX-B-5: each lane goes to its model in budgeted batches,
+			// changed files first, at most max_batches_per_lane calls a night.
+			CloudBatchTokenBudget: cfg.ConsolidationCloudBatchTokenBudget,
+			LocalBatchTokenBudget: cfg.ConsolidationLocalBatchTokenBudget,
+			MaxFileBytes:          cfg.ConsolidationMaxFileBytes,
+			MaxBatchesPerLane:     cfg.ConsolidationMaxBatchesPerLane,
+			ChangedFilesFirst:     cfg.ConsolidationChangedFilesFirst,
 		},
 		Git: backup.NewExecGitRunner(),
 		Cloud: consolidation.CloudSession{Spawner: consolidation.ProcessSpawner{

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1711,5 +1712,74 @@ func TestLocationFallsBackToLocalForHandBuiltConfig(t *testing.T) {
 	}
 	if got := (Config{Timezone: "UTC"}).Location(); got != time.UTC {
 		t.Errorf("Location() = %v, want time.UTC", got)
+	}
+}
+
+// TestLoadConsolidationBatchingDefaultsAndFileOverrides (FIX-B-5): the five
+// consolidation_* batching keys have their documented defaults and are real,
+// independently overridable config.yaml keys.
+func TestLoadConsolidationBatchingDefaultsAndFileOverrides(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ConsolidationCloudBatchTokenBudget != 24000 || cfg.ConsolidationLocalBatchTokenBudget != 5000 ||
+		cfg.ConsolidationMaxFileBytes != 262144 || cfg.ConsolidationMaxBatchesPerLane != 20 || !cfg.ConsolidationChangedFilesFirst {
+		t.Fatalf("defaults = cloud %d, local %d, max_file_bytes %d, max_batches %d, changed_first %v; want 24000, 5000, 262144, 20, true",
+			cfg.ConsolidationCloudBatchTokenBudget, cfg.ConsolidationLocalBatchTokenBudget, cfg.ConsolidationMaxFileBytes,
+			cfg.ConsolidationMaxBatchesPerLane, cfg.ConsolidationChangedFilesFirst)
+	}
+
+	writeConfigYAML(t, home, "consolidation_cloud_batch_token_budget: 48000\n"+
+		"consolidation_local_batch_token_budget: 12000\n"+
+		"consolidation_max_file_bytes: 65536\n"+
+		"consolidation_max_batches_per_lane: 3\n"+
+		"consolidation_changed_files_first: false\n")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ConsolidationCloudBatchTokenBudget != 48000 || cfg.ConsolidationLocalBatchTokenBudget != 12000 ||
+		cfg.ConsolidationMaxFileBytes != 65536 || cfg.ConsolidationMaxBatchesPerLane != 3 || cfg.ConsolidationChangedFilesFirst {
+		t.Fatalf("overrides = cloud %d, local %d, max_file_bytes %d, max_batches %d, changed_first %v; want 48000, 12000, 65536, 3, false",
+			cfg.ConsolidationCloudBatchTokenBudget, cfg.ConsolidationLocalBatchTokenBudget, cfg.ConsolidationMaxFileBytes,
+			cfg.ConsolidationMaxBatchesPerLane, cfg.ConsolidationChangedFilesFirst)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidConsolidationBatching (FIX-B-5): a zero or
+// negative budget, a cloud budget past Haiku 5.5's 100K price tier, a local
+// budget past Qwen's context, a tiny max_file_bytes or zero batches fail Load
+// instead of being silently replaced by a default.
+func TestLoadFailsClosedOnInvalidConsolidationBatching(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, key string }{
+		{"cloud_zero", "consolidation_cloud_batch_token_budget: 0\n", "consolidation_cloud_batch_token_budget"},
+		{"cloud_over_price_tier", "consolidation_cloud_batch_token_budget: 90001\n", "consolidation_cloud_batch_token_budget"},
+		{"local_negative", "consolidation_local_batch_token_budget: -1\n", "consolidation_local_batch_token_budget"},
+		{"local_over_context", "consolidation_local_batch_token_budget: 23001\n", "consolidation_local_batch_token_budget"},
+		{"max_file_bytes_tiny", "consolidation_max_file_bytes: 4095\n", "consolidation_max_file_bytes"},
+		{"max_batches_zero", "consolidation_max_batches_per_lane: 0\n", "consolidation_max_batches_per_lane"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("Load() error = %v, want a %s validation error", err, tc.key)
+			}
+		})
+	}
+	// The bounds themselves are accepted.
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, fmt.Sprintf("consolidation_cloud_batch_token_budget: %d\nconsolidation_local_batch_token_budget: %d\nconsolidation_max_file_bytes: %d\nconsolidation_max_batches_per_lane: 1\n",
+		MaxConsolidationCloudBatchTokenBudget, MaxConsolidationLocalBatchTokenBudget, MinConsolidationMaxFileBytes))
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() at the bounds error = %v, want nil", err)
 	}
 }

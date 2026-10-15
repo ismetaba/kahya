@@ -57,6 +57,8 @@ func (f SessionFunc) Consolidate(ctx context.Context, traceID string, files map[
 // user-facing-strings policy does not apply to model prompts)
 // consolidation instruction (task spec Deliverables, verbatim intent:
 // "merge duplicates, fix headings, fold new notes into topic files").
+// Since FIX-B-5 a session is given one BATCH of one lane's files (select.go),
+// so the prompt confines every merge to that batch.
 // Every file this session is given is TRUSTED first-party memory content
 // (never mail/web bodies - those go through kahyad/internal/reader's
 // separate untrusted-Reader path), so - unlike reader.go's mail/webpage
@@ -64,9 +66,9 @@ func (f SessionFunc) Consolidate(ctx context.Context, traceID string, files map[
 // still forbid anything beyond a whole-file JSON rewrite (no shell, no
 // git, no tool use is even offered - Mode=ModeReader's toolless worker
 // profile enforces that structurally, this is defense in depth only).
-const rewriteSystemPrompt = `You are a memory-consolidation assistant running on the user's own machine. You will be given a JSON object mapping relative file paths to their CURRENT full markdown content, drawn from the user's personal notes.
+const rewriteSystemPrompt = `You are a memory-consolidation assistant running on the user's own machine. You will be given a JSON object mapping relative file paths to their CURRENT full markdown content. It is a SUBSET (one batch) of the user's personal notes, not all of them.
 
-Your job: merge duplicate information across files, fix/normalize markdown headings, and fold any new/loose notes into the correct existing topic file. Preserve every fact; never invent new information; never delete content unless it is a verbatim duplicate of content kept elsewhere.
+Your job: merge duplicate information across the files of this batch, fix/normalize markdown headings, and fold any new/loose notes into the correct existing topic file of this batch. Merge duplicates ONLY within this batch; never reference, create or rename a path you were not given. Preserve every fact; never invent new information; never delete content unless it is a verbatim duplicate of content kept elsewhere in this batch.
 
 Respond with STRICT JSON ONLY, no markdown code fences, no commentary, exactly this shape:
 
@@ -110,6 +112,12 @@ const (
 // the prompt's "Never add a path you were not given".
 var ErrRewriteUnknownPath = errors.New("consolidation: rewrite names a path outside its input set")
 
+// ErrRewriteMalformed (FIX-B-5): a session's response could not be decoded
+// into the rewrite shape at all (typically a JSON cut by the model's output
+// cap). Unlike ErrRewriteUnknownPath it is not a contract breach: the
+// orchestrator drops only that batch and keeps the others (decision G06-7).
+var ErrRewriteMalformed = errors.New("consolidation: malformed rewrite response")
+
 // validateRewriteKeys returns ErrRewriteUnknownPath (with the lane, the
 // count and the sorted-first offender) when rewrites holds any key absent
 // from input. A missing key is fine: it means "unchanged".
@@ -142,10 +150,10 @@ func parseRewriteResponse(raw, lane string, input map[string]string) (map[string
 	}
 	trimmed := strings.TrimSpace(raw)
 	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
-		return nil, fmt.Errorf("consolidation: decode rewrite response: %w", err)
+		return nil, fmt.Errorf("%w: decode rewrite response: %v", ErrRewriteMalformed, err)
 	}
 	if parsed.Files == nil {
-		return nil, fmt.Errorf("consolidation: rewrite response missing \"files\" object")
+		return nil, fmt.Errorf("%w: rewrite response missing \"files\" object", ErrRewriteMalformed)
 	}
 	if err := validateRewriteKeys(lane, input, parsed.Files); err != nil {
 		return nil, err
