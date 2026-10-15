@@ -80,6 +80,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runEntity(client, args[1:], stdout, stderr)
 	case "memory":
 		return runMemory(client, args[1:], stdout, stderr)
+	case "ingest":
+		return runIngest(client, args[1:], stdin, stdout, stderr)
 	case "remembered":
 		return runRemembered(client, args[1:], stdout, stderr)
 	case "eval":
@@ -1009,6 +1011,86 @@ func runMemoryExtract(client *Client, args []string, stdout, stderr io.Writer) i
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgExtractDone+"\n", res.Episodes, res.Facts, res.Entities, res.Skipped)
+	return 0
+}
+
+// runIngest implements `kahya ingest <dosya|-> [--title <başlık>]
+// [--source <url|etiket>] [--secret] [--no-raw]` (G13 MEM-6 phase 3): the
+// document (a UTF-8 text/markdown file, or stdin for "-") goes to kahyad,
+// which classifies it LOCALLY before any cloud byte, writes an external_doc
+// note built only from the Reader's validated fields and its facts, and
+// keeps the raw bytes unless --no-raw. --secret forces the local model
+// (never the reverse). The note and facts stay unconfirmed: the hint names
+// the `kahya memory confirm` that lifts the quarantine. The path may come
+// before or after the flags.
+func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	path := ""
+	if len(args) > 0 && (args[0] == "-" || !strings.HasPrefix(args[0], "-")) {
+		path, args = args[0], args[1:]
+	}
+	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	title := fs.String("title", "", "notun başlığı (verilmezse belgeden)")
+	source := fs.String("source", "", "kaynak: URL ya da etiket (verilmezse dosya yolu)")
+	secret := fs.Bool("secret", false, "belgeyi gizli şerit olarak işle (yalnız yerel model)")
+	noRaw := fs.Bool("no-raw", false, "ham belgeyi saklama")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	switch {
+	case fs.NArg() == 1 && path == "":
+		path = fs.Arg(0)
+	case fs.NArg() > 0:
+		fmt.Fprintln(stderr, MsgIngestUsage)
+		return 2
+	}
+	if strings.TrimSpace(path) == "" {
+		fmt.Fprintln(stderr, MsgIngestUsage)
+		return 2
+	}
+	var content []byte
+	var err error
+	sourceRef := strings.TrimSpace(*source)
+	if path == "-" {
+		content, err = io.ReadAll(stdin)
+	} else {
+		content, err = os.ReadFile(path)
+		if sourceRef == "" {
+			if abs, aerr := filepath.Abs(path); aerr == nil {
+				sourceRef = abs
+			} else {
+				sourceRef = path
+			}
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, MsgIngestReadFailed+"\n", err.Error())
+		return 2
+	}
+	res, err := client.Ingest(context.Background(), traceid.New(), content, sourceRef, strings.TrimSpace(*title), *secret, *noRaw)
+	if err != nil {
+		var ie *ingestError
+		switch {
+		case errors.As(err, &ie) && ie.Reason == "too_large":
+			fmt.Fprintf(stderr, MsgIngestTooLarge+"\n", ie.MaxBytes)
+		case errors.As(err, &ie) && ie.Reason == "local_unavailable":
+			fmt.Fprintln(stderr, MsgIngestLocalUnavailable)
+		case errors.As(err, &ie) && ie.Reason != "":
+			fmt.Fprintln(stderr, ie.Msg)
+		default:
+			fmt.Fprintln(stderr, wrapServerError(MsgIngestFailed, err))
+		}
+		return 2
+	}
+	lane := MsgIngestLaneNormal
+	if res.Lane == "secret" {
+		lane = MsgIngestLaneSecret
+	}
+	fmt.Fprintf(stdout, MsgIngestDone+"\n", res.File, res.Chunks, res.Facts, res.Entities, res.SourceTier, lane)
+	if res.Lane == "secret" {
+		fmt.Fprintf(stdout, MsgIngestSecretBadge+"\n", res.File)
+	}
+	fmt.Fprintf(stdout, MsgIngestQuarantineHint+"\n", res.File)
 	return 0
 }
 

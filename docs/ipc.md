@@ -801,7 +801,17 @@ a cloud model, without changing anything in §2-§6 above:
   source_tier, raw_path, sha256, trace_id}`. Everything ingested is
   quarantined (external_doc, decision MEM-6.a) until `kahya memory confirm`
   / `kahya fact confirm`. URL ingest (`--url`, `x/net/html`) is deferred
-  (decision MEM-6.d: `curl … | kahya ingest -`).
+  (decision MEM-6.d: `curl … | kahya ingest -`). CLI (FIX-MEM-6 phase 3):
+  `kahya ingest <dosya|-> [--title <başlık>] [--source <url|etiket>]
+  [--secret] [--no-raw]` (`-` = stdin; a file's absolute path is the default
+  source; the note's name follows --title, then the source label, then the
+  Reader's title) prints `"Belge alındı: %s (%d parça, %d olgu, %d varlık;
+  katman: %s, şerit: %s)"`, on the secret lane `"🔒 Belge gizli şerit olarak
+  işlendi (yalnız yerel model); not: %s"`, then `"Not ve olgular onaysız
+  (external_doc); otomatik hatırlatmaya girmesi için: kahya memory confirm
+  %s"`; a 413 prints `"Dosya çok büyük (en fazla %d bayt)."`, the no-local-
+  model refusal its handbook text, any other refusal the daemon's Turkish
+  text (exit 2).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

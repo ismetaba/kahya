@@ -526,3 +526,33 @@ func TestSlugify(t *testing.T) {
 }
 
 var _ = sqlcgen.Event{}
+
+// TestIngestNoteNameFollowsTheUserLabel: the note's file name comes from
+// --title, then the source label (the handbook's `kahya ingest - --source
+// not` -> ingest/<day>-not.md), the Reader's title last; the heading is
+// the Reader's title unless --title overrides it.
+func TestIngestNoteNameFollowsTheUserLabel(t *testing.T) {
+	f := newFixture(t)
+	f.answer = acmeAnswer(t)
+	res, err := f.ingest(Request{Content: []byte(acmeDoc), SourceRef: "not", NoRaw: true})
+	if err != nil || res.File != "ingest/2026-10-08-not.md" {
+		t.Fatalf("source label = %+v %v", res, err)
+	}
+	if note, _ := os.ReadFile(filepath.Join(f.memDir, res.File)); !strings.Contains(string(note), "\n# Acme taşınma\n") {
+		t.Fatalf("heading = %s", note)
+	}
+	g := newFixture(t)
+	g.answer = acmeAnswer(t)
+	res, err = g.ingest(Request{Content: []byte(acmeDoc), Title: "Ofis Taşınması", SourceRef: "not", NoRaw: true})
+	if err != nil || res.File != "ingest/2026-10-08-ofis-tasinmasi.md" {
+		t.Fatalf("title = %+v %v", res, err)
+	}
+	if note, _ := os.ReadFile(filepath.Join(g.memDir, res.File)); !strings.Contains(string(note), "\n# Ofis Taşınması\n") {
+		t.Fatalf("heading = %s", note)
+	}
+	h := newFixture(t)
+	h.answer = acmeAnswer(t)
+	if res, err = h.ingest(Request{Content: []byte(acmeDoc), NoRaw: true}); err != nil || res.File != "ingest/2026-10-08-acme-tasinma.md" {
+		t.Fatalf("no label = %+v %v", res, err)
+	}
+}

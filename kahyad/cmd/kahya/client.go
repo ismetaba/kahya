@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1230,6 +1231,71 @@ func (c *Client) MemoryConfirm(ctx context.Context, traceID, file string) (memor
 	var res memoryConfirmResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return memoryConfirmResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("memory confirm: decode response: %w", err)}
+	}
+	return res, nil
+}
+
+// ingestResult mirrors kahyad's POST /v1/ingest answer
+// (kahyad/internal/server.ingestResponse, G13 MEM-6).
+type ingestResult struct {
+	OK         bool   `json:"ok"`
+	File       string `json:"file"`
+	EpisodeID  int64  `json:"episode_id"`
+	Lane       string `json:"lane"`
+	Chunks     int    `json:"chunks"`
+	Facts      int    `json:"facts"`
+	Entities   int    `json:"entities"`
+	SourceTier string `json:"source_tier"`
+	RawPath    string `json:"raw_path"`
+}
+
+// ingestError is a kahyad refusal of POST /v1/ingest: its text (Turkish
+// for every ingest reason), the reason code and, for a 413, the cap.
+type ingestError struct {
+	Msg      string
+	Reason   string
+	MaxBytes int64
+}
+
+func (e *ingestError) Error() string { return e.Msg }
+
+// Ingest calls POST /v1/ingest (`kahya ingest`). No client timeout: a long
+// document on the local model can take minutes.
+func (c *Client) Ingest(ctx context.Context, traceID string, content []byte, sourceRef, title string, secret, noRaw bool) (ingestResult, error) {
+	body := map[string]any{
+		"content_b64": base64.StdEncoding.EncodeToString(content), "source_ref": sourceRef, "title": title, "no_raw": noRaw,
+	}
+	if secret {
+		body["lane_hint"] = "secret"
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return ingestResult{}, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/ingest", traceID, bytes.NewReader(b))
+	if err != nil {
+		return ingestResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return ingestResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error    string `json:"error"`
+			Reason   string `json:"reason"`
+			MaxBytes int64  `json:"max_bytes"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		if e.Error == "" {
+			return ingestResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("ingest: status %d", resp.StatusCode)}
+		}
+		return ingestResult{}, &ingestError{Msg: e.Error, Reason: e.Reason, MaxBytes: e.MaxBytes}
+	}
+	var res ingestResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return ingestResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("ingest: decode response: %w", err)}
 	}
 	return res, nil
 }

@@ -306,7 +306,10 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 
 	// Step 5: the external_doc note.
 	now := r.now()
-	rel := NoteDir + "/" + now.In(r.location()).Format("2006-01-02") + "-" + slugify(firstNonEmpty(req.Title, out.Title, labelTitle(req.SourceRef))) + ".md"
+	// The file name follows the user's own label first (`--title`, then the
+	// source: `kahya ingest - --source not` -> ingest/<day>-not.md), the
+	// Reader's title last.
+	rel := NoteDir + "/" + now.In(r.location()).Format("2006-01-02") + "-" + slugify(firstNonEmpty(req.Title, labelTitle(req.SourceRef), out.Title)) + ".md"
 	note, err := r.Memory.HandleWriteTiered(ctx, traceID, memory.TieredWriteArgs{
 		RelPath: rel, Tier: factengine.TierExternalDoc, SecretLane: lane == router.LaneSecret, CommitPrefix: "ingest", Body: body,
 		FrontMatter: []memory.FrontMatterField{

@@ -85,7 +85,7 @@ func TestIngestRouteHappyPath(t *testing.T) {
 		t.Fatalf("ingest = %d %v (cloud calls %d)", status, res, *cloudCalls)
 	}
 	file, _ := res["file"].(string)
-	if !strings.HasPrefix(file, "ingest/") || !strings.HasSuffix(file, "-zeynep-ofis-notu.md") {
+	if !strings.HasPrefix(file, "ingest/") || !strings.HasSuffix(file, "-not.md") {
 		t.Fatalf("file = %q", file)
 	}
 	note, err := os.ReadFile(filepath.Join(f.memoryDir, file))

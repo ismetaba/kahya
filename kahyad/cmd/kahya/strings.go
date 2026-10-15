@@ -669,4 +669,25 @@ const (
 	MsgFactListFailed    = "Olgu listesi alınamadı: %s"
 	MsgFactConfirmFailed = "Olgu onayı başarısız: %s"
 	MsgFactDenyFailed    = "Olgu reddi başarısız: %s"
+
+	// `kahya ingest` (G13 MEM-6 phase 3; the handbook's byte-exact texts).
+	// MsgIngestDone: note path, chunks, facts, entities, source tier, lane
+	// label (ingestLaneLabel). MsgIngestLocalUnavailable / MsgIngestTooLarge
+	// equal kahyad/internal/ingest's MsgIngestLocalUnavailable /
+	// MsgIngestTooLargeFmt (pinned by TestIngestCLIStringsMatchIngestPackage).
+	MsgIngestUsage            = "kullanım: kahya ingest <dosya|-> [--title <başlık>] [--source <url|etiket>] [--secret]"
+	MsgIngestDone             = "Belge alındı: %s (%d parça, %d olgu, %d varlık; katman: %s, şerit: %s)"
+	MsgIngestSecretBadge      = "🔒 Belge gizli şerit olarak işlendi (yalnız yerel model); not: %s"
+	MsgIngestLocalUnavailable = "Belge gizli şerit olarak sınıflandı ama yerel model kullanılamıyor (yerel model için bellek yok); buluta gönderilmedi. Daha sonra tekrar dene."
+	MsgIngestQuarantineHint   = "Not ve olgular onaysız (external_doc); otomatik hatırlatmaya girmesi için: kahya memory confirm %s"
+	MsgIngestTooLarge         = "Dosya çok büyük (en fazla %d bayt)."
+	// MsgIngestReadFailed: the CLI could not read the file / stdin (%s = the
+	// OS error). MsgIngestFailed wraps a kahyad-side failure that carries no
+	// Turkish text of its own (the daemon's English detail).
+	MsgIngestReadFailed = "Belge okunamadı: %s"
+	MsgIngestFailed     = "Belge alınamadı: %s"
+	// MsgIngestLaneSecret / MsgIngestLaneNormal are MsgIngestDone's lane
+	// labels.
+	MsgIngestLaneSecret = "gizli"
+	MsgIngestLaneNormal = "normal"
 )
