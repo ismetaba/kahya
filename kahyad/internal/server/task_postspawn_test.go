@@ -32,7 +32,7 @@ func TestDecidePostSpawnTable(t *testing.T) {
 		{"executing_runerr_failed", task.StatusExecuting, errors.New("bad worker_cmd"), spawn.Outcome{}, task.StatusFailed, "error", "error", ""},
 		{"executing_cloud_unreachable_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusCloudUnreachable}, "", "waiting_retry", "error", task.MsgCloudParked},
 		{"budget_blocked_reports_paused", task.StatusBlockedUser, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "paused_budget", "error", fmt.Sprintf(MsgTaskPausedBudgetFmt, trace, id)},
-		{"executing_timeout_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusTimeout}, "", "error", "error", ""},
+		{"executing_timeout_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusTimeout}, "", "error", "error", fmt.Sprintf(MsgTaskTimeout, 30)},
 		{"parked_error_line_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "waiting_retry", "error", task.MsgCloudParked},
 		{"parked_ok_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "waiting_retry", "error", task.MsgCloudParked},
 		{"halted_ok_untouched", task.StatusUserHalted, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "done", "result", ""},
@@ -44,7 +44,7 @@ func TestDecidePostSpawnTable(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			d := decidePostSpawn(c.current, c.runErr, c.outcome, trace, id, 30)
+			d := decidePostSpawn(c.current, c.runErr, c.outcome, trace, id, 30, false)
 			if d.toStatus != c.wantTo {
 				t.Errorf("toStatus = %q, want %q", d.toStatus, c.wantTo)
 			}
@@ -61,5 +61,28 @@ func TestDecidePostSpawnTable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDecidePostSpawnShutdownTimeoutSaysRestart (FIX-FINAL
+// shutdown-reported-as-timeout): a StatusTimeout while kahyad is shutting
+// down is the shutdown's kill, not the task deadline - the SSE says kahyad
+// is restarting and the task resumes, while status (stays 'executing'),
+// state ("error") and ledger kind (task_timeout) are unchanged (FIX-I-5).
+// Outside a shutdown the same outcome still says MsgTaskTimeout, and a
+// shutdown changes nothing for any other outcome.
+func TestDecidePostSpawnShutdownTimeoutSaysRestart(t *testing.T) {
+	const trace, id = "trace-ps", "task-ps"
+	d := decidePostSpawn(task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusTimeout}, trace, id, 30, true)
+	if d.toStatus != "" || d.mapping.finalState != "error" || d.mapping.ledgerKind != "task_timeout" || d.mapping.sseEvent != "error" {
+		t.Fatalf("decision = %+v, want stay executing / error / task_timeout / error", d)
+	}
+	payload, _ := d.mapping.ssePayload.(map[string]string)
+	if want := fmt.Sprintf(MsgTaskShutdownInterruptedFmt, id); payload["message"] != want {
+		t.Errorf("SSE message = %q, want %q", payload["message"], want)
+	}
+	d = decidePostSpawn(task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusOK}, trace, id, 30, true)
+	if d.toStatus != task.StatusDone || d.mapping.sseEvent != "result" {
+		t.Errorf("an OK outcome during shutdown = %+v, want done/result unchanged", d)
 	}
 }

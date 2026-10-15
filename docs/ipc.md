@@ -1388,8 +1388,13 @@ to the request, the task deadline **and** the daemon's lifecycle
 lifecycle, releases parked approval waits, then waits up to 15 s
 (`inflightDrainTimeout`, owner decision G10-5; JSONL
 `shutdown_inflight_timeout` past it) for the in-flight `/v1/task`
-requests to kill their workers and record the outcome (`task_timeout`,
-`tasks.state` `error`); a `/v1/task` arriving meanwhile gets 503. Only
+requests to kill their workers and record the outcome (`task_timeout`
+with `shutdown: true`, `tasks.state` `error`); the still-connected client's
+SSE `error` then says `"Görev kahyad kapandığı için durduruldu; kahyad
+yeniden başlayınca devam ettirilir. Durum: kahya task show <id>"`, never
+the `MsgTaskTimeout` "(30 dk)" text, which is only for a reached task
+deadline (FIX-FINAL shutdown-reported-as-timeout); a `/v1/task` arriving
+meanwhile gets 503. Only
 then the HTTP server, Docker containers, socket and control secret go,
 the startup flock last. The outbox dispatcher gets the same lifecycle
 (`SetBaseContext`): it claims nothing once shutdown began and a running

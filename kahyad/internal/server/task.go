@@ -59,6 +59,12 @@ const (
 	// MsgTaskTimeout is the SSE "error" event message when task_timeout_min
 	// elapses before the worker finishes (%d = cfg.task_timeout_min).
 	MsgTaskTimeout = "Görev zaman aşımına uğradı (%d dk)."
+	// MsgTaskShutdownInterruptedFmt replaces MsgTaskTimeout when the worker
+	// was stopped because kahyad itself is shutting down (FIX-I-5
+	// lifecycleCancel), not because the task deadline was reached
+	// (%s = task id). The task stays 'executing' for the restarted kahyad's
+	// resume scan (FIX-FINAL shutdown-reported-as-timeout).
+	MsgTaskShutdownInterruptedFmt = "Görev kahyad kapandığı için durduruldu; kahyad yeniden başlayınca devam ettirilir. Durum: kahya task show %s"
 	// MsgTaskUnexpectedExit is the SSE "error" event message when the
 	// worker process ends (any exit code) without ever sending a terminal
 	// "result"/"error" stdout line, OR when kahyad itself could not even
@@ -1172,7 +1178,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// eventually surfaces to the user via blocked_user/W1's retry cap, it
 	// simply takes one more tick to get there).
 	current, _ := s.taskDurabilityStatus(persistCtx, taskID) // "" when unwired or unreadable
-	d := decidePostSpawn(current, runErr, outcome, traceID, taskID, timeoutMin)
+	// FIX-FINAL shutdown-reported-as-timeout: a worker killed by kahyad's
+	// own shutdown (lifecycleCancel) returns StatusTimeout like a real
+	// deadline; the client is told kahyad is restarting, not "30 dk".
+	shuttingDown := s.lifecycle != nil && s.lifecycle.Err() != nil
+	d := decidePostSpawn(current, runErr, outcome, traceID, taskID, timeoutMin, shuttingDown)
 	m := d.mapping
 
 	if err := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
@@ -1181,9 +1191,11 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		log.Error("task_state_update_failed", "task_id", taskID, "err", err.Error())
 	}
 	if s.eventLogger != nil {
-		if err := s.eventLogger.LogEvent(persistCtx, traceID, m.ledgerKind, map[string]any{
-			"task_id": taskID, "status": outcome.Status,
-		}); err != nil {
+		payload := map[string]any{"task_id": taskID, "status": outcome.Status}
+		if m.ledgerKind == "task_timeout" {
+			payload["shutdown"] = shuttingDown
+		}
+		if err := s.eventLogger.LogEvent(persistCtx, traceID, m.ledgerKind, payload); err != nil {
 			log.Warn("task_ledger_error", "kind", m.ledgerKind, "err", err.Error())
 		}
 	}
@@ -1375,8 +1387,9 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 	}
 
 	// FIX-I-5: the local answer ends with the daemon too (boundTaskContext);
-	// the task stays 'executing' and the restarted kahyad's dispatcher fails
-	// it (a local answer is never handed to a worker).
+	// finishSecretLaneTask then fails the task (FIX-I-14: task_error with
+	// MsgSecretLaneModelCallFailed) - a local answer is never handed to a
+	// worker.
 	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
 	defer cancel()
 
@@ -1590,7 +1603,14 @@ type postSpawnDecision struct {
 // to resume (FIX-I-2). A timeout, a crash without any terminal line and
 // cloud_unreachable stay 'executing' for the resume scan (W4-07, see
 // handleTask's comment), now bounded by task_max_crash_resumes.
-func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceID, taskID string, timeoutMin int) postSpawnDecision {
+//
+// shuttingDown (FIX-FINAL shutdown-reported-as-timeout) is true when
+// kahyad's own lifecycle context had ended by the time spawn.Run returned:
+// a StatusTimeout is then the shutdown's kill, not the task deadline, so
+// the SSE carries MsgTaskShutdownInterruptedFmt instead of MsgTaskTimeout.
+// Everything else is unchanged (status stays 'executing', state "error",
+// ledger task_timeout - the FIX-I-5 acceptance).
+func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceID, taskID string, timeoutMin int, shuttingDown bool) postSpawnDecision {
 	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
 	switch current {
 	case task.StatusRetryWait:
@@ -1617,6 +1637,9 @@ func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceI
 		return postSpawnDecision{toStatus: task.StatusDone, mapping: m}
 	case outcome.Status == spawn.StatusError && outcome.ErrMsg != "":
 		return postSpawnDecision{toStatus: task.StatusFailed, mapping: m}
+	case outcome.Status == spawn.StatusTimeout && shuttingDown:
+		m.ssePayload = map[string]string{"message": fmt.Sprintf(MsgTaskShutdownInterruptedFmt, taskID)}
+		return postSpawnDecision{mapping: m}
 	default:
 		return postSpawnDecision{mapping: m}
 	}

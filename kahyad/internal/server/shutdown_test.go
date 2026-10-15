@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
@@ -193,4 +194,78 @@ func TestInflightGateRefusesAfterClose(t *testing.T) {
 		t.Error("closeAndWait must report a timeout while a run is still in flight")
 	}
 	g2.end()
+}
+
+// TestShutdownTellsClientTaskWillResume (FIX-FINAL shutdown-reported-as-
+// timeout): the still-connected `kahya ask` client of a task whose worker
+// kahyad's own Shutdown killed was told "Görev zaman aşımına uğradı (30
+// dk)." seconds into the run. It now gets the shutdown message naming the
+// task, and the task_timeout row carries shutdown:true.
+func TestShutdownTellsClientTaskWillResume(t *testing.T) {
+	traceID := "abcdef0123456789abcdef0123456702"
+	live := task.NewLiveRegistry()
+	script := filepath.Join(spawnTestdataDir(t), "hang_worker.py")
+	f := newTaskTestFixtureWithOptions(t, []string{"python3", script}, 30, "https://upstream.invalid", generousTestGovernor(), func(srv *Server, st *store.Store) {
+		wireDurability(srv, st)
+		srv.SetTaskLiveRegistry(live)
+	})
+	bodyCh := make(chan string, 1)
+	go func() {
+		body, _ := json.Marshal(map[string]any{"prompt": "uzun bir iş", "trace_id": traceID})
+		req, err := http.NewRequest(http.MethodPost, "http://kahyad/v1/task", bytes.NewReader(body))
+		if err != nil {
+			bodyCh <- ""
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Kahya-Trace-Id", traceID)
+		resp, err := longClient(f.srv.cfg.Socket).Do(req)
+		if err != nil {
+			bodyCh <- ""
+			return
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		bodyCh <- string(raw)
+	}()
+	var taskID string
+	var pid int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && pid == 0 {
+		if taskID == "" {
+			_ = f.store.DB().QueryRow(`SELECT id FROM tasks WHERE trace_id = ?`, traceID).Scan(&taskID)
+		}
+		if taskID != "" {
+			if p, ok := live.PID(taskID); ok && p > 0 {
+				pid = p
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("worker never registered")
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	_ = f.srv.Shutdown()
+	waitForGroupEmpty(t, pid)
+	var sse string
+	select {
+	case sse = <-bodyCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the client's SSE stream never ended")
+	}
+	if want := fmt.Sprintf(MsgTaskShutdownInterruptedFmt, taskID); !strings.Contains(sse, want) {
+		t.Errorf("client SSE = %q, want it to carry %q", sse, want)
+	}
+	if strings.Contains(sse, fmt.Sprintf(MsgTaskTimeout, 30)) {
+		t.Errorf("client SSE still says the task timed out: %q", sse)
+	}
+	var shutdownFlag int
+	if err := f.store.DB().QueryRow(`SELECT count(*) FROM events WHERE trace_id = ? AND kind = 'task_timeout' AND json_extract(payload, '$.shutdown') = 1`, traceID).Scan(&shutdownFlag); err != nil {
+		t.Fatal(err)
+	}
+	if shutdownFlag != 1 {
+		t.Errorf("task_timeout rows with shutdown:true = %d, want 1", shutdownFlag)
+	}
 }
