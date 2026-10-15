@@ -898,7 +898,11 @@ a cloud model, without changing anything in §2-§6 above:
   byte-exact like the cloud lane's (`hafiza_injected {task_id, chunk_ids,
   block_sha256, block, lane[, fact_ids, entity_ids]}`, §5 safety #4), and
   every `hafiza_injected` row now carries `lane` (`"normal"` for the hook's
-  block); a block whose row could not be written is not injected. JSONL
+  block); a block whose row could not be written is not injected - on
+  both injection points: `/v1/memory/search for_injection:true` then
+  answers `hafiza_block: ""` and no `facts`, so the worker hook injects
+  nothing (JSONL `memory_search_injection_withheld`; FIX-FINAL
+  cloud-injection-without-ledger-row). JSONL
   `secretlane_hafiza_injected {task_id, lane, chunk_count, fact_count}`;
   `secretlane_hafiza_skipped {reason: search_unwired | deny_all |
   ledger_unwired}` (deny-all: policy is untrusted, so no memory is served -

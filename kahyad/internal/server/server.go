@@ -1050,11 +1050,19 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 			SourceTier: h.SourceTier,
 		})
 	}
-	if req.ForInjection {
+	// HANDOFF §5 safety #4 (FIX-FINAL cloud-injection-without-ledger-row):
+	// a block whose hafiza_injected row could not be written is never
+	// handed to the worker hook - the same rule as the local injection
+	// point (localHafizaPrompt): the turn proceeds without memory. With no
+	// event logger wired at all (unit tests only; production always wires
+	// one) there is no row to write.
+	if req.ForInjection && (hb.Ledgered || s.eventLogger == nil) {
 		resp.HafizaBlock = hb.Block
 		for _, f := range hb.Facts {
 			resp.Facts = append(resp.Facts, memorySearchFactItemFrom(f))
 		}
+	} else if req.ForInjection && hb.Block != "" {
+		s.log.With(traceID).Warn("memory_search_injection_withheld", "task_id", taskID, "reason", "hafiza_injected_not_ledgered")
 	}
 
 	w.Header().Set("Content-Type", "application/json")

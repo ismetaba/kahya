@@ -303,6 +303,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #4 | a secret-lane task's local `<hafiza>` block is ledgered byte-exact as hafiza_injected with lane=secret, block_sha256 = sha256(block) and the task's id; the answerer's prompt is that block + the prompt | `kahyad/internal/server/TestSecretLaneTaskInjectsLocalHafiza` | FIX-MEM-7 | ci-hermetic |
 | Safety #4 | every injected local block is ledgered: a block whose hafiza_injected row could not be written is not injected (bare prompt) | `kahyad/internal/server/TestSecretLaneTaskInjectionNotInjectedWhenLedgerFails` | FIX-MEM-7 | ci-hermetic |
 | Safety #4 | the worker hook's cloud-bound block is ledgered with lane=normal; block and block_sha256 are unchanged by the new field | `kahyad/internal/server/TestMemorySearchForInjectionLedgersLaneNormal` | FIX-MEM-7 | ci-hermetic |
+| Safety #4 | the cloud hook's `for_injection:true` block is withheld (empty `hafiza_block`/`facts`) when its `hafiza_injected` row could not be written | `kahyad/internal/server/TestMemorySearchForInjectionUnledgeredBlockNotReturned` | FIX-FINAL cloud-injection-without-ledger-row | ci-hermetic |
 | Safety #5 | homoglyph host normalized/rejected (WYSIWYE) | `kahyad/internal/canon/TestNormalize_HomoglyphHost` | W3-06 | ci-hermetic |
 | Safety #5 | bidi-override filename normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_BidiFilename` | W3-06 | ci-hermetic |
 | Safety #5 | zero-width URL normalized (WYSIWYE) | `kahyad/internal/canon/TestNormalize_ZeroWidthURL` | W3-06 | ci-hermetic |
