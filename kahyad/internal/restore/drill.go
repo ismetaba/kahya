@@ -131,9 +131,11 @@ type InjectionResult struct {
 // The returned Block is therefore byte-identical to what the server would
 // inject/ledger for the same query against the same db when the server runs
 // the committed default fusion config with the embedder down (the drill
-// wires no embedder). Both sides of the drill's compare go through this
-// function, so the production-vs-restored byte-compare (after Normalize)
-// stays a faithful equivalence proof. traceID "" is fine - it only scopes a
+// wires no embedder, and a recency weight the server activated through
+// search.Searcher.ActivateFusionConfig - FIX-MEM-8 - is not applied here).
+// Both sides of the drill's compare go through this function, so the
+// production-vs-restored byte-compare (after Normalize) stays a faithful
+// equivalence proof. traceID "" is fine - it only scopes a
 // JSONL log line here, never the block content.
 func RunEquivalence(ctx context.Context, db *sql.DB, log *logx.Logger, query string, k int) (InjectionResult, error) {
 	searcher := search.New(db, log, search.DefaultConfig())

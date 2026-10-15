@@ -87,6 +87,52 @@ func TestHandleEvalRetrievalRunOK(t *testing.T) {
 	}
 }
 
+// TestHandleEvalRetrievalRunReportsCandidate (FIX-MEM-8): a run that also
+// scored a pending candidate fusion config (a configured recency weight)
+// reports it under "candidate"; the top-level fields stay the active
+// config's result. A run without a candidate omits the key.
+func TestHandleEvalRetrievalRunReportsCandidate(t *testing.T) {
+	runner := &fakeEvalRetrievalRunner{out: eval.RetrievalOutcome{
+		Report:        eval.RetrievalReport{Total: 4, Correct: 4, Precision: 1.0},
+		DatasetSHA256: "d1", ModelVer: "m1", FusionSHA256: "f-active",
+		Candidate: &eval.CandidateOutcome{
+			Report:       eval.RetrievalReport{Total: 4, Correct: 3, Precision: 0.75},
+			FusionSHA256: "f-cand",
+		},
+	}}
+	client := newEvalRetrievalTestServer(t, runner, &fakeRitualExporter{}, false)
+	resp, err := client.Post("http://kahyad/v1/eval/retrieval", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /v1/eval/retrieval: %v", err)
+	}
+	defer resp.Body.Close()
+	var body evalRetrievalRunResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.FusionSHA256 != "f-active" || body.Precision != 1.0 {
+		t.Fatalf("top-level = %+v, want the active result", body)
+	}
+	if body.Candidate == nil || body.Candidate.FusionSHA256 != "f-cand" || body.Candidate.Precision != 0.75 ||
+		body.Candidate.Total != 4 || body.Candidate.Correct != 3 {
+		t.Fatalf("candidate = %+v, want f-cand 3/4", body.Candidate)
+	}
+
+	runner.out.Candidate = nil
+	resp2, err := client.Post("http://kahyad/v1/eval/retrieval", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp2.Body.Close()
+	var raw map[string]any
+	if err := json.NewDecoder(resp2.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := raw["candidate"]; ok {
+		t.Fatalf("response = %v, want no candidate key without a candidate", raw)
+	}
+}
+
 func TestHandleEvalRetrievalRunUnwired(t *testing.T) {
 	client := newEvalRetrievalTestServer(t, nil, nil, false)
 	resp, err := client.Post("http://kahyad/v1/eval/retrieval", "application/json", nil)

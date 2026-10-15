@@ -110,12 +110,12 @@ func (g EvalGate) CheckRetrievalGate(ctx context.Context, maxAge time.Duration, 
 
 // CheckFusionActivation is the search.FusionGate adaptation (gate point c):
 // it asks whether a green result covers a candidate fusion_sha256 within the
-// freshness window, matching the CURRENT dataset_sha256/model_ver. Because
-// the fusion config is a boot-time literal today, this is only reachable
-// through search.Searcher.ActivateFusionConfig, which has no live caller yet
-// - it exists so a future fusion change is gated by construction. maxAge and
-// the current dataset/model state are captured on the gate value via its
-// fields below.
+// freshness window, matching the CURRENT dataset_sha256/model_ver. It is
+// reached only through search.Searcher.ActivateFusionConfig, whose one
+// caller is kahyad's boot-time recency activation (FIX-MEM-8: config
+// search_recency_weight > 0); RetrievalRunner's candidate pass ledgers the
+// green result such an activation needs. maxAge and the current
+// dataset/model state are captured on the gate value via its fields below.
 func (g FusionActivationGate) CheckFusionActivation(fusionSHA string) (bool, string) {
 	res := g.Gate.Check(g.ctx(), g.MaxAge, GateState{DatasetSHA256: g.DatasetSHA256, ModelVer: g.ModelVer, FusionSHA256: fusionSHA})
 	return res.Allowed, res.Reason

@@ -57,7 +57,20 @@ type evalRetrievalRunResponse struct {
 	FusionSHA256  string                    `json:"fusion_sha256"`
 	DatasetSHA256 string                    `json:"dataset_sha256"`
 	Items         []evalRetrievalItemResult `json:"items"`
-	Error         string                    `json:"error,omitempty"`
+	// Candidate is the pending candidate fusion config's result
+	// (FIX-MEM-8: a configured search_recency_weight the gate has not
+	// activated yet), ledgered under its own fusion_sha256. Absent without
+	// a candidate.
+	Candidate *evalRetrievalCandidate `json:"candidate,omitempty"`
+	Error     string                  `json:"error,omitempty"`
+}
+
+// evalRetrievalCandidate mirrors kahyad/internal/eval.CandidateOutcome.
+type evalRetrievalCandidate struct {
+	Precision    float64 `json:"precision"`
+	Total        int     `json:"total"`
+	Correct      int     `json:"correct"`
+	FusionSHA256 string  `json:"fusion_sha256"`
 }
 
 // handleEvalRetrievalRun implements POST /v1/eval/retrieval. Deny-all (W3-01)
@@ -88,6 +101,10 @@ func (s *Server) handleEvalRetrievalRun(w http.ResponseWriter, r *http.Request) 
 	for i, it := range out.Report.Items {
 		items[i] = evalRetrievalItemResult{ID: it.ID, Answerable: it.Answerable, Correct: it.Correct, Abstained: it.Abstained}
 	}
+	var cand *evalRetrievalCandidate
+	if c := out.Candidate; c != nil {
+		cand = &evalRetrievalCandidate{Precision: c.Report.Precision, Total: c.Report.Total, Correct: c.Report.Correct, FusionSHA256: c.FusionSHA256}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(evalRetrievalRunResponse{
@@ -98,6 +115,7 @@ func (s *Server) handleEvalRetrievalRun(w http.ResponseWriter, r *http.Request) 
 		FusionSHA256:  out.FusionSHA256,
 		DatasetSHA256: out.DatasetSHA256,
 		Items:         items,
+		Candidate:     cand,
 	})
 }
 

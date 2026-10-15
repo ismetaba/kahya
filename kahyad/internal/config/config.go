@@ -109,6 +109,19 @@ type Config struct {
 	// eval_retrieval_dataset_path key or KAHYA_EVAL_RETRIEVAL_DATASET_PATH.
 	EvalRetrievalDatasetPath string `yaml:"eval_retrieval_dataset_path"`
 
+	// SearchRecencyWeight / SearchRecencyHalfLifeDays (FIX-MEM-8) are the
+	// memory search's recency weight w in [0,1] and its half-life in days
+	// (kahyad/internal/search.Config.RecencyWeight/RecencyHalfLifeDays:
+	// score' = (1-w)*fused + w*exp(-ln2*ageDays/halfLife)). Default 0 (off)
+	// and 90. A weight > 0 is a fusion change (HANDOFF §5 memory #5): kahyad
+	// activates it at boot ONLY through the retrieval-eval gate
+	// (search.Searcher.ActivateFusionConfig) - without a green
+	// `kahya eval retrieval` result for that exact config it logs
+	// search_recency_not_activated, keeps recency off, and lets the next
+	// eval run score the candidate too. Outside the bounds Load fails.
+	SearchRecencyWeight       float64 `yaml:"search_recency_weight"`
+	SearchRecencyHalfLifeDays int     `yaml:"search_recency_half_life_days"`
+
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
 	// passes through (HANDOFF S5 safety #1). Default 3128 (the
@@ -845,6 +858,8 @@ type fileConfig struct {
 	PolicyPath                    *string         `yaml:"policy_path"`
 	EvalMiniBaselinePath          *string         `yaml:"eval_mini_baseline_path"`
 	EvalRetrievalDatasetPath      *string         `yaml:"eval_retrieval_dataset_path"`
+	SearchRecencyWeight           *float64        `yaml:"search_recency_weight"`
+	SearchRecencyHalfLifeDays     *int            `yaml:"search_recency_half_life_days"`
 	EgressPort                    *int            `yaml:"egress_port"`
 	DockerImageTag                *string         `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string         `yaml:"docker_image_digest_path"`
@@ -1018,6 +1033,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateTimezone(cfg.Timezone); err != nil {
+		return Config{}, err
+	}
+	if err := validateSearchRecency(cfg.SearchRecencyWeight, cfg.SearchRecencyHalfLifeDays); err != nil {
 		return Config{}, err
 	}
 
@@ -1282,6 +1300,24 @@ func validateConsolidationBatching(cfg Config) error {
 	return nil
 }
 
+// DefaultSearchRecencyHalfLifeDays is search_recency_half_life_days'
+// default (FIX-MEM-8); it equals kahyad/internal/search's
+// DefaultRecencyHalfLifeDays (pinned by kahyad's
+// TestSearchRecencyDefaultsMatchSearchPackage).
+const DefaultSearchRecencyHalfLifeDays = 90
+
+// validateSearchRecency fails Load closed (FIX-MEM-8) on a recency weight
+// outside [0,1] (NaN included) or a half-life below 1 day.
+func validateSearchRecency(weight float64, halfLifeDays int) error {
+	if !(weight >= 0 && weight <= 1) {
+		return fmt.Errorf("config: search_recency_weight must be 0..1, got %v", weight)
+	}
+	if halfLifeDays < 1 {
+		return fmt.Errorf("config: search_recency_half_life_days must be >= 1, got %d", halfLifeDays)
+	}
+	return nil
+}
+
 // validateTimezone fails Load closed on an unknown timezone name
 // (FIX-P-14): kahyad must never silently run its day boundaries in a zone
 // the operator did not ask for. Empty = time.Local (see Config.Timezone).
@@ -1346,6 +1382,10 @@ func defaults(home, env string) Config {
 		ActiveEmbedModelVer:      "qwen3-embedding-0.6b:512:v1",
 		LogLevel:                 "info",
 		UndoWindowSeconds:        300,
+		// FIX-MEM-8: recency off until the operator opts in and a green
+		// retrieval eval covers the recency config.
+		SearchRecencyWeight:       0,
+		SearchRecencyHalfLifeDays: DefaultSearchRecencyHalfLifeDays,
 		// B-1 approval loop defaults (config.Config's own doc comments).
 		ApprovalWaitSeconds:     300,
 		AutonomyBootstrapLevels: map[string]int{"memory_search/R/global": 1},
@@ -1763,6 +1803,12 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.EvalRetrievalDatasetPath != nil {
 		cfg.EvalRetrievalDatasetPath = expandHome(*fc.EvalRetrievalDatasetPath, home)
+	}
+	if fc.SearchRecencyWeight != nil {
+		cfg.SearchRecencyWeight = *fc.SearchRecencyWeight
+	}
+	if fc.SearchRecencyHalfLifeDays != nil {
+		cfg.SearchRecencyHalfLifeDays = *fc.SearchRecencyHalfLifeDays
 	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort

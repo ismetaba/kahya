@@ -405,6 +405,13 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #5 | eval gate refuses on stale result (gate before consolidation) | `kahyad/internal/eval/TestGateRefusesStale` | W78-01 | ci-hermetic |
 | Memory #5 | eval gate fails closed on reader error | `kahyad/internal/eval/TestGateRefusesOnReaderErrorFailClosed` | W78-01 | ci-hermetic |
 | Memory #5 | re-embed gate refuses without a green candidate | `kahyad/internal/eval/TestReEmbedGateRefusesWithoutGreenCandidate` | W78-01 | ci-hermetic |
+| Memory #5 | recency weight only activates through the fusion gate | `kahyad/internal/search/TestActivateFusionConfigRecencyRefusedWithoutGreenEval` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | recency off (the default) keeps the pre-recency fusion identity byte for byte, so existing green results and gates stay valid; a non-zero weight changes it | `kahyad/internal/search/TestConfigSHA256UnchangedWhenRecencyOff` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | recency weight 0 is the identity: Search's order and scores are unchanged | `kahyad/internal/search/TestSearchRecencyWeightZeroIsIdentity` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | an embed outage never turns an activated recency weight off (read from the declared config, not the degraded one - EK-MEM-C) | `kahyad/internal/search/TestSearchRecencyAppliesWhenVecLegDegrades` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | a configured `search_recency_weight` without a green eval for that config stays off at boot (`search_recency_not_activated`) and is handed to the eval as a candidate | `kahyad/TestSearchRecencyNotActivatedWithoutGreenEval` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | kahyad activates recency before it reads the `fusion_sha256` every gate and the eval record, through the real eval gate | `kahyad/TestSearchRecencyActivatedBeforeFusionSHAIsRead` | FIX-MEM-8 | ci-hermetic |
+| Memory #5 | the eval scores a pending candidate config under its own `fusion_sha256`; a green candidate unlocks only its own activation, never the active config's gates | `kahyad/internal/eval/TestRetrievalCandidateGreenUnlocksOnlyItsOwnActivation` | FIX-MEM-8 | ci-hermetic |
 | Product A | W3 never auto-allows, even with a forged L4 autonomy row | `kahyad/internal/policy/TestW3NeverAllowsEvenWithForgedL4Row` | W3-02 | ci-hermetic |
 | Product A | W3 card is notice-only, no approve keyboard on Telegram | `kahyad/internal/telegram/TestW3NoticeOnlyNoKeyboard` | W3-07 | ci-hermetic |
 | Product A | a written local W3 approval executes exactly once (grant single-use; W3 never auto-allows afterwards) | `kahyad/internal/policy/TestW3ApprovedGrantRedeemedExactlyOnce` | FIX-B-1 | ci-hermetic |

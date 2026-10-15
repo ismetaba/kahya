@@ -341,7 +341,6 @@ func run() int {
 	// PRIVATE ~/Kahya repo and may be absent on a fresh install - an empty
 	// dataset_sha256 then never matches a recorded green event, keeping every
 	// gate fail-closed until the real dataset + a green run exist.
-	fusionSHA := searcher.FusionConfigSHA256()
 	retrievalDatasetSHA := ""
 	if ds, dsErr := eval.LoadRetrievalDataset(cfg.EvalRetrievalDatasetPath); dsErr != nil {
 		log.Warn("eval_retrieval_dataset_unavailable", "path", cfg.EvalRetrievalDatasetPath, "err", dsErr.Error())
@@ -349,6 +348,28 @@ func run() int {
 		retrievalDatasetSHA = ds.SHA256
 	}
 	evalGate := eval.EvalGate{Reader: eval.StoreEventReader{Q: st.Queries}}
+
+	// FIX-MEM-8: a configured search_recency_weight is a fusion change, so it
+	// is activated ONLY through the eval gate (gate point c) - and BEFORE
+	// fusionSHA is read below, so every gate and the retrieval eval record
+	// the config that actually serves. Without a green result for the
+	// recency config it stays off (search_recency_not_activated) and the
+	// retrieval runner scores it as a candidate under its own sha; a green
+	// candidate run activates it on the next boot.
+	recencyCandidate := activateSearchRecency(searcher, cfg.SearchRecencyWeight, cfg.SearchRecencyHalfLifeDays,
+		eval.FusionActivationGate{
+			Gate:          evalGate,
+			MaxAge:        consolidation.DefaultEvalGateMaxAge,
+			DatasetSHA256: retrievalDatasetSHA,
+			ModelVer:      cfg.ActiveEmbedModelVer,
+			Ctx:           lifecycleCtx,
+		},
+		func(c search.Config) *search.Searcher {
+			s := search.New(st.DB(), log, c)
+			s.SetEmbedder(embedClient, cfg.ActiveEmbedModelVer)
+			return s
+		}, log)
+	fusionSHA := searcher.FusionConfigSHA256()
 
 	// /v1/reindex (W12-04 step 5; W12-11 steps 3/5 add the vector
 	// backfill/re_embed pass). idx is shared between this route and the
@@ -1144,6 +1165,9 @@ func run() int {
 		FusionSHA256: fusionSHA,
 		Searcher:     searcher,
 		EventLogger:  st,
+		// FIX-MEM-8: a configured recency weight not yet activated is
+		// scored too (its own eval.retrieval.result, candidate: true).
+		Candidate: recencyCandidate,
 	}
 	ritualExporter := &eval.RitualExporter{Reader: eval.StoreRitualLabelReader{Q: st.Queries}}
 	srv.SetEvalRetrievalRunner(retrievalRunner, ritualExporter)

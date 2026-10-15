@@ -293,6 +293,23 @@ type RetrievalRunner struct {
 
 	Searcher    RetrievalSearcher
 	EventLogger EventLogger
+
+	// Candidate, when set, is a configured fusion config the gate has not
+	// activated yet (FIX-MEM-8: search_recency_weight > 0 without a green
+	// result). Run scores it too and ledgers its result under the
+	// candidate's own fusion_sha256, so a green run lets the next boot
+	// activate it through search.Searcher.ActivateFusionConfig. The active
+	// config's outcome (what the gates and the CLI read) is unchanged.
+	Candidate *RetrievalCandidate
+}
+
+// RetrievalCandidate is a not-yet-active fusion config RetrievalRunner also
+// scores (FIX-MEM-8).
+type RetrievalCandidate struct {
+	// FusionSHA256 is search.ConfigSHA256 of the candidate config.
+	FusionSHA256 string
+	// Searcher runs the candidate config over the same brain.db.
+	Searcher RetrievalSearcher
 }
 
 // RetrievalOutcome is Run's full result.
@@ -301,6 +318,14 @@ type RetrievalOutcome struct {
 	DatasetSHA256 string
 	ModelVer      string
 	FusionSHA256  string
+	// Candidate is the candidate config's result (nil without a candidate).
+	Candidate *CandidateOutcome
+}
+
+// CandidateOutcome is the candidate pass's result (FIX-MEM-8).
+type CandidateOutcome struct {
+	Report       RetrievalReport
+	FusionSHA256 string
 }
 
 // Run executes one full retrieval-eval pass: load the dataset, run+score it,
@@ -308,6 +333,12 @@ type RetrievalOutcome struct {
 // dataset_sha256, model_ver, fusion_sha256, trace_id}. The event is written
 // even on a red (< MinPrecision) run - the gate reads precision from the
 // payload; a red run simply never satisfies it.
+//
+// With a Candidate (FIX-MEM-8) the same dataset is also scored through the
+// candidate's searcher and a second event is ledgered after the first, with
+// the candidate's fusion_sha256 and candidate: true. Both passes run before
+// anything is ledgered: a search error in either fails the whole run and
+// records nothing (fail-closed).
 func (r *RetrievalRunner) Run(ctx context.Context, traceID string) (RetrievalOutcome, error) {
 	if r.DatasetPath == "" {
 		return RetrievalOutcome{}, fmt.Errorf("eval: RetrievalRunner.Run: no DatasetPath configured")
@@ -320,21 +351,47 @@ func (r *RetrievalRunner) Run(ctx context.Context, traceID string) (RetrievalOut
 	if err != nil {
 		return RetrievalOutcome{}, err
 	}
+	var cand *CandidateOutcome
+	if r.Candidate != nil {
+		crep, err := RunRetrieval(ctx, r.Candidate.Searcher, traceID, ds.Items)
+		if err != nil {
+			return RetrievalOutcome{}, fmt.Errorf("eval: candidate fusion config %s: %w", r.Candidate.FusionSHA256, err)
+		}
+		cand = &CandidateOutcome{Report: crep, FusionSHA256: r.Candidate.FusionSHA256}
+	}
 
 	if r.EventLogger != nil {
-		payload := map[string]any{
-			"trace_id":       traceID,
-			"precision":      rep.Precision,
-			"total":          rep.Total,
-			"correct":        rep.Correct,
-			"dataset_sha256": ds.SHA256,
-			"model_ver":      r.ModelVer,
-			"fusion_sha256":  r.FusionSHA256,
+		if err := r.ledgerResult(ctx, traceID, rep, ds.SHA256, r.FusionSHA256, false); err != nil {
+			return RetrievalOutcome{}, err
 		}
-		if err := r.EventLogger.LogEvent(ctx, traceID, EventRetrievalResult, payload); err != nil {
-			return RetrievalOutcome{}, fmt.Errorf("eval: ledger %s event: %w", EventRetrievalResult, err)
+		if cand != nil {
+			if err := r.ledgerResult(ctx, traceID, cand.Report, ds.SHA256, cand.FusionSHA256, true); err != nil {
+				return RetrievalOutcome{}, err
+			}
 		}
 	}
 
-	return RetrievalOutcome{Report: rep, DatasetSHA256: ds.SHA256, ModelVer: r.ModelVer, FusionSHA256: r.FusionSHA256}, nil
+	return RetrievalOutcome{Report: rep, DatasetSHA256: ds.SHA256, ModelVer: r.ModelVer, FusionSHA256: r.FusionSHA256, Candidate: cand}, nil
+}
+
+// ledgerResult writes one eval.retrieval.result event; a candidate result
+// carries candidate: true (the gate matches on fusion_sha256 alone, the flag
+// is for the reader).
+func (r *RetrievalRunner) ledgerResult(ctx context.Context, traceID string, rep RetrievalReport, datasetSHA, fusionSHA string, candidate bool) error {
+	payload := map[string]any{
+		"trace_id":       traceID,
+		"precision":      rep.Precision,
+		"total":          rep.Total,
+		"correct":        rep.Correct,
+		"dataset_sha256": datasetSHA,
+		"model_ver":      r.ModelVer,
+		"fusion_sha256":  fusionSHA,
+	}
+	if candidate {
+		payload["candidate"] = true
+	}
+	if err := r.EventLogger.LogEvent(ctx, traceID, EventRetrievalResult, payload); err != nil {
+		return fmt.Errorf("eval: ledger %s event: %w", EventRetrievalResult, err)
+	}
+	return nil
 }

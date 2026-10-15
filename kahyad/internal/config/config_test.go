@@ -1783,3 +1783,58 @@ func TestLoadFailsClosedOnInvalidConsolidationBatching(t *testing.T) {
 		t.Fatalf("Load() at the bounds error = %v, want nil", err)
 	}
 }
+
+// TestLoadSearchRecencyDefaultsAndFileOverrides (FIX-MEM-8): recency is off
+// by default (search_recency_weight 0, half-life 90 days) and both keys are
+// real config.yaml keys.
+func TestLoadSearchRecencyDefaultsAndFileOverrides(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SearchRecencyWeight != 0 || cfg.SearchRecencyHalfLifeDays != DefaultSearchRecencyHalfLifeDays || DefaultSearchRecencyHalfLifeDays != 90 {
+		t.Fatalf("defaults = weight %v, half-life %d; want 0, 90", cfg.SearchRecencyWeight, cfg.SearchRecencyHalfLifeDays)
+	}
+
+	writeConfigYAML(t, home, "search_recency_weight: 0.2\nsearch_recency_half_life_days: 30\n")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SearchRecencyWeight != 0.2 || cfg.SearchRecencyHalfLifeDays != 30 {
+		t.Fatalf("overrides = weight %v, half-life %d; want 0.2, 30", cfg.SearchRecencyWeight, cfg.SearchRecencyHalfLifeDays)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidSearchRecency (FIX-MEM-8): a weight outside
+// [0,1] or a half-life below 1 day fails Load instead of reaching the fusion
+// config (and its hash).
+func TestLoadFailsClosedOnInvalidSearchRecency(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, key string }{
+		{"weight_negative", "search_recency_weight: -0.1\n", "search_recency_weight"},
+		{"weight_above_one", "search_recency_weight: 1.5\n", "search_recency_weight"},
+		{"weight_nan", "search_recency_weight: .nan\n", "search_recency_weight"},
+		{"half_life_zero", "search_recency_half_life_days: 0\n", "search_recency_half_life_days"},
+		{"half_life_negative", "search_recency_half_life_days: -3\n", "search_recency_half_life_days"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("Load() error = %v, want a %s validation error", err, tc.key)
+			}
+		})
+	}
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, "search_recency_weight: 1\nsearch_recency_half_life_days: 1\n")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() at the bounds error = %v, want nil", err)
+	}
+}

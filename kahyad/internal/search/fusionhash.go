@@ -31,6 +31,15 @@ func ConfigSHA256(cfg Config) string {
 		";scanfloor=" + f(cfg.ScanFloorScore) +
 		";unilimit=" + strconv.Itoa(cfg.UniLimit) +
 		";ladderstartmax=" + strconv.Itoa(cfg.LadderStartMax)
+	// FIX-MEM-8: the recency fields join the identity only while recency is
+	// on, so the default (off) config keeps its pre-recency hash byte for
+	// byte - every green eval.retrieval.result already ledgered, the
+	// consolidation auto-commit gate and the re_embed gate stay valid - and
+	// any recency config needs a green eval of its own.
+	if cfg.RecencyWeight != 0 {
+		canonical += ";recency=" + f(cfg.RecencyWeight) +
+			";halflife=" + strconv.Itoa(cfg.RecencyHalfLifeDays)
+	}
 	sum := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(sum[:])
 }
@@ -57,11 +66,14 @@ type FusionGate interface {
 	CheckFusionActivation(fusionSHA string) (allowed bool, reason string)
 }
 
-// ActivateFusionConfig is the SINGLE guarded seam any runtime fusion-config
-// change must route through (W78-01 gate point c). The active fusion Config
-// is otherwise a boot-time literal (main.go constructs the Searcher with
-// DefaultConfig and never mutates it), so there is no live caller today;
-// this exists so a FUTURE runtime fusion change cannot bypass the gate.
+// ActivateFusionConfig is the SINGLE guarded seam any fusion-config change
+// must route through (W78-01 gate point c). The active fusion Config is
+// otherwise a boot-time literal (main.go constructs the Searcher with
+// DefaultConfig). Its one caller is main.go's boot-time recency activation
+// (FIX-MEM-8: config search_recency_weight > 0), which runs before any
+// request is served and before main.go reads FusionConfigSHA256 for the
+// other gates and the retrieval eval, so every identity kahyad records
+// names the config that actually serves.
 //
 // It computes the candidate config's fusion_sha256, asks gate whether a
 // green eval result covers it, and swaps s.cfg in ONLY when the gate allows.

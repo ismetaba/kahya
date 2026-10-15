@@ -76,7 +76,34 @@ type Config struct {
 	// every other request for seconds. Real Turkish words are well under
 	// this floor, so natural-language behavior is unchanged.
 	LadderStartMax int
+
+	// RecencyWeight (w, [0,1]) blends an episode-age decay into the fused
+	// score (FIX-MEM-8): score' = (1-w)*fused + w*exp(-ln2 * ageDays /
+	// RecencyHalfLifeDays), where ageDays is the age of the chunk's
+	// episodes.created_at (when the note was first indexed - an index date,
+	// not a content date). 0 (the committed default) disables it exactly:
+	// score' == fused, and ConfigSHA256 is the pre-recency identity. Any
+	// non-zero value changes the fusion config SHA (fusionhash.go), so it
+	// must pass the W78-01 retrieval-eval gate before activation (HANDOFF
+	// §5 memory #5): config search_recency_weight is applied through
+	// ActivateFusionConfig at boot, never set directly on a live Searcher.
+	// Search reads it from the DECLARED s.cfg, never from the degraded
+	// local copy (EK-MEM-C), so an embed outage never turns it off.
+	RecencyWeight float64
+	// RecencyHalfLifeDays is the decay's half-life in days (default
+	// DefaultRecencyHalfLifeDays = 90, HANDOFF §5 memory #4's hot-window
+	// length). Only meaningful while RecencyWeight > 0; a value <= 0 then
+	// gives every chunk zero recency.
+	RecencyHalfLifeDays int
 }
+
+// DefaultRecencyHalfLifeDays is the committed recency half-life (FIX-MEM-8).
+const DefaultRecencyHalfLifeDays = 90
+
+// recencyPool is how many of the best fused candidates (or k, if larger)
+// the recency weight re-ranks (FIX-MEM-8). Candidates beyond it are never
+// returned once recency is on.
+const recencyPool = 200
 
 // DefaultConfig returns the committed-default 3-way fusion weights
 // (W12-11 step 4: "tri 0.3, uni 0.2, vec 0.5") - the full hybrid-search
@@ -94,6 +121,9 @@ func DefaultConfig() Config {
 		UniLimit:       50,
 		VecLimit:       50,
 		LadderStartMax: 32,
+		// FIX-MEM-8: recency off by default (search_recency_weight: 0).
+		RecencyWeight:       0,
+		RecencyHalfLifeDays: DefaultRecencyHalfLifeDays,
 	}
 }
 
@@ -111,6 +141,10 @@ func FTSOnlyConfig() Config {
 		UniLimit:       50,
 		VecLimit:       50,
 		LadderStartMax: 32,
+		// Search never reads recency from this degraded config (it reads
+		// the declared s.cfg, EK-MEM-C); the fields only mirror the default.
+		RecencyWeight:       0,
+		RecencyHalfLifeDays: DefaultRecencyHalfLifeDays,
 	}
 }
 
@@ -126,6 +160,10 @@ type Hit struct {
 	Text       string
 	Score      float64
 	SourceTier string
+	// EpisodeCreatedAt is the owning episode's created_at (RFC3339Nano UTC,
+	// when the note was first indexed) - the date the recency weight ages
+	// a chunk by (FIX-MEM-8).
+	EpisodeCreatedAt string
 }
 
 // Embedder is the query-embedding dependency Search's vector leg needs
@@ -147,6 +185,8 @@ type Searcher struct {
 	cfg            Config
 	embed          Embedder
 	activeModelVer string
+	// now is the recency weight's clock (nil = time.Now; tests only).
+	now func() time.Time
 }
 
 // New constructs a Searcher. log is the boot-scoped logger; each Search
@@ -235,6 +275,16 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		}
 		return ids[i] > ids[j] // tie-break: chunks.id desc
 	})
+	// FIX-MEM-8: the recency weight re-ranks the best candidates before the
+	// k cut. It is read from the DECLARED s.cfg, never from the local cfg a
+	// vector-leg degrade replaced above (EK-MEM-C).
+	recencyApplied := 0
+	if s.cfg.RecencyWeight > 0 && len(ids) > 0 {
+		ids, recencyApplied, err = s.applyRecency(ctx, ids, fused, k)
+		if err != nil {
+			return nil, fmt.Errorf("search: recency: %w", err)
+		}
+	}
 	if len(ids) > k {
 		ids = ids[:k]
 	}
@@ -251,10 +301,106 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		"tri_match_hits", matchHits,
 		"tri_scan_hits", scanHits,
 		"vec_hits", vecHits,
+		"recency_applied", recencyApplied,
 		"result_count", len(hits),
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	return hits, nil
+}
+
+// recencyWeight is the declared recency weight (0 = off).
+func (s *Searcher) recencyWeight() float64 { return s.cfg.RecencyWeight }
+
+func (s *Searcher) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// applyRecency blends the episode-age decay into the fused scores of the
+// best max(recencyPool, k) candidates (ids arrive fused-desc), writes the
+// blended scores back into fused (Hit.Score reports them) and returns those
+// candidates re-sorted by blended score desc, chunks.id desc on a tie, plus
+// how many were re-ranked. The rest of ids is dropped.
+func (s *Searcher) applyRecency(ctx context.Context, ids []int64, fused map[int64]float64, k int) ([]int64, int, error) {
+	pool := recencyPool
+	if k > pool {
+		pool = k
+	}
+	if len(ids) > pool {
+		ids = ids[:pool]
+	}
+	created, err := s.loadEpisodeCreatedAt(ctx, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	w := s.cfg.RecencyWeight
+	now := s.clock()
+	for _, id := range ids {
+		fused[id] = (1-w)*fused[id] + w*recencyFactor(created[id], now, s.cfg.RecencyHalfLifeDays)
+	}
+	out := make([]int64, len(ids))
+	copy(out, ids)
+	sort.Slice(out, func(i, j int) bool {
+		si, sj := fused[out[i]], fused[out[j]]
+		if si != sj {
+			return si > sj
+		}
+		return out[i] > out[j]
+	})
+	return out, len(out), nil
+}
+
+// recencyFactor is exp(-ln2 * ageDays / halfLifeDays) for createdAt
+// (RFC3339/RFC3339Nano) at now: 1 for a chunk indexed now (and for a
+// future createdAt - clock skew is age 0, never a boost above 1), 0.5 one
+// half-life later. An unparseable createdAt, or a halfLifeDays <= 0, gives
+// 0 (age treated as infinite: no recency, never a boost).
+func recencyFactor(createdAt string, now time.Time, halfLifeDays int) float64 {
+	if halfLifeDays <= 0 {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return 0
+	}
+	age := now.Sub(t)
+	if age < 0 {
+		age = 0
+	}
+	days := age.Hours() / 24
+	return math.Exp(-math.Ln2 * days / float64(halfLifeDays))
+}
+
+// loadEpisodeCreatedAt returns chunk id -> its episode's created_at for ids
+// (a chunk without a row is simply absent: recencyFactor("") is 0).
+func (s *Searcher) loadEpisodeCreatedAt(ctx context.Context, ids []int64) (map[int64]string, error) {
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT c.id, e.created_at
+		FROM chunks c
+		JOIN episodes e ON e.id = c.episode_id
+		WHERE c.id IN (%s)`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var createdAt sql.NullString
+		if err := rows.Scan(&id, &createdAt); err != nil {
+			return nil, err
+		}
+		out[id] = createdAt.String
+	}
+	return out, rows.Err()
 }
 
 // vecLeg runs the chunk_vec KNN leg (W12-11 step 4): queryVec against the
@@ -636,7 +782,7 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 		args[i] = id
 	}
 	query := fmt.Sprintf(`
-		SELECT c.id, c.episode_id, c.seq, c.text, e.source_path, e.source_tier
+		SELECT c.id, c.episode_id, c.seq, c.text, e.source_path, e.source_tier, e.created_at
 		FROM chunks c
 		JOIN episodes e ON e.id = c.episode_id
 		WHERE c.id IN (%s)`, strings.Join(placeholders, ","))
@@ -650,11 +796,12 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 	byID := make(map[int64]Hit, len(ids))
 	for rows.Next() {
 		var h Hit
-		var path sql.NullString
-		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Seq, &h.Text, &path, &h.SourceTier); err != nil {
+		var path, createdAt sql.NullString
+		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Seq, &h.Text, &path, &h.SourceTier, &createdAt); err != nil {
 			return nil, err
 		}
 		h.Path = path.String
+		h.EpisodeCreatedAt = createdAt.String
 		h.Score = fused[h.ChunkID]
 		byID[h.ChunkID] = h
 	}
