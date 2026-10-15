@@ -129,3 +129,33 @@ func TestQwenClassifierAdapterAppliesConfiguredWarmBudget(t *testing.T) {
 		})
 	}
 }
+
+// TestQwenClassifierAdapterWithBudgetOverridesTheInteractiveBudget (G13
+// MEM-3): the extractor's adapter bounds a warm call by its OWN budget, not
+// the supervisor's interactive qwen_classify_budget_ms - on the SAME warm
+// supervisor (default 300ms) a 600ms classification fails closed through the
+// default adapter and succeeds through a 2s-budget one.
+func TestQwenClassifierAdapterWithBudgetOverridesTheInteractiveBudget(t *testing.T) {
+	port := freePort(t)
+	sup := New(Config{
+		Cmd:          []string{"python3", "testdata/fake_qwen_server.py", strconv.Itoa(port), "600"},
+		Port:         port,
+		MemCheck:     sufficientMemCheck,
+		PollInterval: 200 * time.Millisecond,
+		StartupGrace: realConnectTimeout,
+		Log:          testLogger(t),
+	})
+	t.Cleanup(sup.Stop)
+	interactive := NewQwenClassifierAdapter(sup, "qwen3-30b-a3b")
+	batch := NewQwenClassifierAdapterWithBudget(sup, "qwen3-30b-a3b", 2*time.Second)
+
+	if _, err := batch.Classify(context.Background(), "soğuk çağrı"); err != nil {
+		t.Fatalf("cold Classify() error = %v", err)
+	}
+	if _, err := interactive.Classify(context.Background(), "sıcak çağrı"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("interactive warm Classify() error = %v, want a deadline error under the 300ms default", err)
+	}
+	if _, err := batch.Classify(context.Background(), "sıcak çağrı"); err != nil {
+		t.Fatalf("batch warm Classify() error = %v, want nil under its own 2s budget", err)
+	}
+}

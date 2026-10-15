@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -91,5 +92,65 @@ func TestWorkerCloudModelPropagatesWorkerErrorStatus(t *testing.T) {
 func TestSpawnModeReaderConstant(t *testing.T) {
 	if spawn.ModeReader != "reader" {
 		t.Fatalf("spawn.ModeReader = %q, want %q", spawn.ModeReader, "reader")
+	}
+}
+
+// TestWorkerCloudModelOpensAPerCallProxy (G13 MEM-3 phase 4): with a
+// ProxyOpener the call gets its own forward-proxy listener for its own task
+// id and trace, closed when Read returns; in passthrough mode the per-call
+// token travels only in X-Kahya-Task-Token (ANTHROPIC_CUSTOM_HEADERS) and
+// ANTHROPIC_API_KEY stays unset (owner decision G11-1/G11-2).
+func TestWorkerCloudModelOpensAPerCallProxy(t *testing.T) {
+	const token = "per-call-token-0123456789abcdef"
+	t.Setenv("KAHYA_TEST_EXPECT_TOKEN", token)
+	var mu sync.Mutex
+	var lines []string
+	var openedTask, openedTrace string
+	opened, closed := 0, 0
+	m := WorkerCloudModel{
+		Cmd:            []string{"python3", filepath.Join("testdata", "fake_reader_env_worker.py")},
+		CredentialMode: spawn.CredentialModePassthroughLiteral,
+		ProxyOpener: func(taskID, traceID string) (string, string, func() error, error) {
+			opened++
+			openedTask, openedTrace = taskID, traceID
+			return "http://127.0.0.1:41999", token, func() error { closed++; return nil }, nil
+		},
+		OnStderr: func(line string) {
+			mu.Lock()
+			lines = append(lines, line)
+			mu.Unlock()
+		},
+	}
+	content, err := m.Read(context.Background(), JobTypeFactExtract, []byte("### CHUNK 1\nx\n\n"), "trace-per-call-proxy")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if content != `{"entities":[],"facts":[]}` {
+		t.Fatalf("content = %q", content)
+	}
+	if opened != 1 || closed != 1 || openedTrace != "trace-per-call-proxy" || openedTask == "" {
+		t.Fatalf("opener calls %d/closed %d, task %q, trace %q; want one listener for this call, closed after", opened, closed, openedTask, openedTrace)
+	}
+	mu.Lock()
+	diag := strings.Join(lines, "\n")
+	mu.Unlock()
+	for _, want := range []string{"base_url=http://127.0.0.1:41999", "task_id=" + openedTask, "token_header=yes", "api_key_set=no"} {
+		if !strings.Contains(diag, want) {
+			t.Errorf("worker diagnostics %q lack %q", diag, want)
+		}
+	}
+}
+
+// TestWorkerCloudModelProxyOpenFailureSpawnsNothing: no listener, no
+// worker - the call fails.
+func TestWorkerCloudModelProxyOpenFailureSpawnsNothing(t *testing.T) {
+	m := WorkerCloudModel{
+		Cmd: []string{"/nonexistent/worker/binary/should/never/run"},
+		ProxyOpener: func(taskID, traceID string) (string, string, func() error, error) {
+			return "", "", nil, errors.New("governor: daily budget exhausted")
+		},
+	}
+	if _, err := m.Read(context.Background(), JobTypeFactExtract, []byte("x"), "trace-x"); err == nil || !strings.Contains(err.Error(), "proxy") {
+		t.Fatalf("Read = %v, want a proxy-open error", err)
 	}
 }

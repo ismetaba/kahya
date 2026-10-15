@@ -31,6 +31,7 @@ import (
 	"kahya/kahyad/internal/egress"
 	"kahya/kahyad/internal/embed"
 	"kahya/kahyad/internal/eval"
+	"kahya/kahyad/internal/extract"
 	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
@@ -42,6 +43,7 @@ import (
 	"kahya/kahyad/internal/notify"
 	"kahya/kahyad/internal/outbox"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/reader"
 	"kahya/kahyad/internal/readiness"
 	"kahya/kahyad/internal/remembered"
 	"kahya/kahyad/internal/ritual"
@@ -920,6 +922,43 @@ func run() int {
 	}
 	srv.SetSecretLane(secretLaneClassifier, secretLaneAnswerer, markSensitiveRead)
 
+	// G13 MEM-3: the knowledge extractor - memory episodes -> facts +
+	// entities through the toolless Reader (fact_extract_v1) and the ONE
+	// fact-write path (factEngine). Ordering per call (HANDOFF §4, G00 H-7):
+	// path glob (laneClassifier) -> GuardCloudExtraction -> the Reader's own
+	// classification -> only then the cloud; a secret verdict, a
+	// classification error or an unloadable local model never reaches the
+	// cloud. Its classifier is the same local Qwen with a batch warm budget
+	// (extract.DefaultClassifyWarmBudget): a 6-chunk call cannot be classified
+	// within the interactive qwen_classify_budget_ms, and a timeout is a
+	// secret verdict. The cloud call goes through a fresh per-call task proxy
+	// (srv.NewTaskProxy: governor, egress gate, passthrough credential).
+	extractClassifier := secretlane.NewClassifier(mlx.NewQwenClassifierAdapterWithBudget(qwenSup, cfg.QwenModelName, extract.DefaultClassifyWarmBudget))
+	readerRunner := reader.NewRunner(extractClassifier, reader.NewLocalModel(qwenSup, cfg.QwenModelName), reader.WorkerCloudModel{
+		Cmd: cfg.WorkerCmd, Socket: cfg.Socket, LogDir: cfg.LogDir,
+		MCPBridgePath: cfg.MCPBridgePath, CredentialMode: cfg.CredentialMode,
+		ProxyOpener: func(taskID, traceID string) (string, string, func() error, error) {
+			return srv.NewTaskProxy(taskID, traceID)
+		},
+	}, taintTracker, st)
+	extractRunner := &extract.Runner{
+		Store:      st.Queries,
+		Reader:     readerRunner,
+		Engine:     factEngine,
+		Lane:       laneClassifier,
+		Classifier: extractClassifier,
+		Ledger:     st,
+		Log:        log,
+		Cfg: extract.Config{
+			Enabled:           cfg.ExtractionEnabled,
+			MaxEpisodesPerRun: cfg.ExtractionBatchMaxEpisodes,
+			ChunksPerCall:     cfg.ExtractionChunksPerCall,
+			// The run summary's day is the configured calendar day.
+			Location: cfg.Location(),
+		},
+	}
+	srv.SetMemoryExtractor(extractRunner)
+
 	// W3-08 proxy backstop: the W12-08 chokepoint's SECOND, independent
 	// enforcement layer (the FIRST is that a secret-lane task never spawns
 	// a worker at all - task.go's own handleSecretLaneTask branch). Even if
@@ -1148,6 +1187,18 @@ func run() int {
 	}
 	sched.RegisterHandler("nightly-consolidation", func(ctx context.Context) error {
 		return consolidator.Run(ctx, scheduler.TraceIDFromContext(ctx))
+	})
+	// G13 MEM-3: the 02:30 fact-extraction job (`kahya job run
+	// fact-extraction` too). It ends with the daemon: lifecycleCtx cancels
+	// the run (a Reader worker is killed, the unfinished episodes stay pending
+	// for the next run, the run summary is still written).
+	sched.RegisterHandler("fact-extraction", func(ctx context.Context) error {
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		stop := context.AfterFunc(lifecycleCtx, cancel)
+		defer stop()
+		_, err := extractRunner.Nightly(runCtx, scheduler.TraceIDFromContext(ctx))
+		return err
 	})
 	srv.SetConsolidation(consolidator)
 

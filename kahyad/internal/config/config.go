@@ -1572,6 +1572,11 @@ func defaults(home, env string) Config {
 			// wall-clock-scheduling rule backup-nightly/memory-push/
 			// morning-briefing above already follow).
 			{Name: "nightly-consolidation", Handler: "nightly-consolidation", Calendar: CalendarSpec{Hour: intPtr(3), Minute: intPtr(0)}},
+			// G13 MEM-3 nightly knowledge extraction, 30 minutes before the
+			// consolidation (the scheduler serializes runs per job NAME only, so
+			// the earlier slot keeps the two from sharing the local model on a
+			// normal night). extraction_enabled gates the handler, not this entry.
+			{Name: "fact-extraction", Handler: "fact-extraction", Calendar: CalendarSpec{Hour: intPtr(2), Minute: intPtr(30)}},
 			// W5-03 weekly truth ritual (HANDOFF §6 W5 ⚑: "haftalik
 			// dogru/yanlis rituelinin hafif surumu"). Weekday follows
 			// launchd's own StartCalendarInterval convention (0 = Sunday);

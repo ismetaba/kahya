@@ -6,13 +6,16 @@
 // collect the worker's streamed text (kahyad/internal/spawn.Run's own
 // OnDelta callback) into the single JSON object the caller then parses.
 //
-// DEFERRED (this deployment): there is no live Anthropic credential to
-// exercise this end to end yet (kahyad/internal/reader's own package doc
-// comment) - WorkerCloudModel is NOT wired into main.go. Its own test
-// (cloud_model_test.go) proves the envelope this type actually builds
-// (mode/schema/model/toolless intent) against a small fake python script,
-// mirroring kahyad/internal/spawn's own testdata fixture convention - not
-// a real claude-agent-sdk/network call.
+// G13 MEM-3 wires it into main.go for the knowledge extractor's cloud lane
+// (fact_extract_v1): ProxyOpener mints a fresh per-call forward-proxy
+// listener (srv.NewTaskProxy, the same construction every task, the
+// briefing and the nightly consolidation use), so the call goes through
+// the cost governor, the egress gate and the passthrough credential path
+// (X-Kahya-Task-Token; the worker CLI's own login). Its own tests
+// (cloud_model_test.go, run_extract_test.go) prove the envelope this type
+// builds (mode/schema/model/toolless intent) and the proxy plumbing against
+// small fake python scripts - not a real claude-agent-sdk/network call; the
+// live run is the orchestrator's `kahya memory extract` check.
 package reader
 
 import (
@@ -84,11 +87,15 @@ type WorkerCloudModel struct {
 	MCPBridgePath  string
 	CredentialMode string
 
-	// AnthropicBaseURL/APIKey are THIS call's own per-task forward-proxy
-	// listener address/token (kahyad/internal/anthproxy.Proxy.Start, opened
-	// by the caller before Read - see this type's own doc comment; a
-	// Reader job gets its own ephemeral listener exactly like an ordinary
-	// task does, never a shared one).
+	// ProxyOpener (production: srv.NewTaskProxy) opens a fresh per-call
+	// forward-proxy listener for the call's own task id and trace, closed
+	// when Read returns - a Reader call gets its own ephemeral listener
+	// exactly like an ordinary task does, never a shared one. nil falls
+	// back to the static AnthropicBaseURL/APIKey below (tests).
+	ProxyOpener func(taskID, traceID string) (baseURL, apiKey string, closeFn func() error, err error)
+
+	// AnthropicBaseURL/APIKey are a fixed forward-proxy listener address/
+	// token, used only when ProxyOpener is nil.
 	AnthropicBaseURL string
 	APIKey           string
 
@@ -141,9 +148,19 @@ func (m WorkerCloudModel) Read(ctx context.Context, jobType string, rawBytes []b
 		return "", fmt.Errorf("reader: build reader-mode envelope: %w", err)
 	}
 
+	baseURL, apiKey := m.AnthropicBaseURL, m.APIKey
+	if m.ProxyOpener != nil {
+		u, k, closeProxy, err := m.ProxyOpener(env.TaskID, traceID)
+		if err != nil {
+			return "", fmt.Errorf("reader: open per-call Anthropic proxy: %w", err)
+		}
+		defer closeProxy()
+		baseURL, apiKey = u, k
+	}
+
 	cfg := spawn.Config{
 		Cmd: m.Cmd, Socket: m.Socket, LogDir: m.LogDir,
-		AnthropicBaseURL: m.AnthropicBaseURL, APIKey: m.APIKey,
+		AnthropicBaseURL: baseURL, APIKey: apiKey,
 		MCPBridgePath: m.MCPBridgePath, CredentialMode: m.CredentialMode,
 	}
 

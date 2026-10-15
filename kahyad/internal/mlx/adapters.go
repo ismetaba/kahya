@@ -8,6 +8,7 @@ package mlx
 
 import (
 	"context"
+	"time"
 
 	"kahya/kahyad/internal/secretlane"
 )
@@ -18,6 +19,10 @@ import (
 type QwenClassifierAdapter struct {
 	sup  *Supervisor
 	http *secretlane.HTTPQwenClassifier
+	// budget/ownBudget: NewQwenClassifierAdapterWithBudget's warm-call bound
+	// (ownBudget false = the supervisor's ClassifyWarmBudget).
+	budget    time.Duration
+	ownBudget bool
 }
 
 // NewQwenClassifierAdapter constructs a QwenClassifierAdapter. model is the
@@ -28,13 +33,31 @@ func NewQwenClassifierAdapter(sup *Supervisor, model string) *QwenClassifierAdap
 	return &QwenClassifierAdapter{sup: sup, http: secretlane.NewHTTPQwenClassifier(sup.BaseURL(), model)}
 }
 
+// NewQwenClassifierAdapterWithBudget is NewQwenClassifierAdapter with its own
+// warm-call budget instead of the supervisor's interactive
+// ClassifyWarmBudget (qwen_classify_budget_ms) - for a batch caller that
+// classifies long texts and has no user waiting (G13 MEM-3's fact
+// extractor). budget <= 0 = bounded by ctx only. A timeout is still an
+// error, which secretlane.Classifier folds into a secret-lane verdict: the
+// budget only decides how long the cloud lane stays reachable, never whether
+// an unclassified text may leave (fail-closed either way).
+func NewQwenClassifierAdapterWithBudget(sup *Supervisor, model string, budget time.Duration) *QwenClassifierAdapter {
+	a := NewQwenClassifierAdapter(sup, model)
+	a.budget, a.ownBudget = budget, true
+	return a
+}
+
 // Classify implements secretlane.QwenClassifier. A warm server's call is
 // bounded by the supervisor's ClassifyWarmBudget
 // (cfg.qwen_classify_budget_ms, default 300ms - FIX-P-4); a cold one is
 // not (Do's own contract: a cold load WAITS or fails closed).
 func (a *QwenClassifierAdapter) Classify(ctx context.Context, text string) (secretlane.Verdict, error) {
 	var v secretlane.Verdict
-	err := a.sup.Do(ctx, a.sup.ClassifyWarmBudget(), func(callCtx context.Context) error {
+	budget := a.sup.ClassifyWarmBudget()
+	if a.ownBudget {
+		budget = a.budget
+	}
+	err := a.sup.Do(ctx, budget, func(callCtx context.Context) error {
 		var innerErr error
 		v, innerErr = a.http.Classify(callCtx, text)
 		return innerErr

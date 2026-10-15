@@ -228,10 +228,10 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 
 	// W5-01 added a third default entry (morning-briefing); W5-02 added a
-	// fourth (nightly-consolidation); W5-03 added a fifth (truth-ritual) -
-	// see the blocks below.
-	if len(cfg.Jobs) != 5 {
-		t.Fatalf("Jobs = %+v, want exactly 5 default entries", cfg.Jobs)
+	// fourth (nightly-consolidation); W5-03 added a fifth (truth-ritual);
+	// G13 MEM-3 a sixth (fact-extraction) - see the blocks below.
+	if len(cfg.Jobs) != 6 {
+		t.Fatalf("Jobs = %+v, want exactly 6 default entries", cfg.Jobs)
 	}
 
 	byName := make(map[string]JobConfig, len(cfg.Jobs))
@@ -301,6 +301,14 @@ func TestLoadDefaultJobsIncludeBackupNightlyAndMemoryPush(t *testing.T) {
 	}
 	if cfg.ConsolidationAutoCommit {
 		t.Errorf("ConsolidationAutoCommit = true, want false (suggestion mode is the default)")
+	}
+
+	// G13 MEM-3: the 02:30 fact-extraction job (before the 03:00
+	// consolidation).
+	if fe, ok := byName["fact-extraction"]; !ok || fe.Handler != "fact-extraction" ||
+		fe.Calendar.Hour == nil || *fe.Calendar.Hour != 2 || fe.Calendar.Minute == nil || *fe.Calendar.Minute != 30 ||
+		fe.Calendar.Weekday != nil || fe.Calendar.Day != nil {
+		t.Errorf("fact-extraction job = %+v (present %v), want daily 02:30 handler fact-extraction", fe, ok)
 	}
 
 	// W5-03: the Sunday 18:00 truth-ritual job.

@@ -24,9 +24,9 @@
 //     HANDOFF §4 memory-pressure ⚑).
 //  3. otherwise => router.ModelHaiku via the worker's "reader" mode
 //     (toolless, no MCP servers) through the W12-08 forward-proxy
-//     (CloudModel) - deferred in this deployment (no live Anthropic
-//     credential yet); every caller/test here injects a CloudModelFunc
-//     double.
+//     (CloudModel; WorkerCloudModel, wired in main.go for the G13 MEM-3
+//     fact extractor with a per-call proxy) - this package's own tests
+//     inject a CloudModelFunc double.
 //  4. the model's single JSON object response is parsed into the
 //     registered Go struct for jobType and validated (schemas.go). Any
 //     decode/validation failure fails the whole job closed (no partial

@@ -177,18 +177,20 @@ func TestIdleUnloadFiresAfterTTLWithZeroInFlight(t *testing.T) {
 	release := sup.Acquire()
 	release()
 
+	// Wait on OnUnloaded itself, not on State(): mlxsup reports "down"
+	// before StopForIdle has reaped the child (checkIdle's own NOTE), and
+	// OnUnloaded runs only after the reap - polling State() alone raced
+	// both the OnUnloaded assertion and the respawn below (the old child
+	// could still hold the port).
 	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if sup.State() == "down" {
-			break
-		}
+	for atomic.LoadInt64(&unloadedCount) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("idle-unload never fired; state stuck at %q", sup.State())
+			t.Fatalf("idle-unload never fired (OnUnloaded never called); state %q", sup.State())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := atomic.LoadInt64(&unloadedCount); got == 0 {
-		t.Error("OnUnloaded was never called")
+	if got := sup.State(); got != "down" {
+		t.Errorf("State() after idle-unload = %q, want down", got)
 	}
 
 	// A LATER EnsureRunning call must still be able to bring it back - the

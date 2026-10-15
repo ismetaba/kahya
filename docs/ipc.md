@@ -557,7 +557,18 @@ a cloud model, without changing anything in §2-§6 above:
   `extraction_batch_max_episodes` (50, >= 1) and
   `extraction_chunks_per_call` (6, 1..20 - the local model's context);
   decisions MEM-3.a (no extraction at `memory_write` time - no key) and
-  MEM-3.c.
+  MEM-3.c. Wiring (`kahyad/main.go`): the nightly `fact-extraction` job
+  (default `cfg.Jobs` entry, 02:30, before the 03:00 consolidation; also
+  `kahya job run fact-extraction`) ends with the daemon's lifecycle context
+  and writes `extract.run_done{..., last_episode_id, date}` (the configured
+  calendar day). The extractor's classifier is the same supervised local
+  Qwen with a batch warm budget (`extract.DefaultClassifyWarmBudget`, 30s,
+  `mlx.NewQwenClassifierAdapterWithBudget`) instead of the interactive
+  `qwen_classify_budget_ms` (a timeout is still a secret verdict); the
+  Reader's local model is `reader.NewLocalModel(qwenSup)` and its cloud
+  model a `reader.WorkerCloudModel` whose `ProxyOpener` (srv.NewTaskProxy)
+  gives every call its own task proxy - cost governor, egress gate, and in
+  passthrough the per-call token only in `X-Kahya-Task-Token`.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
