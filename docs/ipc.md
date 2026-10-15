@@ -751,6 +751,57 @@ a cloud model, without changing anything in §2-§6 above:
   path-secret: the tier changes, never the lane. The weekly ritual's sample
   size is config `ritual_max_questions` (default 10, 1..50; decision
   MEM-5.b).
+- **Document ingest (FIX-MEM-6, G13; ordering per G00 H-7).** `POST
+  /v1/ingest {"content_b64", "source_ref", "title", "lane_hint": "" |
+  "secret", "no_raw"}` (control route, never an MCP tool - choosing to
+  remember an outside document is the user's trust decision; a live worker
+  is refused even with the secret) runs `kahyad/internal/ingest.Runner`:
+  UTF-8 text without NUL only (no PDF/HTML conversion), at most
+  `ingest_max_bytes` (default 2 MiB; 413 `{"error": "Dosya çok büyük (en
+  fazla %d bayt).", "reason": "too_large", "max_bytes"}`), one-line labels
+  (source <= 500, title <= 200 runes); the extractor's lock is taken
+  (`extract.Runner.TryHold`; a running extraction = 409 `in_progress`); a
+  document whose SHA-256 an `ingest.done` row names while that note is
+  still an active episode is a 409 `"ingest: bu belge zaten alınmış:
+  <note>"`. The lane is decided LOCALLY before any cloud byte:
+  `lane_hint:"secret"` (`--secret`) or a deterministic hit in the user's
+  own title/source label forces the local model; otherwise
+  `reader.RunDocIngest` classifies the whole document (deterministic
+  pre-pass, then the local classifier window by window) and only a normal
+  verdict goes to the cloud Reader (`doc_ingest_v1`); an unavailable local
+  model is a 503 with the Turkish `MsgIngestLocalUnavailable` (never a cloud
+  fallback), another local failure a 502 `local_failed`, a rejected answer
+  a 422. The note is built ONLY from the validated fields (`# <title>`, the
+  summary, `## Önemli noktalar`, `## Tarihler / tutarlar`) - the raw
+  document never enters memory (HANDOFF §5 safety #2); a rendered note that
+  trips the deterministic pre-pass moves to the secret lane. It is written
+  by `mcp/memory HandleWriteTiered` through the process-wide memory server:
+  front matter `kahya_source_tier: external_doc` + `kahya_source_ref`,
+  `kahya_source_sha256`, `kahya_ingested_at`, `kahya_lane` (JSON-quoted
+  values), path `ingest/<local day>-<ascii slug>.md` or, on the secret lane,
+  `<secret_lane_memory_dir>/ingest/...` - refused (500
+  `secret_glob_missing`, `"ingest: gizli şerit için hafıza globu tanımlı
+  değil (policy.yaml secret_lane_globs: ~/Kahya/memory/gizli/**)"`) unless a
+  secret glob covers it as written and as the volume stores it; a taken name
+  gets `-2`, `-3`; committed by kahyad as `ingest: <path>`, reindexed,
+  ledgered `memory_write_tiered`. Its facts and entities go through
+  `extract.Hold.WriteValidated` with the call site's provenance
+  (`external_doc`, extractor version `fact_extract_v1`, session
+  `ingest:<trace>`, evidence `episode:<id>`; a local-lane answer keeps no
+  quote/validity on the row) and the episode is stamped extracted. The raw
+  bytes are kept (`ingest_keep_raw`, decision MEM-6.c; `no_raw` skips one)
+  as `<ingest_raw_dir>/<sha256>.txt|.md` (0600; default
+  `<kahya_dir>/.ingest-raw`, Load refuses one inside the memory dir) only
+  after `backup.EnsureDirIgnored` wrote its anchored `.gitignore` line under
+  kahya_dir; the raw store is never indexed and is self-protected from
+  worker writes. Ledger `ingest.done {file, episode_id, lane, lane_reason,
+  source_ref, sha256, facts, entities, chunks, raw_kept, commit_sha,
+  source_tier}` / `ingest.failed {reason, sha256, source_ref, ...}`. 200 →
+  `{ok, file, episode_id, commit_sha, lane, chunks, facts, entities,
+  source_tier, raw_path, sha256, trace_id}`. Everything ingested is
+  quarantined (external_doc, decision MEM-6.a) until `kahya memory confirm`
+  / `kahya fact confirm`. URL ingest (`--url`, `x/net/html`) is deferred
+  (decision MEM-6.d: `curl … | kahya ingest -`).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

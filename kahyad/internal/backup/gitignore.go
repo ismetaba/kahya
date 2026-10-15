@@ -55,7 +55,26 @@ func EnsureGitignoreEntry(kahyaDir string) error {
 // is left as is. Anchored, because an unanchored "backups/" would also
 // ignore a user note folder such as memory/backups/.
 func EnsureBackupDirIgnored(kahyaDir, backupDir string) (entry string, err error) {
-	if kahyaDir == "" || backupDir == "" {
+	entry, err = EnsureDirIgnored(kahyaDir, backupDir)
+	if errors.Is(err, ErrIgnoredDirIsRepoRoot) {
+		return "", ErrBackupDirIsRepoRoot
+	}
+	return entry, err
+}
+
+// ErrIgnoredDirIsRepoRoot is EnsureDirIgnored's refusal to ignore kahya_dir
+// itself (that would ignore the whole memory repo).
+var ErrIgnoredDirIsRepoRoot = errors.New("backup: an ignored directory must not equal kahya_dir")
+
+// EnsureDirIgnored is EnsureBackupDirIgnored's mechanism for any directory
+// the memory repo must never stage (FIX-P-1; G13 MEM-6 reuses it for the
+// raw ingest store `.ingest-raw/`, G00 C-21 - one gitignore writer): an
+// anchored "/<rel>/" line for dir inside an existing kahyaDir (an existing
+// unanchored "<rel>/" satisfies it), symlinked spellings resolved; ("",
+// nil) when kahyaDir does not exist or dir lies outside it;
+// ErrIgnoredDirIsRepoRoot when dir is kahyaDir. Never runs git.
+func EnsureDirIgnored(kahyaDir, dir string) (entry string, err error) {
+	if kahyaDir == "" || dir == "" {
 		return "", nil
 	}
 	if _, statErr := os.Stat(kahyaDir); statErr != nil {
@@ -64,19 +83,19 @@ func EnsureBackupDirIgnored(kahyaDir, backupDir string) (entry string, err error
 		}
 		return "", fmt.Errorf("backup: stat %s: %w", kahyaDir, statErr)
 	}
-	rel, inside := relInside(kahyaDir, backupDir)
+	rel, inside := relInside(kahyaDir, dir)
 	if !inside {
 		rk, rkErr := filepath.EvalSymlinks(kahyaDir)
 		if rkErr != nil {
 			return "", fmt.Errorf("backup: resolve %s: %w", kahyaDir, rkErr)
 		}
-		rel, inside = relInside(rk, resolveExistingPrefix(backupDir))
+		rel, inside = relInside(rk, resolveExistingPrefix(dir))
 	}
 	if !inside {
 		return "", nil
 	}
 	if rel == "." {
-		return "", ErrBackupDirIsRepoRoot
+		return "", ErrIgnoredDirIsRepoRoot
 	}
 	slash := filepath.ToSlash(rel)
 	entry = "/" + slash + "/"

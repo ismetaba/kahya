@@ -199,3 +199,29 @@ func TestEnsureBackupDirIgnoredResolvesSymlinkedSpelling(t *testing.T) {
 		t.Errorf(".gitignore = %q, want %q", got, "/backups/\n")
 	}
 }
+
+// TestEnsureDirIgnoredCoversTheIngestRawStore (G13 MEM-6, G00 C-21): the
+// raw ingest store under kahya_dir gets its anchored line through the one
+// gitignore writer; a dir outside kahya_dir needs none; kahya_dir itself is
+// refused; a repeat is a no-op.
+func TestEnsureDirIgnoredCoversTheIngestRawStore(t *testing.T) {
+	kahyaDir := t.TempDir()
+	raw := filepath.Join(kahyaDir, ".ingest-raw")
+	entry, err := EnsureDirIgnored(kahyaDir, raw)
+	if err != nil || entry != "/.ingest-raw/" {
+		t.Fatalf("EnsureDirIgnored = %q, %v", entry, err)
+	}
+	if _, err := EnsureDirIgnored(kahyaDir, raw); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(kahyaDir, ".gitignore"))
+	if string(got) != "/.ingest-raw/\n" {
+		t.Fatalf(".gitignore = %q, want the one anchored line", got)
+	}
+	if entry, err := EnsureDirIgnored(kahyaDir, filepath.Join(t.TempDir(), "raw")); err != nil || entry != "" {
+		t.Fatalf("outside dir = %q, %v; want no line", entry, err)
+	}
+	if _, err := EnsureDirIgnored(kahyaDir, kahyaDir); !errors.Is(err, ErrIgnoredDirIsRepoRoot) {
+		t.Fatalf("kahya_dir itself = %v, want ErrIgnoredDirIsRepoRoot", err)
+	}
+}

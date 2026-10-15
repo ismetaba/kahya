@@ -577,6 +577,23 @@ type Config struct {
 	// model's context); outside them Load fails.
 	ExtractionChunksPerCall int `yaml:"extraction_chunks_per_call"`
 
+	// --- G13 MEM-6 kahya ingest ---
+
+	// IngestMaxBytes caps one ingested document (POST /v1/ingest answers 413
+	// above it). Default DefaultIngestMaxBytes (2 MiB); Load fails outside
+	// 1..MaxIngestMaxBytes. A document longer than the local model's context
+	// fails closed on the local lane (never a cloud fallback).
+	IngestMaxBytes int64 `yaml:"ingest_max_bytes"`
+	// IngestKeepRaw keeps each ingested document's raw bytes in IngestRawDir
+	// (decision MEM-6.c: true; `kahya ingest --no-raw` skips it for one
+	// document). The raw store is never indexed and never committed (an
+	// anchored .gitignore line under kahya_dir).
+	IngestKeepRaw bool `yaml:"ingest_keep_raw"`
+	// IngestRawDir is the raw store: absolute, ASCII, outside MemoryDir
+	// (Load fails otherwise - the indexer would read raw untrusted text).
+	// Default <KahyaDir>/.ingest-raw (derived from the final kahya_dir).
+	IngestRawDir string `yaml:"ingest_raw_dir"`
+
 	// --- W5-03 weekly truth ritual ---
 
 	// RitualWeeklyWeekday/Hour/Minute are cfg.ritual.weekly_at's three
@@ -726,8 +743,9 @@ func (c Config) SelfProtectDenyGlobs() []string {
 		}
 	}
 	// Runtime data: brain.db (+ WAL/SHM), logs, undo pre-images, tmp, the
-	// control socket's secret; the memory repo and its backups.
-	for _, dir := range []string{c.DataDir, c.LogDir, c.KahyaDir, c.MemoryDir, c.BackupDir} {
+	// control socket's secret; the memory repo, its backups and the raw
+	// ingest store (G13 MEM-6).
+	for _, dir := range []string{c.DataDir, c.LogDir, c.KahyaDir, c.MemoryDir, c.BackupDir, c.IngestRawDir} {
 		add(dir, true)
 	}
 	// An unset DBPath/Socket yields relative "-wal"/".secret" names, which
@@ -966,6 +984,9 @@ type fileConfig struct {
 	ExtractionEnabled             *bool           `yaml:"extraction_enabled"`
 	ExtractionBatchMaxEpisodes    *int            `yaml:"extraction_batch_max_episodes"`
 	ExtractionChunksPerCall       *int            `yaml:"extraction_chunks_per_call"`
+	IngestMaxBytes                *int64          `yaml:"ingest_max_bytes"`
+	IngestKeepRaw                 *bool           `yaml:"ingest_keep_raw"`
+	IngestRawDir                  *string         `yaml:"ingest_raw_dir"`
 	ConsolidationChangedFirst     *bool           `yaml:"consolidation_changed_files_first"`
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
@@ -1127,6 +1148,15 @@ func Load() (Config, error) {
 	}
 	if !explicitDBPath {
 		cfg.DBPath = filepath.Join(cfg.DataDir, "brain.db")
+	}
+
+	// G13 MEM-6: the raw ingest store follows the FINAL kahya_dir unless
+	// configured.
+	if cfg.IngestRawDir == "" {
+		cfg.IngestRawDir = filepath.Join(cfg.KahyaDir, DefaultIngestRawDirName)
+	}
+	if err := validateIngest(cfg); err != nil {
+		return Config{}, err
 	}
 
 	if err := validateASCIIPaths(cfg); err != nil {
@@ -1395,6 +1425,35 @@ func validateExtraction(batchMaxEpisodes, chunksPerCall int) error {
 	}
 	if chunksPerCall < 1 || chunksPerCall > MaxExtractionChunksPerCall {
 		return fmt.Errorf("config: extraction_chunks_per_call must be 1..%d, got %d", MaxExtractionChunksPerCall, chunksPerCall)
+	}
+	return nil
+}
+
+// G13 MEM-6 ingest bounds: DefaultIngestMaxBytes is the handbook's 2 MiB,
+// MaxIngestMaxBytes a hard ceiling (a document is one Reader call), and
+// DefaultIngestRawDirName the raw store's directory under kahya_dir.
+const (
+	DefaultIngestMaxBytes   int64 = 2 << 20
+	MaxIngestMaxBytes       int64 = 16 << 20
+	DefaultIngestRawDirName       = ".ingest-raw"
+)
+
+// validateIngest fails Load closed (FIX-MEM-6) on an ingest size cap outside
+// 1..MaxIngestMaxBytes, or a raw store that is relative or lies inside (or
+// is) the memory dir: the indexer and consolidation would then read raw
+// untrusted documents as notes.
+func validateIngest(cfg Config) error {
+	if cfg.IngestMaxBytes < 1 || cfg.IngestMaxBytes > MaxIngestMaxBytes {
+		return fmt.Errorf("config: ingest_max_bytes must be 1..%d, got %d", MaxIngestMaxBytes, cfg.IngestMaxBytes)
+	}
+	if !filepath.IsAbs(cfg.IngestRawDir) {
+		return fmt.Errorf("config: ingest_raw_dir must be an absolute path, got %q", cfg.IngestRawDir)
+	}
+	if cfg.MemoryDir != "" {
+		rel, err := filepath.Rel(filepath.Clean(cfg.MemoryDir), filepath.Clean(cfg.IngestRawDir))
+		if err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))) {
+			return fmt.Errorf("config: ingest_raw_dir %q must lie outside memory_dir %q (raw documents are never indexed)", cfg.IngestRawDir, cfg.MemoryDir)
+		}
 	}
 	return nil
 }
@@ -1732,6 +1791,11 @@ func defaults(home, env string) Config {
 		ExtractionEnabled:          true,
 		ExtractionBatchMaxEpisodes: DefaultExtractionBatchMaxEpisodes,
 		ExtractionChunksPerCall:    DefaultExtractionChunksPerCall,
+
+		// G13 MEM-6 kahya ingest (decision MEM-6.c: keep the raw document;
+		// IngestRawDir is derived from the final KahyaDir in Load).
+		IngestMaxBytes: DefaultIngestMaxBytes,
+		IngestKeepRaw:  true,
 
 		// W5-03 weekly truth ritual defaults (task spec: Sunday 18:00 -
 		// HANDOFF §6 W5 flag).
@@ -2197,6 +2261,15 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	if fc.ExtractionChunksPerCall != nil {
 		cfg.ExtractionChunksPerCall = *fc.ExtractionChunksPerCall
 	}
+	if fc.IngestMaxBytes != nil {
+		cfg.IngestMaxBytes = *fc.IngestMaxBytes
+	}
+	if fc.IngestKeepRaw != nil {
+		cfg.IngestKeepRaw = *fc.IngestKeepRaw
+	}
+	if fc.IngestRawDir != nil {
+		cfg.IngestRawDir = expandHome(*fc.IngestRawDir, home)
+	}
 	if fc.ConsolidationChangedFirst != nil {
 		cfg.ConsolidationChangedFilesFirst = *fc.ConsolidationChangedFirst
 	}
@@ -2521,9 +2594,11 @@ func validateASCIIPaths(cfg Config) error {
 		"memory_dir": cfg.MemoryDir,
 		"kahya_dir":  cfg.KahyaDir,
 		"backup_dir": cfg.BackupDir,
+		// G13 MEM-6 (CLAUDE.md: directory names ASCII).
+		"ingest_raw_dir": cfg.IngestRawDir,
 	}
 	// Deterministic order for reproducible error messages.
-	for _, key := range []string{"data_dir", "socket", "log_dir", "db_path", "memory_dir", "kahya_dir", "backup_dir"} {
+	for _, key := range []string{"data_dir", "socket", "log_dir", "db_path", "memory_dir", "kahya_dir", "backup_dir", "ingest_raw_dir"} {
 		p := paths[key]
 		for _, r := range p {
 			if r > 127 {

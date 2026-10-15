@@ -24,6 +24,16 @@ FROM events
 WHERE kind = ?
 ORDER BY id ASC;
 
+-- name: ListIngestDoneBySHA256 :many
+-- `kahya ingest` duplicate check (G13 MEM-6): the ingest.done ledger rows of
+-- a document with this content hash, newest first (kahyad/internal/ingest
+-- refuses a re-ingest while the note one of them names is still an active
+-- episode).
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = 'ingest.done' AND json_extract(payload, '$.sha256') = sqlc.arg(sha256)
+ORDER BY id DESC;
+
 -- name: GetLatestEventByKind :one
 -- Most recent ledger row of one kind (highest id) - kahyad/internal/backup.
 -- TimeMachine.CheckOffsite reads the last backup.no_offsite alarm so the

@@ -2028,3 +2028,53 @@ func TestLoadRitualMaxQuestionsDefaultAndBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadIngestDefaultsAndValidation (FIX-MEM-6): ingest_max_bytes (2 MiB),
+// ingest_keep_raw (true, decision MEM-6.c) and ingest_raw_dir (derived from
+// the FINAL kahya_dir) are real keys; a raw store inside the memory dir (the
+// indexer would read raw untrusted documents), a relative one, a non-ASCII
+// one or a size cap out of range fails Load; the raw store is self-protected
+// from worker writes.
+func TestLoadIngestDefaultsAndValidation(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IngestMaxBytes != 2<<20 || !cfg.IngestKeepRaw || cfg.IngestRawDir != filepath.Join(home, "Kahya", ".ingest-raw") {
+		t.Fatalf("defaults = %d %v %q", cfg.IngestMaxBytes, cfg.IngestKeepRaw, cfg.IngestRawDir)
+	}
+	found := false
+	for _, g := range cfg.SelfProtectDenyGlobs() {
+		if g == filepath.Join(cfg.IngestRawDir, "**") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the raw ingest store is not in SelfProtectDenyGlobs")
+	}
+	other := filepath.Join(home, "Baska")
+	writeConfigYAML(t, home, "kahya_dir: "+other+"\ningest_max_bytes: 1024\ningest_keep_raw: false\n")
+	if cfg, err = Load(); err != nil || cfg.IngestRawDir != filepath.Join(other, ".ingest-raw") || cfg.IngestMaxBytes != 1024 || cfg.IngestKeepRaw {
+		t.Fatalf("overrides = %q %d %v (%v)", cfg.IngestRawDir, cfg.IngestMaxBytes, cfg.IngestKeepRaw, err)
+	}
+	writeConfigYAML(t, home, "ingest_raw_dir: ~/ham\n")
+	if cfg, err = Load(); err != nil || cfg.IngestRawDir != filepath.Join(home, "ham") {
+		t.Fatalf("explicit raw dir = %q (%v)", cfg.IngestRawDir, err)
+	}
+	for _, tc := range []struct{ yaml, key string }{
+		{"ingest_max_bytes: 0\n", "ingest_max_bytes"},
+		{fmt.Sprintf("ingest_max_bytes: %d\n", MaxIngestMaxBytes+1), "ingest_max_bytes"},
+		{"ingest_raw_dir: ham\n", "ingest_raw_dir"},
+		{"ingest_raw_dir: ~/Kahya/memory/.ham\n", "ingest_raw_dir"},
+		{"ingest_raw_dir: ~/Kahya/memory\n", "ingest_raw_dir"},
+		{"ingest_raw_dir: ~/Kâhya-ham\n", "ingest_raw_dir"},
+	} {
+		writeConfigYAML(t, home, tc.yaml)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+			t.Errorf("%q: Load() error = %v, want a %s validation error", tc.yaml, err, tc.key)
+		}
+	}
+}

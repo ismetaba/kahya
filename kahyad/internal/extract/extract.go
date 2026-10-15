@@ -610,7 +610,7 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 			Evidentiality:   f.Evidentiality,
 			Importance:      f.Importance,
 			ExtractorVer:    ExtractorVersion,
-			Evidence:        fmt.Sprintf("episode:%d,chunk:%d", episodeID, f.ChunkID),
+			Evidence:        evidenceRef(episodeID, f.ChunkID),
 			Quote:           cloudLaneOnly(cloudLane, f.Quote),
 			ValidFrom:       cloudLaneOnly(cloudLane, f.ValidFrom),
 			ValidTo:         cloudLaneOnly(cloudLane, f.ValidTo),
@@ -622,6 +622,100 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 		}
 		st.Facts++
 	}
+	return st, nil
+}
+
+// evidenceRef is a fact's evidence citation string: "episode:<id>,chunk:<id>"
+// for a chunk the extractor was shown, "episode:<id>" for a whole ingested
+// document (reader.DocIngestChunkID).
+func evidenceRef(episodeID, chunkID int64) string {
+	if chunkID == reader.DocIngestChunkID {
+		return fmt.Sprintf("episode:%d", episodeID)
+	}
+	return fmt.Sprintf("episode:%d,chunk:%d", episodeID, chunkID)
+}
+
+// Hold is the runner's extraction lock, taken by a caller that writes
+// already-validated candidates itself (G13 MEM-6 `kahya ingest`): entity
+// resolution must not race a running extraction into duplicate first
+// sightings, so an ingest holds the same lock a nightly run does - from
+// before its Reader call to after its facts are written. Release it once.
+type Hold struct {
+	r    *Runner
+	once sync.Once
+}
+
+// TryHold takes the extraction lock, or ErrInProgress while a run (or
+// another holder) has it - never waits: an ingest arriving during a nightly
+// batch is told to retry instead of queuing behind it.
+func (r *Runner) TryHold() (*Hold, error) {
+	if !r.mu.TryLock() {
+		return nil, ErrInProgress
+	}
+	return &Hold{r: r}, nil
+}
+
+// Release gives the lock back (idempotent).
+func (h *Hold) Release() { h.once.Do(h.r.mu.Unlock) }
+
+// ValidatedWrite is one already-validated answer to write for an episode
+// (a whole ingested document: every fact cites reader.DocIngestChunkID).
+type ValidatedWrite struct {
+	EpisodeID int64
+	Entities  []reader.ExtractEntityV1
+	Facts     []reader.ExtractFactV1
+	// Provenance is the call site's claim (external_doc for an ingest) -
+	// never anything the model said.
+	Provenance factengine.Provenance
+	// SessionID is the evidence session ("ingest:<trace>").
+	SessionID string
+	// CloudLane: the answer came from the cloud lane (an ordinary path,
+	// content classified normal) - only then may its quotes, validity
+	// windows and entity links count in the cloud view (see extractEpisode).
+	CloudLane bool
+}
+
+// WriteValidated writes w through the same mapping an extraction call uses
+// (apply: entities, aliases, facts with their evidence citing the episode,
+// retractions only of lower-or-equal-trust unconfirmed facts) and stamps the
+// episode extracted under ExtractorVersion - compare-and-set on the content
+// it holds now, so a later edit of the note is extracted again by the
+// nightly job. The caller holds h.
+func (h *Hold) WriteValidated(ctx context.Context, traceID string, w ValidatedWrite) (Stats, error) {
+	r := h.r
+	ep, err := r.Store.GetEpisodeByID(ctx, w.EpisodeID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && ep.Status != "active") {
+		return Stats{}, fmt.Errorf("%w: id %d", ErrEpisodeNotFound, w.EpisodeID)
+	}
+	if err != nil {
+		return Stats{}, fmt.Errorf("extract: load episode %d: %w", w.EpisodeID, err)
+	}
+	lane := router.LaneSecret
+	if w.CloudLane {
+		lane = router.LaneNormal
+	}
+	st, err := r.apply(ctx, traceID, w.EpisodeID, w.EpisodeID, w.SessionID, w.Provenance, w.CloudLane,
+		reader.FactExtractV1{Entities: w.Entities, Facts: w.Facts})
+	if err != nil {
+		return st, err
+	}
+	stamped, err := r.Store.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{
+		ExtractedAt:  sql.NullString{String: r.now().UTC().Format(time.RFC3339Nano), Valid: true},
+		ExtractorVer: sql.NullString{String: ExtractorVersion, Valid: true},
+		ID:           w.EpisodeID,
+		SourceHash:   ep.SourceHash.String,
+	})
+	if err != nil {
+		return st, fmt.Errorf("extract: stamp episode %d: %w", w.EpisodeID, err)
+	}
+	if stamped == 0 {
+		r.logWarn(traceID, "fact_extraction_stamp_skipped", "episode_id", w.EpisodeID, "reason", SkipChangedDuringExtraction)
+	}
+	st.Episodes = 1
+	r.ledger(ctx, traceID, EventEpisodeExtracted, map[string]any{
+		"episode_id": w.EpisodeID, "lane": lane, "chunks": 0, "calls": 0, "source": "validated_write",
+		"facts_written": st.Facts, "entities_created": st.Entities, "retractions": st.Retractions,
+	})
 	return st, nil
 }
 

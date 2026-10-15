@@ -36,6 +36,7 @@ import (
 	"kahya/kahyad/internal/graph"
 	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
+	"kahya/kahyad/internal/ingest"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/metrics"
@@ -975,6 +976,33 @@ func run() int {
 		},
 	}
 	srv.SetMemoryExtractor(extractRunner)
+
+	// G13 MEM-6: `kahya ingest` - an outside document -> an external_doc
+	// note (built ONLY from the Reader's validated fields) + its facts.
+	// The same Reader (local classification of the whole document, window
+	// by window, BEFORE any cloud byte - HANDOFF §4, H-7), the same
+	// extractor lock and fact mapping, and the process-wide memory server
+	// (srv.MemoryNoteWriter: one memory-repo mutex). Everything it writes is
+	// quarantined until the user confirms it (decision MEM-6.a). The raw
+	// document is kept outside the memory dir only after its .gitignore line
+	// is ensured (MEM-6.c); URL ingest is deferred (MEM-6.d).
+	ingestRunner := &ingest.Runner{
+		Reader:  readerRunner,
+		Memory:  srv.MemoryNoteWriter(),
+		Extract: extractRunner,
+		Lane:    laneClassifier,
+		Store:   st.Queries,
+		Ledger:  st,
+		Log:     log,
+		Cfg: ingest.Config{
+			MaxBytes: cfg.IngestMaxBytes,
+			KeepRaw:  cfg.IngestKeepRaw,
+			RawDir:   cfg.IngestRawDir,
+			KahyaDir: cfg.KahyaDir,
+			Location: cfg.Location(),
+		},
+	}
+	srv.SetIngester(ingestRunner)
 
 	// W3-08 proxy backstop: the W12-08 chokepoint's SECOND, independent
 	// enforcement layer (the FIRST is that a secret-lane task never spawns

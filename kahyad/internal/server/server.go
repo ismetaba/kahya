@@ -133,6 +133,9 @@ type Server struct {
 	memSrvOnce sync.Once
 	memSrv     *memory.Server
 
+	// ingester runs POST /v1/ingest (G13 MEM-6, ingest.go). nil = 503.
+	ingester Ingester
+
 	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
 	// 4). See SetTaskStore's doc comment.
 	taskStore TaskStore
@@ -604,6 +607,10 @@ func (s *Server) routeTable() []route {
 		// G13 MEM-5 phase 2: `kahya memory confirm` (memory_confirm.go) - the
 		// human gate on an agent note; a control route, never an MCP tool.
 		{"POST /v1/memory/confirm", h(s.handleMemoryConfirm)},
+		// G13 MEM-6 phase 2: `kahya ingest` (ingest.go) - remembering an
+		// outside document is the user's trust decision: a control route,
+		// never an MCP tool.
+		{"POST /v1/ingest", h(s.handleIngest)},
 		{"/v1/reindex", h(s.handleReindex)},
 		{"/v1/log", h(s.handleLog)},
 		{"/v1/mcp", s.buildMCPHandler()},

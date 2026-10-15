@@ -574,6 +574,11 @@ type Querier interface {
 	// Facts whose evidence cites one of the chunk hits' episodes - the second
 	// graph seed source (MEM-1). sqlc.slice expands to an IN (...) list.
 	ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.NullInt64) ([]ListFactsCitingEpisodesRow, error)
+	// `kahya ingest` duplicate check (G13 MEM-6): the ingest.done ledger rows of
+	// a document with this content hash, newest first (kahyad/internal/ingest
+	// refuses a re-ingest while the note one of them names is still an active
+	// episode).
+	ListIngestDoneBySHA256(ctx context.Context, sha256 string) ([]Event, error)
 	// Per-fact most-recent asked_at, across every ritual run ever run - the
 	// sampler's "never/longest-ago probed" priority tier (select.go): a
 	// fact_id absent from this result set has never been asked and sorts

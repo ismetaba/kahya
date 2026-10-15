@@ -3469,6 +3469,47 @@ func (q *Queries) ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.
 	return items, nil
 }
 
+const listIngestDoneBySHA256 = `-- name: ListIngestDoneBySHA256 :many
+SELECT id, trace_id, ts, kind, payload, created_at
+FROM events
+WHERE kind = 'ingest.done' AND json_extract(payload, '$.sha256') = ?1
+ORDER BY id DESC
+`
+
+// `kahya ingest` duplicate check (G13 MEM-6): the ingest.done ledger rows of
+// a document with this content hash, newest first (kahyad/internal/ingest
+// refuses a re-ingest while the note one of them names is still an active
+// episode).
+func (q *Queries) ListIngestDoneBySHA256(ctx context.Context, sha256 string) ([]Event, error) {
+	rows, err := q.db.QueryContext(ctx, listIngestDoneBySHA256, sha256)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.TraceID,
+			&i.Ts,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLastAskedAtAllFacts = `-- name: ListLastAskedAtAllFacts :many
 SELECT fact_id, MAX(asked_at) AS last_asked_at
 FROM eval_labels

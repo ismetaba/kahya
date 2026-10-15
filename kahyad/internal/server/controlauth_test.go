@@ -269,6 +269,7 @@ var controlProbes = []controlProbe{
 	{http.MethodPost, "/v1/fact/deny", `{"fact_id":1}`},
 	{http.MethodPost, "/v1/fact/confirm", `{"fact_ids":[1]}`},
 	{http.MethodPost, "/v1/memory/confirm", `{"file":"inbox/x.md"}`},
+	{http.MethodPost, "/v1/ingest", `{"content_b64":"eA=="}`},
 	{http.MethodGet, "/nope", ""},
 }
 
