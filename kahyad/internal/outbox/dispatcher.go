@@ -465,6 +465,15 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		})
 		return
 	}
+	// FIX-FINAL resume-scan-blocks-redispatch-in-not-live-window: from here
+	// until the terminal transition the task is ours, but it is 'executing'
+	// and NOT live until the worker's OnStart registers it - a resume scan
+	// in that window treated it as crashed. Mark it live in-process for the
+	// whole dispatch, as handleTask does (deferred: it ends after the
+	// terminal transition, markDelivered and Unregister).
+	if b, ok := d.live.(interface{ BeginInProcess(string) func() }); ok {
+		defer b.BeginInProcess(t.ID)()
+	}
 
 	// FIX-I-14 review, W3-08 first layer: a secret-lane task is answered
 	// on-device ONLY - kahyad never spawns the worker for it, so no resume

@@ -400,7 +400,24 @@ func (r *Resume) markAllFailed(ctx context.Context, rows []sqlcgen.ToolCall) err
 // at the cap an 'executing' task moves to blocked_user once. A task that is
 // no longer 'executing' (ProcessTask is exported; Scan only ever passes
 // 'executing' rows) is never blocked or notified a second time.
+//
+// FIX-FINAL resume-scan-blocks-redispatch-in-not-live-window: a pending
+// (or claimed, not yet delivered) resume row already owns the task's next
+// attempt (FIX-I-8), so nothing is decided while one exists - checked
+// BEFORE the cap. Checking the cap first blocked a task whose last allowed
+// resume row the dispatcher had claimed and was spawning (executing, not
+// yet live) - the worker then ran anyway while the task sat in
+// blocked_user with a cap notice - and blocked a task whose row merely
+// waited behind a busy dispatcher. The cap still fires on the first scan
+// after the last row is delivered.
 func (r *Resume) requeueOrBlock(ctx context.Context, t sqlcgen.Task) error {
+	pending, err := r.outbox.CountPendingOutboxRowsByTask(ctx, sql.NullString{String: t.ID, Valid: true})
+	if err != nil {
+		return fmt.Errorf("count pending outbox rows: %w", err)
+	}
+	if pending > 0 {
+		return nil
+	}
 	if int(t.CrashResumes) >= r.maxCrashResumes {
 		if t.Status != StatusExecuting {
 			return nil

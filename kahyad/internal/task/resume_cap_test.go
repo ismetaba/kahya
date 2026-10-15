@@ -158,3 +158,42 @@ func TestSetMaxCrashResumesNonPositiveRestoresDefault(t *testing.T) {
 		t.Errorf("maxCrashResumes = %d, want 5", r.maxCrashResumes)
 	}
 }
+
+// TestResumeCapWaitsForPendingResumeRow (FIX-FINAL resume-scan-blocks-
+// redispatch-in-not-live-window): the crash-resume cap was checked before
+// the pending-row dedupe, so a task whose last allowed resume row was
+// pending (waiting behind a busy dispatcher, or claimed and being spawned)
+// was blocked before that resume ever ran. While a row is pending nothing
+// is decided; once it is delivered the cap blocks with the notice.
+func TestResumeCapWaitsForPendingResumeRow(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	insertTask(t, st, "t1")
+	m := NewMachine(st.Queries, st)
+	mustTransition(t, m, ctx, "t1", StatusExecuting)
+	if _, err := st.DB().Exec(`UPDATE tasks SET crash_resumes = 3 WHERE id = 't1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOutboxResumeRow(ctx, st.Queries, time.Now, "trace-t1", "t1"); err != nil {
+		t.Fatal(err)
+	}
+	notifier := &fakeNotifier{}
+	r := NewResume(st.Queries, st.Queries, st.Queries, m, notifier, nil, 3)
+	r.SetMaxCrashResumes(3)
+	row, _ := st.Queries.GetTaskByID(ctx, "t1")
+	if err := r.ProcessTask(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if got := taskStatus(t, st, "t1"); got != StatusExecuting || len(notifier.calls) != 0 {
+		t.Fatalf("with the last resume row pending: status %q, notices %+v; want executing and none", got, notifier.calls)
+	}
+	markAllOutboxDelivered(t, st)
+	row, _ = st.Queries.GetTaskByID(ctx, "t1")
+	if err := r.ProcessTask(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(MsgResumeCapExceededFmt, "t1", 3, "t1")
+	if got := taskStatus(t, st, "t1"); got != StatusBlockedUser || len(notifier.calls) != 1 || notifier.calls[0].message != want {
+		t.Fatalf("after delivery: status %q, notices %+v; want blocked_user and %q", got, notifier.calls, want)
+	}
+}
