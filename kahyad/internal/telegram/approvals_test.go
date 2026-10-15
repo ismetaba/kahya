@@ -667,16 +667,24 @@ func TestApprovalCardTooLargeSendsNoticeWithoutKeyboard(t *testing.T) {
 }
 
 // TestApprovalCardPartialSendFailureNoKeyboard (FIX-P-6, WYSIWYE): when a
-// non-final chunk fails to reach Telegram, the keyboard chunk is never
-// sent; the card is ledgered incomplete and not tracked.
+// MIDDLE chunk fails to reach Telegram while Telegram stays reachable
+// (only send #2 fails; every later send would succeed), the keyboard chunk
+// is never sent - not even attempted: Telegram gets chunk 1 and then only
+// the byte-exact msgCardIncompleteFmt notice, no message carries a
+// keyboard, nothing is tracked, and the card is ledgered
+// telegram_card_incomplete once for that pending id.
 func TestApprovalCardPartialSendFailureNoKeyboard(t *testing.T) {
-	sender := &fakeSender{failAfter: 1}
+	sender := &fakeSender{failOn: 2}
 	ledger := &fakeLedger{}
 	local := &fakeLocalNotifier{}
 	fix := newPolicyFixture(t)
 	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), fix.Engine, local)
 
 	toolInput := fsWriteInput(t, "orta-dosya.txt", fillerLines(150))
+	chunks := approval.ChunkForTelegram(renderPendingApprovalPayload(b.home, "fs_write", toolInput).Render(), 0)
+	if len(chunks) < 3 || len(chunks) > maxCardChunks {
+		t.Fatalf("fixture renders %d chunks, want 3..%d so chunk 2 is a middle chunk", len(chunks), maxCardChunks)
+	}
 	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
 		Tool: "fs_write", TaskID: "task-partial", TraceID: "trace-partial", ToolInput: toolInput,
 	})
@@ -687,29 +695,109 @@ func TestApprovalCardPartialSendFailureNoKeyboard(t *testing.T) {
 		ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: "trace-partial",
 	})
 
-	if len(sender.sent) != 1 {
-		t.Fatalf("sent %d message(s), want exactly the first chunk", len(sender.sent))
+	wantNotice := fmt.Sprintf("⚠️ Onay kartı eksik gönderildi; yerel yüzeyden inceleyin: 'kahya approve %s'", d.PendingApprovalID)
+	got := sender.allTexts()
+	if len(got) != 2 || got[0] != chunks[0] || got[1] != wantNotice {
+		t.Fatalf("sent = %q, want exactly [chunk 1, %q]", got, wantNotice)
 	}
-	for i, s := range sender.sent {
-		if s.Markup != nil {
-			t.Fatalf("message %d carries a keyboard although the card never fully arrived", i)
-		}
+	assertNoKeyboardAttempted(t, sender, 3)
+	if n := cardCount(b); n != 0 {
+		t.Fatalf("tracked cards = %d, want 0", n)
+	}
+	assertCardIncompleteLedgered(t, ledger, d.PendingApprovalID)
+	if n := countLocalKind(local, "telegram_send_failed"); n != 1 {
+		t.Fatalf("local calls = %q, want exactly one telegram_send_failed line (chunk 2)", local.calls)
+	}
+}
+
+// TestApprovalCardSendOutageAfterFirstChunkNoKeyboard (FIX-P-6, the
+// handbook's failAfter scenario): when Telegram goes away after the first
+// chunk (every later send fails, the notice included), only chunk 1 ever
+// reached Telegram, the last attempt was the byte-exact incomplete notice
+// (the keyboard chunk was never attempted), nothing is tracked, the card
+// is ledgered incomplete once, and both failures surface locally.
+func TestApprovalCardSendOutageAfterFirstChunkNoKeyboard(t *testing.T) {
+	sender := &fakeSender{failAfter: 1}
+	ledger := &fakeLedger{}
+	local := &fakeLocalNotifier{}
+	fix := newPolicyFixture(t)
+	b := newTestBot(t, testConfig(), sender, ledger, newAllowGate(t), fix.Engine, local)
+
+	toolInput := fsWriteInput(t, "orta-dosya.txt", fillerLines(150))
+	chunks := approval.ChunkForTelegram(renderPendingApprovalPayload(b.home, "fs_write", toolInput).Render(), 0)
+	if len(chunks) < 3 || len(chunks) > maxCardChunks {
+		t.Fatalf("fixture renders %d chunks, want 3..%d", len(chunks), maxCardChunks)
+	}
+	d, err := fix.Engine.Check(context.Background(), policy.CheckInput{
+		Tool: "fs_write", TaskID: "task-outage", TraceID: "trace-outage", ToolInput: toolInput,
+	})
+	if err != nil || d.Result != policy.ResultNeedsApproval {
+		t.Fatalf("Check = %+v, %v", d, err)
+	}
+	b.OnPendingApproval(context.Background(), policy.PendingApprovalInfo{
+		ID: d.PendingApprovalID, Tool: "fs_write", Class: policy.ClassW2, ToolInput: toolInput, TraceID: "trace-outage",
+	})
+
+	if got := sender.allTexts(); len(got) != 1 || got[0] != chunks[0] {
+		t.Fatalf("sent = %q, want exactly chunk 1", got)
+	}
+	assertNoKeyboardAttempted(t, sender, 3)
+	wantNotice := fmt.Sprintf("⚠️ Onay kartı eksik gönderildi; yerel yüzeyden inceleyin: 'kahya approve %s'", d.PendingApprovalID)
+	if last := sender.attempted[len(sender.attempted)-1].Text; last != wantNotice {
+		t.Fatalf("last send attempt = %q, want the incomplete notice %q", last, wantNotice)
 	}
 	if n := cardCount(b); n != 0 {
 		t.Fatalf("tracked cards = %d, want 0", n)
 	}
+	assertCardIncompleteLedgered(t, ledger, d.PendingApprovalID)
+	if n := countLocalKind(local, "telegram_send_failed"); n != 2 {
+		t.Fatalf("local calls = %q, want two telegram_send_failed lines (chunk 2, notice)", local.calls)
+	}
+}
+
+// assertNoKeyboardAttempted fails unless sender saw exactly wantAttempts
+// Send attempts (failed ones included) and none of them carried a keyboard.
+func assertNoKeyboardAttempted(t *testing.T, sender *fakeSender, wantAttempts int) {
+	t.Helper()
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	for i, s := range sender.attempted {
+		if s.Markup != nil {
+			t.Fatalf("send attempt %d carries the approve keyboard although the card never fully arrived", i+1)
+		}
+	}
+	if len(sender.attempted) != wantAttempts {
+		t.Fatalf("send attempts = %d, want %d (chunk 1, the lost chunk 2, the incomplete notice)", len(sender.attempted), wantAttempts)
+	}
+}
+
+// assertCardIncompleteLedgered fails unless exactly one
+// telegram_card_incomplete row exists and it names pendingID.
+func assertCardIncompleteLedgered(t *testing.T, ledger *fakeLedger, pendingID string) {
+	t.Helper()
 	if n := ledger.countKind("telegram_card_incomplete"); n != 1 {
 		t.Fatalf("telegram_card_incomplete rows = %d, want 1", n)
 	}
-	failed := 0
-	for _, c := range local.calls {
-		if strings.HasPrefix(c, "telegram_send_failed:") {
-			failed++
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	for _, e := range ledger.events {
+		if e.Kind == "telegram_card_incomplete" && e.Payload["pending_approval_id"] != pendingID {
+			t.Fatalf("telegram_card_incomplete payload = %v, want pending_approval_id %s", e.Payload, pendingID)
 		}
 	}
-	if failed < 1 {
-		t.Fatalf("local calls = %q, want at least one telegram_send_failed line", local.calls)
+}
+
+// countLocalKind counts the fakeLocalNotifier lines of one kind.
+func countLocalKind(local *fakeLocalNotifier, kind string) int {
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	n := 0
+	for _, c := range local.calls {
+		if strings.HasPrefix(c, kind+":") {
+			n++
+		}
 	}
+	return n
 }
 
 // TestApprovalCardWithinCapTrackedOnce (FIX-P-6): a card of exactly

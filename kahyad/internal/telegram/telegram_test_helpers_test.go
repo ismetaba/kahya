@@ -42,22 +42,31 @@ type fakeSender struct {
 	nextMsgID int
 	failSend  bool
 	// failAfter > 0 fails every Send once that many messages were sent
-	// (FIX-P-6: a card whose middle chunk never reaches Telegram).
+	// (FIX-P-6: a Telegram outage after the first chunk).
 	failAfter int
+	// failOn > 0 fails ONLY the failOn-th Send attempt (1-based) and lets
+	// every other attempt succeed (FIX-P-6: one middle chunk lost while
+	// Telegram stays reachable for the keyboard chunk and the notice).
+	failOn int
+	// attempted records EVERY Send attempt, failed ones included, so a
+	// test can pin what was tried after a failure (FIX-P-6: the keyboard
+	// chunk is never even attempted once a chunk was lost).
+	attempted []sentMessage
 }
 
 func (f *fakeSender) Send(to tele.Recipient, what interface{}, opts ...interface{}) (*tele.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.failSend || (f.failAfter > 0 && len(f.sent) >= f.failAfter) {
-		return nil, fmt.Errorf("fakeSender: forced send failure")
-	}
 	text, _ := what.(string)
 	var markup *tele.ReplyMarkup
 	for _, o := range opts {
 		if m, ok := o.(*tele.ReplyMarkup); ok {
 			markup = m
 		}
+	}
+	f.attempted = append(f.attempted, sentMessage{Text: text, Markup: markup})
+	if f.failSend || (f.failAfter > 0 && len(f.sent) >= f.failAfter) || (f.failOn > 0 && len(f.attempted) == f.failOn) {
+		return nil, fmt.Errorf("fakeSender: forced send failure")
 	}
 	f.sent = append(f.sent, sentMessage{Text: text, Markup: markup})
 	f.nextMsgID++
