@@ -421,7 +421,14 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		// FIX-P-2: the user-touched map is keyed NormalizePathKey (NFC);
 		// relPath is the disk walk's spelling. The write below keeps the
 		// real on-disk name.
-		final := ApplyUserEditWins(original, proposed, userTouched[NormalizePathKey(toRepoRelPath(relPath))])
+		final, coarse := ApplyUserEditWinsDetailed(original, proposed, userTouched[NormalizePathKey(toRepoRelPath(relPath))])
+		if coarse {
+			// FIX-P-10: the changed region was too large for the exact
+			// diff's bounded table; it was treated as one hunk (a user line
+			// anywhere in it kept the whole region original).
+			c.logWarn("consolidation_diff_coarse_fallback", "trace_id", traceID, "path", relPath,
+				"orig_lines", strings.Count(original, "\n")+1, "proposed_lines", strings.Count(proposed, "\n")+1)
+		}
 		if final == original {
 			continue // nothing changed for this file - no need to touch the worktree
 		}

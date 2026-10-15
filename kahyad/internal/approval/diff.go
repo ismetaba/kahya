@@ -35,7 +35,9 @@ type DiffLine struct {
 // back to a coarse "content replaced" summary rather than risking an
 // unbounded-time/-memory diff on a huge or binary file. 4M cells (e.g.
 // 2000x2000 lines) comfortably covers any realistic approval-sized text
-// edit.
+// edit. lcsDiff's table is one flat int32 slice of (old+1)*(new+1) cells
+// and is skipped when either side is empty (FIX-P-10), so under this cap it
+// stays within 16 MB plus 4 bytes per input line, whatever the shape.
 const maxDiffCells = 4_000_000
 
 // UnifiedDiff computes a full, UNTRUNCATED (WYSIWYE never hides an
@@ -79,26 +81,40 @@ func splitLines(content []byte) []string {
 }
 
 // lcsDiff backtraces a longest-common-subsequence table over old/new
-// lines into a context/add/remove DiffLine sequence.
+// lines into a context/add/remove DiffLine sequence. The table is one flat
+// int32 slice (dp[i*w+j], w = len(new)+1) - FIX-P-10: a row-per-old-line
+// table paid a slice header and a rounded-up allocation per old line, so a
+// tall, narrow diff cost several times its cells. A pure create or delete
+// now builds no table at all. The decisions (and so the rendered diff) are
+// the same as before.
 func lcsDiff(old, new []string) []DiffLine {
 	n, m := len(old), len(new)
-	dp := make([][]int32, n+1)
-	for i := range dp {
-		dp[i] = make([]int32, m+1)
+	out := make([]DiffLine, 0, n+m)
+	if n == 0 || m == 0 {
+		for _, l := range old {
+			out = append(out, DiffLine{Op: DiffRemove, Text: l})
+		}
+		for _, l := range new {
+			out = append(out, DiffLine{Op: DiffAdd, Text: l})
+		}
+		return out
 	}
+	w := m + 1
+	dp := make([]int32, (n+1)*w)
 	for i := n - 1; i >= 0; i-- {
+		row, next := dp[i*w:(i+1)*w], dp[(i+1)*w:(i+2)*w]
 		for j := m - 1; j >= 0; j-- {
-			if old[i] == new[j] {
-				dp[i][j] = dp[i+1][j+1] + 1
-			} else if dp[i+1][j] >= dp[i][j+1] {
-				dp[i][j] = dp[i+1][j]
-			} else {
-				dp[i][j] = dp[i][j+1]
+			switch {
+			case old[i] == new[j]:
+				row[j] = next[j+1] + 1
+			case next[j] >= row[j+1]:
+				row[j] = next[j]
+			default:
+				row[j] = row[j+1]
 			}
 		}
 	}
 
-	out := make([]DiffLine, 0, n+m)
 	i, j := 0, 0
 	for i < n && j < m {
 		switch {
@@ -106,7 +122,7 @@ func lcsDiff(old, new []string) []DiffLine {
 			out = append(out, DiffLine{Op: DiffContext, Text: old[i]})
 			i++
 			j++
-		case dp[i+1][j] >= dp[i][j+1]:
+		case dp[(i+1)*w+j] >= dp[i*w+j+1]:
 			out = append(out, DiffLine{Op: DiffRemove, Text: old[i]})
 			i++
 		default:
