@@ -58,9 +58,13 @@ func (f SessionFunc) Consolidate(ctx context.Context, traceID string, files map[
 // "merge duplicates, fix headings, fold new notes into topic files").
 // Since FIX-B-5 a session is given one BATCH of one lane's files (select.go),
 // so the prompt confines every merge to that batch.
-// Every file this session is given is TRUSTED first-party memory content
-// (never mail/web bodies - those go through kahyad/internal/reader's
-// separate untrusted-Reader path), so - unlike reader.go's mail/webpage
+// Every file this session is given is TRUSTED first-party memory content:
+// Run filters out, in Go, every note whose front-matter tier is not
+// injection-eligible (agent_derived / external_doc / screen, or
+// unparseable - splitQuarantinedNotes, FIX-FINAL consolidation-launders-
+// quarantine-tier) and drops any rewrite that changes a tier
+// (tierPreserved); mail/web bodies go through kahyad/internal/reader's
+// separate untrusted-Reader path. So - unlike reader.go's mail/webpage
 // prompts - this one carries no "treat as untrusted data" caveat; it does
 // still forbid anything beyond a whole-file JSON rewrite (no shell, no
 // git, no tool use is even offered - Mode=ModeReader's toolless worker

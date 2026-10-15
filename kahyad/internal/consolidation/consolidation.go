@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/backup"
+	"kahya/kahyad/internal/factengine"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
 	"kahya/kahyad/internal/mlx"
@@ -358,6 +359,16 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	if err != nil {
 		return err
 	}
+	// FIX-FINAL consolidation-launders-quarantine-tier (HANDOFF §5 memory
+	// #1, safety #3): a quarantined note (agent_derived / external_doc /
+	// screen front matter, or front matter that cannot be parsed) is kept
+	// out of BOTH lanes until `kahya memory confirm` lifts it - so no
+	// rewrite can retier it and no fold can carry its text into a trusted
+	// topic file.
+	files, quarantined := splitQuarantinedNotes(files)
+	if len(quarantined) > 0 {
+		c.logInfo("consolidation_quarantined_skipped", "trace_id", traceID, "files", len(quarantined))
+	}
 	cloudFiles, localFiles := PartitionByLane(files, c.Cfg.MemoryDir, c.Cfg.SecretLaneGlobs, c.matcher())
 
 	// FIX-B-5 phase 0: each lane's size, every night, both lanes (an empty
@@ -488,6 +499,14 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		}
 		if final == original {
 			continue // nothing changed for this file - no need to touch the worktree
+		}
+		// FIX-FINAL consolidation-launders-quarantine-tier: a rewrite never
+		// changes, adds or breaks a file's front-matter tier (the indexer
+		// takes the tier from it); such a proposal is dropped, the original
+		// kept.
+		if !tierPreserved(original, final) {
+			c.logWarn("consolidation_rewrite_tier_changed", "trace_id", traceID, "path", relPath)
+			continue
 		}
 		if err := writeFileInWorktree(worktreeDir, toRepoRelPath(relPath), final); err != nil {
 			c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
@@ -1337,6 +1356,36 @@ func mergeRewrites(dst, src map[string]string) {
 	for k, v := range src {
 		dst[k] = v
 	}
+}
+
+// splitQuarantinedNotes keeps out of consolidation every note whose
+// front-matter tier is not injection-eligible on its own
+// (factengine.TierInjectionEligible with confirmed=false: agent_derived,
+// external_doc, screen) or whose front matter cannot be parsed
+// (fail-closed). They are not sent to either lane's model, so nothing can
+// retier them or fold their text into another file (HANDOFF §5 memory #1,
+// safety #3; FIX-FINAL consolidation-launders-quarantine-tier). After
+// `kahya memory confirm` a note is user_asserted and comes back.
+func splitQuarantinedNotes(files map[string]string) (eligible map[string]string, quarantined []string) {
+	eligible = make(map[string]string, len(files))
+	for rel, content := range files {
+		tier, _, err := indexer.StripFrontMatter(content)
+		if err != nil || !factengine.TierInjectionEligible(tier, false) {
+			quarantined = append(quarantined, rel)
+			continue
+		}
+		eligible[rel] = content
+	}
+	sort.Strings(quarantined)
+	return eligible, quarantined
+}
+
+// tierPreserved reports whether proposed keeps original's front-matter
+// tier exactly (both parse, same tier).
+func tierPreserved(original, proposed string) bool {
+	ot, _, oerr := indexer.StripFrontMatter(original)
+	pt, _, perr := indexer.StripFrontMatter(proposed)
+	return oerr == nil && perr == nil && ot == pt
 }
 
 // readMemoryFiles walks memoryDir for every *.md file, skipping dotfiles/

@@ -796,7 +796,14 @@ a cloud model, without changing anything in §2-§6 above:
   <kahyad@local>` as `memory_confirm: <path>` (never `user` - a review is
   user_asserted, not user_edit), reindexed (its chunks then pass the
   for_injection tier filter) and ledgered `memory_confirm {file,
-  previous_tier, commit_sha}`; a failing commit restores the bytes. Answers:
+  previous_tier, commit_sha}`; a failing commit restores the bytes. Nightly
+  consolidation never touches an unconfirmed note: a note whose front
+  matter is `agent_derived`/`external_doc`/`screen` (or cannot be parsed)
+  is sent to neither lane until confirmed (JSONL
+  `consolidation_quarantined_skipped`), and a rewrite that would change,
+  add or break a front-matter tier is dropped (JSONL
+  `consolidation_rewrite_tier_changed`) - FIX-FINAL
+  consolidation-launders-quarantine-tier. Answers:
   200 `{ok, file, episode_id, commit_sha, previous_tier, trace_id}`, 400
   path outside the memory dir, 404 no such note, 409 `"memory_confirm: not
   zaten onaylı (<tier>)"` (a note with no front matter is the indexer's
