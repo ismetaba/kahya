@@ -120,6 +120,19 @@ load/idle-unload and breaks the hermetic `tests/e2e/w12_gate_test.go` gate
 model-free). No re-architecture was done; `task.go`'s own classification
 comment now carries the same explicit scope statement in code.
 
+### Post-review note (FIX-MEM-7, G13)
+
+The local answer is no longer memory-less: with config
+`secret_lane_memory_injection` (default true, decision MEM-7.a) kahyad
+searches memory in-process and prefixes the local Qwen's prompt with a
+`<hafiza>` block built for the task's real lane (secret-path notes and
+facts only for a secret-lane task; the governor's downgraded normal task
+gets a normal-lane block). The block is ledgered as `hafiza_injected` with
+`lane`, never reaches a worker or the cloud, and memory pressure still
+refuses the task. A local retrieval/tool loop for Qwen stays deferred
+(decision MEM-7.b). See `docs/ipc.md` "Local `<hafiza>` for locally
+answered tasks".
+
 ## Out of scope
 - Reader/Actor taint split and mail/web ingestion pipelines — W4-03 (this task exposes the classifier they will call).
 - Embedding service / `Qwen3-Embedding-0.6B` — W12-11.

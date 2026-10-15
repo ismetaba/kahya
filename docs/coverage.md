@@ -37,7 +37,7 @@
 | Local fleet exactly 3 models, pinned | §4 ⚑ | W0-03 (`docs/models.md`) | covered |
 | `model_ver` rule: single active ver in KNN; full re-embed; eval-gated switch | §4 ⚑ | W12-11, W78-01 (gate b) | covered |
 | Cost governor: 500K/task, $10/day, $150/mo, pause+Telegram, 80% downgrade rung, cache-hit alarm, prompt-cache discipline | §4 ⚑ | W12-08 (+W3-07 alarm delivery, W12-09 frozen prefix, W4-08 rung acting on the routing table incl. Sonnet→yerel) | covered |
-| Memory pressure: on-demand load, idle-TTL, free-mem check, FAIL-CLOSED never cloud | §4 ⚑ | W3-08 (+W4-03, W78-03 test) | covered |
+| Memory pressure: on-demand load, idle-TTL, free-mem check, FAIL-CLOSED never cloud | §4 ⚑ | W3-08 (+W4-03, W78-03 test; FIX-MEM-3/MEM-6: extraction and ingest never fall back to the cloud; FIX-MEM-7: a local `<hafiza>` block never adds a cloud fallback) | covered |
 
 ## §5 invariants
 
@@ -48,7 +48,7 @@
 | Safety #1 · container `--network none`; net jobs only via egress proxy | W3-04, W3-05 (internal network + socat fwd + curl-bypass test) | covered |
 | Safety #1 · approval cards count as egress; post-sensitive-read content restraint | W3-05 (`egress.Check` used by W3-07 sender, W4-05 anchor, W5-03 ritual), FIX-U-5 (Telegram body restraint in `telegram.Bot.send`: allowlist-internal Telegram is gated on the session's sensitive-read mark + content, since `egress.Check` alone only blocks allowlist-external hosts) | covered |
 | Safety #1 · hard block of allowlist-external egress after sensitive read, session-lifetime | W3-05 (+W3-03 `secret_lane_read` seam) | covered |
-| Safety #2: data-level taint + dual-LLM Reader/Actor; Actor never sees raw untrusted text | W4-03 | covered |
+| Safety #2: data-level taint + dual-LLM Reader/Actor; Actor never sees raw untrusted text | W4-03, FIX-MEM-3 / FIX-MEM-6 (fact extraction and document ingest: Reader answers schema-validated in Go, the ingest note built only from validated fields - raw text never enters memory) | covered |
 | Safety #2 · untrusted tier = R-tools + notify only; W-actions from CLEAN seeded session; briefing tainted by design | W4-03, W5-01 | covered |
 | Safety #2 · taint persisted in SQLite by session_id, reloaded on resume, only rises, missing⇒untrusted | W4-03, W78-02 (restart scenario) | covered |
 | Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow), G13 MEM-6.a (external_doc/screen quarantined until confirmed), MEM-5 (note/fact confirm); profile-card builder itself not in MVP | covered |
@@ -60,12 +60,12 @@
 | Safety #6: model shell in Docker by default (workdir-only rw, no net); binary allowlist not a boundary; narrow arg-validated host set | W3-04 | covered |
 | Safety #6 · osascript/JXA/Shortcuts ≥W2, WYSIWYE-diffed, `do shell script` rejected/rerouted | W3-09 (↔ slidable; must land before W7–8) | covered |
 | Safety #6 · fs write-deny globs (shell rc, LaunchAgents, .hammerspoon, App Support/Kahya; FIX-B-4: git config, .git, SSH/GPG, Docker, Claude CLI, ~/Kahya, Python startup files, profile-aware self-protect) | W3-01 (globs), W3-03 (enforcement + canonicalization), FIX-B-4 | covered |
-| Memory #1: source-trust lattice; agent_derived quarantined until user confirms | W5-04, W12-05, W12-04/W0-01 (seed = user_asserted) | covered |
-| Memory #2: evidence-gated entity merge; split op; merge_ledger; provisional namesakes | W5-04 | covered |
-| Memory #3: negative evidence + log-odds; same-session dedupe; <0.3 out of injection; retraction | W5-04, W5-03 (ritual answers) | covered |
-| Memory #4: ≥90-day hot window; detail-atom promotion; summaries from raw evidence only | W5-02 | covered |
-| Memory #5: eval labels from weekly human ritual; gate before every consolidation/embedding/fusion change | W5-03 (labels), W78-01 (3 gated points), W5-05 (mini-baseline) | covered |
-| Schema table list open Day-1 (episodes, chunks, facts+all columns, entities, entity_aliases, evidence, merge_ledger, tasks, events/outbox) | W12-02 | covered |
+| Memory #1: source-trust lattice; agent_derived quarantined until user confirms | W5-04, W12-05, W12-04/W0-01 (seed = user_asserted), FIX-MEM-5 (bulk `kahya fact confirm/deny`, `kahya memory confirm`; no auto-confirm shortcut), FIX-MEM-7 (the quarantine is lane-independent: the secret lane's local block too) | covered |
+| Memory #2: evidence-gated entity merge; split op; merge_ledger; provisional namesakes | W5-04, FIX-MEM-2 (extraction-time entity resolution: only one exact, non-provisional, kind-compatible alias reuses an entity, otherwise a provisional namesake; `kahya entity list/show`; cloud-lane identity scoped by migration 0025) | covered |
+| Memory #3: negative evidence + log-odds; same-session dedupe; <0.3 out of injection; retraction | W5-04, W5-03 (ritual answers), FIX-MEM-3 (extracted facts enter as agent_derived; an extracted retraction never closes a higher-trust or confirmed fact), FIX-MEM-5 (bulk deny) | covered |
+| Memory #4: ≥90-day hot window; detail-atom promotion; summaries from raw evidence only | W5-02, FIX-MEM-3 (facts extracted from raw episode chunks, each quote a byte-exact or NFC-equal substring of the cited chunk) | covered |
+| Memory #5: eval labels from weekly human ritual; gate before every consolidation/embedding/fusion change | W5-03 (labels), W78-01 (3 gated points), W5-05 (mini-baseline), FIX-MEM-8 (recency weighting activates only behind a green retrieval eval for its own fusion identity) | covered |
+| Schema table list open Day-1 (episodes, chunks, facts+all columns, entities, entity_aliases, evidence, merge_ledger, tasks, events/outbox) | W12-02; G13 (review remediation) extends the same tables: 0024 (fact entity links + quote, folded aliases, episode extraction markers), 0025 (lane-scoped alias/link origin) | covered |
 | Product principle: W3 permanent written approval | W3-02, W3-06, W3-07, W78-03 | covered |
 | Product principle: safety in executor (static labels, Go check before tool runs) | W12-07, W3-01/W3-02 | covered |
 | Product principle: privacy in code (Go branch, "yerel işlendi" badge) | W3-08, FIX-U-3 (memory_write classified at ingest, secret notes under the `gizli/**` glob, secret-glob chunks never in a cloud `<hafiza>` block or `memory_search` result), FIX-MEM-7 (a secret-lane task's local `<hafiza>` is built and consumed in kahyad only; the governor's local downgrade route gets a normal-lane block) | covered |
@@ -126,7 +126,10 @@
   Security/VM/wake-word/XTTS-Piper/intent-LoRA/iPhone/hash-chain/SwiftUI/bitemporal-graph/saga-
   compensator/reranker/firehose in the tasks is either a HANDOFF quote, an explicit Out-of-scope
   deferral, or fixture text (NATS/saga in test corpora). W4-05 stays at the running-digest floor;
-  W5-04 populates valid_from/to columns without a graph engine; W12-04 skips FSEvents.
+  W5-04 populates valid_from/to columns without a graph engine; W12-04 skips FSEvents. The 2026-10
+  review remediation (G13, owner-approved: HANDOFF §8's "v2 layer once retrieval fails relational
+  questions") adds a read-only graph READER over those same tables (`kahyad/internal/graph`: the
+  `<olgular>` section, `entity_lookup`/`fact_query`, as_of/known_as_of helpers) - still no graph engine.
 - **(c) Gate tasks vs §6 verbatim:** each `*-acceptance` task encodes every clause of its week's §6
   sentence (checked clause-by-clause above), most quoting the Turkish text byte-exact, and each
   converts the gate into permanent repo tests plus a recorded live run.

@@ -24,7 +24,7 @@ The metaphor: an Ottoman **kâhya** — runs the household *on its own* in the o
 kahyad/            Go daemon — control plane (policy, ledger, scheduler, SQLite index, Keychain)
 kahyad/cmd/kahya/  Go CLI — one-shot + REPL + `kahya log --trace <id>`, talks to daemon over UDS
 worker/            Python — claude-agent-sdk reasoning harness, spawned per-task by kahyad
-mcp/memory/        Go (compiled into kahyad) — memory_search / memory_write / memory_forget
+mcp/memory/        Go (compiled into kahyad) — memory_search / memory_write / memory_forget / entity_lookup / fact_query
 docs/              Handoff + design artifact + generated coverage map
 tasks/             The complete MVP build plan, executable task by task
 policy.yaml        Action classes, reversibility, secret-lane globs, egress allowlist (created in W3-01)
@@ -60,7 +60,13 @@ four are user-assist tasks that stay `[!]` until the user acts: W0-04 (Keychain 
 dialog). The MVP has **not** entered the 2-week dogfood window yet (`docs/dogfood.md`); the start
 gate is `make readiness` (`docs/mvp-readiness.md`). A full code review (2026-10-08) found
 pre-dogfood blockers; its remediation handbook is
-[`docs/review/kahya-inceleme.md`](docs/review/kahya-inceleme.md) and the fixes land as `[FIX-<id>]`
-commits before dogfood starts.
+[`docs/review/kahya-inceleme.md`](docs/review/kahya-inceleme.md). Every finding of its packages
+G01–G13 now has its `[FIX-<id>]` commits, including G13's memory v2 layer: nightly fact/entity
+extraction (`kahya memory extract`, `kahya entity list/show`), graph facts in the `<hafiza>` block,
+filtered `memory_search` plus the `entity_lookup` / `fact_query` tools (`kahya fact query`), bulk
+review (`kahya fact list/confirm/deny`, `kahya memory confirm`), document ingest (`kahya ingest`)
+and a local-only `<hafiza>` block for secret-lane answers. What remains before dogfood starts are
+the live checks on the Mac (real Anthropic, Telegram, MLX and TCC runs) that the handbook lists
+per finding; the handbook's deferred items (the local Qwen tool loop, URL ingest) stay deferred.
 
 **MVP is done when:** 2 weeks of uninterrupted daily use · zero data-loss events (one rehearsed backup restore) · ≥10 commands/day · ≥5 "it remembered" moments/week · egress / secret-lane / W3 invariants covered by code tests, green in CI.
