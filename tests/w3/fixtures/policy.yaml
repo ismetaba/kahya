@@ -15,6 +15,9 @@
 #     yalniz geri-alinabilir eylemler"), so a W2+reversible tool exists
 #     only in this fixture - every W2 in the real policy.yaml is
 #     reversible: false and therefore approvable only locally.
+#     shell_docker/shell_host stay reversible: false as in the real file:
+#     Gate 1b proves such a W2 gets a keyboard-less Telegram notice and
+#     can only be approved locally.
 #   - mail_send (W3) is kept, with no real MCP tool implementation behind
 #     it (none exists yet in the landed W3 stack) — Gate 2 only needs the
 #     REAL policy decision + Telegram notify-only + engine-level

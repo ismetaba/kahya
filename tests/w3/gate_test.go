@@ -251,6 +251,82 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 	}
 }
 
+// TestGate1b_IrreversibleW2TelegramNoticeOnly is B-11's end-to-end gate
+// over the real kahyad binary (HANDOFF §4: "Telegram botu (uzaktan onay,
+// yalnız geri-alınabilir eylemler)"): an IRREVERSIBLE W2 (shell_host,
+// reversible: false in this suite's fixture) gets exactly one Telegram
+// message with NO keyboard - the byte-exact "geri alınamaz W2" notice that
+// names the pending id; a Telegram-surface approve of it is refused Go-side
+// (nonlocal_irreversible_approval_rejected) without consuming the id; and
+// the same id is then approved locally with `kahya approve`. No Docker is
+// needed: at L0 the git command never runs.
+func TestGate1b_IrreversibleW2TelegramNoticeOnly(t *testing.T) {
+	root := repoRoot(t)
+	kahyaBin := filepath.Join(root, "bin", "kahya")
+	requireBuilt(t, kahyaBin)
+
+	fake := faketelegram.New()
+	t.Cleanup(fake.Close)
+	d := bootKahyad(t, daemonOpts{
+		telegramURL: fake.URL(), telegramChatID: gateTelegramChatID, telegramUserID: gateTelegramUserID,
+	})
+	if err := os.MkdirAll(filepath.Join(d.homeDir, "Kahya-w3-gate"), 0o700); err != nil {
+		t.Fatalf("mkdir repo dir: %v", err)
+	}
+
+	const traceID = "trace-gate1b-irreversible-0001"
+	const taskID = "task-gate1b"
+	before := d.existingApprovalIDs(t, "shell_host")
+	res := d.mcpCall(t, traceID, taskID, "shell_host", map[string]any{
+		"command": "git", "args": []string{"status"}, "repo_path": "~/Kahya-w3-gate",
+	})
+	if !res.IsError {
+		t.Fatalf("shell_host at fresh L0 = %+v, want an error (needs approval)", res)
+	}
+	id := d.newPendingID(t, "shell_host", before)
+
+	sent := waitForSentMessages(t, fake, 1, 5*time.Second)
+	if len(sent) != 1 {
+		t.Fatalf("fake telegram got %d messages for an irreversible W2, want exactly 1: %+v", len(sent), sent)
+	}
+	notice := sent[0]
+	if len(notice.Buttons) != 0 {
+		t.Fatalf("irreversible W2 notice must carry NO inline keyboard, got: %+v", notice.Buttons)
+	}
+	if want := "⏳ Yerelde onay bekleniyor (geri alınamaz W2): shell_host. Terminalden 'kahya approve " + id + "' çalıştırın."; notice.Text != want {
+		t.Fatalf("irreversible W2 notice = %q, want byte-exact %q", notice.Text, want)
+	}
+
+	db := d.openDB(t)
+	if ok, _ := d.policyFeedback(t, "approve", id, "telegram"); ok {
+		t.Fatal("approve(surface=telegram) of an irreversible W2 must be refused")
+	}
+	if !waitForEvent(t, db, traceID, "nonlocal_irreversible_approval_rejected", 3*time.Second) {
+		t.Fatal("no nonlocal_irreversible_approval_rejected ledger event after the Telegram-surface approve")
+	}
+	if n := countEventsMatching(t, db, traceID, "nonlocal_irreversible_approval_rejected"); n != 1 {
+		t.Fatalf("nonlocal_irreversible_approval_rejected = %d, want 1", n)
+	}
+	if n := countEventsMatching(t, db, traceID, "policy_feedback_approved"); n != 0 {
+		t.Fatalf("policy_feedback_approved after the refused remote approve = %d, want 0", n)
+	}
+
+	out, exit := runKahyaApprove(t, kahyaBin, d.homeDir, d.sockPath, id, "evet\n")
+	if exit != 0 {
+		t.Fatalf("kahya approve %s <<< evet: exit=%d, want 0 (approved locally)\noutput:\n%s", id, exit, out)
+	}
+	if !strings.Contains(out, "Onaylandı.") {
+		t.Fatalf("kahya approve %s output = %q, want it to contain %q", id, out, "Onaylandı.")
+	}
+	if !waitForEvent(t, db, traceID, "policy_feedback_approved", 3*time.Second) {
+		t.Fatal("no policy_feedback_approved ledger event after the local approve")
+	}
+	approved := eventPayloads(t, db, traceID, "policy_feedback_approved")
+	if len(approved) != 1 || !strings.Contains(approved[0], `"surface":"local"`) {
+		t.Fatalf("policy_feedback_approved payloads = %v, want one with surface:\"local\"", approved)
+	}
+}
+
 // TestGate1c_ApprovalWaitParksCallThenExecutes is B-1's end-to-end gate
 // over the real kahyad binary: with approval_wait_seconds > 0 a fresh (L0)
 // fs_write PARKS inside kahyad instead of failing; a Telegram approval

@@ -206,7 +206,47 @@ func (f *fakeEgressGate) Check(ctx context.Context, target egress.Target, nbytes
 type policyFixture struct {
 	Engine *policy.Engine
 	Store  *store.Store
+	// Policy is the loaded policy the engine runs (B-11: tests wire its
+	// ToolsByName into a bot with SetToolRules).
+	Policy policy.Policy
 }
+
+// testToolRuleList is THE tool registry of this package's tests: the real
+// engine fixture (newPolicyFixture) loads it, and newTestBot wires the same
+// rules (testToolRules) into every test bot, so the bot's reversible-only
+// card gate (B-11) and the engine's ErrNonLocalRequiresReversible backstop
+// agree.
+//
+// fs_write/fs_delete are REVERSIBLE W2 here (B-11): the engine lets a
+// non-local surface (this bot, surface "telegram") approve only a
+// reversible tool, and these tests drive real Telegram approvals of them.
+// shell_docker is the irreversible W2 the B-11 tests use
+// (TestIrreversibleW2NoticeOnlyNoKeyboard,
+// TestForgedIrreversibleW2CallbackRejectedAtEngine); it and
+// applescript_run (W2, irreversible as in policy.yaml) also carry the
+// non-fs tool bodies the FIX-P-6 redaction tests classify, together with
+// jxa_run/shell_host (W2, irreversible) and memory_write (W1, reversible -
+// its card keeps the keyboard), all as in policy.yaml.
+var testToolRuleList = []policy.ToolRule{
+	{Name: "fs_write", Class: policy.ClassW2, Reversible: true, Undo: "pre-op git checkpoint restore"},
+	{Name: "fs_delete", Class: policy.ClassW2, Reversible: true, Undo: "move back from Trash"},
+	{Name: "memory_write", Class: policy.ClassW1, Reversible: true, Undo: "git revert"},
+	{Name: "shell_docker", Class: policy.ClassW2},
+	{Name: "shell_host", Class: policy.ClassW2},
+	{Name: "applescript_run", Class: policy.ClassW2},
+	{Name: "jxa_run", Class: policy.ClassW2},
+	{Name: "mail_send", Class: policy.ClassW3},
+}
+
+// testToolRules is testToolRuleList by name (policy.Policy.ToolsByName's
+// shape). Tests must not mutate it; copy it first.
+var testToolRules = func() map[string]policy.ToolRule {
+	byName := make(map[string]policy.ToolRule, len(testToolRuleList))
+	for _, tr := range testToolRuleList {
+		byName[tr.Name] = tr
+	}
+	return byName
+}()
 
 func newPolicyFixture(t *testing.T) policyFixture {
 	t.Helper()
@@ -222,32 +262,14 @@ func newPolicyFixture(t *testing.T) policyFixture {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	// fs_write/fs_delete are REVERSIBLE W2 here (B-11): the engine lets a
-	// non-local surface (this bot, surface "telegram") approve only a
-	// reversible tool, and these tests drive real Telegram approvals of
-	// them. shell_docker is the irreversible W2 the engine-backstop tests
-	// use (TestForgedIrreversibleW2CallbackRejectedAtEngine); it and
-	// applescript_run (W2, irreversible as in policy.yaml) also carry the
-	// non-fs tool bodies the FIX-P-6 redaction tests classify, together
-	// with jxa_run/shell_host (W2, irreversible) and memory_write (W1,
-	// reversible - its card keeps the keyboard), all as in policy.yaml.
-	tools := []policy.ToolRule{
-		{Name: "fs_write", Class: policy.ClassW2, Reversible: true, Undo: "pre-op git checkpoint restore"},
-		{Name: "fs_delete", Class: policy.ClassW2, Reversible: true, Undo: "move back from Trash"},
-		{Name: "memory_write", Class: policy.ClassW1, Reversible: true, Undo: "git revert"},
-		{Name: "shell_docker", Class: policy.ClassW2},
-		{Name: "shell_host", Class: policy.ClassW2},
-		{Name: "applescript_run", Class: policy.ClassW2},
-		{Name: "jxa_run", Class: policy.ClassW2},
-		{Name: "mail_send", Class: policy.ClassW3},
-	}
+	tools := append([]policy.ToolRule(nil), testToolRuleList...)
 	byName := make(map[string]policy.ToolRule, len(tools))
 	for _, tr := range tools {
 		byName[tr.Name] = tr
 	}
 	pol := policy.Policy{Tools: tools, ToolsByName: byName}
 	engine := policy.NewEngine(pol, st.Queries, st)
-	return policyFixture{Engine: engine, Store: st}
+	return policyFixture{Engine: engine, Store: st, Policy: pol}
 }
 
 // ---- Bot construction bypassing New() (white-box, same package) - the
@@ -267,6 +289,9 @@ func newTestBot(t *testing.T, cfg Config, sender Sender, ledger Ledger, gate Egr
 	b := &Bot{
 		cfg: cfg, tb: tb, sender: sender, ledger: ledger, egress: gate, engine: engine, local: local,
 		home: testHome(t), cards: map[string]*cardState{},
+		// B-11: the same registry newPolicyFixture's engine loads, so a
+		// reversible tool gets its card; SetToolRules(nil) tests unwired.
+		toolRules: testToolRules,
 	}
 	// FIX-P-5: every test built here assumes a REACHABLE bot (send never
 	// dials while offline); a test of the offline path stores false itself.

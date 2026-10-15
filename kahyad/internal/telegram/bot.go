@@ -4,7 +4,10 @@
 //
 //   - delivers W1/W2 pending-approval cards with a byte-exact WYSIWYE diff
 //     (approval.ChunkForTelegram's ≤4096-char monospace-ready chunks) and
-//     an inline "✅ Onayla"/"❌ Reddet" keyboard,
+//     an inline "✅ Onayla"/"❌ Reddet" keyboard - only for a policy.yaml
+//     reversible: true tool (B-11, SetToolRules; HANDOFF §4 "uzaktan onay,
+//     yalnız geri-alınabilir eylemler"); an irreversible W1/W2 gets a
+//     keyboard-less notice instead,
 //   - sends W3 pending approvals a NOTIFY-ONLY message and registers no
 //     handler capable of approving one (HANDOFF §5 safety #5 ⚑: "Telegram
 //     W3 için yalnız 'yerelde onay bekleniyor' bildirimi gönderir, onay
@@ -203,6 +206,12 @@ type Bot struct {
 	home            string
 	secretLaneGlobs []string
 
+	// toolRules is policy.yaml's tool registry (SetToolRules, B-11):
+	// OnPendingApproval offers an approve keyboard only for a tool whose
+	// rule is reversible: true (HANDOFF §4: "Telegram botu (uzaktan onay,
+	// yalnız geri-alınabilir eylemler)"). nil/unknown tool = irreversible.
+	toolRules map[string]policy.ToolRule
+
 	// remembered/ritual are W5-03's late-wired dependencies (like
 	// FeedbackEngine, these drive an actual decision from a callback tap) -
 	// SetRememberedMarker/SetRitualAnswerer, both nil until wired. A nil
@@ -311,6 +320,22 @@ func (b *Bot) wirePoller(p *backoffPoller) {
 		}
 		b.setOnline(true)
 	}
+}
+
+// SetToolRules (B-11) wires policy.yaml's tool registry so OnPendingApproval
+// can apply HANDOFF §4's "Telegram = only reversible actions" gate. Call
+// before Start(); main.go passes pol.ToolsByName. Unwired (nil) means NO
+// tool is treated as reversible - every W1/W2 gets the keyboard-less
+// notice (fail-closed, never a card by omission). The engine's own
+// policy.ErrNonLocalRequiresReversible backstop refuses a Telegram approve
+// of an irreversible tool regardless of what this bot shows.
+func (b *Bot) SetToolRules(rules map[string]policy.ToolRule) { b.toolRules = rules }
+
+// isReversible reports whether tool's policy.yaml rule is reversible: true.
+// An unknown tool or an unwired registry is irreversible (fail-closed).
+func (b *Bot) isReversible(tool string) bool {
+	rule, ok := b.toolRules[tool]
+	return ok && rule.Reversible
 }
 
 // Enabled reports whether this Bot is CONFIGURED: a real token was read

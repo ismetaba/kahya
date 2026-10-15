@@ -471,6 +471,10 @@ func run() int {
 	// are egress too).
 	tgCfg := telegram.Config{ChatID: cfg.TelegramChatID, UserID: cfg.TelegramUserID, APIURL: cfg.TelegramAPIURL}
 	tgBot := telegram.New(tgCfg, buildTelegramTokenSource(cfg, log), st, egressGate, policyEngine, notifier, home, pol.SecretLaneGlobs, log)
+	// B-11: Telegram offers an approve keyboard only for a reversible: true
+	// tool (HANDOFF §4). In deny-all mode pol is the zero value, so every
+	// W1/W2 gets the keyboard-less notice (fail-closed).
+	tgBot.SetToolRules(pol.ToolsByName)
 
 	// W6-01: the Hammerspoon CLI exec bridge - kahyad's LOCAL approval-card
 	// and background/scheduled-task-notification surface (HANDOFF §4 IPC

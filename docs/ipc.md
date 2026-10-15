@@ -1185,8 +1185,10 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
 
 1. `Engine.Check` answers `needs_approval` and mints ONE `pending_approvals`
    row (bound to task, tool, scope and the sha256 of the canonical tool
-   bytes); the approval card goes out (Telegram for a reversible tool,
-   Hammerspoon, `kahya approvals`).
+   bytes); the approval card goes out (Telegram: the diff card with the
+   Onayla/Reddet keyboard only for a `reversible: true` tool, otherwise a
+   keyboard-less "⏳ Yerelde onay bekleniyor (geri alınamaz W2): …" notice
+   naming the pending id - B-11; Hammerspoon; `kahya approvals`).
 2. The in-flight `tools/call` **parks inside kahyad** for
    `approval_wait_seconds` (config, default 300, at most 600 — the pending
    approval's own TTL — and, when written explicitly, below

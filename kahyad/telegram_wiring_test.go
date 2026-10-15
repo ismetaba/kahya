@@ -27,3 +27,21 @@ func TestTelegramBotStartsUnderLifecycleContext(t *testing.T) {
 		t.Errorf("main.go must log %s", wired)
 	}
 }
+
+// TestTelegramToolRulesWiredFromPolicy (B-11): main.go hands the loaded
+// policy's tool registry to the Telegram bot right after constructing it
+// and before the pending-approval hook can fire, so a card's approve
+// keyboard follows policy.yaml's reversible flag (an unwired bot would
+// treat every W1/W2 as irreversible - fail-closed, but no remote approval
+// at all).
+func TestTelegramToolRulesWiredFromPolicy(t *testing.T) {
+	newBot := onlyCallSite(t, "telegram", "New", "")
+	rules := onlyCallSite(t, "tgBot", "SetToolRules", "pol.ToolsByName")
+	hook := onlyCallSite(t, "policyEngine", "SetPendingApprovalHook", "")
+	if rules.offset < newBot.offset {
+		t.Error("tgBot.SetToolRules runs before telegram.New")
+	}
+	if rules.offset > hook.offset {
+		t.Error("tgBot.SetToolRules must run before policyEngine.SetPendingApprovalHook (a card could go out unwired)")
+	}
+}

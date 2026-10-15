@@ -54,7 +54,7 @@
 | Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow); profile-card builder itself not in MVP | covered |
 | Safety #4: external-anchored ledger; every injected `<hafiza>` block recorded | W4-05 (anchor+verify+separate Keychain item), W12-05/W12-10 (`hafiza_injected` + sha256) | covered |
 | Safety #5: WYSIWYE (NFC, bidi/zero-width/homoglyph, canonical path/host, hash; executed≠approved ⇒ reject) | W3-06 (+W78-02 homoglyph scenario) | covered |
-| Safety #5 · W3 "onayla" local-surface only (CLI W3–5, Hammerspoon W6+); Telegram notify-only for W3 | W3-06, W3-07, W6-01 (server-stamped surface) | covered |
+| Safety #5 · W3 "onayla" local-surface only (CLI W3–5, Hammerspoon W6+); Telegram notify-only for W3 | W3-06, W3-07, W6-01 (server-stamped surface), FIX-B-11 (Telegram approves only `reversible: true` W1/W2; every other W1/W2 is notify-only too, engine backstop) | covered |
 | Safety #5 · secret-lane bytes never in Telegram diff (redacted title max) | W3-07 (`redact.go`), W5-01 (briefing redaction) | covered |
 | Safety #5 · Telegram auth: fixed chat_id/user_id Go-side, silent drop + ledger, long-polling, `remote` label | W3-07 | covered |
 | Safety #6: model shell in Docker by default (workdir-only rw, no net); binary allowlist not a boundary; narrow arg-validated host set | W3-04 | covered |
@@ -314,6 +314,12 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | an IBAN on a new line of a multi-line applescript_run body (raw JSON listing: `\nTR33 ...`) never reaches Telegram | `kahyad/internal/telegram/TestApplescriptMultilineBodyIBANRedacted` | FIX-P-6 | ci-hermetic |
 | Safety #5 | a multi-line memory_write note (W1 reversible, keyboard card) carrying an IBAN is redacted: title only, no keyboard, ledgered | `kahyad/internal/telegram/TestMemoryWriteMultilineNoteIBANRedacted` | FIX-P-6 | ci-hermetic |
 | Safety #5 | every escape form (JSON `\n`/`\t`/`\uXXXX`, nested JSON, shell_host args, literal escapes in old file content) is decoded and classified before a card is sent | `kahyad/internal/telegram/TestEscapedToolBodySecretsRedacted` | FIX-P-6 | ci-hermetic |
+| Safety #5 | an irreversible W1/W2 pending approval gets one keyboard-less Telegram notice ("geri alınamaz", pending id), never an approve card | `kahyad/internal/telegram/TestIrreversibleW2NoticeOnlyNoKeyboard` | FIX-B-11 | ci-hermetic |
+| Safety #5 | with the production policy.yaml every irreversible tool is notice-only on Telegram and every reversible W1 (incl. `mail_draft`, decision G01-3) keeps its card | `kahyad/internal/telegram/TestProductionPolicyTelegramKeyboardOnlyForReversibleTools` | FIX-B-11 | ci-hermetic |
+| Safety #5 | no tool rules wired ⇒ no W1/W2 approve keyboard at all (fail-closed) | `kahyad/internal/telegram/TestUnwiredToolRulesTreatedIrreversible` | FIX-B-11 | ci-hermetic |
+| Safety #5 | a secret-lane irreversible action still gets only the redacted title (the reversible branch runs after both redaction gates, G00 C-4) | `kahyad/internal/telegram/TestSecretLaneIrreversibleStillRedacted` | FIX-B-11 | ci-hermetic |
+| Safety #5 | main.go wires policy.yaml's tool registry into the Telegram bot before the pending-approval hook | `kahyad/TestTelegramToolRulesWiredFromPolicy` | FIX-B-11 | ci-hermetic |
+| Safety #5 | real bins: an irreversible W2 (shell_host) gets a keyboard-less notice, a Telegram-surface approve is refused Go-side, the same id approves locally | `tests/w3/TestGate1b_IrreversibleW2TelegramNoticeOnly` | FIX-B-11 | local-integration |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
 | Safety #6 | git config / .git / ssh / gpg / docker / claude / memory-repo / python-startup paths are mandatory fs write-deny globs | `kahyad/internal/policy/TestMandatoryDenyGlobsIncludeGitAndMemoryFamilies` | FIX-B-4 | ci-hermetic |

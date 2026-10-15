@@ -39,6 +39,11 @@ const (
 	// msgTelegramOffline is the local-fallback line send writes when the
 	// bot is configured but Telegram is not reachable (FIX-P-5).
 	msgTelegramOffline = "Telegram çevrimdışı; onay/alarm CLI/yerel yüzeyden takip edilmeli."
+
+	// msgIrreversibleWaitFmt (B-11) is the keyboard-less notice an
+	// IRREVERSIBLE W1/W2 pending approval gets instead of a card: class
+	// (W1/W2), the payload summary, the pending id.
+	msgIrreversibleWaitFmt = "⏳ Yerelde onay bekleniyor (geri alınamaz %s): %s. Terminalden 'kahya approve %s' çalıştırın."
 )
 
 // cbActionApprove/cbActionDeny are the single leading byte of every
@@ -125,6 +130,13 @@ func approvalMarkup(id string) (*tele.ReplyMarkup, error) {
 // TestSecretLaneW3StillRedacted/TestW3NoticeSummaryWithIBANRedacted).
 // Every b.send below carries either a fixed Turkish text or bytes that
 // passed outboundSecretLane.
+//
+// B-11 (HANDOFF §4: Telegram approves only reversible actions): a W1/W2
+// card gets the Onayla/Reddet keyboard only when the tool's policy.yaml
+// rule is reversible: true (SetToolRules); an irreversible one gets the
+// keyboard-less msgIrreversibleWaitFmt notice, exactly like W3. Decided
+// AFTER both redaction gates (G00 C-4), so a secret-lane irreversible
+// action still gets only the redacted title.
 func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApprovalInfo) {
 	if !b.Enabled() {
 		return
@@ -157,8 +169,38 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 		// The card branch: outbound is already classified, so anything
 		// that decides HOW a W1/W2 card is presented (keyboard or notice)
 		// belongs here, after the classification above.
+		if !b.isReversible(info.Tool) {
+			// B-11 / HANDOFF §4: Telegram may approve only reversible
+			// actions. An irreversible W1/W2 (policy.yaml reversible:
+			// false, an unknown tool, or no rules wired) gets the same
+			// notify-only treatment W3 gets - no keyboard, ever. The
+			// engine's ErrNonLocalRequiresReversible backstop makes this
+			// unbypassable even under a forged callback
+			// (TestForgedIrreversibleW2CallbackRejectedAtEngine).
+			b.sendIrreversibleNotice(ctx, info, payload)
+			return
+		}
 		b.sendApprovalCard(ctx, info, payload, outbound)
 	}
+}
+
+// sendIrreversibleNotice sends the keyboard-less B-11 notice for an
+// irreversible W1/W2 pending approval: class, payload.Summary (a tool name,
+// or "fs_write: <path>" - the first line of the rendered card, already
+// classified by OnPendingApproval) and the pending id. The exact notice
+// text is classified once more before it leaves (fail-closed): it is the
+// only content-carrying text this path sends.
+func (b *Bot) sendIrreversibleNotice(ctx context.Context, info policy.PendingApprovalInfo, payload approval.ApprovalPayload) {
+	text := fmt.Sprintf(msgIrreversibleWaitFmt, info.Class, payload.Summary, info.ID)
+	if secret, reason := outboundSecretLane(text); secret {
+		b.redact(ctx, info, reason)
+		return
+	}
+	b.ledgerEvent(info.TraceID, "telegram_irreversible_notice", map[string]any{
+		"event": "telegram_irreversible_notice", "tool": info.Tool, "class": string(info.Class),
+		"pending_approval_id": info.ID,
+	})
+	b.send(ctx, info.TraceID, text, nil) // NEVER a keyboard
 }
 
 // redact sends the redacted title instead of the card and ledgers why
