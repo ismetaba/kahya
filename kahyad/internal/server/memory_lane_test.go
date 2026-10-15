@@ -405,3 +405,83 @@ func TestMemorySearchForInjectionExcludesSecretPathChunks(t *testing.T) {
 		t.Fatalf("for_injection:false results = %+v, want all 3 (the local surface is not filtered)", raw.Results)
 	}
 }
+
+// caseInsensitiveVolume reports whether the volume holding t.TempDir()
+// (where the MCP fixture puts the memory dir) folds name case.
+func caseInsensitiveVolume(t *testing.T) bool {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "case-probe"), nil, 0o600); err != nil {
+		t.Fatalf("case probe: %v", err)
+	}
+	_, err := os.Stat(filepath.Join(dir, "CASE-PROBE"))
+	return err == nil
+}
+
+// TestMCPMemoryCaseVariantSecretDirNeverReachesMemorySearch is the FIX-U-3
+// review's repro over /v1/mcp, made permanent. On macOS APFS a "Gizli/"
+// directory and the secret-lane dir "gizli/" are one directory: task-a's
+// agent writes a normal note to Gizli/liste.md and forgets it (the empty
+// Gizli/ stays), then memory_writes IBAN content, which is redirected to
+// gizli/notes/... and would be STORED as Gizli/notes/... A boot reindex
+// then indexes the stored name. Neither that note, nor a secret note the
+// user keeps under Gizli/ themselves, may reach an unrelated normal-lane
+// task's memory_search tool result (a cloud worker's view).
+func TestMCPMemoryCaseVariantSecretDirNeverReachesMemorySearch(t *testing.T) {
+	f := newMCPTestFixtureSecretLane(t)
+	insertLaneTask(t, f.store, "task-a", "trace-a", "normal")
+	insertLaneTask(t, f.store, "task-b", "trace-b", "normal")
+	seedAutonomyState(t, f.store, "memory_write", "W1", "global", 2)
+	seedAutonomyState(t, f.store, "memory_forget", "W1", "global", 2)
+	seedAutonomyState(t, f.store, "memory_search", "R", "global", 1)
+	asA := map[string]string{traceHeader: "trace-a", taskHeader: "task-a"}
+
+	if p, body := postToolCallAs(t, f.client, secretMemoryWriteCall(1, "toplanti notu", "Gizli/liste.md"), asA); p.Result.IsError {
+		t.Fatalf("normal memory_write = %s, want success", body)
+	}
+	forget := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_forget","arguments":{"file":"Gizli/liste.md"}}}`
+	if p, body := postToolCallAs(t, f.client, forget, asA); p.Result.IsError {
+		t.Fatalf("memory_forget = %s, want success", body)
+	}
+	p, body := postToolCallAs(t, f.client, secretMemoryWriteCall(3, u3IBAN, "inbox/u.md"), asA)
+	if caseInsensitiveVolume(t) {
+		if !p.Result.IsError || len(p.Result.Content) == 0 || p.Result.Content[0].Text != memory.MsgMemoryWriteSecretLaneRefused {
+			t.Fatalf("IBAN memory_write into a case-variant secret dir = %s, want IsError %q", body, memory.MsgMemoryWriteSecretLaneRefused)
+		}
+		if n := countEventsWhere(t, f.store, memory.EventMemoryWriteSecretLaneRefused, `json_extract(payload, '$.reason') = 'secret_dir_case_mismatch'`); n != 1 {
+			t.Fatalf("%s (secret_dir_case_mismatch) rows = %d, want 1", memory.EventMemoryWriteSecretLaneRefused, n)
+		}
+	} else if p.Result.IsError {
+		t.Fatalf("IBAN memory_write on a case-sensitive volume = %s, want success under gizli/", body)
+	}
+	if lane, _ := taskLane(t, f.store, "task-a"); lane != "secret" {
+		t.Fatalf("task-a lane = %q, want secret (escalated whatever happens to the note)", lane)
+	}
+
+	// The user keeps a secret note of their own under the same Gizli/.
+	if err := os.MkdirAll(filepath.Join(f.memoryDir, "Gizli"), 0o700); err != nil {
+		t.Fatalf("mkdir Gizli: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.memoryDir, "Gizli", "banka.md"), []byte("Banka: TR33 0006 1005 1978 6457 8413 26\n"), 0o600); err != nil {
+		t.Fatalf("write user note: %v", err)
+	}
+
+	// kahyad restart: the boot reindex (main.go reindexBackfiller) indexes
+	// what is on disk, under its stored names.
+	if _, err := indexer.New(f.store.DB(), f.memoryDir, testLogger(t)).Reindex(context.Background(), "boot", false); err != nil {
+		t.Fatalf("Reindex: %v", err)
+	}
+	var stored int
+	if err := f.store.DB().QueryRow(`SELECT count(*) FROM episodes WHERE status = 'active' AND source_path = 'Gizli/banka.md'`).Scan(&stored); err != nil || stored != 1 {
+		t.Fatalf("active Gizli/banka.md episodes = %d (err %v), want 1 (fixture sanity: the note is indexed)", stored, err)
+	}
+
+	search := `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"TR33","k":8}}}`
+	p, body = postToolCallAs(t, f.client, search, map[string]string{traceHeader: "trace-b", taskHeader: "task-b"})
+	if p.Result.IsError {
+		t.Fatalf("memory_search = %s, want success", body)
+	}
+	if strings.Contains(body, "TR33") || strings.Contains(strings.ToLower(body), "gizli/") {
+		t.Fatalf("memory_search tool result for task-b = %s, want no secret-lane note", body)
+	}
+}

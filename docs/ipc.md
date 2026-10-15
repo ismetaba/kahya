@@ -481,13 +481,21 @@ a cloud model, without changing anything in §2-§6 above:
   `inbox/2026-10-13.md` → `gizli/notes/inbox/2026-10-13.md`; a path
   already under `gizli/` is kept) and the target must be covered by a
   `secret_lane_globs` entry (`policy.yaml`: `~/Kahya/memory/gizli/**`,
-  decision MEM-6.b). Every failure refuses the write, nothing on disk or in
-  git: mark/escalate/no matcher → `"Gizli-şerit not kaydedilemedi; not güvenlik gereği yazılmadı (fail-closed)."`,
+  decision MEM-6.b) - byte-exact, and so must the name the volume will
+  STORE it under: on macOS APFS (case- and normalisation-insensitive) an
+  existing `Gizli/` swallows `gizli/notes/...` and every walker downstream
+  reports `Gizli/notes/...`. The stored name of each existing component is
+  read back (`os.ReadDir` + `os.SameFile`) before the write and again after
+  it; a stored name that is still covered becomes the note's path, an
+  uncovered one (or one that changed during the write - the bytes are then
+  removed) refuses. Every failure refuses the write, nothing on disk or in
+  git: mark/escalate/no matcher/stored-name mismatch → `"Gizli-şerit not kaydedilemedi; not güvenlik gereği yazılmadı (fail-closed)."`,
   no covering glob →
   `"memory_write: gizli şerit için hafıza globu tanımlı değil (policy.yaml secret_lane_globs: ~/Kahya/memory/gizli/**); not yazılmadı."`
   (ledger `memory_write.secret_lane_refused{reason}`, reasons
   `sensitive_mark_failed` / `lane_escalate_failed` / `matcher_unwired` /
-  `secret_glob_missing`). A redirected write ledgers `memory_write`
+  `secret_path_unresolved` / `secret_glob_missing` /
+  `secret_dir_case_mismatch` with `on_disk_file`). A redirected write ledgers `memory_write`
   (`secret_lane:true`, `task_id`) and `memory_write.secret_lane_redirected
   {requested_file, file, category, task_id, commit_sha}`; the tool output
   gains `secret_lane` and returns the path the note actually landed on.
@@ -499,7 +507,12 @@ a cloud model, without changing anything in §2-§6 above:
   surface) is unfiltered. Nightly consolidation's
   `consolidation.PartitionByLane` keeps a `gizli/**` note in the local lane,
   and a secret-lane glob it cannot evaluate now counts as a match (local
-  lane, fail-closed) instead of "no match" (cloud lane).
+  lane, fail-closed) instead of "no match" (cloud lane). Both memory-side
+  path rules (`memlane.PathIsSecret`, `PartitionByLane`) fold glob and path
+  first (`memlane.FoldForSecretGlob`: NFC, Turkish I family, lowercase), so
+  a case or normalisation variant of a secret path (`Gizli/banka.md`,
+  `FINANS.md`) is local-lane too; over-matching only keeps a note on the
+  machine.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

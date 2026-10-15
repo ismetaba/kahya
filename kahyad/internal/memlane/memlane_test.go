@@ -72,6 +72,43 @@ func TestPathIsSecret(t *testing.T) {
 	}
 }
 
+// TestPathIsSecretFoldsCaseAndNormalization (FIX-U-3 review): macOS APFS
+// stores "Gizli/" and "gizli/" as ONE directory, so the walkers report
+// whichever spelling exists on disk; a case, Turkish-I or Unicode
+// normalisation variant of a secret path is secret too (over-matching only
+// keeps a path local). Ordinary paths stay normal.
+func TestPathIsSecretFoldsCaseAndNormalization(t *testing.T) {
+	c := newClassifier(nil)
+	for rel, want := range map[string]bool{
+		"Gizli/notes/inbox/u.md": true,
+		"GIZLI/x.md":             true,
+		"GİZLİ/x.md":             true, // dotted capital I
+		"Finans-2026.md":         true,
+		"FINANS.md":              true,
+		"inbox/Gizli.md":         false,
+		"notes/Finans.md":        false,
+		"Inbox/x.md":             false,
+	} {
+		if got := c.PathIsSecret(rel); got != want {
+			t.Errorf("PathIsSecret(%q) = %v, want %v", rel, got, want)
+		}
+	}
+	// A glob spelled in another case (or a memory dir configured so) still
+	// covers the stored path.
+	upper := Classifier{MemoryDir: "/M", SecretGlobs: []string{"/m/GIZLI/**"}, Matcher: policyMatcher{}}
+	if !upper.PathIsSecret("gizli/x.md") {
+		t.Error("PathIsSecret with a differently-cased glob and memory dir = false, want true")
+	}
+	// Decomposed (NFD) and precomposed (NFC) spellings of a non-ASCII glob.
+	nfd := Classifier{MemoryDir: testMemoryDir, SecretGlobs: []string{"/m/sağlık/**"}, Matcher: policyMatcher{}}
+	if !nfd.PathIsSecret("sağlık/a.md") {
+		t.Error("PathIsSecret(NFD spelling of an NFC glob) = false, want true")
+	}
+	if got := FoldForSecretGlob("/Users/X/Kahya/memory/Gİzli/**"); got != "/users/x/kahya/memory/gizli/**" {
+		t.Errorf("FoldForSecretGlob = %q, want /users/x/kahya/memory/gizli/**", got)
+	}
+}
+
 type erroringMatcher struct{}
 
 func (erroringMatcher) Match(string, string) (bool, error) { return false, errors.New("bad glob") }

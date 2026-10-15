@@ -17,6 +17,10 @@ package memory
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -146,7 +150,10 @@ func (s *Server) secretLaneTarget(requested string) string {
 // that cannot be evaluated is NOT coverage here: this check refuses the
 // write unless some glob provably covers the target (fail-closed in the
 // direction that matters - an uncovered secret note would look normal to
-// every path-based rule downstream).
+// every path-based rule downstream). It is deliberately byte-exact, i.e.
+// stricter than the case-/normalisation-folded downstream rules
+// (memlane.PathIsSecret, consolidation.PartitionByLane): a note this
+// package places is covered for a byte-exact consumer too.
 func (s *Server) secretGlobCovers(relPath string) bool {
 	abs := filepath.Join(s.MemoryDir, filepath.FromSlash(relPath))
 	for _, g := range s.secretLane.Globs {
@@ -155,6 +162,69 @@ func (s *Server) secretGlobCovers(relPath string) bool {
 		}
 	}
 	return false
+}
+
+// onDiskRelPath returns relPath (forward-slash, cleaned, relative to
+// memoryDir) with every component that already exists on disk replaced by
+// the name its directory entry actually carries; the first missing
+// component and everything after it are kept as given (os.MkdirAll /
+// os.WriteFile create them with exactly those names).
+//
+// Why (FIX-U-3 review): macOS APFS is case- and normalisation-insensitive
+// but preserving. When a "Gizli/" directory already exists, writing
+// "gizli/notes/x.md" resolves INTO it, and every path walker downstream
+// (consolidation.readMemoryFiles, indexer.walkFiles) then reports
+// "Gizli/notes/x.md" - a name the byte-exact secret_lane_globs check never
+// saw. HandleWriteForTask therefore checks glob coverage on the name this
+// returns, before the write and again after it. Existing components are
+// found by Lstat (which honours the volume's name equivalence) and their
+// stored name by os.ReadDir + os.SameFile, so no case-folding rule is
+// re-implemented here.
+func onDiskRelPath(memoryDir, relPath string) (string, error) {
+	cur, err := filepath.EvalSymlinks(memoryDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve memory dir %s: %w", memoryDir, err)
+	}
+	segs := strings.Split(relPath, "/")
+	for i, seg := range segs {
+		info, err := os.Lstat(filepath.Join(cur, seg))
+		if errors.Is(err, fs.ErrNotExist) {
+			break // this and every later component will be created as named
+		}
+		if err != nil {
+			return "", fmt.Errorf("stat %s: %w", filepath.Join(cur, seg), err)
+		}
+		name, err := storedEntryName(cur, seg, info)
+		if err != nil {
+			return "", err
+		}
+		segs[i] = name
+		cur = filepath.Join(cur, name)
+	}
+	return strings.Join(segs, "/"), nil
+}
+
+// storedEntryName returns the name dir's entry for want (already known to
+// exist, info its Lstat) is stored under: want itself when an entry is
+// byte-identical, otherwise the entry that is the same file (a case or
+// Unicode normalisation variant on an insensitive volume). No such entry
+// is an error - the caller refuses (fail-closed).
+func storedEntryName(dir, want string, info fs.FileInfo) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("read dir %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.Name() == want {
+			return want, nil
+		}
+	}
+	for _, e := range entries {
+		if other, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil && os.SameFile(info, other) {
+			return e.Name(), nil
+		}
+	}
+	return "", fmt.Errorf("read dir %s: no entry is stored as %q", dir, want)
 }
 
 // ledgerEvent is the best-effort ledger write memory_write's FIX-U-3 kinds

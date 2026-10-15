@@ -23,10 +23,13 @@
 //     alone is not enough.
 //
 // Fail-closed throughout: a store read error is returned (the caller then
-// refuses), and a glob that cannot be evaluated - or no matcher at all -
-// makes the path secret. (The ritual copy treated a glob match error as "no
-// match"; policy.Load validates every glob at boot, so that never happened
-// in practice, but this package never fails open.)
+// refuses), a glob that cannot be evaluated - or no matcher at all -
+// makes the path secret, and glob and path are case-/normalisation-folded
+// before matching (FoldForSecretGlob), so a variant spelling of a secret
+// path on a case-insensitive volume is secret too. (The ritual copy
+// treated a glob match error as "no match"; policy.Load validates every
+// glob at boot, so that never happened in practice, but this package
+// never fails open.)
 //
 // This package does not import kahyad/internal/policy: the matcher is
 // injected (ritual.PolicyGlobMatcher in production). That keeps hermetic
@@ -45,6 +48,7 @@ import (
 
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
+	"kahya/kahyad/internal/textnorm"
 )
 
 // Store is the brain.db read surface Classify needs - *sqlcgen.Queries
@@ -112,19 +116,36 @@ func FactText(f sqlcgen.Fact) string {
 // MemoryDir, as episodes.source_path stores it) matches a secret-lane glob.
 // A glob that errors, or a missing matcher while globs are configured,
 // counts as a match (fail-closed).
+//
+// Both the glob and the path are folded first (FoldForSecretGlob: NFC,
+// Turkish I-family, lowercase): macOS APFS is case- and normalisation-
+// insensitive, so "Gizli/x.md" and "gizli/x.md" are the same directory
+// and a byte-exact match would hand the former to the cloud lane.
+// Over-matching only ever keeps a path on the machine.
 func (c Classifier) PathIsSecret(relPath string) bool {
-	abs := filepath.Join(c.MemoryDir, filepath.FromSlash(relPath))
+	abs := FoldForSecretGlob(filepath.Join(c.MemoryDir, filepath.FromSlash(relPath)))
 	for _, g := range c.SecretGlobs {
 		if c.Matcher == nil {
 			return true
 		}
-		ok, err := c.Matcher.Match(g, abs)
+		ok, err := c.Matcher.Match(FoldForSecretGlob(g), abs)
 		if err != nil || ok {
 			return true
 		}
 	}
 	return false
 }
+
+// FoldForSecretGlob is the folding every memory-side secret-lane path rule
+// applies to BOTH a secret_lane_globs pattern and the path it is matched
+// against (memlane.PathIsSecret, consolidation.PartitionByLane):
+// textnorm.Fold - NFC normalisation, the Turkish dotted/dotless I family
+// collapsed onto "i", then Unicode lowercase. It is a superset of what an
+// APFS volume treats as the same name (case- and normalisation-
+// insensitive), so a case or normalisation variant of a secret path is
+// secret too (mcp/fs.MatchesAnyGlobCI's rationale, HANDOFF S5 safety #6).
+// Glob metacharacters are unaffected.
+func FoldForSecretGlob(s string) string { return textnorm.Fold(s) }
 
 // Classify decides whether fact f may leave the machine: path half first
 // (any cited secret path excludes; no resolvable citation excludes), then

@@ -220,10 +220,12 @@ func (s *Server) HandleWrite(ctx context.Context, traceID string, args MemoryWri
 // §4 ordering invariant, "classified at ingest"): validate the requested
 // path, classify the content locally, and on a secret hit - durable
 // sensitive mark, sticky lane escalation, target path under the
-// secret-lane dir, glob coverage check - ALL before a single byte is
-// written, each failure refusing the write (fail-closed). The front matter
-// stays agent_derived (HANDOFF §5 memory #1): a redirect changes the path,
-// never the tier.
+// secret-lane dir, glob coverage of that path AND of the name the volume
+// will store it under (onDiskRelPath) - ALL before a single byte is
+// written, each failure refusing the write (fail-closed); the stored name
+// is checked once more right after the write (a mismatch undoes it). The
+// front matter stays agent_derived (HANDOFF §5 memory #1): a redirect
+// changes the path, never the tier.
 func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string, args MemoryWriteArgs) (MemoryWriteOutput, error) {
 	// Serialize the whole mutate sequence below - see the Server.mu doc
 	// comment for why (concurrent git index races + orphaned writes).
@@ -246,30 +248,36 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 	if s.secretLane.Classifier != nil {
 		secretLane, category = s.secretLane.Classifier.ClassifySecretLane(args.Content)
 	}
+	// refuse ledgers a secret-lane refusal (relPath as it stands at the
+	// refusal) and returns the Turkish tool error; onDisk is the name the
+	// volume stores the target under, when that is what failed.
+	refuse := func(reason, msg string, err error, onDisk string) (MemoryWriteOutput, error) {
+		payload := map[string]any{
+			"requested_file": requested, "file": relPath, "category": category, "task_id": taskID, "reason": reason,
+		}
+		if err != nil {
+			payload["err"] = err.Error()
+		}
+		if onDisk != "" {
+			payload["on_disk_file"] = onDisk
+		}
+		s.ledgerEvent(ctx, traceID, EventMemoryWriteSecretLaneRefused, payload)
+		s.Log.Warn("memory_write_secret_lane_refused", "request_trace_id", traceID, "task_id", taskID, "reason", reason)
+		return MemoryWriteOutput{}, errors.New(msg)
+	}
 	if secretLane {
 		relPath = s.secretLaneTarget(requested)
-		refuse := func(reason, msg string, err error) (MemoryWriteOutput, error) {
-			payload := map[string]any{
-				"requested_file": requested, "file": relPath, "category": category, "task_id": taskID, "reason": reason,
-			}
-			if err != nil {
-				payload["err"] = err.Error()
-			}
-			s.ledgerEvent(ctx, traceID, EventMemoryWriteSecretLaneRefused, payload)
-			s.Log.Warn("memory_write_secret_lane_refused", "request_trace_id", traceID, "task_id", taskID, "reason", reason)
-			return MemoryWriteOutput{}, errors.New(msg)
-		}
 		// FIX-B-7 twin: the producing session is marked sensitive, durably,
 		// keyed on the request's own server-assigned trace_id.
 		if s.secretLane.Marker != nil && traceID != "" {
 			if err := s.secretLane.Marker.MarkSensitiveRead(ctx, traceID, traceID); err != nil {
-				return refuse("sensitive_mark_failed", MsgMemoryWriteSecretLaneRefused, err)
+				return refuse("sensitive_mark_failed", MsgMemoryWriteSecretLaneRefused, err, "")
 			}
 		}
 		// FIX-B-6 twin: sticky tasks.lane='secret' BEFORE any byte lands.
 		if s.secretLane.Escalator != nil {
 			if err := s.secretLane.Escalator.EscalateSecretLane(ctx, taskID, traceID, category); err != nil {
-				return refuse("lane_escalate_failed", MsgMemoryWriteSecretLaneRefused, err)
+				return refuse("lane_escalate_failed", MsgMemoryWriteSecretLaneRefused, err, "")
 			}
 		}
 		// The target MUST be covered by a secret_lane_globs entry, or every
@@ -278,10 +286,25 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 		// lane) would treat the note as normal. The task was escalated
 		// above regardless - the agent already holds the bytes.
 		if s.secretLane.Matcher == nil {
-			return refuse("matcher_unwired", MsgMemoryWriteSecretLaneRefused, nil)
+			return refuse("matcher_unwired", MsgMemoryWriteSecretLaneRefused, nil, "")
+		}
+		// ...and so must the name the volume will STORE it under: on a
+		// case-/normalisation-insensitive volume (macOS APFS) an existing
+		// "Gizli/" swallows "gizli/notes/...", and the walkers downstream
+		// see "Gizli/notes/..." (onDiskRelPath). A covered stored name is
+		// adopted as the note's path; an uncovered one refuses the write.
+		onDisk, err := onDiskRelPath(s.MemoryDir, relPath)
+		if err != nil {
+			return refuse("secret_path_unresolved", MsgMemoryWriteSecretLaneRefused, err, "")
 		}
 		if !s.secretGlobCovers(relPath) {
-			return refuse("secret_glob_missing", MsgMemoryWriteSecretGlobMissing, nil)
+			return refuse("secret_glob_missing", MsgMemoryWriteSecretGlobMissing, nil, "")
+		}
+		if onDisk != relPath {
+			if !s.secretGlobCovers(onDisk) {
+				return refuse("secret_dir_case_mismatch", MsgMemoryWriteSecretLaneRefused, nil, onDisk)
+			}
+			relPath = onDisk
 		}
 	}
 
@@ -293,6 +316,19 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 	prevContent, hadPrev, err := writeMemoryFile(abs, args.Content)
 	if err != nil {
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
+	}
+	if secretLane {
+		// Post-condition: the note is stored under exactly relPath (a
+		// directory created concurrently between the check above and the
+		// write would otherwise redirect it unseen). Anything else undoes
+		// the write and refuses.
+		if landed, err := onDiskRelPath(s.MemoryDir, relPath); err != nil || landed != relPath {
+			restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
+			if err != nil {
+				return refuse("secret_path_unresolved", MsgMemoryWriteSecretLaneRefused, err, "")
+			}
+			return refuse("secret_dir_case_mismatch", MsgMemoryWriteSecretLaneRefused, nil, landed)
+		}
 	}
 
 	repoRoot, err := gitRepoRoot(s.MemoryDir)

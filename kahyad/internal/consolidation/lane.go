@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
 )
 
@@ -60,7 +61,9 @@ func (PolicyGlobMatcher) Match(pattern, path string) (bool, error) {
 // it as "no match" would hand a possibly secret file (a gizli/** note
 // memory_write redirected, a finans*.md note) to the cloud lane. The
 // invariant this function exists to protect is "never cloud", not "never
-// local". This is the same rule memlane.Classifier.PathIsSecret applies.
+// local". This is the same rule memlane.Classifier.PathIsSecret applies,
+// including its case-/normalisation folding of glob and path (FIX-U-3
+// review: APFS stores "Gizli/" and "gizli/" as one directory).
 func PartitionByLane(files map[string]string, memoryDir string, secretGlobs []string, matcher GlobMatcher) (cloudFiles, localFiles map[string]string) {
 	cloudFiles = make(map[string]string, len(files))
 	localFiles = make(map[string]string, len(files))
@@ -80,12 +83,18 @@ func PartitionByLane(files map[string]string, memoryDir string, secretGlobs []st
 // globs. A per-glob match error, or a nil matcher while globs are
 // configured, is treated as a match - see PartitionByLane's own doc
 // comment for why over-blocking (not over-trusting) is the safe direction.
+// Glob and path are folded first (memlane.FoldForSecretGlob - the same
+// rule memlane.PathIsSecret applies): the walk reports the name a
+// case-/normalisation-insensitive volume STORES ("Gizli/notes/x.md" for a
+// note written as gizli/notes/x.md into an existing Gizli/), which a
+// byte-exact match would put in the cloud lane.
 func matchesAnySecretGlob(absPath string, globs []string, matcher GlobMatcher) bool {
+	folded := memlane.FoldForSecretGlob(absPath)
 	for _, g := range globs {
 		if matcher == nil {
 			return true
 		}
-		ok, err := matcher.Match(g, absPath)
+		ok, err := matcher.Match(memlane.FoldForSecretGlob(g), folded)
 		if err != nil || ok {
 			return true
 		}
