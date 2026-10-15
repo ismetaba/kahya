@@ -18,7 +18,9 @@ import (
 	"testing"
 
 	"kahya/kahyad/internal/config"
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/ritual"
 	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/taint"
@@ -645,5 +647,67 @@ func TestMemorySearchHafizaInjectedPinnedToAttributedWorker(t *testing.T) {
 	overrides := led.eventsOfKind("worker_identity_override")
 	if len(overrides) != 1 || overrides[0].traceID != "trace-live" || overrides[0].payload["claimed_task_id"] != "task-forged" || overrides[0].payload["source"] != "body" {
 		t.Fatalf("worker_identity_override events = %+v, want one body override claiming task-forged under trace-live", overrides)
+	}
+}
+
+// TestWorkerRawMemorySearchRefused (FIX-FINAL worker-raw-memory-search-
+// for-injection-false): /v1/memory/search is a worker route, but its
+// for_injection flag came from the body, so a live worker posting
+// for_injection:false got the unfiltered local results - secret-glob
+// notes, content-secret chunks and quarantined episodes - with no mark,
+// escalation or ledger row. An attributed live worker asking for the raw
+// surface is now refused (403, ledgered control_auth_rejected) while its
+// for_injection:true request still gets only the cloud-eligible hit.
+func TestWorkerRawMemorySearchRefused(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 1, EpisodeID: 1, Path: "finans-2026.md", Seq: 0, Text: "Maas hesabi bakiyesi", Score: 0.9, SourceTier: "user_asserted"},
+		{ChunkID: 2, EpisodeID: 2, Path: "gizli/notes/saglik.md", Seq: 0, Text: "Tahlil sonucu: HbA1c 7.9", Score: 0.8, SourceTier: "agent_derived"},
+		{ChunkID: 3, EpisodeID: 3, Path: "notlar/kira.md", Seq: 0, Text: contentSecretIBANText, Score: 0.7, SourceTier: "user_asserted"},
+		{ChunkID: 4, EpisodeID: 4, Path: "properties/kadikoy.md", Seq: 2, Text: "Kadıköy'de iki daire gezdik", Score: 0.6, SourceTier: "user_asserted"},
+	}}
+	led := &fakeEventLogger{}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	srv.SetEventLogger(led)
+	srv.SetMemoryLane(&memlane.Classifier{MemoryDir: "/m", SecretGlobs: []string{"/m/gizli/**", "/m/finans*.md"}, Matcher: ritual.PolicyGlobMatcher{}})
+	reg := task.NewLiveRegistry()
+	srv.SetTaskLiveRegistry(reg)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	go srv.Serve() //nolint:errcheck
+	defer srv.Shutdown()
+	reg.RegisterWorker("t-live", "trace-live", os.Getpid(), testProcessSID(t))
+
+	for _, body := range []string{
+		`{"query":"hesap","for_injection":false}`,
+		`{"query":"hesap"}`,
+	} {
+		resp := postMemorySearch(t, unixHTTPClientNoSecret(socketPath), body)
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s: status = %d, want 403 (body %s)", body, resp.StatusCode, raw)
+		}
+		if strings.Contains(string(raw), "Maas") || strings.Contains(string(raw), "HbA1c") || strings.Contains(string(raw), "TR33") {
+			t.Fatalf("%s: refusal body carries memory content: %s", body, raw)
+		}
+	}
+	rejected := led.eventsOfKind("control_auth_rejected")
+	if len(rejected) != 2 || rejected[0].payload["reason"] != "worker_raw_memory_search" || rejected[0].payload["task_id"] != "t-live" {
+		t.Fatalf("control_auth_rejected = %+v, want two worker_raw_memory_search rows for t-live", rejected)
+	}
+
+	resp := postMemorySearch(t, unixHTTPClientNoSecret(socketPath), `{"query":"hesap","for_injection":true}`)
+	var out struct {
+		Results []struct {
+			ChunkID int64 `json:"chunk_id"`
+		} `json:"results"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(out.Results) != 1 || out.Results[0].ChunkID != 4 {
+		t.Fatalf("for_injection:true = %d %+v, want 200 with only the clean chunk 4", resp.StatusCode, out.Results)
 	}
 }

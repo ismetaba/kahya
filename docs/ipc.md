@@ -611,6 +611,11 @@ a cloud model, without changing anything in §2-§6 above:
   FIX-FINAL cloud-chunk-filter-neighbour-drop-needs-coretrieval), JSONL
   `memory_search_secret_content_dropped`; `for_injection:false` (the local
   surface) and a secret-lane task's local block are unfiltered by lane.
+  The raw surface is served only to an unattributed caller holding the
+  control secret (the CLI, drills): an attributed live worker asking for
+  it is refused 403 `MsgControlSecretRejected`, ledger
+  `control_auth_rejected{reason: worker_raw_memory_search}` (FIX-FINAL
+  worker-raw-memory-search-for-injection-false).
   Nightly consolidation's `consolidation.PartitionByLane` keeps a
   `gizli/**` note - and any file whose content classifies secret - in the
   local lane,

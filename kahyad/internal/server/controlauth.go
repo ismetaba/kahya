@@ -141,6 +141,11 @@ const (
 	// controlRejectNoTrace: an attributable live worker registered without
 	// a trace_id cannot be pinned completely - fail closed (B-14).
 	controlRejectNoTrace = "attributed_worker_without_trace"
+	// controlRejectWorkerRawSearch: an attributed live worker asked
+	// /v1/memory/search for the raw for_injection:false surface, which is
+	// the local CLI's only (FIX-FINAL worker-raw-memory-search-for-
+	// injection-false).
+	controlRejectWorkerRawSearch = "worker_raw_memory_search"
 )
 
 // workerLookup is the narrow reverse lookup caller attribution needs (G03

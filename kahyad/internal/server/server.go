@@ -1000,6 +1000,18 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "query must not be empty")
 		return
 	}
+	// FIX-FINAL worker-raw-memory-search-for-injection-false: the raw
+	// (for_injection:false) surface is served only to an unattributed caller
+	// holding the control secret (the kahya CLI, drills). An attributed live
+	// worker - a cloud session by construction - asking for it would get
+	// secret_lane_globs notes, content-secret chunks and quarantined
+	// episodes with no mark, escalation or ledger row, so it is refused
+	// (403, ledgered control_auth_rejected{reason: worker_raw_memory_search})
+	// rather than silently upgraded: the sanctioned hook never sends false.
+	if att, ok := callerAttributionFromContext(r.Context()); ok && att.TaskID != "" && !req.ForInjection {
+		s.rejectControl(w, r, controlRejectWorkerRawSearch)
+		return
+	}
 
 	// G03 / B-14: pinned to the attributed live worker's own ids when the
 	// caller is one (controlauth.go pinBodyIdentity), so hafiza_injected is
@@ -1033,7 +1045,9 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	// This filters BOTH the returned results AND what the renderer/ledger
 	// ever sees - "absent with for_injection:true" means absent from the
 	// response entirely, not merely excluded from hafiza_block.
-	// for_injection:false is the raw local surface and is not filtered.
+	// for_injection:false is the raw local surface, served only to an
+	// unattributed caller holding the control secret (the CLI and drills;
+	// an attributed live worker was refused above), and is not filtered.
 	filtered := hits
 	var hb hafizaBlock
 	if req.ForInjection {
