@@ -37,9 +37,14 @@
 //  5. HALT KILLS IN-FLIGHT SPEECH. Each utterance's `say` child is started
 //     as its own process GROUP leader (Setpgid: true, pid==pgid - mirrors
 //     kahyad/internal/halt's own killProcessGroup convention) and
-//     registered as "currently speaking for task X" for exactly the
-//     duration of that one utterance; KillTaskSpeech (this file)
-//     implements kahyad/internal/halt.SpeechKiller, so ⌥⎋ reaches it.
+//     registered as "currently speaking (for task X, or for no task)" for
+//     exactly the duration of that one utterance. The registration happens
+//     in the SAME activeMu critical section as cmd.Start (FIX-P-20), so a
+//     halt can never observe a started-but-unregistered child, and a
+//     task-less utterance (ui.HSCli's generic notification path) is
+//     registered too, so KillAllSpeech reaches it; KillTaskSpeech/
+//     KillAllSpeech (this file) implement kahyad/internal/halt.SpeechKiller,
+//     so ⌥⎋ reaches both.
 //
 // Text is passed on the child's STDIN, never argv - argv would hit
 // Turkish quoting/length issues (task spec) - and is truncated to
@@ -79,11 +84,35 @@ const (
 	DefaultMaxChars = 280
 )
 
-// voiceCheckTimeout bounds the one-time `say -v '?'` voice-availability probe
+// voiceCheckTimeout bounds each `say -v '?'` voice-availability probe
 // (W6-05 review: degrade-never-block - see voiceAvailable). A var, not a
 // const, so TestVoiceCheckDoesNotHangOnWedgedSay can lower it to keep that
 // regression fast; production never reassigns it.
 var voiceCheckTimeout = 5 * time.Second
+
+// voiceProbeRetryInterval bounds how often an INCONCLUSIVE probe (timeout /
+// exec error - the voice list could not be obtained at all) is retried
+// (FIX-P-20). A CONCLUSIVE probe (the list was obtained, the voice is in it
+// or not) is cached for the daemon's lifetime per the W6-05 spec ("cached
+// per daemon lifetime"); owner decision G09-6: a definite "no voice" result
+// is NOT retried periodically. A var so tests can shorten it; production
+// never reassigns it.
+var voiceProbeRetryInterval = 60 * time.Second
+
+// voiceState is the voice-availability state machine that replaced the
+// pre-FIX-P-20 run-once cache (which kept a transient probe failure as a
+// permanent "voice missing"). Only voiceInstalled/voiceMissing are terminal.
+type voiceState int
+
+const (
+	// voiceUnknown: no conclusive probe yet (never probed, or every probe so
+	// far was inconclusive).
+	voiceUnknown voiceState = iota
+	// voiceInstalled: a conclusive probe listed the configured voice.
+	voiceInstalled
+	// voiceMissing: a conclusive probe did NOT list the configured voice.
+	voiceMissing
+)
 
 // Event kinds this file ledgers/JSONL-logs - grepped by `kahya log
 // --trace <id>` and this package's own tests.
@@ -97,10 +126,29 @@ const (
 	EventSkippedSecretLane = "tts.skipped_secret_lane"
 	// EventVoiceMissing is ledgered (via Notifier.Notify - one JSONL line
 	// + one ledger row, see notify.go's own JSONLNotifier.record) exactly
-	// ONCE per daemon lifetime (voiceCheckOnce below), the first time a
-	// Speak call ever discovers the configured voice is not installed.
+	// ONCE per daemon lifetime, the first time a CONCLUSIVE probe (the
+	// voice list was obtained) shows the configured voice is not installed.
+	// An inconclusive probe (timeout / exec error) never produces it - that
+	// is EventVoiceProbeFailed (FIX-P-20).
 	EventVoiceMissing = "tts.voice_missing"
+	// EventVoiceProbeFailed is JSONL-logged (Warn) for every INCONCLUSIVE
+	// `say -v '?'` probe (timeout or exec error; retried at most once per
+	// voiceProbeRetryInterval) and notified (MsgVoiceProbeFailed: one JSONL
+	// line + one ledger row via Notifier.Notify) at most ONCE per daemon
+	// lifetime (FIX-P-20).
+	EventVoiceProbeFailed = "tts.voice_probe_failed"
+	// EventVoiceReady is JSONL-logged (Info) once, when a conclusive probe
+	// finds the configured voice (FIX-P-20).
+	EventVoiceReady = "tts.voice_ready"
 )
+
+// MsgVoiceProbeFailed is the BYTE-EXACT Turkish notification (CLAUDE.md
+// language policy; FIX-P-20, handbook text) shown at most once per daemon
+// lifetime when the voice list could not be obtained at all (a wedged or
+// slow Speech Synthesis Manager, an exec failure) - deliberately NOT
+// MsgVoiceMissing, which would wrongly tell the user to install a voice that
+// may well be installed.
+const MsgVoiceProbeFailed = "Ses listesi alınamadı (say -v ?); konuşma geçici olarak kapalı, yeniden denenecek."
 
 // MsgVoiceMissing is the BYTE-EXACT Turkish notification text (CLAUDE.md
 // language policy; tasks/w6-voice/W6-05-tts-yelda.md, verbatim) shown
@@ -143,11 +191,12 @@ type SpeakRequest struct {
 	// every log line carries trace_id).
 	TraceID string
 	// TaskID, when non-empty, is what KillTaskSpeech (⌥⎋'s own halt path)
-	// matches against - see core invariant #5. Empty is a documented,
-	// halt-unreachable degrade (a background/scheduled delivery with no
-	// task_id of its own - kahyad/internal/ui.HSCli's own generic
-	// notification path never carries one): the utterance still speaks
-	// (or degrades) normally, it is simply never halt-killable by taskID.
+	// matches against - see core invariant #5. Empty is a background/
+	// scheduled delivery with no task_id of its own (kahyad/internal/
+	// ui.HSCli's own generic notification path never carries one): the
+	// utterance still speaks (or degrades) normally and is never matched by
+	// KillTaskSpeech, but since FIX-P-20 it IS registered, so KillAllSpeech
+	// (halt-all, ⌥⎋) still silences it.
 	TaskID string
 	// Lane is the W3-08 secret-lane label (LaneSecret/LaneNormal/empty -
 	// empty is treated identically to LaneNormal, mirroring
@@ -195,14 +244,31 @@ type Speaker struct {
 	activeTaskID string
 	activePID    int
 
-	// voiceCheckOnce/voiceInstalled cache the FIRST `say -v '?'` check's
-	// outcome for the rest of this Speaker's (i.e. this daemon's) own
-	// lifetime (task spec: "cached per daemon lifetime") - see
-	// voiceAvailable's own doc comment for why the "exactly one
-	// notification" guarantee falls directly out of sync.Once, needing no
-	// separate bookkeeping of its own.
-	voiceCheckOnce sync.Once
-	voiceInstalled bool
+	// voiceMu guards the voice-availability state machine (FIX-P-20) and is
+	// held for the duration of one probe, so concurrent Speak calls wait on
+	// ONE probe instead of each starting their own. A separate lock from
+	// serializeMu and activeMu: KillTaskSpeech/KillAllSpeech never touch it.
+	voiceMu sync.Mutex
+	// voiceStatus is terminal once a probe was CONCLUSIVE (task spec:
+	// "cached per daemon lifetime"); voiceUnknown otherwise.
+	voiceStatus voiceState
+	// voiceNextProbe is the earliest time an INCONCLUSIVE probe may be
+	// re-run (now + voiceProbeRetryInterval after each failure), so a hanging
+	// `say -v '?'` is not re-run on every Speak.
+	voiceNextProbe time.Time
+	// voiceMissingNotified/voiceProbeFailNotified each make their
+	// notification fire at most once per daemon lifetime.
+	voiceMissingNotified   bool
+	voiceProbeFailNotified bool
+
+	// now is the clock voiceAvailable reads (time.Now; tests inject). nil is
+	// treated as time.Now.
+	now func() time.Time
+
+	// startHook, when non-nil, runs inside Speak's activeMu critical
+	// section right after cmd.Start and the active-utterance registration.
+	// Tests only (the halt-window regression); nil in production.
+	startHook func()
 }
 
 // NewSpeaker constructs a Speaker from cfg, filling in DefaultVoice/
@@ -233,6 +299,7 @@ func NewSpeaker(cfg SpeakerConfig, log *logx.Logger, ledger EventLedger, notifie
 		log:             log,
 		ledger:          ledger,
 		notifier:        notifier,
+		now:             time.Now,
 	}
 }
 
@@ -278,16 +345,29 @@ func (s *Speaker) Speak(ctx context.Context, req SpeakRequest) {
 	cmd.Stdin = strings.NewReader(text)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	if err := cmd.Start(); err != nil {
-		s.logDegraded(req.TraceID, "tts.exec_start_failed", err)
+	// FIX-P-20: Start and the active-utterance registration happen in ONE
+	// activeMu critical section, so a concurrent KillTaskSpeech/
+	// KillAllSpeech either runs before the child exists (nothing to kill
+	// yet) or sees its pid - never a started-but-unregistered child. Every
+	// utterance is registered, task-less ones included (TaskID ""), so
+	// KillAllSpeech (halt-all) reaches ui.HSCli's generic notification
+	// speech too; KillTaskSpeech never matches an empty task id.
+	s.activeMu.Lock()
+	startErr := cmd.Start()
+	if startErr == nil {
+		s.activeTaskID, s.activePID = req.TaskID, cmd.Process.Pid
+	}
+	if s.startHook != nil {
+		s.startHook()
+	}
+	s.activeMu.Unlock()
+	if startErr != nil {
+		s.logDegraded(req.TraceID, "tts.exec_start_failed", startErr)
 		return
 	}
 
 	pid := cmd.Process.Pid
-	if req.TaskID != "" {
-		s.setActive(req.TaskID, pid)
-		defer s.clearActive(req.TaskID)
-	}
+	defer s.clearActivePID(pid)
 
 	if err := cmd.Wait(); err != nil {
 		// Covers BOTH a genuine `say` failure (degrade-never-block, core
@@ -304,35 +384,79 @@ func (s *Speaker) Speak(ctx context.Context, req SpeakRequest) {
 	})
 }
 
-// voiceAvailable implements the task spec's voice-missing handling: on
-// the FIRST call (across this Speaker's whole lifetime - sync.Once),
-// actually run `say -v '?'` and check for the configured voice; every
-// later call reuses that cached outcome. A missing voice - or the check
-// itself failing to run at all (treated identically, degrade-never-block)
-// - fires EventVoiceMissing's single Turkish notification/ledger event
-// EXACTLY once, from directly inside the Once callback, needing no
-// separate "have we already notified" bookkeeping.
+// voiceAvailable implements the task spec's voice-missing handling as a
+// small state machine (FIX-P-20; it replaced a run-once cache that kept a
+// transient probe failure as a permanent "voice missing"):
+//
+//   - A CONCLUSIVE probe (`say -v '?'` returned a list) is final for this
+//     Speaker's (i.e. this daemon's) lifetime - task spec: "cached per
+//     daemon lifetime". Voice listed => voiceInstalled (EventVoiceReady,
+//     JSONL). Voice not listed => voiceMissing, and MsgVoiceMissing is
+//     notified exactly once. Owner decision G09-6: a definite "no voice" is
+//     not retried periodically.
+//   - An INCONCLUSIVE probe (timeout after voiceCheckTimeout, exec error)
+//     leaves the state voiceUnknown: this Speak stays silent (degrade, never
+//     block), EventVoiceProbeFailed is JSONL-logged, MsgVoiceProbeFailed is
+//     notified at most once per daemon lifetime, and the probe is retried by
+//     the first Speak after voiceProbeRetryInterval - never on every Speak,
+//     so a wedged Speech Synthesis Manager costs at most one bounded probe
+//     per interval.
+//
+// voiceMu is held for the probe itself: concurrent Speak calls wait for ONE
+// bounded probe rather than starting their own.
 func (s *Speaker) voiceAvailable(ctx context.Context, traceID string) bool {
-	s.voiceCheckOnce.Do(func() {
-		// Bound the voice-availability probe (DEGRADE-NEVER-BLOCK, W6-05
-		// review): a wedged Speech Synthesis Manager could make `say -v '?'`
-		// hang forever, and Speak runs synchronously on the task's own
-		// goroutine - so an unbounded probe would wedge the task, not degrade
-		// it. On timeout the voice is treated as unavailable (silent + the
-		// one-time notification), exactly the missing-voice degrade.
-		cctx, cancel := context.WithTimeout(context.Background(), voiceCheckTimeout)
-		defer cancel()
-		out, err := exec.CommandContext(cctx, s.sayBin, "-v", "?").Output()
-		s.voiceInstalled = err == nil && strings.Contains(strings.ToLower(string(out)), strings.ToLower(s.voice))
-		if !s.voiceInstalled {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	switch s.voiceStatus {
+	case voiceInstalled:
+		return true
+	case voiceMissing:
+		return false
+	}
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	if now.Before(s.voiceNextProbe) {
+		// Inconclusive recently: do not re-run a possibly hanging probe on
+		// every Speak.
+		return false
+	}
+	// Bound the voice-availability probe (DEGRADE-NEVER-BLOCK, W6-05
+	// review): a wedged Speech Synthesis Manager could make `say -v '?'`
+	// hang forever, and Speak runs synchronously on the task's own
+	// goroutine - so an unbounded probe would wedge the task, not degrade it.
+	cctx, cancel := context.WithTimeout(context.Background(), voiceCheckTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, s.sayBin, "-v", "?").Output()
+	if err != nil {
+		s.voiceNextProbe = now.Add(voiceProbeRetryInterval)
+		s.logDegraded(traceID, EventVoiceProbeFailed, err)
+		if !s.voiceProbeFailNotified {
+			s.voiceProbeFailNotified = true
 			if s.notifier != nil {
-				_ = s.notifier.Notify(ctx, traceID, EventVoiceMissing, MsgVoiceMissing, map[string]any{"voice": s.voice})
-			} else if s.log != nil {
-				s.log.With(traceID).Warn(EventVoiceMissing, "message", MsgVoiceMissing, "voice", s.voice)
+				_ = s.notifier.Notify(ctx, traceID, EventVoiceProbeFailed, MsgVoiceProbeFailed, map[string]any{"voice": s.voice, "err": err.Error()})
 			}
 		}
-	})
-	return s.voiceInstalled
+		return false
+	}
+	if strings.Contains(strings.ToLower(string(out)), strings.ToLower(s.voice)) {
+		s.voiceStatus = voiceInstalled
+		if s.log != nil {
+			s.log.With(traceID).Info(EventVoiceReady, "voice", s.voice)
+		}
+		return true
+	}
+	s.voiceStatus = voiceMissing
+	if !s.voiceMissingNotified {
+		s.voiceMissingNotified = true
+		if s.notifier != nil {
+			_ = s.notifier.Notify(ctx, traceID, EventVoiceMissing, MsgVoiceMissing, map[string]any{"voice": s.voice})
+		} else if s.log != nil {
+			s.log.With(traceID).Warn(EventVoiceMissing, "message", MsgVoiceMissing, "voice", s.voice)
+		}
+	}
+	return false
 }
 
 // KillTaskSpeech implements kahyad/internal/halt.SpeechKiller (core
@@ -347,8 +471,11 @@ func (s *Speaker) voiceAvailable(ctx context.Context, traceID string) bool {
 // task" cases). A dead pid makes syscall.Kill fail ESRCH, logged and
 // ignored - mirrors kahyad/internal/halt.Executor.killProcessGroup's own
 // documented treatment of exactly this case, never surfaced as an error.
+// An empty taskID is always a no-op (FIX-P-20): task-less utterances are
+// registered with an empty task id, and "" must never match them - only
+// KillAllSpeech (halt-all) may stop a task-less utterance.
 func (s *Speaker) KillTaskSpeech(_ context.Context, taskID string) error {
-	if s == nil {
+	if s == nil || taskID == "" {
 		return nil
 	}
 	s.activeMu.Lock()
@@ -366,7 +493,8 @@ func (s *Speaker) KillTaskSpeech(_ context.Context, taskID string) error {
 // BEFORE it speaks its result, so the task speaking when the user hits ⌥⎋ is
 // often terminal and NOT in that list at all. "Stop everything now" must
 // silence it anyway. The Speaker serializes utterances, so there is at most
-// one to kill.
+// one to kill. Since FIX-P-20 every utterance is registered (task-less ones
+// included), so this also silences ui.HSCli's generic notification speech.
 func (s *Speaker) KillAllSpeech(_ context.Context) error {
 	if s == nil {
 		return nil
@@ -390,19 +518,14 @@ func killSpeechPID(pid int) error {
 	return nil
 }
 
-func (s *Speaker) setActive(taskID string, pid int) {
+// clearActivePID unsets the active-utterance bookkeeping, but ONLY if it
+// still refers to pid - guards against a (should-never-happen, given core
+// invariant #4's own serialization) reordering where a later Speak call's
+// registration already ran before this defer fires. Keyed by pid, not task
+// id, since task-less utterances share the empty task id (FIX-P-20).
+func (s *Speaker) clearActivePID(pid int) {
 	s.activeMu.Lock()
-	s.activeTaskID, s.activePID = taskID, pid
-	s.activeMu.Unlock()
-}
-
-// clearActive unsets the active-utterance bookkeeping, but ONLY if it
-// still refers to taskID - guards against a (should-never-happen, given
-// core invariant #4's own serialization) reordering where a later Speak
-// call's setActive already ran before this defer fires.
-func (s *Speaker) clearActive(taskID string) {
-	s.activeMu.Lock()
-	if s.activeTaskID == taskID {
+	if s.activePID == pid {
 		s.activeTaskID, s.activePID = "", 0
 	}
 	s.activeMu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -372,9 +373,9 @@ func TestSpeakDegradesOnFailedExecNeverPanics(t *testing.T) {
 // regression: a wedged Speech Synthesis Manager could make `say -v '?'` hang
 // forever, and voiceAvailable runs on the task's OWN synchronous goroutine -
 // so an unbounded probe would wedge the whole task, not degrade it. The
-// probe is now context-bounded by voiceCheckTimeout: on timeout the voice is
-// treated as missing (the exact missing-voice degrade), and Speak returns
-// promptly instead of blocking for the fixture's full hang.
+// probe is context-bounded by voiceCheckTimeout, and Speak returns promptly
+// instead of blocking for the fixture's full hang. Since FIX-P-20 a timed-out
+// probe is INCONCLUSIVE (EventVoiceProbeFailed), not "voice missing".
 func TestVoiceCheckDoesNotHangOnWedgedSay(t *testing.T) {
 	orig := voiceCheckTimeout
 	voiceCheckTimeout = 200 * time.Millisecond
@@ -400,10 +401,11 @@ func TestVoiceCheckDoesNotHangOnWedgedSay(t *testing.T) {
 		t.Fatal("Speak() hung on a wedged `say -v ?` - voiceCheckTimeout did not bound the probe")
 	}
 
-	// A timed-out probe is the missing-voice degrade: exactly one
-	// voice-missing notification, and nothing was ever actually spoken.
-	if notifier.count() != 1 || notifier.notifyCalls[0].kind != EventVoiceMissing {
-		t.Errorf("want exactly 1 %q notification on probe timeout, got %d calls", EventVoiceMissing, notifier.count())
+	// A timed-out probe is inconclusive (FIX-P-20): exactly one probe-failed
+	// notification, never the misleading "install the voice" one, and
+	// nothing was ever actually spoken.
+	if notifier.count() != 1 || notifier.notifyCalls[0].kind != EventVoiceProbeFailed {
+		t.Errorf("want exactly 1 %q notification on probe timeout, got %d calls (%+v)", EventVoiceProbeFailed, notifier.count(), notifier.notifyCalls)
 	}
 }
 
@@ -467,5 +469,210 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 func TestMsgVoiceMissingCarriesNoInternalTaskID(t *testing.T) {
 	if m := regexp.MustCompile(`\bW[0-9]+-[0-9]+\b`).FindString(MsgVoiceMissing); m != "" {
 		t.Fatalf("MsgVoiceMissing = %q, must not reference internal task id %q", MsgVoiceMissing, m)
+	}
+}
+
+// shortVoiceProbe lowers voiceCheckTimeout (else every hanging probe costs
+// the production 5s) and sets voiceProbeRetryInterval, restoring both.
+func shortVoiceProbe(t *testing.T, retry time.Duration) {
+	t.Helper()
+	origTimeout, origRetry := voiceCheckTimeout, voiceProbeRetryInterval
+	voiceCheckTimeout = 200 * time.Millisecond
+	voiceProbeRetryInterval = retry
+	t.Cleanup(func() { voiceCheckTimeout, voiceProbeRetryInterval = origTimeout, origRetry })
+}
+
+// countVoiceProbes counts the `say -v ?` probe invocations fake_say.py logged.
+func countVoiceProbes(t *testing.T, argvLog string) int {
+	t.Helper()
+	n := 0
+	for _, l := range strings.Split(readFileString(t, argvLog), "\n") {
+		if l == "ARGV -v ?" {
+			n++
+		}
+	}
+	return n
+}
+
+// readyPID reads the pid fake_say.py wrote to its ready file and registers a
+// group kill as cleanup, so a failing test never leaves a 60s sleeper behind.
+func readyPID(t *testing.T, readyFile string) int {
+	t.Helper()
+	waitForFile(t, readyFile, 5*time.Second)
+	pid, err := strconv.Atoi(strings.TrimSpace(readFileString(t, readyFile)))
+	if err != nil {
+		t.Fatalf("parse ready pid: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+	return pid
+}
+
+// TestVoiceProbeTimeoutIsRetriedAndRecovers is the FIX-P-20 regression: a
+// probe that times out (a slow Speech Synthesis Manager warm-up) is
+// INCONCLUSIVE, not "voice missing" - it is notified once with
+// MsgVoiceProbeFailed and retried, so the first Speak after the system
+// recovers actually speaks. Before the fix a run-once cache kept the timeout
+// as a permanent "no voice" for the daemon's lifetime.
+func TestVoiceProbeTimeoutIsRetriedAndRecovers(t *testing.T) {
+	shortVoiceProbe(t, 0)
+	dir := t.TempDir()
+	env := setFakeSayEnv(t, dir, yeldaVoiceList)
+	t.Setenv("FAKE_SAY_VOICES_HANG_MS", "30000")
+	ledger := &recordingLedger{}
+	notifier := &recordingNotifier{}
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin, Voice: "Yelda"}, testLog(t), ledger, notifier)
+
+	s.Speak(context.Background(), SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+	if got := readFileString(t, env.stdinLog); got != "" {
+		t.Fatalf("stdin.log = %q after a timed-out probe, want silence", got)
+	}
+	if notifier.count() != 1 || notifier.notifyCalls[0].kind != EventVoiceProbeFailed {
+		t.Fatalf("notifications = %+v, want exactly one %q", notifier.notifyCalls, EventVoiceProbeFailed)
+	}
+	if got := notifier.notifyCalls[0].payload["message"]; got != MsgVoiceProbeFailed {
+		t.Fatalf("notification message = %q, want byte-exact %q", got, MsgVoiceProbeFailed)
+	}
+
+	t.Setenv("FAKE_SAY_VOICES_HANG_MS", "")
+	s.Speak(context.Background(), SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+	if got := readFileString(t, env.stdinLog); !strings.Contains(got, "merhaba") {
+		t.Fatalf("stdin.log = %q, want the second Speak to speak once the probe recovered", got)
+	}
+	if n := ledger.countKind(EventSpoken); n != 1 {
+		t.Fatalf("EventSpoken ledgered %d times, want 1", n)
+	}
+	if notifier.count() != 1 {
+		t.Fatalf("notifications = %d, want still 1 (no voice-missing after recovery)", notifier.count())
+	}
+}
+
+// TestVoiceProbeFailureRateLimitedAndNotifiedOnce: an inconclusive probe is
+// re-run at most once per voiceProbeRetryInterval (a hanging `say -v ?` is
+// not re-run on every Speak), and MsgVoiceProbeFailed is notified at most
+// once per daemon lifetime.
+func TestVoiceProbeFailureRateLimitedAndNotifiedOnce(t *testing.T) {
+	shortVoiceProbe(t, time.Hour)
+	dir := t.TempDir()
+	env := setFakeSayEnv(t, dir, yeldaVoiceList)
+	t.Setenv("FAKE_SAY_VOICES_HANG_MS", "30000")
+	notifier := &recordingNotifier{}
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin, Voice: "Yelda"}, testLog(t), &recordingLedger{}, notifier)
+	clock := time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+
+	for i := 0; i < 3; i++ {
+		s.Speak(context.Background(), SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+	}
+	if n := countVoiceProbes(t, env.argvLog); n != 1 {
+		t.Fatalf("voice probes after 3 Speak calls = %d, want 1 (retry interval not elapsed)", n)
+	}
+	if notifier.count() != 1 {
+		t.Fatalf("notifications = %d, want 1", notifier.count())
+	}
+
+	clock = clock.Add(2 * time.Hour)
+	s.Speak(context.Background(), SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+	if n := countVoiceProbes(t, env.argvLog); n != 2 {
+		t.Fatalf("voice probes after the retry interval = %d, want 2", n)
+	}
+	if notifier.count() != 1 {
+		t.Fatalf("notifications = %d, want still 1 (probe-failed notified once per daemon)", notifier.count())
+	}
+}
+
+// TestKillAllSpeechKillsTaskLessUtterance (FIX-P-20): a task-less utterance
+// (ui.HSCli's generic notification path) is registered too, so halt-all
+// (KillAllSpeech) silences it. Before the fix only task-id'd utterances were
+// registered and this Speak ran its full 60s.
+func TestKillAllSpeechKillsTaskLessUtterance(t *testing.T) {
+	dir := t.TempDir()
+	env := setFakeSayEnv(t, dir, yeldaVoiceList)
+	t.Setenv("FAKE_SAY_SLEEP_MS", "60000")
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin}, testLog(t), &recordingLedger{}, nil)
+
+	done := make(chan struct{})
+	go func() {
+		s.Speak(context.Background(), SpeakRequest{TraceID: "t1", Text: "merhaba"})
+		close(done)
+	}()
+	readyPID(t, env.readyFile)
+
+	if err := s.KillAllSpeech(context.Background()); err != nil {
+		t.Fatalf("KillAllSpeech() error = %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Speak() never returned after KillAllSpeech - a task-less utterance was not registered")
+	}
+}
+
+// TestKillTaskSpeechCannotMissTheStartWindow (FIX-P-20): cmd.Start and the
+// active-utterance registration share one activeMu critical section. The
+// test hook fires a KillTaskSpeech INSIDE that section (while the lock is
+// held); the kill waits for the lock and then finds the registered pid. A
+// kill arriving between Start and a later registration (the pre-fix shape)
+// would have seen pid 0 and been a no-op, leaving the utterance speaking.
+func TestKillTaskSpeechCannotMissTheStartWindow(t *testing.T) {
+	dir := t.TempDir()
+	env := setFakeSayEnv(t, dir, yeldaVoiceList)
+	t.Setenv("FAKE_SAY_SLEEP_MS", "60000")
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin}, testLog(t), &recordingLedger{}, nil)
+	ctx := context.Background()
+	killErr := make(chan error, 1)
+	s.startHook = func() {
+		go func() { killErr <- s.KillTaskSpeech(ctx, "task1") }()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.Speak(ctx, SpeakRequest{TraceID: "t1", TaskID: "task1", Text: "merhaba"})
+		close(done)
+	}()
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(env.readyFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}
+	})
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Speak() never returned - the kill fired inside the Start window missed the child")
+	}
+	if err := <-killErr; err != nil {
+		t.Fatalf("KillTaskSpeech() error = %v", err)
+	}
+}
+
+// TestKillTaskSpeechEmptyTaskIDNeverKills (FIX-P-20): task-less utterances
+// are registered with an empty task id, so KillTaskSpeech must treat "" as a
+// no-op - it may never match them (only KillAllSpeech may).
+func TestKillTaskSpeechEmptyTaskIDNeverKills(t *testing.T) {
+	dir := t.TempDir()
+	env := setFakeSayEnv(t, dir, yeldaVoiceList)
+	t.Setenv("FAKE_SAY_SLEEP_MS", "300")
+	ledger := &recordingLedger{}
+	s := NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin}, testLog(t), ledger, nil)
+
+	done := make(chan struct{})
+	go func() {
+		s.Speak(context.Background(), SpeakRequest{TraceID: "t1", Text: "merhaba"})
+		close(done)
+	}()
+	waitForFile(t, env.readyFile, 5*time.Second)
+	if err := s.KillTaskSpeech(context.Background(), ""); err != nil {
+		t.Fatalf("KillTaskSpeech(\"\") error = %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Speak() did not return")
+	}
+	if n := ledger.countKind(EventSpoken); n != 1 {
+		t.Fatalf("EventSpoken = %d, want 1 (the utterance completed, it was not killed)", n)
 	}
 }

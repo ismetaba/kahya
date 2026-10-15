@@ -31,8 +31,8 @@ Kâhya can speak. Behind a config toggle (default **off**), locally delivered an
 1. Read the Handoff refs above; check `docs/models.md`/W0-03's flag for the Yelda voice state on this machine.
 2. Implement `Speaker` with an injectable `say` path; utterances execute strictly serially from a queue; text via stdin; truncate to `tts.max_chars` on a rune boundary (Turkish text — never byte-slice mid-rune).
 3. Wire the Speaker into W6-01's local delivery helper behind `tts.enabled || task.speak_override`; skip with a `tts.skipped_secret_lane` ledger event when the result is secret-lane-labeled and `tts.speak_secret_lane` is false.
-4. Implement the voice check + degrade path (single notification + `tts.voice_missing`, then silent).
-5. Register each utterance's child pid with the W6-03 halt hook so `⌥⎋` kills in-flight speech for the halted task.
+4. Implement the voice check + degrade path (single notification + `tts.voice_missing`, then silent). **Post-review note (FIX-P-20, decision G09-6):** only a CONCLUSIVE probe (the voice list was obtained) is cached for the daemon's lifetime; a definite "no voice" is not retried. An inconclusive probe (timeout / exec error) logs `tts.voice_probe_failed`, notifies once `Ses listesi alınamadı (say -v ?); konuşma geçici olarak kapalı, yeniden denenecek.` and is retried after 60 s.
+5. Register each utterance's child pid with the W6-03 halt hook so `⌥⎋` kills in-flight speech for the halted task. **Post-review note (FIX-P-20):** the pid is registered in the same critical section as `cmd.Start`, and task-less utterances are registered too, so halt-all (`KillAllSpeech`) silences them; `KillTaskSpeech("")` is a no-op.
 6. Add `kahya ask --speak` and plumb the override through the envelope/task row.
 7. Write the tests below; run `make test && make lint`.
 
