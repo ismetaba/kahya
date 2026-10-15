@@ -271,8 +271,14 @@ func TestMemoryV2QueriesBindEveryParameter(t *testing.T) {
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("ListUnextractedEpisodes = %+v, %v; want both episodes pending", pending, err)
 	}
-	if err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: ep.ID}); err != nil {
-		t.Fatal(err)
+	// FIX-MEM-3 review: the stamp is a compare-and-set on the content hash
+	// the extractor read ("" stands for a NULL source_hash) - a stale hash
+	// stamps nothing.
+	if n, err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: ep.ID, SourceHash: "sha256:stale"}); err != nil || n != 0 {
+		t.Fatalf("MarkEpisodeExtracted with a stale hash = %d, %v; want 0 rows", n, err)
+	}
+	if n, err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: ep.ID}); err != nil || n != 1 {
+		t.Fatalf("MarkEpisodeExtracted with the (NULL) hash read = %d, %v; want 1 row", n, err)
 	}
 	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v1"), RowLimit: 10}); err != nil || len(pending) != 1 || pending[0].ID != noPath.ID {
 		t.Fatalf("after MarkEpisodeExtracted(v1) = %+v, %v; want only the other episode", pending, err)
@@ -295,14 +301,25 @@ func TestMemoryV2QueriesBindEveryParameter(t *testing.T) {
 	if e, err := q.GetEpisodeByID(ctx, ep.ID); err != nil || e.ExtractedAt.Valid || e.ExtractorVer.Valid {
 		t.Fatalf("after ResetEpisodeExtraction = %+v, %v; want NULL markers", e, err)
 	}
-	if err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: noPath.ID}); err != nil {
-		t.Fatal(err)
+	if n, err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: noPath.ID}); err != nil || n != 1 {
+		t.Fatalf("MarkEpisodeExtracted(noPath) = %d, %v; want 1 row", n, err)
 	}
 	if err := q.ResetAllEpisodeExtraction(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if e, err := q.GetEpisodeByID(ctx, noPath.ID); err != nil || e.ExtractedAt.Valid || e.ExtractorVer.Valid {
 		t.Fatalf("after ResetAllEpisodeExtraction = %+v, %v; want NULL markers", e, err)
+	}
+	if _, err := s.DB().Exec(`UPDATE episodes SET source_hash = 'sha256:h1' WHERE id = ?`, ep.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		hash string
+		want int64
+	}{{"", 0}, {"sha256:h0", 0}, {"sha256:h1", 1}} {
+		if n, err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: ep.ID, SourceHash: c.hash}); err != nil || n != c.want {
+			t.Fatalf("MarkEpisodeExtracted(hash %q) on a sha256:h1 episode = %d, %v; want %d", c.hash, n, err, c.want)
+		}
 	}
 
 	if _, err := s.DB().Exec(`INSERT INTO tasks (id, trace_id, state, lane, updated_at, created_at) VALUES ('t1', 'tr-1', 'done', 'secret', ?, ?)`, now, now); err != nil {

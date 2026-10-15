@@ -631,7 +631,13 @@ type Querier interface {
 	// facts (task spec step 6: "only then mark cooled").
 	MarkEpisodeCooled(ctx context.Context, arg MarkEpisodeCooledParams) error
 	MarkEpisodeDeleted(ctx context.Context, id int64) error
-	MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) error
+	// Compare-and-set (FIX-MEM-3 review): stamps the episode only while it
+	// still holds the content the extractor read - source_hash as read BEFORE
+	// its chunks (the empty string stands for NULL). An edit the indexer
+	// committed in the meantime (new chunks + ResetEpisodeExtraction, one
+	// transaction) changed the hash, so 0 rows are affected and the episode
+	// stays pending.
+	MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) (int64, error)
 	// Terminal success: the re-spawned worker exited 0 (task spec step 7).
 	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error
 	MarkToolCallExecuting(ctx context.Context, arg MarkToolCallExecutingParams) error

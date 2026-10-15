@@ -546,7 +546,11 @@ a cloud model, without changing anything in §2-§6 above:
   unconfirmed fact of no more trust than the extraction's provenance (else
   `extract.retraction_skipped`). An edited note is pending again (the
   indexer resets `extracted_at` when the content hash changes; a `reindex
-  --full` of unchanged bytes keeps it). Manual runs: `kahya memory extract
+  --full` of unchanged bytes keeps it), and the stamp itself is a
+  compare-and-set on the `source_hash` read before the chunks: a note
+  edited and reindexed while its calls are in flight is not stamped
+  (`extract.skipped{reason:"changed_during_extraction", facts_written}`,
+  the marker stays NULL) and the next run extracts the new text. Manual runs: `kahya memory extract
   [--episode <id> | --file <yol> | --all]` → `POST /v1/memory/extract`
   `{"episode_id":N} | {"file":"rel/path.md"} | {"all":true} | {}` (none =
   one pending batch; a control route, 503 unwired, 404 unknown episode/note,

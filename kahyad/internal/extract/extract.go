@@ -66,7 +66,9 @@ const (
 	// any call of the episode ran on the local model, else "normal".
 	EventEpisodeExtracted = "extract.episode_extracted"
 	// EventExtractionSkipped: {episode_id, reason, lane?, err?} - the
-	// episode keeps extracted_at NULL and the next run retries it.
+	// episode keeps extracted_at NULL and the next run retries it. Reason
+	// changed_during_extraction also carries facts_written: the facts of
+	// the content the run read stay; the new content is extracted next run.
 	EventExtractionSkipped = "extract.skipped"
 	// EventCloudGuardBlocked: {episode_id, chunk_id} - GuardCloudExtraction
 	// found secret-lane content in a call's bytes (path normal); that call
@@ -93,6 +95,10 @@ const (
 	SkipTooLarge         = "too_large"
 	SkipWriteFailed      = "write_failed"
 	SkipReadFailed       = "read_failed"
+	// SkipChangedDuringExtraction: the note was edited and reindexed while
+	// the episode's Reader calls were in flight (its source_hash is no
+	// longer the one read before the chunks), so the stamp did not apply.
+	SkipChangedDuringExtraction = "changed_during_extraction"
 )
 
 // Defaults (Config's zero values fall back to these). The nightly batch cap
@@ -148,7 +154,8 @@ type Store interface {
 	GetEpisodeBySourceAndPath(ctx context.Context, arg sqlcgen.GetEpisodeBySourceAndPathParams) (sqlcgen.GetEpisodeBySourceAndPathRow, error)
 	ListChunksByEpisode(ctx context.Context, episodeID int64) ([]sqlcgen.Chunk, error)
 	ListUnextractedEpisodes(ctx context.Context, arg sqlcgen.ListUnextractedEpisodesParams) ([]sqlcgen.ListUnextractedEpisodesRow, error)
-	MarkEpisodeExtracted(ctx context.Context, arg sqlcgen.MarkEpisodeExtractedParams) error
+	MarkEpisodeExtracted(ctx context.Context, arg sqlcgen.MarkEpisodeExtractedParams) (int64, error)
+	ResetEpisodeExtraction(ctx context.Context, id int64) error
 	ResetAllEpisodeExtraction(ctx context.Context) error
 	GetActiveFactByTriple(ctx context.Context, arg sqlcgen.GetActiveFactByTripleParams) (sqlcgen.Fact, error)
 	GetLatestEventByKind(ctx context.Context, kind string) (sqlcgen.Event, error)
@@ -267,9 +274,12 @@ func (r *Runner) ExtractAll(ctx context.Context, traceID string) (Stats, error) 
 
 // ExtractEpisode extracts ONE active episode (all of its chunks), whatever
 // its marker says, and stamps MarkEpisodeExtracted only after every
-// candidate was written. prov is the CALL SITE's provenance claim:
-// ProvenanceAgentDerived for memory-note episodes (nightly, CLI),
-// ProvenanceExternalDoc for MEM-6 ingest - never anything the model said.
+// candidate was written - and only while the episode still holds the
+// content that was read (a compare-and-set on source_hash; an edit
+// reindexed mid-run leaves it pending). prov is the CALL SITE's
+// provenance claim: ProvenanceAgentDerived for memory-note episodes
+// (nightly, CLI), ProvenanceExternalDoc for MEM-6 ingest - never anything
+// the model said.
 // A skipped episode is Stats.Skipped=1 with a nil error (the reason is in
 // the ledger); an unknown or non-active episode is ErrEpisodeNotFound.
 func (r *Runner) ExtractEpisode(ctx context.Context, traceID string, episodeID int64, prov factengine.Provenance) (Stats, error) {
@@ -284,7 +294,7 @@ func (r *Runner) ExtractEpisode(ctx context.Context, traceID string, episodeID i
 	if err != nil {
 		return Stats{}, fmt.Errorf("extract: load episode %d: %w", episodeID, err)
 	}
-	return r.extractEpisode(ctx, traceID, ep.ID, ep.SourcePath, prov), nil
+	return r.extractEpisode(ctx, traceID, ep.ID, prov), nil
 }
 
 // ExtractFile is ExtractEpisode for the memory note at relPath (relative
@@ -303,7 +313,7 @@ func (r *Runner) ExtractFile(ctx context.Context, traceID, relPath string) (Stat
 	if err != nil {
 		return Stats{}, fmt.Errorf("extract: load episode for %q: %w", relPath, err)
 	}
-	return r.extractEpisode(ctx, traceID, ep.ID, ep.SourcePath, factengine.ProvenanceAgentDerived), nil
+	return r.extractEpisode(ctx, traceID, ep.ID, factengine.ProvenanceAgentDerived), nil
 }
 
 // SourceMemoryFile is episodes.source for a memory note
@@ -343,7 +353,7 @@ func (r *Runner) runPending(ctx context.Context, traceID string) (Stats, error) 
 		if ctx.Err() != nil {
 			break
 		}
-		st.add(r.extractEpisode(ctx, traceID, ep.ID, ep.SourcePath, factengine.ProvenanceAgentDerived))
+		st.add(r.extractEpisode(ctx, traceID, ep.ID, factengine.ProvenanceAgentDerived))
 		last = ep.ID
 	}
 	r.ledger(context.WithoutCancel(ctx), traceID, EventRunDone, map[string]any{
@@ -391,7 +401,17 @@ type call struct {
 // extractEpisode is ExtractEpisode's body (the caller holds r.mu). It
 // returns the episode's Stats: Episodes=1 when it was stamped, Skipped=1
 // when it was skipped (ledgered).
-func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID int64, sourcePath sql.NullString, prov factengine.Provenance) Stats {
+func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID int64, prov factengine.Provenance) Stats {
+	// The content snapshot the stamp is conditioned on: source_hash is read
+	// BEFORE the chunks. The indexer replaces an edited note's chunks and
+	// its hash (and resets the marker) in one transaction, so if the hash
+	// still matches at stamp time, the chunks read below are that hash's
+	// chunks; if an edit landed in between, the stamp affects no row.
+	ep, err := r.Store.GetEpisodeByID(ctx, episodeID)
+	if err != nil {
+		return r.skip(ctx, traceID, episodeID, SkipReadFailed, "", err, nil)
+	}
+	sourcePath := ep.SourcePath
 	chunks, err := r.Store.ListChunksByEpisode(ctx, episodeID)
 	if err != nil {
 		return r.skip(ctx, traceID, episodeID, SkipReadFailed, "", err, nil)
@@ -472,12 +492,27 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 		}
 	}
 
-	if err := r.Store.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{
+	stamped, err := r.Store.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{
 		ExtractedAt:  sql.NullString{String: r.now().UTC().Format(time.RFC3339Nano), Valid: true},
 		ExtractorVer: sql.NullString{String: ExtractorVersion, Valid: true},
 		ID:           episodeID,
-	}); err != nil {
+		SourceHash:   ep.SourceHash.String,
+	})
+	if err != nil {
 		sk := r.skip(ctx, traceID, episodeID, SkipWriteFailed, episodeLane, err, nil)
+		st.Skipped += sk.Skipped
+		return st
+	}
+	if stamped == 0 {
+		// The note changed under the run (the facts above are those of the
+		// content it read). The indexer already reset the marker with the
+		// new chunks; resetting it here too keeps the episode pending
+		// whatever wrote the new hash, so the new text is extracted by the
+		// next run instead of hiding behind an old stamp.
+		if rerr := r.Store.ResetEpisodeExtraction(context.WithoutCancel(ctx), episodeID); rerr != nil {
+			r.logWarn(traceID, "fact_extraction_marker_reset_failed", "episode_id", episodeID, "err", rerr.Error())
+		}
+		sk := r.skip(ctx, traceID, episodeID, SkipChangedDuringExtraction, episodeLane, nil, map[string]any{"facts_written": st.Facts})
 		st.Skipped += sk.Skipped
 		return st
 	}

@@ -3960,19 +3960,36 @@ func (q *Queries) MarkEpisodeDeleted(ctx context.Context, id int64) error {
 	return err
 }
 
-const markEpisodeExtracted = `-- name: MarkEpisodeExtracted :exec
-UPDATE episodes SET extracted_at = ?, extractor_ver = ? WHERE id = ?
+const markEpisodeExtracted = `-- name: MarkEpisodeExtracted :execrows
+UPDATE episodes
+SET extracted_at = ?1, extractor_ver = ?2
+WHERE id = ?3 AND COALESCE(source_hash, '') = CAST(?4 AS TEXT)
 `
 
 type MarkEpisodeExtractedParams struct {
 	ExtractedAt  sql.NullString `json:"extracted_at"`
 	ExtractorVer sql.NullString `json:"extractor_ver"`
 	ID           int64          `json:"id"`
+	SourceHash   string         `json:"source_hash"`
 }
 
-func (q *Queries) MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) error {
-	_, err := q.db.ExecContext(ctx, markEpisodeExtracted, arg.ExtractedAt, arg.ExtractorVer, arg.ID)
-	return err
+// Compare-and-set (FIX-MEM-3 review): stamps the episode only while it
+// still holds the content the extractor read - source_hash as read BEFORE
+// its chunks (the empty string stands for NULL). An edit the indexer
+// committed in the meantime (new chunks + ResetEpisodeExtraction, one
+// transaction) changed the hash, so 0 rows are affected and the episode
+// stays pending.
+func (q *Queries) MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markEpisodeExtracted,
+		arg.ExtractedAt,
+		arg.ExtractorVer,
+		arg.ID,
+		arg.SourceHash,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const markOutboxDelivered = `-- name: MarkOutboxDelivered :exec

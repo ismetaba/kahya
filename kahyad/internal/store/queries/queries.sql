@@ -1317,8 +1317,16 @@ WHERE status = 'active'
 ORDER BY id ASC
 LIMIT sqlc.arg(row_limit);
 
--- name: MarkEpisodeExtracted :exec
-UPDATE episodes SET extracted_at = ?, extractor_ver = ? WHERE id = ?;
+-- name: MarkEpisodeExtracted :execrows
+-- Compare-and-set (FIX-MEM-3 review): stamps the episode only while it
+-- still holds the content the extractor read - source_hash as read BEFORE
+-- its chunks (the empty string stands for NULL). An edit the indexer
+-- committed in the meantime (new chunks + ResetEpisodeExtraction, one
+-- transaction) changed the hash, so 0 rows are affected and the episode
+-- stays pending.
+UPDATE episodes
+SET extracted_at = sqlc.arg(extracted_at), extractor_ver = sqlc.arg(extractor_ver)
+WHERE id = sqlc.arg(id) AND COALESCE(source_hash, '') = CAST(sqlc.arg(source_hash) AS TEXT);
 
 -- name: ResetEpisodeExtraction :exec
 UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE id = ?;
