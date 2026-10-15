@@ -151,7 +151,7 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 	if !b.Enabled() {
 		return
 	}
-	if secret, reason := inputSecretLane(b.home, b.secretLaneGlobs, info.Tool, info.ToolInput); secret {
+	if secret, reason := inputSecretLane(b.home, b.memoryDir, b.secretLaneGlobs, info.Tool, info.ToolInput); secret {
 		b.redact(ctx, info, reason)
 		return
 	}

@@ -7,9 +7,13 @@
 //
 //  1. isSecretLane (first gate): the fs_write/fs_delete path matched
 //     policy.yaml's secret_lane_globs, or fs_write's NEW content matched
-//     kahyad/internal/secretlane's deterministic pre-pass. It fails CLOSED
-//     (FIX-P-6a): a path it cannot canonicalize, or a malformed glob, also
-//     redacts.
+//     kahyad/internal/secretlane's deterministic pre-pass, or (FIX-FINAL
+//     telegram-memory-write-gizli-card-unredacted) the memory_write /
+//     memory_forget `file` - relative to the memory dir - matched a
+//     secret-lane glob (memlane.MatchesSecretGlob, the rule memlane and
+//     consolidation apply to the same path). It fails CLOSED (FIX-P-6a): a
+//     path it cannot canonicalize, a malformed glob, or a memory-tool file
+//     with no memory dir wired, also redacts.
 //  2. outboundSecretLane (second gate): the EXACT text about to be sent —
 //     the rendered card, which carries the OLD file content read from disk
 //     (render.go's readCurrentFile), every non-fs tool body (script,
@@ -29,15 +33,31 @@ package telegram
 import (
 	"encoding/base64"
 	"encoding/json"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 
 	"kahya/kahyad/internal/canon"
+	"kahya/kahyad/internal/memlane"
+	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/secretlane"
 	mcpfs "kahya/mcp/fs"
 )
+
+// memoryFileToolInput reads the {"file": "..."} field memory_write and
+// memory_forget carry - a path RELATIVE to the memory dir.
+type memoryFileToolInput struct {
+	File string `json:"file"`
+}
+
+// policyGlobMatcher adapts policy.MatchGlob to memlane.GlobMatcher.
+type policyGlobMatcher struct{}
+
+func (policyGlobMatcher) Match(pattern, path string) (bool, error) {
+	return policy.MatchGlob(pattern, path)
+}
 
 // fsPathToolInput reads just the {"path": "..."} field common to
 // fs_write/fs_delete's tool_input envelope (render.go's fsWriteToolInput
@@ -52,6 +72,9 @@ const (
 	redactReasonGlob              = "glob"
 	redactReasonCanonicalizeError = "canonicalize_error"
 	redactReasonGlobError         = "glob_error"
+	// redactReasonMemoryDirUnwired: a memory-tool card names a file but no
+	// memory dir is wired to resolve it against (fail-closed).
+	redactReasonMemoryDirUnwired = "memory_dir_unwired"
 )
 
 // isSecretLane is the first redaction gate: it reports whether tool/
@@ -70,15 +93,38 @@ const (
 // a malformed glob means the redaction decision is unknown. The local
 // surface still shows the full card.
 func isSecretLane(home string, secretLaneGlobs []string, tool string, toolInput []byte) bool {
-	secret, _ := inputSecretLane(home, secretLaneGlobs, tool, toolInput)
+	secret, _ := inputSecretLane(home, "", secretLaneGlobs, tool, toolInput)
 	return secret
 }
 
 // inputSecretLane is isSecretLane with the ledger reason: redactReasonGlob,
-// redactReasonCanonicalizeError, redactReasonGlobError, or "content:" +
-// the classifier's reason for fs_write's new content.
-func inputSecretLane(home string, secretLaneGlobs []string, tool string, toolInput []byte) (bool, string) {
+// redactReasonCanonicalizeError, redactReasonGlobError,
+// redactReasonMemoryDirUnwired, or "content:" + the classifier's reason
+// for fs_write's new content. memoryDir is cfg.MemoryDir, the root
+// memory_write's / memory_forget's `file` is relative to.
+func inputSecretLane(home, memoryDir string, secretLaneGlobs []string, tool string, toolInput []byte) (bool, string) {
 	switch tool {
+	case "memory_write", "memory_forget":
+		var env memoryFileToolInput
+		if json.Unmarshal(toolInput, &env) != nil {
+			// No path to label; the rendered card is still classified by
+			// outboundSecretLane (the fs rule for an unparseable input).
+			return false, ""
+		}
+		rel := strings.TrimSpace(env.File)
+		if rel == "" {
+			return false, "" // memory_write's default target: inbox/<date>.md
+		}
+		if memoryDir == "" {
+			return true, redactReasonMemoryDirUnwired
+		}
+		abs := filepath.Join(memoryDir, filepath.FromSlash(rel))
+		for _, g := range secretLaneGlobs {
+			if memlane.MatchesSecretGlob(policyGlobMatcher{}, g, abs) {
+				return true, redactReasonGlob
+			}
+		}
+		return false, ""
 	case "fs_write", "fs_delete":
 		var env fsPathToolInput
 		if err := json.Unmarshal(toolInput, &env); err != nil || env.Path == "" {

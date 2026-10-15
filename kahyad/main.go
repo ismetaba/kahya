@@ -503,6 +503,7 @@ func run() int {
 	// what tgBot asks before any content-carrying byte leaves for Telegram
 	// (HANDOFF §5 safety #1 ⚑, second clause). Never a second tracker.
 	tgBot.SetSessionTaint(sessions)
+	tgBot.SetMemoryDir(cfg.MemoryDir)
 	// B-11: Telegram offers an approve keyboard only for a reversible: true
 	// tool (HANDOFF §4). In deny-all mode pol is the zero value, so every
 	// W1/W2 gets the keyboard-less notice (fail-closed).

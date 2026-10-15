@@ -289,6 +289,9 @@ func newTestBot(t *testing.T, cfg Config, sender Sender, ledger Ledger, gate Egr
 	b := &Bot{
 		cfg: cfg, tb: tb, sender: sender, ledger: ledger, egress: gate, engine: engine, local: local,
 		home: testHome(t), cards: map[string]*cardState{},
+		// FIX-FINAL telegram-memory-write-gizli-card-unredacted: a wired
+		// memory dir, as main.go's SetMemoryDir does.
+		memoryDir: filepath.Join(t.TempDir(), "memory"),
 		// B-11: the same registry newPolicyFixture's engine loads, so a
 		// reversible tool gets its card; SetToolRules(nil) tests unwired.
 		toolRules: testToolRules,

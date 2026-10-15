@@ -229,6 +229,10 @@ type Bot struct {
 
 	home            string
 	secretLaneGlobs []string
+	// memoryDir is cfg.MemoryDir (SetMemoryDir): memory_write's and
+	// memory_forget's `file` are relative to it (FIX-FINAL
+	// telegram-memory-write-gizli-card-unredacted).
+	memoryDir string
 
 	// toolRules is policy.yaml's tool registry (SetToolRules, B-11):
 	// OnPendingApproval offers an approve keyboard only for a tool whose
@@ -367,6 +371,11 @@ func (b *Bot) SetToolRules(rules map[string]policy.ToolRule) { b.toolRules = rul
 // redacted to msgOutboundRedactedFmt and telegram_session_taint_unwired is
 // logged once).
 func (b *Bot) SetSessionTaint(t SessionTaint) { b.taint = t }
+
+// SetMemoryDir wires cfg.MemoryDir for the memory-tool path gate of the
+// first redaction gate (inputSecretLane). Unwired, a memory-tool card that
+// names a file is redacted (fail-closed).
+func (b *Bot) SetMemoryDir(dir string) { b.memoryDir = dir }
 
 // isReversible reports whether tool's policy.yaml rule is reversible: true.
 // An unknown tool or an unwired registry is irreversible (fail-closed).
