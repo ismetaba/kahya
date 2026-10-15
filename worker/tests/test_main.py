@@ -861,6 +861,48 @@ class TestResumeOptionWiring(unittest.TestCase):
         code, out = run_main_with(envelope, base_env(log_dir), client_factory=capturing_factory)
         return code, out, created
 
+    def _memory_hook_query(self, envelope: dict) -> list:
+        """Runs the wired UserPromptSubmit hook with the turn text the CLI
+        would submit (_session_prompt) and returns the /v1/memory/search
+        bodies it posted."""
+        import asyncio
+        from unittest import mock
+
+        from kahya_worker.envelope import parse_envelope
+
+        env = parse_envelope(json.dumps(envelope).encode("utf-8"))
+        options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
+        hook = options.hooks["UserPromptSubmit"][0].hooks[0]
+        posted: list = []
+
+        def fake_post_json(sock, path, body, timeout=None):
+            posted.append((path, body))
+            return {"hafiza_block": ""}
+
+        with mock.patch("kahya_worker.hooks.post_json", fake_post_json):
+            asyncio.run(hook({"prompt": worker_main._session_prompt(env)}, None, None))
+        return posted
+
+    def test_resume_memory_search_uses_task_prompt_not_continuation(self) -> None:
+        """FIX-FINAL resume-memory-search-uses-continuation-text: a resumed
+        session submits RESUME_CONTINUATION_PROMPT, but memory must be
+        searched (and the injected block ledgered) for the task's own
+        prompt, never the boilerplate continuation text."""
+        from kahya_worker.hooks import MEMORY_SEARCH_PATH
+
+        d = dict(VALID_ENVELOPE, session_id="sess-1", resume=True, memory_injection=True)
+        posted = self._memory_hook_query(d)
+        self.assertEqual(len(posted), 1, posted)
+        self.assertEqual(posted[0][0], MEMORY_SEARCH_PATH)
+        self.assertEqual(posted[0][1]["query"], VALID_ENVELOPE["prompt"])
+        self.assertNotEqual(posted[0][1]["query"], worker_main.RESUME_CONTINUATION_PROMPT)
+
+    def test_fresh_memory_search_uses_submitted_prompt(self) -> None:
+        d = dict(VALID_ENVELOPE, memory_injection=True)
+        posted = self._memory_hook_query(d)
+        self.assertEqual(len(posted), 1, posted)
+        self.assertEqual(posted[0][1]["query"], VALID_ENVELOPE["prompt"])
+
     def test_resume_true_sends_continuation_prompt_not_original(self) -> None:
         d = dict(VALID_ENVELOPE)
         d["session_id"] = "sess-1"

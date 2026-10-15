@@ -79,6 +79,7 @@ def make_user_prompt_submit_hook(
     task_id: str,
     trace_id: str,
     memory_injection: bool,
+    search_query: str | None = None,
 ) -> Callable[[dict[str, Any], str | None, Any], Awaitable[dict[str, Any]]]:
     """Returns a ``UserPromptSubmit`` hook callback (the
     ``claude_agent_sdk.HookCallback`` shape). When ``memory_injection`` is
@@ -93,6 +94,13 @@ def make_user_prompt_submit_hook(
     ``additionalContext`` - memory search is enrichment, not a security
     gate, so the turn proceeds without injection rather than failing the
     task.
+
+    ``search_query``, when not None, is searched INSTEAD of the submitted
+    turn's text. A resumed session (FIX-I-4) submits the fixed
+    RESUME_CONTINUATION_PROMPT, which says nothing about the task; the
+    worker passes the task's own prompt here so the injected (and
+    ledgered) ``<hafiza>`` block matches the task, not the boilerplate
+    (FIX-FINAL resume-memory-search-uses-continuation-text).
     """
 
     async def user_prompt_submit(
@@ -101,7 +109,7 @@ def make_user_prompt_submit_hook(
         if not memory_injection:
             return {}
 
-        prompt = input_data.get("prompt", "")
+        prompt = search_query if search_query is not None else input_data.get("prompt", "")
         try:
             # FIX-I-16: off the event loop (see the module docstring).
             resp = await asyncio.to_thread(

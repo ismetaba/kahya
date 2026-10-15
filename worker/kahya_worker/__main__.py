@@ -602,8 +602,17 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
             "UserPromptSubmit": [
                 HookMatcher(
                     hooks=[
+                        # FIX-FINAL resume-memory-search-uses-continuation-
+                        # text: a resumed session submits
+                        # RESUME_CONTINUATION_PROMPT; memory is searched with
+                        # the task's own prompt instead, so the injected and
+                        # ledgered <hafiza> block matches the task.
                         make_user_prompt_submit_hook(
-                            socket_path, envelope.task_id, envelope.trace_id, envelope.memory_injection
+                            socket_path,
+                            envelope.task_id,
+                            envelope.trace_id,
+                            envelope.memory_injection,
+                            search_query=envelope.prompt if envelope.resume else None,
                         )
                     ]
                 ),
