@@ -19,6 +19,8 @@
 //   - git.go/userlines.go/diff.go: the git-worktree mechanics + USER-EDIT-
 //     WINS line-skip enforcement.
 //   - state.go: pending-suggestion state, persisted in the events ledger.
+//   - tokens.go: the lanes' size arithmetic (FIX-B-5): the conservative
+//     token estimate the batch budgets are checked against.
 //   - hotwindow.go: the >=90-day hot-window detail-atom promotion (the
 //     ONE piece of this package that DOES write brain.db - via kahyad's
 //     own fact-write path, never the session/worker).
@@ -221,6 +223,12 @@ func (c *Consolidator) worktreeParentDir() string {
 	return os.TempDir()
 }
 
+func (c *Consolidator) logInfo(event string, kv ...any) {
+	if c.Log != nil {
+		c.Log.Info(event, kv...)
+	}
+}
+
 func (c *Consolidator) logWarn(event string, kv ...any) {
 	if c.Log != nil {
 		c.Log.Warn(event, kv...)
@@ -328,6 +336,11 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		return err
 	}
 	cloudFiles, localFiles := PartitionByLane(files, c.Cfg.MemoryDir, c.Cfg.SecretLaneGlobs, c.matcher())
+
+	// FIX-B-5 phase 0: each lane's size, every night, both lanes (an empty
+	// lane too), before any model is called.
+	c.ledgerLaneStats(ctx, traceID, LaneCloud, cloudFiles)
+	c.ledgerLaneStats(ctx, traceID, LaneLocal, localFiles)
 
 	baseSHA, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)
 	if err != nil {
@@ -642,6 +655,39 @@ func (c *Consolidator) refuseRepoState(ctx context.Context, traceID string, st R
 // reason carries the offending path (local ledger only); the Telegram
 // notice never names a file.
 const EventRewriteRejected = "consolidation.rewrite_rejected"
+
+// EventLaneStats is ledgered once per lane every night that reaches the
+// lane partition (FIX-B-5 phase 0): {lane, files, bytes, est_tokens,
+// largest_file, largest_bytes}. est_tokens is estimateFilesTokens, the same
+// estimate the batch budgets are checked against.
+const EventLaneStats = "consolidation.lane_stats"
+
+// laneStats is one lane's size summary (EventLaneStats' payload).
+func laneStats(lane string, files map[string]string) map[string]any {
+	total, largestBytes, largest := 0, 0, ""
+	for _, p := range sortedKeys(files) {
+		n := len(files[p])
+		total += n
+		if n > largestBytes || largest == "" {
+			largest, largestBytes = p, n
+		}
+	}
+	return map[string]any{
+		"lane": lane, "files": len(files), "bytes": total, "est_tokens": estimateFilesTokens(files),
+		"largest_file": largest, "largest_bytes": largestBytes,
+	}
+}
+
+// ledgerLaneStats logs (JSONL) and ledgers one lane's size. Best-effort: a
+// failed ledger write never fails the night.
+func (c *Consolidator) ledgerLaneStats(ctx context.Context, traceID, lane string, files map[string]string) {
+	st := laneStats(lane, files)
+	c.logInfo("consolidation_lane_stats", "trace_id", traceID, "lane", lane, "files", st["files"], "bytes", st["bytes"],
+		"est_tokens", st["est_tokens"], "largest_file", st["largest_file"], "largest_bytes", st["largest_bytes"])
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventLaneStats, st)
+	}
+}
 
 // rejectRewrite logs, ledgers and notifies one rejected night.
 func (c *Consolidator) rejectRewrite(ctx context.Context, traceID, lane string, cause error) {
