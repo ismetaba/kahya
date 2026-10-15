@@ -1384,8 +1384,24 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 	// 'executing' with an empty registry: the outbox dispatcher then fails
 	// it - a secret-lane row is never given to a worker, and a locally
 	// answered task stores no envelope to resume from.)
+	//
+	// FIX-I-5: the local answer ends with the daemon too (boundTaskContext);
+	// finishSecretLaneTask then fails the task (FIX-I-14: task_error with
+	// MsgSecretLaneModelCallFailed) - a local answer is never handed to a
+	// worker. FIX-FINAL halt-does-not-stop-inprocess-sessions: the
+	// context's cancel is registered with the in-process session, so a
+	// halt (which has no worker pid to kill here) cancels the answer, and
+	// finishSecretLaneTask drops a halted task's output.
+	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
+	defer cancel()
 	if s.taskInProcess != nil {
-		defer s.taskInProcess.BeginInProcess(taskID)()
+		if c, ok := s.taskInProcess.(interface {
+			BeginInProcessCancelable(string, context.CancelFunc) func()
+		}); ok {
+			defer c.BeginInProcessCancelable(taskID, cancel)()
+		} else {
+			defer s.taskInProcess.BeginInProcess(taskID)()
+		}
 	}
 
 	// FIX-I-14: this task enters the W4-02 status machine like a cloud task
@@ -1425,13 +1441,6 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 		}
 	}
 
-	// FIX-I-5: the local answer ends with the daemon too (boundTaskContext);
-	// finishSecretLaneTask then fails the task (FIX-I-14: task_error with
-	// MsgSecretLaneModelCallFailed) - a local answer is never handed to a
-	// worker.
-	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
-	defer cancel()
-
 	if s.secretLaneAnswerer == nil {
 		s.finishSecretLaneTask(persistCtx, log, taskID, traceID, lane, speakOverride, writeSSE, "", fmt.Errorf("secretlane: no local answerer wired"))
 		return
@@ -1457,6 +1466,28 @@ func (s *Server) handleSecretLaneTask(w http.ResponseWriter, log *logx.Logger, t
 // answer failure so the user sees the EXACT documented Turkish string
 // rather than a generic one.
 func (s *Server) finishSecretLaneTask(persistCtx context.Context, log *logx.Logger, taskID, traceID, lane string, speakOverride bool, writeSSE func(string, any), answer string, err error) {
+	// FIX-FINAL halt-does-not-stop-inprocess-sessions: a halt that landed
+	// during the local answer (it cancelled the answer's context, or the
+	// answer finished first) means nothing of it is delivered - no delta,
+	// no result, no speech - and the row is never stamped done. The same
+	// generic message a halted cloud worker's client gets.
+	if cur, serr := s.taskDurabilityStatus(persistCtx, taskID); serr == nil && cur == task.StatusUserHalted {
+		log.Warn("secretlane_answer_dropped_halted", "task_id", taskID)
+		if uerr := s.taskStore.UpdateTaskState(persistCtx, sqlcgen.UpdateTaskStateParams{
+			State: "error", UpdatedAt: rfc3339Now(), ID: taskID,
+		}); uerr != nil {
+			log.Error("task_state_update_failed", "task_id", taskID, "err", uerr.Error())
+		}
+		if s.eventLogger != nil {
+			if lerr := s.eventLogger.LogEvent(persistCtx, traceID, "task_error", map[string]any{
+				"task_id": taskID, "status": task.StatusUserHalted,
+			}); lerr != nil {
+				log.Warn("task_ledger_error", "kind", "task_error", "err", lerr.Error())
+			}
+		}
+		writeSSE("error", map[string]string{"message": fmt.Sprintf(MsgTaskUnexpectedExit, traceID)})
+		return
+	}
 	if err != nil {
 		msg := fmt.Sprintf(MsgSecretLaneModelCallFailed, traceID)
 		if errors.Is(err, mlx.ErrLocalModelUnavailable) {

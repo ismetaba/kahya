@@ -1346,7 +1346,17 @@ worker's group before `spawn.Run` writes its envelope (JSONL
 `task_worker_killed_halted` / ledger `outbox.worker_killed_halted`). A
 halt that wins the `intent` edge makes `handleTask`'s `->executing`
 transition fail, and it then fails closed - no proxy, no worker, 409
-`"⛔ Görev başlamadan durduruldu (user_halted)."`. A locally
+`"⛔ Görev başlamadan durduruldu (user_halted)."`. An in-process session
+has no pid to kill, so it registers its context's cancel
+(`LiveRegistry.BeginInProcessCancelable`; FIX-FINAL
+halt-does-not-stop-inprocess-sessions) and the halt calls
+`CancelInProcess` after the `user_halted` transition (JSONL
+`halt.in_process_canceled`): a halted local answer is never streamed,
+spoken or stamped `done` (JSONL `secretlane_answer_dropped_halted`, ledger
+`task_error{status: user_halted}`, the generic `MsgTaskUnexpectedExit`
+SSE error), and a halted briefing kills its worker through `spawn.Run`'s
+context and is never redacted or delivered (`briefing.failed{reason:
+user_halted}`). A locally
 answered task — secret lane or downgrade route — stores **no**
 `tasks.envelope` (it is never given to a worker), and the outbox
 dispatcher never gives a secret-lane row (row lane or stored envelope

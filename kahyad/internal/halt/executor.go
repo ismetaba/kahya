@@ -118,6 +118,16 @@ type haltMarker interface {
 
 var _ haltMarker = (*task.LiveRegistry)(nil)
 
+// inProcessCanceler is the optional part of a LiveRegistry that stops a
+// session running INSIDE kahyad (FIX-FINAL halt-does-not-stop-inprocess-
+// sessions): a local answer or a briefing run has no worker pid to kill,
+// so the halt cancels its registered context instead.
+type inProcessCanceler interface {
+	CancelInProcess(taskID string) int
+}
+
+var _ inProcessCanceler = (*task.LiveRegistry)(nil)
+
 // ApprovalInvalidator is the narrow approval-invalidation surface
 // Executor needs - *kahyad/internal/policy.Engine satisfies this
 // directly via InvalidateApprovalsForTask (that method's own doc comment
@@ -325,6 +335,15 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 	if err := x.machine.Transition(ctx, traceID, taskID, task.StatusUserHalted); err != nil {
 		x.logJSONLErr(traceID, "halt.transition_failed", taskID, err)
 		haltedNow = false
+	}
+	// FIX-FINAL halt-does-not-stop-inprocess-sessions: cancel the task's
+	// in-process sessions (a local answer, a briefing run) AFTER the
+	// transition, whatever its result, so a session waking on ctx.Done and
+	// re-reading tasks.status sees user_halted and drops its output.
+	if c, ok := x.live.(inProcessCanceler); ok {
+		if n := c.CancelInProcess(taskID); n > 0 {
+			x.logJSONL(traceID, "halt.in_process_canceled", taskID, fmt.Sprintf("%d", n))
+		}
 	}
 	if haltedNow {
 		if err := x.store.SetTaskHaltedAt(ctx, sqlcgen.SetTaskHaltedAtParams{

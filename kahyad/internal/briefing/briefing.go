@@ -533,12 +533,23 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 			return result, fmt.Errorf("briefing: taint session: %w", err)
 		}
 	}
+	// FIX-FINAL halt-does-not-stop-inprocess-sessions: the worker run's
+	// context is cancelled by a halt (the in-process session registers its
+	// cancel), and spawn.Run kills the worker's group on ctx.Done.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	if o.TaskStore != nil {
 		// FIX-I-14 review: live BEFORE the row can be 'executing'; the
 		// deferred end runs after every finishTask (the terminal status), so
 		// a resume-scan tick never sees this run's row executing-but-not-live.
 		if o.Live != nil {
-			defer o.Live.BeginInProcess(taskID)()
+			if c, ok := o.Live.(interface {
+				BeginInProcessCancelable(string, context.CancelFunc) func()
+			}); ok {
+				defer c.BeginInProcessCancelable(taskID, cancelRun)()
+			} else {
+				defer o.Live.BeginInProcess(taskID)()
+			}
 		}
 		nowStr := rfc3339(now)
 		if _, err := o.TaskStore.InsertTask(ctx, sqlcgen.InsertTaskParams{
@@ -566,7 +577,12 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	o.jsonlInfo(traceID, "briefing_worker_spawn", "task_id", taskID, "session_id", sessionID, "model", ModelName)
 
 	env := BuildEnvelope(taskID, traceID, prompt, now)
-	rawJSON, err := o.Spawner.Spawn(ctx, env)
+	rawJSON, err := o.Spawner.Spawn(runCtx, env)
+	// FIX-FINAL halt-does-not-stop-inprocess-sessions: a halted briefing is
+	// never redacted or delivered, whatever the worker returned.
+	if o.halted(ctx, traceID, taskID) {
+		return result, errors.New("briefing: halted by the user (user_halted)")
+	}
 	if err != nil {
 		o.jsonlWarn(traceID, "briefing_worker_failed", "task_id", taskID, "err", err.Error())
 		o.ledgerRaw(ctx, traceID, EventFailed, map[string]any{"reason": "spawn_failed", "err": err.Error()})
@@ -631,6 +647,9 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 	// delivered briefing only by the placeholder line").
 	fullText := renderDeliveryText(traceID, redacted, calendarLine, anyDropped, "")
 
+	if o.halted(ctx, traceID, taskID) {
+		return result, errors.New("briefing: halted by the user (user_halted)")
+	}
 	sent := o.Delivery.SendNotification(ctx, traceID, fullText)
 	if !sent {
 		// FIX-P-8: a started run never ends without a terminal ledger row
@@ -650,6 +669,23 @@ func (o *Orchestrator) Run(ctx context.Context, traceID string) (Result, error) 
 
 	result.Delivered = true
 	return result, nil
+}
+
+// halted reports whether the briefing's task row is user_halted (FIX-FINAL
+// halt-does-not-stop-inprocess-sessions); when it is, the run is ledgered
+// failed {reason: user_halted} and logged briefing_halted. No task row
+// (TaskStore unwired) or an unreadable one is not a halt.
+func (o *Orchestrator) halted(ctx context.Context, traceID, taskID string) bool {
+	if o.TaskStore == nil {
+		return false
+	}
+	t, err := o.TaskStore.GetTaskByID(context.WithoutCancel(ctx), taskID)
+	if err != nil || t.Status != task.StatusUserHalted {
+		return false
+	}
+	o.jsonlWarn(traceID, "briefing_halted", "task_id", taskID)
+	o.ledgerRaw(context.WithoutCancel(ctx), traceID, EventFailed, map[string]any{"reason": "user_halted", "task_id": taskID})
+	return true
 }
 
 // warmClassifier runs the Warmer once with the cold-load budget and logs

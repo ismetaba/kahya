@@ -131,3 +131,30 @@ func TestLiveRegistryMarkHaltedOrdersWithRegistration(t *testing.T) {
 		t.Fatal("the end of the last in-process session must clear the halt mark")
 	}
 }
+
+// TestLiveRegistryCancelInProcess (FIX-FINAL halt-does-not-stop-inprocess-
+// sessions): CancelInProcess calls every registered in-process session's
+// cancel func of that task only, leaves the sessions live until their own
+// end func runs, and end stays idempotent.
+func TestLiveRegistryCancelInProcess(t *testing.T) {
+	l := NewLiveRegistry()
+	var a, b, other int
+	endA := l.BeginInProcessCancelable("t1", func() { a++ })
+	endB := l.BeginInProcessCancelable("t1", func() { b++ })
+	endNil := l.BeginInProcess("t1")
+	endOther := l.BeginInProcessCancelable("t2", func() { other++ })
+	if n := l.CancelInProcess("t1"); n != 2 || a != 1 || b != 1 || other != 0 {
+		t.Fatalf("CancelInProcess = %d (a=%d b=%d other=%d), want 2 with only t1's cancels called", n, a, b, other)
+	}
+	if !l.IsLive("t1") {
+		t.Fatal("cancelled sessions must stay live until their end func runs")
+	}
+	endA()
+	endA()
+	endB()
+	endNil()
+	if l.IsLive("t1") {
+		t.Fatal("t1 still live after every session ended")
+	}
+	endOther()
+}

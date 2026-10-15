@@ -478,3 +478,22 @@ func TestHaltAllHaltsEveryNonTerminalTask(t *testing.T) {
 		t.Errorf("second HaltAll() = %d, want 0 (nothing non-terminal left)", n2)
 	}
 }
+
+// TestHaltTaskCancelsInProcessSession (FIX-FINAL halt-does-not-stop-
+// inprocess-sessions): a task whose session runs inside kahyad (no worker
+// pid) has its registered context cancelled by HaltTask.
+func TestHaltTaskCancelsInProcessSession(t *testing.T) {
+	st := testStore(t)
+	m := task.NewMachine(st.Queries, st)
+	live := task.NewLiveRegistry()
+	insertExecutingTask(t, st, "t-local")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer live.BeginInProcessCancelable("t-local", cancel)()
+	x := NewExecutor(st.Queries, m, live, nil, nil, st)
+	if halted, err := x.HaltTask(context.Background(), "t-local"); err != nil || !halted {
+		t.Fatalf("HaltTask = %v %v, want halted", halted, err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the in-process session's context was not cancelled")
+	}
+}

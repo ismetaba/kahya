@@ -26,7 +26,10 @@
 // window between its executing transition and its worker's registration.
 package task
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // LiveRegistry tracks task_id -> worker pid (plus, since G03 / B-14, the
 // worker's SESSION id and trace_id) for tasks kahyad's own spawn.Run is
@@ -47,9 +50,12 @@ import "sync"
 type LiveRegistry struct {
 	mu      sync.RWMutex
 	entries map[string]liveEntry
-	// inProcess counts the open BeginInProcess sessions per task_id
-	// (FIX-I-14 review) - see the package doc comment above.
-	inProcess map[string]int
+	// inProcess holds the open BeginInProcess sessions per task_id
+	// (FIX-I-14 review) - see the package doc comment above - each with the
+	// cancel func a halt calls (CancelInProcess; nil when the session
+	// registered none).
+	inProcess  map[string]map[uint64]context.CancelFunc
+	nextInProc uint64
 	// halted records the tasks a halt marked (MarkHalted, FIX-FINAL
 	// halt-window-worker-still-spawned): a worker that registers AFTER the
 	// mark must kill itself (Halted), one that registered before it is
@@ -68,7 +74,7 @@ type liveEntry struct {
 
 // NewLiveRegistry constructs an empty LiveRegistry.
 func NewLiveRegistry() *LiveRegistry {
-	return &LiveRegistry{entries: make(map[string]liveEntry), inProcess: make(map[string]int), halted: make(map[string]struct{})}
+	return &LiveRegistry{entries: make(map[string]liveEntry), inProcess: make(map[string]map[uint64]context.CancelFunc), halted: make(map[string]struct{})}
 }
 
 // MarkHalted records that taskID is being halted and returns its live
@@ -138,27 +144,63 @@ func (l *LiveRegistry) Unregister(taskID string) {
 // it live. PID/BySID never report it (there is no pid). end is
 // idempotent; Unregister (the worker path) does not end it.
 func (l *LiveRegistry) BeginInProcess(taskID string) (end func()) {
+	return l.BeginInProcessCancelable(taskID, nil)
+}
+
+// BeginInProcessCancelable is BeginInProcess with the session's cancel
+// func registered: a halt of taskID calls it (CancelInProcess, FIX-FINAL
+// halt-does-not-stop-inprocess-sessions), so a local answer or a briefing
+// run - which has no worker pid to kill - actually stops. cancel may be
+// nil.
+func (l *LiveRegistry) BeginInProcessCancelable(taskID string, cancel context.CancelFunc) (end func()) {
 	l.mu.Lock()
-	l.inProcess[taskID]++
+	l.nextInProc++
+	id := l.nextInProc
+	if l.inProcess[taskID] == nil {
+		l.inProcess[taskID] = make(map[uint64]context.CancelFunc)
+	}
+	l.inProcess[taskID][id] = cancel
 	l.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			if l.inProcess[taskID] <= 1 {
-				delete(l.inProcess, taskID)
-				// The task's last in-process session is over (its terminal
-				// transition already ran): the halt mark has nothing left
-				// to guard.
-				if _, worker := l.entries[taskID]; !worker {
-					delete(l.halted, taskID)
-				}
+			sessions := l.inProcess[taskID]
+			delete(sessions, id)
+			if len(sessions) > 0 {
 				return
 			}
-			l.inProcess[taskID]--
+			delete(l.inProcess, taskID)
+			// The task's last in-process session is over (its terminal
+			// transition already ran): the halt mark has nothing left to
+			// guard.
+			if _, worker := l.entries[taskID]; !worker {
+				delete(l.halted, taskID)
+			}
 		})
 	}
+}
+
+// CancelInProcess calls the cancel func of every open in-process session
+// of taskID (BeginInProcessCancelable) and returns how many it called. The
+// sessions stay registered until their own end func runs - they are still
+// winding down. The halt executor calls it after the user_halted
+// transition, so a session that wakes on ctx.Done and re-reads tasks.status
+// sees user_halted.
+func (l *LiveRegistry) CancelInProcess(taskID string) int {
+	l.mu.RLock()
+	var cancels []context.CancelFunc
+	for _, c := range l.inProcess[taskID] {
+		if c != nil {
+			cancels = append(cancels, c)
+		}
+	}
+	l.mu.RUnlock()
+	for _, c := range cancels {
+		c()
+	}
+	return len(cancels)
 }
 
 // IsLive implements LiveChecker: a worker kahyad spawned for taskID is
@@ -169,7 +211,7 @@ func (l *LiveRegistry) IsLive(taskID string) bool {
 	if _, ok := l.entries[taskID]; ok {
 		return true
 	}
-	return l.inProcess[taskID] > 0
+	return len(l.inProcess[taskID]) > 0
 }
 
 // PID returns taskID's live worker pid, if any - `kahya task show <id>`'s
