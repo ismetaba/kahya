@@ -830,11 +830,19 @@ a cloud model, without changing anything in §2-§6 above:
   matches every alias (local view). CLI: `kahya fact list [--quarantined]
   [--entity <ad|id>] [--since T] [--limit N]` (`"Olgular (%d):"`,
   `"#%d  %s | %s | %s  (p=%.2f, %s%s)  ← %s"`, `"Olgu yok."`), `kahya fact
-  confirm <id>... | --episode <id> | --all-quarantined --since T [--yes]`
-  (one id keeps `"Olgu onaylandı: %d"`, otherwise `"%d olgu onaylandı."`;
-  `--all-quarantined` without `--since` is a usage error, without `--yes`
-  it only lists and prints `"%d olgu onaylanacak; devam için komutu --yes
-  ile tekrarla."`), `kahya fact deny <id>...` (`"Olgu reddedildi (güven
+  confirm <id>... | --episode <id> | --all-quarantined --since T [--upto N
+  --yes]` (one id keeps `"Olgu onaylandı: %d"`, otherwise `"%d olgu
+  onaylandı."`; `--all-quarantined` without `--since` is a usage error,
+  without `--yes` it only lists and prints `"%d olgu onaylanacak; devam
+  için komutu --yes ile tekrarla."` followed by `"Yalnız bu listeyi
+  onaylamak için: kahya fact confirm --all-quarantined --since %s --upto %d
+  --yes"` (%d = the largest listed fact id); `--yes` needs `--upto` (usage
+  error 2 `"--yes için --upto <id> zorunlu (listeyi gördükten sonra
+  eklenen olgular onaylanmasın)."`), sends `all_quarantined_max_id` and
+  prints `"Onaylananlar: #12, #9"` - fact ids only grow, so `--yes`
+  confirms only facts the dry run listed (FIX-FINAL TUX-2; the route 400s a
+  negative max id or one without `all_quarantined_since`)), `kahya fact
+  deny <id>...` (`"Olgu reddedildi (güven
   düşürüldü): %d"` / `"%d olgu reddedildi."`); a failed id is one stderr
   line and exit 1. No "N confirmations => auto-inject" shortcut exists
   (decision MEM-5.a). **Ingested tiers (FIX-MEM-6 phase 0, decision

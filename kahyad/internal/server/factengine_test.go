@@ -542,3 +542,29 @@ func TestFactReviewRoutesRefuseLiveWorker(t *testing.T) {
 		t.Fatalf("negative evidence = %d (%v), want 0", neg, err)
 	}
 }
+
+// TestFactConfirmRouteAllQuarantinedMaxIDExcludesLaterFact (FIX-FINAL
+// TUX-2): `--all-quarantined --since S --yes` re-resolved the window at
+// --yes time, so a fact extracted after the dry run listing was confirmed
+// unseen. all_quarantined_max_id bounds the window to what the dry run
+// listed (ids only grow): the later fact stays quarantined. A negative
+// bound, or one without all_quarantined_since, is a 400.
+func TestFactConfirmRouteAllQuarantinedMaxIDExcludesLaterFact(t *testing.T) {
+	client, fe, _ := newEntityRouteFixture(t, true)
+	listed := agentFact(t, fe, "Emre", "Acme", 0)
+	later := agentFact(t, fe, "Ayla", "Beta", 0) // written after the dry run listed `listed`
+	for _, body := range []string{`{"all_quarantined_since":"2000-01-01T00:00:00Z","all_quarantined_max_id":-1}`, fmt.Sprintf(`{"fact_ids":[%d],"all_quarantined_max_id":%d}`, listed, listed)} {
+		var res bulkFactResponse
+		if status := postFactJSON(t, client, "/v1/fact/confirm", body, &res); status != http.StatusBadRequest {
+			t.Fatalf("%s = %d %+v, want 400", body, status, res)
+		}
+	}
+	var res bulkFactResponse
+	body := fmt.Sprintf(`{"all_quarantined_since":"2000-01-01T00:00:00Z","all_quarantined_max_id":%d}`, listed)
+	if status := postFactJSON(t, client, "/v1/fact/confirm", body, &res); status != http.StatusOK || !res.OK {
+		t.Fatalf("status = %d %+v", status, res)
+	}
+	if !reflect.DeepEqual(res.Confirmed, []int64{listed}) || confirmedAt(t, fe, later) {
+		t.Fatalf("confirmed = %v, want only the listed %d (the later %d stays quarantined)", res.Confirmed, listed, later)
+	}
+}

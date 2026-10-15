@@ -42,7 +42,7 @@ type FactEngineRunner interface {
 	DenyFact(ctx context.Context, traceID string, factID int64, sessionID string) error
 	ListFacts(ctx context.Context, q factengine.FactListQuery) ([]factengine.FactListItem, bool, error)
 	FactIDsByEpisode(ctx context.Context, episodeID int64) ([]int64, error)
-	QuarantinedFactIDsSince(ctx context.Context, since time.Time) ([]int64, error)
+	QuarantinedFactIDsSinceThrough(ctx context.Context, since time.Time, maxID int64) ([]int64, error)
 }
 
 var _ FactEngineRunner = (*factengine.Engine)(nil)
@@ -74,6 +74,10 @@ type factConfirmRequest struct {
 	EpisodeID           int64   `json:"episode_id"`
 	AllQuarantined      bool    `json:"all_quarantined"`
 	AllQuarantinedSince string  `json:"all_quarantined_since"`
+	// AllQuarantinedMaxID > 0 bounds all_quarantined_since above: only facts
+	// with id <= it are confirmed - the largest id the dry run listed
+	// (FIX-FINAL TUX-2). Only with all_quarantined_since.
+	AllQuarantinedMaxID int64 `json:"all_quarantined_max_id"`
 }
 
 // factDenyRequest is POST /v1/fact/deny's body: {"fact_id": N} or
@@ -125,6 +129,10 @@ func (s *Server) handleFactConfirm(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "give exactly one of fact_id, fact_ids, episode_id, all_quarantined_since")
 		return
 	}
+	if req.AllQuarantinedMaxID < 0 || (req.AllQuarantinedMaxID != 0 && req.AllQuarantinedSince == "") {
+		writeJSONError(w, http.StatusBadRequest, "all_quarantined_max_id must be a positive integer, given with all_quarantined_since")
+		return
+	}
 	traceID := traceIDFromContext(r)
 	ctx := r.Context()
 	if req.FactID != 0 {
@@ -156,7 +164,7 @@ func (s *Server) handleFactConfirm(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "all_quarantined_since must be RFC3339")
 			return
 		}
-		ids, err = s.factEngine.QuarantinedFactIDsSince(ctx, since)
+		ids, err = s.factEngine.QuarantinedFactIDsSinceThrough(ctx, since, req.AllQuarantinedMaxID)
 	}
 	if err != nil {
 		writeFactSelectionError(w, err)

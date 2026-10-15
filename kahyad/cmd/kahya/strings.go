@@ -679,6 +679,16 @@ const (
 	MsgFactConfirmAllPrompt     = "%d olgu onaylanacak; devam için komutu --yes ile tekrarla."
 	MsgFactDenied               = "Olgu reddedildi (güven düşürüldü): %d"
 	MsgFactDeniedMany           = "%d olgu reddedildi."
+	// MsgFactConfirmAllUpto follows the dry run's prompt (FIX-FINAL TUX-2):
+	// the exact command that confirms only the listed facts (%s = the
+	// --since bound, %d = the largest listed fact id).
+	MsgFactConfirmAllUpto = "Yalnız bu listeyi onaylamak için: kahya fact confirm --all-quarantined --since %s --upto %d --yes"
+	// MsgFactConfirmAllNeedsUpto refuses --yes without --upto: otherwise a
+	// fact written after the review would be confirmed unseen.
+	MsgFactConfirmAllNeedsUpto = "--yes için --upto <id> zorunlu (listeyi gördükten sonra eklenen olgular onaylanmasın)."
+	// MsgFactConfirmedIDs lists what --all-quarantined --yes confirmed (%s =
+	// "#12, #13").
+	MsgFactConfirmedIDs = "Onaylananlar: %s"
 	// MsgFactEvidenceUnknown stands in for a fact no evidence row ties to a
 	// memory note.
 	MsgFactEvidenceUnknown = "-"

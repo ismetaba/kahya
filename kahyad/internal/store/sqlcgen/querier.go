@@ -615,6 +615,9 @@ type Querier interface {
 	// - created at or after created_since, newest first. created_since is
 	// compared as text: the caller passes a UTC "YYYY-MM-DDTHH:MM:SS" prefix
 	// ('' = no bound), which orders correctly against the stored RFC3339Nano.
+	// max_id > 0 keeps only ids at or below it (fact ids only grow): `kahya
+	// fact confirm --all-quarantined --since S --upto N --yes` confirms only
+	// what the dry run listed (FIX-FINAL TUX-2); 0 = no upper bound.
 	ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedFactsParams) ([]Fact, error)
 	// Every tool_calls row for task_id still stuck at 'intent'/'executing' -
 	// i.e. a side-effectful call whose kahyad-side execution was interrupted

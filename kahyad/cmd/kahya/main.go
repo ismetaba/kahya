@@ -695,13 +695,15 @@ func factQueryValidity(from, to string) string {
 }
 
 // runFactConfirm implements `kahya fact confirm <id> [<id>...] | --episode
-// <id> | --all-quarantined --since <RFC3339> [--yes]`: lifts facts'
-// quarantine (kahyad/internal/factengine.Engine.ConfirmFact, one ledger row
-// each) - the human confirmation half of HANDOFF S5 memory #1. One id keeps
-// the W5-04 answer line; several ids, an episode or the quarantined window
-// print the count. --all-quarantined without --yes only lists what it would
-// confirm (the user sees every fact before confirming it); without --since
-// it is refused outright.
+// <id> | --all-quarantined --since <RFC3339> [--upto <id> --yes]`: lifts
+// facts' quarantine (kahyad/internal/factengine.Engine.ConfirmFact, one
+// ledger row each) - the human confirmation half of HANDOFF S5 memory #1.
+// One id keeps the W5-04 answer line; several ids, an episode or the
+// quarantined window print the count. --all-quarantined without --yes only
+// lists what it would confirm and the exact --upto command (the user sees
+// every fact before confirming it); --yes requires that --upto, the largest
+// listed id, so a fact written after the review is never confirmed unseen
+// (FIX-FINAL TUX-2); without --since it is refused outright.
 func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fact confirm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -709,7 +711,8 @@ func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int
 	episode := fs.Int64("episode", 0, "bu bölümün (episode id) kanıtladığı tüm olguları onayla")
 	allQuarantined := fs.Bool("all-quarantined", false, "--since tarihinden beri kaydedilen tüm onaysız olguları onayla")
 	since := fs.String("since", "", "RFC3339: --all-quarantined için alt sınır (zorunlu)")
-	yes := fs.Bool("yes", false, "listelenen onaysız olguları gerçekten onayla (önce --yes olmadan çalıştırıp listeyi gör)")
+	yes := fs.Bool("yes", false, "listelenen onaysız olguları gerçekten onayla (önce --yes olmadan çalıştırıp listeyi gör; --upto ile)")
+	upto := fs.Int64("upto", 0, "--all-quarantined --yes için üst sınır: yalnız listede gördüğün en büyük olgu kimliğine kadar onayla")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -720,7 +723,7 @@ func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int
 			selectors++
 		}
 	}
-	if !ok || selectors != 1 || *episode < 0 || (!*allQuarantined && (*since != "" || *yes)) {
+	if !ok || selectors != 1 || *episode < 0 || *upto < 0 || (!*allQuarantined && (*since != "" || *yes || *upto != 0)) {
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
@@ -752,15 +755,36 @@ func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int
 			}
 			if len(rows) > 0 {
 				fmt.Fprintf(stdout, MsgFactConfirmAllPrompt+"\n", len(rows))
+				var maxID int64
+				for _, r := range rows {
+					maxID = max(maxID, r.FactID)
+				}
+				fmt.Fprintf(stdout, MsgFactConfirmAllUpto+"\n", bound, maxID)
 			}
 			return 0
 		}
-		res, err := client.ConfirmFacts(ctx, trace, nil, 0, bound)
+		// FIX-FINAL TUX-2: --yes confirms only what the dry run listed. The
+		// dry run's --upto is its largest fact id; fact ids only grow, so a
+		// fact extracted or ingested after the review is never confirmed
+		// unseen.
+		if *upto == 0 {
+			fmt.Fprintln(stderr, MsgFactConfirmAllNeedsUpto)
+			return 2
+		}
+		res, err := client.ConfirmFactsThrough(ctx, trace, bound, *upto)
 		if err != nil {
 			fmt.Fprintln(stderr, wrapServerError(MsgFactConfirmFailed, err))
 			return 2
 		}
-		return printFactBulk(stdout, stderr, MsgFactConfirmedMany, res.Confirmed, res.Failed)
+		code := printFactBulk(stdout, stderr, MsgFactConfirmedMany, res.Confirmed, res.Failed)
+		if len(res.Confirmed) > 0 {
+			done := make([]string, 0, len(res.Confirmed))
+			for _, id := range res.Confirmed {
+				done = append(done, "#"+strconv.FormatInt(id, 10))
+			}
+			fmt.Fprintf(stdout, MsgFactConfirmedIDs+"\n", strings.Join(done, ", "))
+		}
+		return code
 	default:
 		res, err := client.ConfirmFacts(ctx, trace, ids, *episode, "")
 		if err != nil {

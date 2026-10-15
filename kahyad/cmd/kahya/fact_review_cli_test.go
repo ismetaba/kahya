@@ -18,6 +18,8 @@ type factReviewFake struct {
 	denyBody    map[string]any
 	listRows    []map[string]any
 	truncated   bool
+	// confirmAnswer, when set, is the bulk confirm route's answer.
+	confirmAnswer map[string]any
 }
 
 func (f *factReviewFake) handler() http.Handler {
@@ -31,6 +33,10 @@ func (f *factReviewFake) handler() http.Handler {
 		json.NewDecoder(r.Body).Decode(&f.confirmBody)
 		if id, ok := f.confirmBody["fact_id"]; ok {
 			json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
+			return
+		}
+		if f.confirmAnswer != nil {
+			json.NewEncoder(w).Encode(f.confirmAnswer)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "confirmed": []int64{12, 13}, "failed": map[string]string{"14": "factengine: fact not found: 14"}})
@@ -117,22 +123,35 @@ func TestFactConfirmAllQuarantinedWithoutSinceIsUsageError(t *testing.T) {
 }
 
 // TestFactConfirmAllQuarantinedListsThenNeedsYes: without --yes the window
-// is only listed with the prompt (nothing confirmed); with --yes the same
-// bound is confirmed.
+// is only listed with the prompt and the exact --upto command (nothing
+// confirmed); --yes needs that --upto (FIX-FINAL TUX-2: a fact written
+// after the review must never be confirmed unseen) and sends it as
+// all_quarantined_max_id, printing the confirmed ids.
 func TestFactConfirmAllQuarantinedListsThenNeedsYes(t *testing.T) {
 	fake := &factReviewFake{listRows: []map[string]any{
 		{"fact_id": 12, "subject": "Emre", "predicate": "works_at", "object": "Acme", "source_tier": "agent_derived", "confidence_p": 0.4, "quarantined": true, "evidence_path": "inbox/a.md"},
-	}}
+		{"fact_id": 9, "subject": "Ayla", "predicate": "lives_in", "object": "Moda", "source_tier": "agent_derived", "confidence_p": 0.4, "quarantined": true},
+	}, confirmAnswer: map[string]any{"ok": true, "confirmed": []int64{12, 9}, "failed": map[string]string{}}}
 	code, out, _ := runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2026-10-01T00:00:00Z")
-	if code != 0 || !strings.HasSuffix(out, "1 olgu onaylanacak; devam için komutu --yes ile tekrarla.\n") || !strings.HasPrefix(out, "Olgular (1):\n#12  Emre") {
+	wantTail := "2 olgu onaylanacak; devam için komutu --yes ile tekrarla.\n" +
+		"Yalnız bu listeyi onaylamak için: kahya fact confirm --all-quarantined --since 2026-10-01T00:00:00Z --upto 12 --yes\n"
+	if code != 0 || !strings.HasSuffix(out, wantTail) || !strings.HasPrefix(out, "Olgular (2):\n#12  Emre") {
 		t.Fatalf("dry run = %d %q", code, out)
 	}
 	if fake.confirmBody != nil {
 		t.Fatalf("dry run confirmed %v", fake.confirmBody)
 	}
-	code, out, _ = runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2026-10-01T00:00:00Z", "--yes")
-	if code != 1 || out != "2 olgu onaylandı.\n" || fake.confirmBody["all_quarantined_since"] != "2026-10-01T00:00:00Z" {
-		t.Fatalf("--yes = %d %q body %v", code, out, fake.confirmBody)
+	code, out, errOut := runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2026-10-01T00:00:00Z", "--yes")
+	if code != 2 || out != "" || errOut != MsgFactConfirmAllNeedsUpto+"\n" || fake.confirmBody != nil {
+		t.Fatalf("--yes without --upto = %d %q %q body %v, want usage 2 and no request", code, out, errOut, fake.confirmBody)
+	}
+	code, out, _ = runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2026-10-01T00:00:00Z", "--upto", "12", "--yes")
+	if code != 0 || out != "2 olgu onaylandı.\nOnaylananlar: #12, #9\n" || fake.confirmBody["all_quarantined_since"] != "2026-10-01T00:00:00Z" || fake.confirmBody["all_quarantined_max_id"] != float64(12) {
+		t.Fatalf("--yes --upto 12 = %d %q body %v", code, out, fake.confirmBody)
+	}
+	fake.confirmBody = nil
+	if code, _, errOut := runFactCLI(t, fake, "fact", "confirm", "12", "--upto", "12"); code != 2 || !strings.Contains(errOut, MsgFactUsage) || fake.confirmBody != nil {
+		t.Fatalf("--upto without --all-quarantined = %d %q, want usage", code, errOut)
 	}
 	fake.truncated = true
 	fake.confirmBody = nil

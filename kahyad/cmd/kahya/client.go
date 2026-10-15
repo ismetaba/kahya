@@ -934,6 +934,13 @@ func (c *Client) ConfirmFacts(ctx context.Context, traceID string, ids []int64, 
 	return c.factBulk(ctx, traceID, "/v1/fact/confirm", body)
 }
 
+// ConfirmFactsThrough calls POST /v1/fact/confirm for every quarantined
+// fact created since since whose id is at most maxID - the largest id the
+// dry run listed (FIX-FINAL TUX-2).
+func (c *Client) ConfirmFactsThrough(ctx context.Context, traceID, since string, maxID int64) (factBulkResult, error) {
+	return c.factBulk(ctx, traceID, "/v1/fact/confirm", map[string]any{"all_quarantined_since": since, "all_quarantined_max_id": maxID})
+}
+
 // DenyFacts calls POST /v1/fact/deny with several ids (`kahya fact deny
 // <id> <id>...`).
 func (c *Client) DenyFacts(ctx context.Context, traceID string, ids []int64) (factBulkResult, error) {

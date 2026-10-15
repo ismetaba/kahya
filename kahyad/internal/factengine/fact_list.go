@@ -49,6 +49,11 @@ type FactListQuery struct {
 	// CreatedSince keeps facts created at or after it (second precision,
 	// inclusive).
 	CreatedSince time.Time
+	// MaxID > 0 keeps only facts whose id is at most MaxID (QuarantinedOnly
+	// only): fact ids only grow, so a confirm bounded by the largest id a
+	// dry run listed can only touch a subset of that listing (FIX-FINAL
+	// TUX-2).
+	MaxID int64
 	// EntityID / EntityName keep the facts linked to that entity as subject
 	// or object; a name matches every active entity whose folded alias key
 	// equals AliasKey(EntityName) (no such entity = no facts).
@@ -120,7 +125,14 @@ func (e *Engine) ListFacts(ctx context.Context, q FactListQuery) (items []FactLi
 // after since. More than MaxFactBatch is ErrFactBatchTooLarge - nothing is
 // returned, so a caller never confirms a silently cut set.
 func (e *Engine) QuarantinedFactIDsSince(ctx context.Context, since time.Time) ([]int64, error) {
-	facts, truncated, err := e.listFactRows(ctx, FactListQuery{QuarantinedOnly: true, CreatedSince: since}, MaxFactBatch)
+	return e.QuarantinedFactIDsSinceThrough(ctx, since, 0)
+}
+
+// QuarantinedFactIDsSinceThrough is QuarantinedFactIDsSince bounded above
+// by maxID (0 = no bound): `kahya fact confirm --all-quarantined --since S
+// --upto N --yes` confirms only facts the dry run listed (FIX-FINAL TUX-2).
+func (e *Engine) QuarantinedFactIDsSinceThrough(ctx context.Context, since time.Time, maxID int64) ([]int64, error) {
+	facts, truncated, err := e.listFactRows(ctx, FactListQuery{QuarantinedOnly: true, CreatedSince: since, MaxID: maxID}, MaxFactBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +182,7 @@ func (e *Engine) listFactRows(ctx context.Context, q FactListQuery, limit int) (
 	bound := createdSinceBound(q.CreatedSince)
 	var rows []sqlcgen.Fact
 	if q.QuarantinedOnly {
-		rows, err = e.store.ListQuarantinedFacts(ctx, sqlcgen.ListQuarantinedFactsParams{CreatedSince: bound, RowLimit: read})
+		rows, err = e.store.ListQuarantinedFacts(ctx, sqlcgen.ListQuarantinedFactsParams{CreatedSince: bound, MaxID: q.MaxID, RowLimit: read})
 	} else {
 		rows, err = e.store.ListActiveFactsCreatedSince(ctx, sqlcgen.ListActiveFactsCreatedSinceParams{CreatedSince: bound, RowLimit: read})
 	}

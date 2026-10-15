@@ -3788,12 +3788,14 @@ SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, i
 FROM facts
 WHERE status = 'active' AND source_tier NOT IN ('user_edit', 'user_asserted') AND confirmed_at IS NULL
   AND created_at >= ?1
+  AND (id <= ?2 OR ?2 = 0)
 ORDER BY id DESC
-LIMIT ?2
+LIMIT ?3
 `
 
 type ListQuarantinedFactsParams struct {
 	CreatedSince string `json:"created_since"`
+	MaxID        int64  `json:"max_id"`
 	RowLimit     int64  `json:"row_limit"`
 }
 
@@ -3804,8 +3806,11 @@ type ListQuarantinedFactsParams struct {
 // - created at or after created_since, newest first. created_since is
 // compared as text: the caller passes a UTC "YYYY-MM-DDTHH:MM:SS" prefix
 // (” = no bound), which orders correctly against the stored RFC3339Nano.
+// max_id > 0 keeps only ids at or below it (fact ids only grow): `kahya
+// fact confirm --all-quarantined --since S --upto N --yes` confirms only
+// what the dry run listed (FIX-FINAL TUX-2); 0 = no upper bound.
 func (q *Queries) ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedFactsParams) ([]Fact, error) {
-	rows, err := q.db.QueryContext(ctx, listQuarantinedFacts, arg.CreatedSince, arg.RowLimit)
+	rows, err := q.db.QueryContext(ctx, listQuarantinedFacts, arg.CreatedSince, arg.MaxID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
