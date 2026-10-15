@@ -629,6 +629,47 @@ a cloud model, without changing anything in §2-§6 above:
   duration_ms}` (the query text at debug only). The restore drill's
   `RunEquivalence` proves the chunk half only (`<olgular>` is facts-table
   state, not retrieval).
+- **Structured memory tools and filters (FIX-MEM-4, G13).** `/v1/mcp`
+  lists five memory tools. `memory_search` gains optional filters
+  (`since`/`until` RFC3339 on the note's first-index time, `source`
+  exact, `path_prefix` byte-exact, `entity_id` = notes an active fact about
+  that entity cites, `min_tier` on the lattice user_edit > user_asserted >
+  external_doc > screen > agent_derived), applied by
+  `search.Searcher.SearchFiltered` to the fused candidates BEFORE the
+  recency pool and the top-k cut (scores and the fusion identity are
+  unchanged); a filter against a searcher without it is refused
+  (`"memory_search: filtreli arama bu kurulumda kullanılamıyor"`), a bad
+  time too (`"memory_search: since/until RFC3339 olmalı"`); results echo
+  `episode_created_at` and `source`. Two new class-R tools read the fact
+  graph (`kahyad/internal/graph`, policy.yaml + policy.dev.yaml + the w4/w6
+  fixtures; `autonomy_bootstrap_levels` seeds both at L1 next to
+  `memory_search`): `entity_lookup {name, k?}` (folded-prefix match; aliases,
+  fact count, up to 5 injection-eligible top facts) and `fact_query
+  {subject?, predicate?, object?, entity_id?, since?, until?, as_of?,
+  known_as_of?, min_tier?, include_quarantined?, k?}` (subject/object
+  byte-exact, folded on a miss; `since`/`until` bound `valid_from`, `as_of`
+  = valid at that instant with an unknown bound open, `known_as_of` =
+  `created_at` at or before it; default only `factengine.InjectionEligible`
+  facts, `include_quarantined: true` (decision MEM-4.a) adds the hidden ones
+  labelled `quarantined: true` - a tool answer only, never written into
+  `<hafiza>` or a profile card, G00 H-6). Both always answer in the CLOUD
+  lane (the caller is a worker - a cloud session): no secret-path fact, no
+  fact without a resolvable citation, and only VISIBLE names (an alias only
+  a secret note carries is neither matched nor listed, a canonical name only
+  a secret note uses is replaced, secret facts are not counted). Deviation
+  from the recipe: the task's lane is not looked up (a secret-lane task's
+  worker gets the same filter). Unwired graph: `"graf katmanı bu kurulumda
+  kullanılamıyor"`. The user's LOCAL view is `kahya fact query [--subject S]
+  [--predicate P] [--object O] [--entity <id|ad>] [--as-of T]
+  [--known-as-of T] [--since T] [--until T] [--quarantined] [--limit N]` →
+  `GET /v1/fact/query?subject=&predicate=&object=&entity=&as_of=&known_as_of=&since=&until=&min_tier=&quarantined=1&limit=`
+  (a control route; local lane: secret-lane facts listed; 400 on a bad
+  time/tier/limit, 503 unwired) → `{"facts": [{fact_id, subject, predicate,
+  object, source_tier, evidentiality, confidence_p, quarantined, valid_from,
+  valid_to, known_since, quote, evidence, subject_entity_id,
+  object_entity_id}], "trace_id"}`, printed `"Olgular (%d):"` /
+  `"#%d  %s | %s | %s  (p=%.2f, %s%s%s)"` (e.g. `(p=0.80, user_asserted,
+  2026-05-01→, onaysız)`) / `"Eşleşen olgu yok."`.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,
@@ -1456,8 +1497,10 @@ server-side, so a raw value on the wire could only be presented to
 
 **First-run autonomy (`autonomy_bootstrap_levels`):** at boot kahyad seeds
 the configured `"tool/class/scope": level` rows (default
-`{"memory_search/R/global": 1}` — the assistant may read its own memory on
-a fresh install) **only where no `autonomy_state` row exists yet**, ledgered
+`{"memory_search/R/global": 1, "entity_lookup/R/global": 1,
+"fact_query/R/global": 1}` — the assistant may read its own memory, chunks
+and the G13 MEM-4 graph tools, on a fresh install) **only where no
+`autonomy_state` row exists yet**, ledgered
 `autonomy_bootstrapped`; an existing row — a demotion back to L0 included —
 is never touched (equivalent to one `kahya autonomy promote` per key on
 first boot). `{}` disables it.

@@ -36,6 +36,17 @@ tools:
     reversible: true
     undo: "git revert"
 
+  # G13 MEM-4: structured, read-only graph tools (entity_lookup /
+  # fact_query) - the answer is lane-filtered kahyad-side, never written
+  # anywhere.
+  - name: entity_lookup
+    class: R
+    reversible: false
+
+  - name: fact_query
+    class: R
+    reversible: false
+
   - name: fs_read
     class: R
     reversible: false

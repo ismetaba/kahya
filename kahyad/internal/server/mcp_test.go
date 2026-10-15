@@ -138,10 +138,10 @@ type jsonrpcToolCallResult struct {
 	} `json:"result"`
 }
 
-// ---- W12-05 acceptance: tools/list over /v1/mcp returns exactly three
-// tools. ----
+// ---- W12-05 acceptance: tools/list over /v1/mcp returns exactly the
+// memory tools - five since G13 MEM-4 (entity_lookup, fact_query). ----
 
-func TestMCPToolsListReturnsExactlyThreeTools(t *testing.T) {
+func TestMCPToolsListReturnsExactlyFiveTools(t *testing.T) {
 	f := newMCPTestFixture(t)
 
 	resp := postMCP(t, f.client, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
@@ -158,14 +158,14 @@ func TestMCPToolsListReturnsExactlyThreeTools(t *testing.T) {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		t.Fatalf("decode: %v\nbody=%s", err, body)
 	}
-	if len(parsed.Result.Tools) != 3 {
-		t.Fatalf("tools = %+v, want exactly 3", parsed.Result.Tools)
+	if len(parsed.Result.Tools) != 5 {
+		t.Fatalf("tools = %+v, want exactly 5", parsed.Result.Tools)
 	}
 	names := map[string]bool{}
 	for _, tool := range parsed.Result.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"memory_search", "memory_write", "memory_forget"} {
+	for _, want := range []string{"memory_search", "memory_write", "memory_forget", "entity_lookup", "fact_query"} {
 		if !names[want] {
 			t.Errorf("missing tool %q; got %+v", want, parsed.Result.Tools)
 		}

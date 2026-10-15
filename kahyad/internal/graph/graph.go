@@ -75,6 +75,11 @@ type Store interface {
 	ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.NullInt64) ([]sqlcgen.ListFactsCitingEpisodesRow, error)
 	ListFactsByEntityHop(ctx context.Context, arg sqlcgen.ListFactsByEntityHopParams) ([]sqlcgen.Fact, error)
 	GetFact(ctx context.Context, id int64) (sqlcgen.Fact, error)
+
+	// The structured reads (query.go, MEM-4).
+	ListEntitiesByFolded(ctx context.Context, arg sqlcgen.ListEntitiesByFoldedParams) ([]sqlcgen.ListEntitiesByFoldedRow, error)
+	ListEntityAliasesByEntity(ctx context.Context, entityID int64) ([]sqlcgen.EntityAlias, error)
+	CountActiveFactsForEntity(ctx context.Context, arg sqlcgen.CountActiveFactsForEntityParams) (int64, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -137,9 +142,12 @@ func (o Options) normalized() Options {
 }
 
 // Graph is the read-only graph layer. Lane is the ONE memory-side lane rule
-// (kahyad/main.go's laneClassifier); Log may be nil.
+// (kahyad/main.go's laneClassifier); DB is brain.db for the hand-written
+// structured fact query (query.go; the walk needs only Store); Log may be
+// nil.
 type Graph struct {
 	Store Store
+	DB    *sql.DB
 	Lane  memlane.Classifier
 	Log   *logx.Logger
 }

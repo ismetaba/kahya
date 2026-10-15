@@ -25,8 +25,8 @@ import (
 
 // testPolicyDoc is a small, hand-built policy.Policy covering every tool
 // name this package's tests exercise - memory_search/memory_write/
-// memory_forget (R/W1/W1) plus fs_write (W1) and mail_send (W3) for
-// engine-wiring coverage. Built directly (not via policy.Load) so tests
+// memory_forget (R/W1/W1), entity_lookup/fact_query (R, G13 MEM-4) plus
+// fs_write (W1) and mail_send (W3) for engine-wiring coverage. Built directly (not via policy.Load) so tests
 // don't depend on the repo-root policy.yaml's exact contents.
 func testPolicyDoc() policy.Policy {
 	tools := []policy.ToolRule{
@@ -35,6 +35,9 @@ func testPolicyDoc() policy.Policy {
 		// non-local surface may approve only a reversible tool.
 		{Name: "memory_write", Class: policy.ClassW1, Reversible: true, Undo: "git revert", ScopeKey: "global"},
 		{Name: "memory_forget", Class: policy.ClassW1, Reversible: true, Undo: "git revert", ScopeKey: "global"},
+		// G13 MEM-4's read-only graph tools (R, as in policy.yaml).
+		{Name: "entity_lookup", Class: policy.ClassR, ScopeKey: "global"},
+		{Name: "fact_query", Class: policy.ClassR, ScopeKey: "global"},
 		{Name: "fs_write", Class: policy.ClassW1, Reversible: true, Undo: "pre-op git checkpoint restore", ScopeKey: "global"},
 		{Name: "mail_send", Class: policy.ClassW3, ScopeKey: "global"},
 	}

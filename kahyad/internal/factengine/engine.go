@@ -776,6 +776,28 @@ func InjectionEligible(f sqlcgen.Fact) bool {
 	return TierInjectionEligible(f.SourceTier, f.ConfirmedAt.Valid)
 }
 
+// TierRank is the source-trust lattice's order (HANDOFF §5 memory #1):
+// user_edit 5 > user_asserted 4 > external_doc 3 > screen 2 >
+// agent_derived 1; ok is false for any other string. It is what a "min
+// tier" filter compares against (G13 MEM-4: memory_search / fact_query
+// min_tier).
+func TierRank(tier string) (rank int, ok bool) {
+	switch tier {
+	case TierUserEdit:
+		return 5, true
+	case TierUserAsserted:
+		return 4, true
+	case TierExternalDoc:
+		return 3, true
+	case TierScreen:
+		return 2, true
+	case TierAgentDerived:
+		return 1, true
+	default:
+		return 0, false
+	}
+}
+
 // TierInjectionEligible is the TIER-ONLY half of InjectionEligible
 // (HANDOFF S5 memory #1's quarantine rule alone, without the log-odds/
 // status halves that only a facts.Fact row carries) - reusable by any

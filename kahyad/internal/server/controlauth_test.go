@@ -264,6 +264,7 @@ var controlProbes = []controlProbe{
 	{http.MethodPost, "/v1/memory/extract", `{}`},
 	{http.MethodGet, "/v1/entity/list", ""},
 	{http.MethodGet, "/v1/entity/show/1", ""},
+	{http.MethodGet, "/v1/fact/query?predicate=works_at", ""},
 	{http.MethodGet, "/nope", ""},
 }
 

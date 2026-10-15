@@ -164,6 +164,9 @@ type Hit struct {
 	// when the note was first indexed) - the date the recency weight ages
 	// a chunk by (FIX-MEM-8).
 	EpisodeCreatedAt string
+	// Source is the owning episode's source ("memory_file", "external_doc",
+	// ...) - FIX-MEM-4's memory_search source filter and result field.
+	Source string
 }
 
 // Embedder is the query-embedding dependency Search's vector leg needs
@@ -217,6 +220,15 @@ func (s *Searcher) SetEmbedder(e Embedder, activeModelVer string) {
 // line carries query length, never the query itself (HANDOFF §4 ⚑ logging
 // invariant: this endpoint may see sensitive content).
 func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit, error) {
+	return s.SearchFiltered(ctx, traceID, q, k, Filter{})
+}
+
+// SearchFiltered is Search narrowed by f (FIX-MEM-4): the filter runs on the
+// fused candidate set BEFORE the recency re-rank and the top-k cut, so k
+// results survive it whenever enough candidates match. It never changes a
+// score or the fusion weights (HANDOFF §5 memory #5: the eval gate's
+// identity is untouched); a zero Filter is exactly Search.
+func (s *Searcher) SearchFiltered(ctx context.Context, traceID, q string, k int, f Filter) ([]Hit, error) {
 	start := time.Now()
 	log := s.log.With(traceID)
 
@@ -225,6 +237,10 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 	}
 	if k <= 0 {
 		k = DefaultK
+	}
+	allowedTiers, err := f.allowedTiers()
+	if err != nil {
+		return nil, err
 	}
 
 	log.Debug("memory_search_query", "query", q)
@@ -275,6 +291,15 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		}
 		return ids[i] > ids[j] // tie-break: chunks.id desc
 	})
+	// FIX-MEM-4: the filter narrows the whole fused candidate set first, so
+	// neither the recency pool below nor the k cut can starve it.
+	filtered := !f.IsZero()
+	if filtered {
+		ids, err = s.applyFilter(ctx, ids, f, allowedTiers)
+		if err != nil {
+			return nil, fmt.Errorf("search: filter: %w", err)
+		}
+	}
 	// FIX-MEM-8: the recency weight re-ranks the best candidates before the
 	// k cut. It is read from the DECLARED s.cfg, never from the local cfg a
 	// vector-leg degrade replaced above (EK-MEM-C).
@@ -302,6 +327,7 @@ func (s *Searcher) Search(ctx context.Context, traceID, q string, k int) ([]Hit,
 		"tri_scan_hits", scanHits,
 		"vec_hits", vecHits,
 		"recency_applied", recencyApplied,
+		"filtered", filtered,
 		"result_count", len(hits),
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
@@ -782,7 +808,7 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 		args[i] = id
 	}
 	query := fmt.Sprintf(`
-		SELECT c.id, c.episode_id, c.seq, c.text, e.source_path, e.source_tier, e.created_at
+		SELECT c.id, c.episode_id, c.seq, c.text, e.source_path, e.source_tier, e.created_at, e.source
 		FROM chunks c
 		JOIN episodes e ON e.id = c.episode_id
 		WHERE c.id IN (%s)`, strings.Join(placeholders, ","))
@@ -797,7 +823,7 @@ func (s *Searcher) loadHits(ctx context.Context, ids []int64, fused map[int64]fl
 	for rows.Next() {
 		var h Hit
 		var path, createdAt sql.NullString
-		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Seq, &h.Text, &path, &h.SourceTier, &createdAt); err != nil {
+		if err := rows.Scan(&h.ChunkID, &h.EpisodeID, &h.Seq, &h.Text, &path, &h.SourceTier, &createdAt, &h.Source); err != nil {
 			return nil, err
 		}
 		h.Path = path.String

@@ -263,6 +263,8 @@ func TestCommittedPolicyYAMLToolRegistrations(t *testing.T) {
 		"memory_search":   ClassR,
 		"memory_write":    ClassW1,
 		"memory_forget":   ClassW1,
+		"entity_lookup":   ClassR, // G13 MEM-4
+		"fact_query":      ClassR, // G13 MEM-4
 		"fs_read":         ClassR,
 		"fs_write":        ClassW1,
 		"fs_delete":       ClassW1,

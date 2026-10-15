@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -454,7 +455,8 @@ func wrapServerError(format string, err error) string {
 }
 
 // runFact implements `kahya fact confirm <id>` and `kahya fact retract
-// <özne> <yüklem> <nesne> [oturum_id]` (W5-04).
+// <özne> <yüklem> <nesne> [oturum_id]` (W5-04), and `kahya fact query ...`
+// (G13 MEM-4).
 func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, MsgFactUsage)
@@ -465,10 +467,86 @@ func runFact(client *Client, args []string, stdout, stderr io.Writer) int {
 		return runFactConfirm(client, args[1:], stdout, stderr)
 	case "retract":
 		return runFactRetract(client, args[1:], stdout, stderr)
+	case "query":
+		return runFactQuery(client, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, MsgFactUsage)
 		return 2
 	}
+}
+
+// runFactQuery implements `kahya fact query [--subject S] [--predicate P]
+// [--object O] [--entity <id|ad>] [--as-of RFC3339] [--known-as-of
+// RFC3339] [--since RFC3339] [--until RFC3339] [--quarantined] [--limit N]`
+// (G13 MEM-4 phase 4) over GET /v1/fact/query: the user's LOCAL view of
+// the fact graph (secret-lane facts included; quarantined ones only with
+// --quarantined, marked ", onaysız"). "What X knew about Y before May" is
+// --subject X --known-as-of 2026-05-01T00:00:00Z.
+func runFactQuery(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("fact query", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	subject := fs.String("subject", "", "özne (bayt-tam; yoksa büyük/küçük harf ve Türkçe I katlanmış eşitlik)")
+	predicate := fs.String("predicate", "", "yüklem, örn. works_at")
+	object := fs.String("object", "", "nesne")
+	entity := fs.String("entity", "", "varlık id'si ya da adı")
+	asOf := fs.String("as-of", "", "RFC3339: bu anda geçerli olan olgular")
+	knownAsOf := fs.String("known-as-of", "", "RFC3339: bu tarihte bilinen olgular")
+	since := fs.String("since", "", "RFC3339: geçerlilik başlangıcı bu tarihten sonra")
+	until := fs.String("until", "", "RFC3339: geçerlilik başlangıcı bu tarihten önce")
+	quarantined := fs.Bool("quarantined", false, "onaysız (karantinadaki) olguları da göster")
+	limit := fs.Int("limit", 0, "en fazla kaç olgu (varsayılan 20, en çok 100)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(stderr, MsgFactUsage)
+		return 2
+	}
+	v := url.Values{}
+	for key, val := range map[string]string{
+		"subject": *subject, "predicate": *predicate, "object": *object, "entity": *entity,
+		"as_of": *asOf, "known_as_of": *knownAsOf, "since": *since, "until": *until,
+	} {
+		if strings.TrimSpace(val) != "" {
+			v.Set(key, val)
+		}
+	}
+	if *quarantined {
+		v.Set("quarantined", "1")
+	}
+	if *limit != 0 {
+		v.Set("limit", strconv.Itoa(*limit))
+	}
+	facts, err := client.QueryFacts(context.Background(), traceid.New(), v)
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgFactQueryFailed, err))
+		return 2
+	}
+	if len(facts) == 0 {
+		fmt.Fprintln(stdout, MsgFactQueryNone)
+		return 0
+	}
+	fmt.Fprintf(stdout, MsgFactQueryHeader+"\n", len(facts))
+	for _, f := range facts {
+		suffix := ""
+		if f.Quarantined {
+			suffix = MsgEntityFactUnconfirmedSuffix
+		}
+		fmt.Fprintf(stdout, MsgFactQueryRow+"\n", f.FactID, f.Subject, f.Predicate, f.Object, f.ConfidenceP, f.SourceTier, factQueryValidity(f.ValidFrom, f.ValidTo), suffix)
+	}
+	return 0
+}
+
+// factQueryValidity is a fact row's validity part: "" when both bounds are
+// unknown, else ", <from>→<to>" with an unknown bound left empty and a
+// date-only bound (midnight UTC, as factengine stores it) shown as the
+// date - the same form as the <hafiza> block's <olgular> lines.
+func factQueryValidity(from, to string) string {
+	if from == "" && to == "" {
+		return ""
+	}
+	trim := func(s string) string { return strings.TrimSuffix(s, "T00:00:00Z") }
+	return ", " + trim(from) + "→" + trim(to)
 }
 
 // runFactConfirm implements `kahya fact confirm <id>`: lifts an

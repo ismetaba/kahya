@@ -635,6 +635,10 @@ func (s *Server) routeTable() []route {
 		// G13 MEM-2 phase 2: `kahya entity list|show` (factengine.go).
 		{"GET /v1/entity/list", h(s.handleEntityList)},
 		{"GET /v1/entity/show/{id}", h(s.handleEntityShow)},
+		// G13 MEM-4 phase 4: `kahya fact query` (memory_graph.go) - a GET-only
+		// literal path, so it never overlaps the any-method /v1/fact/confirm|
+		// retract patterns.
+		{"GET /v1/fact/query", h(s.handleFactQuery)},
 		{"/v1/remembered", h(s.handleRemembered)},
 		// W78-04: read-only metrics reporting over the events ledger (`kahya
 		// metrics`) - see metrics.go's own doc comment.

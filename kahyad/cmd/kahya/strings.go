@@ -622,4 +622,18 @@ const (
 	// MsgEntityQueryFailed wraps a kahyad-side failure of GET
 	// /v1/entity/list|show/{id} (the daemon's English detail).
 	MsgEntityQueryFailed = "Varlık sorgusu başarısız: %s"
+
+	// `kahya fact query` (G13 MEM-4 phase 4; header/none are the handbook's
+	// byte-exact texts). MsgFactQueryRow: fact id, subject, predicate,
+	// object, p, source tier, then factQueryValidity's ", <from>→<to>" (or
+	// "") and MsgEntityFactUnconfirmedSuffix (or "") - so the handbook's
+	// "(p=0.80, user_asserted, 2026-05-01→, onaysız)" renders byte-exact and
+	// a fact with no validity window gets no dangling ", ".
+	MsgFactQueryHeader = "Olgular (%d):"
+	MsgFactQueryNone   = "Eşleşen olgu yok."
+	MsgFactQueryRow    = "#%d  %s | %s | %s  (p=%.2f, %s%s%s)"
+	// MsgFactQueryFailed wraps a kahyad-side failure of GET /v1/fact/query
+	// (a bad RFC3339 time, an unknown tier, a store error - the daemon's
+	// English detail).
+	MsgFactQueryFailed = "Olgu sorgusu başarısız: %s"
 )

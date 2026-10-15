@@ -41,7 +41,7 @@ func newGraphFixture(t *testing.T) graphFixture {
 	f := newMCPTestFixtureWith(t, testPolicyDoc(), func(srv *Server, st *store.Store) {
 		lane = memlane.Classifier{Store: st.Queries, MemoryDir: srv.mcpMemoryDir, SecretGlobs: []string{filepath.Join(srv.mcpMemoryDir, "finans*.md")}, Matcher: ritual.PolicyGlobMatcher{}}
 		srv.SetMemoryLane(&lane)
-		srv.SetGraph(&graph.Graph{Store: st.Queries, Lane: lane})
+		srv.SetGraph(&graph.Graph{Store: st.Queries, DB: st.DB(), Lane: lane})
 		srv.cfg.HafizaGraphEnabled = true
 		srv.cfg.HafizaGraphHops = 1
 	})
@@ -191,6 +191,14 @@ func (g *fakeGraph) Neighbourhood(_ context.Context, _, q string, eps []int64, o
 	g.calls++
 	g.q, g.eps, g.opts = q, eps, opts
 	return g.lines, g.ents, g.err
+}
+
+func (g *fakeGraph) LookupEntities(context.Context, string, string, int, bool) ([]graph.EntityRecord, error) {
+	return nil, errors.New("fakeGraph: no entities")
+}
+
+func (g *fakeGraph) QueryFacts(context.Context, string, graph.FactQuery) ([]graph.FactRecord, error) {
+	return nil, errors.New("fakeGraph: no facts")
 }
 
 func graphLines(n int) []graph.FactLine {

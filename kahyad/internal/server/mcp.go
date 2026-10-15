@@ -3,9 +3,10 @@
 // enforcement plane: "Baglayici politika karari kahyad'da verilir" - never
 // in the worker's can_use_tool early-reject callback).
 //
-// All THREE tool handlers (memory_search/memory_write/memory_forget) live
-// in kahya/mcp/memory, compiled into this binary but outside the
-// kahyad/internal/* import boundary (see that package's doc comment).
+// All five memory tool handlers (memory_search/memory_write/memory_forget,
+// and FIX-MEM-4's entity_lookup/fact_query) live in kahya/mcp/memory,
+// compiled into this binary but outside the kahyad/internal/* import
+// boundary (see that package's doc comment).
 // This file is the seam: it adapts this package's own concrete
 // search/indexer/ledger types to the narrow interfaces mcp/memory.Server
 // depends on, wraps the resulting *mcp.Server with the interim policy
@@ -16,11 +17,13 @@ package server
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
+	"kahya/kahyad/internal/search"
 	"kahya/kahyad/internal/task"
 	"kahya/kahyad/internal/traceid"
 	"kahya/mcp/memory"
@@ -111,21 +114,75 @@ func (a mcpSearchAdapter) Search(ctx context.Context, traceID, query string, k i
 	if err != nil {
 		return nil, err
 	}
+	return a.toMemoryHits(hits), nil
+}
+
+// FilteredSearcher is the optional filtered search (FIX-MEM-4,
+// kahyad/internal/search.Searcher.SearchFiltered) the memory_search tool's
+// filter arguments need.
+type FilteredSearcher interface {
+	SearchFiltered(ctx context.Context, traceID, query string, k int, f search.Filter) ([]search.Hit, error)
+}
+
+var _ FilteredSearcher = (*search.Searcher)(nil)
+
+// SearchFiltered implements mcp/memory.FilteredSearcher (FIX-MEM-4): the
+// tool's filter is converted to search.Filter (since/until were validated
+// RFC3339 by mcp/memory) and run by the wired searcher; one without
+// SearchFiltered answers memory.ErrFilterUnsupported. The secret-path drop
+// applies exactly as for Search.
+func (a mcpSearchAdapter) SearchFiltered(ctx context.Context, traceID, query string, k int, f memory.SearchFilter) ([]memory.Hit, error) {
+	fs, ok := a.inner.(FilteredSearcher)
+	if !ok {
+		return nil, memory.ErrFilterUnsupported
+	}
+	sf := search.Filter{Source: f.Source, PathPrefix: f.PathPrefix, EntityID: f.EntityID, MinTier: f.MinTier}
+	var err error
+	if sf.Since, err = parseFilterTime(f.Since); err != nil {
+		return nil, err
+	}
+	if sf.Until, err = parseFilterTime(f.Until); err != nil {
+		return nil, err
+	}
+	hits, err := fs.SearchFiltered(ctx, traceID, query, k, sf)
+	if err != nil {
+		return nil, err
+	}
+	return a.toMemoryHits(hits), nil
+}
+
+func parseFilterTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, memory.ErrFilterBadTime
+	}
+	return t, nil
+}
+
+// toMemoryHits converts the ranked hits, dropping every secret-path note
+// (FIX-U-3).
+func (a mcpSearchAdapter) toMemoryHits(hits []search.Hit) []memory.Hit {
 	out := make([]memory.Hit, 0, len(hits))
 	for _, h := range hits {
 		if a.lane != nil && a.lane.PathIsSecret(h.Path) {
 			continue
 		}
-		out = append(out, memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier})
+		out = append(out, memory.Hit{
+			ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier,
+			EpisodeCreatedAt: h.EpisodeCreatedAt, Source: h.Source,
+		})
 	}
-	return out, nil
+	return out
 }
 
 // buildMCPHandler constructs the /v1/mcp route's http.Handler once (called
 // from Prepare()): if the memory tools have not been fully wired
 // (SetSearcher and SetMCPMemory), it answers 503 like every other
 // not-yet-wired route in this package; otherwise it builds mcp/memory's
-// three tools, installs the binding policy gate (policyGateMiddleware) as
+// five tools, installs the binding policy gate (policyGateMiddleware) as
 // MCP receiving middleware - so it runs on EVERY tools/call before any
 // tool handler executes, regardless of transport - and mounts the result
 // via the pinned official MCP Go SDK's stateless, JSON-response
@@ -150,6 +207,11 @@ func (s *Server) buildMCPHandler() http.Handler {
 	// lands; a secret hit is redirected under the secret-lane memory dir and
 	// escalates the attributed task's lane (memory_lane.go).
 	memSrv.SetSecretLaneSeam(s.mcpSecretLane)
+	// FIX-MEM-4: entity_lookup / fact_query read the graph layer, always in
+	// the cloud lane (mcpGraphAdapter). Unwired = ErrGraphUnavailable.
+	if s.graph != nil {
+		memSrv.SetGraph(mcpGraphAdapter{g: s.graph})
+	}
 	mcpServer := memSrv.MCPServer(nil)
 	// W3-03: fs_read/fs_write/fs_delete, registered onto this SAME shared
 	// server (one MCP session/tool surface for the worker) - see

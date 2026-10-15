@@ -435,9 +435,10 @@ func run() int {
 	srv.SetApprovalWait(time.Duration(cfg.ApprovalWaitSeconds) * time.Second)
 	policyEngine.SetApprovalDecidedHook(srv.ApprovalDecided)
 	// B-1, owner decision G01-2 option A: config autonomy_bootstrap_levels
-	// (default memory_search/R/global -> L1) seeds autonomy_state rows only
-	// where none exist yet - a first-run promotion, ledgered as
-	// autonomy_bootstrapped, never an override of an earned/demoted level.
+	// (default memory_search, entity_lookup, fact_query /R/global -> L1)
+	// seeds autonomy_state rows only where none exist yet - a first-run
+	// promotion, ledgered as autonomy_bootstrapped, never an override of an
+	// earned/demoted level.
 	// Skipped in deny-all mode (nothing may be decided from a policy that
 	// failed to load).
 	if !srv.DenyAll() {
@@ -624,10 +625,13 @@ func run() int {
 	srv.SetMemoryLane(&laneClassifier)
 	// G13 MEM-1: the retrieval graph layer - the for_injection <hafiza>
 	// block's <olgular> section (config hafiza_graph_enabled, decision
-	// MEM-1.a: on, one hop). Read-only over brain.db; every fact passes
-	// factengine.InjectionEligible and, this block being cloud-bound,
-	// laneClassifier (a secret-path fact never enters it).
-	graphReader := &graph.Graph{Store: st.Queries, Lane: laneClassifier, Log: log}
+	// MEM-1.a: on, one hop) - and MEM-4's entity_lookup / fact_query MCP
+	// tools (always the cloud lane) and GET /v1/fact/query (local CLI).
+	// Read-only over brain.db; every cloud-bound fact passes
+	// factengine.InjectionEligible (fact_query's labelled
+	// include_quarantined aside, decision MEM-4.a) and laneClassifier (a
+	// secret-path fact never leaves the machine).
+	graphReader := &graph.Graph{Store: st.Queries, DB: st.DB(), Lane: laneClassifier, Log: log}
 	srv.SetGraph(graphReader)
 	srv.SetMCPMemorySecretLane(memory.SecretLaneSeam{
 		Classifier: server.NewMemoryContentClassifier(),

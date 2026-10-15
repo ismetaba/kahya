@@ -224,8 +224,10 @@ type Config struct {
 	// user running `kahya autonomy promote` once per key on first boot,
 	// ledgered as autonomy_bootstrapped; an existing row, a demotion to L0
 	// included, is never overridden). Default
-	// {"memory_search/R/global": 1} so the assistant can read its own
-	// memory on a fresh install; set to {} to disable.
+	// DefaultAutonomyBootstrapLevels(): memory_search, entity_lookup and
+	// fact_query (the read-only memory tools, class R) at L1, so the
+	// assistant can read its own memory on a fresh install; set to {} to
+	// disable.
 	AutonomyBootstrapLevels map[string]int `yaml:"autonomy_bootstrap_levels"`
 
 	// --- W12-08 cost governor (HANDOFF S4 flag, verbatim defaults) ---
@@ -1405,6 +1407,20 @@ func validateSearchRecency(weight float64, halfLifeDays int) error {
 	return nil
 }
 
+// DefaultAutonomyBootstrapLevels is autonomy_bootstrap_levels' default
+// (B-1, owner decision G01-2 option A): the assistant's read-only memory
+// tools start at L1 - memory_search, and G13 MEM-4's entity_lookup and
+// fact_query (class R, the same memory surface, lane-filtered kahyad-side;
+// joining them keeps the recipe's "R -> Check allow" for the graph tools
+// without a standing ladder exception). A fresh map per call.
+func DefaultAutonomyBootstrapLevels() map[string]int {
+	return map[string]int{
+		"memory_search/R/global": 1,
+		"entity_lookup/R/global": 1,
+		"fact_query/R/global":    1,
+	}
+}
+
 // G13 MEM-1 <hafiza> graph-layer defaults (decision MEM-1.a) and bounds.
 // The defaults equal kahya/mcp/memory.MaxFactLines/MaxFactsRunes and
 // MaxHafizaFactsMaxRunes equals memory.MaxBlockRunes (the whole block's
@@ -1553,7 +1569,7 @@ func defaults(home, env string) Config {
 		HafizaFactsMaxRunes: DefaultHafizaFactsMaxRunes,
 		// B-1 approval loop defaults (config.Config's own doc comments).
 		ApprovalWaitSeconds:     300,
-		AutonomyBootstrapLevels: map[string]int{"memory_search/R/global": 1},
+		AutonomyBootstrapLevels: DefaultAutonomyBootstrapLevels(),
 		Env:                     env,
 		WorkerCmd:               defaultWorkerCmd(),
 		EmbedCmd:                defaultEmbedCmd(),

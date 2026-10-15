@@ -1471,15 +1471,16 @@ func TestLoadApprovalWaitSecondsValidation(t *testing.T) {
 }
 
 // TestLoadAutonomyBootstrapLevels (B-1, owner decision G01-2 option A): the
-// default seeds memory_search/R/global at L1; config.yaml can replace the
-// map or disable it with {}.
+// default seeds the read-only memory tools (memory_search, and G13 MEM-4's
+// entity_lookup / fact_query) at L1; config.yaml can replace the map or
+// disable it with {}.
 func TestLoadAutonomyBootstrapLevels(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		yaml string
 		want map[string]int
 	}{
-		{"default", "", map[string]int{"memory_search/R/global": 1}},
+		{"default", "", map[string]int{"memory_search/R/global": 1, "entity_lookup/R/global": 1, "fact_query/R/global": 1}},
 		{"disabled", "autonomy_bootstrap_levels: {}\n", map[string]int{}},
 		{"replaced", "autonomy_bootstrap_levels:\n  fs_read/R/global: 1\n", map[string]int{"fs_read/R/global": 1}},
 	} {

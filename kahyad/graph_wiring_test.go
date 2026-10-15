@@ -17,6 +17,7 @@ func TestGraphReaderWiredWithLaneClassifier(t *testing.T) {
 	g := onlyCompositeLit(t, "graph", "Graph")
 	for field, want := range map[string]string{
 		"Store": "st.Queries",
+		"DB":    "st.DB()",
 		"Lane":  "laneClassifier",
 		"Log":   "log",
 	} {

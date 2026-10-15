@@ -1018,6 +1018,36 @@ func (c *Client) getEntityJSON(ctx context.Context, traceID, path string, out an
 	return nil
 }
 
+// factQueryRow mirrors kahyad's GET /v1/fact/query fact item
+// (kahyad/internal/server.factQueryItem, G13 MEM-4).
+type factQueryRow struct {
+	FactID      int64   `json:"fact_id"`
+	Subject     string  `json:"subject"`
+	Predicate   string  `json:"predicate"`
+	Object      string  `json:"object"`
+	SourceTier  string  `json:"source_tier"`
+	ConfidenceP float64 `json:"confidence_p"`
+	Quarantined bool    `json:"quarantined"`
+	ValidFrom   string  `json:"valid_from"`
+	ValidTo     string  `json:"valid_to"`
+	KnownSince  string  `json:"known_since"`
+}
+
+// QueryFacts calls GET /v1/fact/query?<params> (`kahya fact query`).
+func (c *Client) QueryFacts(ctx context.Context, traceID string, params url.Values) ([]factQueryRow, error) {
+	path := "/v1/fact/query"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	var out struct {
+		Facts []factQueryRow `json:"facts"`
+	}
+	if err := c.getEntityJSON(ctx, traceID, path, &out); err != nil {
+		return nil, err
+	}
+	return out.Facts, nil
+}
+
 // memoryExtractResult mirrors kahyad's POST /v1/memory/extract JSON body
 // (kahyad/internal/server.memoryExtractResponse, G13 MEM-3).
 type memoryExtractResult struct {

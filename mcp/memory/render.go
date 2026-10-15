@@ -73,6 +73,10 @@ type Hit struct {
 	// BEFORE hits ever reach Render, so a caller that forgets to filter
 	// gets an uncensored block rather than a silently-wrong one.
 	SourceTier string
+	// EpisodeCreatedAt / Source are the owning episode's created_at and
+	// source (memory_search's FIX-MEM-4 result fields); Render ignores them.
+	EpisodeCreatedAt string
+	Source           string
 }
 
 // Render formats hits into the exact <hafiza> injection block (W12-05 step

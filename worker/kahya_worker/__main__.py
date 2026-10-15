@@ -117,7 +117,7 @@ _CLOUD_UNREACHABLE_FALLBACK_MARKERS = (
 # tainted KAHYA_TRACE_ID value itself.
 _SAFE_TRACE_ID_PLACEHOLDER = "redacted"
 
-# The exact 3 MCP tool names this worker's "kahya_memory" MCP server
+# The exact 5 memory MCP tool names this worker's "kahya_memory" MCP server
 # exposes (kahyad's own /policy/check policy table keys off these same
 # SDK-prefixed names - see hooks.make_can_use_tool). Kept as documentation/
 # cross-check reference only as of the BLOCKER 2 fix in _build_options
@@ -127,11 +127,14 @@ _SAFE_TRACE_ID_PLACEHOLDER = "redacted"
 # (claude-agent-sdk==0.2.111) whole-tool-allows any bare tool name listed
 # in allowed_tools, auto-approving it before can_use_tool is ever
 # consulted, which would make the mandated fail-closed policy gate
-# (HANDOFF §5 ⚑) dead code for exactly these 3 tools.
+# (HANDOFF §5 ⚑) dead code for exactly these tools.
 ALLOWED_TOOLS = [
     "mcp__kahya_memory__memory_search",
     "mcp__kahya_memory__memory_write",
     "mcp__kahya_memory__memory_forget",
+    # G13 MEM-4: the read-only graph tools (policy.yaml class R).
+    "mcp__kahya_memory__entity_lookup",
+    "mcp__kahya_memory__fact_query",
 ]
 
 # B-15 fix: Claude Code's BUILT-IN tools are never exposed to this worker's
@@ -524,7 +527,7 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
         # can_use_tool is ever consulted - so passing ALLOWED_TOOLS here
         # would make can_use_tool (and the fail-closed /policy/check gate +
         # event=tool_gate logging it drives - HANDOFF §5 ⚑) dead code for
-        # exactly the 3 tools this worker actually calls. Deliberately left
+        # exactly the memory tools this worker actually calls. Deliberately left
         # EMPTY (the SDK default) instead: with permission_mode="default"
         # below, every MCP tool call the model attempts is routed through
         # can_use_tool and kahyad's /policy/check. Built-in tools are

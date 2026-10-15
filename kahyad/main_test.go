@@ -27,8 +27,9 @@ func TestDispatchPolicyValidateAcceptsRealPolicyYAML(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("dispatch(policy validate ../policy.yaml) = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "14") {
-		t.Errorf("stdout = %q, want it to mention the tool count (14)", stdout.String())
+	// 16 = the 14 pre-G13 tools + MEM-4's entity_lookup and fact_query.
+	if !strings.Contains(stdout.String(), "16") {
+		t.Errorf("stdout = %q, want it to mention the tool count (16)", stdout.String())
 	}
 }
 

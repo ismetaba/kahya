@@ -62,8 +62,8 @@ func (noopLogger) Info(string, ...any)  {}
 func (noopLogger) Warn(string, ...any)  {}
 func (noopLogger) Error(string, ...any) {}
 
-// Server implements the three memory MCP tools (memory_search,
-// memory_write, memory_forget - W12-05). It holds no policy logic at all:
+// Server implements the memory MCP tools (memory_search, memory_write,
+// memory_forget - W12-05; entity_lookup, fact_query - FIX-MEM-4). It holds no policy logic at all:
 // the binding allow/deny gate is kahyad-side, in front of this package
 // (kahyad/internal/server's /v1/mcp dispatcher + kahyad/internal/policy),
 // per HANDOFF §5 ⚑ - by the time a call reaches these handlers, either
@@ -85,6 +85,10 @@ type Server struct {
 	// secretLane is memory_write's FIX-U-3 ingest-time secret-lane seam
 	// (secretlane.go, SetSecretLaneSeam). Zero value = no classification.
 	secretLane SecretLaneSeam
+
+	// Graph backs entity_lookup / fact_query (FIX-MEM-4, graphtools.go,
+	// SetGraph); nil = both answer ErrGraphUnavailable.
+	Graph GraphReader
 
 	// mu serializes the ENTIRE mutate sequence of HandleWrite/HandleForget
 	// (path validation through file write, git add/mv, git commit,
@@ -110,11 +114,53 @@ func New(memoryDir string, search Searcher, index Indexer, ledger Ledger, log Lo
 // ---- MCP wire types (W12-05 step 3/4/5: English arg names, Turkish tool
 // descriptions registered in MCPServer). ----
 
-// MemorySearchArgs is memory_search's input: {query, k?}.
+// MemorySearchArgs is memory_search's input: {query, k?} plus the optional
+// FIX-MEM-4 filters (all "any" when omitted).
 type MemorySearchArgs struct {
-	Query string `json:"query" jsonschema:"aranacak metin"`
-	K     int    `json:"k,omitempty" jsonschema:"en fazla kac sonuc donsun (varsayilan 8)"`
+	Query      string `json:"query" jsonschema:"aranacak metin"`
+	K          int    `json:"k,omitempty" jsonschema:"en fazla kac sonuc donsun (varsayilan 8)"`
+	Since      string `json:"since,omitempty" jsonschema:"RFC3339; yalniz bu tarihten sonra indekslenen notlar"`
+	Until      string `json:"until,omitempty" jsonschema:"RFC3339; yalniz bu tarihten once indekslenen notlar"`
+	Source     string `json:"source,omitempty" jsonschema:"memory_file | external_doc"`
+	PathPrefix string `json:"path_prefix,omitempty" jsonschema:"hafiza koku altinda yol oneki, orn. people/"`
+	EntityID   int64  `json:"entity_id,omitempty" jsonschema:"entity_lookup'tan gelen varlik id; yalniz o varligi anan notlar"`
+	MinTier    string `json:"min_tier,omitempty" jsonschema:"user_edit|user_asserted|external_doc|screen|agent_derived - en dusuk kabul edilen guven katmani"`
 }
+
+// SearchFilter is memory_search's filter as the FilteredSearcher receives
+// it (FIX-MEM-4): Since/Until are already-validated RFC3339 strings; every
+// zero value means "any".
+type SearchFilter struct {
+	Since, Until, Source, PathPrefix, MinTier string
+	EntityID                                  int64
+}
+
+// IsZero reports whether f filters nothing.
+func (f SearchFilter) IsZero() bool { return f == SearchFilter{} }
+
+// filter is the args' filter half.
+func (a MemorySearchArgs) filter() SearchFilter {
+	return SearchFilter{
+		Since: strings.TrimSpace(a.Since), Until: strings.TrimSpace(a.Until), Source: a.Source,
+		PathPrefix: a.PathPrefix, MinTier: a.MinTier, EntityID: a.EntityID,
+	}
+}
+
+// FilteredSearcher is the OPTIONAL capability a Searcher may implement
+// (FIX-MEM-4). When the wired Searcher lacks it and the call carries a
+// non-empty filter, HandleSearch returns ErrFilterUnsupported instead of
+// silently ignoring the filter (fail-closed on the request's own intent).
+type FilteredSearcher interface {
+	SearchFiltered(ctx context.Context, traceID, query string, k int, f SearchFilter) ([]Hit, error)
+}
+
+// ErrFilterUnsupported is memory_search's answer to a filtered call against
+// a Searcher without FilteredSearcher (byte-exact Turkish).
+var ErrFilterUnsupported = errors.New("memory_search: filtreli arama bu kurulumda kullanılamıyor")
+
+// ErrFilterBadTime is memory_search's answer to a since/until that is not
+// RFC3339 (byte-exact Turkish).
+var ErrFilterBadTime = errors.New("memory_search: since/until RFC3339 olmalı")
 
 // MemorySearchResultItem is one raw ranked hit memory_search returns - no
 // for_injection filtering here: injection eligibility is a kahyad-internal
@@ -126,6 +172,10 @@ type MemorySearchResultItem struct {
 	Text       string  `json:"text"`
 	Score      float64 `json:"score"`
 	SourceTier string  `json:"source_tier"`
+	// EpisodeCreatedAt (when the note was first indexed) and Source (the
+	// episode's source) are FIX-MEM-4's filterable fields, echoed back.
+	EpisodeCreatedAt string `json:"episode_created_at"`
+	Source           string `json:"source"`
 }
 
 // MemorySearchOutput is memory_search's output.
@@ -176,18 +226,45 @@ type MemoryForgetOutput struct {
 // and kahyad's gate test, which calls the SAME handler directly "below
 // the gate" to prove the policy boundary is kahyad-side - can invoke it
 // without any MCP/HTTP plumbing at all.
+//
+// FIX-MEM-4: a non-empty filter (since/until/source/path_prefix/entity_id/
+// min_tier) needs a FilteredSearcher (else ErrFilterUnsupported) and
+// RFC3339 since/until (else ErrFilterBadTime) - a filter is never silently
+// ignored.
 func (s *Server) HandleSearch(ctx context.Context, traceID string, args MemorySearchArgs) (MemorySearchOutput, error) {
 	if strings.TrimSpace(args.Query) == "" {
 		return MemorySearchOutput{}, errors.New("memory_search: query must not be empty")
 	}
-	hits, err := s.Search.Search(ctx, traceID, args.Query, args.K)
+	var hits []Hit
+	var err error
+	if f := args.filter(); !f.IsZero() {
+		for _, ts := range []string{f.Since, f.Until} {
+			if ts == "" {
+				continue
+			}
+			if _, perr := time.Parse(time.RFC3339, ts); perr != nil {
+				return MemorySearchOutput{}, ErrFilterBadTime
+			}
+		}
+		fs, ok := s.Search.(FilteredSearcher)
+		if !ok {
+			return MemorySearchOutput{}, ErrFilterUnsupported
+		}
+		hits, err = fs.SearchFiltered(ctx, traceID, args.Query, args.K, f)
+	} else {
+		hits, err = s.Search.Search(ctx, traceID, args.Query, args.K)
+	}
 	if err != nil {
+		if errors.Is(err, ErrFilterUnsupported) {
+			return MemorySearchOutput{}, err
+		}
 		return MemorySearchOutput{}, fmt.Errorf("memory_search: %w", err)
 	}
 	out := MemorySearchOutput{Results: make([]MemorySearchResultItem, 0, len(hits))}
 	for _, h := range hits {
 		out.Results = append(out.Results, MemorySearchResultItem{
 			Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier,
+			EpisodeCreatedAt: h.EpisodeCreatedAt, Source: h.Source,
 		})
 	}
 	return out, nil
@@ -479,7 +556,7 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 // MCPServer builds a fresh *mcp.Server (github.com/modelcontextprotocol/
 // go-sdk/mcp, pinned in go.mod - W12-05's chosen transport/protocol
 // implementation, see kahyad/cmd/kahya-mcp's package doc for why the
-// bridge binary does NOT also use this SDK) with all three tools
+// bridge binary does NOT also use this SDK) with all five tools
 // registered. impl may be nil (a default Implementation is used). kahyad
 // wires the returned *mcp.Server behind the binding policy gate
 // (AddReceivingMiddleware) BEFORE mounting it via
@@ -505,6 +582,25 @@ func (s *Server) MCPServer(impl *mcp.Implementation) *mcp.Server {
 		Description: "Kâhya hafızasına yeni bir not yazar (markdown + git commit); yazılan içerik her zaman 'agent_derived' güven katmanında kaydedilir.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args MemoryWriteArgs) (*mcp.CallToolResult, MemoryWriteOutput, error) {
 		out, err := s.HandleWriteForTask(ctx, traceIDFromRequest(req), taskIDFromRequest(req), args)
+		return nil, out, err
+	})
+
+	// FIX-MEM-4: the two structured, read-only graph tools - always
+	// registered (tools/list is fixed at five memory tools); class R in
+	// policy.yaml, so the /v1/mcp gate allows them without a token.
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "entity_lookup",
+		Description: "Kâhya hafızasındaki varlıkları (kişi/kurum/yer/proje) ada veya takma ada göre bulur; her varlık için takma adları ve en güvenilir olguları döndürür.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args EntityLookupArgs) (*mcp.CallToolResult, EntityLookupOutput, error) {
+		out, err := s.HandleEntityLookup(ctx, traceIDFromRequest(req), args)
+		return nil, out, err
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "fact_query",
+		Description: "Yapılandırılmış olguları (özne-yüklem-nesne) varlık, yüklem ve zaman (as_of / known_as_of / since / until) filtresiyle sorgular; onaysız ajan çıkarımları yalnız include_quarantined=true ile ve 'quarantined' etiketiyle döner.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args FactQueryArgs) (*mcp.CallToolResult, FactQueryOutput, error) {
+		out, err := s.HandleFactQuery(ctx, traceIDFromRequest(req), args)
 		return nil, out, err
 	})
 
