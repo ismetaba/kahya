@@ -546,7 +546,18 @@ a cloud model, without changing anything in §2-§6 above:
   unconfirmed fact of no more trust than the extraction's provenance (else
   `extract.retraction_skipped`). An edited note is pending again (the
   indexer resets `extracted_at` when the content hash changes; a `reindex
-  --full` of unchanged bytes keeps it).
+  --full` of unchanged bytes keeps it). Manual runs: `kahya memory extract
+  [--episode <id> | --file <yol> | --all]` → `POST /v1/memory/extract`
+  `{"episode_id":N} | {"file":"rel/path.md"} | {"all":true} | {}` (none =
+  one pending batch; a control route, 503 unwired, 404 unknown episode/note,
+  409 while another run holds the extractor) → `{"episodes", "facts",
+  "entities", "skipped", "retractions", "trace_id"}`, printed as
+  `"Çıkarım tamamlandı: %d bölüm, %d olgu, %d varlık, %d atlandı (olgular agent_derived karantinasında; onay için: kahya fact list --quarantined)"`.
+  Config: `extraction_enabled` (default true; gates only the nightly job),
+  `extraction_batch_max_episodes` (50, >= 1) and
+  `extraction_chunks_per_call` (6, 1..20 - the local model's context);
+  decisions MEM-3.a (no extraction at `memory_write` time - no key) and
+  MEM-3.c.
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

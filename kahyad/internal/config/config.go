@@ -544,6 +544,21 @@ type Config struct {
 	// commit time only. Default true.
 	ConsolidationChangedFilesFirst bool `yaml:"consolidation_changed_files_first"`
 
+	// --- G13 MEM-3 knowledge extraction ---
+
+	// ExtractionEnabled gates the nightly "fact-extraction" job (02:30):
+	// false = it runs and does nothing. A manual `kahya memory extract`
+	// runs regardless. Default true.
+	ExtractionEnabled bool `yaml:"extraction_enabled"`
+	// ExtractionBatchMaxEpisodes caps how many memory episodes one run
+	// extracts (decision MEM-3.c: 50); the rest follow on later nights.
+	// Load fails below 1.
+	ExtractionBatchMaxEpisodes int `yaml:"extraction_batch_max_episodes"`
+	// ExtractionChunksPerCall is how many chunks one Reader call carries
+	// (decision MEM-3.c: 6). Bounds 1..MaxExtractionChunksPerCall (the local
+	// model's context); outside them Load fails.
+	ExtractionChunksPerCall int `yaml:"extraction_chunks_per_call"`
+
 	// --- W5-03 weekly truth ritual ---
 
 	// RitualWeeklyWeekday/Hour/Minute are cfg.ritual.weekly_at's three
@@ -920,6 +935,9 @@ type fileConfig struct {
 	ConsolidationLocalBatchTokens *int            `yaml:"consolidation_local_batch_token_budget"`
 	ConsolidationMaxFileBytes     *int            `yaml:"consolidation_max_file_bytes"`
 	ConsolidationMaxBatches       *int            `yaml:"consolidation_max_batches_per_lane"`
+	ExtractionEnabled             *bool           `yaml:"extraction_enabled"`
+	ExtractionBatchMaxEpisodes    *int            `yaml:"extraction_batch_max_episodes"`
+	ExtractionChunksPerCall       *int            `yaml:"extraction_chunks_per_call"`
 	ConsolidationChangedFirst     *bool           `yaml:"consolidation_changed_files_first"`
 	RitualWeeklyWeekday           *int            `yaml:"ritual_weekly_weekday"`
 	RitualWeeklyHour              *int            `yaml:"ritual_weekly_hour"`
@@ -1052,6 +1070,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSecretLaneMemoryDir(cfg.SecretLaneMemoryDir); err != nil {
+		return Config{}, err
+	}
+	if err := validateExtraction(cfg.ExtractionBatchMaxEpisodes, cfg.ExtractionChunksPerCall); err != nil {
 		return Config{}, err
 	}
 
@@ -1316,6 +1337,33 @@ func validateConsolidationBatching(cfg Config) error {
 	return nil
 }
 
+// G13 MEM-3 extraction defaults (decision MEM-3.c) and bounds. The
+// defaults equal kahyad/internal/extract's package defaults (pinned by
+// kahyad's TestExtractionDefaultsMatchExtractPackage).
+const (
+	DefaultExtractionBatchMaxEpisodes = 50
+	DefaultExtractionChunksPerCall    = 6
+	// MaxExtractionChunksPerCall keeps one call (chunks of at most 1600
+	// runes, ~1K tokens each, plus the ~1K-token instructions and the
+	// 4096-token answer) inside the local Qwen3-30B-A3B's 32,768-token
+	// context - the secret-lane calls run there; the cloud Haiku 5.5's
+	// 100K price tier is far above it.
+	MaxExtractionChunksPerCall = 20
+)
+
+// validateExtraction fails Load closed (FIX-MEM-3) on a batch cap below 1
+// or a chunks-per-call outside 1..MaxExtractionChunksPerCall: a zero would
+// otherwise be silently replaced by the package default.
+func validateExtraction(batchMaxEpisodes, chunksPerCall int) error {
+	if batchMaxEpisodes < 1 {
+		return fmt.Errorf("config: extraction_batch_max_episodes must be >= 1, got %d", batchMaxEpisodes)
+	}
+	if chunksPerCall < 1 || chunksPerCall > MaxExtractionChunksPerCall {
+		return fmt.Errorf("config: extraction_chunks_per_call must be 1..%d, got %d", MaxExtractionChunksPerCall, chunksPerCall)
+	}
+	return nil
+}
+
 // DefaultSearchRecencyHalfLifeDays is search_recency_half_life_days'
 // default (FIX-MEM-8); it equals kahyad/internal/search's
 // DefaultRecencyHalfLifeDays (pinned by kahyad's
@@ -1569,6 +1617,11 @@ func defaults(home, env string) Config {
 		ConsolidationMaxFileBytes:          DefaultConsolidationMaxFileBytes,
 		ConsolidationMaxBatchesPerLane:     DefaultConsolidationMaxBatchesPerLane,
 		ConsolidationChangedFilesFirst:     true,
+
+		// G13 MEM-3 knowledge extraction (decision MEM-3.c).
+		ExtractionEnabled:          true,
+		ExtractionBatchMaxEpisodes: DefaultExtractionBatchMaxEpisodes,
+		ExtractionChunksPerCall:    DefaultExtractionChunksPerCall,
 
 		// W5-03 weekly truth ritual defaults (task spec: Sunday 18:00 -
 		// HANDOFF §6 W5 flag).
@@ -2011,6 +2064,15 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.ConsolidationMaxBatches != nil {
 		cfg.ConsolidationMaxBatchesPerLane = *fc.ConsolidationMaxBatches
+	}
+	if fc.ExtractionEnabled != nil {
+		cfg.ExtractionEnabled = *fc.ExtractionEnabled
+	}
+	if fc.ExtractionBatchMaxEpisodes != nil {
+		cfg.ExtractionBatchMaxEpisodes = *fc.ExtractionBatchMaxEpisodes
+	}
+	if fc.ExtractionChunksPerCall != nil {
+		cfg.ExtractionChunksPerCall = *fc.ExtractionChunksPerCall
 	}
 	if fc.ConsolidationChangedFirst != nil {
 		cfg.ConsolidationChangedFilesFirst = *fc.ConsolidationChangedFirst

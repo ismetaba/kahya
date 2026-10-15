@@ -925,6 +925,57 @@ func (c *Client) SplitEntities(ctx context.Context, traceID string, mergeLedgerI
 	})
 }
 
+// memoryExtractResult mirrors kahyad's POST /v1/memory/extract JSON body
+// (kahyad/internal/server.memoryExtractResponse, G13 MEM-3).
+type memoryExtractResult struct {
+	Episodes    int    `json:"episodes"`
+	Facts       int    `json:"facts"`
+	Entities    int    `json:"entities"`
+	Skipped     int    `json:"skipped"`
+	Retractions int    `json:"retractions"`
+	TraceID     string `json:"trace_id"`
+}
+
+// MemoryExtract calls POST /v1/memory/extract (`kahya memory extract`): at
+// most one of episodeID (non-zero), file (non-empty) or all; none = one
+// pending batch. The call is synchronous (no client timeout - an extraction
+// batch can take minutes on the local model).
+func (c *Client) MemoryExtract(ctx context.Context, traceID string, episodeID int64, file string, all bool) (memoryExtractResult, error) {
+	body := map[string]any{}
+	switch {
+	case episodeID != 0:
+		body["episode_id"] = episodeID
+	case file != "":
+		body["file"] = file
+	case all:
+		body["all"] = true
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return memoryExtractResult{}, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/v1/memory/extract", traceID, bytes.NewReader(b))
+	if err != nil {
+		return memoryExtractResult{}, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return memoryExtractResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if msg := apiError(resp.Body); msg != "" {
+			return memoryExtractResult{}, fmt.Errorf("%s", msg)
+		}
+		return memoryExtractResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("memory extract: status %d", resp.StatusCode)}
+	}
+	var res memoryExtractResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return memoryExtractResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("memory extract: decode response: %w", err)}
+	}
+	return res, nil
+}
+
 // rememberedResponse mirrors kahyad's POST /v1/remembered JSON body
 // (kahyad/internal/server.rememberedResponse, W5-03).
 type rememberedResponse struct {

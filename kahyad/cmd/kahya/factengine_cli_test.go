@@ -165,3 +165,89 @@ func TestEntityUsageOnBadSubcommand(t *testing.T) {
 		t.Errorf("stderr = %q, want usage message", stderr.String())
 	}
 }
+
+// memoryExtractFakeServer answers POST /v1/memory/extract and records the
+// request body (G13 MEM-3).
+type memoryExtractFakeServer struct {
+	body   map[string]any
+	status int
+	resp   map[string]any
+}
+
+func (f *memoryExtractFakeServer) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/extract", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		f.body = map[string]any{}
+		json.NewDecoder(r.Body).Decode(&f.body)
+		w.Header().Set("Content-Type", "application/json")
+		if f.status != 0 {
+			w.WriteHeader(f.status)
+		}
+		json.NewEncoder(w).Encode(f.resp)
+	})
+	return mux
+}
+
+func TestMemoryExtractPrintsTurkishSummary(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want map[string]any
+	}{
+		{[]string{"memory", "extract"}, map[string]any{}},
+		{[]string{"memory", "extract", "--episode", "12"}, map[string]any{"episode_id": 12.0}},
+		{[]string{"memory", "extract", "--file", "inbox/2026-10-08.md"}, map[string]any{"file": "inbox/2026-10-08.md"}},
+		{[]string{"memory", "extract", "--all"}, map[string]any{"all": true}},
+	} {
+		t.Run(strings.Join(tc.args[2:], "_"), func(t *testing.T) {
+			fake := &memoryExtractFakeServer{resp: map[string]any{"episodes": 3, "facts": 7, "entities": 2, "skipped": 1, "trace_id": "tr"}}
+			t.Setenv("KAHYA_SOCKET", startFakeServer(t, fake.handler()))
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+				t.Fatalf("exit %d, stderr %q", code, stderr.String())
+			}
+			want := "Çıkarım tamamlandı: 3 bölüm, 7 olgu, 2 varlık, 1 atlandı (olgular agent_derived karantinasında; onay için: kahya fact list --quarantined)\n"
+			if stdout.String() != want {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+			}
+			if len(fake.body) != len(tc.want) {
+				t.Fatalf("request body = %v, want %v", fake.body, tc.want)
+			}
+			for k, v := range tc.want {
+				if fake.body[k] != v {
+					t.Fatalf("request body = %v, want %v", fake.body, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestMemoryExtractUsageErrors(t *testing.T) {
+	noDaemonSocket(t)
+	for _, args := range [][]string{
+		{"memory"},
+		{"memory", "confirm"},
+		{"memory", "nope"},
+		{"memory", "extract", "--episode", "1", "--all"},
+		{"memory", "extract", "--file", "a.md", "--episode", "2"},
+		{"memory", "extract", "--episode", "-1"},
+		{"memory", "extract", "stray"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
+			t.Errorf("%v: exit %d, want 2", args, code)
+		}
+		if !strings.Contains(stderr.String(), MsgMemoryUsage) {
+			t.Errorf("%v: stderr = %q, want the usage line", args, stderr.String())
+		}
+	}
+}
+
+func TestMemoryExtractServerErrorIsWrappedInTurkish(t *testing.T) {
+	const detail = "extract: no active episode: id 99"
+	errorBodyServer(t, http.StatusNotFound, map[string]any{"error": detail})
+	assertWrapped(t, []string{"memory", "extract", "--episode", "99"}, "", MsgMemoryExtractFailed, detail)
+}

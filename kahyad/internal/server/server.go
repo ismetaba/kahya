@@ -309,6 +309,11 @@ type Server struct {
 	// convention as consolidation above.
 	factEngine FactEngineRunner
 
+	// memoryExtractor wires POST /v1/memory/extract (G13 MEM-3,
+	// memory_extract.go); nil until SetMemoryExtractor is called - same
+	// "unwired dependency" convention as factEngine above.
+	memoryExtractor MemoryExtractor
+
 	// remembered wires POST /v1/remembered (W5-03, remembered.go's own doc
 	// comment); nil until SetRememberedMarker is called - same "unwired
 	// dependency" convention as factEngine above.
@@ -578,6 +583,9 @@ func (s *Server) routeTable() []route {
 	return []route{
 		{"/health", h(s.handleHealth)},
 		{"/v1/memory/search", h(s.handleMemorySearch)},
+		// G13 MEM-3: `kahya memory extract` (memory_extract.go). A control
+		// route: a worker never triggers extraction.
+		{"POST /v1/memory/extract", h(s.handleMemoryExtract)},
 		{"/v1/reindex", h(s.handleReindex)},
 		{"/v1/log", h(s.handleLog)},
 		{"/v1/mcp", s.buildMCPHandler()},

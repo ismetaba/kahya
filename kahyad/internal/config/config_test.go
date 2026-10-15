@@ -1887,3 +1887,56 @@ func TestLoadFailsClosedOnInvalidSecretLaneMemoryDir(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadExtractionDefaultsAndFileOverrides (FIX-MEM-3, decision MEM-3.c):
+// the nightly extraction job is on, 50 episodes a run, 6 chunks a call, and
+// the three keys are real config.yaml keys.
+func TestLoadExtractionDefaultsAndFileOverrides(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.ExtractionEnabled || cfg.ExtractionBatchMaxEpisodes != 50 || cfg.ExtractionChunksPerCall != 6 {
+		t.Fatalf("defaults = enabled %v, batch %d, chunks %d; want true, 50, 6",
+			cfg.ExtractionEnabled, cfg.ExtractionBatchMaxEpisodes, cfg.ExtractionChunksPerCall)
+	}
+	writeConfigYAML(t, home, "extraction_enabled: false\nextraction_batch_max_episodes: 5\nextraction_chunks_per_call: 2\n")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ExtractionEnabled || cfg.ExtractionBatchMaxEpisodes != 5 || cfg.ExtractionChunksPerCall != 2 {
+		t.Fatalf("overrides = enabled %v, batch %d, chunks %d; want false, 5, 2",
+			cfg.ExtractionEnabled, cfg.ExtractionBatchMaxEpisodes, cfg.ExtractionChunksPerCall)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidExtraction (FIX-MEM-3): a zero batch or a
+// chunks-per-call outside the local model's context fails Load instead of
+// being silently replaced by a default.
+func TestLoadFailsClosedOnInvalidExtraction(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, key string }{
+		{"batch_zero", "extraction_batch_max_episodes: 0\n", "extraction_batch_max_episodes"},
+		{"chunks_zero", "extraction_chunks_per_call: 0\n", "extraction_chunks_per_call"},
+		{"chunks_over_context", fmt.Sprintf("extraction_chunks_per_call: %d\n", MaxExtractionChunksPerCall+1), "extraction_chunks_per_call"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("Load() error = %v, want a %s validation error", err, tc.key)
+			}
+		})
+	}
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, fmt.Sprintf("extraction_batch_max_episodes: 1\nextraction_chunks_per_call: %d\n", MaxExtractionChunksPerCall))
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() at the bounds error = %v, want nil", err)
+	}
+}

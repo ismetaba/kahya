@@ -584,4 +584,17 @@ const (
 	// MsgLogFailed wraps a kahyad-side failure of GET /v1/log (the daemon's
 	// own English log-read errors).
 	MsgLogFailed = "Log okunamadı: %s"
+
+	// MsgMemoryUsage is printed when `kahya memory` is given anything but a
+	// valid subcommand (G13 MEM-3; the handbook's byte-exact text - the
+	// `confirm` half is G13 MEM-5's).
+	MsgMemoryUsage = "kullanım: kahya memory extract [--episode <id> | --file <yol> | --all] | kahya memory confirm <yol>"
+	// MsgExtractDone is `kahya memory extract`'s success line (G13 MEM-3):
+	// %d episodes extracted, facts written, entities created, episodes
+	// skipped (the reason of each is in `kahya log --trace <id>`).
+	MsgExtractDone = "Çıkarım tamamlandı: %d bölüm, %d olgu, %d varlık, %d atlandı (olgular agent_derived karantinasında; onay için: kahya fact list --quarantined)"
+	// MsgMemoryExtractFailed wraps a kahyad-side failure of POST
+	// /v1/memory/extract (an unknown episode/file, a run already in
+	// progress, a store error - the daemon's English detail).
+	MsgMemoryExtractFailed = "Hafıza çıkarımı başarısız: %s"
 )

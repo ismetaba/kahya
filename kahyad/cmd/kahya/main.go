@@ -77,6 +77,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runFact(client, args[1:], stdout, stderr)
 	case "entity":
 		return runEntity(client, args[1:], stdout, stderr)
+	case "memory":
+		return runMemory(client, args[1:], stdout, stderr)
 	case "remembered":
 		return runRemembered(client, args[1:], stdout, stderr)
 	case "eval":
@@ -586,6 +588,52 @@ func runEntitySplit(client *Client, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	fmt.Fprintf(stdout, MsgEntitySplit+"\n", id)
+	return 0
+}
+
+// runMemory implements `kahya memory extract [--episode <id> | --file <yol>
+// | --all]` (G13 MEM-3): a manual run of the knowledge extractor - one
+// episode, one note, every episode reset and re-extracted, or (no flag) one
+// pending batch like the nightly fact-extraction job.
+func runMemory(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, MsgMemoryUsage)
+		return 2
+	}
+	switch args[0] {
+	case "extract":
+		return runMemoryExtract(client, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, MsgMemoryUsage)
+		return 2
+	}
+}
+
+func runMemoryExtract(client *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("memory extract", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	episode := fs.Int64("episode", 0, "yalnız bu bölümü (episode id) çıkar")
+	file := fs.String("file", "", "yalnız bu notu çıkar (hafıza dizinine göre yol)")
+	all := fs.Bool("all", false, "tüm bölümlerin çıkarım işaretini sıfırla ve yeniden çıkar (yeni çıkarıcı sürümü için)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	selectors := 0
+	for _, set := range []bool{*episode != 0, strings.TrimSpace(*file) != "", *all} {
+		if set {
+			selectors++
+		}
+	}
+	if fs.NArg() != 0 || selectors > 1 || *episode < 0 {
+		fmt.Fprintln(stderr, MsgMemoryUsage)
+		return 2
+	}
+	res, err := client.MemoryExtract(context.Background(), traceid.New(), *episode, strings.TrimSpace(*file), *all)
+	if err != nil {
+		fmt.Fprintln(stderr, wrapServerError(MsgMemoryExtractFailed, err))
+		return 2
+	}
+	fmt.Fprintf(stdout, MsgExtractDone+"\n", res.Episodes, res.Facts, res.Entities, res.Skipped)
 	return 0
 }
 

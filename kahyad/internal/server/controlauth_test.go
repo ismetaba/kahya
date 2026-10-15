@@ -261,6 +261,7 @@ var controlProbes = []controlProbe{
 	{http.MethodGet, "/readiness", ""},
 	{http.MethodPost, "/debug/emit-approval", `{}`},
 	{http.MethodPost, "/v1/remembered", `{}`},
+	{http.MethodPost, "/v1/memory/extract", `{}`},
 	{http.MethodGet, "/nope", ""},
 }
 

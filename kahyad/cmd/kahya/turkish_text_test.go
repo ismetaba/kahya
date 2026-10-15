@@ -81,6 +81,9 @@ func TestFlagHelpTextsAreNotAsciiFolded(t *testing.T) {
 		{[]string{"undo", "-h"}, "geri al: bu trace_id'nin açık geri-alma pencerelerini tetikle", "acik geri-alma"},
 		{[]string{"undo", "-h"}, "yalnız en yeni işlemi geri al (varsayılan: trace'teki tüm açık işlemler, yeniden eskiye)", "yalniz en yeni"},
 		{[]string{"approvals", "show", "-h"}, "makine-okunur JSON çıktısı", "makine-okur JSON"},
+		// G13 MEM-3.
+		{[]string{"memory", "extract", "-h"}, "tüm bölümlerin çıkarım işaretini sıfırla ve yeniden çıkar (yeni çıkarıcı sürümü için)", "tum bolumlerin"},
+		{[]string{"memory", "extract", "-h"}, "yalnız bu notu çıkar (hafıza dizinine göre yol)", "yalniz bu notu"},
 	}
 	for _, c := range cases {
 		t.Run(strings.Join(c.args, "_"), func(t *testing.T) {
