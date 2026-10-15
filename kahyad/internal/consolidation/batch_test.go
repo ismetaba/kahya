@@ -396,12 +396,82 @@ func TestRunBatchesCloudLaneWithinBudget(t *testing.T) {
 	}
 }
 
-// TestRunBatchKeyValidationPerBatch: a batch may only rewrite its own files.
-// Returning another batch's file (one that IS in the lane) rejects the night
-// exactly like a path outside the lane (FIX-P-7, per batch).
+// assertBatchRewriteRejected checks a night rejected for a batch's foreign
+// rewrite key: ErrRewriteUnknownPath, no consolidation branch left, the
+// smuggled text in no commit, one cloud rewrite_rejected row, no pending
+// row and only the rejection notice.
+func assertBatchRewriteRejected(t *testing.T, repo string, err error, logger *fakeEventStore, notifier *fakeNotifier, smuggled string) {
+	t.Helper()
+	if !errors.Is(err, ErrRewriteUnknownPath) {
+		t.Fatalf("Run() error = %v, want ErrRewriteUnknownPath", err)
+	}
+	if br := runGit(t, repo, "branch", "--list", ConsolidationBranchPrefix+"*"); br != "" {
+		t.Errorf("consolidation branch survived: %q", br)
+	}
+	if out := runGit(t, repo, "log", "--all", "-p", "--format="); strings.Contains(out, smuggled) {
+		t.Fatal("a batch's rewrite of another batch's file reached a commit")
+	}
+	rejected := payloadsOfKind(logger.rows, EventRewriteRejected)
+	if len(rejected) != 1 || rejected[0]["lane"] != LaneCloud {
+		t.Fatalf("rewrite_rejected rows = %v, want one for lane cloud", rejected)
+	}
+	if len(payloadsOfKind(logger.rows, EventPending)) != 0 {
+		t.Fatal("a pending row was written for a rejected night")
+	}
+	if len(notifier.sent) != 1 || notifier.sent[0] != MsgRewriteRejected {
+		t.Fatalf("notifier.sent = %q, want exactly [%q]", notifier.sent, MsgRewriteRejected)
+	}
+}
+
+// TestRunBatchKeyValidationPerBatch: a batch may only rewrite its own files
+// (FIX-P-7, per batch). Batch 1 leaves every file unchanged (no entry, the
+// v2 answer's usual shape); batch 2, never given those files, rewrites
+// them; every later batch is unchanged again. They ARE lane files and no
+// other batch returned them, so only the
+// per-batch bound inside runLane catches this: the night is rejected at
+// batch 2 exactly like a path outside the lane. A lane-wide bound (or none)
+// would commit the smuggled content.
 func TestRunBatchKeyValidationPerBatch(t *testing.T) {
 	repo := initKahyaRepo(t)
 	seedCorpus(t, repo, 3, 100)
+	const smuggled = "SMUGGLED BY BATCH 2"
+	var batches []map[string]string
+	cloud := SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
+		batches = append(batches, files)
+		if len(batches) != 2 {
+			return map[string]string{}, nil // every other batch: everything unchanged
+		}
+		out := map[string]string{}
+		for k := range batches[0] {
+			out[k] = smuggled + "\n" // in the lane, but not in this batch
+		}
+		return out, nil
+	})
+	c, logger, notifier := newBatchConsolidator(t, repo, cloud, nil, func(cfg *Config) { cfg.CloudBatchTokenBudget = 1000 })
+	err := c.Run(context.Background(), "trace-b5-perbatch")
+	if len(batches) < 2 {
+		t.Fatalf("cloud calls = %d, want >= 2 batches", len(batches))
+	}
+	for k := range batches[0] {
+		if _, ok := batches[1][k]; ok {
+			t.Fatalf("fixture: %s is in both batches, want disjoint batches", k)
+		}
+	}
+	assertBatchRewriteRejected(t, repo, err, logger, notifier, smuggled)
+	if len(batches) != 2 {
+		t.Fatalf("cloud calls = %d, want 2 (the night stops at the breaching batch 2)", len(batches))
+	}
+}
+
+// TestRunBatchPathReturnedByTwoBatchesRejected: batch 1 rewrites its files
+// and batch 2 returns them again. The per-batch bound rejects batch 2
+// first; the cross-batch duplicate check in runLane is the second line,
+// which still rejects this night if the per-batch bound were ever widened
+// to the whole lane.
+func TestRunBatchPathReturnedByTwoBatchesRejected(t *testing.T) {
+	repo := initKahyaRepo(t)
+	seedCorpus(t, repo, 3, 100)
+	const smuggled = "RETURNED BY TWO BATCHES"
 	var first map[string]string
 	calls := 0
 	cloud := SessionFunc(func(ctx context.Context, traceID string, files map[string]string) (map[string]string, error) {
@@ -415,33 +485,15 @@ func TestRunBatchKeyValidationPerBatch(t *testing.T) {
 			return out, nil
 		}
 		for k := range first {
-			out[k] = "SMUGGLED BY BATCH 2\n" // in the lane, but not in this batch
+			out[k] = smuggled + "\n"
 		}
 		return out, nil
 	})
 	c, logger, notifier := newBatchConsolidator(t, repo, cloud, nil, func(cfg *Config) { cfg.CloudBatchTokenBudget = 1000 })
-	err := c.Run(context.Background(), "trace-b5-perbatch")
-	if !errors.Is(err, ErrRewriteUnknownPath) {
-		t.Fatalf("Run() error = %v, want ErrRewriteUnknownPath", err)
-	}
-	if calls < 2 {
-		t.Fatalf("cloud calls = %d, want >= 2", calls)
-	}
-	if br := runGit(t, repo, "branch", "--list", ConsolidationBranchPrefix+"*"); br != "" {
-		t.Errorf("consolidation branch survived: %q", br)
-	}
-	if out := runGit(t, repo, "log", "--all", "-p", "--format="); strings.Contains(out, "SMUGGLED BY BATCH 2") {
-		t.Fatal("a batch's rewrite of another batch's file reached a commit")
-	}
-	rejected := payloadsOfKind(logger.rows, EventRewriteRejected)
-	if len(rejected) != 1 || rejected[0]["lane"] != LaneCloud {
-		t.Fatalf("rewrite_rejected rows = %v, want one for lane cloud", rejected)
-	}
-	if len(payloadsOfKind(logger.rows, EventPending)) != 0 {
-		t.Fatal("a pending row was written for a rejected night")
-	}
-	if len(notifier.sent) != 1 || notifier.sent[0] != MsgRewriteRejected {
-		t.Fatalf("notifier.sent = %q, want exactly [%q]", notifier.sent, MsgRewriteRejected)
+	err := c.Run(context.Background(), "trace-b5-twice")
+	assertBatchRewriteRejected(t, repo, err, logger, notifier, smuggled)
+	if calls != 2 {
+		t.Fatalf("cloud calls = %d, want 2", calls)
 	}
 }
 
