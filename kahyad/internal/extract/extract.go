@@ -423,17 +423,22 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 		for _, c := range chunks[start:end] {
 			group = append(group, reader.ExtractChunk{ID: c.ID, Text: c.Text})
 		}
+		// One deadline covers the whole call - the guard's local
+		// classification (a cold model load included) and the Reader call -
+		// so a wedged local model cannot hold the batch. A guard that times
+		// out is a secret verdict, and the local call then fails on the
+		// same expired deadline: the episode is skipped, never sent out.
+		callCtx, cancel := context.WithTimeout(ctx, timeout)
 		forceSecret := pathSecret
 		if !forceSecret {
 			// Step 2 (H-7): the guard classifies the exact bytes the Reader
 			// would send; a secret verdict (or a classification that could not
 			// complete) keeps the call local.
-			if gerr := factengine.GuardCloudExtraction(ctx, r.Classifier, reader.RenderExtractInput(group)); gerr != nil {
+			if gerr := factengine.GuardCloudExtraction(callCtx, r.Classifier, reader.RenderExtractInput(group)); gerr != nil {
 				forceSecret = true
 				r.ledger(ctx, traceID, EventCloudGuardBlocked, map[string]any{"episode_id": episodeID, "chunk_id": group[0].ID})
 			}
 		}
-		callCtx, cancel := context.WithTimeout(ctx, timeout)
 		out, lane, err := r.Reader.RunExtract(callCtx, group, traceID, forceSecret)
 		cancel()
 		if err != nil {

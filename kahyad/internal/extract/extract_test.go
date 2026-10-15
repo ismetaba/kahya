@@ -691,3 +691,33 @@ func TestExtractEpisodeLexiconHitForcesLocalWithoutAskingQwen(t *testing.T) {
 		t.Fatalf("cloud_guard_blocked rows = %v", rows)
 	}
 }
+
+// TestExtractEpisodeGuardSharesTheCallDeadline: a local classifier that
+// hangs past the per-call deadline is a secret verdict, the local call
+// fails on the same expired deadline, and the episode is skipped - never
+// sent to the cloud, never left hanging.
+func TestExtractEpisodeGuardSharesTheCallDeadline(t *testing.T) {
+	f := newFixture(t, func(n int, chunks []reader.ExtractChunk, forceSecret bool) (reader.FactExtractV1, string, error) {
+		if !forceSecret {
+			t.Fatal("a call whose guard never answered reached the Reader as normal-lane")
+		}
+		return reader.FactExtractV1{}, router.LaneSecret, fmt.Errorf("%w: deadline", reader.ErrLocalUnavailable)
+	})
+	f.runner.Classifier = secretlane.NewClassifier(secretlane.QwenClassifierFunc(func(ctx context.Context, text string) (secretlane.Verdict, error) {
+		<-ctx.Done()
+		return secretlane.Verdict{}, ctx.Err()
+	}))
+	f.runner.Cfg.CallTimeout = 50 * time.Millisecond
+	epID, _ := f.seedEpisode("inbox/a.md", "Emre Acme'de.")
+	start := time.Now()
+	st, err := f.runner.ExtractEpisode(context.Background(), "tr-deadline", epID, factengine.ProvenanceAgentDerived)
+	if err != nil || st.Skipped != 1 {
+		t.Fatalf("stats %+v, err %v; want the episode skipped", st, err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("ExtractEpisode took %v - the guard is not bounded by the call deadline", elapsed)
+	}
+	if rows := f.events(EventExtractionSkipped); len(rows) != 1 || rows[0]["reason"] != SkipLocalUnavailable {
+		t.Fatalf("skipped rows = %v", rows)
+	}
+}
