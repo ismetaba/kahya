@@ -18,6 +18,7 @@
 package consolidation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,12 +27,10 @@ import (
 	"strings"
 )
 
-// Session is one lane's whole-file-rewrite transport. Consolidate MUST
-// return a map containing an entry for every key in files (a session that
-// leaves a file unchanged still echoes it back verbatim) - ApplyRewrites
-// (worktree.go) tolerates a MISSING key by treating it as "unchanged", so
-// a non-compliant implementation degrades safely rather than losing a
-// file, but every implementation in THIS package always echoes every key.
+// Session is one lane's whole-file-rewrite transport. Consolidate returns
+// the files it rewrote (whole new content); a MISSING key means "unchanged"
+// (FIX-B-5 phase 2: the model answers {"status":"unchanged"} for such a
+// file instead of echoing it, and parseRewriteResponse leaves it out).
 // Consolidate MUST NOT return a key absent from files: the orchestrator
 // rejects the whole lane - and the night - with ErrRewriteUnknownPath
 // (FIX-P-7; both production sessions already refuse such a response in
@@ -72,9 +71,9 @@ Your job: merge duplicate information across the files of this batch, fix/normal
 
 Respond with STRICT JSON ONLY, no markdown code fences, no commentary, exactly this shape:
 
-{"files": {"<path>": "<new full whole-file content>", ...}}
+{"files": {"<path>": {"status": "unchanged"}, "<path>": {"status": "rewrite", "content": "<new full whole-file content>"}, ...}}
 
-You MUST include an entry for EVERY path you were given, even ones you leave completely unchanged (echo the original content back verbatim in that case). Never add a path you were not given. Never include any key other than "files".`
+You MUST include an entry for EVERY path you were given. For a file you leave untouched return {"status": "unchanged"} (never echo its content). For a file you change return {"status": "rewrite", "content": <its full new content>} - always the whole file, never a fragment, a diff or a patch. Never add a path you were not given. Never include any key other than "files".`
 
 // separatorBetweenInstructionsAndContent mirrors kahyad/internal/reader/
 // cloud_model.go's identical constant: the envelope carries one prompt
@@ -135,6 +134,14 @@ func validateRewriteKeys(lane string, input, rewrites map[string]string) error {
 	return fmt.Errorf("%w: lane=%s count=%d first=%q", ErrRewriteUnknownPath, lane, len(unknown), unknown[0])
 }
 
+// Rewrite response entry statuses (FIX-B-5 phase 2, RewriteJobType v2).
+// Decision G06-6: the optional "patch" status is NOT enabled; a file is
+// either unchanged or rewritten whole.
+const (
+	rewriteStatusUnchanged = "unchanged"
+	rewriteStatusRewrite   = "rewrite"
+)
+
 // parseRewriteResponse decodes a model's raw text response into a
 // {"files": {...}} rewrite map, tolerating (task spec: fail-closed for
 // SECURITY, not for an honest model-output parsing hiccup) leading/
@@ -142,11 +149,18 @@ func validateRewriteKeys(lane string, input, rewrites map[string]string) error {
 // that one-key JSON object is a hard error, never a partial/best-effort
 // parse (mirrors kahyad/internal/reader's own "decode/validation failure
 // fails the whole job closed" posture). input is the EXACT file set the
-// lane was given: a response naming any other path is rejected whole
-// (FIX-P-7).
+// lane (batch) was given: a response naming any other path, an
+// "unchanged" entry included, is rejected whole (FIX-P-7).
+//
+// Each entry is either v2 - {"status":"unchanged"} (left out of the result:
+// missing = unchanged) or {"status":"rewrite","content":"<whole file>"} -
+// or the v1 form, a plain JSON string holding the whole new content. Any
+// other entry (another status such as "patch", a rewrite without content,
+// an unchanged entry carrying content, null, a number) makes the whole
+// response ErrRewriteMalformed.
 func parseRewriteResponse(raw, lane string, input map[string]string) (map[string]string, error) {
 	var parsed struct {
-		Files map[string]string `json:"files"`
+		Files map[string]json.RawMessage `json:"files"`
 	}
 	trimmed := strings.TrimSpace(raw)
 	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
@@ -155,8 +169,57 @@ func parseRewriteResponse(raw, lane string, input map[string]string) (map[string
 	if parsed.Files == nil {
 		return nil, fmt.Errorf("%w: rewrite response missing \"files\" object", ErrRewriteMalformed)
 	}
-	if err := validateRewriteKeys(lane, input, parsed.Files); err != nil {
+	named := make(map[string]string, len(parsed.Files))
+	for k := range parsed.Files {
+		named[k] = ""
+	}
+	if err := validateRewriteKeys(lane, input, named); err != nil {
 		return nil, err
 	}
-	return parsed.Files, nil
+	out := make(map[string]string, len(parsed.Files))
+	for _, k := range sortedKeys(named) {
+		content, rewritten, err := decodeRewriteEntry(parsed.Files[k])
+		if err != nil {
+			return nil, fmt.Errorf("%w: entry %q: %v", ErrRewriteMalformed, k, err)
+		}
+		if rewritten {
+			out[k] = content
+		}
+	}
+	return out, nil
+}
+
+// decodeRewriteEntry decodes one "files" entry (see parseRewriteResponse).
+func decodeRewriteEntry(raw json.RawMessage) (content string, rewritten bool, err error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		if err := json.Unmarshal(trimmed, &content); err != nil {
+			return "", false, err
+		}
+		return content, true, nil // v1: a plain string is the whole new file
+	}
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return "", false, fmt.Errorf("want a status object or a string, got %.20s", trimmed)
+	}
+	var e struct {
+		Status  string  `json:"status"`
+		Content *string `json:"content"`
+	}
+	if err := json.Unmarshal(trimmed, &e); err != nil {
+		return "", false, err
+	}
+	switch e.Status {
+	case rewriteStatusUnchanged:
+		if e.Content != nil {
+			return "", false, errors.New(`an "unchanged" entry carries content`)
+		}
+		return "", false, nil
+	case rewriteStatusRewrite:
+		if e.Content == nil {
+			return "", false, errors.New(`a "rewrite" entry has no content`)
+		}
+		return *e.Content, true, nil
+	default:
+		return "", false, fmt.Errorf("unknown status %q (only %q and %q)", e.Status, rewriteStatusUnchanged, rewriteStatusRewrite)
+	}
 }

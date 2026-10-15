@@ -40,8 +40,10 @@ const CloudModelName = router.ModelHaiku
 // carry - purely informational (envelope.go: "the worker does nothing
 // with Schema beyond echoing it into its own JSONL logs; schema
 // enforcement is entirely Go-side" - parseRewriteResponse in session.go is
-// that Go-side enforcement).
-const RewriteJobType = "consolidation_rewrite_v1"
+// that Go-side enforcement). v2 (FIX-B-5 phase 2): per-file
+// {"status":"unchanged"} | {"status":"rewrite","content":...} entries; the
+// v1 plain-string entries are still accepted.
+const RewriteJobType = "consolidation_rewrite_v2"
 
 // defaultSpawnTimeout bounds one cloud-lane consolidation call (one batch,
 // FIX-B-5) when ProcessSpawner.Timeout is unset. It was 2 minutes, copied
