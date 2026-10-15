@@ -15,7 +15,7 @@ import (
 // TestBuildEnvelopeShape proves BuildEnvelope produces the exact envelope
 // shape this task's own worker profile relies on: Kind stays "chat"
 // (unchanged, frozen IPC contract), Mode=spawn.ModeReader (toolless),
-// Model=ModelName (claude-haiku-4-5, Go-side), Schema=SummaryJobType, a
+// Model=ModelName (claude-haiku-5-5, Go-side), Schema=SummaryJobType, a
 // fresh (never-resumed) session.
 func TestBuildEnvelopeShape(t *testing.T) {
 	now := time.Date(2026, 7, 12, 8, 30, 0, 0, time.UTC)
@@ -30,8 +30,8 @@ func TestBuildEnvelopeShape(t *testing.T) {
 	if env.Model != ModelName {
 		t.Errorf("Model = %q, want %q", env.Model, ModelName)
 	}
-	if env.Model != "claude-haiku-4-5" {
-		t.Errorf("Model = %q, want the literal HANDOFF §4 routing-table value claude-haiku-4-5", env.Model)
+	if env.Model != "claude-haiku-5-5" {
+		t.Errorf("Model = %q, want the literal HANDOFF §4 routing-table value claude-haiku-5-5", env.Model)
 	}
 	if env.Schema != SummaryJobType {
 		t.Errorf("Schema = %q, want %q", env.Schema, SummaryJobType)

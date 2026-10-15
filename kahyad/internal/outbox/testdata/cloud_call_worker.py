@@ -52,7 +52,7 @@ def main():
     emit({"type": "session", "session_id": "cloud-call-session"})
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-    body = json.dumps({"model": "claude-sonnet-5", "messages": []}).encode("utf-8")
+    body = json.dumps({"model": "claude-sonnet-5-5", "messages": []}).encode("utf-8")
     req = urllib.request.Request(
         base_url + "/v1/messages",
         data=body,

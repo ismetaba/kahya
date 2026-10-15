@@ -78,7 +78,7 @@ def main():
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
 
     body = json.dumps({
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "W4-07 scenario B probe"}],
     }).encode("utf-8")

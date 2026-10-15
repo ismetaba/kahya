@@ -30,20 +30,19 @@ import (
 	"sync"
 	"time"
 
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/spawn"
 )
 
 // ModelName is the HANDOFF §4 routing-table model for the briefing
-// summarizer - claude-haiku-4-5, set Go-side (spawn.Envelope.Model), never
-// chosen by the worker. Duplicated as a plain literal (rather than
-// importing kahyad/internal/router) matching this codebase's existing
-// "a low-level IPC-contract-adjacent package duplicates a routing literal
-// instead of adding a dependency" convention (spawn/envelope.go's own
-// LaneSecret/LaneNormal doc comment; kahyad/internal/reader/cloud_model.go
-// sources the SAME literal from router.SelectModel at package-init time
-// instead - this package keeps it a bare constant since it has exactly
-// one caller and one value, never a table of them).
-const ModelName = "claude-haiku-4-5"
+// summarizer - the router's Haiku, set Go-side (spawn.Envelope.Model),
+// never chosen by the worker. A bare constant (one caller, one value -
+// kahyad/internal/reader/cloud_model.go asks router.SelectModel instead),
+// but derived from router.ModelHaiku since FIX-G12-N2 so a model-id bump
+// cannot leave it behind (it was a duplicated literal before; this package
+// already depends on router through spawn). Pinned to the current HANDOFF
+// §9 line by kahyad/internal/server's TestModelIDsMatchHandoffSection9.
+const ModelName = router.ModelHaiku
 
 // SummaryJobType is the Schema value this package's envelopes carry - an
 // informational label only (envelope.go: "the worker does nothing with

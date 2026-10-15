@@ -16,6 +16,7 @@ import (
 
 	"kahya/kahyad/internal/cloudretry"
 	"kahya/kahyad/internal/logx"
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/secretlane"
 )
 
@@ -121,7 +122,7 @@ func TestRetrySucceedsAfterTwoRetryableFailures(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, sleeper)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -176,7 +177,7 @@ func TestRetryAttemptsLoggedAsJSONLWithTraceID(t *testing.T) {
 	cfg.TraceID = "trace_jsonl_test"
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -234,7 +235,7 @@ func TestRetryExhaustionInvokesOnCloudUnreachable(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -285,7 +286,7 @@ func TestNonRetryableStatusNeverRetriesAndInvokesCallback(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -325,7 +326,7 @@ func TestRetryAfterHonoredOverBackoff(t *testing.T) {
 	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, sleeper)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -348,81 +349,119 @@ func TestRetryAfterHonoredOverBackoff(t *testing.T) {
 	}
 }
 
-// --- Fable-5 request shaping ---
+// --- Fable request shaping ---
 
+// TestFable5ShapingInjectsBetaAndFallback: every Fable id the proxy
+// forwards - the current claude-fable-5-1 and the legacy claude-fable-5
+// (FIX-G12-N2, owner decision G12-6) - leaves with the array-form fallback
+// to claude-opus-4-8 and its required beta. claude-opus-4-8 is spelled
+// literally on purpose: Fable 5.1's permitted fallback targets are only
+// claude-opus-4-8 / claude-opus-5, never the current Opus.
 func TestFable5ShapingInjectsBetaAndFallback(t *testing.T) {
-	upstream := newStatusSequenceUpstream(t, []int{200})
-	ledger := &fakeLedger{}
-	governor := generousGovernor()
-	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
-	baseURL, _ := startTestProxy(t, cfg)
+	for _, model := range []string{router.ModelFable, router.LegacyModelFable} {
+		t.Run(model, func(t *testing.T) {
+			upstream := newStatusSequenceUpstream(t, []int{200})
+			ledger := &fakeLedger{}
+			governor := generousGovernor()
+			cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
+			baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-fable-5","messages":[]}`)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Do() error = %v", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
+			req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"`+model+`","messages":[]}`)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do() error = %v", err)
+			}
+			defer resp.Body.Close()
+			_, _ = io.ReadAll(resp.Body)
 
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if upstream.hits() != 1 {
-		t.Fatalf("upstream hits = %d, want 1", upstream.hits())
-	}
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if upstream.hits() != 1 {
+				t.Fatalf("upstream hits = %d, want 1", upstream.hits())
+			}
 
-	var seen struct {
-		Model     string   `json:"model"`
-		Betas     []string `json:"betas"`
-		Fallbacks []struct {
-			Model string `json:"model"`
-		} `json:"fallbacks"`
-	}
-	if err := json.Unmarshal([]byte(upstream.bodyAt(0)), &seen); err != nil {
-		t.Fatalf("decode upstream body: %v (%s)", err, upstream.bodyAt(0))
-	}
-	if seen.Model != "claude-fable-5" {
-		t.Errorf("upstream model = %q, want claude-fable-5", seen.Model)
-	}
-	found := false
-	for _, b := range seen.Betas {
-		if b == "server-side-fallback-2026-06-01" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("upstream betas = %v, want it to contain server-side-fallback-2026-06-01", seen.Betas)
-	}
-	if len(seen.Fallbacks) != 1 || seen.Fallbacks[0].Model != "claude-opus-4-8" {
-		t.Errorf("upstream fallbacks = %v, want exactly [{model:claude-opus-4-8}]", seen.Fallbacks)
-	}
+			var seen struct {
+				Model     string   `json:"model"`
+				Betas     []string `json:"betas"`
+				Fallbacks []struct {
+					Model string `json:"model"`
+				} `json:"fallbacks"`
+			}
+			if err := json.Unmarshal([]byte(upstream.bodyAt(0)), &seen); err != nil {
+				t.Fatalf("decode upstream body: %v (%s)", err, upstream.bodyAt(0))
+			}
+			if seen.Model != model {
+				t.Errorf("upstream model = %q, want %q (shaping never changes the model)", seen.Model, model)
+			}
+			if len(seen.Betas) != 1 || seen.Betas[0] != "server-side-fallback-2026-06-01" {
+				t.Errorf("upstream betas = %v, want exactly [server-side-fallback-2026-06-01]", seen.Betas)
+			}
+			if len(seen.Fallbacks) != 1 || seen.Fallbacks[0].Model != "claude-opus-4-8" {
+				t.Errorf("upstream fallbacks = %v, want exactly [{model:claude-opus-4-8}]", seen.Fallbacks)
+			}
 
-	if got := ledger.countKind(EventFable5Shaped); got != 1 {
-		t.Errorf("proxy.fable5_shaped ledgered %d times, want 1", got)
+			if got := ledger.countKind(EventFable5Shaped); got != 1 {
+				t.Errorf("proxy.fable5_shaped ledgered %d times, want 1", got)
+			}
+		})
 	}
 }
 
+// TestFable5ShapingDropsConflictingFallbackBeta (FIX-G12-N2, owner decision
+// G12-6): the array form of fallbacks requires exactly
+// server-side-fallback-2026-06-01 - pairing it with the newer
+// server-side-fallback-2026-07-01 is a 400 - so a Fable body that already
+// carries another fallback beta (or the new fallbacks:"default" form) is
+// rewritten to the one HANDOFF shape; unrelated betas are kept.
+func TestFable5ShapingDropsConflictingFallbackBeta(t *testing.T) {
+	in := `{"model":"` + router.ModelFable + `","betas":["server-side-fallback-2026-07-01","other-beta-2026-01-01","server-side-fallback-2026-06-01"],"fallbacks":"default","messages":[]}`
+	out, shaped := shapeFable5Body([]byte(in))
+	if !shaped {
+		t.Fatalf("shapeFable5Body(%s) shaped=false, want true", in)
+	}
+	var seen struct {
+		Betas     []string          `json:"betas"`
+		Fallbacks []json.RawMessage `json:"fallbacks"`
+	}
+	if err := json.Unmarshal(out, &seen); err != nil {
+		t.Fatalf("decode shaped body: %v (%s)", err, out)
+	}
+	if want := []string{"other-beta-2026-01-01", "server-side-fallback-2026-06-01"}; strings.Join(seen.Betas, ",") != strings.Join(want, ",") {
+		t.Errorf("betas = %v, want %v (no other server-side-fallback-* beta, required one once)", seen.Betas, want)
+	}
+	if len(seen.Fallbacks) != 1 || string(seen.Fallbacks[0]) != `{"model":"claude-opus-4-8"}` {
+		t.Errorf("fallbacks = %s, want the array form [{\"model\":\"claude-opus-4-8\"}]", out)
+	}
+}
+
+// TestFable5ShapingNeverAppliesToOtherModels: no other model - in
+// particular Haiku 5.5, which has no server-side fallback at all - ever
+// gets betas/fallbacks injected or a proxy.fable5_shaped row.
 func TestFable5ShapingNeverAppliesToOtherModels(t *testing.T) {
-	upstream := newStatusSequenceUpstream(t, []int{200})
-	ledger := &fakeLedger{}
-	governor := generousGovernor()
-	cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
-	baseURL, _ := startTestProxy(t, cfg)
+	for _, model := range []string{router.ModelOpus, router.ModelSonnet, router.ModelHaiku, router.LegacyModelHaiku, router.LegacyModelOpus} {
+		t.Run(model, func(t *testing.T) {
+			upstream := newStatusSequenceUpstream(t, []int{200})
+			ledger := &fakeLedger{}
+			governor := generousGovernor()
+			cfg := retryCfg(t, upstream.srv.URL, governor, ledger, nil)
+			baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","messages":[]}`)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Do() error = %v", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
+			req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"`+model+`","messages":[]}`)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do() error = %v", err)
+			}
+			defer resp.Body.Close()
+			_, _ = io.ReadAll(resp.Body)
 
-	if strings.Contains(upstream.bodyAt(0), "fallbacks") {
-		t.Errorf("upstream body = %s, want no fallbacks field injected for a non-Fable-5 model", upstream.bodyAt(0))
-	}
-	if got := ledger.countKind(EventFable5Shaped); got != 0 {
-		t.Errorf("proxy.fable5_shaped ledgered %d times, want 0 (never for a non-Fable-5 model)", got)
+			if body := upstream.bodyAt(0); strings.Contains(body, "fallbacks") || strings.Contains(body, "betas") {
+				t.Errorf("upstream body = %s, want no betas/fallbacks injected for a non-Fable model", body)
+			}
+			if got := ledger.countKind(EventFable5Shaped); got != 0 {
+				t.Errorf("proxy.fable5_shaped ledgered %d times, want 0 (never for a non-Fable model)", got)
+			}
+		})
 	}
 }
 
@@ -459,7 +498,7 @@ func TestSecretLaneTaskNeverRetriesIntoCloud(t *testing.T) {
 	cfg.EgressGate = backstop("t_secret_task", "trace_secret")
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)

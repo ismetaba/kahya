@@ -13,7 +13,7 @@
 //     Show.
 //   - lane.go: the secret-lane ORDERING INVARIANT (path-glob partition,
 //     BEFORE any session is built).
-//   - session.go/worker.go/localsession.go: the cloud (claude-haiku-4-5)
+//   - session.go/worker.go/localsession.go: the cloud (router.ModelHaiku)
 //     and local (Qwen3-30B-A3B) whole-file-rewrite transports - neither
 //     ever touches brain.db (WRITE BOUNDARY invariant).
 //   - git.go/userlines.go/diff.go: the git-worktree mechanics + USER-EDIT-

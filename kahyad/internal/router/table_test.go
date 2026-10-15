@@ -47,7 +47,7 @@ func TestSelectModelUsesConfiguredDefaultModel(t *testing.T) {
 	}
 }
 
-// TestSelectModelFableOnlyWithDeepThink proves claude-fable-5 is NEVER
+// TestSelectModelFableOnlyWithDeepThink proves ModelFable is NEVER
 // reachable through any table row/intent alone - only DeepThink==true ever
 // produces it, and every intent produces it identically once DeepThink is
 // set.
@@ -60,12 +60,12 @@ func TestSelectModelFableOnlyWithDeepThink(t *testing.T) {
 		for _, downgraded := range []bool{false, true} {
 			got := SelectModel(RouteInput{Intent: intent, Lane: LaneNormal, DeepThink: false, Downgraded: downgraded, DefaultModel: ModelSonnet})
 			if got.Model == ModelFable {
-				t.Errorf("SelectModel(intent=%q, deep_think=false, downgraded=%v) = %+v, want claude-fable-5 NEVER selected without deep_think", intent, downgraded, got)
+				t.Errorf("SelectModel(intent=%q, deep_think=false, downgraded=%v) = %+v, want %q NEVER selected without deep_think", intent, downgraded, got, ModelFable)
 			}
 		}
 		got := SelectModel(RouteInput{Intent: intent, Lane: LaneNormal, DeepThink: true, DefaultModel: ModelSonnet})
 		if got.Local || got.Model != ModelFable {
-			t.Errorf("SelectModel(intent=%q, deep_think=true) = %+v, want Model=claude-fable-5 Local=false", intent, got)
+			t.Errorf("SelectModel(intent=%q, deep_think=true) = %+v, want Model=%q Local=false", intent, got, ModelFable)
 		}
 	}
 }
@@ -143,14 +143,14 @@ func TestSelectModelDowngradeChain(t *testing.T) {
 
 // TestSelectModelDeepThinkHonoredUnderDowngradeButFlagged proves an
 // explicit derin opt-in is NOT itself a router choice subject to
-// downgrade: it is still honored (Model stays claude-fable-5) even when
+// downgrade: it is still honored (Model stays ModelFable) even when
 // Downgraded is true, but the decision is flagged (DerinDuringDowngrade)
 // so the caller can ledger derin_during_downgrade + its own Turkish spend
 // warning.
 func TestSelectModelDeepThinkHonoredUnderDowngradeButFlagged(t *testing.T) {
 	got := SelectModel(RouteInput{Intent: IntentChat, Lane: LaneNormal, DeepThink: true, Downgraded: true, DefaultModel: ModelSonnet})
 	if got.Local || got.Model != ModelFable {
-		t.Errorf("SelectModel(deep_think=true, downgraded=true) = %+v, want Model=claude-fable-5 (honored despite downgrade)", got)
+		t.Errorf("SelectModel(deep_think=true, downgraded=true) = %+v, want Model=%q (honored despite downgrade)", got, ModelFable)
 	}
 	if !got.DerinDuringDowngrade {
 		t.Error("SelectModel(deep_think=true, downgraded=true).DerinDuringDowngrade = false, want true")
@@ -166,4 +166,59 @@ func TestSelectModelDeepThinkHonoredUnderDowngradeButFlagged(t *testing.T) {
 // (matches every other optional-dependency Ledger consumer's posture).
 func TestLogRoutingDecisionNilLedgerNoop(t *testing.T) {
 	LogRoutingDecision(nil, nil, "trace1", RouteInput{Intent: IntentChat}, RouteDecision{Model: ModelSonnet})
+}
+
+// TestSelectModelNeverSelectsLegacyID (FIX-G12-N2, owner decision G12-7):
+// after the model-id bump the previous generation is accepted for resumed
+// tasks but never chosen - every decision for every intent, lane,
+// deep-think and downgrade combination names a current-generation id (or
+// the local lane).
+func TestSelectModelNeverSelectsLegacyID(t *testing.T) {
+	current := map[string]bool{}
+	for _, m := range CurrentModels() {
+		current[m] = true
+	}
+	legacy := map[string]bool{}
+	for _, m := range LegacyModels() {
+		if current[m] {
+			t.Fatalf("%q is both a current and a legacy model id", m)
+		}
+		legacy[m] = true
+	}
+	if len(current) != 4 || len(legacy) != 4 {
+		t.Fatalf("CurrentModels()=%v LegacyModels()=%v, want four distinct ids each", CurrentModels(), LegacyModels())
+	}
+	intents := []string{IntentPlan, IntentCodeMultiFile, IntentHardExec, IntentSubagentExec, IntentFanout,
+		IntentExtract, IntentWriteback, IntentRoute, IntentClassify, IntentReader, IntentChat, "", "unknown"}
+	for _, intent := range intents {
+		for _, lane := range []string{LaneNormal, LaneSecret, ""} {
+			for _, deep := range []bool{false, true} {
+				for _, down := range []bool{false, true} {
+					got := SelectModel(RouteInput{Intent: intent, Lane: lane, DeepThink: deep, Downgraded: down, DefaultModel: ModelSonnet})
+					if got.Local {
+						continue
+					}
+					if !current[got.Model] {
+						t.Errorf("SelectModel(intent=%q lane=%q deep=%v down=%v) = %q, want a current-generation id %v", intent, lane, deep, down, got.Model, CurrentModels())
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestSelectModelLegacyDefaultModelTakesDowngradeRung (FIX-G12-N2): an
+// operator config.yaml written before the bump may still name a legacy
+// default_model; the chat row keeps honoring it, and the 80% rung still
+// applies to it (legacy Opus -> current Sonnet, legacy Sonnet -> local).
+func TestSelectModelLegacyDefaultModelTakesDowngradeRung(t *testing.T) {
+	if got := SelectModel(RouteInput{Intent: IntentChat, Lane: LaneNormal, DefaultModel: LegacyModelSonnet}); got.Local || got.Model != LegacyModelSonnet {
+		t.Errorf("chat with legacy default, not downgraded = %+v, want Model=%q", got, LegacyModelSonnet)
+	}
+	if got := SelectModel(RouteInput{Intent: IntentChat, Lane: LaneNormal, Downgraded: true, DefaultModel: LegacyModelSonnet}); !got.Local || got.Reason != ReasonDowngradeSonnetToLocal {
+		t.Errorf("chat with legacy Sonnet default, downgraded = %+v, want the local lane (%s)", got, ReasonDowngradeSonnetToLocal)
+	}
+	if got := SelectModel(RouteInput{Intent: IntentChat, Lane: LaneNormal, Downgraded: true, DefaultModel: LegacyModelOpus}); got.Local || got.Model != ModelSonnet || got.Reason != ReasonDowngradeOpusToSonnet {
+		t.Errorf("chat with legacy Opus default, downgraded = %+v, want Model=%q (%s)", got, ModelSonnet, ReasonDowngradeOpusToSonnet)
+	}
 }

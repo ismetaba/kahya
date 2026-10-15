@@ -63,7 +63,7 @@ func TestSpawnInsertsCleanRowAndLedgersActorSeeded(t *testing.T) {
 	ctx := context.Background()
 
 	v := MailSummaryV1{FromDisplay: "a", Subject: "b", Summary: "c"}
-	res, err := Spawn(ctx, st.DB(), st, v, "claude-sonnet-5", "episode-123", "trace-spawn")
+	res, err := Spawn(ctx, st.DB(), st, v, "claude-sonnet-5-5", "episode-123", "trace-spawn")
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestActorSessionStartsCleanAndPolicyCheckPassesTaint(t *testing.T) {
 	ctx := context.Background()
 
 	v := WebpageExtractV1{Title: "t", KeyPoints: []string{"a"}}
-	res, err := Spawn(ctx, st.DB(), st, v, "claude-sonnet-5", "episode-456", "trace-spawn-2")
+	res, err := Spawn(ctx, st.DB(), st, v, "claude-sonnet-5-5", "episode-456", "trace-spawn-2")
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}

@@ -26,8 +26,8 @@ func TestBuildEnvelopeShape(t *testing.T) {
 	if env.Model != CloudModelName {
 		t.Errorf("Model = %q, want %q", env.Model, CloudModelName)
 	}
-	if env.Model != "claude-haiku-4-5" {
-		t.Errorf("Model = %q, want the literal HANDOFF §4 routing-table value claude-haiku-4-5", env.Model)
+	if env.Model != "claude-haiku-5-5" {
+		t.Errorf("Model = %q, want the literal HANDOFF §4 routing-table value claude-haiku-5-5", env.Model)
 	}
 	if env.Schema != RewriteJobType {
 		t.Errorf("Schema = %q, want %q", env.Schema, RewriteJobType)

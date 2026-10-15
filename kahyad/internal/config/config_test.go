@@ -67,7 +67,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.EmbedPort != 8092 {
 		t.Errorf("EmbedPort = %d, want 8092", cfg.EmbedPort)
 	}
-	if cfg.DefaultModel != "claude-sonnet-5" {
+	if cfg.DefaultModel != "claude-sonnet-5-5" {
 		t.Errorf("DefaultModel = %q", cfg.DefaultModel)
 	}
 	if cfg.TaskTimeoutMin != 30 {

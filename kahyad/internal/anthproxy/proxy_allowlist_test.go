@@ -138,7 +138,7 @@ func TestProxyRejectsUnknownPath(t *testing.T) {
 			cfg := testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil)
 			baseURL, _ := startTestProxy(t, cfg)
 
-			status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+path, `{"model":"claude-sonnet-5"}`))
+			status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+path, `{"model":"claude-sonnet-5-5"}`))
 			if status != http.StatusNotFound {
 				t.Fatalf("status = %d, want 404; body %s", status, body)
 			}
@@ -176,7 +176,7 @@ func TestProxyAllowsCountTokensPath(t *testing.T) {
 	upstream := newJSONUpstream(t, 200, `{"input_tokens":12}`)
 	ledger := &fakeLedger{}
 	baseURL, _ := startTestProxy(t, testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil))
-	if status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages/count_tokens?beta=true", `{"model":"claude-sonnet-5","messages":[]}`)); status != 200 {
+	if status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages/count_tokens?beta=true", `{"model":"claude-sonnet-5-5","messages":[]}`)); status != 200 {
 		t.Fatalf("status = %d, want 200; body %s", status, body)
 	}
 	if upstream.hits() != 1 {
@@ -267,7 +267,7 @@ func TestProxyRejectsCaseVariantOrDuplicateModelKey(t *testing.T) {
 		{"case_variant_key_first", `{"MODEL":"` + allowed + `","model":"` + unknownModelID + `","max_tokens":1}`},
 		{"duplicate_exact_key", `{"model":"` + unknownModelID + `","model":"` + allowed + `","max_tokens":1}`},
 		{"lone_case_variant_key", `{"Model":"` + allowed + `","max_tokens":1}`},
-		{"duplicate_key_ending_in_fable", `{"model":"` + allowed + `","model":"` + fable5Model + `","max_tokens":1}`},
+		{"duplicate_key_ending_in_fable", `{"model":"` + allowed + `","model":"` + router.ModelFable + `","max_tokens":1}`},
 		{"other_member_collision", `{"model":"` + allowed + `","max_tokens":1,"MAX_TOKENS":64000}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

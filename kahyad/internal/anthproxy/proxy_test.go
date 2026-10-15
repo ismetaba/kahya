@@ -157,7 +157,7 @@ func TestProxyKeychainModeStripsTokenAndInjectsKey(t *testing.T) {
 	cfg.Credential = NewKeychainCredentialSource(&fakeKeychainReader{key: "sk-ant-real-keychain-key"}, "prod", nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5","messages":[]}`))
+	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5","messages":[]}`))
 	req.Header.Set("x-api-key", testToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -247,7 +247,7 @@ func TestProxySSEStreamsUnbufferedAndRecordsUsage(t *testing.T) {
 	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","stream":true}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5","stream":true}`)
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
@@ -307,14 +307,14 @@ func TestProxyBlocksAtTaskCeilingBeforeForwarding(t *testing.T) {
 	}, nil, nil)
 	// Pre-seed the ceiling via a prior recorded call - the NEXT request
 	// must be blocked before it is ever forwarded.
-	governor.RecordUsage(t.Context(), 0, ledger, "trace1", "t_test", "claude-sonnet-5",
+	governor.RecordUsage(t.Context(), 0, ledger, "trace1", "t_test", "claude-sonnet-5-5",
 		Usage{InputTokens: 500_000}, 1.0, "ok", 10, "")
 	ledger.calls = nil // reset so the test only counts calls from THIS request
 
 	cfg := testProxyConfig(t, upstream.srv.URL, governor, ledger, nil)
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -343,7 +343,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 		DailyBudgetUSD: 0.01, MonthlyBudgetUSD: 10000, TaskTokenCeiling: 500_000,
 		DowngradeAtRatio: 0.8, CacheHitAlarmThreshold: 0.5,
 	}, nil, nil)
-	governor.RecordUsage(context.Background(), 0, ledger, "trace1", "t_test", "claude-sonnet-5",
+	governor.RecordUsage(context.Background(), 0, ledger, "trace1", "t_test", "claude-sonnet-5-5",
 		Usage{InputTokens: 1000}, 0.02, "ok", 10, "")
 	ledger.calls = nil
 
@@ -358,7 +358,7 @@ func TestProxyBlocksAtDailyBudgetWithExactTurkishMessage(t *testing.T) {
 	}
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
@@ -401,7 +401,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	if _, err := http.DefaultClient.Do(req); err != nil {
 		t.Fatalf("request before Close() failed: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestProxyListenerClosesOnTaskEnd(t *testing.T) {
 	}
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	req2 := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req2 := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 	if _, err := client.Do(req2); err == nil {
 		t.Fatal("request after Close() succeeded, want connection refused/failed")
 	}
@@ -464,7 +464,7 @@ func TestProxyKeychainUnavailableRespondsAndNotifiesOnce(t *testing.T) {
 	baseURL, _ := startTestProxy(t, cfg)
 
 	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5"}`))
 		req.Header.Set("x-api-key", testToken)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

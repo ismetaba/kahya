@@ -180,7 +180,7 @@ func TestProxyRecordsUsageWhenClientDisconnectsMidStream(t *testing.T) {
 	// A private transport so closing the body really drops the connection
 	// (no keep-alive pool shared with other tests).
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	resp, err := client.Do(newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","stream":true}`))
+	resp, err := client.Do(newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5","stream":true}`))
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestProxyRecordsUsageWhenClientWriteFailsMidStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "http://proxy.invalid/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5","stream":true}`))
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.invalid/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5","stream":true}`))
 	req.Header.Set(TaskTokenHeader, testToken)
 	req.Header.Set("Authorization", "Bearer test-upstream-credential")
 	w := &failAfterWriter{header: http.Header{}, limit: len(sseMessageStart1000)}

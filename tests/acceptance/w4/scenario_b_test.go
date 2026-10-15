@@ -177,7 +177,7 @@ func startFakeHealthyUpstream(t *testing.T, port int) *http.Server {
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"msg_fake","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"id":"msg_fake","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-5-5","usage":{"input_tokens":1,"output_tokens":1}}`))
 	})
 	srv := &http.Server{Handler: mux}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))

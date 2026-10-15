@@ -82,7 +82,7 @@ func TestProxyPassthroughRealCLIShapeOnlyAPIKeyHeader(t *testing.T) {
 	baseURL, _ := startTestProxy(t, cfg)
 
 	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5"}`))
 		req.Header.Set("x-api-key", testToken)
 		status, body := doAndDrain(t, req)
 		if status != http.StatusUnauthorized {
@@ -117,7 +117,7 @@ func TestProxyPassthroughForwardsWorkerAuthUnchanged(t *testing.T) {
 	cfg.CredentialMode = CredentialModePassthrough
 	baseURL, _ := startTestProxy(t, cfg)
 
-	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5"}`))
 	req.Header.Set(TaskTokenHeader, testToken)
 	req.Header.Set("Authorization", "Bearer worker-own-session-credential")
 	if status, body := doAndDrain(t, req); status != 200 {
@@ -158,7 +158,7 @@ func TestProxyKeychainModeAcceptsTaskTokenHeader(t *testing.T) {
 	// The exact keychain-mode shape BuildEnv produces: ANTHROPIC_API_KEY=<token>
 	// (x-api-key) AND ANTHROPIC_CUSTOM_HEADERS (X-Kahya-Task-Token).
 	for _, legacyToo := range []bool{false, true} {
-		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+		req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5"}`))
 		req.Header.Set(TaskTokenHeader, testToken)
 		if legacyToo {
 			req.Header.Set("x-api-key", testToken)
@@ -192,7 +192,7 @@ func TestProxyRejectsWrongTaskTokenHeader(t *testing.T) {
 			cfg.Credential = NewKeychainCredentialSource(&fakeKeychainReader{key: "sk-ant-fake"}, "prod", nil)
 			baseURL, _ := startTestProxy(t, cfg)
 
-			req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+			req, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5-5"}`))
 			req.Header.Set(TaskTokenHeader, "kahya-task-wrongwrongwrongwrongwrongwrong")
 			req.Header.Set("x-api-key", testToken)
 			req.Header.Set("Authorization", "Bearer some-credential")

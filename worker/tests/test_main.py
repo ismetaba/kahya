@@ -33,7 +33,7 @@ VALID_ENVELOPE = {
     "session_id": None,
     "kind": "chat",
     "prompt": "Kadıköy'deki randevuyu hatırlat",
-    "model": "claude-sonnet-5",
+    "model": "claude-sonnet-5-5",
     "memory_injection": True,
     "created_at": "2026-07-10T12:00:00Z",
 }
@@ -339,7 +339,7 @@ class TestStartupEnvAssertions(unittest.TestCase):
 class TestStdoutProtocolAndSession(unittest.TestCase):
     def test_success_stream_emits_session_delta_result_one_json_per_line(self) -> None:
         messages = [
-            AssistantMessage(content=[TextBlock(text="Merhaba!")], model="claude-sonnet-5", session_id="sess-abc"),
+            AssistantMessage(content=[TextBlock(text="Merhaba!")], model="claude-sonnet-5-5", session_id="sess-abc"),
             ResultMessage(
                 subtype="success", duration_ms=10, duration_api_ms=5,
                 is_error=False, num_turns=1, session_id="sess-abc",
@@ -550,7 +550,7 @@ class TestClarificationTurnStream(unittest.TestCase):
         messages = [
             AssistantMessage(
                 content=[TextBlock(text="Hangi hesaptan ödeme yapayım?")],
-                model="claude-sonnet-5", session_id="sess-clar",
+                model="claude-sonnet-5-5", session_id="sess-clar",
             ),
             _ok_result(),
         ]
@@ -570,7 +570,7 @@ class TestClarificationTurnStream(unittest.TestCase):
                     ToolUseBlock(id="tu1", name="mcp__kahya_memory__memory_search", input={"q": "x"}),
                     TextBlock(text="Bunu mu demek istedin?"),
                 ],
-                model="claude-sonnet-5", session_id="sess-clar",
+                model="claude-sonnet-5-5", session_id="sess-clar",
             ),
             _ok_result(),
         ]
@@ -581,7 +581,7 @@ class TestClarificationTurnStream(unittest.TestCase):
         messages = [
             AssistantMessage(
                 content=[TextBlock(text="Fatura ödendi.")],
-                model="claude-sonnet-5", session_id="sess-clar",
+                model="claude-sonnet-5-5", session_id="sess-clar",
             ),
             _ok_result(),
         ]
@@ -603,7 +603,7 @@ class TestBuildOptions(unittest.TestCase):
         options = worker_main._build_options(env, "/tmp/k.sock", "/repo/bin/kahya-mcp")
 
         self.assertEqual(options.allowed_tools, [])
-        self.assertEqual(options.model, "claude-sonnet-5")
+        self.assertEqual(options.model, "claude-sonnet-5-5")
         self.assertEqual(options.permission_mode, "default")
         self.assertIsNotNone(options.can_use_tool)
         mcp_cfg = options.mcp_servers["kahya_memory"]
@@ -929,7 +929,7 @@ class TestReaderMode(unittest.TestCase):
         **VALID_ENVELOPE,
         "mode": "reader",
         "schema": "mail_summary_v1",
-        "model": "claude-haiku-4-5",
+        "model": "claude-haiku-5-5",
         "memory_injection": False,
     }
 
@@ -976,7 +976,7 @@ class TestReaderMode(unittest.TestCase):
         messages = [
             AssistantMessage(
                 content=[TextBlock(text='{"from_display":"","subject":"",'), TextBlock(text='"summary":"s","dates":[],"amounts":[]}')],
-                model="claude-haiku-4-5",
+                model="claude-haiku-5-5",
             ),
             ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1, session_id="sess-reader", total_cost_usd=0.0),
         ]
@@ -1150,7 +1150,7 @@ class TestStreamWithoutResult(unittest.TestCase):
     ends without a ResultMessage is now an error (fail-closed)."""
 
     def test_stream_ending_without_result_message_is_error_not_fake_ok(self) -> None:
-        msgs = [AssistantMessage(content=[TextBlock(text="yarım?")], model="claude-sonnet-5", session_id="sess-half")]
+        msgs = [AssistantMessage(content=[TextBlock(text="yarım?")], model="claude-sonnet-5-5", session_id="sess-half")]
         with tempfile.TemporaryDirectory() as log_dir:
             code, out = run_main_with(
                 dict(VALID_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=msgs)
@@ -1181,7 +1181,7 @@ class TestStreamWithoutResult(unittest.TestCase):
         self.assertFalse(any(l.get("type") == "result" for l in lines), lines)
 
     def test_reader_stream_ending_without_result_is_error(self) -> None:
-        msgs = [AssistantMessage(content=[TextBlock(text='{"summary":')], model="claude-haiku-4-5")]
+        msgs = [AssistantMessage(content=[TextBlock(text='{"summary":')], model="claude-haiku-5-5")]
         with tempfile.TemporaryDirectory() as log_dir:
             code, out = run_main_with(
                 dict(TestReaderMode.READER_ENVELOPE), base_env(log_dir), client_factory=fake_client_factory(messages=msgs)

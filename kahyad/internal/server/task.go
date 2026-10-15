@@ -323,7 +323,7 @@ type taskRequest struct {
 	Prompt  string `json:"prompt"`
 	TraceID string `json:"trace_id"`
 	// DeepThink is W4-08's `kahya ask --derin` opt-in: true pins
-	// claude-fable-5 (kahyad/internal/router.SelectModel), UNLESS the
+	// router.ModelFable (kahyad/internal/router.SelectModel), UNLESS the
 	// classified lane is secret (which outranks it). Optional/backward-
 	// compatible: absent/false is every pre-W4-08 request body's exact
 	// existing behavior. The OTHER opt-in form - the byte-exact Turkish
@@ -969,7 +969,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 
 	// W4-08: an explicit "derin düşün" opt-in is NOT itself a router
 	// choice subject to downgrade (router.RouteDecision.DerinDuringDowngrade
-	// is only ever true here, on the cloud/claude-fable-5 path - never on
+	// is only ever true here, on the cloud/Fable path - never on
 	// the lane==secret or decision.Local branches above, which already
 	// returned) - it is honored, but the user is warned, in the output
 	// itself, that they are spending through an active 80% downgrade.

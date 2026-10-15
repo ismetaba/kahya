@@ -96,17 +96,19 @@ Metafor: Osmanlı **kâhya**sı — evi sahibinin adına *kendi başına* yönet
 ### Model yönlendirme (karar **Go kodunda**, istemde değil)
 | Görev | Model | Fiyat /MTok |
 |---|---|---|
-| Planlama · zor yürütme · çok-dosya kod | `claude-opus-4-8` | $5 / $25 (1M ctx) |
-| Alt-ajan yürütme · fan-out | `claude-sonnet-5` | $3 / $15 (*intro $2/$10, 31.08.2026'ya dek*) |
+| Planlama · zor yürütme · çok-dosya kod | `claude-opus-5-5` | $4 / $20 (1M ctx) |
+| Alt-ajan yürütme · fan-out | `claude-sonnet-5-5` | $2 / $10 |
 | **Yönlendirme / sınıflandırma** | ⚑ **yerel Qwen3-30B-A3B** (<300ms) — gizli-şerit tespiti burada | — |
-| Çıkarım · geri-yazım (gizli-şerit-dışı onaylı) | `claude-haiku-4-5` | $1 / $5 |
-| **Okuyucu** (güvenilmez içerik ayrıştırma) | ⚑ içerik yerel ön-sınıflandırıcıdan geçer; gizli-şerit ise **Qwen3-30B-A3B (yerel)**, değilse `claude-haiku-4-5` | — |
+| Çıkarım · geri-yazım (gizli-şerit-dışı onaylı) | `claude-haiku-5-5` | $0.10 / $0.50 (istem ≤100K token; üstü $0.50 / $2.50) |
+| **Okuyucu** (güvenilmez içerik ayrıştırma) | ⚑ içerik yerel ön-sınıflandırıcıdan geçer; gizli-şerit ise **Qwen3-30B-A3B (yerel)**, değilse `claude-haiku-5-5` | — |
 | **Gizli şerit** (finans/sağlık/kimlik) | `Qwen3-30B-A3B` MLX 4-bit yerel | — (makineden çıkmaz) |
-| "Derin düşün" opt-in | `claude-fable-5` | $10 / $50 |
+| "Derin düşün" opt-in | `claude-fable-5-1` | $10 / $50 |
+
+⚑ **Model kimliği güncellemesi (G12-N2, sahip kararı G12-5 = B, 2026-10):** tablo güncel nesildir. Önbellek fiyatları model başınadır (/MTok, okuma · 1-saat yazma): Opus 5.5 $0.20 · $8; Sonnet 5.5 $0.20 · $4; Haiku 5.5 girdi fiyatının 0.1× · 2×'i (istem kademesiyle birlikte); Fable 5.1 $0.25 · $20. Önceki nesil — `claude-opus-4-8` $5 / $25 · `claude-sonnet-5` $3 / $15 (*intro $2/$10, 31.08.2026'ya dek*) · `claude-haiku-4-5` $1 / $5 · `claude-fable-5` $10 / $50 (önbellek okuma 0.1×, 1-saat yazma 2×) — **yalnız kabul edilir ve fiyatlanır, yönlendirici asla seçmez**: güncellemeden önce `tasks.model`'i yazılmış görevler resume edebilsin diye, non-terminal eski-model görev kalmayana dek allowlist'te kalır (G12-7). İki bilinçli kullanım: `claude-opus-4-8` Fable'ın fallback hedefidir (aşağıda); `claude-haiku-4-5` paketli CLI'ın kendi yardımcı çağrılarının modelidir (`spawn.CLIAuxiliaryModel` — pinli CLI bu çağrılarda Haiku 5.5'in reddettiği `budget_tokens`/örnekleme/prefill parametrelerini gönderebilir; canlı doğrulanınca `claude-haiku-5-5`'e geçilir). kahyad Opus 5.5'e `effort` enjekte etmez (G12-8); pinli CLI kendi `output_config.effort` değerini gönderir, proxy ona dokunmaz.
 
 ⚑ **Sıralama değişmezi:** *Hiçbir bayt, gizli-şerit sınıflandırması yerel/deterministik olarak tamamlanmadan bulut modele gitmez.* policy.yaml globları **yalnız dosya yolları** için; mail/web gibi içerik-kaynaklı veride gizli-şerit kararı yerel içerik-sınıflandırıcıyla **alım anında** verilir.
 
-- Fable 5 **asla varsayılan değil** ve daima `betas:["server-side-fallback-2026-06-01"]` + `fallbacks:[{model:"claude-opus-4-8"}]` ile (30-gün saklama zorunluluğu + güvenlik-bitişik işte red sınıflandırıcıları).
+- Fable (`claude-fable-5-1`; eski `claude-fable-5` de) **asla varsayılan değil** ve daima `betas:["server-side-fallback-2026-06-01"]` + `fallbacks:[{model:"claude-opus-4-8"}]` ile (30-gün saklama zorunluluğu + güvenlik-bitişik işte red sınıflandırıcıları). ⚑ Sahip kararı G12-6: Fable 5.1'in izin verilen sunucu-tarafı fallback hedefleri yalnız `claude-opus-4-8` / `claude-opus-5`'tir — fallback **`claude-opus-5-5` değildir**; bu yüzden `claude-opus-4-8` allowlist'te ve fiyatlı kalır. Dizi biçimi tam olarak bu betayı ister (`server-side-fallback-2026-07-01` ile eşlemek 400 döner); proxy gövdedeki başka `server-side-fallback-*` betalarını düşürür. Haiku 5.5'in sunucu-tarafı fallback'i yoktur: Haiku isteklerine asla `fallbacks` eklenmez.
 - Yerel filo v1'de **tam üç** yerleşik model: `whisper-large-v3-turbo`, `Qwen3-Embedding-0.6B` (512-dim MRL, `model_ver` etiketli), `Qwen3-30B-A3B`. Reranker/120B/wake-word ertelendi.
   - ⚑ **`model_ver` kullanım kuralı:** her vektör satırı `model_ver` taşır; KNN sorguları daima **tek aktif `model_ver`'e filtrelenir** (karışık-versiyon KNN yasak). Gömülü yükseltme = Markdown kaynak-gerçeğinden **tam yeniden-gömme**; §5-Hafıza-#5 retrieval eval kapısı yeşilse aktif versiyon değişir, eski vektörler sonra silinir.
 
@@ -253,6 +255,7 @@ Gömülü NATS · SQLCipher · yerel GPT-OSS-120B · ekran gözlemi firehose · 
 - **Anahtar kütüphaneler:** `claude-agent-sdk` (Python, sürüm pinli), MCP, `sqlc` + **`goose`/`golang-migrate`**, `sqlite-vec` (≥0.1.9), `robfig/cron/v3`, `mlx-whisper`, `mlx_lm.server`, Hammerspoon, Telegram bot **`gopkg.in/telebot.v4` (Go — kahyad içinde, WYSIWYE onay kapısının parçası; grammY/TS DEĞİL — iki-süreç yığınıyla çelişir)**.
 - **Dosya düzeni:** kod = `~/code/kahya` (git); hafıza = `~/Kahya/memory/*.md` (git, private remote); indeks/defter = `~/Library/Application Support/Kahya/brain.db` (SQLite WAL); yedek = `~/Kahya/backups/brain-YYYYMMDD.db`; sırlar = macOS Keychain (`kahya.anthropic` / `kahya.telegram` / `kahya.anchor`).
 - **Yedekleme:** `~/Kahya` git → private remote (gecelik push); `brain.db` gecelik `VACUUM INTO` (son 7 kopya) — defter markdown'dan türetilemez, tek diskte kalamaz.
-- **Model ID'leri:** `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5`. Yerel: `whisper-large-v3-turbo`, `Qwen3-Embedding-0.6B`, `Qwen3-30B-A3B`.
+- **Model ID'leri:** `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`. Yerel: `whisper-large-v3-turbo`, `Qwen3-Embedding-0.6B`, `Qwen3-30B-A3B`.
+- **Eski model ID'leri (yalnız kabul edilir, seçilmez):** `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` — G12-N2 güncellemesinden (2026-10) önce başlamış görevlerin resume'u için; `claude-opus-4-8` ayrıca Fable fallback hedefi, `claude-haiku-4-5` paketli CLI'ın yardımcı modeli (§4).
 
 **MVP tamamlandı sayılır:** 2 hafta kesintisiz günlük kullanım · sıfır veri-kaybı olayı (yedekten geri-dönüş bir kez tatbik edildi) · ≥10 komut/gün · haftada ≥5 "hatırladı" anı · egress/gizli-şerit/W3 değişmezleri kod-testli (CI'da yeşil).

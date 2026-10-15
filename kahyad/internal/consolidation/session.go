@@ -1,7 +1,7 @@
 // session.go defines the "consolidation session" seam this package
 // depends on: given a lane's file set (relPath -> whole-file content), get
 // back whole-file REWRITES for that same set. Two independent
-// implementations exist - CloudSession (worker.go, claude-haiku-4-5 via
+// implementations exist - CloudSession (worker.go, router.ModelHaiku via
 // the toolless Reader-mode worker profile, HANDOFF §4 routing row
 // "Cikarim . geri-yazim") and LocalSession (localsession.go, the local
 // Qwen3-30B-A3B server, HANDOFF §4 gizli-serit row) - and the orchestrator

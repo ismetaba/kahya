@@ -111,7 +111,7 @@ func TestClarificationTurnRateComputesFromEmittedEvent(t *testing.T) {
 	// this test free of a mid-flight cfg.WorkerCmd swap (which the handler
 	// goroutine reads concurrently).
 	if err := f.store.LogEvent(ctx, "trace-metric-plain-000000001", "task_spawned", map[string]any{
-		"task_id": "t_plain", "model": "claude-sonnet-5", "lane": "normal",
+		"task_id": "t_plain", "model": "claude-sonnet-5-5", "lane": "normal",
 	}); err != nil {
 		t.Fatalf("seed plain task_spawned: %v", err)
 	}

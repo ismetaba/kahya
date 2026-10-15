@@ -99,7 +99,7 @@ func TestSecretLaneTaskFailureReachesFailedStatus(t *testing.T) {
 // path and must also end 'done'.
 func TestLocalDowngradeTaskReachesDoneStatus(t *testing.T) {
 	governor := anthproxy.Boot([]anthproxy.BootEvent{
-		{Ts: time.Now().UTC(), Record: anthproxy.ModelCallRecord{TaskID: "seed", Model: "claude-opus-4-8", USD: 8.0}},
+		{Ts: time.Now().UTC(), Record: anthproxy.ModelCallRecord{TaskID: "seed", Model: "claude-opus-5-5", USD: 8.0}},
 	}, anthproxy.Limits{
 		DailyBudgetUSD: 10, MonthlyBudgetUSD: 1000, TaskTokenCeiling: 500000,
 		DowngradeAtRatio: 0.8, CacheHitAlarmThreshold: 0.5,

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/notify"
+	"kahya/kahyad/internal/router"
 )
 
 // Limits are the governor's configured thresholds (config keys committed
@@ -428,10 +429,13 @@ func (g *Governor) CheckBeforeForward(taskID, model string, body []byte) CheckRe
 //
 // The estimate is returned as a Usage shaped so that est.CostUSD(row) is
 // exactly usd: the input side as CacheCreationInputTokens (CostUSD prices
-// those at the 1h cache-write rate), the output side as OutputTokens, and
-// est.BillableCeilingTokens() as the token count reserved against the
-// per-task ceiling. FailClosedUsage bills this same Usage when a call's
-// real usage cannot be read.
+// those at the 1h cache-write rate, and a tiered row picks its tier from
+// them), the output side as OutputTokens, and est.BillableCeilingTokens()
+// as the token count reserved against the per-task ceiling. The one
+// exception is strategy 2 on a prompt-size tiered row (FIX-G12-N2): with
+// no prompt size known it is priced at the row's costlier tier.
+// FailClosedUsage bills this same Usage when a call's real usage cannot be
+// read.
 func (g *Governor) estimateRequestLocked(model string, body []byte) (est Usage, usd float64) {
 	row, priceErr := PriceFor(model, g.now())
 	if priceErr != nil {
@@ -455,8 +459,11 @@ func (g *Governor) estimateRequestLocked(model string, body []byte) (est Usage, 
 		return est, est.CostUSD(row)
 	}
 
+	// No body to size the prompt from: a prompt-size tiered row (FIX-G12-N2,
+	// Haiku 5.5) is assumed to be in its costlier tier - never the cheap
+	// one an empty Usage would select.
 	est = Usage{OutputTokens: fallbackTokens}
-	return est, est.CostUSD(row)
+	return est, est.CostUSD(row.costliestTier())
 }
 
 // FailClosedUsage returns the usage and USD to bill for a forwarded call
@@ -575,9 +582,16 @@ func (g *Governor) ReleaseReservation(id ReservationID) {
 // decision, never a model string. This method is kept exactly as W12-08
 // left it (a pure Opus->Sonnet mapping) for any caller that only needs
 // that one leg in isolation; production routing does not call it.
+//
+// FIX-G12-N2: the current generation steps router.ModelOpus down to
+// router.ModelSonnet; the legacy Opus -> legacy Sonnet mapping stays for a
+// caller still holding a legacy id.
 func (g *Governor) DowngradeModel(model string) (result string, changed bool) {
-	if model == "claude-opus-4-8" {
-		return "claude-sonnet-5", true
+	switch model {
+	case router.ModelOpus:
+		return router.ModelSonnet, true
+	case router.LegacyModelOpus:
+		return router.LegacyModelSonnet, true
 	}
 	return model, false
 }

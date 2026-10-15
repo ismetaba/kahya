@@ -1,6 +1,6 @@
 // router_task_test.go covers W4-08's wiring of kahyad/internal/router into
 // POST /v1/task: the "derin düşün" opt-in (both forms) selecting
-// claude-fable-5 with the real per-task anthproxy.Proxy's own Fable-5
+// claude-fable-5-1 with the real per-task anthproxy.Proxy's own Fable-5
 // shaping applied end to end, the cost-governor 80% downgrade rung routing
 // a Sonnet-class chat task to the local lane, secret-lane pinning
 // outranking --derin with zero bytes reaching the fake upstream, and the
@@ -72,7 +72,7 @@ func generousTestGovernor() *anthproxy.Governor {
 // modelCloudWorkerScript resolves this package's own testdata fixture that
 // echoes the envelope's OWN model field into a real cloud call (unlike
 // kahyad/internal/outbox/testdata/cloud_call_worker.py, which hardcodes
-// claude-sonnet-5 - see that file's own doc comment for why this task
+// claude-sonnet-5-5 - see that file's own doc comment for why this task
 // needs a different fixture).
 func modelCloudWorkerScript(t *testing.T) []string {
 	t.Helper()
@@ -80,7 +80,7 @@ func modelCloudWorkerScript(t *testing.T) []string {
 }
 
 // assertUpstreamSawFable5Shaping decodes body and asserts it names
-// claude-fable-5 with the mandatory server-side-fallback beta and Opus
+// claude-fable-5-1 with the mandatory server-side-fallback beta and Opus
 // fallback (HANDOFF §4, verbatim) - the SAME assertion shape
 // kahyad/internal/anthproxy's own TestFable5ShapingInjectsBetaAndFallback
 // uses, reused here to prove the router's own opt-in entry point drives a
@@ -97,8 +97,8 @@ func assertUpstreamSawFable5Shaping(t *testing.T, body string) {
 	if err := json.Unmarshal([]byte(body), &seen); err != nil {
 		t.Fatalf("decode upstream body: %v (%s)", err, body)
 	}
-	if seen.Model != "claude-fable-5" {
-		t.Errorf("upstream model = %q, want claude-fable-5", seen.Model)
+	if seen.Model != "claude-fable-5-1" {
+		t.Errorf("upstream model = %q, want claude-fable-5-1", seen.Model)
 	}
 	found := false
 	for _, b := range seen.Betas {
@@ -115,7 +115,7 @@ func assertUpstreamSawFable5Shaping(t *testing.T, body string) {
 }
 
 // TestDerinFlagSelectsFable5WithProxyShaping proves `kahya ask --derin`
-// (taskRequest.DeepThink) produces envelope model=claude-fable-5 and that
+// (taskRequest.DeepThink) produces envelope model=claude-fable-5-1 and that
 // the real per-task anthproxy.Proxy applies the mandatory Fable-5 shaping
 // to the actual outbound request.
 func TestDerinFlagSelectsFable5WithProxyShaping(t *testing.T) {
@@ -141,7 +141,7 @@ func TestDerinFlagSelectsFable5WithProxyShaping(t *testing.T) {
 
 // TestDerinDusunPrefixSelectsFable5AndStripsPrefix proves the byte-exact
 // Turkish prompt prefix "derin düşün: şu mimariyi değerlendir" ALSO
-// produces envelope model=claude-fable-5 (with the same proxy shaping),
+// produces envelope model=claude-fable-5-1 (with the same proxy shaping),
 // and that the prefix itself is stripped before the worker ever sees the
 // prompt (model_cloud_worker.py doesn't echo the prompt, so this is proven
 // via the classifier/envelope path instead - see
@@ -204,8 +204,8 @@ func TestDerinDusunPrefixStrippedFromEnvelopePrompt(t *testing.T) {
 	if !strings.Contains(echoed, "şu mimariyi değerlendir") {
 		t.Errorf("echoed envelope = %s, want the remaining prompt content preserved", echoed)
 	}
-	if !strings.Contains(echoed, `"model":"claude-fable-5"`) {
-		t.Errorf("echoed envelope = %s, want model:claude-fable-5", echoed)
+	if !strings.Contains(echoed, `"model":"claude-fable-5-1"`) {
+		t.Errorf("echoed envelope = %s, want model:claude-fable-5-1", echoed)
 	}
 	if !strings.Contains(echoed, `"deep_think":true`) {
 		t.Errorf("echoed envelope = %s, want deep_think:true", echoed)
@@ -231,13 +231,13 @@ func TestDerinDusunPrefixAloneRejectedAsEmptyPrompt(t *testing.T) {
 // governor's Sonnet->yerel rung: with Downgraded()==true (fixture spend at
 // exactly 80% of daily_budget_usd, seeded via anthproxy.Boot - no ledger
 // side effect of its own), an ordinary chat task (cfg.default_model =
-// claude-sonnet-5) is answered ENTIRELY locally - the worker (a
+// claude-sonnet-5-5) is answered ENTIRELY locally - the worker (a
 // nonexistent binary) is never spawned - and its persisted tasks.lane
 // stays "normal" (the CONTENT was never secret; only the ROUTE was local).
 func TestDowngradeRoutesSonnetClassChatTaskToLocalLane(t *testing.T) {
 	seedNow := time.Now().UTC()
 	governor := anthproxy.Boot([]anthproxy.BootEvent{
-		{Ts: seedNow, Record: anthproxy.ModelCallRecord{TaskID: "seed", Model: "claude-opus-4-8", USD: 8.0}},
+		{Ts: seedNow, Record: anthproxy.ModelCallRecord{TaskID: "seed", Model: "claude-opus-5-5", USD: 8.0}},
 	}, anthproxy.Limits{
 		DailyBudgetUSD: 10, MonthlyBudgetUSD: 1000, TaskTokenCeiling: 500000,
 		DowngradeAtRatio: 0.8, CacheHitAlarmThreshold: 0.5,

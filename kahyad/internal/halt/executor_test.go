@@ -62,7 +62,7 @@ func insertExecutingTask(t *testing.T, st *store.Store, id string) sqlcgen.Task 
 	traceID := "trace-" + id
 	env := spawn.Envelope{
 		SchemaVersion: spawn.SchemaVersion, TaskID: id, TraceID: traceID,
-		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5",
+		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5-5",
 		MemoryInjection: true, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	envJSON, err := env.Marshal()
@@ -72,7 +72,7 @@ func insertExecutingTask(t *testing.T, st *store.Store, id string) sqlcgen.Task 
 	now := time.Now().UTC().Format(time.RFC3339)
 	if _, err := st.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
 		ID: id, TraceID: traceID, State: "running",
-		Model:     sql.NullString{String: "claude-sonnet-5", Valid: true},
+		Model:     sql.NullString{String: "claude-sonnet-5-5", Valid: true},
 		Envelope:  sql.NullString{String: string(envJSON), Valid: true},
 		UpdatedAt: now, CreatedAt: now, Lane: "normal",
 	}); err != nil {
@@ -147,7 +147,7 @@ func waitForGroupEmpty(t *testing.T, pgid int) {
 func spawnHangWorker(ctx context.Context, taskID, traceID string, onStart func(pid int)) (doneCh <-chan spawn.Outcome) {
 	env := spawn.Envelope{
 		SchemaVersion: spawn.SchemaVersion, TaskID: taskID, TraceID: traceID,
-		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5",
+		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5-5",
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	cfg := spawn.Config{Cmd: []string{"python3", "testdata/hang_worker.py"}}

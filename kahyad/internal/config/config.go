@@ -869,6 +869,13 @@ type fileConfig struct {
 	TTSSpeakSecretLane            *bool           `yaml:"tts_speak_secret_lane"`
 }
 
+// DefaultModelID is default_model's built-in value: HANDOFF §9's current
+// Sonnet (the §4 chat/unknown row). A literal because config is a leaf
+// package; kahyad/internal/server's TestModelIDsMatchHandoffSection9 pins
+// it equal to router.ModelSonnet (FIX-G12-N2: claude-sonnet-5 ->
+// claude-sonnet-5-5).
+const DefaultModelID = "claude-sonnet-5-5"
+
 // Load resolves Config from defaults, an optional config.yaml, and
 // environment overrides, in that precedence order (lowest to highest).
 func Load() (Config, error) {
@@ -1253,7 +1260,7 @@ func defaults(home, env string) Config {
 		EvalRetrievalDatasetPath: filepath.Join(kahyaDir, "eval", "retrieval", "dataset.jsonl"),
 		AnthropicUpstreamURL:     "https://api.anthropic.com",
 		EmbedPort:                8092,
-		DefaultModel:             "claude-sonnet-5",
+		DefaultModel:             DefaultModelID,
 		TaskTimeoutMin:           30,
 		ActiveEmbedModelVer:      "qwen3-embedding-0.6b:512:v1",
 		LogLevel:                 "info",

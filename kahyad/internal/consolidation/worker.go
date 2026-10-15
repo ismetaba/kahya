@@ -12,7 +12,7 @@
 // beyond its own process memory, and kahyad alone writes the returned
 // rewrites into the worktree, worktree.go's own job).
 //
-// Model is claude-haiku-4-5 (HANDOFF §4 routing table row "Cikarim .
+// Model is router.ModelHaiku (HANDOFF §4 routing table row "Cikarim .
 // geri-yazim (gizli-serit-disi onayli)") - Go-side, never worker-chosen
 // (spawn.Envelope.Model), matching every other cloud-lane call site in
 // this codebase.
@@ -25,12 +25,16 @@ import (
 	"sync"
 	"time"
 
+	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/spawn"
 )
 
 // CloudModelName is the HANDOFF §4 routing-table model for the cloud
-// (non-secret-lane) consolidation lane.
-const CloudModelName = "claude-haiku-4-5"
+// (non-secret-lane) consolidation lane: the extract/writeback row's Haiku,
+// derived from the router's HANDOFF §9 constant so a model-id bump moves
+// it too (FIX-G12-N2: claude-haiku-5-5; pinned to the current §9 line by
+// kahyad/internal/server's TestModelIDsMatchHandoffSection9).
+const CloudModelName = router.ModelHaiku
 
 // RewriteJobType is the Schema value this package's cloud-lane envelopes
 // carry - purely informational (envelope.go: "the worker does nothing

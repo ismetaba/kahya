@@ -2,6 +2,7 @@ package anthproxy
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -104,10 +105,10 @@ func TestCheckBeforeForwardBlocksAtTaskCeiling(t *testing.T) {
 	g := NewGovernor(testLimits(), fixedClock(now), nil)
 
 	ledger := &fakeLedger{}
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_ceiling", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_ceiling", "claude-sonnet-5-5",
 		Usage{InputTokens: 500_000}, 1.0, "ok", 100, "")
 
-	res := g.CheckBeforeForward("t_ceiling", "claude-sonnet-5", nil)
+	res := g.CheckBeforeForward("t_ceiling", "claude-sonnet-5-5", nil)
 	if res.Allowed {
 		t.Fatal("CheckBeforeForward() Allowed = true, want false once the task is at/over its 500K ceiling")
 	}
@@ -116,7 +117,7 @@ func TestCheckBeforeForwardBlocksAtTaskCeiling(t *testing.T) {
 	}
 
 	// A DIFFERENT task must be unaffected.
-	if res2 := g.CheckBeforeForward("t_other", "claude-sonnet-5", nil); !res2.Allowed {
+	if res2 := g.CheckBeforeForward("t_other", "claude-sonnet-5-5", nil); !res2.Allowed {
 		t.Errorf("a different task_id was blocked by another task's ceiling: %+v", res2)
 	}
 }
@@ -134,10 +135,10 @@ func TestCheckBeforeForwardBlocksAtDailyBudget(t *testing.T) {
 	g := NewGovernor(limits, fixedClock(now), nil)
 
 	ledger := &fakeLedger{}
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_budget", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_budget", "claude-sonnet-5-5",
 		Usage{InputTokens: 1000, OutputTokens: 1000}, 0.02, "ok", 50, "")
 
-	res := g.CheckBeforeForward("t_budget", "claude-sonnet-5", nil)
+	res := g.CheckBeforeForward("t_budget", "claude-sonnet-5-5", nil)
 	if res.Allowed {
 		t.Fatal("CheckBeforeForward() Allowed = true, want false once daily spend >= daily_budget_usd")
 	}
@@ -153,10 +154,10 @@ func TestCheckBeforeForwardBlocksAtMonthlyBudget(t *testing.T) {
 	limits.MonthlyBudgetUSD = 5
 	g := NewGovernor(limits, fixedClock(now), nil)
 
-	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t_monthly", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t_monthly", "claude-sonnet-5-5",
 		Usage{InputTokens: 1}, 6.0, "ok", 10, "")
 
-	res := g.CheckBeforeForward("t_monthly", "claude-sonnet-5", nil)
+	res := g.CheckBeforeForward("t_monthly", "claude-sonnet-5-5", nil)
 	if res.Allowed || res.Message != MsgMonthlyBudgetBlock {
 		t.Errorf("CheckBeforeForward() = %+v, want blocked with %q", res, MsgMonthlyBudgetBlock)
 	}
@@ -164,7 +165,7 @@ func TestCheckBeforeForwardBlocksAtMonthlyBudget(t *testing.T) {
 
 func TestCheckBeforeForwardAllowsUnderLimits(t *testing.T) {
 	g := NewGovernor(testLimits(), fixedClock(time.Now()), nil)
-	res := g.CheckBeforeForward("t_fresh", "claude-sonnet-5", nil)
+	res := g.CheckBeforeForward("t_fresh", "claude-sonnet-5-5", nil)
 	if !res.Allowed {
 		t.Errorf("CheckBeforeForward() on a fresh task = %+v, want Allowed=true", res)
 	}
@@ -187,7 +188,7 @@ func TestDowngradeFlipsAt80Percent(t *testing.T) {
 
 	ledger := &fakeLedger{}
 	// $8 of $10 daily budget = exactly the 0.8 ratio.
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-opus-4-8",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-opus-5-5",
 		Usage{InputTokens: 1}, 8.0, "ok", 10, "")
 
 	if !g.Downgraded() {
@@ -202,21 +203,30 @@ func TestDowngradeFlipsAt80Percent(t *testing.T) {
 
 	// A second call the same day must NOT re-ledger either "once per day"
 	// event.
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-opus-4-8",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-opus-5-5",
 		Usage{InputTokens: 1}, 0.5, "ok", 10, "")
 	if got := ledger.countKind(EventBudgetDowngradeOn); got != 1 {
 		t.Errorf("EventBudgetDowngradeOn ledgered %d times after a second call, want still 1 (once per day)", got)
 	}
 
-	// DowngradeModel: Opus -> Sonnet; Sonnet unchanged.
-	if model, changed := g.DowngradeModel("claude-opus-4-8"); model != "claude-sonnet-5" || !changed {
-		t.Errorf("DowngradeModel(opus) = (%q, %v), want (claude-sonnet-5, true)", model, changed)
-	}
-	if model, changed := g.DowngradeModel("claude-sonnet-5"); model != "claude-sonnet-5" || changed {
-		t.Errorf("DowngradeModel(sonnet) = (%q, %v), want (claude-sonnet-5, false) - no Sonnet->Haiku rung", model, changed)
-	}
-	if model, changed := g.DowngradeModel("claude-haiku-4-5"); model != "claude-haiku-4-5" || changed {
-		t.Errorf("DowngradeModel(haiku) = (%q, %v), want unchanged - Haiku is a task-class model, never a rung", model, changed)
+	// DowngradeModel: Opus -> Sonnet; Sonnet unchanged. FIX-G12-N2: the
+	// current generation (claude-opus-5-5 -> claude-sonnet-5-5) and the
+	// legacy mapping (claude-opus-4-8 -> claude-sonnet-5) both hold.
+	for _, c := range []struct {
+		in, want string
+		changed  bool
+	}{
+		{"claude-opus-5-5", "claude-sonnet-5-5", true},
+		{"claude-opus-4-8", "claude-sonnet-5", true},
+		{"claude-sonnet-5-5", "claude-sonnet-5-5", false}, // no Sonnet->Haiku rung
+		{"claude-sonnet-5", "claude-sonnet-5", false},
+		{"claude-haiku-5-5", "claude-haiku-5-5", false}, // Haiku is a task-class model, never a rung
+		{"claude-haiku-4-5", "claude-haiku-4-5", false},
+		{"claude-fable-5-1", "claude-fable-5-1", false},
+	} {
+		if model, changed := g.DowngradeModel(c.in); model != c.want || changed != c.changed {
+			t.Errorf("DowngradeModel(%q) = (%q, %v), want (%q, %v)", c.in, model, changed, c.want, c.changed)
+		}
 	}
 }
 
@@ -228,7 +238,7 @@ func TestSpendAlarmsFireOnceAt80And100(t *testing.T) {
 	notifier := &fakeNotifier{}
 	g.notifier = notifier
 
-	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5", Usage{InputTokens: 1}, 8.5, "ok", 10, "")
+	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5-5", Usage{InputTokens: 1}, 8.5, "ok", 10, "")
 	if got := notifier.countAlarm(EventSpendAlarm80); got != 1 {
 		t.Errorf("EventSpendAlarm80 fired %d times, want 1", got)
 	}
@@ -236,7 +246,7 @@ func TestSpendAlarmsFireOnceAt80And100(t *testing.T) {
 		t.Errorf("EventSpendAlarm100 fired %d times before reaching 100%%, want 0", got)
 	}
 
-	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5", Usage{InputTokens: 1}, 2.0, "ok", 10, "")
+	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5-5", Usage{InputTokens: 1}, 2.0, "ok", 10, "")
 	if got := notifier.countAlarm(EventSpendAlarm100); got != 1 {
 		t.Errorf("EventSpendAlarm100 fired %d times after crossing 100%%, want 1", got)
 	}
@@ -257,7 +267,7 @@ func TestCacheHitAlarmFiresBelowThresholdWith20Calls(t *testing.T) {
 	// 19 calls with a poor cache-hit ratio: must not fire yet (floor is
 	// >=20 calls).
 	for i := 0; i < 19; i++ {
-		g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5",
+		g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5-5",
 			Usage{InputTokens: 100, CacheReadInputTokens: 0}, 0.01, "ok", 5, "")
 	}
 	if got := notifier.countAlarm(EventCacheHitAlarm); got != 0 {
@@ -265,7 +275,7 @@ func TestCacheHitAlarmFiresBelowThresholdWith20Calls(t *testing.T) {
 	}
 
 	// The 20th call crosses the floor; ratio is still 0 < 0.5 threshold.
-	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5-5",
 		Usage{InputTokens: 100, CacheReadInputTokens: 0}, 0.01, "ok", 5, "")
 	if got := notifier.countAlarm(EventCacheHitAlarm); got != 1 {
 		t.Errorf("EventCacheHitAlarm fired %d times at call 20 with a 0%% hit ratio, want 1", got)
@@ -279,7 +289,7 @@ func TestCacheHitAlarmDoesNotFireAboveThreshold(t *testing.T) {
 	g.notifier = notifier
 
 	for i := 0; i < 25; i++ {
-		g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5",
+		g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t1", "claude-sonnet-5-5",
 			Usage{InputTokens: 10, CacheReadInputTokens: 90}, 0.01, "ok", 5, "")
 	}
 	if got := notifier.countAlarm(EventCacheHitAlarm); got != 0 {
@@ -297,7 +307,7 @@ func TestCacheBusterSuspectAfterThreeChanges(t *testing.T) {
 
 	hashes := []string{"h1", "h2", "h3", "h4"} // h1->h2, h2->h3, h3->h4 = 3 changes
 	for _, h := range hashes {
-		g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-sonnet-5",
+		g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-sonnet-5-5",
 			Usage{InputTokens: 1}, 0.001, "ok", 5, h)
 	}
 	if got := ledger.countKind(EventCacheBusterSuspect); got == 0 {
@@ -311,7 +321,7 @@ func TestCacheBusterNotSuspectForStableHash(t *testing.T) {
 	ledger := &fakeLedger{}
 
 	for i := 0; i < 10; i++ {
-		g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-sonnet-5",
+		g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t1", "claude-sonnet-5-5",
 			Usage{InputTokens: 1}, 0.001, "ok", 5, "stable-hash")
 	}
 	if got := ledger.countKind(EventCacheBusterSuspect); got != 0 {
@@ -325,7 +335,7 @@ func TestModelCallAlwaysLedgered(t *testing.T) {
 	g := NewGovernor(testLimits(), fixedClock(now), nil)
 	ledger := &fakeLedger{}
 
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace-xyz", "t1", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace-xyz", "t1", "claude-sonnet-5-5",
 		Usage{InputTokens: 10, OutputTokens: 20, CacheReadInputTokens: 5, CacheCreationInputTokens: 2}, 0.5, "ok", 123, "")
 
 	ledger.mu.Lock()
@@ -353,9 +363,9 @@ func TestModelCallAlwaysLedgered(t *testing.T) {
 func TestBootRebuildsTotalsFromFixtureEvents(t *testing.T) {
 	day := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	events := []BootEvent{
-		{Ts: day, Record: ModelCallRecord{TaskID: "t1", Model: "claude-sonnet-5", InputTokens: 100_000, OutputTokens: 50_000, USD: 1.5}},
-		{Ts: day.Add(time.Hour), Record: ModelCallRecord{TaskID: "t1", Model: "claude-sonnet-5", InputTokens: 50_000, OutputTokens: 25_000, USD: 0.75}},
-		{Ts: day.Add(2 * time.Hour), Record: ModelCallRecord{TaskID: "t2", Model: "claude-opus-4-8", InputTokens: 10_000, OutputTokens: 5_000, USD: 3.0}},
+		{Ts: day, Record: ModelCallRecord{TaskID: "t1", Model: "claude-sonnet-5-5", InputTokens: 100_000, OutputTokens: 50_000, USD: 1.5}},
+		{Ts: day.Add(time.Hour), Record: ModelCallRecord{TaskID: "t1", Model: "claude-sonnet-5-5", InputTokens: 50_000, OutputTokens: 25_000, USD: 0.75}},
+		{Ts: day.Add(2 * time.Hour), Record: ModelCallRecord{TaskID: "t2", Model: "claude-opus-5-5", InputTokens: 10_000, OutputTokens: 5_000, USD: 3.0}},
 	}
 
 	g := Boot(events, testLimits(), fixedClock(day.Add(3*time.Hour)), nil)
@@ -394,11 +404,11 @@ func TestBootRebuildsTotalsFromFixtureEvents(t *testing.T) {
 func TestBootThenCheckBeforeForwardBlocksAlreadyAtCeiling(t *testing.T) {
 	day := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	events := []BootEvent{
-		{Ts: day, Record: ModelCallRecord{TaskID: "t_old", Model: "claude-sonnet-5", InputTokens: 500_000, USD: 1.0}},
+		{Ts: day, Record: ModelCallRecord{TaskID: "t_old", Model: "claude-sonnet-5-5", InputTokens: 500_000, USD: 1.0}},
 	}
 	g := Boot(events, testLimits(), fixedClock(day), nil)
 
-	res := g.CheckBeforeForward("t_old", "claude-sonnet-5", nil)
+	res := g.CheckBeforeForward("t_old", "claude-sonnet-5-5", nil)
 	if res.Allowed {
 		t.Fatal("CheckBeforeForward() after Boot replayed a ceiling-crossing task, want blocked")
 	}
@@ -426,7 +436,7 @@ func TestReservationPreventsConcurrentBurstFromExceedingTaskCeiling(t *testing.T
 	g := NewGovernor(limits, fixedClock(now), nil)
 
 	ledger := &fakeLedger{}
-	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_burst", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, ledger, "trace1", "t_burst", "claude-sonnet-5-5",
 		Usage{InputTokens: 450_000}, 1.0, "ok", 100, "")
 
 	const n = 8
@@ -436,7 +446,7 @@ func TestReservationPreventsConcurrentBurstFromExceedingTaskCeiling(t *testing.T
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results <- g.CheckBeforeForward("t_burst", "claude-sonnet-5", nil)
+			results <- g.CheckBeforeForward("t_burst", "claude-sonnet-5-5", nil)
 		}()
 	}
 	wg.Wait()
@@ -468,7 +478,7 @@ func TestReservationPreventsConcurrentBurstFromExceedingTaskCeiling(t *testing.T
 // CheckBeforeForward must still only let one through once their combined
 // reservations would otherwise cross $10. Completed spend is seeded at
 // $9.50; each request's config-default estimate (40K tokens, output-priced
-// at claude-sonnet-5's $10/MTok intro rate = exactly $0.40) means the
+// at claude-sonnet-5-5's $10/MTok rate = exactly $0.40) means the
 // first grant lands at $9.90 (<=$10) and a second concurrent one would
 // reach $10.30 (>$10).
 func TestReservationPreventsConcurrentBurstFromExceedingDailyBudget(t *testing.T) {
@@ -477,7 +487,7 @@ func TestReservationPreventsConcurrentBurstFromExceedingDailyBudget(t *testing.T
 	limits.EstRequestTokens = 40_000
 	g := NewGovernor(limits, fixedClock(now), nil)
 
-	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t_a", "claude-sonnet-5",
+	g.RecordUsage(context.Background(), noReservation, nil, "trace1", "t_a", "claude-sonnet-5-5",
 		Usage{InputTokens: 1}, 9.5, "ok", 10, "")
 
 	taskIDs := []string{"t_a", "t_b"}
@@ -487,7 +497,7 @@ func TestReservationPreventsConcurrentBurstFromExceedingDailyBudget(t *testing.T
 		wg.Add(1)
 		go func(taskID string) {
 			defer wg.Done()
-			results <- g.CheckBeforeForward(taskID, "claude-sonnet-5", nil)
+			results <- g.CheckBeforeForward(taskID, "claude-sonnet-5-5", nil)
 		}(taskID)
 	}
 	wg.Wait()
@@ -520,7 +530,7 @@ func TestFailedRequestReleaseAllowsLaterCall(t *testing.T) {
 	limits.EstRequestTokens = 90_000
 	g := NewGovernor(limits, fixedClock(now), nil)
 
-	first := g.CheckBeforeForward("t_retry", "claude-sonnet-5", nil)
+	first := g.CheckBeforeForward("t_retry", "claude-sonnet-5-5", nil)
 	if !first.Allowed {
 		t.Fatalf("first CheckBeforeForward() = %+v, want Allowed=true", first)
 	}
@@ -528,7 +538,7 @@ func TestFailedRequestReleaseAllowsLaterCall(t *testing.T) {
 	// While the first reservation is still outstanding, a second call must
 	// be blocked - proves the reservation really does occupy headroom
 	// (90K reserved + 90K this estimate = 180K > 100K ceiling).
-	if blocked := g.CheckBeforeForward("t_retry", "claude-sonnet-5", nil); blocked.Allowed {
+	if blocked := g.CheckBeforeForward("t_retry", "claude-sonnet-5-5", nil); blocked.Allowed {
 		t.Fatal("second CheckBeforeForward() while the first reservation is outstanding = Allowed, want blocked")
 	}
 
@@ -539,7 +549,7 @@ func TestFailedRequestReleaseAllowsLaterCall(t *testing.T) {
 
 	// A later legitimate request must be allowed again - the failed
 	// request's reservation must not have leaked permanently.
-	if after := g.CheckBeforeForward("t_retry", "claude-sonnet-5", nil); !after.Allowed {
+	if after := g.CheckBeforeForward("t_retry", "claude-sonnet-5-5", nil); !after.Allowed {
 		t.Error("CheckBeforeForward() after releasing the failed request's reservation = blocked, want Allowed (the reservation must not leak)")
 	}
 }
@@ -566,8 +576,8 @@ func TestEstimateUsesMaxRateForUnpricedModel(t *testing.T) {
 // read, the fixed fallback estimate. Never zero.
 func TestFailClosedUsageIsTheReservedEstimate(t *testing.T) {
 	g := NewGovernor(Limits{DailyBudgetUSD: 1000, MonthlyBudgetUSD: 10000, TaskTokenCeiling: 5_000_000}, nil, nil)
-	body := []byte(`{"model":"claude-sonnet-5","max_tokens":4000,"messages":[]}`)
-	check := g.CheckBeforeForward("t_fc", "claude-sonnet-5", body)
+	body := []byte(`{"model":"claude-sonnet-5-5","max_tokens":4000,"messages":[]}`)
+	check := g.CheckBeforeForward("t_fc", "claude-sonnet-5-5", body)
 	if !check.Allowed {
 		t.Fatalf("CheckBeforeForward blocked: %q", check.Message)
 	}
@@ -575,14 +585,14 @@ func TestFailClosedUsageIsTheReservedEstimate(t *testing.T) {
 	reserved := g.reservations[check.Reservation]
 	g.mu.Unlock()
 
-	u, usd := g.FailClosedUsage(check.Reservation, "claude-sonnet-5")
+	u, usd := g.FailClosedUsage(check.Reservation, "claude-sonnet-5-5")
 	if usd <= 0 || usd != reserved.usd {
 		t.Errorf("FailClosedUsage usd = %v, want the reserved %v", usd, reserved.usd)
 	}
 	if got := u.BillableCeilingTokens(); got != reserved.tokens {
 		t.Errorf("FailClosedUsage ceiling tokens = %d, want the reserved %d", got, reserved.tokens)
 	}
-	row, err := PriceFor("claude-sonnet-5", time.Now())
+	row, err := PriceFor("claude-sonnet-5-5", time.Now())
 	if err != nil {
 		t.Fatalf("PriceFor: %v", err)
 	}
@@ -594,11 +604,46 @@ func TestFailClosedUsageIsTheReservedEstimate(t *testing.T) {
 	}
 
 	g.ReleaseReservation(check.Reservation)
-	u, usd = g.FailClosedUsage(check.Reservation, "claude-sonnet-5")
+	u, usd = g.FailClosedUsage(check.Reservation, "claude-sonnet-5-5")
 	if u.OutputTokens != defaultEstRequestTokens || usd <= 0 {
 		t.Errorf("FailClosedUsage without a reservation = %+v / %v, want the %d-token fallback at the output rate", u, usd, defaultEstRequestTokens)
 	}
 	if _, usd := g.FailClosedUsage(0, "claude-mystery-1"); usd != (Usage{OutputTokens: defaultEstRequestTokens}).CostUSD(MaxPriceRow(time.Now())) {
 		t.Errorf("FailClosedUsage for an unpriceable model = %v, want the fallback at MaxPriceRow", usd)
+	}
+}
+
+// TestEstimateTieredRowUsesCostlierTierWithoutPromptSize (FIX-G12-N2):
+// Haiku 5.5's price depends on the prompt size. An estimate sized from the
+// request body picks the tier from that size (a small body stays in the
+// <=100K tier); the no-body fallback, which knows nothing about the
+// prompt, assumes the costlier >100K tier - never the cheap one.
+func TestEstimateTieredRowUsesCostlierTierWithoutPromptSize(t *testing.T) {
+	g := NewGovernor(Limits{DailyBudgetUSD: 1000, MonthlyBudgetUSD: 10000, TaskTokenCeiling: 5_000_000}, nil, nil)
+	const perMTok = 1_000_000.0
+	near := func(got, want float64) bool { return math.Abs(got-want) < 1e-12 }
+
+	body := []byte(`{"model":"claude-haiku-5-5","max_tokens":2000,"messages":[]}`)
+	check := g.CheckBeforeForward("t_tier", "claude-haiku-5-5", body)
+	if !check.Allowed {
+		t.Fatalf("CheckBeforeForward blocked: %q", check.Message)
+	}
+	u, usd := g.FailClosedUsage(check.Reservation, "claude-haiku-5-5")
+	in := float64(int64(len(body)) / estRequestBytesPerToken)
+	if want := in*0.20/perMTok + 2000*0.50/perMTok; !near(usd, want) {
+		t.Errorf("small-body estimate = %v, want %v (short tier: 1h write $0.20, out $0.50)", usd, want)
+	}
+	row, err := PriceFor("claude-haiku-5-5", time.Now())
+	if err != nil {
+		t.Fatalf("PriceFor: %v", err)
+	}
+	if got := u.CostUSD(row); !near(got, usd) {
+		t.Errorf("estimate Usage costs %v at the row, want %v", got, usd)
+	}
+	g.ReleaseReservation(check.Reservation)
+
+	_, usd = g.FailClosedUsage(0, "claude-haiku-5-5")
+	if want := float64(defaultEstRequestTokens) * 2.50 / perMTok; !near(usd, want) {
+		t.Errorf("no-body fallback estimate = %v, want %v (the >100K tier's $2.50 output rate)", usd, want)
 	}
 }

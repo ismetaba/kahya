@@ -168,7 +168,7 @@ func newTaskTestFixtureWithOptions(t *testing.T, workerCmd []string, timeoutMin 
 		Socket:               filepath.Join(shortSocketDir(t), "k.sock"),
 		LogDir:               t.TempDir(),
 		AnthropicUpstreamURL: upstreamURL,
-		DefaultModel:         "claude-sonnet-5",
+		DefaultModel:         "claude-sonnet-5-5",
 		TaskTimeoutMin:       timeoutMin,
 		WorkerCmd:            workerCmd,
 		// G00 C-17: explicit, matching the passthrough CredentialSource
@@ -623,7 +623,7 @@ func TestPolicyCheckDenyAllModeDeniesEvenMemorySearch(t *testing.T) {
 		Socket:               filepath.Join(shortSocketDir(t), "k.sock"),
 		LogDir:               t.TempDir(),
 		AnthropicUpstreamURL: "https://upstream.invalid",
-		DefaultModel:         "claude-sonnet-5",
+		DefaultModel:         "claude-sonnet-5-5",
 		TaskTimeoutMin:       5,
 		WorkerCmd:            []string{"python3", "-c", "pass"},
 	}

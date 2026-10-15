@@ -9,7 +9,7 @@
 // kahyad/internal/secretlane's own combined classify call).
 //
 // LOCAL LANE IS NOT AN ENVELOPE MODEL. kahyad/internal/spawn.Envelope.Model
-// is validated against EXACTLY the four HANDOFF §9 cloud models
+// is validated against EXACTLY the HANDOFF §9 cloud models (current + legacy)
 // (spawn.AllowedModels) - "local"/"yerel" is never a legal value there, and
 // this package deliberately never invents one. When RouteDecision.Local is
 // true, the caller (kahyad/internal/server's POST /v1/task handler) must
@@ -53,15 +53,49 @@ const (
 	IntentChat          = "chat"
 )
 
-// Model* are the HANDOFF §9 cloud model literals (mirrors
-// kahyad/internal/spawn.AllowedModels' own four keys, duplicated rather
-// than imported for the same reason Intent's own doc comment gives).
+// Model* are the CURRENT HANDOFF §9 cloud model ids (the "- **Model
+// ID'leri:**" line): the only ids SelectModel ever returns. G12-N2 bump
+// (owner decision G12-5 = B, 2026-10): the four moved to the current
+// generation. kahyad/internal/spawn.AllowedModels is built from these and
+// the Legacy* ids below (CurrentModels/LegacyModels), and every per-job
+// cloud model (consolidation.CloudModelName, briefing.ModelName) derives
+// from them - a model-id bump edits this block, the pricing table
+// (kahyad/internal/anthproxy) and the worker's ALLOWED_MODELS mirror, and
+// server's TestModelIDsMatchHandoffSection9 keeps all of them in step with
+// HANDOFF §9.
 const (
-	ModelOpus   = "claude-opus-4-8"
-	ModelSonnet = "claude-sonnet-5"
-	ModelHaiku  = "claude-haiku-4-5"
-	ModelFable  = "claude-fable-5"
+	ModelOpus   = "claude-opus-5-5"
+	ModelSonnet = "claude-sonnet-5-5"
+	ModelHaiku  = "claude-haiku-5-5"
+	ModelFable  = "claude-fable-5-1"
 )
+
+// LegacyModel* are the previous generation (HANDOFF §9's "- **Eski model
+// ID'leri (yalnız kabul edilir, seçilmez):**" line): still accepted by
+// envelope validation and priced by the proxy, so a task whose tasks.model
+// predates the G12-N2 bump can resume, but NEVER selected by SelectModel
+// (owner decision G12-7: they stay until no non-terminal task uses them).
+// Two are still sent on purpose, never by routing: LegacyModelOpus is
+// Fable's server-side fallback target (anthproxy fable5.go, owner decision
+// G12-6) and LegacyModelHaiku is the bundled CLI's own auxiliary model
+// (spawn.CLIAuxiliaryModel).
+const (
+	LegacyModelOpus   = "claude-opus-4-8"
+	LegacyModelSonnet = "claude-sonnet-5"
+	LegacyModelHaiku  = "claude-haiku-4-5"
+	LegacyModelFable  = "claude-fable-5"
+)
+
+// CurrentModels returns the four current-generation ids (a fresh slice).
+func CurrentModels() []string {
+	return []string{ModelOpus, ModelSonnet, ModelHaiku, ModelFable}
+}
+
+// LegacyModels returns the accepted-but-never-selected previous-generation
+// ids (a fresh slice).
+func LegacyModels() []string {
+	return []string{LegacyModelOpus, LegacyModelSonnet, LegacyModelHaiku, LegacyModelFable}
+}
 
 // LaneSecret/LaneNormal mirror kahyad/internal/secretlane's OWN identical
 // constants (same duplication convention as spawn.LaneSecret/LaneNormal).
@@ -103,7 +137,7 @@ type RouteInput struct {
 	// else.
 	Lane string
 	// DeepThink is the "derin düşün" opt-in (HANDOFF §4: pins
-	// claude-fable-5 - the ONLY way it is ever selected, see
+	// ModelFable - the ONLY way it is ever selected, see
 	// TestSelectModelFableOnlyWithDeepThink). Outranks Downgraded: an
 	// opted-in deep-think call is still HONORED mid-downgrade - the caller
 	// separately ledgers derin_during_downgrade (RouteDecision.
@@ -112,17 +146,18 @@ type RouteInput struct {
 	// Downgraded mirrors kahyad/internal/anthproxy.Governor.Downgraded() -
 	// today's spend has crossed the cost-governor's 80% rung. Drops the
 	// table's base (non-pinned, non-opted-in) model exactly ONE rung per
-	// HANDOFF §4's fixed chain: claude-opus-4-8 -> claude-sonnet-5,
-	// claude-sonnet-5 -> the local lane. Never touches claude-haiku-4-5 (no
+	// HANDOFF §4's fixed chain: ModelOpus -> ModelSonnet,
+	// ModelSonnet -> the local lane (a legacy Opus/Sonnet cfg.default_model
+	// takes the same rung, see SelectModel). Never touches Haiku (no
 	// rung is defined for it) or an already-Local base decision (already
 	// the cheapest rung there is).
 	Downgraded bool
 	// DefaultModel is cfg.default_model - what the chat/unrecognized row
 	// resolves to (HANDOFF §4: "chat/unknown -> cfg.default_model
-	// (claude-sonnet-5)"). This is the one field beyond the task spec's own
+	// (ModelSonnet)"). This is the one field beyond the task spec's own
 	// four-field shorthand (RouteInput{Intent, Lane, DeepThink,
 	// Downgraded}): cfg.default_model is itself configurable (not always
-	// literally "claude-sonnet-5" - kahyad/internal/config lets an operator
+	// literally ModelSonnet - kahyad/internal/config lets an operator
 	// override it), so SelectModel must take it as an explicit input to
 	// stay a pure value->value function with no hidden config/global
 	// dependency at all. See this task's own closing report for this
@@ -138,15 +173,16 @@ type RouteDecision struct {
 	// envelope/opening an Anthropic proxy listener in that case (see this
 	// package's own doc comment).
 	Local bool
-	// Model is one of the four HANDOFF §9 cloud models - meaningful only
+	// Model is one of the four CURRENT HANDOFF §9 cloud models (or an
+	// operator's cfg.default_model on the chat row) - meaningful only
 	// when !Local.
 	Model string
 	// Reason is an internal, English-only diagnostic naming which rule
 	// produced this decision (ledger/log payloads only).
 	Reason string
-	// DerinDuringDowngrade is true iff this decision is claude-fable-5 (the
+	// DerinDuringDowngrade is true iff this decision is ModelFable (the
 	// DeepThink opt-in) AND Downgraded was also true - the opt-in is still
-	// HONORED (Model stays claude-fable-5; deep-think is never itself
+	// HONORED (Model stays ModelFable; deep-think is never itself
 	// downgraded), but the caller must ledger derin_during_downgrade with a
 	// Turkish spend warning in its own output (HANDOFF §4 cost governor ⚑).
 	// Always false whenever Lane==secret (the secret-lane pin returns
@@ -170,7 +206,7 @@ func SelectModel(in RouteInput) RouteDecision {
 		return RouteDecision{Local: true, Reason: ReasonSecretLanePin}
 	}
 
-	// "Derin düşün" opt-in: the ONLY way claude-fable-5 is ever selected.
+	// "Derin düşün" opt-in: the ONLY way ModelFable is ever selected.
 	// Honored even mid-downgrade (flagged via DerinDuringDowngrade for the
 	// caller's own ledger+Turkish-warning side effect) - deep_think is
 	// never itself downgraded, only the table's ordinary rows are.
@@ -180,10 +216,14 @@ func SelectModel(in RouteInput) RouteDecision {
 
 	model, local, reason := baseRowFor(in.Intent, in.DefaultModel)
 	if in.Downgraded && !local {
+		// The legacy ids can only arrive here through an operator's
+		// cfg.default_model written before the G12-N2 bump; they take the
+		// same rung (an Opus-class default steps down to the CURRENT
+		// Sonnet - the router never selects a legacy id itself).
 		switch model {
-		case ModelOpus:
+		case ModelOpus, LegacyModelOpus:
 			return RouteDecision{Model: ModelSonnet, Reason: ReasonDowngradeOpusToSonnet}
-		case ModelSonnet:
+		case ModelSonnet, LegacyModelSonnet:
 			return RouteDecision{Local: true, Reason: ReasonDowngradeSonnetToLocal}
 		}
 	}

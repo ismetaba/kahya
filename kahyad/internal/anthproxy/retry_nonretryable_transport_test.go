@@ -119,7 +119,7 @@ func TestNonRetryableTransportFailureInvokesCallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`)
 
 	done := make(chan struct{})
 	var resp *http.Response

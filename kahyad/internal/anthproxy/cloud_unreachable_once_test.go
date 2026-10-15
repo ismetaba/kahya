@@ -36,7 +36,7 @@ func TestCloudUnreachableCallbackFiresOncePerProxy(t *testing.T) {
 	baseURL, _ := startTestProxy(t, cfg)
 
 	for i := 0; i < 3; i++ {
-		status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`))
+		status, body := doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`))
 		if status != http.StatusServiceUnavailable {
 			t.Fatalf("request #%d status = %d, want 503", i, status)
 		}

@@ -26,7 +26,7 @@ class Handler(BaseHTTPRequestHandler):
             "type": "message",
             "role": "assistant",
             "content": [{"type": "text", "text": "ok"}],
-            "model": "claude-sonnet-5",
+            "model": "claude-sonnet-5-5",
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }).encode("utf-8")
         self.send_response(200)

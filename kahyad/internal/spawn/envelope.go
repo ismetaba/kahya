@@ -45,24 +45,45 @@ const (
 
 // AllowedModels is the HANDOFF §9 cloud model set envelope.Model is
 // validated against. The routing decision is Go's, never the prompt's
-// (HANDOFF §4: "karar Go kodunda, istemde değil") - a static
-// cfg.default_model is correct for W1-2; the full intent router landing in
-// W4-08 will still only ever pick from this same set.
-var AllowedModels = map[string]bool{
-	"claude-opus-4-8":  true,
-	"claude-sonnet-5":  true,
-	"claude-haiku-4-5": true,
-	"claude-fable-5":   true,
+// (HANDOFF §4: "karar Go kodunda, istemde değil") - the intent router
+// (W4-08) only ever picks from router.CurrentModels(). Since the G12-N2
+// bump (owner decision G12-5 = B) the set is the current generation PLUS
+// the legacy one (router.LegacyModels(), owner decision G12-7): a resumed
+// task's envelope carries the tasks.model it was created with, so a
+// legacy id must keep validating until no non-terminal task uses one; it
+// is never selected for a new task. The worker mirror
+// (worker/kahya_worker/envelope.py ALLOWED_MODELS) and the proxy's priced
+// set are pinned equal to this one by kahyad/internal/server's
+// TestModelIDsMatchHandoffSection9 / TestSpawnAllowedModelsMatchProxyDefault.
+var AllowedModels = buildAllowedModels()
+
+func buildAllowedModels() map[string]bool {
+	out := map[string]bool{}
+	for _, m := range router.CurrentModels() {
+		out[m] = true
+	}
+	for _, m := range router.LegacyModels() {
+		out[m] = true
+	}
+	return out
 }
 
 // CLIAuxiliaryModel is the model BuildEnv pins the bundled claude CLI's
 // OWN auxiliary calls to (summaries, titles, compaction helpers;
 // ANTHROPIC_SMALL_FAST_MODEL / ANTHROPIC_DEFAULT_HAIKU_MODEL, FIX-I-10).
 // Left alone the CLI picks a DATED Haiku id the proxy's allowlist and
-// pricing table do not list. Derived from the router's own HANDOFF §9
-// Haiku constant (never a new literal); AllowedModels[CLIAuxiliaryModel]
-// is pinned by a test.
-const CLIAuxiliaryModel = router.ModelHaiku
+// pricing table do not list. Derived from a router constant (never a new
+// literal); AllowedModels[CLIAuxiliaryModel] is pinned by a test.
+//
+// FIX-G12-N2: deliberately the LEGACY Haiku (claude-haiku-4-5), not
+// router.ModelHaiku. The pinned CLI was built before Haiku 5.5 and its
+// auxiliary requests may carry thinking.budget_tokens, non-default
+// sampling parameters or an assistant prefill - all of which Haiku 5.5
+// rejects with a 400 - so moving the auxiliary calls is a separate step
+// gated on a live check (claude-haiku-5-5 here, no proxy.model_rejected /
+// 400 in kahya log). The legacy id stays allowlisted and priced for as
+// long as this points at it.
+const CLIAuxiliaryModel = router.LegacyModelHaiku
 
 // Envelope is the single JSON object written to a worker's stdin (then
 // stdin is closed) - one per spawned task (HANDOFF §4 IPC ⚑, frozen in
@@ -146,9 +167,9 @@ type Envelope struct {
 	// Turkish prompt prefix "derin düşün:" (detected and stripped
 	// server-side, kahyad/internal/server's POST /v1/task handler - NEVER
 	// model-detected). When true, kahyad/internal/router.SelectModel pins
-	// Model to claude-fable-5 UNCONDITIONALLY unless Lane=="secret" (which
-	// outranks it) - this field itself carries no enforcement, it is only
-	// the audit trail of why Model ended up being claude-fable-5. Optional/
+	// Model to router.ModelFable UNCONDITIONALLY unless Lane=="secret"
+	// (which outranks it) - this field itself carries no enforcement, it is
+	// only the audit trail of why Model ended up being Fable. Optional/
 	// backward-compatible: omitted when false.
 	DeepThink bool `json:"deep_think,omitempty"`
 

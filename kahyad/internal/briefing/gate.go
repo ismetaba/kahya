@@ -1,7 +1,7 @@
 // gate.go implements the W5-01 ordering-invariant gate: HANDOFF §4 ⚑
 // (quoted verbatim in the task spec) - "Hicbir bayt, gizli-serit
 // siniflandirmasi yerel/deterministik olarak tamamlanmadan bulut modele
-// gitmez." The briefing summarizer runs on claude-haiku-4-5 (CLOUD), so
+// gitmez." The briefing summarizer runs on router.ModelHaiku (CLOUD), so
 // EVERY collector item (PR titles, file names/paths, calendar event
 // titles) MUST pass through this gate BEFORE the worker envelope is ever
 // built (briefing.go's Run calls gateItem for every CollectedItem strictly

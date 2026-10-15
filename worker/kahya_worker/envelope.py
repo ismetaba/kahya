@@ -23,9 +23,21 @@ SCHEMA_VERSION = 1
 # HANDOFF §9's cloud model set. The worker NEVER chooses or changes the
 # model - "Model yönlendirme (karar Go kodunda, istemde değil)" - it only
 # validates that the envelope's model is one Go could legitimately have
-# routed to, exactly mirroring kahyad/internal/spawn.AllowedModels.
+# routed to, exactly mirroring kahyad/internal/spawn.AllowedModels: the
+# current generation (the only ids the router selects) plus the legacy one
+# (FIX-G12-N2, owner decision G12-7: a task created before the bump
+# resumes with its stored tasks.model; kept until no non-terminal task
+# uses one). Pinned equal to the Go set and to HANDOFF §9 by
+# kahyad/internal/server TestModelIDsMatchHandoffSection9 and
+# worker/tests/test_envelope.py TestAllowedModelsHandoff.
 ALLOWED_MODELS = frozenset(
     {
+        # current (HANDOFF §9 "Model ID'leri")
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        # legacy (HANDOFF §9 "Eski model ID'leri"): accepted, never selected
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-haiku-4-5",

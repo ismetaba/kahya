@@ -108,7 +108,7 @@ func runOneShot(client *Client, args []string, stdout, stderr io.Writer) int {
 // runAsk implements `kahya ask [--derin] [--palette-opened-at <unix-
 // seconds-float>] [--audio <path>] <question...>` (W4-08 + W6-01 + W6-02):
 // the SAME one-shot task execution as runOneShot, plus the --derin flag
-// that pins claude-fable-5 ("derin düşün" opt-in) via envelope.deep_think,
+// that pins router.ModelFable ("derin düşün" opt-in) via envelope.deep_think,
 // plus --palette-opened-at (W6-01: hammerspoon/kahya.lua's own call into
 // this subcommand, carrying hs.timer.secondsSinceEpoch() captured at
 // hotkey press - never something a human types themselves), plus --audio

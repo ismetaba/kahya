@@ -35,9 +35,9 @@ const defaultCloudReaderTimeout = 2 * time.Minute
 // kahyad/internal/router.SelectModel's own IntentReader row (a single call,
 // evaluated once at package init) rather than a hand-maintained literal, so
 // this package can never silently drift from the one source of routing
-// truth the table now is. Value is unchanged (still "claude-haiku-4-5") -
-// this is a routing-SOURCE change only, not a behavior change (this
-// package's own existing tests, unmodified, still pass).
+// truth the table now is. W4-08 left the value unchanged (a routing-SOURCE
+// change only); the FIX-G12-N2 model-id bump moved it with the router
+// (router.ModelHaiku, claude-haiku-5-5) with no edit here.
 var defaultCloudReaderModel = router.SelectModel(router.RouteInput{
 	Intent: router.IntentReader, Lane: router.LaneNormal,
 }).Model

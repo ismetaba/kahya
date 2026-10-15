@@ -38,7 +38,7 @@ func insertTaskWithEnvelope(t *testing.T, st *store.Store, id, sessionID string)
 	ctx := context.Background()
 	env := spawn.Envelope{
 		SchemaVersion: spawn.SchemaVersion, TaskID: id, TraceID: "trace-" + id,
-		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5",
+		Kind: "chat", Prompt: "merhaba", Model: "claude-sonnet-5-5",
 		MemoryInjection: true, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	envJSON, err := env.Marshal()
@@ -53,7 +53,7 @@ func insertTaskWithEnvelope(t *testing.T, st *store.Store, id, sessionID string)
 	}
 	row, err := st.Queries.InsertTask(ctx, sqlcgen.InsertTaskParams{
 		ID: id, TraceID: "trace-" + id, SessionID: sid, State: "running",
-		Model:     sql.NullString{String: "claude-sonnet-5", Valid: true},
+		Model:     sql.NullString{String: "claude-sonnet-5-5", Valid: true},
 		Envelope:  sql.NullString{String: string(envJSON), Valid: true},
 		UpdatedAt: now, CreatedAt: now, Lane: "normal",
 	})

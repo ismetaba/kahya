@@ -19,7 +19,7 @@ def valid_envelope_dict() -> dict:
         "session_id": None,
         "kind": "chat",
         "prompt": "Kadıköy'deki randevuyu hatırlat",
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "memory_injection": True,
         "created_at": "2026-07-10T12:00:00Z",
     }
@@ -277,6 +277,19 @@ class TestAllowedModelsHandoff(unittest.TestCase):
         current, legacy = handoff_section_9_model_ids()
         invented = ALLOWED_MODELS - current - legacy
         self.assertFalse(invented, f"ALLOWED_MODELS ids absent from HANDOFF §9: {sorted(invented)}")
+
+    def test_legacy_handoff_ids_stay_allowed(self) -> None:
+        # FIX-G12-N2, owner decision G12-7: a task created before the model-id
+        # bump resumes with its stored tasks.model, so every §9 legacy id must
+        # still pass the worker's own envelope check.
+        current, legacy = handoff_section_9_model_ids()
+        self.assertTrue(legacy, "HANDOFF §9 has no legacy model line")
+        self.assertFalse(current & legacy, f"ids both current and legacy: {sorted(current & legacy)}")
+        self.assertLessEqual(legacy, ALLOWED_MODELS, f"legacy ids missing from ALLOWED_MODELS: {sorted(legacy - ALLOWED_MODELS)}")
+        for model in sorted(legacy):
+            d = valid_envelope_dict()
+            d["model"] = model
+            self.assertEqual(parse_envelope(encode(d)).model, model)
 
 
 if __name__ == "__main__":

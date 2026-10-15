@@ -2,7 +2,7 @@
 // ANSWERING a secret-lane task entirely on the local Qwen3-30B-A3B server.
 //
 // HANDOFF §4 routing table says the Reader/secret-lane path uses Qwen3-
-// 30B-A3B locally, "değilse claude-haiku-4-5" otherwise - but the worker
+// 30B-A3B locally, "değilse claude-haiku-5-5" otherwise - but the worker
 // (worker/kahya_worker, W12-09) is built on claude-agent-sdk, which speaks
 // the Anthropic Messages API, not an OpenAI-compatible endpoint like
 // mlx_lm.server exposes. Rewiring that SDK to talk to a local OpenAI

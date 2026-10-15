@@ -31,7 +31,7 @@ def _task_token():
 
 def main():
     json.loads(sys.stdin.buffer.read().decode("utf-8"))
-    body = json.dumps({"model": "claude-sonnet-5", "messages": []}).encode("utf-8")
+    body = json.dumps({"model": "claude-sonnet-5-5", "messages": []}).encode("utf-8")
     req = urllib.request.Request(
         os.environ.get("ANTHROPIC_BASE_URL", "") + "/v1/messages",
         data=body,

@@ -16,7 +16,7 @@ import (
 
 func egressRequest(t *testing.T, baseURL string) (int, string) {
 	t.Helper()
-	return doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5"}`))
+	return doAndDrain(t, newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5"}`))
 }
 
 func TestProxyEgress403FailsTaskExactlyOnce(t *testing.T) {

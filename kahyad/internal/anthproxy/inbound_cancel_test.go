@@ -58,7 +58,7 @@ func TestInboundCancelDoesNotFireNonRetryableCallback(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5","messages":[]}`)
+	req := newAuthedRequest(t, "POST", baseURL+"/v1/messages", `{"model":"claude-sonnet-5-5","messages":[]}`)
 	req = req.WithContext(ctx)
 	go func() {
 		time.Sleep(200 * time.Millisecond)

@@ -152,7 +152,7 @@ def main():
         time.sleep(0.05)
 
     body = json.dumps({
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "IBAN TR33 0006 1005 1978 6457 8413 26 icin odeme talimati"}],
     }).encode("utf-8")

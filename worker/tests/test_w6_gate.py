@@ -72,7 +72,7 @@ class TestW6GateOfflineSttWithinTaskLoop(unittest.TestCase):
             # placeholder prompt: _run_stt_only ignores envelope.prompt, but
             # parse_envelope still requires a non-blank one for every kind.
             "prompt": "(ses girişi transkribe ediliyor)",
-            "model": "claude-opus-4-8",
+            "model": "claude-opus-5-5",
             "memory_injection": False,
             "created_at": "2026-01-01T00:00:00Z",
             "mode": "stt",
@@ -153,7 +153,7 @@ class TestW6GateOfflineSttFailsClosedWithoutModel(unittest.TestCase):
             "session_id": None,
             "kind": "chat",
             "prompt": "(ses girişi transkribe ediliyor)",
-            "model": "claude-opus-4-8",
+            "model": "claude-opus-5-5",
             "memory_injection": False,
             "created_at": "2026-01-01T00:00:00Z",
             "mode": "stt",

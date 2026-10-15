@@ -1,6 +1,7 @@
 package anthproxy
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 func TestParseNonStreamUsage(t *testing.T) {
 	body := []byte(`{
 		"id": "msg_01",
-		"model": "claude-sonnet-5",
+		"model": "claude-sonnet-5-5",
 		"usage": {
 			"input_tokens": 100,
 			"output_tokens": 50,
@@ -88,7 +89,31 @@ func TestUsageCacheHitRatio(t *testing.T) {
 }
 
 func TestPriceForKnownModels(t *testing.T) {
-	at := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	// FIX-G12-N2: the current generation carries each model's own
+	// published cache prices (Anthropic model table cached 2026-10-06).
+	explicit := []struct {
+		model                          string
+		in, out, cacheRead, cacheWrite float64
+	}{
+		{"claude-opus-5-5", 4, 20, 0.20, 8},
+		{"claude-sonnet-5-5", 2, 10, 0.20, 4},
+		{"claude-haiku-5-5", 0.10, 0.50, 0.01, 0.20}, // the <=100K-prompt tier
+		{"claude-fable-5-1", 10, 50, 0.25, 20},
+	}
+	for _, c := range explicit {
+		row, err := PriceFor(c.model, at)
+		if err != nil {
+			t.Fatalf("PriceFor(%q) error = %v", c.model, err)
+		}
+		if row.USDPerMTokIn != c.in || row.USDPerMTokOut != c.out || row.USDPerMTokCacheRead != c.cacheRead || row.USDPerMTokCacheWrite1h != c.cacheWrite {
+			t.Errorf("PriceFor(%q) = in=%v out=%v cache_read=%v cache_write_1h=%v, want %v/%v/%v/%v",
+				c.model, row.USDPerMTokIn, row.USDPerMTokOut, row.USDPerMTokCacheRead, row.USDPerMTokCacheWrite1h, c.in, c.out, c.cacheRead, c.cacheWrite)
+		}
+	}
+
+	// The legacy generation keeps the W12-08 rows: base prices plus the
+	// 0.1x cache-read / 2x 1h-write ratios.
 	cases := []struct {
 		model           string
 		wantIn, wantOut float64
@@ -111,6 +136,59 @@ func TestPriceForKnownModels(t *testing.T) {
 		if row.USDPerMTokCacheWrite1h != row.USDPerMTokIn*2 {
 			t.Errorf("PriceFor(%q).USDPerMTokCacheWrite1h = %v, want 2x base input", c.model, row.USDPerMTokCacheWrite1h)
 		}
+		if row.LongPromptThresholdTokens != 0 {
+			t.Errorf("PriceFor(%q) is tiered (threshold %d), want a flat legacy row", c.model, row.LongPromptThresholdTokens)
+		}
+	}
+}
+
+// TestUsageCostUSDHaiku55LongPromptTier (FIX-G12-N2): Haiku 5.5 bills a
+// prompt of at most 100K tokens at $0.10/$0.50 and a longer one entirely at
+// $0.50/$2.50 (cache read 0.1x, 1h write 2x of the tier's input price). The
+// tier counts every input-side token - plain input, cache read and cache
+// write - so 100_000 vs 100_001 prompt tokens straddle the boundary however
+// they are split.
+func TestUsageCostUSDHaiku55LongPromptTier(t *testing.T) {
+	row, err := PriceFor("claude-haiku-5-5", time.Now())
+	if err != nil {
+		t.Fatalf("PriceFor(claude-haiku-5-5) error = %v", err)
+	}
+	if row.LongPromptThresholdTokens != 100_000 {
+		t.Fatalf("LongPromptThresholdTokens = %d, want 100000", row.LongPromptThresholdTokens)
+	}
+	const perMTok = 1_000_000.0
+	near := func(got, want float64) bool { return math.Abs(got-want) < 1e-9 }
+
+	short := Usage{InputTokens: 100_000, OutputTokens: 1_000}
+	if got, want := short.CostUSD(row), 100_000*0.10/perMTok+1_000*0.50/perMTok; !near(got, want) {
+		t.Errorf("CostUSD(100000 in) = %v, want %v (short tier $0.10/$0.50)", got, want)
+	}
+	long := Usage{InputTokens: 100_001, OutputTokens: 1_000}
+	if got, want := long.CostUSD(row), 100_001*0.50/perMTok+1_000*2.50/perMTok; !near(got, want) {
+		t.Errorf("CostUSD(100001 in) = %v, want %v (long tier $0.50/$2.50)", got, want)
+	}
+	if long.CostUSD(row) <= short.CostUSD(row)*4 {
+		t.Errorf("one token over the threshold must reprice the whole call: short %v long %v", short.CostUSD(row), long.CostUSD(row))
+	}
+
+	// Cache tokens count towards the prompt size and are priced per tier.
+	cachedShort := Usage{InputTokens: 10_000, CacheReadInputTokens: 60_000, CacheCreationInputTokens: 30_000, OutputTokens: 100}
+	if got, want := cachedShort.CostUSD(row), (10_000*0.10+60_000*0.01+30_000*0.20+100*0.50)/perMTok; !near(got, want) {
+		t.Errorf("CostUSD(cached, 100000 prompt) = %v, want %v", got, want)
+	}
+	cachedLong := Usage{InputTokens: 10_001, CacheReadInputTokens: 60_000, CacheCreationInputTokens: 30_000, OutputTokens: 100}
+	if got, want := cachedLong.CostUSD(row), (10_001*0.50+60_000*0.05+30_000*1.00+100*2.50)/perMTok; !near(got, want) {
+		t.Errorf("CostUSD(cached, 100001 prompt) = %v, want %v", got, want)
+	}
+
+	// A flat row never switches tier, whatever the prompt size.
+	flat, err := PriceFor("claude-sonnet-5-5", time.Now())
+	if err != nil {
+		t.Fatalf("PriceFor(claude-sonnet-5-5) error = %v", err)
+	}
+	huge := Usage{InputTokens: 900_000}
+	if got, want := huge.CostUSD(flat), 900_000*2.0/perMTok; !near(got, want) {
+		t.Errorf("flat-row CostUSD(900000 in) = %v, want %v", got, want)
 	}
 }
 
@@ -163,6 +241,16 @@ func TestUsageCostUSD(t *testing.T) {
 	if got != want {
 		t.Errorf("CostUSD() = %v, want %v", got, want)
 	}
+
+	// FIX-G12-N2: a current-generation row bills its own cache prices
+	// (Opus 5.5 reads cache at $0.20 = 0.05x, not 0.1x).
+	row, err = PriceFor("claude-opus-5-5", time.Now())
+	if err != nil {
+		t.Fatalf("PriceFor(claude-opus-5-5) error = %v", err)
+	}
+	if got, want := u.CostUSD(row), 4.0+20.0+0.20+8.0; math.Abs(got-want) > 1e-9 {
+		t.Errorf("CostUSD(opus-5-5) = %v, want %v", got, want)
+	}
 }
 
 // TestAllowedModelsAllPriced (FIX-I-10): every model the default allowlist
@@ -184,20 +272,31 @@ func TestAllowedModelsAllPriced(t *testing.T) {
 
 // TestMaxPriceRowIsCostliestValidRow (FIX-I-10, recipe TestMaxPriceRowIsFable5
 // made id-agnostic so a model bump stays data-only): the fail-closed
-// fallback row dominates every row valid at the query time, and is the
-// HANDOFF "derin düşün" (Fable) tier.
+// fallback row dominates every row valid at the query time - at its
+// costliest tier, cache columns included (FIX-G12-N2: Fable 5.1 and the
+// legacy Fable 5 tie on $10/$50, but Fable 5 reads cache at $1 vs $0.25) -
+// and is the HANDOFF "derin düşün" (Fable) tier.
 func TestMaxPriceRowIsCostliestValidRow(t *testing.T) {
 	now := time.Now()
 	maxRow := MaxPriceRow(now)
 	if maxRow.Model == "" || maxRow.USDPerMTokOut <= 0 {
 		t.Fatalf("MaxPriceRow(now) = %+v, want a real priced row", maxRow)
 	}
+	if maxRow.LongPromptThresholdTokens != 0 {
+		t.Errorf("MaxPriceRow(now) is tiered (%+v), want a flat row at the costliest rates", maxRow)
+	}
 	for _, row := range pricingTable {
 		if (!row.From.IsZero() && now.Before(row.From)) || (!row.To.IsZero() && !now.Before(row.To)) {
 			continue
 		}
-		if row.USDPerMTokOut > maxRow.USDPerMTokOut || (row.USDPerMTokOut == maxRow.USDPerMTokOut && row.USDPerMTokIn > maxRow.USDPerMTokIn) {
-			t.Errorf("row %+v is costlier than MaxPriceRow %+v", row, maxRow)
+		for _, tier := range []PriceRow{row.ratesFor(0), row.ratesFor(row.LongPromptThresholdTokens + 1)} {
+			if tier.USDPerMTokOut > maxRow.USDPerMTokOut || (tier.USDPerMTokOut == maxRow.USDPerMTokOut && tier.USDPerMTokIn > maxRow.USDPerMTokIn) {
+				t.Errorf("row %+v (tier %+v) is costlier than MaxPriceRow %+v", row, tier, maxRow)
+			}
+			if tier.USDPerMTokOut == maxRow.USDPerMTokOut && tier.USDPerMTokIn == maxRow.USDPerMTokIn &&
+				(tier.USDPerMTokCacheRead > maxRow.USDPerMTokCacheRead || tier.USDPerMTokCacheWrite1h > maxRow.USDPerMTokCacheWrite1h) {
+				t.Errorf("row %+v ties MaxPriceRow %+v on in/out but has a costlier cache price", row, maxRow)
+			}
 		}
 	}
 	fable, err := PriceFor(router.ModelFable, now)

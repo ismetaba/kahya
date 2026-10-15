@@ -4,11 +4,11 @@ envelope JSON off stdin, then makes ONE real HTTP POST to
 $ANTHROPIC_BASE_URL/v1/messages (FIX-I-1 auth shape: X-Kahya-Task-Token
 from $ANTHROPIC_CUSTOM_HEADERS + a placeholder Authorization) using the
 envelope's OWN "model" field in the request body (unlike kahyad/internal/outbox/testdata/cloud_call_worker.
-py, which hardcodes "claude-sonnet-5" - that fixture exists to prove a
+py, which hardcodes "claude-sonnet-5-5" - that fixture exists to prove a
 resumed cloud-lane redispatch reaches the cloud at all, not to prove WHICH
 model the router chose). This is what lets a test assert the fake
 upstream's own recorded request body actually carries the router-selected
-model (e.g. claude-fable-5 for a "derin düşün" task) end to end through the
+model (e.g. claude-fable-5-1 for a "derin düşün" task) end to end through the
 real per-task anthproxy.Proxy listener - including that listener's own
 Fable-5 request-shaping (betas/fallbacks), reusing the SAME W4-04 fake-
 upstream harness pattern kahyad/internal/anthproxy's own tests use, just

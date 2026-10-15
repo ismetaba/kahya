@@ -61,7 +61,7 @@ func TestAlarmNotifierFansOutToTelegram(t *testing.T) {
 	an := NewAlarmNotifier(inner, bot)
 
 	gov := anthproxy.NewGovernor(anthproxy.Limits{TaskTokenCeiling: 10}, nil, an)
-	check := gov.CheckBeforeForward("task-ceiling", "claude-sonnet-5", nil)
+	check := gov.CheckBeforeForward("task-ceiling", "claude-sonnet-5-5", nil)
 	if check.Allowed {
 		t.Fatalf("CheckBeforeForward with a 10-token ceiling and a 50000-token fallback estimate must be blocked")
 	}

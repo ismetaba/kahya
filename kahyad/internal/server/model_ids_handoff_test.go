@@ -11,6 +11,7 @@ import (
 
 	"kahya/kahyad/internal/anthproxy"
 	"kahya/kahyad/internal/briefing"
+	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/consolidation"
 	"kahya/kahyad/internal/router"
 	"kahya/kahyad/internal/spawn"
@@ -147,14 +148,23 @@ func TestModelIDsMatchHandoffSection9(t *testing.T) {
 		}
 	}
 	// 2. Per-job cloud model constants (consolidation, morning briefing)
-	//    are current §9 ids too.
+	//    and config's built-in default_model are current §9 ids too.
 	for name, m := range map[string]string{
 		"consolidation.CloudModelName": consolidation.CloudModelName,
 		"briefing.ModelName":           briefing.ModelName,
+		"config.DefaultModelID":        config.DefaultModelID,
 	} {
 		if !current[m] {
 			t.Errorf("%s = %q is not a current HANDOFF §9 id %v", name, m, sortedKeys(current))
 		}
+	}
+	// 2b. The router's own current/legacy lists are exactly §9's two lines
+	//     (FIX-G12-N2: spawn.AllowedModels is built from them).
+	if got := sliceSet(router.CurrentModels()); !sameSet(got, current) {
+		t.Errorf("router.CurrentModels() = %v, want HANDOFF §9 current %v", sortedKeys(got), sortedKeys(current))
+	}
+	if got := sliceSet(router.LegacyModels()); !sameSet(got, legacy) {
+		t.Errorf("router.LegacyModels() = %v, want HANDOFF §9 legacy %v", sortedKeys(got), sortedKeys(legacy))
 	}
 
 	py := workerAllowedModels(t)
@@ -192,4 +202,92 @@ func TestModelIDsMatchHandoffSection9(t *testing.T) {
 			t.Errorf("anthproxy.PriceFor(%q) = %v, want a pricing row", id, err)
 		}
 	}
+	// 7. Legacy §9 ids stay accepted (owner decision G12-7): a task whose
+	//    tasks.model predates the bump must still validate on resume.
+	for id := range legacy {
+		if !spawn.AllowedModels[id] {
+			t.Errorf("legacy HANDOFF §9 id %q is not in spawn.AllowedModels (a resumed pre-bump task would fail validation)", id)
+		}
+	}
+	// 8. The CLI's auxiliary model is a §9 id (current or legacy).
+	if !known[spawn.CLIAuxiliaryModel] {
+		t.Errorf("spawn.CLIAuxiliaryModel %q appears nowhere in HANDOFF §9", spawn.CLIAuxiliaryModel)
+	}
+}
+
+// TestFableShapingMatchesHandoffSection4 (FIX-G12-N2, owner decision
+// G12-6) pins the proxy's Fable shaping to HANDOFF §4's Fable rule line:
+// the beta and the array-form fallback model in the code are the ones the
+// rule spells, the fallback target is allowlisted and priced (so it must
+// stay on §9 for as long as Fable is shaped), and every shaped id is an
+// allowlisted §9 Fable id including the router's current one.
+func TestFableShapingMatchesHandoffSection4(t *testing.T) {
+	var rule string
+	for _, line := range strings.Split(repoFile(t, "docs", "HANDOFF.md"), "\n") {
+		if strings.HasPrefix(line, "- Fable") && strings.Contains(line, "asla varsayılan değil") {
+			if rule != "" {
+				t.Fatal("docs/HANDOFF.md has more than one Fable rule line")
+			}
+			rule = line
+		}
+	}
+	if rule == "" {
+		t.Fatal(`docs/HANDOFF.md: no "- Fable ... asla varsayılan değil" rule line (§4)`)
+	}
+	if want := "`betas:[\"" + anthproxy.Fable5RequiredBeta + "\"]`"; !strings.Contains(rule, want) {
+		t.Errorf("HANDOFF §4 Fable rule lacks %s (anthproxy.Fable5RequiredBeta): %q", want, rule)
+	}
+	if want := "`fallbacks:[{model:\"" + anthproxy.Fable5FallbackModel + "\"}]`"; !strings.Contains(rule, want) {
+		t.Errorf("HANDOFF §4 Fable rule lacks %s (anthproxy.Fable5FallbackModel): %q", want, rule)
+	}
+
+	current, legacy := handoffModelIDs(t)
+	fb := anthproxy.Fable5FallbackModel
+	if !current[fb] && !legacy[fb] {
+		t.Errorf("Fable fallback %q appears nowhere in HANDOFF §9", fb)
+	}
+	if !spawn.AllowedModels[fb] {
+		t.Errorf("Fable fallback %q is not allowlisted", fb)
+	}
+	if _, err := anthproxy.PriceFor(fb, time.Now()); err != nil {
+		t.Errorf("Fable fallback %q is not priced: %v", fb, err)
+	}
+	if fb == router.ModelOpus {
+		t.Errorf("Fable fallback is the current Opus %q - not a permitted Fable 5.1 fallback target (owner decision G12-6)", fb)
+	}
+
+	shaped := sliceSet(anthproxy.Fable5ShapedModels())
+	if !shaped[router.ModelFable] {
+		t.Errorf("anthproxy.Fable5ShapedModels() = %v lacks the router's current Fable %q", sortedKeys(shaped), router.ModelFable)
+	}
+	for id := range shaped {
+		if !spawn.AllowedModels[id] || !strings.HasPrefix(id, "claude-fable-") {
+			t.Errorf("shaped id %q is not an allowlisted Fable id", id)
+		}
+	}
+	for id := range spawn.AllowedModels {
+		if strings.HasPrefix(id, "claude-fable-") && !shaped[id] {
+			t.Errorf("allowlisted Fable id %q is not shaped (it would go upstream without the fallback)", id)
+		}
+	}
+}
+
+func sliceSet(ids []string) map[string]bool {
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
+func sameSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }

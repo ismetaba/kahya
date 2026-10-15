@@ -22,7 +22,7 @@
 //     ErrLocalUnavailable and ledgers EventLocalUnavailable - it NEVER
 //     falls back to the cloud lane (README fail-closed convention /
 //     HANDOFF §4 memory-pressure ⚑).
-//  3. otherwise => claude-haiku-4-5 via the worker's "reader" mode
+//  3. otherwise => router.ModelHaiku via the worker's "reader" mode
 //     (toolless, no MCP servers) through the W12-08 forward-proxy
 //     (CloudModel) - deferred in this deployment (no live Anthropic
 //     credential yet); every caller/test here injects a CloudModelFunc

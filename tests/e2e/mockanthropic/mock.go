@@ -154,7 +154,7 @@ func messageStartEvent() map[string]any {
 		"type": "message_start",
 		"message": map[string]any{
 			"id": "msg_mock_kahya_w12", "type": "message", "role": "assistant",
-			"model":         "claude-sonnet-5",
+			"model":         "claude-sonnet-5-5",
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,

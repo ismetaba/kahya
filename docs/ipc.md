@@ -70,7 +70,7 @@ Single JSON object, written once, then stdin is closed:
   "session_id": null,
   "kind": "chat",
   "prompt": "Kadıköy'deki randevuyu hatırlat",
-  "model": "claude-sonnet-5",
+  "model": "claude-sonnet-5-5",
   "memory_injection": true,
   "created_at": "2026-07-10T12:00:00Z",
   "lane": "normal",
@@ -91,14 +91,14 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `session_id` | **Always present**, JSON `null` for a new task (Go: a nil `*string` — `encoding/json` renders this as `null` with no extra code). Reserved for W4-02 session resume; W1-2 never sets it on the way in. |
 | `kind` | Always `"chat"` in W1-2. Other kinds (scheduled/background) are later work. |
 | `prompt` | The user's text, non-blank (rejected at `/v1/task` before a task_id is even minted). Turkish text passes through byte-exact — no transliteration, no normalization. |
-| `model` | Must be one of the HANDOFF §9 cloud set: `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5` (`spawn.AllowedModels`; worker mirror `ALLOWED_MODELS`). The HANDOFF §9 list ↔ `spawn.AllowedModels` ↔ worker `ALLOWED_MODELS` ↔ `router.Model*` ↔ the proxy pricing table are kept in lock-step by the drift guards `kahyad/internal/server` `TestModelIDsMatchHandoffSection9` and `worker/tests/test_envelope.py` `TestAllowedModelsHandoff` (G12-N2). **W4-08:** set by `kahyad/internal/router.SelectModel` (the §4 routing table, as data — see the "W4-08 note" below) rather than the static `cfg.default_model` W1-2 used; the routing **decision** is always Go's, never the prompt's. Set unconditionally even for a `lane:"secret"` task, or a task the router routed to the LOCAL lane (schema validity only — see the W4-08 note for why "local" is never itself a legal value here) — the ACTUAL enforcement that such a task never reaches this model is the mechanisms described below, not this field. |
+| `model` | Must be one of the HANDOFF §9 cloud set (`spawn.AllowedModels`; worker mirror `ALLOWED_MODELS`): the current generation `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1` — the only ids the router selects — plus the legacy generation `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`, `claude-fable-5`, still accepted (and priced) so a task created before the FIX-G12-N2 bump resumes with its stored `tasks.model` (owner decision G12-7: kept until no non-terminal task uses one; never selected). The HANDOFF §9 lines ↔ `router.CurrentModels`/`LegacyModels` ↔ `spawn.AllowedModels` ↔ worker `ALLOWED_MODELS` ↔ `router.Model*` ↔ `config.DefaultModelID` ↔ the proxy pricing table (and the Fable shaping, `TestFableShapingMatchesHandoffSection4`) are kept in lock-step by the drift guards `kahyad/internal/server` `TestModelIDsMatchHandoffSection9` and `worker/tests/test_envelope.py` `TestAllowedModelsHandoff` (G12-N2). **W4-08:** set by `kahyad/internal/router.SelectModel` (the §4 routing table, as data — see the "W4-08 note" below) rather than the static `cfg.default_model` W1-2 used; the routing **decision** is always Go's, never the prompt's. Set unconditionally even for a `lane:"secret"` task, or a task the router routed to the LOCAL lane (schema validity only — see the W4-08 note for why "local" is never itself a legal value here) — the ACTUAL enforcement that such a task never reaches this model is the mechanisms described below, not this field. |
 | `memory_injection` | Always `true` in W1-2. The `<hafiza>` block itself is rendered by `/v1/memory/search?for_injection=true` (W12-05); the worker's `UserPromptSubmit` hook that actually calls it is W12-09. |
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
 | `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
 | `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
 | `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). FIX-I-4: on resume the worker sends `RESUME_CONTINUATION_PROMPT` (worker/kahya_worker/__main__.py; logs JSONL `session_resumed`), never `prompt` again — the resumed transcript already holds the original prompt, and `client.query` always appends a new user turn. The binding double-execution guard is kahyad's receipt replay (see the W4-02 note in §8), not this text. |
 | `intent` | **W4-08.** The §4 routing-table intent bucket (`kahyad/internal/router`'s `Intent*` constants: `plan`, `code_multi_file`, `hard_exec`, `subagent_exec`, `fanout`, `extract`, `writeback`, `route`, `classify`, `reader`, `chat`) — omitted via `omitempty` when empty, so every pre-W4-08 envelope/test still validates unchanged. Informational only (logs/CLI/ledger `intent_classified`/`routing_decision` events) — no enum validation in `Envelope.Validate` (the routing DECISION already happened before this envelope was built; the worker never reads this to choose anything, §4: "karar Go kodunda, istemde değil"). An ordinary `/v1/task` chat prompt with no CLI-declared kind is always `"chat"`, decided deterministically (no model call) — see the W4-08 note below for why. |
-| `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `claude-fable-5` whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being `claude-fable-5`. |
+| `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `router.ModelFable` (`claude-fable-5-1`) whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being Fable. |
 | `mode` | **W4-03/W6-02.** `""` (ordinary Actor/chat, every pre-W4-03 envelope) \| `"reader"` (toolless cloud-Haiku Reader, `spawn.ModeReader` — requires `schema` non-blank) \| `"stt"` (toolless, CLOUD-LESS local transcription, `spawn.ModeSTT` — requires `input_audio_path` non-blank). See the "W6-02 note" below for the `"stt"` case. |
 | `schema` | **W4-03.** Non-blank only when `mode=="reader"` — names the registered Go-side struct (`kahyad/internal/reader.JobTypeMailSummary`/`JobTypeWebpageExtract`) the caller parses that session's single JSON response into. |
 | `input_audio_path` | **W6-02.** Absolute path to a mono 16kHz wav. Non-blank only when `mode=="stt"` (`Envelope.Validate` enforces this) — see the "W6-02 note" below. |
@@ -119,7 +119,7 @@ MCP timeouts only when an approval wait is configured):
 | `ANTHROPIC_BASE_URL` | Since W12-08: `http://127.0.0.1:<ephemeral-port>` — the per-task `kahyad/internal/anthproxy.Proxy` listener kahyad opens (`127.0.0.1:0`) immediately before spawning this worker and closes immediately after it exits. The cost governor, cache-hit metric, and (since W3-05) the `egressGate` hook — now a real `kahyad/internal/egress.Gate.Check` call, gating `host=<AnthropicUpstreamURL's own host:port>` — are enforced at that proxy, never in this package. |
 | `ANTHROPIC_CUSTOM_HEADERS` | Since FIX-I-1, whenever the spawn has a per-task proxy: exactly one line, `X-Kahya-Task-Token: kahya-task-<hex32>` — the **per-task random token** (`spawn.NewAPIKey`), **NOT a real Anthropic key** (HANDOFF §4 IPC ⚑: "API anahtarı worker'a verilmez"). The bundled CLI adds it to every model call; the per-task forward-proxy listener validates this header first (constant-time; `401` + ledger `proxy_auth_reject` on a mismatch, so no other local process can spend through kahyad by guessing the port) and strips it in both credential modes — it never reaches the upstream. An inherited value is stripped (`spawn.secretEnvDenylist`). |
 | `ANTHROPIC_API_KEY` | Only in `credential_mode: keychain` (and the legacy empty mode): the same per-task token, the W12-08 carrier (the CLI sends it as `x-api-key`; the proxy still accepts it, strips it, and injects the real Keychain key). **Unset in `passthrough`** (FIX-I-1): the CLI picks exactly one credential source and a set `ANTHROPIC_API_KEY` always wins over its own Claude Code login, so any value there would disable the credential passthrough forwards. An inherited value is always stripped. |
-| `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Since FIX-I-10: both `spawn.CLIAuxiliaryModel` (= `router.ModelHaiku`, a HANDOFF §9 id) — pins the bundled CLI's own auxiliary calls (summaries, titles, compaction) to an allowlisted, priced model instead of the CLI's built-in dated Haiku id. Inherited values of these and of `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_{SONNET,OPUS,FABLE}_MODEL` are stripped (`spawn.secretEnvDenylist`): model choice is Go's, never the parent shell's. |
+| `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Since FIX-I-10: both `spawn.CLIAuxiliaryModel` — pins the bundled CLI's own auxiliary calls (summaries, titles, compaction) to an allowlisted, priced model instead of the CLI's built-in dated Haiku id. Since FIX-G12-N2 it is deliberately the **legacy** `router.LegacyModelHaiku` (`claude-haiku-4-5`), not the current `claude-haiku-5-5`: the pinned CLI predates Haiku 5.5 and its auxiliary requests may carry `thinking.budget_tokens`, non-default sampling parameters or a prefill, all of which Haiku 5.5 rejects with a 400 — the move is gated on a live check. Inherited values of these and of `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_{SONNET,OPUS,FABLE}_MODEL` are stripped (`spawn.secretEnvDenylist`): model choice is Go's, never the parent shell's. |
 | `KAHYA_MCP_BRIDGE` | Since W12-09: `cfg.mcp_bridge_path` — the absolute path to the `kahya-mcp` stdio↔UDS bridge binary (`bin/kahya-mcp`, W12-05). The worker execs this as its `"kahya_memory"` MCP server's `stdio` `command` (`ClaudeAgentOptions.mcp_servers`) — it never hardcodes or otherwise discovers this path itself. |
 | `KAHYA_CREDENTIAL_MODE` | Since W12-09: `cfg.credential_mode` (`"keychain"` or `"passthrough"`, mirroring `anthproxy`'s own `CredentialMode` — see the W12-08 note below). The worker reads this to decide which startup env assertions apply (`kahya_worker.__main__._check_credential_env`, exit 2 + `worker_env_invalid` on a violation): in `"passthrough"`, `ANTHROPIC_CUSTOM_HEADERS` must carry the `X-Kahya-Task-Token: kahya-task-<hex32>` line **and** `ANTHROPIC_API_KEY` must be unset (FIX-I-1); in `"keychain"` (and any other value), `ANTHROPIC_API_KEY` must match the per-task token shape. Defaults to `"keychain"` if unset (belt-and-braces: the stricter posture is default-safe). |
 | `KAHYA_MCP_TOOLCALL_TIMEOUT_S` | Since B-1, only when `approval_wait_seconds > 0`: `approval_wait_seconds + 60` — the `kahya-mcp` bridge's per-`tools/call` budget, so a call kahyad parks for a human approval (§6a) is not reported as "kahyad unreachable" after the bridge's ordinary 4 s. Every other JSON-RPC method keeps the 4 s budget, and the dial is always bounded by it. The worker also passes it explicitly in the `kahya_memory` stdio server's own `env` (`_build_options`). |
@@ -269,6 +269,51 @@ model allowlist 400 → governor 503 → keychain 503 → upstream):
   (`TestW12Acceptance`, `TestW12PassthroughCloudAuth`) fail on any of the
   three ledger kinds; with the pinned CLI they see only the main
   `POST /v1/messages` call.
+
+**FIX-G12-N2 — model ids on the current generation (owner decision G12-5 = B).**
+HANDOFF §4/§9 now name `claude-opus-5-5`, `claude-sonnet-5-5`,
+`claude-haiku-5-5` and `claude-fable-5-1`; the previous four stay on a
+separate §9 "Eski model ID'leri" line — allowlisted and priced, never
+selected (G12-7). Proxy consequences:
+
+- **Pricing** (`anthproxy.pricingTable`, Anthropic model table cached
+  2026-10-06): the current rows carry their own cache prices
+  (`priceRowExplicit`; cache read / 1h write per MTok: Opus 5.5 $0.20 / $8,
+  Sonnet 5.5 $0.20 / $4, Fable 5.1 $0.25 / $20) instead of the W12-08
+  0.1x/2x ratios the legacy rows keep. Haiku 5.5 is prompt-size tiered
+  (`PriceRow.LongPromptThresholdTokens` = 100 000): a call whose
+  `Usage.PromptTokens()` (input + cache read + cache write) exceeds it is
+  billed entirely at $0.50/$2.50 (cache 0.1x/2x of that) instead of
+  $0.10/$0.50. The governor's no-body fallback estimate prices a tiered
+  row at its costlier tier; `MaxPriceRow` compares rows at their costliest
+  tier and breaks an in/out tie on the cache columns (Fable 5 vs 5.1).
+  Every cache write is still billed at the 1h rate (over-, never
+  under-billing a 5m write).
+- **Fable shaping** (`fable5.go`) applies to both Fable ids
+  (`anthproxy.Fable5ShapedModels`). The fallback stays the array form
+  `fallbacks:[{"model":"claude-opus-4-8"}]` with exactly
+  `betas:["server-side-fallback-2026-06-01"]` (owner decision G12-6: Fable
+  5.1's permitted fallback targets are only `claude-opus-4-8` /
+  `claude-opus-5`, so never the current Opus; the array form with the
+  newer `server-side-fallback-2026-07-01` beta is a 400, so any other
+  `server-side-fallback-*` beta in the body is dropped). No other model
+  ever gets `betas`/`fallbacks` — Haiku 5.5 has no server-side fallback.
+  kahyad injects no `effort` for Opus 5.5 (G12-8); the pinned CLI sends its
+  own `output_config.effort` (`"high"` in the hermetic gate) and
+  `thinking:{"type":"adaptive"}` on every main call, which the proxy
+  forwards untouched.
+- **Downgrade:** `Governor.DowngradeModel` maps `claude-opus-5-5` →
+  `claude-sonnet-5-5` (legacy mapping kept); `router.SelectModel` applies
+  the rung to a legacy Opus/Sonnet `cfg.default_model` too. The built-in
+  `default_model` is `config.DefaultModelID` (`claude-sonnet-5-5`); an
+  operator `config.yaml` naming a legacy id keeps working.
+- **Live checks pending** (owner-run, through the passthrough proxy): one
+  real call per new id with `usd > 0` in `kahya log` — Sonnet 5.5
+  (`kahya ask`), Fable 5.1 (`kahya ask --derin`, plus
+  `proxy.fable5_shaped`), Opus 5.5 (no `POST /v1/task` path selects the
+  plan row yet — `default_model: claude-opus-5-5` in `config.yaml` for one
+  `kahya ask`, then removed), Haiku 5.5 (`kahya job run morning-briefing`);
+  and a separate try of `claude-haiku-5-5` as `spawn.CLIAuxiliaryModel`.
 
 **FIX-I-11 — a client that disconnects mid-stream is still billed.** A
 client that disconnects mid-stream still produces a `model_call` row
@@ -480,9 +525,9 @@ that `POST /v1/task`'s handler consults to set `model`/`intent`/
 `deep_think` above — replacing W1-2's static `cfg.default_model` with the
 real table:
 
-- **Table rows** (`plan`/`code_multi_file`/`hard_exec` → `claude-opus-4-8`;
-  `subagent_exec`/`fanout` → `claude-sonnet-5`; `extract`/`writeback` →
-  `claude-haiku-4-5`; `route`/`classify` → the local Qwen classifier itself,
+- **Table rows** (`plan`/`code_multi_file`/`hard_exec` → `router.ModelOpus`;
+  `subagent_exec`/`fanout` → `router.ModelSonnet`; `extract`/`writeback` →
+  `router.ModelHaiku`; `route`/`classify` → the local Qwen classifier itself,
   never a cloud model; `reader` → lane-dependent, matching W4-03's Okuyucu
   row unchanged; `chat`/unrecognized → `cfg.default_model`) are `SelectModel`'s
   own ordinary case, driven by `RouteInput.Intent`.
@@ -510,12 +555,12 @@ real table:
   NEVER spawns a worker or opens an Anthropic-proxy listener for that task,
   and `model` in the envelope/tasks-row stays `cfg.default_model` for
   schema validity only (never itself the enforcement).
-- **"Derin düşün" opt-in** pins `claude-fable-5` — the ONLY way it is ever
+- **"Derin düşün" opt-in** pins `router.ModelFable` — the ONLY way it is ever
   selected. Two independent triggers, both setting the SAME `deep_think`
   flag: `kahya ask --derin` (client-supplied `taskRequest.deep_think`), and
   the byte-exact Turkish prompt prefix `"derin düşün:"`, detected and
   stripped **server-side**, in Go (never model-detected), before
-  classification runs on the (now-bare) prompt. `claude-fable-5` still gets
+  classification runs on the (now-bare) prompt. Fable still gets
   its mandatory `betas`/`fallbacks` shaping from the existing W4-04 proxy
   logic (`kahyad/internal/anthproxy/fable5.go`) — this task only creates
   the opt-in entry point that selects it, it does not re-implement that
@@ -524,8 +569,9 @@ real table:
   Opus→Sonnet→yerel): `POST /v1/task`'s handler consults
   `kahyad/internal/anthproxy.Governor.Downgraded()` and passes it as
   `RouteInput.Downgraded`; `SelectModel` drops the table's chosen model ONE
-  rung (`claude-opus-4-8`→`claude-sonnet-5`, `claude-sonnet-5`→the local
-  lane) — never touching `claude-haiku-4-5` (no rung is defined for it) or
+  rung (`router.ModelOpus`→`router.ModelSonnet`, `router.ModelSonnet`→the
+  local lane; since FIX-G12-N2 a legacy Opus/Sonnet `cfg.default_model`
+  takes the same rung) — never touching Haiku (no rung is defined for it) or
   an already-local decision. An explicit `--derin` opt-in is honored EVEN
   during an active downgrade (it is not itself a router choice to
   downgrade) — the handler ledgers `derin_during_downgrade` and prefixes
@@ -536,8 +582,9 @@ real table:
 - **W4-03 Reader** (`kahyad/internal/reader`) now sources its own
   non-secret-lane cloud model choice from this SAME table
   (`router.SelectModel(RouteInput{Intent: router.IntentReader, ...})`)
-  instead of a hand-maintained literal — value unchanged
-  (`claude-haiku-4-5`), a routing-source change only.
+  instead of a hand-maintained literal — value unchanged at the time
+  (a routing-source change only); the FIX-G12-N2 bump moved it with the
+  router to `claude-haiku-5-5` with no reader edit.
 
 ### W6-02 note — push-to-talk / local STT phase (HANDOFF §4 ⚑ "mlx-whisper ... worker içinde kütüphane" + ordering invariant)
 
@@ -1458,7 +1505,7 @@ first boot). `{}` disables it.
   uses the deterministic pre-pass only, per that note's own reasoning.
 - **Subagent/fan-out execution itself** — post-core; W4-08 only encodes
   the `subagent_exec`/`fanout` table row's model constant
-  (`claude-sonnet-5`) for a future runner to read via
+  (`router.ModelSonnet`) for a future runner to read via
   `kahyad/internal/router.SelectModel`.
 
 ## 9 · W1-2 gate — how to re-run

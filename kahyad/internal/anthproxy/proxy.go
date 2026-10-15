@@ -82,10 +82,10 @@ import (
 // rather than this package's older flat W12-08 event style, e.g.
 // EventProxyAuthReject).
 const (
-	// EventFable5Shaped fires every time a request body names
-	// claude-fable-5 (task spec step 7) - regardless of whether betas/
-	// fallbacks needed to actually change that time (see
-	// shapeFable5Body's own doc comment).
+	// EventFable5Shaped fires every time a request body names a Fable id
+	// (claude-fable-5-1, or the legacy claude-fable-5 - task spec step 7,
+	// FIX-G12-N2) - regardless of whether betas/fallbacks needed to
+	// actually change that time (see shapeFable5Body's own doc comment).
 	EventFable5Shaped = "proxy.fable5_shaped"
 	// EventCloudUnreachable fires once per logical call whose inline
 	// retries were exhausted (task spec step 3), right before

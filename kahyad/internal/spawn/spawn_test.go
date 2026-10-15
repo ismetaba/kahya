@@ -27,7 +27,7 @@ func testEnvelope(t *testing.T) Envelope {
 		SessionID:       nil,
 		Kind:            "chat",
 		Prompt:          "Kadıköy'deki randevuyu hatırlat",
-		Model:           "claude-sonnet-5",
+		Model:           "claude-sonnet-5-5",
 		MemoryInjection: true,
 		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
 	}
@@ -850,7 +850,7 @@ func TestRunSpawnsRealDefaultWorkerCommandBlocker1(t *testing.T) {
 		TraceID:       "abcdef0123456789abcdef0123456789",
 		Kind:          "chat",
 		Prompt:        "",
-		Model:         "claude-sonnet-5",
+		Model:         "claude-sonnet-5-5",
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
 

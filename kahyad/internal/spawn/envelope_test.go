@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kahya/kahyad/internal/router"
 )
 
 func validEnvelope() Envelope {
@@ -14,7 +16,7 @@ func validEnvelope() Envelope {
 		SessionID:       nil,
 		Kind:            "chat",
 		Prompt:          "merhaba",
-		Model:           "claude-sonnet-5",
+		Model:           router.ModelSonnet,
 		MemoryInjection: true,
 		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
 	}
@@ -80,6 +82,24 @@ func TestValidateAcceptsEveryAllowedModel(t *testing.T) {
 		e.Model = model
 		if err := e.Validate(); err != nil {
 			t.Errorf("Validate() with model=%q error = %v, want nil", model, err)
+		}
+	}
+}
+
+// TestValidateAcceptsLegacyAndCurrentModelIDs (FIX-G12-N2, owner decision
+// G12-7): AllowedModels is exactly the current generation plus the legacy
+// one. A task created before the bump resumes with its stored tasks.model,
+// so every legacy id must still validate; nothing else may.
+func TestValidateAcceptsLegacyAndCurrentModelIDs(t *testing.T) {
+	want := append(router.CurrentModels(), router.LegacyModels()...)
+	if len(AllowedModels) != len(want) {
+		t.Errorf("len(AllowedModels) = %d, want %d (current %v + legacy %v)", len(AllowedModels), len(want), router.CurrentModels(), router.LegacyModels())
+	}
+	for _, model := range want {
+		e := validEnvelope()
+		e.Model = model
+		if err := e.Validate(); err != nil {
+			t.Errorf("Validate() with model=%q error = %v, want nil (current or legacy id)", model, err)
 		}
 	}
 }

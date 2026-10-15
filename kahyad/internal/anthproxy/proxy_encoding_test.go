@@ -151,7 +151,7 @@ func TestProxyAsksUpstreamForIdentityEncoding(t *testing.T) {
 					cfg.Credential = NewKeychainCredentialSource(&fakeKeychainReader{key: "sk-ant-real-keychain-key"}, "prod", nil)
 				}
 				baseURL, _ := startTestProxy(t, cfg)
-				resp, _ := doEncodingRequest(t, baseURL, `{"model":"claude-sonnet-5","max_tokens":1}`, ae)
+				resp, _ := doEncodingRequest(t, baseURL, `{"model":"claude-sonnet-5-5","max_tokens":1}`, ae)
 				if resp.StatusCode != 200 {
 					t.Fatalf("status = %d, want 200", resp.StatusCode)
 				}
@@ -177,9 +177,9 @@ func TestProxyBillsRealUsageWhenWorkerAcceptsCompression(t *testing.T) {
 			upstream := newEncodingUpstream(t, false, sse, 200)
 			ledger := &fakeLedger{}
 			baseURL, _ := startTestProxy(t, testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil))
-			body := `{"model":"claude-sonnet-5","max_tokens":60000}`
+			body := `{"model":"claude-sonnet-5-5","max_tokens":60000}`
 			if sse {
-				body = `{"model":"claude-sonnet-5","max_tokens":60000,"stream":true}`
+				body = `{"model":"claude-sonnet-5-5","max_tokens":60000,"stream":true}`
 			}
 			resp, raw := doEncodingRequest(t, baseURL, body, cliAcceptEncoding)
 			if resp.StatusCode != 200 {
@@ -198,7 +198,7 @@ func TestProxyBillsRealUsageWhenWorkerAcceptsCompression(t *testing.T) {
 			if p["input_tokens"] != int64(100000) || p["output_tokens"] != int64(50000) {
 				t.Errorf("model_call input_tokens=%v output_tokens=%v, want 100000/50000 (a compressed reply was billed as zero usage)", p["input_tokens"], p["output_tokens"])
 			}
-			row, err := PriceFor("claude-sonnet-5", time.Now())
+			row, err := PriceFor("claude-sonnet-5-5", time.Now())
 			if err != nil {
 				t.Fatalf("PriceFor: %v", err)
 			}
@@ -228,9 +228,9 @@ func TestProxyBillsEncodedBodyFailClosed(t *testing.T) {
 			upstream := newEncodingUpstream(t, true, sse, 200)
 			ledger := &fakeLedger{}
 			baseURL, _ := startTestProxy(t, testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil))
-			body := `{"model":"claude-sonnet-5","max_tokens":60000}`
+			body := `{"model":"claude-sonnet-5-5","max_tokens":60000}`
 			if sse {
-				body = `{"model":"claude-sonnet-5","max_tokens":60000,"stream":true}`
+				body = `{"model":"claude-sonnet-5-5","max_tokens":60000,"stream":true}`
 			}
 			resp, raw := doEncodingRequest(t, baseURL, body, cliAcceptEncoding)
 			if resp.StatusCode != 200 {
@@ -252,7 +252,7 @@ func TestProxyBillsEncodedBodyFailClosed(t *testing.T) {
 				t.Fatalf("model_call rows = %d, want 1", ledger.countKind(EventModelCall))
 			}
 			p := lastPayload(t, ledger, EventModelCall)
-			row, err := PriceFor("claude-sonnet-5", time.Now())
+			row, err := PriceFor("claude-sonnet-5-5", time.Now())
 			if err != nil {
 				t.Fatalf("PriceFor: %v", err)
 			}
@@ -273,7 +273,7 @@ func TestProxyBillsEncodedBodyFailClosed(t *testing.T) {
 				t.Fatalf("%s ledgered %d times, want 1", EventEncodedBody, n)
 			}
 			ev := lastPayload(t, ledger, EventEncodedBody)
-			if ev["content_encoding"] != "gzip" || ev["task_id"] != "t_test" || ev["model"] != "claude-sonnet-5" {
+			if ev["content_encoding"] != "gzip" || ev["task_id"] != "t_test" || ev["model"] != "claude-sonnet-5-5" {
 				t.Errorf("%s payload = %v, want task_id/model/content_encoding=gzip", EventEncodedBody, ev)
 			}
 			if billed, _ := ev["billed_usd"].(float64); math.Abs(billed-wantUSD) > 1e-9 {
@@ -291,7 +291,7 @@ func TestProxyEncodedErrorResponseIsNotBilledAtEstimate(t *testing.T) {
 	upstream := newEncodingUpstream(t, true, false, http.StatusBadRequest)
 	ledger := &fakeLedger{}
 	baseURL, _ := startTestProxy(t, testProxyConfig(t, upstream.srv.URL, generousGovernor(), ledger, nil))
-	resp, _ := doEncodingRequest(t, baseURL, `{"model":"claude-sonnet-5","max_tokens":60000}`, cliAcceptEncoding)
+	resp, _ := doEncodingRequest(t, baseURL, `{"model":"claude-sonnet-5-5","max_tokens":60000}`, cliAcceptEncoding)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
