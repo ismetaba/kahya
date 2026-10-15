@@ -126,7 +126,8 @@ func TestInjectedSetTierAndTopK(t *testing.T) {
 		{ChunkID: 1, Path: "a.md", Text: "one", Score: 0.9, SourceTier: "user_asserted"},
 		{ChunkID: 2, Path: "b.md", Text: "two", Score: 0.85, SourceTier: factengine.TierAgentDerived}, // excluded: tier
 		{ChunkID: 3, Path: "c.md", Text: "three", Score: 0.8, SourceTier: "user_edit"},
-		{ChunkID: 4, Path: "d.md", Text: "four", Score: 0.2, SourceTier: "external_doc"}, // low score, still kept (no floor)
+		{ChunkID: 4, Path: "d.md", Text: "four", Score: 0.5, SourceTier: "external_doc"},  // excluded: unconfirmed ingested tier (HANDOFF S5 safety #3, G13 MEM-6.a)
+		{ChunkID: 5, Path: "e.md", Text: "five", Score: 0.2, SourceTier: "user_asserted"}, // low score, still kept (no floor)
 	}
 	got := injectedSet(hits, 2) // top-2 after the tier filter only
 	if len(got) != 2 {
@@ -134,6 +135,10 @@ func TestInjectedSetTierAndTopK(t *testing.T) {
 	}
 	if got[0].ChunkID != 1 || got[1].ChunkID != 3 {
 		t.Fatalf("got ids %d,%d, want 1,3 (agent_derived dropped; no score floor)", got[0].ChunkID, got[1].ChunkID)
+	}
+	got = injectedSet(hits, 3)
+	if len(got) != 3 || got[2].ChunkID != 5 {
+		t.Fatalf("top-3 = %+v, want 1,3,5 (external_doc dropped by the tier filter; the low-score hit kept)", got)
 	}
 }
 

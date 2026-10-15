@@ -351,6 +351,10 @@ func TestWorkerGraphReadsNeverPairNamesThroughASecretNoteAlias(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteFact: %v", err)
 		}
+		// G13 MEM-6.a: confirmed, or the external_doc fact is quarantined.
+		if err := f.fe.ConfirmFact(ctx, "tr-x", id); err != nil {
+			t.Fatalf("ConfirmFact: %v", err)
+		}
 		return id
 	}
 	// Local-lane extraction of the secret note.

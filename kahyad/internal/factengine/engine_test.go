@@ -234,8 +234,16 @@ func TestUserDenialDropsFactBelowInjectionThreshold(t *testing.T) {
 	if !almostEqual(before.Confidence, CapLogOddsExternalDoc) {
 		t.Fatalf("seed confidence = %v, want %v (p~=0.8)", before.Confidence, CapLogOddsExternalDoc)
 	}
-	if !InjectionEligible(before) {
-		t.Fatal("seed fact should be injection-eligible")
+	// G13 MEM-6.a: an ingested external_doc fact is injection-eligible only
+	// once a user confirmed it.
+	if InjectionEligible(before) {
+		t.Fatal("an unconfirmed external_doc fact must be quarantined")
+	}
+	if err := e.ConfirmFact(ctx, "trace-confirm", factID); err != nil {
+		t.Fatal(err)
+	}
+	if before, err = e.GetFact(ctx, factID); err != nil || !InjectionEligible(before) {
+		t.Fatalf("confirmed seed fact = %+v (%v), want injection-eligible", before, err)
 	}
 
 	beforeEventCount := countEventsOfKind(t, st, EventFactDenied)
@@ -452,4 +460,53 @@ type fakeLaneLookup struct {
 
 func (f fakeLaneLookup) GetTaskLane(_ context.Context, _ string) (lane, category string, found bool, err error) {
 	return f.lane, "finans", true, nil
+}
+
+// TestTierInjectionEligibleQuarantinesExternalDocUntilConfirmed (G13 MEM-6
+// phase 0, decision MEM-6.a; HANDOFF §5 safety #3 "güvenilmez-alınmış
+// hafıza ... refleks enjekte edilemez"): reflex injection is reserved for
+// the user-originated tiers; everything ingested from an untrusted source
+// (external_doc, screen) waits for a human confirmation exactly like an
+// agent_derived fact, and a confirmation lifts it.
+func TestTierInjectionEligibleQuarantinesExternalDocUntilConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		tier      string
+		confirmed bool
+		want      bool
+	}{
+		{TierUserEdit, false, true},
+		{TierUserAsserted, false, true},
+		{TierExternalDoc, false, false},
+		{TierScreen, false, false},
+		{TierAgentDerived, false, false},
+		{TierExternalDoc, true, true},
+		{TierScreen, true, true},
+		{TierAgentDerived, true, true},
+		{"", false, false},
+		{"bilinmeyen", false, false},
+	} {
+		if got := TierInjectionEligible(tc.tier, tc.confirmed); got != tc.want {
+			t.Errorf("TierInjectionEligible(%q, %v) = %v, want %v", tc.tier, tc.confirmed, got, tc.want)
+		}
+	}
+
+	e, _ := newTestEngine(t)
+	ctx := context.Background()
+	id, err := e.WriteFact(ctx, "tr", Candidate{
+		Subject: "Acme", Predicate: "located_in", Object: "Kadıköy", Provenance: ProvenanceExternalDoc,
+		SessionID: "ingest:tr", ExtractorVer: "doc_ingest_v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := e.GetFact(ctx, id)
+	if f.SourceTier != TierExternalDoc || InjectionEligible(f) || !FactQuarantined(f) {
+		t.Fatalf("unconfirmed external_doc fact = %+v, want quarantined (not injection-eligible)", f)
+	}
+	if err := e.ConfirmFact(ctx, "tr", id); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = e.GetFact(ctx, id); !InjectionEligible(f) || FactQuarantined(f) {
+		t.Fatalf("confirmed external_doc fact = %+v, want injection-eligible", f)
+	}
 }

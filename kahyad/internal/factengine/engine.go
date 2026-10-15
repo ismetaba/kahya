@@ -812,7 +812,11 @@ func (e *Engine) GetFact(ctx context.Context, id int64) (sqlcgen.Fact, error) {
 // deliverable, exported for W12-05 to swap into memory_search/injection):
 //
 //	eligible <=> status=active AND log-odds >= InjectionThresholdLogOdds
-//	             AND (tier != agent_derived OR confirmed)
+//	             AND (tier in {user_edit, user_asserted} OR confirmed)
+//
+// (the tier half is TierInjectionEligible; G13 MEM-6.a narrowed it from
+// "tier != agent_derived" so ingested external_doc/screen facts wait for a
+// confirmation too).
 func InjectionEligible(f sqlcgen.Fact) bool {
 	if f.Status != "active" {
 		return false
@@ -851,9 +855,26 @@ func TierRank(tier string) (rank int, ok bool) {
 // caller that filters by source_tier without a full Fact row to hand,
 // e.g. kahyad/internal/server's /v1/memory/search for_injection filter
 // over CHUNK/episode hits (which carry only source_tier, no confidence/
-// status of their own): eligible <=> tier != agent_derived OR confirmed.
+// status of their own).
+//
+// REFLEX injection (<hafiza>, a profile card) is reserved for the
+// user-originated tiers; everything ingested from an untrusted source
+// (external_doc, screen) AND everything an agent derived stays quarantined
+// until a human confirms it (HANDOFF S5 safety #3 + memory #1; G13 MEM-6
+// phase 0, decision MEM-6.a) - `kahya fact confirm` for a fact, `kahya
+// memory confirm` for a note. Explicit tool queries (memory_search
+// for_injection:false, fact_query include_quarantined) are NOT reflex
+// injection and still return these rows, labelled by source_tier. A tier
+// outside the lattice is never eligible unconfirmed (fail-closed).
+//
+//	eligible <=> tier in {user_edit, user_asserted} OR confirmed
 func TierInjectionEligible(tier string, confirmed bool) bool {
-	return tier != TierAgentDerived || confirmed
+	switch tier {
+	case TierUserEdit, TierUserAsserted:
+		return true
+	default:
+		return confirmed
+	}
 }
 
 // ErrSecretLaneCloudExtraction is returned by GuardCloudExtraction when

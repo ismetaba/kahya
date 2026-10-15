@@ -928,8 +928,9 @@ type memorySearchRequest struct {
 	TraceID string `json:"trace_id"`
 	// ForInjection and TaskID are W12-05 step 1's extension: when
 	// ForInjection is true, the response additionally renders a <hafiza>
-	// injection block (excluding 'agent_derived' quarantined episodes,
-	// HANDOFF §5 memory #1) and ledgers it (kind='hafiza_injected',
+	// injection block (excluding quarantined episodes - agent_derived and,
+	// since G13 MEM-6.a, ingested external_doc/screen ones - HANDOFF §5
+	// memory #1, safety #3) and ledgers it (kind='hafiza_injected',
 	// HANDOFF §5 safety #4). TaskID is carried into that ledger payload
 	// only - it does not affect ranking/search itself.
 	ForInjection bool   `json:"for_injection"`
@@ -1012,8 +1013,9 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W12-05 step 1a / W5-04: for_injection=true excludes 'agent_derived'
-	// episodes via kahyad/internal/factengine.TierInjectionEligible - the
+	// W12-05 step 1a / W5-04: for_injection=true excludes quarantined
+	// (agent_derived; external_doc/screen since G13 MEM-6.a) episodes via
+	// kahyad/internal/factengine.TierInjectionEligible - the
 	// SAME tier-quarantine rule facts.Fact rows are held to
 	// (factengine.InjectionEligible), applied here to CHUNK/episode hits
 	// (which carry only source_tier, never a per-fact confirmed_at) with

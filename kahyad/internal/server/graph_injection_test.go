@@ -81,8 +81,9 @@ func (f graphFixture) entity(t *testing.T, name, kind string) int64 {
 	return id
 }
 
-// fact writes an external_doc (injection-eligible) fact citing episode ep,
-// linked by a cloud-lane call (LinksCloudLane).
+// fact writes a user-confirmed external_doc (injection-eligible) fact
+// citing episode ep, linked by a cloud-lane call (LinksCloudLane). G13
+// MEM-6.a: an unconfirmed external_doc fact is quarantined.
 func (f graphFixture) fact(t *testing.T, subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
 	t.Helper()
 	id, err := f.fe.WriteFact(context.Background(), "tr-seed", factengine.Candidate{
@@ -92,6 +93,9 @@ func (f graphFixture) fact(t *testing.T, subj string, subjID int64, pred, obj st
 	})
 	if err != nil {
 		t.Fatalf("WriteFact: %v", err)
+	}
+	if err := f.fe.ConfirmFact(context.Background(), "tr-seed", id); err != nil {
+		t.Fatalf("ConfirmFact: %v", err)
 	}
 	return id
 }

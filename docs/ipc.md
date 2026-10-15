@@ -603,8 +603,9 @@ a cloud model, without changing anything in §2-§6 above:
   citing the filtered chunk hits' episodes, reads the seeds' own facts
   (hop 0) and `hafiza_graph_hops` hops further through the other end of
   each KEPT fact. A fact is kept only when `factengine.InjectionEligible`
-  (active, p >= 0.3, never an unconfirmed `agent_derived` fact - HANDOFF §5
-  memory #1/#3) AND `memlane.CloudEligible` (no secret-path citation, at
+  (active, p >= 0.3, never an unconfirmed `agent_derived` - nor, since
+  FIX-MEM-6 phase 0, an unconfirmed `external_doc`/`screen` - fact; HANDOFF
+  §5 memory #1/#3, safety #3) AND `memlane.CloudEligible` (no secret-path citation, at
   least one resolvable citation, text not secret - fail-closed). In this
   cloud lane the walk itself only follows what may leave the machine, and
   entity identity is lane-scoped (migration 0025, FIX-MEM-1/MEM-4 review):
@@ -721,7 +722,15 @@ a cloud model, without changing anything in §2-§6 above:
   ile tekrarla."`), `kahya fact deny <id>...` (`"Olgu reddedildi (güven
   düşürüldü): %d"` / `"%d olgu reddedildi."`); a failed id is one stderr
   line and exit 1. No "N confirmations => auto-inject" shortcut exists
-  (decision MEM-5.a). **Notes (FIX-MEM-5 phase 2):** `POST
+  (decision MEM-5.a). **Ingested tiers (FIX-MEM-6 phase 0, decision
+  MEM-6.a):** `factengine.TierInjectionEligible` now reserves reflex
+  injection (the `<hafiza>` chunks and `<olgular>` facts, a profile card) for
+  `user_edit`/`user_asserted`; `external_doc` and `screen` (and any tier
+  outside the lattice) wait for a confirmation exactly like `agent_derived`
+  (HANDOFF §5 safety #3) - `kahya fact confirm` / `kahya memory confirm`
+  lift it; `memory_search for_injection:false` and `fact_query
+  include_quarantined` still return them, labelled. **Notes (FIX-MEM-5
+  phase 2):** `POST
   /v1/memory/confirm {"file": "<path relative to the memory dir, or absolute
   inside it>"}` (control route; deliberately NOT an MCP tool - tools/list
   stays five) runs `mcp/memory` `HandleConfirm`: a note whose front matter

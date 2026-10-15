@@ -172,6 +172,10 @@ func TestCloudLaneEntityLinksNeverComeFromASecretNoteAlias(t *testing.T) {
 			assertDisjoint(t, cloudFactEntities(t, g, "had_coffee_with"), cloudFactEntities(t, g, "lives_in"), "coffee vs lives_in")
 
 			if prov == factengine.ProvenanceExternalDoc {
+				// G13 MEM-6.a: an unconfirmed external_doc fact is quarantined
+				// (never in <olgular> at all) - confirm every fact, as the user
+				// would, so the walk assertions below bite.
+				confirmAllFacts(t, f)
 				coffee := walkCloud(t, g, "dün kahve içtim", []int64{eps["inbox/2026-07-10.md"]})
 				if len(coffee) != 1 || coffee[0].Predicate != "had_coffee_with" {
 					t.Fatalf("cloud <olgular> for the coffee note = %+v, want only the coffee fact", coffee)
@@ -276,5 +280,28 @@ func TestLocalLaneKeepsResolvingASplitNameToItsOwnEntity(t *testing.T) {
 	}
 	if n := f.count(`SELECT count(DISTINCT subject_entity_id) FROM facts WHERE predicate = 'prescribes'`); n != 1 {
 		t.Fatalf("prescribes subject entities = %d, want the one secret-note entity", n)
+	}
+}
+
+// confirmAllFacts confirms every fact in f's brain.db (`kahya fact confirm`).
+func confirmAllFacts(t *testing.T, f *fixture) {
+	t.Helper()
+	rows, err := f.st.DB().Query(`SELECT id FROM facts`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if err := f.engine.ConfirmFact(context.Background(), "tr-confirm", id); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -94,12 +94,12 @@ func TestFactQueryAsOfBitemporal(t *testing.T) {
 	f := newFixture(t)
 	ep := f.episode("people/emre.md")
 	emre := f.entity("Emre", "person")
-	window := f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: factengine.ProvenanceExternalDoc,
-		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z", ValidTo: "2026-06-01T00:00:00Z"})
-	open := f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "lives_in", Object: "Moda", Provenance: factengine.ProvenanceExternalDoc,
-		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t"})
-	later := f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Beta", Provenance: factengine.ProvenanceExternalDoc,
-		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-06-01T00:00:00Z"})
+	window := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z", ValidTo: "2026-06-01T00:00:00Z"}))
+	open := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "lives_in", Object: "Moda", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t"}))
+	later := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Beta", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-06-01T00:00:00Z"}))
 
 	march := f.query(FactQuery{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z")})
 	if !sameIDs(recIDs(march), []int64{window, open}) {

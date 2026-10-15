@@ -1409,3 +1409,47 @@ func TestMemorySearchForInjectionEmptyHitsIsEmptyBlock(t *testing.T) {
 		t.Errorf("ledger payload.block = %v, want empty string", events[0].payload["block"])
 	}
 }
+
+// TestMemorySearchForInjectionExcludesUnconfirmedExternalDoc (G13 MEM-6.a,
+// HANDOFF §5 safety #3): a chunk of an ingested (external_doc) or screen
+// note is not reflex-injected until the user confirms the note; the raw
+// for_injection:false surface still returns it, labelled by tier.
+func TestMemorySearchForInjectionExcludesUnconfirmedExternalDoc(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "k.sock")
+	fs := &fakeSearcher{hits: []search.Hit{
+		{ChunkID: 1, EpisodeID: 1, Path: "notlar.md", Seq: 0, Text: "kullanici notu", Score: 0.9, SourceTier: "user_asserted"},
+		{ChunkID: 2, EpisodeID: 2, Path: "ingest/2026-10-08-rapor.md", Seq: 0, Text: "alinan belge ozeti", Score: 0.8, SourceTier: "external_doc"},
+		{ChunkID: 3, EpisodeID: 3, Path: "ekran.md", Seq: 0, Text: "ekran metni", Score: 0.7, SourceTier: "screen"},
+	}}
+	srv := New(testConfig(socketPath), testLogger(t), "v-test", healthyDB)
+	srv.SetSearcher(fs)
+	if err := srv.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	defer srv.Shutdown()
+	client := unixHTTPClient(socketPath)
+
+	var raw, inj struct {
+		Results []struct {
+			Path string `json:"path"`
+		} `json:"results"`
+		HafizaBlock string `json:"hafiza_block"`
+	}
+	resp := postMemorySearch(t, client, `{"query":"not","for_injection":false}`)
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(raw.Results) != 3 {
+		t.Fatalf("for_injection:false = %+v, want all three", raw.Results)
+	}
+	resp = postMemorySearch(t, client, `{"query":"not","for_injection":true,"task_id":"t1"}`)
+	if err := json.NewDecoder(resp.Body).Decode(&inj); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(inj.Results) != 1 || inj.Results[0].Path != "notlar.md" || strings.Contains(inj.HafizaBlock, "alinan belge") || strings.Contains(inj.HafizaBlock, "ekran metni") {
+		t.Fatalf("for_injection:true = %+v %q, want only the user note", inj.Results, inj.HafizaBlock)
+	}
+}

@@ -51,7 +51,7 @@
 | Safety #2: data-level taint + dual-LLM Reader/Actor; Actor never sees raw untrusted text | W4-03 | covered |
 | Safety #2 · untrusted tier = R-tools + notify only; W-actions from CLEAN seeded session; briefing tainted by design | W4-03, W5-01 | covered |
 | Safety #2 · taint persisted in SQLite by session_id, reloaded on resume, only rises, missing⇒untrusted | W4-03, W78-02 (restart scenario) | covered |
-| Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow); profile-card builder itself not in MVP | covered |
+| Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow), G13 MEM-6.a (external_doc/screen quarantined until confirmed), MEM-5 (note/fact confirm); profile-card builder itself not in MVP | covered |
 | Safety #4: external-anchored ledger; every injected `<hafiza>` block recorded | W4-05 (anchor+verify+separate Keychain item), W12-05/W12-10 (`hafiza_injected` + sha256) | covered |
 | Safety #5: WYSIWYE (NFC, bidi/zero-width/homoglyph, canonical path/host, hash; executed≠approved ⇒ reject) | W3-06 (+W78-02 homoglyph scenario) | covered |
 | Safety #5 · W3 "onayla" local-surface only (CLI W3–5, Hammerspoon W6+); Telegram notify-only for W3 | W3-06, W3-07, W6-01 (server-stamped surface), FIX-B-11 (Telegram approves only `reversible: true` W1/W2; every other W1/W2 is notify-only too, engine backstop) | covered |
@@ -219,6 +219,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #3 | agent_derived / untrusted-sourced memory quarantined from injection | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W12-05 | ci-hermetic |
 | Safety #3 | memory search for-injection excludes agent_derived facts | `kahyad/internal/server/TestMemorySearchForInjectionExcludesAgentDerived` | W12-05 | ci-hermetic |
 | Safety #3 | red-team planted-mail-poisons-profile scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |
+| Safety #3 | untrusted-ingested (external_doc) chunks/facts not reflex-injected until confirmed | `kahyad/internal/factengine/TestTierInjectionEligibleQuarantinesExternalDocUntilConfirmed` | FIX-MEM-6 | ci-hermetic |
+| Safety #3 | a chunk of an ingested external_doc / screen note never enters the for_injection `<hafiza>` block unconfirmed; the raw surface still returns it | `kahyad/internal/server/TestMemorySearchForInjectionExcludesUnconfirmedExternalDoc` | FIX-MEM-6 | ci-hermetic |
 | Safety #4 | local ledger tamper detected vs external anchor | `kahyad/internal/anchor/TestVerifyDetectsLocalTamperAfterTwoAnchors` | W4-05 | ci-hermetic |
 | Safety #4 | remote-anchor mismatch detected | `kahyad/internal/anchor/TestVerifyDetectsRemoteMismatch` | W4-05 | ci-hermetic |
 | Safety #4 | anchor ledger is append-only (first line unchanged on 2nd anchor) | `kahyad/internal/anchor/TestPusherRunSecondAnchorAppendsAndFirstLineUnchanged` | W4-05 | ci-hermetic |

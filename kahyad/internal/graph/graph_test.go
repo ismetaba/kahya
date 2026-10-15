@@ -95,27 +95,37 @@ func (f *fixture) localAlias(entityID int64, alias string) {
 	}
 }
 
-// fact writes an external_doc fact (p=0.8, injection-eligible, no session
-// needed) citing episode ep (0 = no episode citation), linked to the given
-// entity ids (0 = unlinked) by a cloud-lane call.
+// fact writes a user-confirmed external_doc fact (p=0.8, injection-
+// eligible - an unconfirmed external_doc fact is quarantined since G13
+// MEM-6.a; no session needed) citing episode ep (0 = no episode citation),
+// linked to the given entity ids (0 = unlinked) by a cloud-lane call.
 func (f *fixture) fact(subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
 	f.t.Helper()
-	return f.factWith(factengine.Candidate{
+	return f.confirmed(f.factWith(factengine.Candidate{
 		Subject: subj, Predicate: pred, Object: obj,
 		Provenance: factengine.ProvenanceExternalDoc, EpisodeID: ep,
 		SubjectEntityID: subjID, ObjectEntityID: objID, ExtractorVer: "test_v1",
-	})
+	}))
 }
 
 // localFact is fact written by a LOCAL-lane call: its links are
 // local-only.
 func (f *fixture) localFact(subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
 	f.t.Helper()
-	return f.writeFact(factengine.Candidate{
+	return f.confirmed(f.writeFact(factengine.Candidate{
 		Subject: subj, Predicate: pred, Object: obj,
 		Provenance: factengine.ProvenanceExternalDoc, EpisodeID: ep,
 		SubjectEntityID: subjID, ObjectEntityID: objID, ExtractorVer: "test_v1",
-	})
+	}))
+}
+
+// confirmed confirms fact id (a user's `kahya fact confirm`) and returns it.
+func (f *fixture) confirmed(id int64) int64 {
+	f.t.Helper()
+	if err := f.fe.ConfirmFact(context.Background(), "tr-test", id); err != nil {
+		f.t.Fatalf("ConfirmFact(%d): %v", id, err)
+	}
+	return id
 }
 
 // factWith writes c as a cloud-lane call does (LinksCloudLane).
@@ -307,11 +317,11 @@ func TestNeighbourhoodCloudLaneDropsSecretPathFacts(t *testing.T) {
 func TestNeighbourhoodCloudLaneDropsFactWithoutEpisodeCitation(t *testing.T) {
 	f := newFixture(t)
 	emre := f.entity("Emre", "person")
-	uncited := f.factWith(factengine.Candidate{
+	uncited := f.confirmed(f.factWith(factengine.Candidate{
 		Subject: "Emre", Predicate: "works_at", Object: "Acme",
 		Provenance: factengine.ProvenanceExternalDoc, SessionID: "sess-no-episode",
 		SubjectEntityID: emre, ExtractorVer: "test_v1",
-	})
+	}))
 	if lines, _ := f.walk("Emre", nil, Options{CloudLane: true}); len(lines) != 0 {
 		t.Fatalf("cloud lane lines = %+v, want none (no citation => secret)", lines)
 	}

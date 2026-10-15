@@ -3745,7 +3745,7 @@ func (q *Queries) ListProvisionalEntitiesByFolded(ctx context.Context, arg ListP
 const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
 SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
-WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
+WHERE status = 'active' AND source_tier NOT IN ('user_edit', 'user_asserted') AND confirmed_at IS NULL
   AND created_at >= ?1
 ORDER BY id DESC
 LIMIT ?2
