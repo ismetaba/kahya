@@ -16,6 +16,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -853,6 +854,27 @@ func pythonVenvDir(argv0 string) string {
 // selfProtectForms returns p (cleaned) and, when it differs, p with its
 // deepest existing ancestor's symlinks resolved. Empty or relative p
 // yields nothing.
+// IngestRawSecretLaneGlobs returns the secret-lane path globs covering the
+// raw ingest store (IngestRawDir/**, in its as-given and symlink-resolved
+// forms; nil when IngestRawDir is unset). `kahya ingest` keeps a raw copy
+// of EVERY document there - including one forced local by a secret-lane
+// source path or --secret - under a content-hash name no
+// secret_lane_globs entry covers, so without these globs fs_read of a raw
+// copy fell back to the content check only and lost the path half of the
+// lane rule (FIX-FINAL ingest-raw-copy-outside-secret-globs). Derived
+// from config, like SelfProtectDenyGlobs, so a relocated ingest_raw_dir
+// stays covered.
+func (c Config) IngestRawSecretLaneGlobs() []string {
+	var globs []string
+	for _, form := range selfProtectForms(c.IngestRawDir) {
+		g := filepath.Join(form, "**")
+		if !slices.Contains(globs, g) {
+			globs = append(globs, g)
+		}
+	}
+	return globs
+}
+
 func selfProtectForms(p string) []string {
 	if p == "" || !filepath.IsAbs(p) {
 		return nil

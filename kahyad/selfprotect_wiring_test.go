@@ -172,3 +172,48 @@ func TestWiredDenyGlobsProtectRealPythonChildStdlib(t *testing.T) {
 		t.Skip("no Python venv in this checkout (make venv)")
 	}
 }
+
+// TestWiredFSSecretLaneGlobsCoverIngestRawStore (FIX-FINAL
+// ingest-raw-copy-outside-secret-globs): `kahya ingest` keeps a raw copy
+// of every document - a secret-lane one included - at
+// <ingest_raw_dir>/<sha256>.txt, which no policy.yaml secret_lane_globs
+// entry covers, so fs_read of it lost the path half of the lane rule. The
+// glob list main.go hands mcp/fs now covers the raw store (policy globs
+// first and unchanged, the input never mutated), also with no policy
+// globs at all (deny-all boot).
+func TestWiredFSSecretLaneGlobsCoverIngestRawStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_POLICY_PATH"} {
+		t.Setenv(k, "")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if cfg.IngestRawDir == "" {
+		t.Fatal("fixture: IngestRawDir is unset")
+	}
+	pol, err := policy.Load(filepath.Join("..", "policy.yaml"))
+	if err != nil {
+		t.Fatalf("policy.Load: %v", err)
+	}
+	raw := filepath.Join(cfg.IngestRawDir, strings.Repeat("ab", 32)+".txt")
+	if hit, _ := mcpfs.MatchesAnyGlobCI(raw, pol.SecretLaneGlobs); hit {
+		t.Fatalf("fixture: %s is already covered by policy.yaml alone", raw)
+	}
+	in := append([]string{}, pol.SecretLaneGlobs...)
+	wired := wiredFSSecretLaneGlobs(in, cfg)
+	if !slices.Equal(in, pol.SecretLaneGlobs) {
+		t.Fatal("wiredFSSecretLaneGlobs mutated its input")
+	}
+	if !slices.Equal(wired[:len(pol.SecretLaneGlobs)], pol.SecretLaneGlobs) {
+		t.Fatal("wired secret-lane globs must start with policy.yaml's own list, unchanged")
+	}
+	for _, globs := range [][]string{wired, wiredFSSecretLaneGlobs(nil, cfg)} {
+		if hit, err := mcpfs.MatchesAnyGlobCI(raw, globs); err != nil || !hit {
+			t.Errorf("raw ingest copy %s is not secret-lane by path (hit=%v err=%v)", raw, hit, err)
+		}
+	}
+}

@@ -870,7 +870,11 @@ a cloud model, without changing anything in §2-§6 above:
   `<kahya_dir>/.ingest-raw`, Load refuses one inside the memory dir) only
   after `backup.EnsureDirIgnored` wrote its anchored `.gitignore` line under
   kahya_dir; the raw store is never indexed and is self-protected from
-  worker writes. Ledger `ingest.done {file, episode_id, lane, lane_reason
+  worker writes, and `fs_read` treats every raw copy (of any lane) as
+  secret-lane by path, so a read escalates the calling task
+  (`config.IngestRawSecretLaneGlobs`, appended to policy.yaml's
+  `secret_lane_globs` for mcp/fs only; FIX-FINAL
+  ingest-raw-copy-outside-secret-globs). Ledger `ingest.done {file, episode_id, lane, lane_reason
   (reader | path_glob | forced | note_content), reader_lane, source_ref,
   sha256, facts, entities, chunks, raw_kept, commit_sha,
   source_tier}` / `ingest.failed {reason, sha256, source_ref, ...}`. 200 →

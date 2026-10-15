@@ -593,7 +593,9 @@ func run() int {
 	// interpreter prefix and the dylibs it links).
 	denyGlobs := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
 	log.Info("self_protect_deny_globs", "count", len(denyGlobs)-len(pol.FSWriteDenyGlobs), "policy_count", len(pol.FSWriteDenyGlobs))
-	fsTool := mcpfs.New(home, denyGlobs, pol.SecretLaneGlobs, filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
+	// FIX-FINAL ingest-raw-copy-outside-secret-globs: fs_read also treats
+	// the raw ingest store as secret-lane by path (wiredFSSecretLaneGlobs).
+	fsTool := mcpfs.New(home, denyGlobs, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg), filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
 	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
 	// paths) - this wires the SEPARATE, content-based half so a file whose
@@ -1635,6 +1637,19 @@ func run() int {
 // and the self-protect globs still apply.
 func wiredFSDenyGlobs(policyGlobs []string, cfg config.Config) []string {
 	return append(append([]string{}, policyGlobs...), cfg.SelfProtectDenyGlobs()...)
+}
+
+// wiredFSSecretLaneGlobs is the secret-lane glob list kahyad hands the
+// file-reading tools: policy.yaml's secret_lane_globs (first, unchanged,
+// never aliased) plus the config-derived raw ingest store globs
+// (config.IngestRawSecretLaneGlobs), so a raw copy of any ingested
+// document - a secret-lane one included - escalates the reading task by
+// path (FIX-FINAL ingest-raw-copy-outside-secret-globs). In deny-all mode
+// (policyGlobs nil) the raw-store globs still apply. memlane,
+// consolidation, ritual and briefing keep pol.SecretLaneGlobs: they only
+// see memory_dir paths, and config.Load refuses a raw dir inside it.
+func wiredFSSecretLaneGlobs(policyGlobs []string, cfg config.Config) []string {
+	return append(append([]string{}, policyGlobs...), cfg.IngestRawSecretLaneGlobs()...)
 }
 
 // hostPortFromURL resolves rawURL's host and port (defaulting to 80/443
