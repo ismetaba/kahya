@@ -205,6 +205,33 @@ type erroringMatcher struct{}
 
 func (erroringMatcher) Match(string, string) (bool, error) { return false, errors.New("bad glob") }
 
+// TestAbsPathIsSecretOutsideTheMemoryDir (FIX-MEM-6 review): the file a
+// document is ingested from is matched against every secret-lane glob with
+// the same folded, fail-closed rule, wherever it lives - ~/Documents/kimlik
+// is no memory path.
+func TestAbsPathIsSecretOutsideTheMemoryDir(t *testing.T) {
+	c := Classifier{MemoryDir: testMemoryDir, SecretGlobs: []string{"/m/finans*.md", "/u/Documents/kimlik/**"}, Matcher: policyMatcher{}}
+	for abs, want := range map[string]bool{
+		"/u/Documents/kimlik/pasaport.txt": true,
+		"/u/Documents/KIMLIK/Pasaport.txt": true, // APFS: the same directory
+		"/u/Documents/kİmlİk/a/b.txt":      true, // dotted capital I
+		"/m/finans-2026.md":                true,
+		"/m/notes/finans.md":               false,
+		"/u/Documents/rapor.txt":           false,
+	} {
+		if got := c.AbsPathIsSecret(abs); got != want {
+			t.Errorf("AbsPathIsSecret(%q) = %v, want %v", abs, got, want)
+		}
+	}
+	c.Matcher = erroringMatcher{}
+	if !c.AbsPathIsSecret("/u/Documents/rapor.txt") {
+		t.Error("a glob match error must classify the path as secret")
+	}
+	if c.Matcher = nil; !c.AbsPathIsSecret("/u/Documents/rapor.txt") {
+		t.Error("no matcher wired must classify the path as secret")
+	}
+}
+
 // TestPathIsSecretMatcherErrorIsSecret: a glob that cannot be evaluated
 // classifies the path as secret (fail-closed). The ritual sampler this
 // classification moved from treated a match error as "no match".

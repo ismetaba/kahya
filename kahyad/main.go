@@ -979,8 +979,10 @@ func run() int {
 
 	// G13 MEM-6: `kahya ingest` - an outside document -> an external_doc
 	// note (built ONLY from the Reader's validated fields) + its facts.
-	// The same Reader (local classification of the whole document, window
-	// by window, BEFORE any cloud byte - HANDOFF §4, H-7), the same
+	// The source file's path is matched against secret_lane_globs first
+	// (laneClassifier: a covered path keeps the document local), then the
+	// same Reader (local classification of the whole document, window by
+	// window, BEFORE any cloud byte - HANDOFF §4, H-7), the same
 	// extractor lock and fact mapping, and the process-wide memory server
 	// (srv.MemoryNoteWriter: one memory-repo mutex). Everything it writes is
 	// quarantined until the user confirms it (decision MEM-6.a). The raw

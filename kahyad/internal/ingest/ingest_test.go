@@ -556,3 +556,97 @@ func TestIngestNoteNameFollowsTheUserLabel(t *testing.T) {
 		t.Fatalf("no label = %+v %v", res, err)
 	}
 }
+
+// TestIngestSecretGlobSourcePathForcesLocal (HANDOFF §4 ordering, G00 H-7:
+// path glob first, then the classifiers, only then the cloud): a document
+// read from a path policy.yaml's secret_lane_globs covers is read by the
+// LOCAL model only and stored under gizli/ingest/ - whatever the local
+// classifier says (here a false negative), whatever label --source gives
+// it, through a case variant or a symlink - as fs_read and the extractor
+// would treat that path. An ordinary path still goes to the cloud Reader;
+// a source path that cannot be matched is refused before any model call.
+func TestIngestSecretGlobSourcePathForcesLocal(t *testing.T) {
+	const home = "/Users/x"
+	policyGlobs := []string{ // policy.yaml's secret_lane_globs, expanded as policy.Load does
+		home + "/Kahya/memory/finans*.md", home + "/Documents/saglik/**", home + "/Documents/kimlik/**",
+	}
+	// A real symlink into a secret directory (resolved temp root: macOS
+	// /var is itself a symlink to /private/var).
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"kimlik", "masaustu"} {
+		if err := os.MkdirAll(filepath.Join(tmp, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(tmp, "kimlik", "pasaport.txt")
+	if err := os.WriteFile(target, []byte(acmeDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, "masaustu", "belge.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	policyGlobs = append(policyGlobs, filepath.Join(tmp, "kimlik", "**"))
+
+	withGlobs := func(t *testing.T) *fixture {
+		f := newFixture(t)
+		f.runner.Lane.SecretGlobs = append(append([]string{}, f.runner.Lane.SecretGlobs...), policyGlobs...)
+		f.answer = acmeAnswer(t)
+		return f
+	}
+	for _, tc := range []struct {
+		name string
+		req  Request
+	}{
+		{"source path, label overridden", Request{SourceRef: "pasaport", SourcePaths: []string{home + "/Documents/kimlik/pasaport.txt"}}},
+		{"finance note path", Request{SourcePaths: []string{home + "/Kahya/memory/finans-2026.md"}}},
+		{"absolute source label only", Request{SourceRef: home + "/Documents/kimlik/pasaport.txt"}},
+		{"case variant", Request{SourcePaths: []string{home + "/Documents/KIMLIK/Pasaport.txt"}}},
+		{"resolved form sent", Request{SourceRef: "belge", SourcePaths: []string{link, target}}},
+		{"symlink resolved by kahyad", Request{SourceRef: link}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := withGlobs(t)
+			f.cloudForbid = true
+			req := tc.req
+			req.Content = []byte(acmeDoc)
+			res, err := f.ingest(req)
+			if err != nil {
+				t.Fatalf("Ingest: %v", err)
+			}
+			if f.cloudCalls != 0 || f.localCalls != 1 || res.Lane != "secret" || !strings.HasPrefix(res.File, "gizli/ingest/") {
+				t.Fatalf("result = %+v (cloud %d, local %d)", res, f.cloudCalls, f.localCalls)
+			}
+			if r := f.lastPayload(EventDone)["lane_reason"]; r != LaneReasonPathGlob {
+				t.Fatalf("lane_reason = %v, want %s", r, LaneReasonPathGlob)
+			}
+			var quote sql.NullString
+			if err := f.st.DB().QueryRow(`SELECT quote FROM facts`).Scan(&quote); err != nil || quote.Valid {
+				t.Fatalf("fact quote = %+v (%v), want none", quote, err)
+			}
+		})
+	}
+
+	// Negative control: an ordinary source path is classified as before.
+	f := withGlobs(t)
+	res, err := f.ingest(Request{Content: []byte(acmeDoc), SourcePaths: []string{home + "/Documents/rapor.txt"}})
+	if err != nil || res.Lane != "normal" || f.cloudCalls != 1 || f.lastPayload(EventDone)["lane_reason"] != LaneReasonReader {
+		t.Fatalf("ordinary path = %+v %v (cloud %d)", res, err, f.cloudCalls)
+	}
+
+	// A source path the glob rule cannot judge is refused, not skipped.
+	g := withGlobs(t)
+	g.cloudForbid = true
+	for _, bad := range [][]string{{"Documents/kimlik/pasaport.txt"}, {""}, {"/a\nb"}, {"/a", "/b", "/c", "/d", "/e"}} {
+		if _, err := g.ingest(Request{Content: []byte(acmeDoc), SourcePaths: bad}); reason(err) != ReasonBadRequest ||
+			err.Error() != fmt.Sprintf(MsgIngestBadSourcePathFmt, MaxSourcePaths, MaxSourcePathBytes) {
+			t.Fatalf("source paths %q = %v", bad, err)
+		}
+	}
+	if g.localCalls+g.cloudCalls != 0 {
+		t.Fatal("a refused source path reached a model")
+	}
+}

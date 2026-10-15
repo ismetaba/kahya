@@ -121,9 +121,17 @@ func FactText(f sqlcgen.Fact) string {
 // cloud lane). A glob that errors, or a missing matcher while globs are
 // configured, counts as a match (fail-closed).
 func (c Classifier) PathIsSecret(relPath string) bool {
-	abs := filepath.Join(c.MemoryDir, filepath.FromSlash(relPath))
+	return c.AbsPathIsSecret(filepath.Join(c.MemoryDir, filepath.FromSlash(relPath)))
+}
+
+// AbsPathIsSecret is PathIsSecret for an absolute path anywhere on disk
+// (not only under MemoryDir) - e.g. the file `kahya ingest` read a
+// document from: secret when any secret-lane glob covers it under
+// MatchesSecretGlob (byte-exact OR folded; a glob error or a missing
+// matcher while globs are configured counts as a match).
+func (c Classifier) AbsPathIsSecret(absPath string) bool {
 	for _, g := range c.SecretGlobs {
-		if MatchesSecretGlob(c.Matcher, g, abs) {
+		if MatchesSecretGlob(c.Matcher, g, absPath) {
 			return true
 		}
 	}

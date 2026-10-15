@@ -57,9 +57,13 @@ func (w memoryNoteWriter) HandleWriteTiered(ctx context.Context, traceID string,
 type ingestRequest struct {
 	ContentB64 string `json:"content_b64"`
 	SourceRef  string `json:"source_ref"`
-	Title      string `json:"title"`
-	LaneHint   string `json:"lane_hint"`
-	NoRaw      bool   `json:"no_raw"`
+	// SourcePaths are the absolute paths the CLI read the file from (as
+	// given + symlink-resolved); matched against secret_lane_globs before
+	// the Reader runs (ingest.Request.SourcePaths).
+	SourcePaths []string `json:"source_paths"`
+	Title       string   `json:"title"`
+	LaneHint    string   `json:"lane_hint"`
+	NoRaw       bool     `json:"no_raw"`
 }
 
 type ingestResponse struct {
@@ -148,7 +152,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	traceID := traceIDFromContext(r)
 	res, err := s.ingester.Ingest(ctx, traceID, ingest.Request{
-		Content: content, SourceRef: req.SourceRef, Title: req.Title, LaneHint: req.LaneHint, NoRaw: req.NoRaw,
+		Content: content, SourceRef: req.SourceRef, SourcePaths: req.SourcePaths, Title: req.Title, LaneHint: req.LaneHint, NoRaw: req.NoRaw,
 	})
 	if err != nil {
 		var ie *ingest.Error

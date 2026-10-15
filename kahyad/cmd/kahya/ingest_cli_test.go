@@ -144,3 +144,47 @@ func TestIngestCLIStringsMatchIngestPackage(t *testing.T) {
 		t.Fatalf("MsgIngestUsage = %q", MsgIngestUsage)
 	}
 }
+
+// TestIngestCLISendsTheSourceFilePaths (FIX-MEM-6 review): for a file the
+// CLI always sends where it read it from - the absolute path as given and
+// its symlink-resolved form - even when --source relabels it, so kahyad can
+// apply the secret_lane_globs path rule before any cloud byte. stdin sends
+// none.
+func TestIngestCLISendsTheSourceFilePaths(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"kimlik", "masaustu"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(dir, "kimlik", "pasaport.txt")
+	if err := os.WriteFile(target, []byte("pasaport\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "masaustu", "belge.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	fake := &ingestFake{lane: "normal"}
+	if code, _, errOut := runIngestCLI(t, fake, "", "--source", "etiket", link); code != 0 {
+		t.Fatalf("exit = %d %q", code, errOut)
+	}
+	got, _ := json.Marshal(fake.body["source_paths"])
+	want, _ := json.Marshal([]string{link, target})
+	if string(got) != string(want) || fake.body["source_ref"] != "etiket" {
+		t.Fatalf("source_paths = %s (source_ref %v), want %s", got, fake.body["source_ref"], want)
+	}
+	// A plain file: its absolute path once.
+	if code, _, errOut := runIngestCLI(t, fake, "", target); code != 0 {
+		t.Fatalf("exit = %d %q", code, errOut)
+	}
+	if got, _ := json.Marshal(fake.body["source_paths"]); string(got) != `["`+target+`"]` {
+		t.Fatalf("plain file source_paths = %s", got)
+	}
+	if code, _, _ := runIngestCLI(t, fake, "x\n", "-"); code != 0 || fake.body["source_paths"] != nil {
+		t.Fatalf("stdin source_paths = %v, want none", fake.body["source_paths"])
+	}
+}

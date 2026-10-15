@@ -1261,9 +1261,14 @@ func (e *ingestError) Error() string { return e.Msg }
 
 // Ingest calls POST /v1/ingest (`kahya ingest`). No client timeout: a long
 // document on the local model can take minutes.
-func (c *Client) Ingest(ctx context.Context, traceID string, content []byte, sourceRef, title string, secret, noRaw bool) (ingestResult, error) {
+// sourcePaths (nil for stdin) are where the file was read from - kahyad's
+// secret_lane_globs path rule.
+func (c *Client) Ingest(ctx context.Context, traceID string, content []byte, sourceRef string, sourcePaths []string, title string, secret, noRaw bool) (ingestResult, error) {
 	body := map[string]any{
 		"content_b64": base64.StdEncoding.EncodeToString(content), "source_ref": sourceRef, "title": title, "no_raw": noRaw,
+	}
+	if len(sourcePaths) > 0 {
+		body["source_paths"] = sourcePaths
 	}
 	if secret {
 		body["lane_hint"] = "secret"

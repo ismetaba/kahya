@@ -752,8 +752,8 @@ a cloud model, without changing anything in §2-§6 above:
   size is config `ritual_max_questions` (default 10, 1..50; decision
   MEM-5.b).
 - **Document ingest (FIX-MEM-6, G13; ordering per G00 H-7).** `POST
-  /v1/ingest {"content_b64", "source_ref", "title", "lane_hint": "" |
-  "secret", "no_raw"}` (control route, never an MCP tool - choosing to
+  /v1/ingest {"content_b64", "source_ref", "source_paths", "title",
+  "lane_hint": "" | "secret", "no_raw"}` (control route, never an MCP tool - choosing to
   remember an outside document is the user's trust decision; a live worker
   is refused even with the secret) runs `kahyad/internal/ingest.Runner`:
   UTF-8 text without NUL only (no PDF/HTML conversion), at most
@@ -763,7 +763,15 @@ a cloud model, without changing anything in §2-§6 above:
   (`extract.Runner.TryHold`; a running extraction = 409 `in_progress`); a
   document whose SHA-256 an `ingest.done` row names while that note is
   still an active episode is a 409 `"ingest: bu belge zaten alınmış:
-  <note>"`. The lane is decided LOCALLY before any cloud byte:
+  <note>"`. The lane is decided LOCALLY before any cloud byte. First the
+  Go-enforced path rule (FIX-MEM-6 review): every `source_paths` entry (at
+  most 4 absolute paths, <= 4096 bytes each, one line - anything else is a
+  400) and `source_ref` when it is an absolute path, each also in its
+  cleaned and symlink-resolved form, is matched against policy.yaml's
+  `secret_lane_globs` with memlane's rule (byte-exact OR
+  case/normalisation-folded; a glob error = secret) - a covered path forces
+  the local model (`lane_reason: path_glob`), whatever a classifier says
+  about the content, as fs_read and the extractor treat that path. Then
   `lane_hint:"secret"` (`--secret`) or a deterministic hit in the user's
   own title/source label forces the local model; otherwise
   `reader.RunDocIngest` classifies the whole document (deterministic
@@ -794,8 +802,8 @@ a cloud model, without changing anything in §2-§6 above:
   `<kahya_dir>/.ingest-raw`, Load refuses one inside the memory dir) only
   after `backup.EnsureDirIgnored` wrote its anchored `.gitignore` line under
   kahya_dir; the raw store is never indexed and is self-protected from
-  worker writes. Ledger `ingest.done {file, episode_id, lane, lane_reason,
-  source_ref, sha256, facts, entities, chunks, raw_kept, commit_sha,
+  worker writes. Ledger `ingest.done {file, episode_id, lane, lane_reason
+  (reader | path_glob | forced | note_content), source_ref, sha256, facts, entities, chunks, raw_kept, commit_sha,
   source_tier}` / `ingest.failed {reason, sha256, source_ref, ...}`. 200 →
   `{ok, file, episode_id, commit_sha, lane, chunks, facts, entities,
   source_tier, raw_path, sha256, trace_id}`. Everything ingested is
@@ -804,7 +812,8 @@ a cloud model, without changing anything in §2-§6 above:
   (decision MEM-6.d: `curl … | kahya ingest -`). CLI (FIX-MEM-6 phase 3):
   `kahya ingest <dosya|-> [--title <başlık>] [--source <url|etiket>]
   [--secret] [--no-raw]` (`-` = stdin; a file's absolute path is the default
-  source; the note's name follows --title, then the source label, then the
+  source, and that path plus its symlink-resolved form are always sent as
+  `source_paths`, even under `--source`; the note's name follows --title, then the source label, then the
   Reader's title) prints `"Belge alındı: %s (%d parça, %d olgu, %d varlık;
   katman: %s, şerit: %s)"`, on the secret lane `"🔒 Belge gizli şerit olarak
   işlendi (yalnız yerel model); not: %s"`, then `"Not ve olgular onaysız

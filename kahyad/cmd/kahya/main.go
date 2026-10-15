@@ -1049,25 +1049,26 @@ func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io
 		return 2
 	}
 	var content []byte
+	var sourcePaths []string
 	var err error
 	sourceRef := strings.TrimSpace(*source)
 	if path == "-" {
 		content, err = io.ReadAll(stdin)
-	} else {
-		content, err = os.ReadFile(path)
-		if sourceRef == "" {
-			if abs, aerr := filepath.Abs(path); aerr == nil {
-				sourceRef = abs
-			} else {
-				sourceRef = path
-			}
+	} else if content, err = os.ReadFile(path); err == nil {
+		// Where the file was read from, always (even when --source relabels
+		// it): kahyad matches these against policy.yaml's secret_lane_globs
+		// BEFORE the Reader runs (HANDOFF §4 ordering, G00 H-7) - a secret
+		// path keeps the document on the local model.
+		sourcePaths, err = ingestSourcePaths(path)
+		if sourceRef == "" && err == nil {
+			sourceRef = sourcePaths[0]
 		}
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, MsgIngestReadFailed+"\n", err.Error())
 		return 2
 	}
-	res, err := client.Ingest(context.Background(), traceid.New(), content, sourceRef, strings.TrimSpace(*title), *secret, *noRaw)
+	res, err := client.Ingest(context.Background(), traceid.New(), content, sourceRef, sourcePaths, strings.TrimSpace(*title), *secret, *noRaw)
 	if err != nil {
 		var ie *ingestError
 		switch {
@@ -1092,6 +1093,22 @@ func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io
 	}
 	fmt.Fprintf(stdout, MsgIngestQuarantineHint+"\n", res.File)
 	return 0
+}
+
+// ingestSourcePaths is where `kahya ingest <dosya>` read a file from: its
+// absolute path as given, then - when it differs - the symlink-resolved
+// one. An absolute path that cannot be built is an error (the file is not
+// ingested): kahyad's secret_lane_globs path rule needs one.
+func ingestSourcePaths(path string) ([]string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{abs}
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil && resolved != abs {
+		paths = append(paths, resolved)
+	}
+	return paths, nil
 }
 
 // runRemembered implements `kahya remembered --trace <id>` (W5-03): the

@@ -10,8 +10,12 @@
 //  2. the extraction lock is taken (extract.Runner.TryHold: entity
 //     resolution never races a nightly run) and an already-ingested
 //     document (same SHA-256, its note still active) is refused;
-//  3. the lane: --secret, or a deterministic secret hit in the user's own
-//     title/source label, forces the local lane; otherwise the Reader
+//  3. the lane: a source file path that policy.yaml's secret_lane_globs
+//     cover (Request.SourcePaths, an absolute SourceRef, and their
+//     symlink-resolved forms - matched with memlane's folded, fail-closed
+//     rule, the Go-enforced path half of the H-7 order, FIRST), --secret,
+//     or a deterministic secret hit in the user's own title/source label,
+//     forces the local lane; otherwise the Reader
 //     classifies the document LOCALLY (reader.RunDocIngest: deterministic
 //     pre-pass over the whole text, local classifier over every window,
 //     fail-closed) BEFORE any byte can reach a cloud model; an unavailable
@@ -77,6 +81,19 @@ const (
 	EventFailed = "ingest.failed"
 )
 
+// Lane reasons (ingest.done "lane_reason"): why the note's lane is what it
+// is. reader = the Reader's own local classification; path_glob = a source
+// file path a secret_lane_globs entry covers (memlane.ReasonPathGlob);
+// forced = --secret or a deterministic hit in the user's own label;
+// note_content = a cloud-read answer whose rendered note tripped the
+// deterministic pre-pass (stored secret-lane, read by the cloud).
+const (
+	LaneReasonReader      = "reader"
+	LaneReasonPathGlob    = memlane.ReasonPathGlob
+	LaneReasonForced      = "forced"
+	LaneReasonNoteContent = "note_content"
+)
+
 // Failure reasons (ingest.failed "reason", Error.Reason).
 const (
 	ReasonBinary            = "binary"
@@ -112,6 +129,7 @@ const (
 	MsgIngestInProgress        = "ingest: şu anda bir hafıza çıkarımı çalışıyor; birazdan tekrar dene."
 	MsgIngestBadLaneHint       = "ingest: şerit ipucu yalnız boş ya da \"secret\" olabilir (normal şerit zorlanamaz)"
 	MsgIngestBadLabelFmt       = "ingest: %s geçersiz (en fazla %d karakter, tek satır, kontrol karakteri yok)"
+	MsgIngestBadSourcePathFmt  = "ingest: kaynak dosya yolu geçersiz (en fazla %d mutlak yol, her biri en fazla %d bayt, tek satır)"
 	MsgIngestFailedFmt         = "ingest: belge alınamadı: %s"
 )
 
@@ -119,7 +137,10 @@ const (
 const (
 	MaxSourceRefRunes = 500
 	MaxTitleRunes     = 200
-	maxSlugRunes      = 60
+	// MaxSourcePaths / MaxSourcePathBytes bound Request.SourcePaths.
+	MaxSourcePaths     = 4
+	MaxSourcePathBytes = 4096
+	maxSlugRunes       = 60
 	// NoteDir is the ingest notes' directory under the lane root.
 	NoteDir = "ingest"
 	// LaneHintSecret is the only lane hint a request may carry.
@@ -196,6 +217,15 @@ type Request struct {
 	Content []byte
 	// SourceRef is a file path, URL or free label (<= 500 runes, one line).
 	SourceRef string
+	// SourcePaths are the absolute local paths the document was read from
+	// (`kahya ingest <dosya>` sends the path as given and its
+	// symlink-resolved form, even when --source relabels it; none for
+	// stdin). Each one - and SourceRef when it is an absolute path - is
+	// matched against policy.yaml's secret_lane_globs BEFORE the Reader
+	// runs: a covered path forces the local lane (HANDOFF §4 ordering, G00
+	// H-7: the path glob comes first). Only ever more restrictive; never
+	// written to the note.
+	SourcePaths []string
 	// Title overrides the Reader's title (<= 200 runes, one line).
 	Title string
 	// LaneHint "" or "secret": the user may force the local lane, never the
@@ -274,10 +304,21 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 		return fail(ingestError(ReasonDuplicate, fmt.Sprintf(MsgIngestDuplicateFmt, file), nil), map[string]any{"file": file})
 	}
 
-	// Step 3: the lane. The user's own labels are classified too - a
-	// deterministic secret hit there keeps the document local.
-	forceSecret := req.LaneHint == LaneHintSecret ||
-		secretlane.ClassifyDeterministic(req.Title+"\n"+req.SourceRef).SecretLane
+	// Step 3: the lane. First the Go-enforced path rule: a source file a
+	// secret_lane_globs entry covers is secret-lane by its path alone (as
+	// fs_read and the extractor treat it), whatever a model says about its
+	// content. Then --secret, and the user's own labels - a deterministic
+	// secret hit there keeps the document local too.
+	laneReason := LaneReasonReader
+	forceSecret := true
+	switch {
+	case r.sourcePathIsSecret(req):
+		laneReason = LaneReasonPathGlob
+	case req.LaneHint == LaneHintSecret, secretlane.ClassifyDeterministic(req.Title + "\n" + req.SourceRef).SecretLane:
+		laneReason = LaneReasonForced
+	default:
+		forceSecret = false
+	}
 	out, lane, err := r.Reader.RunDocIngest(ctx, req.Content, traceID, forceSecret)
 	switch {
 	case errors.Is(err, reader.ErrLocalUnavailable):
@@ -296,12 +337,8 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	// Step 4: the note, from validated fields only.
 	title := firstNonEmpty(req.Title, out.Title, labelTitle(req.SourceRef), "Belge")
 	body := renderNoteBody(title, out)
-	laneReason := "reader"
-	if forceSecret {
-		laneReason = "forced"
-	}
 	if lane == router.LaneNormal && secretlane.ClassifyDeterministic(body).SecretLane {
-		lane, laneReason = router.LaneSecret, "note_content"
+		lane, laneReason = router.LaneSecret, LaneReasonNoteContent
 	}
 
 	// Step 5: the external_doc note.
@@ -391,7 +428,58 @@ func (r *Runner) checkInput(req *Request) *Error {
 	if req.Title, ok = cleanLabel(req.Title, MaxTitleRunes); !ok {
 		return ingestError(ReasonBadRequest, fmt.Sprintf(MsgIngestBadLabelFmt, "başlık", MaxTitleRunes), nil)
 	}
+	if !validSourcePaths(req.SourcePaths) {
+		return ingestError(ReasonBadRequest, fmt.Sprintf(MsgIngestBadSourcePathFmt, MaxSourcePaths, MaxSourcePathBytes), nil)
+	}
 	return nil
+}
+
+// validSourcePaths: at most MaxSourcePaths absolute, clean-enough paths
+// (valid UTF-8, <= MaxSourcePathBytes, no control character). A path that
+// cannot be matched against the absolute secret_lane_globs is refused
+// rather than skipped - skipping it would skip the path rule.
+func validSourcePaths(paths []string) bool {
+	if len(paths) > MaxSourcePaths {
+		return false
+	}
+	for _, p := range paths {
+		if p == "" || len(p) > MaxSourcePathBytes || !utf8.ValidString(p) || !filepath.IsAbs(p) {
+			return false
+		}
+		for _, c := range p {
+			if unicode.IsControl(c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sourcePathIsSecret reports whether the document's source file is
+// secret-lane by its PATH: any of req.SourcePaths, or req.SourceRef when it
+// is an absolute path (a client that put the file path only there), or
+// the symlink-resolved form of either, that a secret_lane_globs entry
+// covers under memlane's rule (byte-exact OR case/normalisation-folded; a
+// glob error or a missing matcher = secret). Cleaning and resolving are
+// best-effort and only ADD candidates: the path as given is always matched
+// too.
+func (r *Runner) sourcePathIsSecret(req Request) bool {
+	candidates := append([]string{}, req.SourcePaths...)
+	if filepath.IsAbs(req.SourceRef) {
+		candidates = append(candidates, req.SourceRef)
+	}
+	for _, p := range candidates {
+		forms := []string{p, filepath.Clean(p)}
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			forms = append(forms, resolved)
+		}
+		for _, f := range forms {
+			if r.Lane.AbsPathIsSecret(f) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // cleanLabel trims and canonicalizes a one-line user label; false for a

@@ -22,6 +22,7 @@ import (
 	"kahya/kahyad/internal/store"
 	"kahya/kahyad/internal/taint"
 	"kahya/kahyad/internal/task"
+	"kahya/mcp/memory"
 )
 
 const ingestRouteDoc = "Zeynep Ankara ofisinde proje yöneticisi olarak başladı.\n"
@@ -172,4 +173,57 @@ func TestIngestRouteNotAnMCPTool(t *testing.T) {
 	if *cloudCalls != 0 || countEventsOfKind(t, f.store, ingest.EventDone) != 0 {
 		t.Fatal("a worker's ingest ran")
 	}
+}
+
+// TestIngestRouteSourcePathSecretGlobStaysLocal (FIX-MEM-6 review; HANDOFF
+// §4 ordering, G00 H-7): POST /v1/ingest's source_paths reach the runner -
+// a document read from a path secret_lane_globs covers is read by the local
+// model only and lands under gizli/ingest/, though the classifier calls it
+// normal and the label is a free one. A relative source path is a 400.
+func TestIngestRouteSourcePathSecretGlobStaysLocal(t *testing.T) {
+	cloudCalls, localCalls := new(int), new(int)
+	f := newMCPTestFixtureWith(t, testPolicyDoc(), func(srv *Server, st *store.Store) {
+		globs := []string{filepath.Join(srv.mcpMemoryDir, "gizli", "**"), "/Users/x/Documents/kimlik/**"}
+		srv.SetMCPMemorySecretLane(memory.SecretLaneSeam{Dir: "gizli", Globs: globs, Matcher: ritual.PolicyGlobMatcher{}})
+		classifier := secretlane.NewClassifier(secretlane.QwenClassifierFunc(func(ctx context.Context, text string) (secretlane.Verdict, error) {
+			return secretlane.Verdict{SecretLane: false, Category: secretlane.CategoryNone, Reason: "qwen"}, nil
+		}))
+		local := ingestLocalModel(func(ctx context.Context, systemPrompt, raw string) (string, error) {
+			*localCalls++
+			return ingestRouteAnswer, nil
+		})
+		cloud := reader.CloudModelFunc(func(ctx context.Context, jobType string, raw []byte, traceID string) (string, error) {
+			*cloudCalls++
+			return ingestRouteAnswer, nil
+		})
+		lane := memlane.Classifier{Store: st.Queries, MemoryDir: srv.mcpMemoryDir, SecretGlobs: globs, Matcher: ritual.PolicyGlobMatcher{}}
+		srv.SetIngester(&ingest.Runner{
+			Reader:  reader.NewRunner(classifier, local, cloud, nil, st),
+			Memory:  srv.MemoryNoteWriter(),
+			Extract: &extract.Runner{Store: st.Queries, Engine: factengine.New(st.Queries, taint.New(st.Queries, st), st), Lane: lane, Ledger: st},
+			Lane:    lane, Store: st.Queries, Ledger: st,
+			Cfg: ingest.Config{MaxBytes: 1 << 20, Location: time.UTC},
+		})
+	})
+	body := func(paths ...string) string {
+		b, _ := json.Marshal(map[string]any{"content_b64": base64.StdEncoding.EncodeToString([]byte(ingestRouteDoc)), "source_ref": "not", "source_paths": paths})
+		return string(b)
+	}
+	status, res := postIngest(t, f.client, body("/Users/x/Documents/kimlik/zeynep.txt"))
+	if status != http.StatusOK || res["lane"] != "secret" || !strings.HasPrefix(res["file"].(string), "gizli/ingest/") || *cloudCalls != 0 || *localCalls != 1 {
+		t.Fatalf("ingest = %d %v (cloud %d, local %d)", status, res, *cloudCalls, *localCalls)
+	}
+	if status, res := postIngest(t, f.client, body("Documents/kimlik/zeynep.txt")); status != http.StatusBadRequest || res["reason"] != ingest.ReasonBadRequest {
+		t.Fatalf("relative source path = %d %v", status, res)
+	}
+	if *cloudCalls != 0 {
+		t.Fatal("a secret-path document reached the cloud")
+	}
+}
+
+// ingestLocalModel adapts a func to reader.LocalModel.
+type ingestLocalModel func(ctx context.Context, systemPrompt, raw string) (string, error)
+
+func (l ingestLocalModel) Read(ctx context.Context, systemPrompt, raw string) (string, error) {
+	return l(ctx, systemPrompt, raw)
 }
