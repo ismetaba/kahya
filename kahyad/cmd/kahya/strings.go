@@ -18,6 +18,16 @@ const (
 	// Exit code 2.
 	MsgEmptyQuestion = "Soru boş olamaz."
 
+	// MsgUsage is the top-level help, printed for `kahya -h|-help|--help`
+	// (exit 2, nothing dialed): a help flag is never a one-shot question
+	// (FIX-FINAL cli-help-flags-become-cloud-questions).
+	MsgUsage = "kullanım: kahya [soru...] | kahya ask [--derin] <soru...> | kahya <alt komut>\n" +
+		"alt komutlar: log, health, reindex, autonomy, undo, approvals, debug, approve, task, ledger, ask, job, consolidation, fact, entity, memory, ingest, remembered, eval, metrics, readiness, halt"
+
+	// MsgHealthUsage is printed (exit 2, nothing dialed) when `kahya
+	// health` is given any argument (e.g. -h).
+	MsgHealthUsage = "kullanım: kahya health"
+
 	// MsgAudioAndTextMutuallyExclusive is printed when `kahya ask --audio
 	// <path>` is combined with trailing typed question text (W6-02) -
 	// rejected locally, before any dial, since the audio IS the prompt in

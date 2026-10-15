@@ -1,7 +1,9 @@
 // kahya is the Kâhya CLI (W12-06): the primary interaction surface for
 // W1-5 (HANDOFF §4 UI). No args starts a REPL; a first argument that isn't
-// a known subcommand is treated as a one-shot question; "log", "health",
-// and "reindex" are subcommands. Everything talks to kahyad over the UDS
+// a known subcommand is treated as a one-shot question - except the help
+// flags -h/-help/--help, which print the Turkish top-level usage instead
+// of becoming a (cloud) question; "log", "health", and "reindex" are
+// subcommands. Everything talks to kahyad over the UDS
 // control socket (client.go); every user-facing string lives in
 // strings.go, in Turkish, per HANDOFF §3's language policy.
 package main
@@ -36,6 +38,15 @@ func main() {
 // in-memory buffers and a fake UDS server instead of the real process
 // streams/socket.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// A help flag is never a question: before this check `kahya -h` was
+	// sent to the cloud model as the prompt "-h". Checked before
+	// resolveSocket so help works with no config/socket at all. Only the
+	// exact help flags are intercepted - a real question may start with
+	// "-" ("-5 derece ne demek").
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprintln(stderr, MsgUsage)
+		return 2
+	}
 	sock, err := resolveSocket()
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -51,7 +62,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "log":
 		return runLog(client, args[1:], stdout, stderr)
 	case "health":
-		return runHealth(client, stdout, stderr)
+		return runHealth(client, args[1:], stdout, stderr)
 	case "reindex":
 		return runReindex(client, args[1:], stdout, stderr)
 	case "autonomy":
@@ -95,6 +106,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	default:
 		return runOneShot(client, args, stdout, stderr)
 	}
+}
+
+// isHelpArg reports whether s is one of the flag package's help flags.
+// Argument-only subcommands (approve, task show, job run, health) check it
+// themselves so `-h` prints their usage instead of being sent to kahyad as
+// an id/name (FIX-FINAL cli-help-flags-become-cloud-questions).
+func isHelpArg(s string) bool {
+	return s == "-h" || s == "-help" || s == "--help"
 }
 
 // runOneShot handles `kahya <question...>` (W12-06 step 2). The prompt is
@@ -291,7 +310,11 @@ func runREPL(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // runHealth implements `kahya health` (W12-06 step 5): GET /health, print
 // the Turkish health line, nonzero exit if unreachable or degraded.
-func runHealth(client *Client, stdout, stderr io.Writer) int {
+func runHealth(client *Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, MsgHealthUsage)
+		return 2
+	}
 	hr, err := client.Health(context.Background(), traceid.New())
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
@@ -334,7 +357,7 @@ func runReindex(client *Client, args []string, stdout, stderr io.Writer) int {
 // run morning-briefing` can therefore never behave differently than the
 // 08:30 scheduled run.
 func runJob(client *Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "run" || strings.TrimSpace(args[1]) == "" {
+	if len(args) != 2 || args[0] != "run" || strings.TrimSpace(args[1]) == "" || isHelpArg(args[1]) {
 		fmt.Fprintln(stderr, MsgJobUsage)
 		return 2
 	}
@@ -1877,7 +1900,7 @@ func runDebugEmitApproval(client *Client, args []string, stdout, stderr io.Write
 // kind="deny" (demoting the ladder, per W3-02), never silently doing
 // nothing.
 func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) != 1 {
+	if len(args) != 1 || isHelpArg(args[0]) {
 		fmt.Fprintln(stderr, MsgApproveUsage)
 		return 2
 	}
@@ -1956,7 +1979,7 @@ func runTask(client *Client, args []string, stdout, stderr io.Writer) int {
 // printed as status/session_id/live-worker-PID/attempts/tool_calls - the
 // W4-07 gate script kills the worker via this exact PID.
 func runTaskShow(client *Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) != 1 {
+	if len(args) != 1 || isHelpArg(args[0]) {
 		fmt.Fprintln(stderr, MsgTaskShowUsage)
 		return 2
 	}

@@ -222,3 +222,69 @@ func TestServerErrorFrameLeavesUnreachableErrorAlone(t *testing.T) {
 		})
 	}
 }
+
+// TestHelpFlagsNeverDialOrBecomeQuestions (FIX-FINAL cli-help-flags-
+// become-cloud-questions): `kahya -h|--help|-help` printed no help - it
+// POSTed /v1/task with the flag as a (cloud) prompt - and the argument-
+// only subcommands sent "-h" to kahyad as an id/name. Every case must
+// now exit 2 locally with its Turkish usage text and send no request.
+func TestHelpFlagsNeverDialOrBecomeQuestions(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-h"}, MsgUsage},
+		{[]string{"--help"}, MsgUsage},
+		{[]string{"-help"}, MsgUsage},
+		{[]string{"approve", "-h"}, MsgApproveUsage},
+		{[]string{"health", "-h"}, MsgHealthUsage},
+		{[]string{"task", "show", "-h"}, MsgTaskShowUsage},
+		{[]string{"job", "run", "-h"}, MsgJobUsage},
+	}
+	for _, tc := range cases {
+		var requests int
+		sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			t.Errorf("kahya %v: unexpected request %s %s", tc.args, r.Method, r.URL.RequestURI())
+		}))
+		t.Setenv("KAHYA_SOCKET", sock)
+		var stdout, stderr bytes.Buffer
+		code := run(tc.args, strings.NewReader(""), &stdout, &stderr)
+		if code != 2 {
+			t.Errorf("kahya %v: exit = %d, want 2", tc.args, code)
+		}
+		if !strings.Contains(stderr.String(), tc.want) {
+			t.Errorf("kahya %v: stderr = %q, want usage %q", tc.args, stderr.String(), tc.want)
+		}
+		if strings.Contains(stderr.String(), "kahyad'a ulaşılamıyor") {
+			t.Errorf("kahya %v: printed the daemon-unreachable error instead of usage", tc.args)
+		}
+		if requests != 0 {
+			t.Errorf("kahya %v: sent %d requests, want 0", tc.args, requests)
+		}
+	}
+}
+
+// TestDashPrefixedQuestionStillOneShot: only the exact help flags are
+// intercepted - a real question that starts with "-" is still a one-shot
+// task prompt.
+func TestDashPrefixedQuestionStillOneShot(t *testing.T) {
+	var gotPrompt string
+	sock := startFakeServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/task" {
+			t.Errorf("path = %q, want /v1/task", r.URL.Path)
+			return
+		}
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		gotPrompt, _ = body["prompt"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: result\ndata: {\"status\":\"ok\"}\n\n")
+	}))
+	t.Setenv("KAHYA_SOCKET", sock)
+	var stdout, stderr bytes.Buffer
+	run([]string{"-5 derece ne demek"}, strings.NewReader(""), &stdout, &stderr)
+	if gotPrompt != "-5 derece ne demek" {
+		t.Errorf("prompt = %q, want the dash-prefixed question sent as-is", gotPrompt)
+	}
+}
