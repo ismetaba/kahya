@@ -73,6 +73,7 @@ type EntityAlias struct {
 	Alias       string         `json:"alias"`
 	CreatedAt   string         `json:"created_at"`
 	AliasFolded sql.NullString `json:"alias_folded"`
+	CloudLane   int64          `json:"cloud_lane"`
 }
 
 type Episode struct {
@@ -123,25 +124,27 @@ type Evidence struct {
 }
 
 type Fact struct {
-	ID              int64          `json:"id"`
-	Subject         string         `json:"subject"`
-	Predicate       string         `json:"predicate"`
-	Object          string         `json:"object"`
-	SourceTier      string         `json:"source_tier"`
-	Evidentiality   string         `json:"evidentiality"`
-	Confidence      float64        `json:"confidence"`
-	Importance      float64        `json:"importance"`
-	ValidFrom       sql.NullString `json:"valid_from"`
-	ValidTo         sql.NullString `json:"valid_to"`
-	Status          string         `json:"status"`
-	Evidence        sql.NullString `json:"evidence"`
-	ExtractorVer    sql.NullString `json:"extractor_ver"`
-	UpdatedAt       string         `json:"updated_at"`
-	CreatedAt       string         `json:"created_at"`
-	ConfirmedAt     sql.NullString `json:"confirmed_at"`
-	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
-	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
-	Quote           sql.NullString `json:"quote"`
+	ID               int64          `json:"id"`
+	Subject          string         `json:"subject"`
+	Predicate        string         `json:"predicate"`
+	Object           string         `json:"object"`
+	SourceTier       string         `json:"source_tier"`
+	Evidentiality    string         `json:"evidentiality"`
+	Confidence       float64        `json:"confidence"`
+	Importance       float64        `json:"importance"`
+	ValidFrom        sql.NullString `json:"valid_from"`
+	ValidTo          sql.NullString `json:"valid_to"`
+	Status           string         `json:"status"`
+	Evidence         sql.NullString `json:"evidence"`
+	ExtractorVer     sql.NullString `json:"extractor_ver"`
+	UpdatedAt        string         `json:"updated_at"`
+	CreatedAt        string         `json:"created_at"`
+	ConfirmedAt      sql.NullString `json:"confirmed_at"`
+	SubjectEntityID  sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID   sql.NullInt64  `json:"object_entity_id"`
+	Quote            sql.NullString `json:"quote"`
+	SubjectLinkCloud int64          `json:"subject_link_cloud"`
+	ObjectLinkCloud  int64          `json:"object_link_cloud"`
 }
 
 type LedgerChainBase struct {

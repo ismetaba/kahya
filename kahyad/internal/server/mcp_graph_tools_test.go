@@ -153,7 +153,7 @@ func TestGraphToolsFilterEvenWhenTaskLaneIsSecret(t *testing.T) {
 	seedAutonomyState(t, f.store, "fact_query", "R", "global", 1)
 	seedAutonomyState(t, f.store, "entity_lookup", "R", "global", 1)
 	emre, visible, _ := emreWithSecretFact(t, f)
-	if _, err := f.fe.AddAlias(t.Context(), "tr", emre, "Patron"); err != nil {
+	if _, err := f.fe.AddAlias(t.Context(), "tr", emre, "Patron", false); err != nil {
 		t.Fatalf("AddAlias: %v", err)
 	}
 	insertLaneTask(t, f.store, "task-secret", "tr-secret", "secret")
@@ -316,5 +316,110 @@ func TestFactQueryRouteRejectsBadParams(t *testing.T) {
 	nog := newMCPTestFixture(t)
 	if status, _, _ := getFactQuery(t, nog, "predicate=works_at"); status != http.StatusServiceUnavailable {
 		t.Fatalf("no graph wired: status %d, want 503", status)
+	}
+}
+
+// TestWorkerGraphReadsNeverPairNamesThroughASecretNoteAlias (FIX-MEM-1/MEM-4
+// review): the worker-facing paths - /v1/mcp entity_lookup, fact_query and
+// memory_search entity_id (through the policy gate) and the cloud
+// for_injection <hafiza> block - never tie "Doktor" to "Ayşe Kaya" when
+// only a secret-path note (finans-doktor.md, extracted locally) says they
+// are the same person. The extraction steps are the lane-aware factengine
+// calls kahyad/internal/extract makes (its own end-to-end test drives the
+// real runner).
+func TestWorkerGraphReadsNeverPairNamesThroughASecretNoteAlias(t *testing.T) {
+	f := newGraphFixture(t)
+	ctx := t.Context()
+	for _, tool := range []string{"entity_lookup", "fact_query", "memory_search"} {
+		seedAutonomyState(t, f.store, tool, "R", "global", 1)
+	}
+	secretEp := f.note(t, "finans-doktor.md", "Doktorum Ayşe Kaya, muayene ücreti 2000 TL.\n")
+	coffeeEp := f.note(t, "inbox/2026-07-10.md", "Doktor ile kahve içtim.\n")
+	peopleEp := f.note(t, "people/ayse.md", "Ayşe Kaya Kadıköy'de yaşıyor.\n")
+	resolve := func(name, kind string, cloud bool) int64 {
+		t.Helper()
+		id, _, _, err := f.fe.ResolveEntityForExtraction(ctx, "tr-x", name, kind, cloud)
+		if err != nil {
+			t.Fatalf("ResolveEntityForExtraction(%s): %v", name, err)
+		}
+		return id
+	}
+	write := func(c factengine.Candidate) int64 {
+		t.Helper()
+		c.Provenance, c.ExtractorVer = factengine.ProvenanceExternalDoc, "fact_extract_v1"
+		id, err := f.fe.WriteFact(ctx, "tr-x", c)
+		if err != nil {
+			t.Fatalf("WriteFact: %v", err)
+		}
+		return id
+	}
+	// Local-lane extraction of the secret note.
+	secretAyse := resolve("Ayşe Kaya", factengine.EntityKindPerson, false)
+	if _, err := f.fe.AddAlias(ctx, "tr-x", secretAyse, "Doktor", false); err != nil {
+		t.Fatal(err)
+	}
+	write(factengine.Candidate{Subject: "Ayşe Kaya", Predicate: "is", Object: "doktorum", EpisodeID: secretEp, SubjectEntityID: secretAyse})
+	// Cloud-lane extraction of the two ordinary notes.
+	doktor := resolve("Doktor", factengine.EntityKindPerson, true)
+	user := resolve("Kullanıcı", factengine.EntityKindPerson, true)
+	coffee := write(factengine.Candidate{Subject: "Kullanıcı", Predicate: "had_coffee_with", Object: "Doktor", EpisodeID: coffeeEp,
+		SubjectEntityID: user, ObjectEntityID: doktor, LinksCloudLane: true})
+	cloudAyse := resolve("Ayşe Kaya", factengine.EntityKindPerson, true)
+	livesIn := write(factengine.Candidate{Subject: "Ayşe Kaya", Predicate: "lives_in", Object: "Kadıköy", EpisodeID: peopleEp,
+		SubjectEntityID: cloudAyse, LinksCloudLane: true})
+	if doktor == secretAyse || cloudAyse == secretAyse || cloudAyse == doktor {
+		t.Fatalf("cloud-lane resolution reused the secret note's entity: doktor=%d cloudAyse=%d secret=%d", doktor, cloudAyse, secretAyse)
+	}
+
+	r := callTool(t, f.mcpTestFixture, "entity_lookup", map[string]any{"name": "doktor"}, "tr-el", "")
+	if r.Result.IsError || strings.Contains(string(r.Result.StructuredContent), "Ayşe") || !strings.Contains(string(r.Result.StructuredContent), `"canonical_name":"Doktor"`) {
+		t.Fatalf("worker entity_lookup(doktor) = %s, want the coffee note's Doktor and no Ayşe Kaya", r.Result.StructuredContent)
+	}
+	r = callTool(t, f.mcpTestFixture, "entity_lookup", map[string]any{"name": "ayşe"}, "tr-el", "")
+	if r.Result.IsError || strings.Contains(string(r.Result.StructuredContent), "Doktor") {
+		t.Fatalf("worker entity_lookup(ayşe) = %s, want no Doktor", r.Result.StructuredContent)
+	}
+
+	r = callTool(t, f.mcpTestFixture, "fact_query", map[string]any{"include_quarantined": true}, "tr-fq", "")
+	var fq memory.FactQueryOutput
+	if r.Result.IsError || json.Unmarshal(r.Result.StructuredContent, &fq) != nil {
+		t.Fatalf("worker fact_query = %+v", r.Result)
+	}
+	ents := map[int64][]int64{}
+	for _, it := range fq.Facts {
+		ents[it.FactID] = []int64{it.SubjectEntityID, it.ObjectEntityID}
+	}
+	for _, a := range ents[coffee] {
+		for _, b := range ents[livesIn] {
+			if a != 0 && a == b {
+				t.Fatalf("worker fact_query: coffee %v and lives_in %v share entity %d", ents[coffee], ents[livesIn], a)
+			}
+		}
+	}
+
+	for _, ent := range []int64{secretAyse, cloudAyse, doktor} {
+		r = callTool(t, f.mcpTestFixture, "memory_search", map[string]any{"query": "Doktor Ayşe kahve Kadıköy", "entity_id": ent}, "tr-ms", "")
+		var ms memory.MemorySearchOutput
+		if r.Result.IsError || json.Unmarshal(r.Result.StructuredContent, &ms) != nil {
+			t.Fatalf("worker memory_search entity %d = %+v", ent, r.Result)
+		}
+		paths := map[string]bool{}
+		for _, res := range ms.Results {
+			paths[res.Path] = true
+		}
+		if paths["inbox/2026-07-10.md"] && paths["people/ayse.md"] {
+			t.Fatalf("worker memory_search entity_id=%d returned both notes %v: the entity filter paired them", ent, paths)
+		}
+		if ent == secretAyse && len(paths) != 0 {
+			t.Fatalf("worker memory_search entity_id=%d (the secret note's entity, local-lane links only) = %v, want nothing", ent, paths)
+		}
+		if ent == cloudAyse && !paths["people/ayse.md"] {
+			t.Fatalf("worker memory_search entity_id=%d = %v, want its own cloud-linked note", ent, paths)
+		}
+	}
+
+	body := postInjection(t, f.client, `{"query":"dün kahve içtim","for_injection":true,"task_id":"t-pair"}`)
+	if !strings.Contains(body.HafizaBlock, "had_coffee_with") || strings.Contains(body.HafizaBlock, "lives_in") || strings.Contains(body.HafizaBlock, "doktorum") {
+		t.Fatalf("cloud hafiza_block pairs the names:\n%s", body.HafizaBlock)
 	}
 }

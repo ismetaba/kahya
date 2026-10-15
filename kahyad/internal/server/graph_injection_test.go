@@ -70,22 +70,25 @@ func (f graphFixture) note(t *testing.T, relPath, body string) int64 {
 	return ep
 }
 
+// entity creates (or reuses) an entity as a CLOUD-lane extraction call does
+// (its first alias in the cloud view, migration 0025).
 func (f graphFixture) entity(t *testing.T, name, kind string) int64 {
 	t.Helper()
-	id, _, err := f.fe.ResolveOrCreateEntity(context.Background(), name, kind)
+	id, _, _, err := f.fe.ResolveEntityForExtraction(context.Background(), "tr-seed", name, kind, true)
 	if err != nil {
-		t.Fatalf("ResolveOrCreateEntity(%s): %v", name, err)
+		t.Fatalf("ResolveEntityForExtraction(%s): %v", name, err)
 	}
 	return id
 }
 
-// fact writes an external_doc (injection-eligible) fact citing episode ep.
+// fact writes an external_doc (injection-eligible) fact citing episode ep,
+// linked by a cloud-lane call (LinksCloudLane).
 func (f graphFixture) fact(t *testing.T, subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
 	t.Helper()
 	id, err := f.fe.WriteFact(context.Background(), "tr-seed", factengine.Candidate{
 		Subject: subj, Predicate: pred, Object: obj, Provenance: factengine.ProvenanceExternalDoc,
 		EpisodeID: ep, SubjectEntityID: subjID, ObjectEntityID: objID, ExtractorVer: "test_v1",
-		ValidFrom: "2026-05-01T00:00:00Z",
+		ValidFrom: "2026-05-01T00:00:00Z", LinksCloudLane: true,
 	})
 	if err != nil {
 		t.Fatalf("WriteFact: %v", err)

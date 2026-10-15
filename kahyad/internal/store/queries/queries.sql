@@ -974,9 +974,12 @@ UPDATE episodes SET cooled_at = ? WHERE id = ?;
 -- G13 (0024): subject_entity_id/object_entity_id/quote are written at
 -- insert time too (NULL for every non-extractor call site); confirmed_at
 -- stays out of the INSERT list - it is never set at insert time.
-INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote;
+-- 0025: subject_link_cloud/object_link_cloud are 1 only for a side whose
+-- link a cloud-lane extraction call wrote (factengine.Candidate.
+-- LinksCloudLane), 0 otherwise.
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud;
 
 -- W5-04 (memory-correctness-engine) queries below: the single fact-write
 -- path (kahyad/internal/factengine) is the ONLY caller of InsertFact
@@ -987,7 +990,7 @@ RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence
 -- name: GetFact :one
 -- Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
 -- engine's own recompute-from-evidence path.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE id = ?;
 
@@ -1001,7 +1004,7 @@ WHERE id = ?;
 -- than reviving the closed one in place - the retracted row stays exactly
 -- as HANDOFF S5 memory #3 requires (closed, never deleted, never
 -- reopened).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -1093,14 +1096,16 @@ SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ?;
 -- name: InsertEntityAlias :one
 -- alias_folded (0024) is factengine.AliasKey(alias), the Turkish
 -- I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
-INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded)
-VALUES (?, ?, ?, ?)
-RETURNING id, entity_id, alias, created_at, alias_folded;
+-- cloud_lane (0025) is 1 only for an alias a cloud-lane extraction call
+-- added (the cloud view - see ListActiveCloudEntityIDsByAliasFolded).
+INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded, cloud_lane)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, entity_id, alias, created_at, alias_folded, cloud_lane;
 
 -- name: ListEntityAliasesByEntity :many
 -- Snapshotted into merge_ledger.evidence BEFORE a merge reassigns them,
 -- so Split can restore exactly this set back onto the losing entity.
-SELECT id, entity_id, alias, created_at, alias_folded
+SELECT id, entity_id, alias, created_at, alias_folded, cloud_lane
 FROM entity_aliases
 WHERE entity_id = ?
 ORDER BY id ASC;
@@ -1139,7 +1144,7 @@ WHERE id = ?;
 -- unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
 -- exclusion/priority policy entirely in Go, never in SQL, so the policy
 -- stays readable/testable as plain code, not buried in a query).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC;
@@ -1234,8 +1239,14 @@ ORDER BY el.answered_at DESC, el.id DESC;
 -- re-assertion) to entity rows / a quote / a validity window when the
 -- earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
 -- the first link wins).
+-- 0025: a side's link-lane flag is written in the same statement as the
+-- link it describes - only while that side is still unlinked (every SET
+-- expression reads the OLD row) - so a link and its flag never disagree;
+-- the caller passes 1 only for a side it links from a cloud-lane call.
 UPDATE facts
-SET subject_entity_id = COALESCE(subject_entity_id, ?),
+SET subject_link_cloud = CASE WHEN subject_entity_id IS NULL THEN ? ELSE subject_link_cloud END,
+    object_link_cloud  = CASE WHEN object_entity_id IS NULL THEN ? ELSE object_link_cloud END,
+    subject_entity_id = COALESCE(subject_entity_id, ?),
     object_entity_id  = COALESCE(object_entity_id, ?),
     quote             = COALESCE(quote, ?),
     valid_from        = COALESCE(valid_from, ?),
@@ -1269,8 +1280,41 @@ FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
 WHERE a.alias_folded = ? AND e.status = 'active'
 ORDER BY a.entity_id ASC;
 
+-- name: ListActiveCloudEntityIDsByAliasFolded :many
+-- The CLOUD VIEW of ListActiveEntityIDsByAliasFolded (0025): only aliases a
+-- cloud-lane extraction call added. A cloud-lane entity resolution, a
+-- cloud-lane alias-collision check and every cloud-lane graph read resolve
+-- a name through these rows alone, so an alias a secret-lane note gave an
+-- entity never decides what a cloud model is shown.
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND a.cloud_lane = 1 AND e.status = 'active'
+ORDER BY a.entity_id ASC;
+
+-- name: ListActiveLocalEntityIDsByAliasFolded :many
+-- The aliases a LOCAL-lane call added (0025). A local-lane resolution
+-- prefers the entities named this way: once a cloud-lane call has created
+-- its own twin of a name only a local note gave an entity (it cannot see
+-- local-lane aliases), the local lane keeps resolving the name to the
+-- entity it named, instead of seeing two candidates and minting a new
+-- provisional one on every later sighting.
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND a.cloud_lane = 0 AND e.status = 'active'
+ORDER BY a.entity_id ASC;
+
+-- name: ListCloudEntityIDsByAlias :many
+-- The cloud view of ListEntityIDsByAlias (byte-exact alias, cloud-lane
+-- rows only).
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ? AND cloud_lane = 1;
+
+-- name: MarkEntityAliasCloud :exec
+-- A cloud-lane call states an alias a local-lane call added first: the
+-- alias is now in the cloud view too (0025). Never set back to 0.
+UPDATE entity_aliases SET cloud_lane = 1 WHERE id = ?;
+
 -- name: GetEntityAliasByEntityAndAlias :one
-SELECT id, entity_id, alias, created_at, alias_folded
+SELECT id, entity_id, alias, created_at, alias_folded, cloud_lane
 FROM entity_aliases
 WHERE entity_id = ? AND alias = ?
 ORDER BY id ASC
@@ -1280,16 +1324,28 @@ LIMIT 1;
 -- One graph hop: every active fact touching entity_id as subject OR object.
 -- Tier/confirmed/threshold eligibility is applied in Go
 -- (factengine.InjectionEligible) so the predicate lives in ONE place.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
+ORDER BY confidence DESC, updated_at DESC
+LIMIT ?;
+
+-- name: ListFactsByEntityCloudLinks :many
+-- The cloud-lane graph hop (0025): the active facts linked to the entity on
+-- a side a CLOUD-lane extraction call linked (subject_link_cloud /
+-- object_link_cloud). A link a local-lane call wrote - possibly through an
+-- alias only a secret note carries - is never followed for a cloud reader.
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+FROM facts
+WHERE status = 'active'
+  AND ((subject_entity_id = ? AND subject_link_cloud = 1) OR (object_entity_id = ? AND object_link_cloud = 1))
 ORDER BY confidence DESC, updated_at DESC
 LIMIT ?;
 
 -- name: ListFactsCitingEpisodes :many
 -- Facts whose evidence cites one of the chunk hits' episodes - the second
 -- graph seed source (MEM-1). sqlc.slice expands to an IN (...) list.
-SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id
+SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id, f.subject_link_cloud, f.object_link_cloud
 FROM evidence ev JOIN facts f ON f.id = ev.fact_id
 WHERE ev.episode_id IN (sqlc.slice('episode_ids')) AND f.status = 'active';
 
@@ -1339,7 +1395,7 @@ UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE status = 'ac
 -- name: ListQuarantinedFacts :many
 -- `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
 -- confirmed.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
 ORDER BY id DESC
@@ -1358,6 +1414,16 @@ WHERE ev.episode_id = ? AND f.status = 'active';
 SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
 FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
 WHERE a.alias_folded LIKE ? AND e.status = 'active'
+ORDER BY e.id ASC
+LIMIT ?;
+
+-- name: ListCloudEntitiesByFolded :many
+-- The cloud view of ListEntitiesByFolded (0025): the prefix matches only
+-- aliases a cloud-lane call added, so a cloud-lane entity_lookup's
+-- candidate set (and its LIMIT) never depends on secret-lane aliases.
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND a.cloud_lane = 1 AND e.status = 'active'
 ORDER BY e.id ASC
 LIMIT ?;
 

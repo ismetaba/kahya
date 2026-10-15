@@ -37,7 +37,10 @@
 // or validity window: the fact row it lands on can become cloud-eligible
 // through ANOTHER note's citation (memlane classifies the triple; the
 // row's quote travels with it), so only text a cloud-lane call was cleared
-// to send may sit on a row (FIX-MEM-3 review).
+// to send may sit on a row (FIX-MEM-3 review). Its entity links and aliases
+// do land, but local-only (migration 0025): they never decide a cloud-lane
+// call's entity resolution, and no cloud-lane read follows them (FIX-MEM-1/
+// MEM-4 review - which entity a name means can itself be secret).
 package extract
 
 import (
@@ -149,8 +152,8 @@ var _ ReaderRunner = (*reader.Runner)(nil)
 type FactEngine interface {
 	WriteFact(ctx context.Context, traceID string, c factengine.Candidate) (int64, error)
 	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error)
-	ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string) (entityID int64, created, provisional bool, err error)
-	AddAlias(ctx context.Context, traceID string, entityID int64, alias string) (bool, error)
+	ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string, cloudLane bool) (entityID int64, created, provisional bool, err error)
+	AddAlias(ctx context.Context, traceID string, entityID int64, alias string, cloudLane bool) (bool, error)
 }
 
 var _ FactEngine = (*factengine.Engine)(nil)
@@ -548,6 +551,13 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 // retraction), linking a fact's subject/object to an entity only when the
 // string is byte-equal to an entity name or alias in the SAME answer. A
 // local-lane answer (cloudLane false) writes no quote and no validity window.
+//
+// Entity identity is lane-scoped too (factengine package doc, migration
+// 0025): a cloud-lane answer resolves its names in the cloud view and its
+// aliases and links join it (Candidate.LinksCloudLane); a local-lane answer
+// resolves in the full view and everything it writes stays local-only, so
+// an alias a secret note gives an entity never ties an ordinary note's name
+// to that entity in anything a cloud model is shown.
 func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceEpisode int64, sessionID string, prov factengine.Provenance, cloudLane bool, out reader.FactExtractV1) (Stats, error) {
 	var st Stats
 	byName := map[string]int64{}
@@ -559,7 +569,7 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 		byName[s] = id
 	}
 	for _, e := range out.Entities {
-		id, created, _, err := r.Engine.ResolveEntityForExtraction(ctx, traceID, e.Name, e.Kind)
+		id, created, _, err := r.Engine.ResolveEntityForExtraction(ctx, traceID, e.Name, e.Kind, cloudLane)
 		if err != nil {
 			return st, fmt.Errorf("resolve entity %q: %w", e.Name, err)
 		}
@@ -568,7 +578,7 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 		}
 		link(e.Name, id)
 		for _, a := range e.Aliases {
-			if _, err := r.Engine.AddAlias(ctx, traceID, id, a); err != nil {
+			if _, err := r.Engine.AddAlias(ctx, traceID, id, a, cloudLane); err != nil {
 				return st, fmt.Errorf("alias %q of entity %d: %w", a, id, err)
 			}
 			link(a, id)
@@ -606,6 +616,7 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 			ValidTo:         cloudLaneOnly(cloudLane, f.ValidTo),
 			SubjectEntityID: entityFor(f.Subject),
 			ObjectEntityID:  entityFor(f.Object),
+			LinksCloudLane:  cloudLane,
 		}); err != nil {
 			return st, fmt.Errorf("write fact %q %q %q: %w", f.Subject, f.Predicate, f.Object, err)
 		}

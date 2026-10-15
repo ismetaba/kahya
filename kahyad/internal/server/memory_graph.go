@@ -98,7 +98,9 @@ func memorySearchFactItemFrom(f memory.FactLine) memorySearchFactItem {
 // WORKER - a cloud session by construction (a secret-lane task never spawns
 // one), exactly mcpSearchAdapter's FIX-U-3 rationale - so the lane is
 // ALWAYS the cloud lane: no secret-path fact, no fact without a resolvable
-// citation, no secret-derived alias or count ever comes back, whatever the
+// citation, no secret-derived alias, entity link (only cloud-lane identity,
+// migration 0025 - see kahyad/internal/graph's package doc) or count ever
+// comes back, whatever the
 // calling task's lane says (a task escalated to secret mid-run is refused
 // its model calls anyway). The local lane exists only for in-process local
 // callers (GET /v1/fact/query, MEM-7's secret-lane block).

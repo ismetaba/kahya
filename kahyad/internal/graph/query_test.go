@@ -258,10 +258,10 @@ func TestEntityLookupCloudLaneHidesSecretAliasesAndCounts(t *testing.T) {
 	secret := f.episode("finans-borc.md")
 	emre := f.entity("Dr. Emre", "person")
 	f.alias(emre, "Emre")
-	f.alias(emre, "Patron")
+	f.localAlias(emre, "Patron")
 	f.fact("Emre", emre, "works_at", "Acme", 0, normal)
-	f.fact("Patron", emre, "owes", "BankX", 0, secret)
-	f.fact("Dr. Emre", emre, "treats", "hasta", 0, secret)
+	f.localFact("Patron", emre, "owes", "BankX", 0, secret)
+	f.localFact("Dr. Emre", emre, "treats", "hasta", 0, secret)
 
 	if got := f.lookup("patron", true); len(got) != 0 {
 		t.Fatalf("cloud lookup by a secret-only alias = %+v, want nothing", got)

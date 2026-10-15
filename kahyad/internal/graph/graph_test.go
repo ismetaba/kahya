@@ -67,25 +67,37 @@ func (f *fixture) episode(relPath string) int64 {
 	return row.ID
 }
 
+// entity creates (or reuses) an entity the way a CLOUD-lane extraction call
+// does - its first alias in the cloud view (migration 0025).
 func (f *fixture) entity(name, kind string) int64 {
 	f.t.Helper()
-	id, _, err := f.fe.ResolveOrCreateEntity(context.Background(), name, kind)
+	id, _, _, err := f.fe.ResolveEntityForExtraction(context.Background(), "tr-test", name, kind, true)
 	if err != nil {
-		f.t.Fatalf("ResolveOrCreateEntity(%s): %v", name, err)
+		f.t.Fatalf("ResolveEntityForExtraction(%s): %v", name, err)
 	}
 	return id
 }
 
+// alias adds a cloud-lane alias (a cloud-lane extraction call's aliases[]).
 func (f *fixture) alias(entityID int64, alias string) {
 	f.t.Helper()
-	if _, err := f.fe.AddAlias(context.Background(), "tr-test", entityID, alias); err != nil {
+	if _, err := f.fe.AddAlias(context.Background(), "tr-test", entityID, alias, true); err != nil {
 		f.t.Fatalf("AddAlias(%d, %s): %v", entityID, alias, err)
+	}
+}
+
+// localAlias adds a local-only alias (a local-lane - e.g. secret-note -
+// extraction call's aliases[]).
+func (f *fixture) localAlias(entityID int64, alias string) {
+	f.t.Helper()
+	if _, err := f.fe.AddAlias(context.Background(), "tr-test", entityID, alias, false); err != nil {
+		f.t.Fatalf("AddAlias(%d, %s, local): %v", entityID, alias, err)
 	}
 }
 
 // fact writes an external_doc fact (p=0.8, injection-eligible, no session
 // needed) citing episode ep (0 = no episode citation), linked to the given
-// entity ids (0 = unlinked).
+// entity ids (0 = unlinked) by a cloud-lane call.
 func (f *fixture) fact(subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
 	f.t.Helper()
 	return f.factWith(factengine.Candidate{
@@ -95,7 +107,25 @@ func (f *fixture) fact(subj string, subjID int64, pred, obj string, objID, ep in
 	})
 }
 
+// localFact is fact written by a LOCAL-lane call: its links are
+// local-only.
+func (f *fixture) localFact(subj string, subjID int64, pred, obj string, objID, ep int64) int64 {
+	f.t.Helper()
+	return f.writeFact(factengine.Candidate{
+		Subject: subj, Predicate: pred, Object: obj,
+		Provenance: factengine.ProvenanceExternalDoc, EpisodeID: ep,
+		SubjectEntityID: subjID, ObjectEntityID: objID, ExtractorVer: "test_v1",
+	})
+}
+
+// factWith writes c as a cloud-lane call does (LinksCloudLane).
 func (f *fixture) factWith(c factengine.Candidate) int64 {
+	f.t.Helper()
+	c.LinksCloudLane = true
+	return f.writeFact(c)
+}
+
+func (f *fixture) writeFact(c factengine.Candidate) int64 {
 	f.t.Helper()
 	id, err := f.fe.WriteFact(context.Background(), "tr-test", c)
 	if err != nil {
@@ -355,9 +385,9 @@ func TestNeighbourhoodCloudLaneSecretAliasNeverSeeds(t *testing.T) {
 	normal := f.episode("people/emre.md")
 	secret := f.episode("finans-borc.md")
 	emre := f.entity("Emre", "person")
-	f.alias(emre, "Patron")
+	f.localAlias(emre, "Patron")
 	worksAt := f.fact("Emre", emre, "works_at", "Acme", 0, normal)
-	f.fact("Patron", emre, "owes", "Banka", 0, secret)
+	f.localFact("Patron", emre, "owes", "Banka", 0, secret)
 
 	if lines, ents := f.walk("Patron ne yaptı", nil, Options{CloudLane: true}); len(lines) != 0 || len(ents) != 0 {
 		t.Fatalf("cloud lane: a secret-only alias seeded %v / %v", factIDs(lines), ents)
@@ -393,6 +423,83 @@ func TestNeighbourhoodCloudLaneNeverWalksThroughSecretFact(t *testing.T) {
 	local, _ := f.walk("Emre", nil, Options{Hops: 1, CloudLane: false})
 	if !hasFact(local, bankFact) {
 		t.Fatalf("local lane facts = %v, want the hop through BankX", factIDs(local))
+	}
+}
+
+// TestNeighbourhoodCloudLaneFollowsOnlyCloudLaneLinks (FIX-MEM-1/MEM-4
+// review, migration 0025): a fact row an ordinary note made cloud-eligible
+// can still carry a link a LOCAL-lane call wrote first ("Doktor" linked to
+// Ayşe Kaya through an alias only a secret note carries). The cloud lane
+// never follows, seeds from or reports such a link: the fact is not Ayşe
+// Kaya's, its own episode seeds nothing through it, and its entity id is
+// reported as 0. The local lane follows every link.
+func TestNeighbourhoodCloudLaneFollowsOnlyCloudLaneLinks(t *testing.T) {
+	f := newFixture(t)
+	ayseEp := f.episode("people/ayse.md")
+	komsuEp := f.episode("inbox/komsu.md")
+	ayse := f.entity("Ayşe Kaya", "person")
+	acme := f.entity("Acme", "org")
+	worksAt := f.fact("Ayşe Kaya", ayse, "works_at", "Acme", acme, ayseEp)
+	livesIn := f.localFact("Doktor", ayse, "lives_in", "Kadıköy", 0, komsuEp)
+
+	cloud, ents := f.walk("Ayşe Kaya nerede", nil, Options{Hops: 1, CloudLane: true})
+	if !reflect.DeepEqual(factIDs(cloud), []int64{worksAt}) {
+		t.Fatalf("cloud lane facts = %v, want only [%d] (the local-lane link of %d is never followed)", factIDs(cloud), worksAt, livesIn)
+	}
+	if !reflect.DeepEqual(ents, []int64{ayse, acme}) {
+		t.Fatalf("cloud lane entity ids = %v", ents)
+	}
+	if lines, ents := f.walk("komşu", []int64{komsuEp}, Options{Hops: 1, CloudLane: true}); len(lines) != 0 || len(ents) != 0 {
+		t.Fatalf("cloud lane episode seed through a local-lane link = %v / %v, want nothing", factIDs(lines), ents)
+	}
+	local, _ := f.walk("Ayşe Kaya nerede", nil, Options{Hops: 1, CloudLane: false})
+	if !hasFact(local, livesIn) || !hasFact(local, worksAt) {
+		t.Fatalf("local lane facts = %v, want both", factIDs(local))
+	}
+
+	recs := f.query(FactQuery{Predicate: "lives_in", CloudLane: true})
+	if len(recs) != 1 || recs[0].FactID != livesIn || recs[0].SubjectEntityID != 0 {
+		t.Fatalf("cloud fact_query lives_in = %+v, want the fact with subject entity 0 (a local-lane link)", recs)
+	}
+	if recs := f.query(FactQuery{Predicate: "lives_in"}); len(recs) != 1 || recs[0].SubjectEntityID != ayse {
+		t.Fatalf("local fact_query lives_in = %+v, want subject entity %d", recs, ayse)
+	}
+	if recs := f.query(FactQuery{EntityID: ayse, CloudLane: true}); !reflect.DeepEqual(recIDs(recs), []int64{worksAt}) {
+		t.Fatalf("cloud fact_query entity %d = %v, want only [%d]", ayse, recIDs(recs), worksAt)
+	}
+	if recs := f.query(FactQuery{EntityID: ayse}); !sameIDs(recIDs(recs), []int64{worksAt, livesIn}) {
+		t.Fatalf("local fact_query entity %d = %v, want both", ayse, recIDs(recs))
+	}
+
+	got := f.lookup("ayşe", true)
+	if len(got) != 1 || got[0].FactCount != 1 || !reflect.DeepEqual(got[0].Aliases, []string{"Ayşe Kaya"}) {
+		t.Fatalf("cloud entity_lookup = %+v, want Ayşe Kaya with one fact and no \"Doktor\"", got)
+	}
+	if got := f.lookup("doktor", true); len(got) != 0 {
+		t.Fatalf("cloud entity_lookup(doktor) = %+v, want nothing", got)
+	}
+}
+
+// TestEntityLookupCloudLaneListsOnlyCloudLaneAliases (FIX-MEM-1/MEM-4
+// review): an alias row a local-lane call added never matches or is listed
+// in the cloud lane - even when a cloud-linked fact uses the same name.
+func TestEntityLookupCloudLaneListsOnlyCloudLaneAliases(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	f.localAlias(emre, "Patron")
+	f.fact("Emre", emre, "works_at", "Acme", 0, ep)
+	f.fact("Patron", emre, "likes", "çay", 0, ep)
+
+	if got := f.lookup("patron", true); len(got) != 0 {
+		t.Fatalf("cloud lookup by a local-only alias = %+v, want nothing", got)
+	}
+	got := f.lookup("emre", true)
+	if len(got) != 1 || !reflect.DeepEqual(got[0].Aliases, []string{"Emre"}) {
+		t.Fatalf("cloud lookup emre = %+v, want aliases [Emre] only", got)
+	}
+	if local := f.lookup("patron", false); len(local) != 1 || len(local[0].Aliases) != 2 {
+		t.Fatalf("local lookup patron = %+v, want the entity with both aliases", local)
 	}
 }
 

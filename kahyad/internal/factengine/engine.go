@@ -260,6 +260,16 @@ type Candidate struct {
 	SubjectEntityID int64
 	ObjectEntityID  int64
 
+	// LinksCloudLane marks SubjectEntityID/ObjectEntityID as resolved by a
+	// CLOUD-lane call (ResolveEntityForExtraction/AddAlias with cloudLane):
+	// the names were resolved in the cloud view, from bytes classified
+	// non-secret before they left the machine (migration 0025). Every
+	// cloud-lane read follows only links stored with this mark; false (the
+	// default, and every local-lane call) keeps the link local-only, because
+	// a local call may have resolved the name through an alias only a secret
+	// note carries.
+	LinksCloudLane bool
+
 	// Quote is the <=MaxQuoteRunes verbatim span the extractor cited. Same
 	// charclass validation as every other free-text field.
 	Quote string
@@ -277,6 +287,15 @@ type Candidate struct {
 // a re-assertion should merge into an existing fact.
 func (c Candidate) hasLinkFields() bool {
 	return c.SubjectEntityID != 0 || c.ObjectEntityID != 0 || c.Quote != "" || c.ValidFrom != "" || c.ValidTo != ""
+}
+
+// linkCloudFlag is facts.subject_link_cloud / object_link_cloud for one side
+// linked to entityID: 1 only for a real link from a cloud-lane call.
+func (c Candidate) linkCloudFlag(entityID int64) int64 {
+	if c.LinksCloudLane && entityID != 0 {
+		return 1
+	}
+	return 0
 }
 
 // Store is the narrow brain.db surface this package needs -
@@ -309,6 +328,12 @@ type Store interface {
 	UpdateFactLinksAndValidity(ctx context.Context, arg sqlcgen.UpdateFactLinksAndValidityParams) error
 	ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
 	GetEntityAliasByEntityAndAlias(ctx context.Context, arg sqlcgen.GetEntityAliasByEntityAndAliasParams) (sqlcgen.EntityAlias, error)
+
+	// The cloud view (migration 0025): aliases a cloud-lane call added.
+	ListActiveCloudEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
+	ListActiveLocalEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
+	ListCloudEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error)
+	MarkEntityAliasCloud(ctx context.Context, id int64) error
 
 	// G13 MEM-2 phase 2 reads (entity_read.go: `kahya entity list/show`).
 	ListEntitiesByFolded(ctx context.Context, arg sqlcgen.ListEntitiesByFoldedParams) ([]sqlcgen.ListEntitiesByFoldedRow, error)
@@ -574,6 +599,9 @@ func (e *Engine) WriteFact(ctx context.Context, traceID string, c Candidate) (in
 			Quote:           nullString(c.Quote),
 			ValidFrom:       nullString(c.ValidFrom),
 			ValidTo:         nullString(c.ValidTo),
+			// 0025: which link a cloud-lane call wrote.
+			SubjectLinkCloud: c.linkCloudFlag(c.SubjectEntityID),
+			ObjectLinkCloud:  c.linkCloudFlag(c.ObjectEntityID),
 		})
 		if err != nil {
 			return 0, fmt.Errorf("factengine: insert fact: %w", err)
@@ -582,15 +610,20 @@ func (e *Engine) WriteFact(ctx context.Context, traceID string, c Candidate) (in
 		return 0, fmt.Errorf("factengine: lookup fact: %w", err)
 	case c.hasLinkFields():
 		// A re-assertion of an existing active triple: fill a NULL link,
-		// quote or validity bound, never overwrite one (COALESCE in SQL).
+		// quote or validity bound, never overwrite one (COALESCE in SQL). A
+		// side's link-lane flag is filled together with its link (0025): a
+		// link a local-lane call wrote first stays local-only even when a
+		// cloud-lane call re-asserts the triple.
 		if err := e.store.UpdateFactLinksAndValidity(ctx, sqlcgen.UpdateFactLinksAndValidityParams{
-			SubjectEntityID: nullInt64(c.SubjectEntityID),
-			ObjectEntityID:  nullInt64(c.ObjectEntityID),
-			Quote:           nullString(c.Quote),
-			ValidFrom:       nullString(c.ValidFrom),
-			ValidTo:         nullString(c.ValidTo),
-			UpdatedAt:       now,
-			ID:              fact.ID,
+			SubjectLinkCloud: c.linkCloudFlag(c.SubjectEntityID),
+			ObjectLinkCloud:  c.linkCloudFlag(c.ObjectEntityID),
+			SubjectEntityID:  nullInt64(c.SubjectEntityID),
+			ObjectEntityID:   nullInt64(c.ObjectEntityID),
+			Quote:            nullString(c.Quote),
+			ValidFrom:        nullString(c.ValidFrom),
+			ValidTo:          nullString(c.ValidTo),
+			UpdatedAt:        now,
+			ID:               fact.ID,
 		}); err != nil {
 			return 0, fmt.Errorf("factengine: link fact %d: %w", fact.ID, err)
 		}

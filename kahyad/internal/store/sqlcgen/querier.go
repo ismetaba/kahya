@@ -290,6 +290,8 @@ type Querier interface {
 	InsertEntity(ctx context.Context, arg InsertEntityParams) (InsertEntityRow, error)
 	// alias_folded (0024) is factengine.AliasKey(alias), the Turkish
 	// I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
+	// cloud_lane (0025) is 1 only for an alias a cloud-lane extraction call
+	// added (the cloud view - see ListActiveCloudEntityIDsByAliasFolded).
 	InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error)
 	InsertEpisode(ctx context.Context, arg InsertEpisodeParams) (InsertEpisodeRow, error)
 	// One row per fact ASKED about in a single ritual run (W5-03 task spec
@@ -320,6 +322,9 @@ type Querier interface {
 	// G13 (0024): subject_entity_id/object_entity_id/quote are written at
 	// insert time too (NULL for every non-extractor call site); confirmed_at
 	// stays out of the INSERT list - it is never set at insert time.
+	// 0025: subject_link_cloud/object_link_cloud are 1 only for a side whose
+	// link a cloud-lane extraction call wrote (factengine.Candidate.
+	// LinksCloudLane), 0 otherwise.
 	InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error)
 	// One row per merge AND per split (HANDOFF S5 memory #2: "Merge-defteri +
 	// varlik-bolme operasyonu") - never updated, never deleted, matching the
@@ -415,6 +420,12 @@ type Querier interface {
 	// side effect - idx_undo_windows_op_id); scope = that token's real bound
 	// scope, so an undo demotes the real (tool, class, scope) triple.
 	InsertUndoWindow(ctx context.Context, arg InsertUndoWindowParams) (UndoWindow, error)
+	// The CLOUD VIEW of ListActiveEntityIDsByAliasFolded (0025): only aliases a
+	// cloud-lane extraction call added. A cloud-lane entity resolution, a
+	// cloud-lane alias-collision check and every cloud-lane graph read resolve
+	// a name through these rows alone, so an alias a secret-lane note gave an
+	// entity never decides what a cloud model is shown.
+	ListActiveCloudEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
 	// Only entities still 'active' (a merged-away entity's aliases were moved to
 	// the survivor by MergeEntities, so this is defensive).
 	ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
@@ -427,6 +438,13 @@ type Querier interface {
 	// exclusion/priority policy entirely in Go, never in SQL, so the policy
 	// stays readable/testable as plain code, not buried in a query).
 	ListActiveFacts(ctx context.Context) ([]Fact, error)
+	// The aliases a LOCAL-lane call added (0025). A local-lane resolution
+	// prefers the entities named this way: once a cloud-lane call has created
+	// its own twin of a name only a local note gave an entity (it cannot see
+	// local-lane aliases), the local lane keeps resolving the name to the
+	// entity it named, instead of seeing two candidates and minting a new
+	// provisional one on every later sighting.
+	ListActiveLocalEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error)
 	ListActiveMemoryFileEpisodes(ctx context.Context) ([]ListActiveMemoryFileEpisodesRow, error)
 	// Every ledger event ever appended, oldest first - verify.go's own
 	// full-recompute pass (task spec step 6: "recompute the digest from event
@@ -452,6 +470,13 @@ type Querier interface {
 	// prior summary (HANDOFF S5 memory #4: "her ozet ham kanittan uretilir,
 	// asla alt-ozetten").
 	ListChunksByEpisode(ctx context.Context, episodeID int64) ([]Chunk, error)
+	// The cloud view of ListEntitiesByFolded (0025): the prefix matches only
+	// aliases a cloud-lane call added, so a cloud-lane entity_lookup's
+	// candidate set (and its LIMIT) never depends on secret-lane aliases.
+	ListCloudEntitiesByFolded(ctx context.Context, arg ListCloudEntitiesByFoldedParams) ([]ListCloudEntitiesByFoldedRow, error)
+	// The cloud view of ListEntityIDsByAlias (byte-exact alias, cloud-lane
+	// rows only).
+	ListCloudEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error)
 	// Candidate rows for one dispatcher claim pass: not yet delivered,
 	// available (available_at <= now), and not currently leased by another
 	// dispatcher (lease_until IS NULL, i.e. never claimed, OR lease_until has
@@ -533,6 +558,11 @@ type Querier interface {
 	// `kahya fact confirm --episode <id>` (MEM-5): every active fact evidenced
 	// by that episode.
 	ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullInt64) ([]int64, error)
+	// The cloud-lane graph hop (0025): the active facts linked to the entity on
+	// a side a CLOUD-lane extraction call linked (subject_link_cloud /
+	// object_link_cloud). A link a local-lane call wrote - possibly through an
+	// alias only a secret note carries - is never followed for a cloud reader.
+	ListFactsByEntityCloudLinks(ctx context.Context, arg ListFactsByEntityCloudLinksParams) ([]Fact, error)
 	// One graph hop: every active fact touching entity_id as subject OR object.
 	// Tier/confirmed/threshold eligibility is applied in Go
 	// (factengine.InjectionEligible) so the predicate lives in ONE place.
@@ -627,6 +657,9 @@ type Querier interface {
 	// called once the git push has actually landed on the remote (task spec
 	// step 3: "On success mark pushed").
 	MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error
+	// A cloud-lane call states an alias a local-lane call added first: the
+	// alias is now in the cloud view too (0025). Never set back to 0.
+	MarkEntityAliasCloud(ctx context.Context, id int64) error
 	// Stamped ONLY after this episode's detail atoms have been promoted to
 	// facts (task spec step 6: "only then mark cooled").
 	MarkEpisodeCooled(ctx context.Context, arg MarkEpisodeCooledParams) error
@@ -791,6 +824,10 @@ type Querier interface {
 	// re-assertion) to entity rows / a quote / a validity window when the
 	// earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
 	// the first link wins).
+	// 0025: a side's link-lane flag is written in the same statement as the
+	// link it describes - only while that side is still unlinked (every SET
+	// expression reads the OLD row) - so a link and its flag never disagree;
+	// the caller passes 1 only for a side it links from a cloud-lane call.
 	UpdateFactLinksAndValidity(ctx context.Context, arg UpdateFactLinksAndValidityParams) error
 	// Persists a worker-reported session_id onto the task row (W12-07 step 3:
 	// kahyad "persists session_id onto the task row" as the worker's

@@ -337,7 +337,7 @@ func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) er
 }
 
 const getActiveFactByTriple = `-- name: GetActiveFactByTriple :one
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -382,6 +382,8 @@ func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactBy
 		&i.SubjectEntityID,
 		&i.ObjectEntityID,
 		&i.Quote,
+		&i.SubjectLinkCloud,
+		&i.ObjectLinkCloud,
 	)
 	return i, err
 }
@@ -531,7 +533,7 @@ func (q *Queries) GetEntity(ctx context.Context, id int64) (GetEntityRow, error)
 }
 
 const getEntityAliasByEntityAndAlias = `-- name: GetEntityAliasByEntityAndAlias :one
-SELECT id, entity_id, alias, created_at, alias_folded
+SELECT id, entity_id, alias, created_at, alias_folded, cloud_lane
 FROM entity_aliases
 WHERE entity_id = ? AND alias = ?
 ORDER BY id ASC
@@ -552,6 +554,7 @@ func (q *Queries) GetEntityAliasByEntityAndAlias(ctx context.Context, arg GetEnt
 		&i.Alias,
 		&i.CreatedAt,
 		&i.AliasFolded,
+		&i.CloudLane,
 	)
 	return i, err
 }
@@ -742,7 +745,7 @@ func (q *Queries) GetEvidenceByFactSessionPolarity(ctx context.Context, arg GetE
 
 const getFact = `-- name: GetFact :one
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE id = ?
 `
@@ -777,6 +780,8 @@ func (q *Queries) GetFact(ctx context.Context, id int64) (Fact, error) {
 		&i.SubjectEntityID,
 		&i.ObjectEntityID,
 		&i.Quote,
+		&i.SubjectLinkCloud,
+		&i.ObjectLinkCloud,
 	)
 	return i, err
 }
@@ -1463,9 +1468,9 @@ func (q *Queries) InsertEntity(ctx context.Context, arg InsertEntityParams) (Ins
 }
 
 const insertEntityAlias = `-- name: InsertEntityAlias :one
-INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded)
-VALUES (?, ?, ?, ?)
-RETURNING id, entity_id, alias, created_at, alias_folded
+INSERT INTO entity_aliases (entity_id, alias, created_at, alias_folded, cloud_lane)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id, entity_id, alias, created_at, alias_folded, cloud_lane
 `
 
 type InsertEntityAliasParams struct {
@@ -1473,16 +1478,20 @@ type InsertEntityAliasParams struct {
 	Alias       string         `json:"alias"`
 	CreatedAt   string         `json:"created_at"`
 	AliasFolded sql.NullString `json:"alias_folded"`
+	CloudLane   int64          `json:"cloud_lane"`
 }
 
 // alias_folded (0024) is factengine.AliasKey(alias), the Turkish
 // I/i-insensitive lookup key (see ListActiveEntityIDsByAliasFolded).
+// cloud_lane (0025) is 1 only for an alias a cloud-lane extraction call
+// added (the cloud view - see ListActiveCloudEntityIDsByAliasFolded).
 func (q *Queries) InsertEntityAlias(ctx context.Context, arg InsertEntityAliasParams) (EntityAlias, error) {
 	row := q.db.QueryRowContext(ctx, insertEntityAlias,
 		arg.EntityID,
 		arg.Alias,
 		arg.CreatedAt,
 		arg.AliasFolded,
+		arg.CloudLane,
 	)
 	var i EntityAlias
 	err := row.Scan(
@@ -1491,6 +1500,7 @@ func (q *Queries) InsertEntityAlias(ctx context.Context, arg InsertEntityAliasPa
 		&i.Alias,
 		&i.CreatedAt,
 		&i.AliasFolded,
+		&i.CloudLane,
 	)
 	return i, err
 }
@@ -1689,29 +1699,31 @@ func (q *Queries) InsertEvidence(ctx context.Context, arg InsertEvidenceParams) 
 }
 
 const insertFact = `-- name: InsertFact :one
-INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 `
 
 type InsertFactParams struct {
-	Subject         string         `json:"subject"`
-	Predicate       string         `json:"predicate"`
-	Object          string         `json:"object"`
-	SourceTier      string         `json:"source_tier"`
-	Evidentiality   string         `json:"evidentiality"`
-	Confidence      float64        `json:"confidence"`
-	Importance      float64        `json:"importance"`
-	ValidFrom       sql.NullString `json:"valid_from"`
-	ValidTo         sql.NullString `json:"valid_to"`
-	Status          string         `json:"status"`
-	Evidence        sql.NullString `json:"evidence"`
-	ExtractorVer    sql.NullString `json:"extractor_ver"`
-	UpdatedAt       string         `json:"updated_at"`
-	CreatedAt       string         `json:"created_at"`
-	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
-	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
-	Quote           sql.NullString `json:"quote"`
+	Subject          string         `json:"subject"`
+	Predicate        string         `json:"predicate"`
+	Object           string         `json:"object"`
+	SourceTier       string         `json:"source_tier"`
+	Evidentiality    string         `json:"evidentiality"`
+	Confidence       float64        `json:"confidence"`
+	Importance       float64        `json:"importance"`
+	ValidFrom        sql.NullString `json:"valid_from"`
+	ValidTo          sql.NullString `json:"valid_to"`
+	Status           string         `json:"status"`
+	Evidence         sql.NullString `json:"evidence"`
+	ExtractorVer     sql.NullString `json:"extractor_ver"`
+	UpdatedAt        string         `json:"updated_at"`
+	CreatedAt        string         `json:"created_at"`
+	SubjectEntityID  sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID   sql.NullInt64  `json:"object_entity_id"`
+	Quote            sql.NullString `json:"quote"`
+	SubjectLinkCloud int64          `json:"subject_link_cloud"`
+	ObjectLinkCloud  int64          `json:"object_link_cloud"`
 }
 
 // One hot-window candidate fact: source_tier is ALWAYS 'agent_derived'
@@ -1726,6 +1738,9 @@ type InsertFactParams struct {
 // G13 (0024): subject_entity_id/object_entity_id/quote are written at
 // insert time too (NULL for every non-extractor call site); confirmed_at
 // stays out of the INSERT list - it is never set at insert time.
+// 0025: subject_link_cloud/object_link_cloud are 1 only for a side whose
+// link a cloud-lane extraction call wrote (factengine.Candidate.
+// LinksCloudLane), 0 otherwise.
 func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, error) {
 	row := q.db.QueryRowContext(ctx, insertFact,
 		arg.Subject,
@@ -1745,6 +1760,8 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		arg.SubjectEntityID,
 		arg.ObjectEntityID,
 		arg.Quote,
+		arg.SubjectLinkCloud,
+		arg.ObjectLinkCloud,
 	)
 	var i Fact
 	err := row.Scan(
@@ -1767,6 +1784,8 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		&i.SubjectEntityID,
 		&i.ObjectEntityID,
 		&i.Quote,
+		&i.SubjectLinkCloud,
+		&i.ObjectLinkCloud,
 	)
 	return i, err
 }
@@ -2163,6 +2182,41 @@ func (q *Queries) InsertUndoWindow(ctx context.Context, arg InsertUndoWindowPara
 	return i, err
 }
 
+const listActiveCloudEntityIDsByAliasFolded = `-- name: ListActiveCloudEntityIDsByAliasFolded :many
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND a.cloud_lane = 1 AND e.status = 'active'
+ORDER BY a.entity_id ASC
+`
+
+// The CLOUD VIEW of ListActiveEntityIDsByAliasFolded (0025): only aliases a
+// cloud-lane extraction call added. A cloud-lane entity resolution, a
+// cloud-lane alias-collision check and every cloud-lane graph read resolve
+// a name through these rows alone, so an alias a secret-lane note gave an
+// entity never decides what a cloud model is shown.
+func (q *Queries) ListActiveCloudEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveCloudEntityIDsByAliasFolded, aliasFolded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listActiveEntityIDsByAliasFolded = `-- name: ListActiveEntityIDsByAliasFolded :many
 SELECT DISTINCT a.entity_id
 FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
@@ -2197,7 +2251,7 @@ func (q *Queries) ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFol
 
 const listActiveFacts = `-- name: ListActiveFacts :many
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC
@@ -2240,10 +2294,48 @@ func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
 			&i.SubjectEntityID,
 			&i.ObjectEntityID,
 			&i.Quote,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActiveLocalEntityIDsByAliasFolded = `-- name: ListActiveLocalEntityIDsByAliasFolded :many
+SELECT DISTINCT a.entity_id
+FROM entity_aliases a JOIN entities e ON e.id = a.entity_id
+WHERE a.alias_folded = ? AND a.cloud_lane = 0 AND e.status = 'active'
+ORDER BY a.entity_id ASC
+`
+
+// The aliases a LOCAL-lane call added (0025). A local-lane resolution
+// prefers the entities named this way: once a cloud-lane call has created
+// its own twin of a name only a local note gave an entity (it cannot see
+// local-lane aliases), the local lane keeps resolving the name to the
+// entity it named, instead of seeing two candidates and minting a new
+// provisional one on every later sighting.
+func (q *Queries) ListActiveLocalEntityIDsByAliasFolded(ctx context.Context, aliasFolded sql.NullString) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listActiveLocalEntityIDsByAliasFolded, aliasFolded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -2517,6 +2609,90 @@ func (q *Queries) ListChunksByEpisode(ctx context.Context, episodeID int64) ([]C
 	return items, nil
 }
 
+const listCloudEntitiesByFolded = `-- name: ListCloudEntitiesByFolded :many
+SELECT DISTINCT e.id, e.canonical_name, e.kind, e.status, e.provisional, e.created_at
+FROM entities e JOIN entity_aliases a ON a.entity_id = e.id
+WHERE a.alias_folded LIKE ? AND a.cloud_lane = 1 AND e.status = 'active'
+ORDER BY e.id ASC
+LIMIT ?
+`
+
+type ListCloudEntitiesByFoldedParams struct {
+	AliasFolded sql.NullString `json:"alias_folded"`
+	Limit       int64          `json:"limit"`
+}
+
+type ListCloudEntitiesByFoldedRow struct {
+	ID            int64          `json:"id"`
+	CanonicalName string         `json:"canonical_name"`
+	Kind          sql.NullString `json:"kind"`
+	Status        string         `json:"status"`
+	Provisional   int64          `json:"provisional"`
+	CreatedAt     string         `json:"created_at"`
+}
+
+// The cloud view of ListEntitiesByFolded (0025): the prefix matches only
+// aliases a cloud-lane call added, so a cloud-lane entity_lookup's
+// candidate set (and its LIMIT) never depends on secret-lane aliases.
+func (q *Queries) ListCloudEntitiesByFolded(ctx context.Context, arg ListCloudEntitiesByFoldedParams) ([]ListCloudEntitiesByFoldedRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCloudEntitiesByFolded, arg.AliasFolded, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCloudEntitiesByFoldedRow{}
+	for rows.Next() {
+		var i ListCloudEntitiesByFoldedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CanonicalName,
+			&i.Kind,
+			&i.Status,
+			&i.Provisional,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCloudEntityIDsByAlias = `-- name: ListCloudEntityIDsByAlias :many
+SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ? AND cloud_lane = 1
+`
+
+// The cloud view of ListEntityIDsByAlias (byte-exact alias, cloud-lane
+// rows only).
+func (q *Queries) ListCloudEntityIDsByAlias(ctx context.Context, alias string) ([]int64, error) {
+	rows, err := q.db.QueryContext(ctx, listCloudEntityIDsByAlias, alias)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var entity_id int64
+		if err := rows.Scan(&entity_id); err != nil {
+			return nil, err
+		}
+		items = append(items, entity_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDueOutboxRows = `-- name: ListDueOutboxRows :many
 SELECT o.id, o.trace_id, o.kind, o.payload, o.dispatched_at, o.created_at, o.available_at, o.lease_until, o.attempts, o.task_id, o.canceled_at
 FROM outbox o
@@ -2652,7 +2828,7 @@ func (q *Queries) ListEntitiesByFolded(ctx context.Context, arg ListEntitiesByFo
 }
 
 const listEntityAliasesByEntity = `-- name: ListEntityAliasesByEntity :many
-SELECT id, entity_id, alias, created_at, alias_folded
+SELECT id, entity_id, alias, created_at, alias_folded, cloud_lane
 FROM entity_aliases
 WHERE entity_id = ?
 ORDER BY id ASC
@@ -2675,6 +2851,7 @@ func (q *Queries) ListEntityAliasesByEntity(ctx context.Context, entityID int64)
 			&i.Alias,
 			&i.CreatedAt,
 			&i.AliasFolded,
+			&i.CloudLane,
 		); err != nil {
 			return nil, err
 		}
@@ -3050,8 +3227,72 @@ func (q *Queries) ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullIn
 	return items, nil
 }
 
+const listFactsByEntityCloudLinks = `-- name: ListFactsByEntityCloudLinks :many
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+FROM facts
+WHERE status = 'active'
+  AND ((subject_entity_id = ? AND subject_link_cloud = 1) OR (object_entity_id = ? AND object_link_cloud = 1))
+ORDER BY confidence DESC, updated_at DESC
+LIMIT ?
+`
+
+type ListFactsByEntityCloudLinksParams struct {
+	SubjectEntityID sql.NullInt64 `json:"subject_entity_id"`
+	ObjectEntityID  sql.NullInt64 `json:"object_entity_id"`
+	Limit           int64         `json:"limit"`
+}
+
+// The cloud-lane graph hop (0025): the active facts linked to the entity on
+// a side a CLOUD-lane extraction call linked (subject_link_cloud /
+// object_link_cloud). A link a local-lane call wrote - possibly through an
+// alias only a secret note carries - is never followed for a cloud reader.
+func (q *Queries) ListFactsByEntityCloudLinks(ctx context.Context, arg ListFactsByEntityCloudLinksParams) ([]Fact, error) {
+	rows, err := q.db.QueryContext(ctx, listFactsByEntityCloudLinks, arg.SubjectEntityID, arg.ObjectEntityID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Fact{}
+	for rows.Next() {
+		var i Fact
+		if err := rows.Scan(
+			&i.ID,
+			&i.Subject,
+			&i.Predicate,
+			&i.Object,
+			&i.SourceTier,
+			&i.Evidentiality,
+			&i.Confidence,
+			&i.Importance,
+			&i.ValidFrom,
+			&i.ValidTo,
+			&i.Status,
+			&i.Evidence,
+			&i.ExtractorVer,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.ConfirmedAt,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.Quote,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFactsByEntityHop = `-- name: ListFactsByEntityHop :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
 ORDER BY confidence DESC, updated_at DESC
@@ -3096,6 +3337,8 @@ func (q *Queries) ListFactsByEntityHop(ctx context.Context, arg ListFactsByEntit
 			&i.SubjectEntityID,
 			&i.ObjectEntityID,
 			&i.Quote,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
 		); err != nil {
 			return nil, err
 		}
@@ -3111,15 +3354,17 @@ func (q *Queries) ListFactsByEntityHop(ctx context.Context, arg ListFactsByEntit
 }
 
 const listFactsCitingEpisodes = `-- name: ListFactsCitingEpisodes :many
-SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id
+SELECT DISTINCT f.id, f.subject_entity_id, f.object_entity_id, f.subject_link_cloud, f.object_link_cloud
 FROM evidence ev JOIN facts f ON f.id = ev.fact_id
 WHERE ev.episode_id IN (/*SLICE:episode_ids*/?) AND f.status = 'active'
 `
 
 type ListFactsCitingEpisodesRow struct {
-	ID              int64         `json:"id"`
-	SubjectEntityID sql.NullInt64 `json:"subject_entity_id"`
-	ObjectEntityID  sql.NullInt64 `json:"object_entity_id"`
+	ID               int64         `json:"id"`
+	SubjectEntityID  sql.NullInt64 `json:"subject_entity_id"`
+	ObjectEntityID   sql.NullInt64 `json:"object_entity_id"`
+	SubjectLinkCloud int64         `json:"subject_link_cloud"`
+	ObjectLinkCloud  int64         `json:"object_link_cloud"`
 }
 
 // Facts whose evidence cites one of the chunk hits' episodes - the second
@@ -3143,7 +3388,13 @@ func (q *Queries) ListFactsCitingEpisodes(ctx context.Context, episodeIds []sql.
 	items := []ListFactsCitingEpisodesRow{}
 	for rows.Next() {
 		var i ListFactsCitingEpisodesRow
-		if err := rows.Scan(&i.ID, &i.SubjectEntityID, &i.ObjectEntityID); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.SubjectEntityID,
+			&i.ObjectEntityID,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -3431,7 +3682,7 @@ func (q *Queries) ListProvisionalEntitiesByFolded(ctx context.Context, arg ListP
 }
 
 const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 FROM facts
 WHERE status = 'active' AND source_tier = 'agent_derived' AND confirmed_at IS NULL
 ORDER BY id DESC
@@ -3469,6 +3720,8 @@ func (q *Queries) ListQuarantinedFacts(ctx context.Context, limit int64) ([]Fact
 			&i.SubjectEntityID,
 			&i.ObjectEntityID,
 			&i.Quote,
+			&i.SubjectLinkCloud,
+			&i.ObjectLinkCloud,
 		); err != nil {
 			return nil, err
 		}
@@ -3930,6 +4183,17 @@ type MarkAnchorPushedParams struct {
 // step 3: "On success mark pushed").
 func (q *Queries) MarkAnchorPushed(ctx context.Context, arg MarkAnchorPushedParams) error {
 	_, err := q.db.ExecContext(ctx, markAnchorPushed, arg.RemoteRef, arg.ID)
+	return err
+}
+
+const markEntityAliasCloud = `-- name: MarkEntityAliasCloud :exec
+UPDATE entity_aliases SET cloud_lane = 1 WHERE id = ?
+`
+
+// A cloud-lane call states an alias a local-lane call added first: the
+// alias is now in the cloud view too (0025). Never set back to 0.
+func (q *Queries) MarkEntityAliasCloud(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, markEntityAliasCloud, id)
 	return err
 }
 
@@ -4542,7 +4806,9 @@ func (q *Queries) UpdateFactConfidence(ctx context.Context, arg UpdateFactConfid
 const updateFactLinksAndValidity = `-- name: UpdateFactLinksAndValidity :exec
 
 UPDATE facts
-SET subject_entity_id = COALESCE(subject_entity_id, ?),
+SET subject_link_cloud = CASE WHEN subject_entity_id IS NULL THEN ? ELSE subject_link_cloud END,
+    object_link_cloud  = CASE WHEN object_entity_id IS NULL THEN ? ELSE object_link_cloud END,
+    subject_entity_id = COALESCE(subject_entity_id, ?),
     object_entity_id  = COALESCE(object_entity_id, ?),
     quote             = COALESCE(quote, ?),
     valid_from        = COALESCE(valid_from, ?),
@@ -4552,13 +4818,15 @@ WHERE id = ?
 `
 
 type UpdateFactLinksAndValidityParams struct {
-	SubjectEntityID sql.NullInt64  `json:"subject_entity_id"`
-	ObjectEntityID  sql.NullInt64  `json:"object_entity_id"`
-	Quote           sql.NullString `json:"quote"`
-	ValidFrom       sql.NullString `json:"valid_from"`
-	ValidTo         sql.NullString `json:"valid_to"`
-	UpdatedAt       string         `json:"updated_at"`
-	ID              int64          `json:"id"`
+	SubjectLinkCloud int64          `json:"subject_link_cloud"`
+	ObjectLinkCloud  int64          `json:"object_link_cloud"`
+	SubjectEntityID  sql.NullInt64  `json:"subject_entity_id"`
+	ObjectEntityID   sql.NullInt64  `json:"object_entity_id"`
+	Quote            sql.NullString `json:"quote"`
+	ValidFrom        sql.NullString `json:"valid_from"`
+	ValidTo          sql.NullString `json:"valid_to"`
+	UpdatedAt        string         `json:"updated_at"`
+	ID               int64          `json:"id"`
 }
 
 // G13 memory v2 queries below (0024_memory_v2_graph). See
@@ -4570,8 +4838,14 @@ type UpdateFactLinksAndValidityParams struct {
 // re-assertion) to entity rows / a quote / a validity window when the
 // earlier assertion had none. Never overwrites a non-NULL value (COALESCE:
 // the first link wins).
+// 0025: a side's link-lane flag is written in the same statement as the
+// link it describes - only while that side is still unlinked (every SET
+// expression reads the OLD row) - so a link and its flag never disagree;
+// the caller passes 1 only for a side it links from a cloud-lane call.
 func (q *Queries) UpdateFactLinksAndValidity(ctx context.Context, arg UpdateFactLinksAndValidityParams) error {
 	_, err := q.db.ExecContext(ctx, updateFactLinksAndValidity,
+		arg.SubjectLinkCloud,
+		arg.ObjectLinkCloud,
 		arg.SubjectEntityID,
 		arg.ObjectEntityID,
 		arg.Quote,

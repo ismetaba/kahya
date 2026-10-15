@@ -68,7 +68,10 @@ type FactQuery struct {
 	// MaxFactQueryLimit).
 	Limit int
 	// CloudLane: the answer goes to a cloud model (a worker's tool call),
-	// so every fact must pass memlane.CloudEligible.
+	// so every fact must pass memlane.CloudEligible, and only cloud-lane
+	// aliases and links count (package doc): EntityID/EntityName match a
+	// fact only through a link a cloud-lane call wrote, and a local-lane
+	// link is reported as entity id 0.
 	CloudLane bool
 }
 
@@ -124,9 +127,10 @@ func (g *Graph) QueryFacts(ctx context.Context, traceID string, q FactQuery) ([]
 		limit = MaxFactQueryLimit
 	}
 
+	w := newWalk(ctx, g, Options{CloudLane: q.CloudLane}.normalized())
 	entityIDs := []int64{q.EntityID}
 	if q.EntityName != "" {
-		ids, err := g.Store.ListActiveEntityIDsByAliasFolded(ctx, sql.NullString{String: factengine.AliasKey(q.EntityName), Valid: true})
+		ids, err := w.entityIDsByName(factengine.AliasKey(q.EntityName))
 		if err != nil {
 			return nil, fmt.Errorf("graph: resolve entity %q: %w", q.EntityName, err)
 		}
@@ -139,7 +143,6 @@ func (g *Graph) QueryFacts(ctx context.Context, traceID string, q FactQuery) ([]
 		entityIDs = ids
 	}
 
-	w := newWalk(ctx, g, Options{CloudLane: q.CloudLane}.normalized())
 	exact := q.Subject != "" || q.Object != ""
 	out, err := g.queryFactsPass(w, q, entityIDs, exact, limit)
 	if err != nil {
@@ -160,10 +163,15 @@ func (g *Graph) QueryFacts(ctx context.Context, traceID string, q FactQuery) ([]
 
 // queryFactsPass runs the SQL for each entity id (0 = no entity filter),
 // with subject/object as byte-exact SQL equality (exact) or as a Go-side
-// folded equality (!exact), and applies the Go filters.
+// folded equality (!exact), and applies the Go filters. In the cloud lane
+// the entity filter matches only a side a cloud-lane call linked.
 func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bool, limit int) ([]FactRecord, error) {
 	seen := map[int64]bool{}
 	var cands []sqlcgen.Fact
+	cloudOnly := 0
+	if w.opts.CloudLane {
+		cloudOnly = 1
+	}
 	for _, e := range entityIDs {
 		subj, obj := "", ""
 		if exact {
@@ -172,14 +180,16 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		rows, err := g.DB.QueryContext(w.ctx, `
 			SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance,
 			       valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at,
-			       confirmed_at, subject_entity_id, object_entity_id, quote
+			       confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
 			FROM facts
 			WHERE status = 'active'
 			  AND (? = '' OR subject = ?) AND (? = '' OR predicate = ?) AND (? = '' OR object = ?)
-			  AND (? = 0 OR subject_entity_id = ? OR object_entity_id = ?)
+			  AND (? = 0
+			       OR (subject_entity_id = ? AND (? = 0 OR subject_link_cloud = 1))
+			       OR (object_entity_id = ? AND (? = 0 OR object_link_cloud = 1)))
 			ORDER BY confidence DESC, updated_at DESC, id ASC
 			LIMIT ?`,
-			subj, subj, q.Predicate, q.Predicate, obj, obj, e, e, e, factQueryScanCap)
+			subj, subj, q.Predicate, q.Predicate, obj, obj, e, e, cloudOnly, e, cloudOnly, factQueryScanCap)
 		if err != nil {
 			return nil, fmt.Errorf("graph: fact query: %w", err)
 		}
@@ -187,7 +197,7 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 			var f sqlcgen.Fact
 			if err := rows.Scan(&f.ID, &f.Subject, &f.Predicate, &f.Object, &f.SourceTier, &f.Evidentiality, &f.Confidence, &f.Importance,
 				&f.ValidFrom, &f.ValidTo, &f.Status, &f.Evidence, &f.ExtractorVer, &f.UpdatedAt, &f.CreatedAt,
-				&f.ConfirmedAt, &f.SubjectEntityID, &f.ObjectEntityID, &f.Quote); err != nil {
+				&f.ConfirmedAt, &f.SubjectEntityID, &f.ObjectEntityID, &f.Quote, &f.SubjectLinkCloud, &f.ObjectLinkCloud); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("graph: fact query scan: %w", err)
 			}
@@ -235,7 +245,7 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		if !ok {
 			continue
 		}
-		out = append(out, toRecord(f, !eligible))
+		out = append(out, w.toRecord(f, !eligible))
 	}
 	return out, nil
 }
@@ -294,7 +304,10 @@ func parseStored(s sql.NullString) (time.Time, bool) {
 	return t, err == nil
 }
 
-func toRecord(f sqlcgen.Fact, quarantined bool) FactRecord {
+// toRecord is f as a FactRecord, its entity ids as the walk's lane sees
+// them (walk.links: a local-lane link is 0 for a cloud-lane caller).
+func (w *walk) toRecord(f sqlcgen.Fact, quarantined bool) FactRecord {
+	subj, obj := w.links(f)
 	return FactRecord{
 		FactID: f.ID, Subject: f.Subject, Predicate: f.Predicate, Object: f.Object,
 		SourceTier: f.SourceTier, Evidentiality: f.Evidentiality,
@@ -302,7 +315,7 @@ func toRecord(f sqlcgen.Fact, quarantined bool) FactRecord {
 		Quarantined: quarantined,
 		ValidFrom:   f.ValidFrom.String, ValidTo: f.ValidTo.String, KnownSince: f.CreatedAt,
 		Quote: f.Quote.String, Evidence: f.Evidence.String,
-		SubjectEntityID: f.SubjectEntityID.Int64, ObjectEntityID: f.ObjectEntityID.Int64,
+		SubjectEntityID: subj, ObjectEntityID: obj,
 	}
 }
 
@@ -320,13 +333,16 @@ func intersect(ids []int64, want int64) []int64 {
 // DefaultEntityLookupLimit, at most MaxEntityLookupLimit), each with its
 // aliases, its active-fact count and up to 5 injection-eligible facts.
 //
-// cloudLane (a worker's tool call): only VISIBLE names count - the folded
-// subject/object string, on the entity's own side, of a cloud-eligible fact
-// (see the package doc). An entity is returned only when one of its visible
-// names matches the prefix; its aliases are the visible ones, its canonical
-// name is replaced by its first visible alias when the canonical name itself
-// is not visible, and FactCount counts its cloud-eligible facts only - so
-// neither an alias a secret note added nor the existence of secret facts
+// cloudLane (a worker's tool call): only cloud-lane identity counts (see the
+// package doc). The candidates are the entities with a cloud-lane alias
+// matching the prefix; a name of an entity counts only when it is a
+// cloud-lane alias AND VISIBLE - the folded subject/object string, on a side
+// a cloud-lane call linked to the entity, of a cloud-eligible fact. An
+// entity is returned only when one of its counted names matches the prefix;
+// its aliases are the counted ones, its canonical name is replaced by its
+// first counted alias when the canonical name itself does not count, and
+// FactCount counts its cloud-linked cloud-eligible facts only - so neither
+// an alias or link a secret note led to nor the existence of secret facts
 // leaves the machine.
 func (g *Graph) LookupEntities(ctx context.Context, traceID, name string, k int, cloudLane bool) ([]EntityRecord, error) {
 	if g == nil || g.Store == nil {
@@ -342,9 +358,7 @@ func (g *Graph) LookupEntities(ctx context.Context, traceID, name string, k int,
 	if k > MaxEntityLookupLimit {
 		k = MaxEntityLookupLimit
 	}
-	rows, err := g.Store.ListEntitiesByFolded(ctx, sqlcgen.ListEntitiesByFoldedParams{
-		AliasFolded: sql.NullString{String: likePrefix(key), Valid: true}, Limit: int64(MaxEntityLookupLimit * 4),
-	})
+	rows, err := g.entityCandidates(ctx, key, cloudLane)
 	if err != nil {
 		return nil, fmt.Errorf("graph: entity lookup: %w", err)
 	}
@@ -368,6 +382,27 @@ func (g *Graph) LookupEntities(ctx context.Context, traceID, name string, k int,
 	return out, nil
 }
 
+// entityCandidates is LookupEntities' SQL candidate set: active entities
+// with an alias whose folded key starts with key - in the cloud lane only a
+// cloud-lane alias (ListCloudEntitiesByFolded), so the candidate LIMIT never
+// depends on secret-lane aliases either.
+func (g *Graph) entityCandidates(ctx context.Context, key string, cloudLane bool) ([]sqlcgen.ListEntitiesByFoldedRow, error) {
+	pattern := sql.NullString{String: likePrefix(key), Valid: true}
+	limit := int64(MaxEntityLookupLimit * 4)
+	if !cloudLane {
+		return g.Store.ListEntitiesByFolded(ctx, sqlcgen.ListEntitiesByFoldedParams{AliasFolded: pattern, Limit: limit})
+	}
+	rows, err := g.Store.ListCloudEntitiesByFolded(ctx, sqlcgen.ListCloudEntitiesByFoldedParams{AliasFolded: pattern, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sqlcgen.ListEntitiesByFoldedRow, len(rows))
+	for i, r := range rows {
+		out[i] = sqlcgen.ListEntitiesByFoldedRow(r)
+	}
+	return out, nil
+}
+
 // likePrefix is key as a LIKE prefix pattern. LIKE's own wildcards in key
 // are left as they are: every candidate is re-checked with a byte-exact
 // strings.HasPrefix in entityRecord, so they can only widen the SQL
@@ -384,7 +419,9 @@ func (g *Graph) entityRecord(w *walk, r sqlcgen.ListEntitiesByFoldedRow, key str
 		return EntityRecord{}, false, fmt.Errorf("graph: aliases of entity %d: %w", r.ID, err)
 	}
 
-	visible := func(string) bool { return true }
+	// counts reports whether alias row a is a name this lane may show: every
+	// alias locally; in the cloud lane a cloud-lane alias that is visible.
+	counts := func(sqlcgen.EntityAlias) bool { return true }
 	laneFacts := facts
 	if w.opts.CloudLane {
 		names := map[string]bool{}
@@ -398,29 +435,38 @@ func (g *Graph) entityRecord(w *walk, r sqlcgen.ListEntitiesByFoldedRow, key str
 				continue
 			}
 			laneFacts = append(laneFacts, f)
-			if f.SubjectEntityID.Valid && f.SubjectEntityID.Int64 == r.ID {
+			// factsOf read only facts cloud-linked to r.ID; links names
+			// the sides that are.
+			subj, obj := w.links(f)
+			if subj == r.ID {
 				names[factengine.AliasKey(f.Subject)] = true
 			}
-			if f.ObjectEntityID.Valid && f.ObjectEntityID.Int64 == r.ID {
+			if obj == r.ID {
 				names[factengine.AliasKey(f.Object)] = true
 			}
 		}
-		visible = func(n string) bool { return names[factengine.AliasKey(n)] }
+		counts = func(a sqlcgen.EntityAlias) bool { return a.CloudLane == 1 && names[factengine.AliasKey(a.Alias)] }
 	}
 
 	rec := EntityRecord{EntityID: r.ID, Kind: r.Kind.String, Provisional: r.Provisional != 0, Aliases: []string{}, TopFacts: []FactRecord{}}
-	matched := false
+	matched, canonicalCounts := false, false
 	for _, a := range aliases {
-		if !visible(a.Alias) {
+		if !counts(a) {
 			continue
 		}
 		rec.Aliases = append(rec.Aliases, a.Alias)
+		if a.Alias == r.CanonicalName {
+			canonicalCounts = true
+		}
 		if strings.HasPrefix(factengine.AliasKey(a.Alias), key) {
 			matched = true
 		}
 	}
+	if !w.opts.CloudLane {
+		canonicalCounts = true
+	}
 	switch {
-	case visible(r.CanonicalName):
+	case canonicalCounts:
 		rec.CanonicalName = r.CanonicalName
 		if strings.HasPrefix(factengine.AliasKey(r.CanonicalName), key) {
 			matched = true
@@ -447,7 +493,7 @@ func (g *Graph) entityRecord(w *walk, r sqlcgen.ListEntitiesByFoldedRow, key str
 			break
 		}
 		if factengine.InjectionEligible(f) {
-			rec.TopFacts = append(rec.TopFacts, toRecord(f, false))
+			rec.TopFacts = append(rec.TopFacts, w.toRecord(f, false))
 		}
 	}
 	return rec, true, nil

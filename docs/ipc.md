@@ -606,13 +606,26 @@ a cloud model, without changing anything in §2-§6 above:
   (active, p >= 0.3, never an unconfirmed `agent_derived` fact - HANDOFF §5
   memory #1/#3) AND `memlane.CloudEligible` (no secret-path citation, at
   least one resolvable citation, text not secret - fail-closed). In this
-  cloud lane the walk itself only follows what may leave the machine: a
-  query word seeds an entity only when it is one of the entity's visible
-  names (the subject/object string of a cloud-eligible fact on its own
-  side - an alias the extractor took from a secret note never seeds), an
-  episode seed only comes from a cloud-eligible fact, and a hop only goes
-  through a kept fact. Ranking: hop, then confidence, `valid_from` desc, id;
-  at most `hafiza_facts_max_lines` (12) lines / `hafiza_facts_max_runes`
+  cloud lane the walk itself only follows what may leave the machine, and
+  entity identity is lane-scoped (migration 0025, FIX-MEM-1/MEM-4 review):
+  which entity a name means can itself be secret (a finans/saglik/kimlik
+  note extracted locally may make "Doktor" an alias of Ayşe Kaya), so every
+  alias row records whether a cloud-lane extraction call added it
+  (`entity_aliases.cloud_lane`) and every fact side whether a cloud-lane
+  call linked it (`facts.subject_link_cloud`/`object_link_cloud`). A
+  cloud-lane extraction call resolves names and checks alias collisions in
+  that cloud view only (`factengine.ResolveEntityForExtraction`/`AddAlias`
+  with `cloudLane`), so a secret note's alias never makes an ordinary
+  note's name land on its entity; and the cloud-lane walk follows, seeds
+  from and reports only cloud-lane links (a link a local-lane call wrote -
+  first link wins on a shared triple row - is never followed and its
+  entity id is reported as 0). Pre-0025 rows are local-only (fail-closed).
+  A query word seeds an entity only through a cloud-lane alias that is
+  also one of its visible names (the subject/object string of a
+  cloud-eligible fact on a cloud-linked side), an episode seed only comes
+  from a cloud-eligible fact's cloud-linked sides, and a hop only goes
+  through a kept fact's cloud-linked sides. Ranking: hop, then confidence,
+  `valid_from` desc, id; at most `hafiza_facts_max_lines` (12) lines / `hafiza_facts_max_runes`
   (1200) runes, chunk lines dropped first to make room. The
   `hafiza_injected` row gains `fact_ids` (exactly the facts in the block)
   and `entity_ids` (every entity the walk read); `block`/`block_sha256`
@@ -632,9 +645,10 @@ a cloud model, without changing anything in §2-§6 above:
 - **Structured memory tools and filters (FIX-MEM-4, G13).** `/v1/mcp`
   lists five memory tools. `memory_search` gains optional filters
   (`since`/`until` RFC3339 on the note's first-index time, `source`
-  exact, `path_prefix` byte-exact, `entity_id` = notes an active fact about
-  that entity cites, `min_tier` on the lattice user_edit > user_asserted >
-  external_doc > screen > agent_derived), applied by
+  exact, `path_prefix` byte-exact, `entity_id` = notes an active fact cites
+  whose link to that entity a cloud-lane extraction call wrote (never a
+  local-lane link, migration 0025), `min_tier` on the lattice user_edit >
+  user_asserted > external_doc > screen > agent_derived), applied by
   `search.Searcher.SearchFiltered` to the fused candidates BEFORE the
   recency pool and the top-k cut (scores and the fusion identity are
   unchanged); a filter against a searcher without it is refused
@@ -654,9 +668,13 @@ a cloud model, without changing anything in §2-§6 above:
   labelled `quarantined: true` - a tool answer only, never written into
   `<hafiza>` or a profile card, G00 H-6). Both always answer in the CLOUD
   lane (the caller is a worker - a cloud session): no secret-path fact, no
-  fact without a resolvable citation, and only VISIBLE names (an alias only
-  a secret note carries is neither matched nor listed, a canonical name only
-  a secret note uses is replaced, secret facts are not counted). Deviation
+  fact without a resolvable citation, only cloud-lane identity (candidates
+  by cloud-lane alias; an alias counts only when it is a cloud-lane alias
+  AND a visible name on a cloud-linked side of a cloud-eligible fact; an
+  `entity_id` filter matches only a cloud-lane link and a local-lane link is
+  reported as entity id 0), so an alias or link only a secret note led to
+  is neither matched nor listed, a canonical name that does not count is
+  replaced, and secret facts are not counted. Deviation
   from the recipe: the task's lane is not looked up (a secret-lane task's
   worker gets the same filter). Unwired graph: `"graf katmanı bu kurulumda
   kullanılamıyor"`. The user's LOCAL view is `kahya fact query [--subject S]

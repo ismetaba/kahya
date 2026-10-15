@@ -13,19 +13,19 @@ import (
 func TestListEntitiesPrefixFoldedAndProvisionalFilter(t *testing.T) {
 	e, _ := newTestEngine(t)
 	ctx := context.Background()
-	emre, _, _, err := e.ResolveEntityForExtraction(ctx, "tr", "Emre", EntityKindPerson)
+	emre, _, _, err := e.ResolveEntityForExtraction(ctx, "tr", "Emre", EntityKindPerson, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.AddAlias(ctx, "tr", emre, "Emre Bey"); err != nil {
+	if _, err := e.AddAlias(ctx, "tr", emre, "Emre Bey", false); err != nil {
 		t.Fatal(err)
 	}
-	acme, _, _, err := e.ResolveEntityForExtraction(ctx, "tr", "Acme", EntityKindOrg)
+	acme, _, _, err := e.ResolveEntityForExtraction(ctx, "tr", "Acme", EntityKindOrg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A second "Emre" of another kind is a provisional namesake.
-	emre2, _, prov, err := e.ResolveEntityForExtraction(ctx, "tr", "EMRE", EntityKindOrg)
+	emre2, _, prov, err := e.ResolveEntityForExtraction(ctx, "tr", "EMRE", EntityKindOrg, false)
 	if err != nil || !prov {
 		t.Fatalf("namesake = %d provisional %v (%v), want provisional", emre2, prov, err)
 	}
@@ -61,8 +61,8 @@ func TestListEntitiesPrefixFoldedAndProvisionalFilter(t *testing.T) {
 func TestShowEntityAliasesFactsAndQuarantine(t *testing.T) {
 	e, st := newTestEngine(t)
 	ctx := context.Background()
-	emre, _, _, _ := e.ResolveEntityForExtraction(ctx, "tr", "Emre", EntityKindPerson)
-	acme, _, _, _ := e.ResolveEntityForExtraction(ctx, "tr", "Acme", EntityKindOrg)
+	emre, _, _, _ := e.ResolveEntityForExtraction(ctx, "tr", "Emre", EntityKindPerson, false)
+	acme, _, _, _ := e.ResolveEntityForExtraction(ctx, "tr", "Acme", EntityKindOrg, false)
 	insertCleanSession(t, st, "clean-1")
 	userFact, err := e.WriteFact(ctx, "tr", Candidate{
 		Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: ProvenanceUserAsserted,

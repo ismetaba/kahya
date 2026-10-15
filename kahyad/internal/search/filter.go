@@ -22,8 +22,13 @@ type Filter struct {
 	// PathPrefix is a byte-exact prefix of episodes.source_path (relative to
 	// the memory dir, forward slashes, e.g. "people/").
 	PathPrefix string
-	// EntityID keeps only chunks of episodes an ACTIVE fact touching that
-	// entity (subject or object) cites.
+	// EntityID keeps only chunks of episodes an ACTIVE fact cites whose
+	// link to that entity (subject or object side) a CLOUD-lane extraction
+	// call wrote (facts.subject_link_cloud/object_link_cloud, migration
+	// 0025). A link a local-lane call wrote - it may have resolved a name
+	// through an alias only a secret note carries - never narrows the search
+	// to an episode: the only caller is the worker's memory_search tool, a
+	// cloud reader (kahyad/internal/graph's package doc has the rule).
 	EntityID int64
 	// MinTier is the trust-lattice floor: user_edit > user_asserted >
 	// external_doc > screen > agent_derived. An unknown value is an error.
@@ -96,9 +101,9 @@ func (s *Searcher) filterBatch(ctx context.Context, ids []int64, f Filter, tiers
 		args = append(args, id)
 	}
 	// The entity half is the only one SQL decides (an EXISTS over the
-	// evidence/facts join); the rest is compared in Go, where a timestamp
-	// is parsed rather than string-compared (RFC3339Nano is not always
-	// lexicographically ordered).
+	// evidence/facts join, cloud-lane links only - see Filter.EntityID); the
+	// rest is compared in Go, where a timestamp is parsed rather than
+	// string-compared (RFC3339Nano is not always lexicographically ordered).
 	args = append(args, f.EntityID, f.EntityID, f.EntityID)
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT c.id, e.created_at, e.source, e.source_path, e.source_tier
@@ -108,7 +113,8 @@ func (s *Searcher) filterBatch(ctx context.Context, ids []int64, f Filter, tiers
 		  AND (? = 0 OR EXISTS (
 		        SELECT 1 FROM evidence ev JOIN facts fa ON fa.id = ev.fact_id
 		        WHERE ev.episode_id = e.id AND fa.status = 'active'
-		          AND (fa.subject_entity_id = ? OR fa.object_entity_id = ?)))`, strings.Join(placeholders, ",")), args...)
+		          AND ((fa.subject_entity_id = ? AND fa.subject_link_cloud = 1)
+		               OR (fa.object_entity_id = ? AND fa.object_link_cloud = 1))))`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return err
 	}

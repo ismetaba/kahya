@@ -45,7 +45,7 @@ func eventPayloads(t *testing.T, st *store.Store, kind string) []map[string]any 
 
 func resolve(t *testing.T, e *Engine, name, kind string) (int64, bool, bool) {
 	t.Helper()
-	id, created, provisional, err := e.ResolveEntityForExtraction(context.Background(), "trace-resolve", name, kind)
+	id, created, provisional, err := e.ResolveEntityForExtraction(context.Background(), "trace-resolve", name, kind, false)
 	if err != nil {
 		t.Fatalf("ResolveEntityForExtraction(%q, %q): %v", name, kind, err)
 	}
@@ -205,18 +205,18 @@ func TestAddAliasSkipsAliasOwnedByAnotherEntity(t *testing.T) {
 	emre, _, _ := resolve(t, e, "Emre Yılmaz", "person")
 	ahmet, _, _ := resolve(t, e, "Ahmet", "person")
 
-	added, err := e.AddAlias(ctx, "trace-alias", emre, "Emre")
+	added, err := e.AddAlias(ctx, "trace-alias", emre, "Emre", false)
 	if err != nil || !added {
 		t.Fatalf("AddAlias(Emre) = %v, %v; want added", added, err)
 	}
-	if added, err := e.AddAlias(ctx, "trace-alias", emre, "Emre"); err != nil || added {
+	if added, err := e.AddAlias(ctx, "trace-alias", emre, "Emre", false); err != nil || added {
 		t.Fatalf("repeat AddAlias = %v, %v; want not added (already there)", added, err)
 	}
 	if got, created, _ := resolve(t, e, "emre", "person"); got != emre || created {
 		t.Fatalf("emre resolves to %d (created %v), want %d through the new alias", got, created, emre)
 	}
 
-	added, err = e.AddAlias(ctx, "trace-alias", ahmet, "EMRE")
+	added, err = e.AddAlias(ctx, "trace-alias", ahmet, "EMRE", false)
 	if err != nil || added {
 		t.Fatalf("AddAlias(ahmet, EMRE) = %v, %v; want skipped", added, err)
 	}
@@ -229,10 +229,10 @@ func TestAddAliasSkipsAliasOwnedByAnotherEntity(t *testing.T) {
 		t.Fatalf("Ahmet aliases = %+v, %v; want only his own", aliases, err)
 	}
 
-	if _, err := e.AddAlias(ctx, "trace-alias", 9999, "x"); err == nil {
+	if _, err := e.AddAlias(ctx, "trace-alias", 9999, "x", false); err == nil {
 		t.Fatal("AddAlias on an unknown entity must fail")
 	}
-	if _, err := e.AddAlias(ctx, "trace-alias", emre, "  "); err == nil {
+	if _, err := e.AddAlias(ctx, "trace-alias", emre, "  ", false); err == nil {
 		t.Fatal("AddAlias with an empty alias must fail")
 	}
 }

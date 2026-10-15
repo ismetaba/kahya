@@ -60,14 +60,14 @@ func getEntityJSON(t *testing.T, client *http.Client, path string, out any) int 
 func TestEntityListPrefixAndShow(t *testing.T) {
 	client, fe, st := newEntityRouteFixture(t, true)
 	ctx := context.Background()
-	emre, _, _, err := fe.ResolveEntityForExtraction(ctx, "tr", "Emre", factengine.EntityKindPerson)
+	emre, _, _, err := fe.ResolveEntityForExtraction(ctx, "tr", "Emre", factengine.EntityKindPerson, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fe.AddAlias(ctx, "tr", emre, "Emre Bey"); err != nil {
+	if _, err := fe.AddAlias(ctx, "tr", emre, "Emre Bey", false); err != nil {
 		t.Fatal(err)
 	}
-	acme, _, _, err := fe.ResolveEntityForExtraction(ctx, "tr", "Acme", factengine.EntityKindOrg)
+	acme, _, _, err := fe.ResolveEntityForExtraction(ctx, "tr", "Acme", factengine.EntityKindOrg, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,6 +19,20 @@
 // kind-compatible entity - identity resolution, not a merge - and otherwise
 // falls back to the provisional-new-row rule above.
 //
+// Lane-scoped identity (migration 0025, FIX-MEM-1/MEM-4 review): which
+// entity a name resolves to can itself be secret ("Doktorum Ayse Kaya" in a
+// finans/saglik/kimlik note makes "Doktor" an alias of Ayse Kaya). Every
+// alias row records whether a CLOUD-lane call added it. A cloud-lane
+// resolution or alias-collision check (cloudLane true - the extractor's call
+// ran on the cloud model, so its bytes were classified non-secret locally)
+// consults only those rows, the CLOUD VIEW, and the rows it writes join the
+// cloud view; a local-lane one consults every row (a resolution prefers the
+// entities a local-lane call named, see resolutionCandidates) and writes
+// local-only rows. So an alias a secret note gave an entity never makes an
+// ordinary note's name resolve to that entity on the cloud lane, and the
+// links a cloud-lane call writes (Candidate.LinksCloudLane) depend on
+// cloud-lane data alone. ResolveOrCreateEntity writes local-only rows.
+//
 // MergeEntities/SplitEntities are the only two operations that ever
 // change that fact: Merge requires a real, existing fact id as its
 // distinguishing evidence (never optional, never name-similarity alone)
@@ -197,7 +211,7 @@ func (e *Engine) ResolveOrCreateEntity(ctx context.Context, name, kind string) (
 		return 0, false, fmt.Errorf("factengine: lookup alias %q: %w", name, err)
 	}
 	provisional = len(existingIDs) > 0
-	entityID, err = e.insertEntity(ctx, name, kind, provisional)
+	entityID, err = e.insertEntity(ctx, name, kind, provisional, false)
 	if err != nil {
 		return 0, false, err
 	}
@@ -205,8 +219,8 @@ func (e *Engine) ResolveOrCreateEntity(ctx context.Context, name, kind string) (
 }
 
 // insertEntity creates one active entity named name plus its first alias
-// row (alias_folded = AliasKey(name)).
-func (e *Engine) insertEntity(ctx context.Context, name, kind string, provisional bool) (int64, error) {
+// row (alias_folded = AliasKey(name)), in the cloud view when cloudLane.
+func (e *Engine) insertEntity(ctx context.Context, name, kind string, provisional, cloudLane bool) (int64, error) {
 	prov := int64(0)
 	if provisional {
 		prov = 1
@@ -219,7 +233,7 @@ func (e *Engine) insertEntity(ctx context.Context, name, kind string, provisiona
 		return 0, fmt.Errorf("factengine: insert entity %q: %w", name, err)
 	}
 	if _, err := e.store.InsertEntityAlias(ctx, sqlcgen.InsertEntityAliasParams{
-		EntityID: ent.ID, Alias: name, AliasFolded: nullString(AliasKey(name)), CreatedAt: now,
+		EntityID: ent.ID, Alias: name, AliasFolded: nullString(AliasKey(name)), CreatedAt: now, CloudLane: laneFlag(cloudLane),
 	}); err != nil {
 		return 0, fmt.Errorf("factengine: insert alias for entity %d: %w", ent.ID, err)
 	}
@@ -246,14 +260,20 @@ func (e *Engine) insertEntity(ctx context.Context, name, kind string, provisiona
 // reusing an unambiguous exact alias is identity resolution, nothing is ever
 // joined to anything, and MergeEntities/SplitEntities remain the only way
 // two rows become one. The stored canonical_name/alias keep the surface form.
-func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string) (entityID int64, created, provisional bool, err error) {
+//
+// cloudLane selects the view (package doc): a cloud-lane call counts only
+// cloud-view aliases in every case above and creates its entity's first
+// alias in the cloud view; a local-lane call counts every alias. A
+// cloud-lane call that reuses an entity therefore reuses it through a name a
+// cloud-lane call gave it - never through an alias only a secret note added.
+func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string, cloudLane bool) (entityID int64, created, provisional bool, err error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return 0, false, false, errors.New("factengine: entity name is required")
 	}
 	kind = NormalizeEntityKind(kind)
 	key := AliasKey(name)
-	ids, err := e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+	ids, err := e.resolutionCandidates(ctx, key, cloudLane)
 	if err != nil {
 		return 0, false, false, fmt.Errorf("factengine: lookup alias key %q: %w", key, err)
 	}
@@ -261,7 +281,7 @@ func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, 
 	reason := ""
 	switch len(ids) {
 	case 0:
-		exact, err := e.store.ListEntityIDsByAlias(ctx, name)
+		exact, err := e.entityIDsByExactAlias(ctx, name, cloudLane)
 		if err != nil {
 			return 0, false, false, fmt.Errorf("factengine: lookup alias %q: %w", name, err)
 		}
@@ -287,17 +307,64 @@ func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, 
 		reason, provisional = EntityCreatedAmbiguousAlias, true
 	}
 
-	entityID, err = e.insertEntity(ctx, name, kind, provisional)
+	entityID, err = e.insertEntity(ctx, name, kind, provisional, cloudLane)
 	if err != nil {
 		return 0, false, false, err
 	}
 	if e.ledger != nil {
 		_ = e.ledger.LogEvent(ctx, traceID, EventEntityCreated, map[string]any{
 			"entity_id": entityID, "canonical_name": name, "kind": kind,
-			"provisional": provisional, "reason": reason,
+			"provisional": provisional, "reason": reason, "cloud_lane": cloudLane,
 		})
 	}
 	return entityID, true, provisional, nil
+}
+
+// entityIDsByAliasKey is ListActiveEntityIDsByAliasFolded in the requested
+// view (cloudLane: aliases a cloud-lane call added only) - AddAlias's
+// collision check.
+func (e *Engine) entityIDsByAliasKey(ctx context.Context, key string, cloudLane bool) ([]int64, error) {
+	if cloudLane {
+		return e.store.ListActiveCloudEntityIDsByAliasFolded(ctx, nullString(key))
+	}
+	return e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+}
+
+// resolutionCandidates is the entity set ResolveEntityForExtraction applies
+// its rule to: the cloud view for a cloud-lane call; for a local-lane call
+// the entities a LOCAL-lane call gave that key, falling back to every
+// active entity with it. The local preference only matters for a name the
+// two lanes split: a cloud-lane call cannot see a local-only alias, so it
+// creates its own twin of such a name, and without the preference every
+// later local sighting would see two candidates and mint yet another
+// provisional entity. Nothing a local-lane call writes is in the cloud
+// view, so this choice never reaches a cloud reader.
+func (e *Engine) resolutionCandidates(ctx context.Context, key string, cloudLane bool) ([]int64, error) {
+	if cloudLane {
+		return e.store.ListActiveCloudEntityIDsByAliasFolded(ctx, nullString(key))
+	}
+	ids, err := e.store.ListActiveLocalEntityIDsByAliasFolded(ctx, nullString(key))
+	if err != nil || len(ids) > 0 {
+		return ids, err
+	}
+	return e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+}
+
+// entityIDsByExactAlias is ListEntityIDsByAlias in the requested view.
+func (e *Engine) entityIDsByExactAlias(ctx context.Context, alias string, cloudLane bool) ([]int64, error) {
+	if cloudLane {
+		return e.store.ListCloudEntityIDsByAlias(ctx, alias)
+	}
+	return e.store.ListEntityIDsByAlias(ctx, alias)
+}
+
+// laneFlag is entity_aliases.cloud_lane for a row written from a call in
+// that lane.
+func laneFlag(cloudLane bool) int64 {
+	if cloudLane {
+		return 1
+	}
+	return 0
 }
 
 // AddAlias adds alias to entityID (an active entity) for the extractor's
@@ -307,7 +374,13 @@ func (e *Engine) ResolveEntityForExtraction(ctx context.Context, traceID, name, 
 // already answers to (an alias is never taken from, or shared with, another
 // entity; MergeEntities is the only way names move). An empty alias, or an
 // unknown or non-active entity, is an error.
-func (e *Engine) AddAlias(ctx context.Context, traceID string, entityID int64, alias string) (added bool, err error) {
+//
+// cloudLane selects the view (package doc): a cloud-lane call checks
+// collisions against cloud-view aliases only and writes a cloud-view row; an
+// alias the entity already has from a local-lane call joins the cloud view
+// (the cloud bytes state it too) unless another entity answers to it there.
+// A local-lane call checks every alias and writes a local-only row.
+func (e *Engine) AddAlias(ctx context.Context, traceID string, entityID int64, alias string, cloudLane bool) (added bool, err error) {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		return false, errors.New("factengine: alias is required")
@@ -319,13 +392,16 @@ func (e *Engine) AddAlias(ctx context.Context, traceID string, entityID int64, a
 	if ent.Status != "active" {
 		return false, fmt.Errorf("factengine: add alias: entity %d is %s", entityID, ent.Status)
 	}
-	if _, err := e.store.GetEntityAliasByEntityAndAlias(ctx, sqlcgen.GetEntityAliasByEntityAndAliasParams{EntityID: entityID, Alias: alias}); err == nil {
-		return false, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	existing, err := e.store.GetEntityAliasByEntityAndAlias(ctx, sqlcgen.GetEntityAliasByEntityAndAliasParams{EntityID: entityID, Alias: alias})
+	found := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("factengine: lookup alias %q on entity %d: %w", alias, entityID, err)
 	}
+	if found && (!cloudLane || existing.CloudLane == 1) {
+		return false, nil
+	}
 	key := AliasKey(alias)
-	owners, err := e.store.ListActiveEntityIDsByAliasFolded(ctx, nullString(key))
+	owners, err := e.entityIDsByAliasKey(ctx, key, cloudLane)
 	if err != nil {
 		return false, fmt.Errorf("factengine: lookup alias key %q: %w", key, err)
 	}
@@ -335,13 +411,20 @@ func (e *Engine) AddAlias(ctx context.Context, traceID string, entityID int64, a
 		}
 		if e.ledger != nil {
 			_ = e.ledger.LogEvent(ctx, traceID, EventAliasSkippedCollision, map[string]any{
-				"entity_id": entityID, "alias": alias, "owner_entity_id": owner,
+				"entity_id": entityID, "alias": alias, "owner_entity_id": owner, "cloud_lane": cloudLane,
 			})
 		}
 		return false, nil
 	}
+	if found {
+		// A local-lane row the cloud bytes state too: it joins the cloud view.
+		if err := e.store.MarkEntityAliasCloud(ctx, existing.ID); err != nil {
+			return false, fmt.Errorf("factengine: mark alias %d cloud-lane: %w", existing.ID, err)
+		}
+		return false, nil
+	}
 	if _, err := e.store.InsertEntityAlias(ctx, sqlcgen.InsertEntityAliasParams{
-		EntityID: entityID, Alias: alias, AliasFolded: nullString(key), CreatedAt: e.nowRFC3339(),
+		EntityID: entityID, Alias: alias, AliasFolded: nullString(key), CreatedAt: e.nowRFC3339(), CloudLane: laneFlag(cloudLane),
 	}); err != nil {
 		return false, fmt.Errorf("factengine: insert alias for entity %d: %w", entityID, err)
 	}

@@ -136,7 +136,8 @@ func TestSearchFilteredPathPrefixAndSource(t *testing.T) {
 }
 
 // TestSearchFilteredEntityIDOnlyCitedEpisodes: entity_id keeps only the
-// chunks of episodes an ACTIVE fact touching that entity cites.
+// chunks of episodes an ACTIVE fact touching that entity (through a
+// cloud-lane link) cites.
 func TestSearchFilteredEntityIDOnlyCitedEpisodes(t *testing.T) {
 	st := newTestStore(t)
 	ids, eps := seedFiltered(t, st,
@@ -158,8 +159,8 @@ func TestSearchFilteredEntityIDOnlyCitedEpisodes(t *testing.T) {
 	emre := exec(`INSERT INTO entities (canonical_name, kind, status, created_at) VALUES ('Emre', 'person', 'active', ?)`, now)
 	ayse := exec(`INSERT INTO entities (canonical_name, kind, status, created_at) VALUES ('Ayşe', 'person', 'active', ?)`, now)
 	fact := func(subjID int64, status string, ep int64) {
-		id := exec(`INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, status, updated_at, created_at, subject_entity_id)
-			VALUES ('x', 'works_on', 'proje', 'user_asserted', 'witnessed', 2, ?, ?, ?, ?)`, status, now, now, subjID)
+		id := exec(`INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, status, updated_at, created_at, subject_entity_id, subject_link_cloud)
+			VALUES ('x', 'works_on', 'proje', 'user_asserted', 'witnessed', 2, ?, ?, ?, ?, 1)`, status, now, now, subjID)
 		exec(`INSERT INTO evidence (fact_id, episode_id, polarity, weight, created_at) VALUES (?, ?, 1, 2, ?)`, id, ep, now)
 	}
 	fact(emre, "active", eps[0])
@@ -172,6 +173,49 @@ func TestSearchFilteredEntityIDOnlyCitedEpisodes(t *testing.T) {
 	}
 	if got := searchF(t, s, "proje", 8, Filter{EntityID: 999}); len(got) != 0 {
 		t.Fatalf("unknown entity = %v, want none", hitIDs(got))
+	}
+}
+
+// TestSearchFilteredEntityIDFollowsOnlyCloudLaneLinks (FIX-MEM-1/MEM-4
+// review, migration 0025): the memory_search entity_id filter answers a
+// worker - a cloud reader - so it follows only a link a cloud-lane
+// extraction call wrote. A link a local-lane call wrote (it may have
+// resolved "Doktor" through an alias only a secret note gives Ayşe Kaya)
+// never returns that note's chunks for Ayşe Kaya's entity, on either side.
+func TestSearchFilteredEntityIDFollowsOnlyCloudLaneLinks(t *testing.T) {
+	st := newTestStore(t)
+	ids, eps := seedFiltered(t, st,
+		filterSeed{"people/ayse.md", "Ayşe Kaya Kadıköy notu", "memory_file", "user_asserted", at(3)},
+		filterSeed{"inbox/2026-07-10.md", "Doktor ile kahve notu", "memory_file", "user_asserted", at(3)},
+		filterSeed{"inbox/2026-07-11.md", "Kullanıcı Doktor ziyareti notu", "memory_file", "user_asserted", at(3)},
+	)
+	db := st.DB()
+	exec := func(q string, args ...any) int64 {
+		t.Helper()
+		res, err := db.Exec(q, args...)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	now := at(0)
+	ayse := exec(`INSERT INTO entities (canonical_name, kind, status, created_at) VALUES ('Ayşe Kaya', 'person', 'active', ?)`, now)
+	cite := func(factID, ep int64) {
+		exec(`INSERT INTO evidence (fact_id, episode_id, polarity, weight, created_at) VALUES (?, ?, 1, 2, ?)`, factID, ep, now)
+	}
+	// Cloud-lane subject link: Ayşe Kaya lives_in Kadıköy (people/ayse.md).
+	cite(exec(`INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, status, updated_at, created_at, subject_entity_id, subject_link_cloud)
+		VALUES ('Ayşe Kaya', 'lives_in', 'Kadıköy', 'user_asserted', 'witnessed', 2, 'active', ?, ?, ?, 1)`, now, now, ayse), eps[0])
+	// Local-lane links: "Doktor" -> Ayşe Kaya, as subject and as object.
+	cite(exec(`INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, status, updated_at, created_at, subject_entity_id, subject_link_cloud)
+		VALUES ('Doktor', 'drinks', 'kahve', 'user_asserted', 'witnessed', 2, 'active', ?, ?, ?, 0)`, now, now, ayse), eps[1])
+	cite(exec(`INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, status, updated_at, created_at, object_entity_id, object_link_cloud)
+		VALUES ('Kullanıcı', 'visited', 'Doktor', 'user_asserted', 'witnessed', 2, 'active', ?, ?, ?, 0)`, now, now, ayse), eps[2])
+
+	s := newTestSearcher(t, st)
+	if got := searchF(t, s, "notu", 8, Filter{EntityID: ayse}); !reflect.DeepEqual(hitIDs(got), []int64{ids[0]}) {
+		t.Fatalf("entity %d = %v, want only the cloud-linked note [%d] (local-lane links followed)", ayse, hitIDs(got), ids[0])
 	}
 }
 

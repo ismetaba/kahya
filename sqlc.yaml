@@ -94,6 +94,11 @@ sql:
       # select, so it MUST be here for sqlc to regenerate the Fact,
       # EntityAlias and Episode models with them.
       - "kahyad/migrations/0024_memory_v2_graph.sql"
+      # 0025 (FIX-MEM-1/MEM-4 review: lane-scoped entity identity) is plain
+      # ALTER TABLE ADD COLUMN (entity_aliases.cloud_lane,
+      # facts.subject_link_cloud/object_link_cloud) plus a plain CREATE
+      # INDEX - columns the Fact and EntityAlias models carry.
+      - "kahyad/migrations/0025_memory_link_lanes.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:
