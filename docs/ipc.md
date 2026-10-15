@@ -496,7 +496,10 @@ a cloud model, without changing anything in §2-§6 above:
   `memory_search` tool result and the `for_injection:true` `<hafiza>`
   block never carry a chunk of a secret-glob note (`gizli/**`,
   `finans*.md`), whatever its tier; `for_injection:false` (the local
-  surface) is unfiltered.
+  surface) is unfiltered. Nightly consolidation's
+  `consolidation.PartitionByLane` keeps a `gizli/**` note in the local lane,
+  and a secret-lane glob it cannot evaluate now counts as a match (local
+  lane, fail-closed) instead of "no match" (cloud lane).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

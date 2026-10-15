@@ -52,14 +52,50 @@ func TestPartitionByLaneNoGlobsEverythingCloud(t *testing.T) {
 	}
 }
 
-func TestPartitionByLaneMatcherErrorTreatedAsNoMatch(t *testing.T) {
-	files := map[string]string{"a.md": "x"}
+// TestPartitionByLaneMatcherErrorTreatedAsSecret (FIX-U-3): a glob that
+// cannot be evaluated - or no matcher at all - puts the file in the LOCAL
+// lane, never the cloud one (fail-closed; memlane.PathIsSecret applies
+// the same rule). It replaces TestPartitionByLaneMatcherErrorTreatedAsNoMatch,
+// which pinned the old fail-open "no match" folding.
+func TestPartitionByLaneMatcherErrorTreatedAsSecret(t *testing.T) {
+	files := map[string]string{"a.md": "x", "gizli/notes/inbox/b.md": "y"}
 	m := fakeMatcher{matchFn: func(pattern, path string) (bool, error) {
 		return false, errors.New("forced glob error")
 	}}
-	cloud, local := PartitionByLane(files, "/home/user/Kahya/memory", []string{"**"}, m)
-	if _, ok := cloud["a.md"]; !ok {
-		t.Fatalf("a.md should stay in cloudFiles when the matcher errors: cloud=%v local=%v", cloud, local)
+	for _, tc := range []struct {
+		name    string
+		matcher GlobMatcher
+	}{{"erroring", m}, {"nil", nil}} {
+		cloud, local := PartitionByLane(files, "/home/user/Kahya/memory", []string{"/home/user/Kahya/memory/gizli/**"}, tc.matcher)
+		if len(cloud) != 0 || len(local) != 2 {
+			t.Fatalf("%s matcher: cloud=%v local=%v, want every file local (fail-closed)", tc.name, cloud, local)
+		}
+	}
+	// No globs configured: nothing is evaluated, nothing is secret.
+	cloud, local := PartitionByLane(files, "/home/user/Kahya/memory", nil, nil)
+	if len(cloud) != 2 || len(local) != 0 {
+		t.Fatalf("no globs: cloud=%v local=%v, want everything cloud", cloud, local)
+	}
+}
+
+// TestPartitionByLaneGizliNoteGoesLocal (FIX-U-3): a note memory_write
+// redirected under gizli/ is local-lane under the real policy.yaml glob.
+func TestPartitionByLaneGizliNoteGoesLocal(t *testing.T) {
+	pol, err := policy.Load("../../../policy.yaml")
+	if err != nil {
+		t.Fatalf("policy.Load() error = %v", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("home dir: %v", err)
+	}
+	files := map[string]string{"gizli/notes/inbox/2026-10-13.md": "secret", "inbox/2026-10-13.md": "ordinary"}
+	cloud, local := PartitionByLane(files, home+"/Kahya/memory", pol.SecretLaneGlobs, PolicyGlobMatcher{})
+	if _, ok := local["gizli/notes/inbox/2026-10-13.md"]; !ok || len(local) != 1 {
+		t.Fatalf("local = %v, want only the gizli/ note", local)
+	}
+	if _, ok := cloud["inbox/2026-10-13.md"]; !ok || len(cloud) != 1 {
+		t.Fatalf("cloud = %v, want only the ordinary inbox note", cloud)
 	}
 }
 

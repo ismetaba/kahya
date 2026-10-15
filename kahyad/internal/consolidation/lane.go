@@ -51,16 +51,16 @@ func (PolicyGlobMatcher) Match(pattern, path string) (bool, error) {
 // every entry in secretGlobs (already ~-expanded - kahyad/internal/
 // policy.Policy.SecretLaneGlobs). A file matching ANY glob goes to
 // localFiles and is skipped from cloudFiles entirely - never both. Globs
-// are matched with matcher (PolicyGlobMatcher{} in production); a glob
-// syntax error is folded into "no match for this glob" (logged by the
-// caller if it cares) rather than aborting the whole partition, since
-// policy.Load has ALREADY validated every glob's syntax at boot
-// (kahyad/internal/policy/loader.go's validateGlobSyntax) - a runtime
-// error here would only ever be a doublestar library edge case, and
-// fail-closed for THIS specific check means "assume it might be
-// secret" is the WRONG direction (over-blocking a file into local-lane
-// is always safe; the invariant this function exists to protect is
-// "never cloud", not "never local").
+// are matched with matcher (PolicyGlobMatcher{} in production; nil = the
+// file is treated as secret). A glob that cannot be evaluated counts as a
+// MATCH (fail-closed, FIX-U-3): policy.Load has already validated every
+// glob's syntax at boot (kahyad/internal/policy/loader.go's
+// validateGlobSyntax), so a runtime error is a doublestar edge case - and
+// over-blocking a file into the local lane is always safe, while treating
+// it as "no match" would hand a possibly secret file (a gizli/** note
+// memory_write redirected, a finans*.md note) to the cloud lane. The
+// invariant this function exists to protect is "never cloud", not "never
+// local". This is the same rule memlane.Classifier.PathIsSecret applies.
 func PartitionByLane(files map[string]string, memoryDir string, secretGlobs []string, matcher GlobMatcher) (cloudFiles, localFiles map[string]string) {
 	cloudFiles = make(map[string]string, len(files))
 	localFiles = make(map[string]string, len(files))
@@ -77,16 +77,16 @@ func PartitionByLane(files map[string]string, memoryDir string, secretGlobs []st
 }
 
 // matchesAnySecretGlob reports whether absPath matches any entry in
-// globs. A per-glob match error is treated as "no match" - see
-// PartitionByLane's own doc comment for why over-blocking (not
-// over-trusting) is the safe direction here regardless.
+// globs. A per-glob match error, or a nil matcher while globs are
+// configured, is treated as a match - see PartitionByLane's own doc
+// comment for why over-blocking (not over-trusting) is the safe direction.
 func matchesAnySecretGlob(absPath string, globs []string, matcher GlobMatcher) bool {
 	for _, g := range globs {
-		ok, err := matcher.Match(g, absPath)
-		if err != nil {
-			continue
+		if matcher == nil {
+			return true
 		}
-		if ok {
+		ok, err := matcher.Match(g, absPath)
+		if err != nil || ok {
 			return true
 		}
 	}
