@@ -238,6 +238,10 @@ func (x *Executor) nowRFC3339() string { return x.now().UTC().Format(time.RFC333
 // machine's three terminal, zero-outbound-edge statuses
 // (kahyad/internal/task.allowedTransitions has no entry at all for any of
 // these three, by construction).
+// haltTransitionAttempts bounds HaltTask's user_halted compare-and-set
+// retries against concurrent non-terminal transitions.
+const haltTransitionAttempts = 8
+
 func isTerminalStatus(status string) bool {
 	switch status {
 	case task.StatusDone, task.StatusFailed, task.StatusUserHalted:
@@ -327,14 +331,35 @@ func (x *Executor) HaltTask(ctx context.Context, taskID string) (haltedNow bool,
 	// acceptance criterion greps for).
 	//
 	// FIX-I-14: only a transition that actually happened counts as a halt
-	// (haltedNow, halted_at, task.user_halted below). A lost race
-	// (ErrLostTransitionRace - the task concurrently reached a terminal
-	// status) or an illegal edge is logged and NOT counted; the remaining
-	// safety steps (outbox cancel, approvals) still run regardless.
-	haltedNow = true
-	if err := x.machine.Transition(ctx, traceID, taskID, task.StatusUserHalted); err != nil {
-		x.logJSONLErr(traceID, "halt.transition_failed", taskID, err)
-		haltedNow = false
+	// (haltedNow, halted_at, task.user_halted below). An illegal edge or a
+	// DB error is logged and NOT counted; the remaining safety steps (outbox
+	// cancel, approvals) still run regardless.
+	//
+	// FIX-FINAL halt-lost-cas-race-leaves-task-runnable: a lost compare-
+	// and-set (ErrLostTransitionRace) does NOT mean the task reached a
+	// terminal status. The winner can be a non-terminal edge - the outbox
+	// redispatch (retry-wait -> executing), a cloud park (executing ->
+	// retry-wait), a resume-scan block, Resolver.Retry - and giving up then
+	// left the task runnable: the next Unregister cleared the halt mark and
+	// the resume scan ran the task to completion after the user pressed
+	// the halt key. So the halt re-reads the status and retries while the
+	// task is still non-terminal (bounded); haltedNow=false only when it
+	// really reached done, failed or user_halted.
+	haltedNow = false
+	for attempt := 0; attempt < haltTransitionAttempts; attempt++ {
+		terr := x.machine.Transition(ctx, traceID, taskID, task.StatusUserHalted)
+		if terr == nil {
+			haltedNow = true
+			break
+		}
+		x.logJSONLErr(traceID, "halt.transition_failed", taskID, terr)
+		if !errors.Is(terr, task.ErrLostTransitionRace) {
+			break
+		}
+		cur, gerr := x.store.GetTaskByID(ctx, taskID)
+		if gerr != nil || isTerminalStatus(cur.Status) {
+			break // a terminal status won: genuinely not halted now
+		}
 	}
 	// FIX-FINAL halt-does-not-stop-inprocess-sessions: cancel the task's
 	// in-process sessions (a local answer, a briefing run) AFTER the
