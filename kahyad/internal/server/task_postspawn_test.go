@@ -34,7 +34,9 @@ func TestDecidePostSpawnTable(t *testing.T) {
 		{"budget_blocked_reports_paused", task.StatusBlockedUser, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "paused_budget", "error", fmt.Sprintf(MsgTaskPausedBudgetFmt, trace, id)},
 		{"executing_timeout_stays", task.StatusExecuting, nil, spawn.Outcome{Status: spawn.StatusTimeout}, "", "error", "error", fmt.Sprintf(MsgTaskTimeout, 30)},
 		{"parked_error_line_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusError, ErrMsg: "x"}, "", "waiting_retry", "error", task.MsgCloudParked},
-		{"parked_ok_reports_parked", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "waiting_retry", "error", task.MsgCloudParked},
+		// FIX-FINAL park-then-cli-retry-success-reruns-task: a clean success after
+		// a park (the CLI's own retry succeeded) un-parks to done.
+		{"parked_ok_unparks_done", task.StatusRetryWait, nil, spawn.Outcome{Status: spawn.StatusOK}, task.StatusDone, "done", "result", ""},
 		{"halted_ok_untouched", task.StatusUserHalted, nil, spawn.Outcome{Status: spawn.StatusOK}, "", "done", "result", ""},
 		{"failed_runerr_untouched", task.StatusFailed, errors.New("boom"), spawn.Outcome{}, "", "error", "error", ""},
 		// FIX-U-4: the egress-gate callback already failed the task; the

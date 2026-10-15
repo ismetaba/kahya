@@ -1316,7 +1316,13 @@ the same markers there (`_is_cloud_unreachable_text`) and prints
 when the task's status is `bekliyor-yeniden-deneme` after the worker exits,
 `handleTask` answers with `tasks.state` `waiting_retry`, ledger
 `task_waiting_retry` and the SSE `error` message `task.MsgCloudParked`,
-whatever the worker's terminal line said.
+whatever the worker's terminal error line said - except a clean worker
+success: the CLI retries the 503 itself and the proxy keeps forwarding, so
+when that retry succeeded the parked task moves back to `executing` and on
+to `done` (SSE `result`, ledger `task.unparked_on_success`) instead of
+being re-run at `next_retry_at`; the outbox dispatcher does the same for a
+redispatch re-parked mid-run (FIX-FINAL
+park-then-cli-retry-success-reruns-task).
 
 **`event`-keyed lines (not `type`-keyed):** a few worker lines carry a
 top-level `"event"` key **instead of** `"type"` — kahyad matches these on

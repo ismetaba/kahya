@@ -1253,6 +1253,20 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info(m.ledgerKind, "task_id", taskID)
 
+	if s.taskMachine != nil && d.unpark {
+		// retry-wait's only legal edges are {executing, user_halted}: back
+		// to executing first (still race-free against the dispatcher - the
+		// worker stays registered live until the deferred Unregister), then
+		// done below. A halt that won leaves it user_halted.
+		if terr := s.taskMachine.Transition(persistCtx, traceID, taskID, task.StatusExecuting); terr != nil {
+			log.Warn("task_unpark_failed", "task_id", taskID, "err", terr.Error())
+			d.toStatus = ""
+		} else if s.eventLogger != nil {
+			if err := s.eventLogger.LogEvent(persistCtx, traceID, task.EventUnparkedOnSuccess, map[string]any{"task_id": taskID}); err != nil {
+				log.Warn("task_ledger_error", "kind", task.EventUnparkedOnSuccess, "err", err.Error())
+			}
+		}
+	}
 	if s.taskMachine != nil && d.toStatus != "" {
 		// Machine.Transition's compare-and-set settles a race with a halt:
 		// if the halt won, ErrLostTransitionRace is logged here and the
@@ -1663,6 +1677,11 @@ func mapTaskOutcome(runErr error, outcome spawn.Outcome, traceID, taskID string,
 type postSpawnDecision struct {
 	toStatus string
 	mapping  taskOutcomeMapping
+	// unpark: the task is parked (bekliyor-yeniden-deneme) but its worker
+	// finished cleanly - the CLI's own retry of the 503 succeeded after the
+	// proxy parked it - so it moves back to executing and then to done
+	// (FIX-FINAL park-then-cli-retry-success-reruns-task).
+	unpark bool
 }
 
 // decidePostSpawn is the pure post-spawn decision (G10). current is the
@@ -1697,6 +1716,17 @@ func decidePostSpawn(current string, runErr error, outcome spawn.Outcome, traceI
 	m := mapTaskOutcome(runErr, outcome, traceID, taskID, timeoutMin)
 	switch current {
 	case task.StatusRetryWait:
+		// FIX-FINAL park-then-cli-retry-success-reruns-task: the proxy parks
+		// once the inline retries are exhausted, but the worker's bundled
+		// CLI keeps retrying the 503 itself and the proxy keeps forwarding.
+		// When that retry succeeded and the worker finished cleanly, the
+		// answer is real: reporting "parked" left a pending resume row that
+		// re-ran the finished task at next_retry_at (a second cloud spend, a
+		// second answer, non-identical tool calls again). A clean success
+		// un-parks to done; any other outcome stays parked.
+		if runErr == nil && outcome.Status == spawn.StatusOK {
+			return postSpawnDecision{toStatus: task.StatusDone, mapping: m, unpark: true}
+		}
 		return postSpawnDecision{mapping: taskOutcomeMapping{
 			finalState: "waiting_retry", ledgerKind: "task_waiting_retry",
 			sseEvent: "error", ssePayload: map[string]string{"message": task.MsgCloudParked},

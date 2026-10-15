@@ -670,6 +670,23 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	})
 
 	if runErr == nil && outcome.Status == spawn.StatusOK {
+		// FIX-FINAL park-then-cli-retry-success-reruns-task: this redispatch
+		// may have been re-parked mid-run and then finished cleanly anyway
+		// (the CLI's own retry of the 503 succeeded): retry-wait -> done is
+		// not a legal edge, so the task goes back to executing first (a
+		// from==to no-op when it never left it); the re-park's own future
+		// row is acked by its done guard later.
+		if cur, gerr := d.store.GetTaskByID(recordCtx, t.ID); gerr == nil && cur.Status == task.StatusRetryWait {
+			if err := d.machine.Transition(recordCtx, t.TraceID, t.ID, task.StatusExecuting); err != nil {
+				d.ledgerRaw(recordCtx, t.TraceID, "outbox.transition_failed", map[string]any{
+					"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
+				})
+			} else {
+				d.ledgerRaw(recordCtx, t.TraceID, task.EventUnparkedOnSuccess, map[string]any{
+					"event": task.EventUnparkedOnSuccess, "task_id": t.ID, "outbox_id": row.ID,
+				})
+			}
+		}
 		if err := d.machine.Transition(recordCtx, t.TraceID, t.ID, task.StatusDone); err != nil {
 			d.ledgerRaw(recordCtx, t.TraceID, "outbox.transition_failed", map[string]any{
 				"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),

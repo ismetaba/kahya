@@ -49,6 +49,12 @@ const (
 	// EventCloudWaitingRetry is task spec step 3's own name, verbatim:
 	// "ledger event task.waiting_retry".
 	EventCloudWaitingRetry = "task.waiting_retry"
+	// EventUnparkedOnSuccess is ledgered when a parked task's worker still
+	// finished cleanly (the CLI's own retry of the 503 succeeded after the
+	// park): the task leaves bekliyor-yeniden-deneme for done instead of
+	// being re-run at next_retry_at (FIX-FINAL
+	// park-then-cli-retry-success-reruns-task).
+	EventUnparkedOnSuccess = "task.unparked_on_success"
 	// EventCloudTaskFailed is task spec step 4/6's own name, verbatim:
 	// "ledger event task.failed" - used for BOTH the non-retryable-
 	// immediately path and the give-up-after-24h path, distinguished by

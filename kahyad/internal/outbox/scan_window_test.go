@@ -76,3 +76,43 @@ func TestResumeScanInRedispatchWindowNeverBlocksLastResume(t *testing.T) {
 		t.Fatalf("notices = %v, want none (no cap notice for a task that finished)", notifier.kinds)
 	}
 }
+
+// TestRedispatchReparkedThenSucceededEndsDone (FIX-FINAL park-then-cli-
+// retry-success-reruns-task, dispatcher half): a redispatched run that is
+// re-parked mid-run (the proxy's park) and then finishes cleanly anyway
+// tried retry-wait -> done, an illegal edge: the row was acked and the task
+// stayed parked, to be re-run again. It now goes back to executing and
+// ends done.
+func TestRedispatchReparkedThenSucceededEndsDone(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	insertTaskWithEnvelope(t, st, "t1", "sess-1")
+	payload, _ := json.Marshal(task.OutboxTaskResumePayload{TaskID: "t1"})
+	now := task.FixedNanoRFC3339(time.Now())
+	if _, err := st.Queries.InsertOutboxRow(ctx, sqlcgen.InsertOutboxRowParams{
+		TraceID: "trace-t1", Kind: task.OutboxKindTaskResume, Payload: string(payload),
+		CreatedAt: now, AvailableAt: sql.NullString{String: now, Valid: true},
+		TaskID: sql.NullString{String: "t1", Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := task.NewMachine(st.Queries, st)
+	d := NewDispatcher(st.Queries, st, m, spawn.Config{Cmd: []string{"python3", "testdata/echo_session_worker.py"}}, task.NewLiveRegistry())
+	d.SetAnthproxyOpener(func(ctx context.Context, taskID, traceID string) (string, string, func() error, error) {
+		// the proxy parks the redispatched task mid-run
+		if err := m.Transition(ctx, traceID, taskID, task.StatusRetryWait); err != nil {
+			t.Errorf("mid-run park: %v", err)
+		}
+		return "http://127.0.0.1:1", "k", func() error { return nil }, nil
+	})
+	if _, err := d.ClaimAndDispatch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cur, _ := st.Queries.GetTaskByID(ctx, "t1"); cur.Status != task.StatusDone {
+		t.Fatalf("final status = %q, want done", cur.Status)
+	}
+	var unparked int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM events WHERE kind = ?`, task.EventUnparkedOnSuccess).Scan(&unparked); err != nil || unparked != 1 {
+		t.Fatalf("%s rows = %d (%v), want 1", task.EventUnparkedOnSuccess, unparked, err)
+	}
+}
