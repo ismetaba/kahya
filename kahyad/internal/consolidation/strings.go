@@ -15,3 +15,8 @@ const MsgLocalSkipped = "yerel model için bellek yok — gizli-şerit dosyalar�
 // MsgSuggestionReady is the Telegram notice sent once a suggestion-mode
 // consolidation run has produced a pending diff (task spec step 7).
 const MsgSuggestionReady = "Konsolidasyon önerisi hazır — kahya consolidation show"
+
+// MsgBackupDirStaged is the Telegram notice sent when the nightly run
+// refused to commit because a path under the backup dir was staged in
+// ~/Kahya (FIX-P-1; byte-exact handbook text, em-dash).
+const MsgBackupDirStaged = "Konsolidasyon durduruldu — yedek dizini git'e eklenmek üzereydi; ~/Kahya/.gitignore dosyasını kontrol et"

@@ -17,6 +17,7 @@ package consolidation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,34 +34,107 @@ const MainBranch = "main"
 // "kahya/consolidation-YYYYMMDD" (task spec, verbatim).
 const ConsolidationBranchPrefix = "kahya/consolidation-"
 
-// IsDirty reports whether repoDir's working tree has any uncommitted
-// change (tracked or untracked) - `git status --porcelain` prints one
-// line per such change, nothing at all when clean.
-func IsDirty(ctx context.Context, git backup.GitRunner, repoDir string) (bool, error) {
-	out, stderr, err := git.Run(ctx, repoDir, "status", "--porcelain")
-	if err != nil {
-		return false, fmt.Errorf("consolidation: git status --porcelain: %w (%s)", err, stderr)
-	}
-	return strings.TrimSpace(out) != "", nil
+// ErrBackupPathStaged is returned when a path under the backup dir is
+// staged in the memory repo's index (FIX-P-1): a .gitignore edit/negation
+// or a manual `git add -f` must never let a brain-*.db into a commit
+// (HANDOFF §6 backup: snapshots travel via Time Machine, never git).
+var ErrBackupPathStaged = errors.New("consolidation: backup dir path staged for commit")
+
+// literalPathspec turns a repo-relative, forward-slash directory into a git
+// pathspec that matches that directory and everything under it, with glob
+// characters taken literally.
+func literalPathspec(dir string) string {
+	return ":(literal)" + dir
 }
 
-// CommitAll stages every change in repoDir (tracked and untracked alike -
-// `git add -A`) and commits it with author (and, via an inline -c
-// override, the SAME identity as committer, so this never depends on
-// repoDir already having user.name/user.email configured) and message.
-// author must be "Name <email>" (UserCommitAuthor/KahyaCommitAuthor).
-func CommitAll(ctx context.Context, git backup.GitRunner, repoDir, author, message string) error {
-	if _, stderr, err := git.Run(ctx, repoDir, "add", "-A"); err != nil {
-		return fmt.Errorf("consolidation: git add -A: %w (%s)", err, stderr)
+// IsDirtyUnder reports whether repoDir has any uncommitted change (tracked,
+// staged or untracked; ignored files do not count) at or under dir, a
+// repo-relative forward-slash path. A change anywhere else in the tree is
+// not seen - consolidation only ever commits the memory directory.
+func IsDirtyUnder(ctx context.Context, git backup.GitRunner, repoDir, dir string) (bool, error) {
+	out, stderr, err := git.Run(ctx, repoDir, "status", "--porcelain", "-z", "--", literalPathspec(dir))
+	if err != nil {
+		return false, fmt.Errorf("consolidation: git status --porcelain -- %s: %w (%s)", dir, err, stderr)
+	}
+	return len(splitNUL(out)) > 0, nil
+}
+
+// StagePaths stages every change - additions, modifications, deletions and
+// untracked files - at or under each repo-relative dir, and nothing outside
+// them (FIX-P-1: the nightly pre-commit stages only memory/**, never the
+// whole tree, so a backup snapshot, a scratch file or any other non-memory
+// change in ~/Kahya is never swept into an author=user commit). Ignored
+// files stay unstaged.
+func StagePaths(ctx context.Context, git backup.GitRunner, repoDir string, dirs ...string) error {
+	if len(dirs) == 0 {
+		return errors.New("consolidation: StagePaths needs at least one directory")
+	}
+	args := []string{"add", "--all", "--"}
+	for _, d := range dirs {
+		args = append(args, literalPathspec(d))
+	}
+	if _, stderr, err := git.Run(ctx, repoDir, args...); err != nil {
+		return fmt.Errorf("consolidation: git add --all -- %s: %w (%s)", strings.Join(dirs, " "), err, stderr)
+	}
+	return nil
+}
+
+// StagedPathsUnder lists the index entries that differ from HEAD at or
+// under dir.
+func StagedPathsUnder(ctx context.Context, git backup.GitRunner, repoDir, dir string) ([]string, error) {
+	out, stderr, err := git.Run(ctx, repoDir, "diff", "--cached", "--name-only", "-z", "--", literalPathspec(dir))
+	if err != nil {
+		return nil, fmt.Errorf("consolidation: git diff --cached --name-only -- %s: %w (%s)", dir, err, stderr)
+	}
+	return splitNUL(out), nil
+}
+
+// CommitPaths commits the changes at or under each repo-relative dir with
+// author (and, via an inline -c override, the SAME identity as committer,
+// so this never depends on repoDir already having user.name/user.email
+// configured) and message. It uses `git commit --only -- <dirs>`: whatever
+// else is staged in the index (the user's own `git add`) is neither
+// committed nor un-staged. author must be "Name <email>"
+// (UserCommitAuthor/KahyaCommitAuthor). Callers stage first (StagePaths) so
+// untracked files under dirs are part of the commit.
+func CommitPaths(ctx context.Context, git backup.GitRunner, repoDir, author, message string, dirs ...string) error {
+	if len(dirs) == 0 {
+		return errors.New("consolidation: CommitPaths needs at least one directory")
 	}
 	name, email := parseAuthor(author)
 	args := []string{
 		"-c", "user.name=" + name,
 		"-c", "user.email=" + email,
-		"commit", "--author=" + author, "-m", message,
+		"commit", "--only", "--author=" + author, "-m", message, "--",
+	}
+	for _, d := range dirs {
+		args = append(args, literalPathspec(d))
 	}
 	if _, stderr, err := git.Run(ctx, repoDir, args...); err != nil {
 		return fmt.Errorf("consolidation: git commit --author=%q: %w (%s)", author, err, stderr)
+	}
+	return nil
+}
+
+// AssertNoPathsStagedUnder fails closed if any staged index entry equals
+// prefix or lies under it (prefix is repo-relative, forward-slash, no
+// leading/trailing slash). It checks the WHOLE index - also a path the user
+// force-added by hand, which is one `git commit` away from the remote - and
+// un-stages only the offending prefix (`git reset -q -- <prefix>`; the
+// working tree and the user's other staged work are left alone). When that
+// targeted reset fails it falls back to a full `git reset -q`.
+func AssertNoPathsStagedUnder(ctx context.Context, git backup.GitRunner, repoDir, prefix string) error {
+	out, stderr, err := git.Run(ctx, repoDir, "diff", "--cached", "--name-only", "-z")
+	if err != nil {
+		return fmt.Errorf("consolidation: git diff --cached --name-only -z: %w (%s)", err, stderr)
+	}
+	for _, p := range splitNUL(out) {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			if _, _, rerr := git.Run(ctx, repoDir, "reset", "-q", "--", literalPathspec(prefix)); rerr != nil {
+				_, _, _ = git.Run(ctx, repoDir, "reset", "-q")
+			}
+			return fmt.Errorf("%w: %q under %q", ErrBackupPathStaged, p, prefix)
+		}
 	}
 	return nil
 }
@@ -169,7 +243,7 @@ func RebaseWorktreeOnto(ctx context.Context, git backup.GitRunner, worktreeDir, 
 // MergeFastForwardOnly merges branch into repoDir's currently checked-out
 // branch (main, in production) with --ff-only (task spec, verbatim) - no
 // merge commit is ever created; main's HEAD simply becomes branch's tip
-// commit (already authored KahyaCommitAuthor by CommitAll during Run). A
+// commit (already authored KahyaCommitAuthor by CommitPaths during Run). A
 // non-fast-forward state (main advanced with commits branch does not
 // contain, and RebaseOnto was somehow skipped or itself did not fully
 // catch up) fails closed: an error, main untouched.

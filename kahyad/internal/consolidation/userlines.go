@@ -146,6 +146,18 @@ func parseAddedLineNumbers(unifiedDiff string) map[int]bool {
 	return touched
 }
 
+// splitNUL splits git -z output on NUL, dropping empty entries (git -z
+// output ends with a NUL; a path itself can never contain one).
+func splitNUL(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, "\x00") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // splitNonEmptyLines splits s on "\n", trimming a trailing "\r" per line
 // and dropping any empty line (git's own plain-text output convention:
 // git.Run's stdout carries no trailing-blank-line surprises worth

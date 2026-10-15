@@ -16,4 +16,9 @@ func TestByteExactTurkishStrings(t *testing.T) {
 	if MsgSuggestionReady != wantSuggestionReady {
 		t.Errorf("MsgSuggestionReady = %q, want %q", MsgSuggestionReady, wantSuggestionReady)
 	}
+	// FIX-P-1 (handbook G06 P-1 text, byte-exact).
+	wantBackupDirStaged := "Konsolidasyon durduruldu — yedek dizini git'e eklenmek üzereydi; ~/Kahya/.gitignore dosyasını kontrol et"
+	if MsgBackupDirStaged != wantBackupDirStaged {
+		t.Errorf("MsgBackupDirStaged = %q, want %q", MsgBackupDirStaged, wantBackupDirStaged)
+	}
 }

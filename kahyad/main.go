@@ -958,6 +958,19 @@ func run() int {
 	// (03:30)/memory-push (03:45) entries (config.defaults' doc comment)
 	// resolve to real handlers on the very first boot, not just after a
 	// later `kahyad -sync-jobs`/restart.
+	//
+	// FIX-P-1: the backup dir must never be committable from the memory
+	// repo - brain-*.db snapshots (and a crashed run's .staging copy, in the
+	// same dir) carry the ledger, episodes and secret-lane facts, and
+	// ~/Kahya is pushed to a remote every night. It runs in every profile
+	// (no cfg.Env gate): a dev/test KahyaDir is its own tree, the only write
+	// is one .gitignore line, and a KahyaDir that does not exist yet is left
+	// alone. The nightly consolidation re-checks it before staging anything.
+	if entry, err := backup.EnsureBackupDirIgnored(cfg.KahyaDir, cfg.BackupDir); err != nil {
+		log.Error("backup_gitignore_failed", "kahya_dir", cfg.KahyaDir, "backup_dir", cfg.BackupDir, "err", err.Error())
+	} else if entry != "" {
+		log.Info("backup_gitignore_ensured", "entry", entry)
+	}
 	snapshotter := backup.NewSnapshotter(st, governorNotifier, cfg.BackupDir)
 	pusher := backup.NewPusher(backup.NewExecGitRunner(), governorNotifier, cfg.KahyaDir)
 	sched.RegisterHandler("backup-nightly", func(ctx context.Context) error {
@@ -1048,8 +1061,11 @@ func run() int {
 	// push implementation.
 	consolidator := &consolidation.Consolidator{
 		Cfg: consolidation.Config{
-			KahyaDir:        cfg.KahyaDir,
-			MemoryDir:       cfg.MemoryDir,
+			KahyaDir:  cfg.KahyaDir,
+			MemoryDir: cfg.MemoryDir,
+			// FIX-P-1: Run re-ensures the backup dir is git-ignored and
+			// refuses to commit while a path under it is staged.
+			BackupDir:       cfg.BackupDir,
 			SecretLaneGlobs: pol.SecretLaneGlobs,
 			AutoCommit:      cfg.ConsolidationAutoCommit,
 			// W78-01 gate point a: the current index state the auto-commit

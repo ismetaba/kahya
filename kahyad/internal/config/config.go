@@ -369,8 +369,10 @@ type Config struct {
 
 	// KahyaDir is the ~/Kahya memory-repo root (task spec: "the Kahya repo
 	// root is filepath.Dir(MemoryDir) = ~/Kahya") — kahyad/internal/backup.
-	// Pusher's `git -C <KahyaDir> push origin HEAD` target and
-	// backup.EnsureGitignoreEntry's target directory. Kept as its OWN
+	// Pusher's `git -C <KahyaDir> push origin HEAD` target and the repo
+	// whose .gitignore backup.EnsureBackupDirIgnored keeps covering
+	// BackupDir (FIX-P-1: at every boot and before every nightly
+	// consolidation). Kept as its OWN
 	// explicit field (not derived at use-time via
 	// filepath.Dir(cfg.MemoryDir)) so a config.yaml override that moves
 	// MemoryDir alone does not silently also move the git-push target

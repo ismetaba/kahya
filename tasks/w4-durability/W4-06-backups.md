@@ -77,6 +77,12 @@ Binding text (HANDOFF §6, quote verbatim):
    a user-owned repo config change). Rationale: the ⚑ routes DB snapshots through Time Machine
    ("VACUUM kopyası dahil edilir") and markdown through git; pushing daily DB binaries would
    bloat the private remote. Note this in the commit message.
+   **Post-review note (FIX-P-1):** kahyad now writes the line itself, anchored as `/backups/`
+   (`backup.EnsureBackupDirIgnored(cfg.KahyaDir, cfg.BackupDir)` at every boot, every profile,
+   and again before every nightly consolidation; an existing unanchored `backups/` line already
+   satisfies it). It never commits the `.gitignore` change. The nightly author=user pre-commit
+   stages only `memory/**` and refuses (`consolidation.backup_dir_staged` + Turkish notice) while
+   any path under the backup dir is staged.
 6. `docs/runbooks/keychain-loss.md` — numbered recovery steps per ⚑ item (3):
    rotate the Anthropic API key in the console; regenerate the Telegram token via BotFather;
    create a new anchor deploy key + update the remote repo; re-add all three items

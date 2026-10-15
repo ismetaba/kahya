@@ -114,6 +114,10 @@ type Config struct {
 	// MemoryDir is ~/Kahya/memory (cfg.MemoryDir) - every *.md file under
 	// here is a candidate for consolidation.
 	MemoryDir string
+	// BackupDir is cfg.BackupDir (FIX-P-1). When it lies inside KahyaDir,
+	// every Run first makes sure .gitignore covers it and refuses to commit
+	// while any path under it is staged. Empty = no backup-dir guard.
+	BackupDir string
 	// SecretLaneGlobs is policy.yaml's secret_lane_globs, already
 	// `~`-expanded (kahyad/internal/policy.Policy.SecretLaneGlobs).
 	SecretLaneGlobs []string
@@ -242,16 +246,39 @@ func (c *Consolidator) notify(ctx context.Context, traceID, text string) {
 func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	now := c.now()
 
-	// Step 1: pre-run guard - dirty ~/Kahya working tree commits as
-	// author=user FIRST (task spec step 2).
-	dirty, err := IsDirty(ctx, c.Git, c.Cfg.KahyaDir)
+	// memRelToRepo is MemoryDir's own path RELATIVE TO KahyaDir (normally
+	// "memory") - the worktree mirrors the WHOLE ~/Kahya repo, not just
+	// memory_dir, so every relPath key in files/rewrites/userTouched (all
+	// relative to MemoryDir) must be re-based onto this prefix before it
+	// means anything as a worktree path OR a git-diff-reported path
+	// (ComputeUserTouchedLines' own keys are repo-root-relative, since
+	// that is what `git diff --name-only` reports). It is also the ONE
+	// pathspec either commit of this run stages (FIX-P-1).
+	memRelToRepo, err := memoryPathspec(c.Cfg.KahyaDir, c.Cfg.MemoryDir)
 	if err != nil {
 		return err
 	}
-	if dirty {
-		if err := CommitAll(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage); err != nil {
-			return err
+	toRepoRelPath := func(relPath string) string {
+		return filepath.ToSlash(filepath.Join(memRelToRepo, relPath))
+	}
+
+	// FIX-P-1 (b): before anything is staged, make sure the backup dir is
+	// git-ignored (fail-closed: never pre-commit blind). backupRel is its
+	// repo-relative prefix ("" when it lies outside the repo or is unset).
+	backupRel := ""
+	if c.Cfg.BackupDir != "" {
+		entry, err := backup.EnsureBackupDirIgnored(c.Cfg.KahyaDir, c.Cfg.BackupDir)
+		if err != nil {
+			return fmt.Errorf("consolidation: ensure backup dir ignored: %w", err)
 		}
+		backupRel = strings.Trim(entry, "/")
+	}
+
+	// Step 1: pre-run guard - a dirty memory directory commits as
+	// author=user FIRST (task spec step 2). Only memory/** is staged and
+	// committed; the rest of ~/Kahya is left exactly as the user left it.
+	if err := c.preCommitUserEdits(ctx, traceID, memRelToRepo, backupRel); err != nil {
+		return err
 	}
 
 	// Step 2: the user-touched line set for the day (task spec step 3) -
@@ -283,21 +310,6 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		return err
 	}
 	cloudFiles, localFiles := PartitionByLane(files, c.Cfg.MemoryDir, c.Cfg.SecretLaneGlobs, c.matcher())
-
-	// memRelToRepo is MemoryDir's own path RELATIVE TO KahyaDir (normally
-	// "memory") - the worktree mirrors the WHOLE ~/Kahya repo, not just
-	// memory_dir, so every relPath key in files/rewrites/userTouched (all
-	// relative to MemoryDir) must be re-based onto this prefix before it
-	// means anything as a worktree path OR a git-diff-reported path
-	// (ComputeUserTouchedLines' own keys are repo-root-relative, since
-	// that is what `git diff --name-only` reports).
-	memRelToRepo, err := filepath.Rel(c.Cfg.KahyaDir, c.Cfg.MemoryDir)
-	if err != nil {
-		return fmt.Errorf("consolidation: relativize memory dir: %w", err)
-	}
-	toRepoRelPath := func(relPath string) string {
-		return filepath.ToSlash(filepath.Join(memRelToRepo, relPath))
-	}
 
 	baseSHA, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)
 	if err != nil {
@@ -384,7 +396,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		}
 	}
 
-	hasDiff, err := IsDirty(ctx, c.Git, worktreeDir)
+	hasDiff, err := IsDirtyUnder(ctx, c.Git, worktreeDir, memRelToRepo)
 	if err != nil {
 		c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
 		return err
@@ -397,8 +409,13 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	}
 
 	// Step 7 (task spec step 7): commit on the branch as author=kahyad -
-	// ALWAYS a separate commit from any author=user pre-commit above.
-	if err := CommitAll(ctx, c.Git, worktreeDir, KahyaCommitAuthor, "nightly consolidation"); err != nil {
+	// ALWAYS a separate commit from any author=user pre-commit above. Like
+	// the pre-commit it stages and commits the memory directory only.
+	if err := StagePaths(ctx, c.Git, worktreeDir, memRelToRepo); err != nil {
+		c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
+		return err
+	}
+	if err := CommitPaths(ctx, c.Git, worktreeDir, KahyaCommitAuthor, "nightly consolidation", memRelToRepo); err != nil {
 		c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
 		return err
 	}
@@ -423,6 +440,67 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	}
 	c.notify(ctx, traceID, MsgSuggestionReady)
 	return nil
+}
+
+// ErrMemoryDirNotInRepo is returned when memory_dir is not a subdirectory
+// of kahya_dir: there is then no memory-only pathspec to stage, and the
+// nightly run refuses rather than fall back to the whole tree (FIX-P-1).
+var ErrMemoryDirNotInRepo = errors.New("consolidation: memory_dir must be a subdirectory of kahya_dir")
+
+// EventBackupDirStaged is ledgered when a path under the backup dir was
+// staged in the memory repo and the run refused to commit (FIX-P-1).
+const EventBackupDirStaged = "consolidation.backup_dir_staged"
+
+// memoryPathspec returns memoryDir relative to kahyaDir in forward-slash
+// form, or ErrMemoryDirNotInRepo when it is kahyaDir itself or outside it.
+func memoryPathspec(kahyaDir, memoryDir string) (string, error) {
+	rel, err := filepath.Rel(filepath.Clean(kahyaDir), filepath.Clean(memoryDir))
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w (kahya_dir=%q memory_dir=%q)", ErrMemoryDirNotInRepo, kahyaDir, memoryDir)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// preCommitUserEdits is Run's step 1 (FIX-P-1): stage the memory directory
+// only, refuse while any backup-dir path is staged (layer (c): a .gitignore
+// negation or a manual `git add -f` must never let a brain-*.db into a
+// commit), then commit the memory changes as author=user. A dirty tree
+// outside memRel is not a memory edit and is never committed or un-staged.
+func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, backupRel string) error {
+	dirty, err := IsDirtyUnder(ctx, c.Git, c.Cfg.KahyaDir, memRel)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		if err := StagePaths(ctx, c.Git, c.Cfg.KahyaDir, memRel); err != nil {
+			return err
+		}
+	}
+	if backupRel != "" {
+		if err := AssertNoPathsStagedUnder(ctx, c.Git, c.Cfg.KahyaDir, backupRel); err != nil {
+			// A git error here is fail-closed too (no commit), but only a
+			// real staged backup path earns the ledger row and the notice.
+			if errors.Is(err, ErrBackupPathStaged) {
+				c.logError("consolidation_backup_dir_staged", "trace_id", traceID, "prefix", backupRel, "err", err.Error())
+				if c.EventLogger != nil {
+					_ = c.EventLogger.LogEvent(ctx, traceID, EventBackupDirStaged, map[string]any{"prefix": backupRel, "reason": err.Error()})
+				}
+				c.notify(ctx, traceID, MsgBackupDirStaged)
+			}
+			return err
+		}
+	}
+	if !dirty {
+		return nil
+	}
+	staged, err := StagedPathsUnder(ctx, c.Git, c.Cfg.KahyaDir, memRel)
+	if err != nil {
+		return err
+	}
+	if len(staged) == 0 {
+		return nil // e.g. an edit reverted to HEAD's content: nothing to commit
+	}
+	return CommitPaths(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage, memRel)
 }
 
 // Show renders the pending suggestion's diff (`git diff main...<branch>`,
