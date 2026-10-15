@@ -296,3 +296,82 @@ func TestCommittedPolicyYAMLToolRegistrations(t *testing.T) {
 		t.Errorf("mail_send.Reversible = true, want false (W3 is irreversible)")
 	}
 }
+
+// gizliSecretLaneGlob is decision MEM-6.b's secret_lane_globs entry
+// (pulled forward with FIX-U-3): the memory subtree memory_write (and
+// later kahya ingest) lands locally classified secret content under.
+const gizliSecretLaneGlob = "~/Kahya/memory/gizli/**"
+
+// TestLoadRealPolicyYAMLHasGizliSecretGlob (FIX-U-3 / MEM-6.b): both
+// committed policy files declare the gizli/ memory subtree secret-lane, and
+// once loaded (~-expanded) the glob matches a redirected memory_write note
+// under gizli/notes/ but not the ordinary inbox note it was redirected from
+// - every path-based lane rule (consolidation, ritual, graph, injection
+// filter) keys on this one glob.
+func TestLoadRealPolicyYAMLHasGizliSecretGlob(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve home dir: %v", err)
+	}
+	for _, name := range []string{"policy.yaml", "policy.dev.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			pol, err := Load(filepath.Join(repoRoot(t), name))
+			if err != nil {
+				t.Fatalf("Load(%s) = %v, want nil", name, err)
+			}
+			suffix := filepath.Join("Kahya", "memory", "gizli", "**")
+			var glob string
+			for _, g := range pol.SecretLaneGlobs {
+				if strings.HasSuffix(g, suffix) {
+					glob = g
+				}
+			}
+			if glob == "" {
+				t.Fatalf("%s secret_lane_globs = %v, want an entry ending in %s", name, pol.SecretLaneGlobs, suffix)
+			}
+			redirected := filepath.Join(home, "Kahya", "memory", "gizli", "notes", "inbox", "2026-10-13.md")
+			if ok, err := MatchGlob(glob, redirected); err != nil || !ok {
+				t.Errorf("MatchGlob(%q, %q) = %v, %v; want true", glob, redirected, ok, err)
+			}
+			ordinary := filepath.Join(home, "Kahya", "memory", "inbox", "2026-10-13.md")
+			if ok, err := MatchGlob(glob, ordinary); err != nil || ok {
+				t.Errorf("MatchGlob(%q, %q) = %v, %v; want false", glob, ordinary, ok, err)
+			}
+		})
+	}
+}
+
+// TestPolicyFixturesCarryGizliSecretGlob keeps the w4/w6 acceptance
+// fixtures (copies of the production policy) in sync with the gizli/
+// secret-lane glob (G00 C-12), and pins tests/w3's fixture to its
+// deliberately EMPTY secret_lane_globs (Gate 3 proves the content
+// classifier, never a path-glob coincidence).
+func TestPolicyFixturesCarryGizliSecretGlob(t *testing.T) {
+	root := repoRoot(t)
+	for _, rel := range []string{
+		"policy.yaml",
+		"policy.dev.yaml",
+		filepath.Join("tests", "acceptance", "w4", "fixtures", "policy.yaml"),
+		filepath.Join("tests", "acceptance", "w6", "fixtures", "policy.yaml"),
+	} {
+		doc, err := parseFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("parse %s: %v", rel, err)
+		}
+		found := false
+		for _, g := range doc.SecretLaneGlobs {
+			found = found || g == gizliSecretLaneGlob
+		}
+		if !found {
+			t.Errorf("%s: secret_lane_globs = %v, want %q", rel, doc.SecretLaneGlobs, gizliSecretLaneGlob)
+		}
+	}
+	w3 := filepath.Join("tests", "w3", "fixtures", "policy.yaml")
+	doc, err := parseFile(filepath.Join(root, w3))
+	if err != nil {
+		t.Fatalf("parse %s: %v", w3, err)
+	}
+	if len(doc.SecretLaneGlobs) != 0 {
+		t.Errorf("%s: secret_lane_globs = %v, want empty (Gate 3 keeps it empty on purpose)", w3, doc.SecretLaneGlobs)
+	}
+}

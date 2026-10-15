@@ -90,6 +90,7 @@ tools:
 
 secret_lane_globs:
   - "~/Kahya/memory/finans*.md"
+  - "~/Kahya/memory/gizli/**"
   - "~/Documents/saglik/**"
   - "~/Documents/kimlik/**"
 

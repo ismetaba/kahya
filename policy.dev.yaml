@@ -84,8 +84,12 @@ tools:
 # pre-classifier, NEVER by matching a glob against a path — HANDOFF §4's
 # ordering invariant ("policy.yaml globlari yalniz dosya yollari icin")
 # means these globs never see the inside of a file, only its path.
+# gizli/** is where memory_write (FIX-U-3) and kahya ingest (MEM-6) land
+# content the LOCAL classifier flagged - path-glob so every path-based
+# lane rule (consolidation, ritual, graph, injection) sees it.
 secret_lane_globs:
   - "~/Kahya/memory/finans*.md"
+  - "~/Kahya/memory/gizli/**"
   - "~/Documents/saglik/**"
   - "~/Documents/kimlik/**"
 
