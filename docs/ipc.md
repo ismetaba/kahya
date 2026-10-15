@@ -796,7 +796,12 @@ a cloud model, without changing anything in §2-§6 above:
   <kahyad@local>` as `memory_confirm: <path>` (never `user` - a review is
   user_asserted, not user_edit), reindexed (its chunks then pass the
   for_injection tier filter) and ledgered `memory_confirm {file,
-  previous_tier, commit_sha}`; a failing commit restores the bytes. Nightly
+  previous_tier, commit_sha}`; a failing commit restores the bytes. The
+  path is resolved to the name the volume stores (`memory.StoredRelPath`),
+  so an NFD/NFC or case variant confirms the existing note - one episode,
+  the stored spelling in the commit, ledger and answer (FIX-FINAL
+  memory-confirm-nfd-duplicate-episode; `POST /v1/memory/extract
+  {"file"}` resolves the same way). Nightly
   consolidation never touches an unconfirmed note: a note whose front
   matter is `agent_derived`/`external_doc`/`screen` (or cannot be parsed)
   is sent to neither lane until confirmed (JSONL

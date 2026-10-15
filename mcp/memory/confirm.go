@@ -59,6 +59,16 @@ var (
 	ErrNotePath             = errors.New("memory_confirm: invalid note path")
 )
 
+// StoredRelPath returns rel (forward-slash, relative to memoryDir) with
+// every existing component replaced by the name the volume STORES it
+// under - the spelling episodes.source_path carries - so a case or Unicode
+// normalisation variant of an existing note's path resolves to that note.
+// Components that do not exist are kept as given; an error means the
+// stored name could not be determined (callers refuse, fail-closed).
+func StoredRelPath(memoryDir, rel string) (string, error) {
+	return onDiskRelPath(memoryDir, rel)
+}
+
 // HandleConfirm promotes an agent_derived (or external_doc / screen) note
 // to user_asserted: its front matter becomes kahya_source_tier:
 // user_asserted + kahya_confirmed_at: <RFC3339, UTC> (every other key is
@@ -86,6 +96,25 @@ func (s *Server) HandleConfirm(ctx context.Context, traceID string, args MemoryC
 	}
 	if err != nil {
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: read %s: %w", relPath, err)
+	}
+	// FIX-FINAL memory-confirm-nfd-duplicate-episode: on a case- and
+	// normalisation-insensitive volume (APFS) an NFD/NFC or case variant of
+	// the path opens the same file, but the indexer keys episodes on the
+	// exact source_path bytes - a variant spelling inserted a SECOND active
+	// episode (and a case variant failed with a raw git pathspec error).
+	// From here on only the name the volume STORES is used: the write, the
+	// commit pathspec and message, the reindex, the ledger and the output.
+	// A resolution error refuses before any write (fail-closed).
+	stored, err := onDiskRelPath(s.MemoryDir, filepath.ToSlash(filepath.Clean(filepath.FromSlash(relPath))))
+	if err != nil {
+		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: resolve the stored name of %s: %w", relPath, err)
+	}
+	if stored != relPath {
+		storedAbs, err := resolveMemoryPath(s.MemoryDir, stored)
+		if err != nil {
+			return MemoryConfirmOutput{}, fmt.Errorf("%w: %v", ErrNotePath, err)
+		}
+		relPath, abs = stored, storedAbs
 	}
 	fm, body, err := splitLeadingFrontMatter(string(raw))
 	if err != nil {

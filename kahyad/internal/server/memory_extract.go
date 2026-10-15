@@ -15,6 +15,7 @@ import (
 
 	"kahya/kahyad/internal/extract"
 	"kahya/kahyad/internal/factengine"
+	"kahya/mcp/memory"
 )
 
 // memoryExtractTimeout bounds one synchronous /v1/memory/extract run (a
@@ -87,6 +88,17 @@ func (s *Server) handleMemoryExtract(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "file must be a note path inside the memory dir")
 			return
 		}
+		// FIX-FINAL memory-confirm-nfd-duplicate-episode: ExtractFile looks
+		// the episode up by its exact source_path bytes; a case / NFD
+		// variant of an existing note's path is resolved to the name the
+		// volume stores (a path that does not exist keeps its spelling, so
+		// ExtractFile still answers 404).
+		stored, err := memory.StoredRelPath(s.cfg.MemoryDir, relPath)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "resolve note path: "+err.Error())
+			return
+		}
+		relPath = stored
 	}
 
 	if !s.inflight.begin() {
