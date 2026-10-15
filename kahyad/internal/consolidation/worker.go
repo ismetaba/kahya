@@ -188,5 +188,5 @@ func (s CloudSession) Consolidate(ctx context.Context, traceID string, files map
 	if err != nil {
 		return nil, err
 	}
-	return parseRewriteResponse(raw)
+	return parseRewriteResponse(raw, LaneCloud, files)
 }

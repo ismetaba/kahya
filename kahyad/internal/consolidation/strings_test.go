@@ -21,4 +21,9 @@ func TestByteExactTurkishStrings(t *testing.T) {
 	if MsgBackupDirStaged != wantBackupDirStaged {
 		t.Errorf("MsgBackupDirStaged = %q, want %q", MsgBackupDirStaged, wantBackupDirStaged)
 	}
+	// FIX-P-7 (handbook G06 P-7 text, byte-exact).
+	wantRewriteRejected := "Konsolidasyon bu gece iptal edildi — model kendisine verilmeyen bir dosya yolu döndürdü"
+	if MsgRewriteRejected != wantRewriteRejected {
+		t.Errorf("MsgRewriteRejected = %q, want %q", MsgRewriteRejected, wantRewriteRejected)
+	}
 }

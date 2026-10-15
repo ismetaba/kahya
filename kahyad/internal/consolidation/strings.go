@@ -20,3 +20,9 @@ const MsgSuggestionReady = "Konsolidasyon önerisi hazır — kahya consolidatio
 // refused to commit because a path under the backup dir was staged in
 // ~/Kahya (FIX-P-1; byte-exact handbook text, em-dash).
 const MsgBackupDirStaged = "Konsolidasyon durduruldu — yedek dizini git'e eklenmek üzereydi; ~/Kahya/.gitignore dosyasını kontrol et"
+
+// MsgRewriteRejected is the Telegram notice sent when a lane's rewrite named
+// a file it was not given and the night was rejected (FIX-P-7; byte-exact
+// handbook text, em-dash). It deliberately names no path: a secret-lane
+// file name must not leave the machine; the path is in the local ledger.
+const MsgRewriteRejected = "Konsolidasyon bu gece iptal edildi — model kendisine verilmeyen bir dosya yolu döndürdü"

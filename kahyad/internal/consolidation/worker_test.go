@@ -130,10 +130,10 @@ func TestCloudSessionPropagatesSpawnError(t *testing.T) {
 }
 
 func TestParseRewriteResponseRejectsMalformedJSON(t *testing.T) {
-	if _, err := parseRewriteResponse("not json at all"); err == nil {
+	if _, err := parseRewriteResponse("not json at all", LaneCloud, map[string]string{}); err == nil {
 		t.Fatal("parseRewriteResponse() error = nil, want a decode failure")
 	}
-	if _, err := parseRewriteResponse(`{"wrong_key": {}}`); err == nil {
+	if _, err := parseRewriteResponse(`{"wrong_key": {}}`, LaneCloud, map[string]string{}); err == nil {
 		t.Fatal("parseRewriteResponse() error = nil, want a missing-files failure")
 	}
 }

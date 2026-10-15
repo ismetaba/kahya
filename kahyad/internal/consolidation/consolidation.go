@@ -334,10 +334,22 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	rewrites := make(map[string]string, len(files))
 	skippedSecretLane := false
 
+	// FIX-P-7: each lane's rewrite may only name files from that lane's own
+	// input (validated here as well as inside the production sessions'
+	// parseRewriteResponse, since a Session may be any implementation). An
+	// unknown key rejects the night (decision G06-3: hard reject) - a cloud
+	// rewrite naming a secret-lane path would otherwise be applied whenever
+	// the local lane is skipped.
 	if len(cloudFiles) > 0 {
 		cr, err := c.Cloud.Consolidate(ctx, traceID, cloudFiles)
+		if err == nil {
+			err = validateRewriteKeys(LaneCloud, cloudFiles, cr)
+		}
 		if err != nil {
 			c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
+			if errors.Is(err, ErrRewriteUnknownPath) {
+				c.rejectRewrite(ctx, traceID, LaneCloud, err)
+			}
 			return fmt.Errorf("consolidation: cloud-lane session: %w", err)
 		}
 		mergeRewrites(rewrites, cr)
@@ -345,6 +357,9 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 
 	if len(localFiles) > 0 {
 		lr, localErr := c.Local.Consolidate(ctx, traceID, localFiles)
+		if localErr == nil {
+			localErr = validateRewriteKeys(LaneLocal, localFiles, lr)
+		}
 		if localErr != nil {
 			if errors.Is(localErr, mlx.ErrLocalModelUnavailable) {
 				// FAIL-CLOSED, NEVER a cloud fallback (HANDOFF §4 ⚑): the
@@ -360,11 +375,22 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 				}
 			} else {
 				c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
+				if errors.Is(localErr, ErrRewriteUnknownPath) {
+					c.rejectRewrite(ctx, traceID, LaneLocal, localErr)
+				}
 				return fmt.Errorf("consolidation: local-lane session: %w", localErr)
 			}
 		} else {
 			mergeRewrites(rewrites, lr)
 		}
+	}
+
+	// Last structural check before anything is written to the worktree:
+	// the merged set names only files that were read from disk.
+	if err := validateRewriteKeys("merged", files, rewrites); err != nil {
+		c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
+		c.rejectRewrite(ctx, traceID, "merged", err)
+		return err
 	}
 
 	// Step 5 (task spec step 5): user_edit wins - apply Go-side, per file,
@@ -501,6 +527,21 @@ func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, 
 		return nil // e.g. an edit reverted to HEAD's content: nothing to commit
 	}
 	return CommitPaths(ctx, c.Git, c.Cfg.KahyaDir, UserCommitAuthor, UserPreCommitMessage, memRel)
+}
+
+// EventRewriteRejected is ledgered when a lane's rewrite named a path
+// outside its input set and the night was rejected (FIX-P-7). The payload's
+// reason carries the offending path (local ledger only); the Telegram
+// notice never names a file.
+const EventRewriteRejected = "consolidation.rewrite_rejected"
+
+// rejectRewrite logs, ledgers and notifies one rejected night.
+func (c *Consolidator) rejectRewrite(ctx context.Context, traceID, lane string, cause error) {
+	c.logError("consolidation_rewrite_rejected", "trace_id", traceID, "lane", lane, "err", cause.Error())
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventRewriteRejected, map[string]any{"lane": lane, "reason": cause.Error()})
+	}
+	c.notify(ctx, traceID, MsgRewriteRejected)
 }
 
 // Show renders the pending suggestion's diff (`git diff main...<branch>`,
@@ -715,8 +756,9 @@ func (c *Consolidator) refuseAutoCommit(ctx context.Context, traceID, detail, tu
 
 // mergeRewrites copies every entry of src into dst (later callers - the
 // local lane's own merge call - never overwrite an entry the cloud lane
-// already wrote, since PartitionByLane guarantees cloudFiles/localFiles
-// never share a key in the first place).
+// already wrote: PartitionByLane guarantees cloudFiles/localFiles never
+// share a key, and validateRewriteKeys (FIX-P-7) guarantees each lane's
+// OUTPUT stays inside its own input).
 func mergeRewrites(dst, src map[string]string) {
 	for k, v := range src {
 		dst[k] = v

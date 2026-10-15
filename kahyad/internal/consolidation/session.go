@@ -20,7 +20,9 @@ package consolidation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -30,6 +32,10 @@ import (
 // (worktree.go) tolerates a MISSING key by treating it as "unchanged", so
 // a non-compliant implementation degrades safely rather than losing a
 // file, but every implementation in THIS package always echoes every key.
+// Consolidate MUST NOT return a key absent from files: the orchestrator
+// rejects the whole lane - and the night - with ErrRewriteUnknownPath
+// (FIX-P-7; both production sessions already refuse such a response in
+// parseRewriteResponse).
 type Session interface {
 	Consolidate(ctx context.Context, traceID string, files map[string]string) (rewrites map[string]string, err error)
 }
@@ -90,14 +96,47 @@ func buildRewritePrompt(files map[string]string) (string, error) {
 	return rewriteSystemPrompt + separatorBetweenInstructionsAndContent + string(body), nil
 }
 
+// Lane names, as ledgered in consolidation.rewrite_rejected.
+const (
+	LaneCloud = "cloud"
+	LaneLocal = "local"
+)
+
+// ErrRewriteUnknownPath (FIX-P-7): a session returned a path that was not in
+// the file set it was given. Fail-closed for the whole lane (the model broke
+// the contract; a cloud model naming a secret-lane path is exactly the
+// attack). The lane split is structural on the INPUT side (PartitionByLane);
+// this makes it structural on the OUTPUT side too, instead of resting on
+// the prompt's "Never add a path you were not given".
+var ErrRewriteUnknownPath = errors.New("consolidation: rewrite names a path outside its input set")
+
+// validateRewriteKeys returns ErrRewriteUnknownPath (with the lane, the
+// count and the sorted-first offender) when rewrites holds any key absent
+// from input. A missing key is fine: it means "unchanged".
+func validateRewriteKeys(lane string, input, rewrites map[string]string) error {
+	var unknown []string
+	for k := range rewrites {
+		if _, ok := input[k]; !ok {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("%w: lane=%s count=%d first=%q", ErrRewriteUnknownPath, lane, len(unknown), unknown[0])
+}
+
 // parseRewriteResponse decodes a model's raw text response into a
 // {"files": {...}} rewrite map, tolerating (task spec: fail-closed for
 // SECURITY, not for an honest model-output parsing hiccup) leading/
 // trailing whitespace but nothing else - a response that is not exactly
 // that one-key JSON object is a hard error, never a partial/best-effort
 // parse (mirrors kahyad/internal/reader's own "decode/validation failure
-// fails the whole job closed" posture).
-func parseRewriteResponse(raw string) (map[string]string, error) {
+// fails the whole job closed" posture). input is the EXACT file set the
+// lane was given: a response naming any other path is rejected whole
+// (FIX-P-7).
+func parseRewriteResponse(raw, lane string, input map[string]string) (map[string]string, error) {
 	var parsed struct {
 		Files map[string]string `json:"files"`
 	}
@@ -107,6 +146,9 @@ func parseRewriteResponse(raw string) (map[string]string, error) {
 	}
 	if parsed.Files == nil {
 		return nil, fmt.Errorf("consolidation: rewrite response missing \"files\" object")
+	}
+	if err := validateRewriteKeys(lane, input, parsed.Files); err != nil {
+		return nil, err
 	}
 	return parsed.Files, nil
 }

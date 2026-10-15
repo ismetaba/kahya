@@ -79,7 +79,7 @@ func (s LocalSession) Consolidate(ctx context.Context, traceID string, files map
 		// anything.
 		return nil, err
 	}
-	return parseRewriteResponse(raw)
+	return parseRewriteResponse(raw, LaneLocal, files)
 }
 
 // buildRewriteHalves splits buildRewritePrompt's combined string back into
