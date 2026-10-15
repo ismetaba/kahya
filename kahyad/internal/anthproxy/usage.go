@@ -194,12 +194,6 @@ func withLongPromptTier(row PriceRow, thresholdTokens int64, in, out, cacheRead,
 // prompt of at most 100K tokens is billed at the short rates.
 const haiku55LongPromptThreshold = 100_000
 
-// sonnet5IntroEnd is HANDOFF §4's fixed end of Sonnet 5's introductory
-// pricing window (verbatim: "intro $2/$10, 31.08.2026'ya dek" — "'ya dek"
-// = "until", so the window is inclusive of 2026-08-31 and the standard
-// price takes effect at the first instant of 2026-09-01 UTC).
-var sonnet5IntroEnd = time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-
 // pricingTable is HANDOFF §4's model routing table, priced (task file
 // step 2: "implement as dated rows, not a flag"). Each row names its id
 // literally: a price is a fact about one specific id, so a router constant
@@ -227,8 +221,12 @@ var pricingTable = []PriceRow{
 
 	// Legacy generation (accepted, never selected).
 	priceRow("claude-opus-4-8", time.Time{}, time.Time{}, 5, 25),
-	priceRow("claude-sonnet-5", time.Time{}, sonnet5IntroEnd, 2, 10),
-	priceRow("claude-sonnet-5", sonnet5IntroEnd, time.Time{}, 3, 15),
+	// claude-sonnet-5: flat $2/$10 (FIX-G12-N2-E1, owner decision G12-9:
+	// the Anthropic model table cached 2026-10-06 still lists $2/$10 after
+	// HANDOFF's old "intro until 31.08.2026" window, so the dated $3/$15
+	// row from 2026-09-01 over-counted every call by 50%). Past metrics
+	// rows are not recomputed; the ledger is never rewritten.
+	priceRow("claude-sonnet-5", time.Time{}, time.Time{}, 2, 10),
 	priceRow("claude-haiku-4-5", time.Time{}, time.Time{}, 1, 5),
 	priceRow("claude-fable-5", time.Time{}, time.Time{}, 10, 50),
 }

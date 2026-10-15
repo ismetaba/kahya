@@ -192,35 +192,43 @@ func TestUsageCostUSDHaiku55LongPromptTier(t *testing.T) {
 	}
 }
 
-// TestPriceForSonnet5IntroWindow proves the dated-row intro-pricing logic
-// (task spec step 2: "implement as dated rows, not a flag") - HANDOFF §4:
-// intro $2/$10 until 2026-08-31, then $3/$15.
-func TestPriceForSonnet5IntroWindow(t *testing.T) {
-	introDate := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	row, err := PriceFor("claude-sonnet-5", introDate)
-	if err != nil {
-		t.Fatalf("PriceFor() error = %v", err)
+// TestPriceForSonnet5FlatPrice (FIX-G12-N2-E1, owner decision G12-9):
+// Anthropic's model table (cached 2026-10-06) still lists claude-sonnet-5
+// at $2/$10 after HANDOFF's "intro until 31.08.2026" window, so the legacy
+// row is one open-ended $2/$10 row - the same price on both sides of the
+// old 2026-09-01 boundary and today (before: $3/$15 from 2026-09-01, which
+// over-counted every Sonnet 5 call by 50% and tripped the 80% downgrade
+// rung early).
+func TestPriceForSonnet5FlatPrice(t *testing.T) {
+	for _, at := range []time.Time{
+		time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		time.Now(),
+		time.Now().AddDate(1, 0, 0),
+	} {
+		row, err := PriceFor("claude-sonnet-5", at)
+		if err != nil {
+			t.Fatalf("PriceFor(claude-sonnet-5, %s) error = %v", at.Format(time.RFC3339), err)
+		}
+		if row.USDPerMTokIn != 2 || row.USDPerMTokOut != 10 {
+			t.Errorf("PriceFor(claude-sonnet-5, %s) = in=%v out=%v, want the flat $2/$10", at.Format(time.RFC3339), row.USDPerMTokIn, row.USDPerMTokOut)
+		}
+		if row.USDPerMTokCacheRead != 0.2 || row.USDPerMTokCacheWrite1h != 4 {
+			t.Errorf("PriceFor(claude-sonnet-5, %s) cache = read %v / 1h write %v, want 0.2 / 4 (0.1x / 2x)", at.Format(time.RFC3339), row.USDPerMTokCacheRead, row.USDPerMTokCacheWrite1h)
+		}
+		if !row.From.IsZero() || !row.To.IsZero() {
+			t.Errorf("PriceFor(claude-sonnet-5, %s) row is dated [%v, %v), want one open-ended row", at.Format(time.RFC3339), row.From, row.To)
+		}
 	}
-	if row.USDPerMTokIn != 2 || row.USDPerMTokOut != 10 {
-		t.Errorf("intro-window PriceFor() = in=%v out=%v, want in=2 out=10", row.USDPerMTokIn, row.USDPerMTokOut)
+	rows := 0
+	for _, row := range pricingTable {
+		if row.Model == "claude-sonnet-5" {
+			rows++
+		}
 	}
-
-	lastIntroDay := time.Date(2026, 8, 31, 23, 59, 59, 0, time.UTC)
-	row, err = PriceFor("claude-sonnet-5", lastIntroDay)
-	if err != nil {
-		t.Fatalf("PriceFor() error = %v", err)
-	}
-	if row.USDPerMTokIn != 2 {
-		t.Errorf("2026-08-31 23:59:59 UTC PriceFor().USDPerMTokIn = %v, want 2 (still within the intro window)", row.USDPerMTokIn)
-	}
-
-	standardDate := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	row, err = PriceFor("claude-sonnet-5", standardDate)
-	if err != nil {
-		t.Fatalf("PriceFor() error = %v", err)
-	}
-	if row.USDPerMTokIn != 3 || row.USDPerMTokOut != 15 {
-		t.Errorf("standard-window PriceFor() = in=%v out=%v, want in=3 out=15", row.USDPerMTokIn, row.USDPerMTokOut)
+	if rows != 1 {
+		t.Errorf("pricingTable has %d claude-sonnet-5 rows, want exactly 1", rows)
 	}
 }
 
