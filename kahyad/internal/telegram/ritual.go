@@ -129,7 +129,8 @@ func (b *Bot) SetRitualAnswerer(a RitualAnswerer) { b.ritual = a }
 // through the SAME egress-gated send path every other message this bot
 // sends uses (task spec step 5: ritual sends are content-carrying egress,
 // same gate as everything else). Returns true iff it actually reached
-// Telegram.
+// Telegram. P-17 classifies factText upstream (ritual.Sampler); send's
+// FIX-U-5 session+content gate is the backstop.
 func (b *Bot) SendRitualQuestion(ctx context.Context, traceID string, evalLabelID int64, factText string) bool {
 	text := fmt.Sprintf(msgRitualQuestionFmt, factText)
 	markup := ritualMarkup(evalLabelID, traceID)

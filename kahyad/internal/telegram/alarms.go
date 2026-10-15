@@ -66,7 +66,9 @@ func (a *AlarmNotifier) Notify(ctx context.Context, traceID, kind, message strin
 // happens first and its error is what's returned; the Telegram fan-out is
 // best-effort on top (a Telegram send failure must never make an alarm
 // call itself report failure — the alarm was already durably recorded by
-// inner regardless).
+// inner regardless). FIX-U-5: the Telegram fan-out text is session+content
+// gated in send (a sensitive-read session's alarm reaches the phone only as
+// msgOutboundRedactedFmt); inner's JSONL+ledger write is never affected.
 func (a *AlarmNotifier) Alarm(ctx context.Context, traceID, kind, message string, payload map[string]any) error {
 	err := a.inner.Alarm(ctx, traceID, kind, message, payload)
 	if a.bot != nil && a.bot.Enabled() {

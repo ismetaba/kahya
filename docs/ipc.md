@@ -1308,6 +1308,22 @@ first boot). `{}` disables it.
     failure), so the allowlisted model call itself is cut off at the proxy
     backstop - the sensitive-read mark alone never blocked it, because
     `api.anthropic.com` is on the allowlist.
+  - **Allowlist-internal, content-carrying Telegram bodies (FIX-U-5,
+    HANDOFF §5 #1 ⚑ second clause).** `egress.Gate.Check` only hard-blocks
+    allowlist-EXTERNAL hosts after a sensitive read, and
+    `api.telegram.org` is allowlisted, so the Telegram bot gates its own
+    bodies before `Check`: `telegram.Bot.send` asks the SAME durable
+    tracker (`Bot.SetSessionTaint(sessions)`, `IsMarkedCtx`) whether the
+    trace did a secret-lane read and runs the deterministic secret-lane
+    pre-pass (`outboundSecretLane`) over the exact text. A hit — or a
+    lookup error, or no tracker wired (fail-closed) — sends only
+    `"🔒 Bildirim yalnız yerel yüzeyde (gizli şerit / hassas oturum); trace:
+    <trace_id>"` (no keyboard, still egress-checked), ledgers
+    `telegram_text_redacted{reason, bytes, keyboard}` (never the text) and
+    tells the local notifier; `SendNotification`/`SendTaskResult` return
+    false, so `ui.FanOutDelivery` still delivers the full text locally.
+    Approval cards of a marked session get only the redacted title, decided
+    before the card is rendered. Alarms are not exempt (decision U5-1).
   - **`needs_network:true` container egress is attributed via a
     per-task Proxy-Authorization credential.** `mcp/shell`'s
     `EgressTokenRegistrar` seam (`kahyad/internal/server.

@@ -44,6 +44,16 @@ const (
 	// IRREVERSIBLE W1/W2 pending approval gets instead of a card: class
 	// (W1/W2), the payload summary, the pending id.
 	msgIrreversibleWaitFmt = "⏳ Yerelde onay bekleniyor (geri alınamaz %s): %s. Terminalden 'kahya approve %s' çalıştırın."
+
+	// msgOutboundRedactedFmt (FIX-U-5) is the ONLY text a restricted
+	// (sensitive-read session or secret-lane content) non-card body may
+	// ever send - no content, no keyboard; the trace id is the `kahya` CLI
+	// lookup key, exactly as every alarm line's "(trace: %s)" suffix is.
+	msgOutboundRedactedFmt = "🔒 Bildirim yalnız yerel yüzeyde (gizli şerit / hassas oturum); trace: %s"
+	// msgTextRedactedLocal accompanies every FIX-U-5 redaction on the local
+	// notifier (notify.JSONLNotifier: JSONL + ledger) - never sent to
+	// Telegram.
+	msgTextRedactedLocal = "Telegram'a gizli-şerit/hassas-oturum içeriği gönderilmedi; tam metin yerel yüzeyde."
 )
 
 // cbActionApprove/cbActionDeny are the single leading byte of every
@@ -145,6 +155,16 @@ func (b *Bot) OnPendingApproval(ctx context.Context, info policy.PendingApproval
 		b.redact(ctx, info, reason)
 		return
 	}
+	// FIX-U-5: a session that has done a secret-lane read gets ONLY the
+	// redacted title for its cards too (HANDOFF §5 #1 ⚑: approval cards
+	// are egress and are subject to the post-sensitive-read restraint).
+	// Decided HERE, before render/chunk, so a multi-chunk card never
+	// degrades into N generic notices plus a spurious
+	// telegram_card_incomplete row from send's own backstop.
+	if reason, restricted := b.sessionRestricted(ctx, info.TraceID); restricted {
+		b.redact(ctx, info, reason)
+		return
+	}
 	payload := renderPendingApprovalPayload(b.home, info.Tool, info.ToolInput)
 	var outbound string
 	if info.Class == policy.ClassW3 {
@@ -205,13 +225,16 @@ func (b *Bot) sendIrreversibleNotice(ctx context.Context, info policy.PendingApp
 
 // redact sends the redacted title instead of the card and ledgers why
 // (telegram_card_redacted; reason is local-only and never names content
-// beyond a lexicon keyword or a rule name like "iban").
+// beyond a lexicon keyword or a rule name like "iban", or the FIX-U-5
+// session reason). The title is a constant plus a policy.yaml tool name, so
+// it goes through sendNotice: send's session gate would otherwise replace a
+// sensitive session's tool-named title with the generic notice.
 func (b *Bot) redact(ctx context.Context, info policy.PendingApprovalInfo, reason string) {
 	b.ledgerEvent(info.TraceID, "telegram_card_redacted", map[string]any{
 		"event": "telegram_card_redacted", "tool": info.Tool, "class": string(info.Class),
 		"reason": reason, "pending_approval_id": info.ID,
 	})
-	b.send(ctx, info.TraceID, redactedNoticeText(info.Tool), nil)
+	b.sendNotice(ctx, info.TraceID, redactedNoticeText(info.Tool))
 }
 
 // ledgerEvent appends one events row (best-effort, like ledgerUnauthorized)

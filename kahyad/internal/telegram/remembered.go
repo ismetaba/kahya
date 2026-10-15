@@ -90,6 +90,10 @@ func rememberedButtonRow(traceID string) []tele.InlineButton {
 // mechanism itself is directly testable now (W5-03 task spec deliverable:
 // "a 🌟 Hatırladı inline button appended to Telegram-delivered task-result
 // notifications").
+//
+// FIX-U-5: text is session+content gated in send; a restricted result
+// sends msgOutboundRedactedFmt WITHOUT the Hatırladı button and returns
+// false - the caller must still deliver it locally.
 func (b *Bot) SendTaskResult(ctx context.Context, traceID, text string) bool {
 	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{rememberedButtonRow(traceID)}}
 	return b.send(ctx, traceID, text, markup) != nil

@@ -45,3 +45,22 @@ func TestTelegramToolRulesWiredFromPolicy(t *testing.T) {
 		t.Error("tgBot.SetToolRules must run before policyEngine.SetPendingApprovalHook (a card could go out unwired)")
 	}
 }
+
+// TestTelegramSessionTaintIsTheEgressGateTracker (FIX-U-5): the Telegram
+// bot's sensitive-read gate asks the SAME durable tracker the egress gate
+// consults - one tracker, wired before any card or notification can go out
+// (an unwired bot would redact every Telegram body, fail-closed).
+func TestTelegramSessionTaintIsTheEgressGateTracker(t *testing.T) {
+	onlyCallSite(t, "egress", "NewDurableSensitiveTracker", "st.Queries")
+	gate := onlyCallSite(t, "egress", "NewGate", "")
+	if !strings.HasPrefix(gate.args, "pol.Egress, sessions,") {
+		t.Fatalf("egress.NewGate(%s): want the sessions tracker as its second argument", gate.args)
+	}
+	taint := onlyCallSite(t, "tgBot", "SetSessionTaint", "sessions")
+	newBot := onlyCallSite(t, "telegram", "New", "")
+	hook := onlyCallSite(t, "policyEngine", "SetPendingApprovalHook", "")
+	start := onlyCallSite(t, "tgBot", "Start", "lifecycleCtx")
+	if taint.offset < newBot.offset || taint.offset > hook.offset || taint.offset > start.offset {
+		t.Error("tgBot.SetSessionTaint must run after telegram.New and before the pending-approval hook and tgBot.Start")
+	}
+}

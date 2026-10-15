@@ -292,6 +292,9 @@ func newTestBot(t *testing.T, cfg Config, sender Sender, ledger Ledger, gate Egr
 		// B-11: the same registry newPolicyFixture's engine loads, so a
 		// reversible tool gets its card; SetToolRules(nil) tests unwired.
 		toolRules: testToolRules,
+		// FIX-U-5: an empty in-memory tracker - every test assumes an
+		// unmarked session unless it marks one (or swaps the taint) itself.
+		taint: egress.NewSensitiveTracker(),
 	}
 	// FIX-P-5: every test built here assumes a REACHABLE bot (send never
 	// dials while offline); a test of the offline path stores false itself.

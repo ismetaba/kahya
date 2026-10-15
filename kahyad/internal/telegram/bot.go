@@ -22,7 +22,12 @@
 //
 // Every outbound byte passes kahyad/internal/egress.Gate.Check first
 // (host=api.telegram.org — HANDOFF §5 safety #1: approval cards are
-// egress too); a missing/locked kahya.telegram Keychain item, or an
+// egress too). FIX-U-5: every content-carrying text (approval cards,
+// notifications, task results, alarms, ritual questions) is ALSO gated by
+// this package before egress.Check: a session that has done a secret-lane
+// read (SessionTaint) or text the deterministic secret-lane pre-pass flags
+// leaves only as a constant, content-free notice (send, below). A
+// missing/locked kahya.telegram Keychain item, or an
 // unconfigured chat_id/user_id pair, disables the bot entirely (New never
 // returns an error) — every other kahyad subsystem is unaffected either
 // way (task spec step 1).
@@ -50,6 +55,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -150,6 +156,24 @@ type Sender interface {
 var _ Sender = (*tele.Bot)(nil)
 var _ EgressGate = (*egress.Gate)(nil)
 
+// SessionTaint is the narrow "has this session done a secret-lane read"
+// lookup this bot consults BEFORE any content-carrying byte leaves for
+// Telegram - HANDOFF §5 safety #1 ⚑, second clause: an allowlist-INTERNAL
+// but content-carrying target (Telegram sendMessage) is subject to the
+// post-sensitive-read content restraint (FIX-U-5). egress.Gate.Check only
+// enforces the allowlist-EXTERNAL half (`sensitive && !matched`), and
+// api.telegram.org IS allowlisted, so that rule can never fire for
+// anything this package sends; this seam is the other half.
+// *egress.SensitiveTracker satisfies it directly (IsMarkedCtx, FIX-B-7:
+// memory first, then the sensitive_reads table; (true, err) on a store
+// error). A nil SessionTaint is "cannot answer" and restricts every content
+// send (CLAUDE.md fail-closed) - see sessionRestricted.
+type SessionTaint interface {
+	IsMarkedCtx(ctx context.Context, sessionID string) (bool, error)
+}
+
+var _ SessionTaint = (*egress.SensitiveTracker)(nil)
+
 // telegramAPIHost is the fixed egress-gate host every Telegram send/edit
 // this package makes is checked against (HANDOFF §5 safety #1: approval
 // cards/alarms are egress too, same gate every other off-box byte passes
@@ -220,6 +244,12 @@ type Bot struct {
 	// posture elsewhere.
 	remembered RememberedMarker
 	ritual     RitualAnswerer
+
+	// taint is the FIX-U-5 session gate (SetSessionTaint; main.go wires the
+	// SAME *egress.SensitiveTracker egressGate consults). taintUnwiredOnce
+	// rate-limits the "unwired" warning to one JSONL line per process.
+	taint            SessionTaint
+	taintUnwiredOnce sync.Once
 
 	// online is FIX-P-5's "reachable" bit: set by Start's waitOnline once
 	// getMe succeeds, cleared after offlineAfterPollErrors consecutive
@@ -330,6 +360,13 @@ func (b *Bot) wirePoller(p *backoffPoller) {
 // policy.ErrNonLocalRequiresReversible backstop refuses a Telegram approve
 // of an irreversible tool regardless of what this bot shows.
 func (b *Bot) SetToolRules(rules map[string]policy.ToolRule) { b.toolRules = rules }
+
+// SetSessionTaint wires the sensitive-read lookup (FIX-U-5). Call before
+// Start(); main.go passes the SAME tracker egress.NewGate received. Leaving
+// it nil does NOT disable the gate - it fails closed (every content send is
+// redacted to msgOutboundRedactedFmt and telegram_session_taint_unwired is
+// logged once).
+func (b *Bot) SetSessionTaint(t SessionTaint) { b.taint = t }
 
 // isReversible reports whether tool's policy.yaml rule is reversible: true.
 // An unknown tool or an unwired registry is irreversible (fail-closed).
@@ -613,15 +650,67 @@ func (b *Bot) Start(ctx context.Context) {
 	b.tb.Start()
 }
 
-// send is the ONE path every outbound Telegram TEXT message goes through:
-// egress.Check FIRST (host=api.telegram.org, nbytes=len(text) — task spec
-// step 5), THEN the actual send. A blocked/failed send falls back to a
-// local notify line (best-effort) and is never silently swallowed; it
-// returns nil on any failure so callers can skip card-state bookkeeping
-// for a message that never actually reached Telegram. FIX-P-5 (decision
-// G09-1): while the bot is not Online, send returns BEFORE the egress
-// check without touching the network - one local telegram_offline line
-// instead of a send that could block on the HTTP client timeout.
+// sessionRestricted is the session half of the FIX-U-5 gate: has traceID
+// (this package's egress session key, == SessionInfo.SessionID) done a
+// secret-lane read? Returns the English ledger reason and true when the
+// text must NOT leave as-is. An empty traceID has no session to consult
+// (egress.SessionInfo's own "never a denial on that basis alone"), so only
+// the content half applies to it.
+func (b *Bot) sessionRestricted(ctx context.Context, traceID string) (reason string, restricted bool) {
+	if traceID == "" {
+		return "", false
+	}
+	if b.taint == nil {
+		b.taintUnwiredOnce.Do(func() {
+			if b.log != nil {
+				b.log.Warn("telegram_session_taint_unwired")
+			}
+		})
+		return "session:unwired", true // fail closed: cannot answer => restricted
+	}
+	marked, err := b.taint.IsMarkedCtx(ctx, traceID)
+	if err != nil {
+		// IsMarkedCtx already reports marked=true on a store error
+		// (FIX-B-7); record why so the redaction row is explainable.
+		b.ledgerEvent(traceID, "telegram_session_taint_lookup_failed", map[string]any{
+			"event": "telegram_session_taint_lookup_failed", "err": err.Error(),
+		})
+		return "session:lookup_failed", true
+	}
+	if marked {
+		return "session:sensitive_read", true
+	}
+	return "", false
+}
+
+// outboundRestricted is the full FIX-U-5 decision for ONE outbound text:
+// the session half first (independent of content; one map hit or one PK
+// SELECT), then P-6's deterministic content pre-pass over the EXACT bytes
+// about to be sent (outboundSecretLane: the text, its canon-stripped form
+// and its escape-decoded forms). No model, no network.
+func (b *Bot) outboundRestricted(ctx context.Context, traceID, text string) (reason string, restricted bool) {
+	if reason, restricted := b.sessionRestricted(ctx, traceID); restricted {
+		return reason, true
+	}
+	if secret, why := outboundSecretLane(text); secret {
+		return why, true
+	}
+	return "", false
+}
+
+// send is the ONE path every outbound content-carrying Telegram TEXT
+// message goes through. Order: Enabled -> Online (FIX-P-5, decision G09-1:
+// while offline nothing dials, one local telegram_offline line instead) ->
+// FIX-U-5 session+content gate -> transmit (egress.Check + Sender.Send). A
+// restricted text NEVER reaches transmit: the constant notice
+// msgOutboundRedactedFmt (no keyboard) goes in its place, the restriction
+// is ledgered (reason only - never a byte of the text), the local notifier
+// gets msgTextRedactedLocal, and nil is returned so every caller reports
+// "did not reach Telegram" (SendNotification/SendTaskResult => false).
+// OnPendingApproval decides the session half for a whole card BEFORE
+// rendering it (so a multi-chunk card never degrades into N notices); this
+// is the backstop. Returns nil on any failure so callers can skip
+// card-state bookkeeping for a message that never reached Telegram.
 func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.ReplyMarkup) *tele.Message {
 	if !b.Enabled() {
 		return nil
@@ -630,13 +719,43 @@ func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.Reply
 		b.fallbackLocal(ctx, traceID, "telegram_offline", msgTelegramOffline)
 		return nil
 	}
-	// MINOR D fix: SessionID is now set (== traceID) alongside TraceID, so
-	// a sensitive-read session's Telegram sends are actually subject to
-	// the sensitive-read egress rule (kahyad/internal/egress.Gate.Check's
-	// decision order, step 1) - matching anthproxy_hook.go's per-task
-	// trace-id-is-the-session-key convention. Previously SessionID was
-	// always left empty here, so that rule could never fire for anything
-	// this package ever sent.
+	if reason, restricted := b.outboundRestricted(ctx, traceID, text); restricted {
+		b.ledgerEvent(traceID, "telegram_text_redacted", map[string]any{
+			"event": "telegram_text_redacted", "reason": reason, "bytes": len(text), "keyboard": markup != nil,
+		})
+		b.fallbackLocal(ctx, traceID, "telegram_text_redacted", msgTextRedactedLocal)
+		b.transmit(ctx, traceID, fmt.Sprintf(msgOutboundRedactedFmt, traceID), nil)
+		return nil
+	}
+	return b.transmit(ctx, traceID, text, markup)
+}
+
+// sendNotice sends a constant, content-free notice (redactedNoticeText)
+// through Enabled/Online/transmit - send's FIX-U-5 gate is skipped ON
+// PURPOSE: a notice carries no user byte, and gating it would turn a
+// sensitive session's tool-named redacted title into the generic one.
+// Nothing but a compile-time constant plus a policy.yaml tool name (or a
+// trace id) may ever be passed here.
+func (b *Bot) sendNotice(ctx context.Context, traceID, notice string) *tele.Message {
+	if !b.Enabled() {
+		return nil
+	}
+	if !b.Online() {
+		b.fallbackLocal(ctx, traceID, "telegram_offline", msgTelegramOffline)
+		return nil
+	}
+	return b.transmit(ctx, traceID, notice, nil)
+}
+
+// transmit is send's former body: egress.Check FIRST (host=api.telegram.org,
+// nbytes=len(text) — task spec step 5), THEN Sender.Send; a blocked/failed
+// send falls back to a local notify line (best-effort) and returns nil.
+// MINOR D: SessionID == TraceID == traceID, so a sensitive-read session is
+// subject to the egress gate's own sensitive-read rule too (anthproxy_hook
+// .go's per-task-trace-id-is-the-session-key convention). It takes ONLY
+// text outboundRestricted just cleared or a constant notice; its callers
+// are exactly send (twice) and sendNotice (once).
+func (b *Bot) transmit(ctx context.Context, traceID, text string, markup *tele.ReplyMarkup) *tele.Message {
 	dec, err := b.egress.Check(ctx, egress.Target{Host: telegramAPIHost, Port: 443}, int64(len(text)), egress.SessionInfo{SessionID: traceID, TraceID: traceID})
 	if err != nil || !dec.Allow {
 		b.fallbackLocal(ctx, traceID, "telegram_send_blocked", "Telegram gönderimi engellendi; onay/alarm CLI/yerel yüzeyden takip edilmeli.")
@@ -667,7 +786,10 @@ func (b *Bot) send(ctx context.Context, traceID, text string, markup *tele.Reply
 // call itself succeeded) so a caller can ledger delivery precisely rather
 // than assuming success - send's own best-effort local-fallback notify
 // still fires on a blocked/failed send exactly as it does for every other
-// caller of send.
+// caller of send. FIX-U-5: it also returns false when send's session/
+// content gate redacted the text (only the constant msgOutboundRedactedFmt
+// notice reached Telegram); ui.FanOutDelivery's local half still delivers
+// the full text.
 func (b *Bot) SendNotification(ctx context.Context, traceID, text string) bool {
 	return b.send(ctx, traceID, text, nil) != nil
 }

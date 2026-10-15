@@ -20,6 +20,10 @@
 //     bytes `\n`).
 //
 // The local surface (`kahya approve <id>`) always shows the full card.
+//
+// FIX-U-5: every outbound body, not only approval payloads, is classified
+// by outboundSecretLane (bot.go send), and a session that has done a
+// secret-lane read sends nothing but constant notices.
 package telegram
 
 import (
