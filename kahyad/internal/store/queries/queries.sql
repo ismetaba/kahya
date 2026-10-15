@@ -622,10 +622,10 @@ LIMIT 1;
 -- Every tool_calls row for task_id still stuck at 'intent'/'executing' -
 -- i.e. a side-effectful call whose kahyad-side execution was interrupted
 -- (worker died, kahyad crashed) before a receipt (or a failure) was ever
--- recorded. Ordered most-recent-first: the resume scan (task spec step 6)
--- only ever needs the single most recent one - realistically there is at
--- most one such row per task at any moment, but the scan itself is
--- defensive about that.
+-- recorded. Ordered most-recent-first. The resume scan (task spec step 6)
+-- examines EVERY row: FIX-I-4's ErrReceiptPersistFailed can leave an older
+-- W2/W3 row 'executing' while the task continues, and a later interrupted
+-- W1 call must not hide it (W2/W3 never auto-retry).
 SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
 FROM tool_calls
 WHERE task_id = ? AND status IN ('intent', 'executing')

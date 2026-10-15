@@ -277,13 +277,19 @@ func (r *Resume) Scan(ctx context.Context) (int, error) {
 //     mid-side-effect (or the interrupted call already has a durable
 //     receipt, from Receipts.Execute's own idempotent-replay guarantee) ->
 //     requeue for resume directly.
-//   - The most recent receipt-less row is class W1 -> mark it failed,
-//     count every attempt ever made for this exact (task_id, tool_name,
-//     args_hash) triple; within task.retry.w1_max_auto -> requeue for
-//     resume (auto-retry); past the cap -> blocked_user + the exact
-//     Turkish W1-cap string.
-//   - The most recent receipt-less row is class W2/W3 -> mark it failed,
-//     blocked_user + the exact Turkish W2/W3 string. No auto-retry at all.
+//   - EVERY receipt-less row is marked failed, then (FIX-FINAL
+//     resume-scan-ignores-older-receiptless-w2: not only the newest row -
+//     FIX-I-4's ErrReceiptPersistFailed can leave an OLDER W2/W3 row
+//     'executing' while the task continues):
+//   - Any receipt-less row is class W2/W3 -> blocked_user + the exact
+//     Turkish W2/W3 string naming the newest such row's tool. No
+//     auto-retry at all (HANDOFF §6 W4: "yalniz W1 oto-tekrar, W2/W3
+//     asla").
+//   - Otherwise (all W1) -> count every attempt ever made for each
+//     distinct (task_id, tool_name, args_hash) triple; any past
+//     task.retry.w1_max_auto -> blocked_user + the exact Turkish W1-cap
+//     string for the newest such row; all within the cap -> requeue for
+//     resume (auto-retry).
 //
 // FIX-I-2: every "requeue" outcome above first passes the crash-resume cap
 // (requeueOrBlock): a task whose crash re-dispatches (tasks.crash_resumes)
@@ -303,25 +309,37 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 		return r.requeueOrBlock(ctx, t)
 	}
 
-	row := rows[0]
-	if err := r.toolCalls.MarkToolCallFailed(ctx, sqlcgen.MarkToolCallFailedParams{
-		FinishedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
-	}); err != nil {
-		return fmt.Errorf("mark tool_calls failed (id=%d): %w", row.ID, err)
+	// rows are newest first (ListReceiptlessToolCalls ORDER BY id DESC).
+	for _, row := range rows {
+		if err := r.toolCalls.MarkToolCallFailed(ctx, sqlcgen.MarkToolCallFailedParams{
+			FinishedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
+		}); err != nil {
+			return fmt.Errorf("mark tool_calls failed (id=%d): %w", row.ID, err)
+		}
+	}
+	for _, row := range rows {
+		if row.Class != string(ClassW1) {
+			return r.blockOnReceiptless(ctx, traceID, t.ID, row.ToolName)
+		}
 	}
 
-	if row.Class != string(ClassW1) {
-		return r.blockOnReceiptless(ctx, traceID, t.ID, row.ToolName)
-	}
-
-	attempts, err := r.toolCalls.CountToolCallAttempts(ctx, sqlcgen.CountToolCallAttemptsParams{
-		TaskID: t.ID, ToolName: row.ToolName, ArgsHash: row.ArgsHash,
-	})
-	if err != nil {
-		return fmt.Errorf("count tool_calls attempts: %w", err)
-	}
-	if int(attempts) > r.w1MaxAuto {
-		return r.blockOnW1CapExceeded(ctx, traceID, t.ID, row.ToolName, attempts)
+	type triple struct{ tool, argsHash string }
+	counted := make(map[triple]bool, len(rows))
+	for _, row := range rows {
+		k := triple{row.ToolName, row.ArgsHash}
+		if counted[k] {
+			continue
+		}
+		counted[k] = true
+		attempts, err := r.toolCalls.CountToolCallAttempts(ctx, sqlcgen.CountToolCallAttemptsParams{
+			TaskID: t.ID, ToolName: row.ToolName, ArgsHash: row.ArgsHash,
+		})
+		if err != nil {
+			return fmt.Errorf("count tool_calls attempts: %w", err)
+		}
+		if int(attempts) > r.w1MaxAuto {
+			return r.blockOnW1CapExceeded(ctx, traceID, t.ID, row.ToolName, attempts)
+		}
 	}
 
 	return r.requeueOrBlock(ctx, t)

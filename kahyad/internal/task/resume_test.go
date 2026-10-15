@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"kahya/kahyad/internal/store"
@@ -375,5 +376,78 @@ func TestEnqueueResumeAfterRowDeliveredEnqueuesAgain(t *testing.T) {
 	}
 	if got := taskCrashResumes(t, st, "t1"); got != 2 {
 		t.Errorf("crash_resumes = %d, want 2", got)
+	}
+}
+
+// TestOlderReceiptlessW2BlocksEvenWhenNewestIsW1 (FIX-FINAL
+// resume-scan-ignores-older-receiptless-w2): ProcessTask looked only at
+// the NEWEST receipt-less row. FIX-I-4's ErrReceiptPersistFailed can
+// leave an older W2 row 'executing' while the task continues; a later
+// interrupted W1 call then hid it and the task was auto-resumed with
+// nobody asked - HANDOFF §6 W4: "yalniz W1 oto-tekrar, W2/W3 asla". Every
+// receipt-less row is now examined and marked failed.
+func TestOlderReceiptlessW2BlocksEvenWhenNewestIsW1(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	setupTaskWithReceiptlessCall(t, st, "t1", "shell_host", "W2", HashArgs([]byte("a")))
+	insertReceiptlessToolCall(t, st, "t1", "fs_write", "W1", HashArgs([]byte("b")))
+	m := NewMachine(st.Queries, st)
+	notifier := &fakeNotifier{}
+	r := newResume(st, m, notifier, 3)
+	task, err := st.Queries.GetTaskByID(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetTaskByID: %v", err)
+	}
+	if err := r.ProcessTask(ctx, task); err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+	if got := taskStatus(t, st, "t1"); got != StatusBlockedUser {
+		t.Fatalf("status = %q, want %q (a receipt-less W2 must never auto-resume)", got, StatusBlockedUser)
+	}
+	if n := countOutboxResumeRows(t, st); n != 0 {
+		t.Errorf("outbox resume rows = %d, want 0", n)
+	}
+	if len(notifier.calls) != 1 {
+		t.Fatalf("notify calls = %d, want 1", len(notifier.calls))
+	}
+	if want := fmt.Sprintf(MsgW2W3ReceiptlessFmt, "t1", "shell_host", "t1"); notifier.calls[0].message != want || notifier.calls[0].kind != EventW2W3Receiptless {
+		t.Errorf("notify = %+v, want %s %q", notifier.calls[0], EventW2W3Receiptless, want)
+	}
+	if n := countToolCalls(t, st, "t1", CallStatusFailed); n != 2 {
+		t.Errorf("failed tool_calls = %d, want 2 (every receipt-less row)", n)
+	}
+}
+
+// TestOlderW1PastCapBlocksEvenWhenNewestW1IsWithinCap: with only W1 rows,
+// the cap is checked for every distinct (tool, args) triple, not only the
+// newest row's.
+func TestOlderW1PastCapBlocksEvenWhenNewestW1IsWithinCap(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	const w1Max = 1
+	hashA := HashArgs([]byte("a"))
+	setupTaskWithReceiptlessCall(t, st, "t1", "fs_write", "W1", hashA)
+	// that first attempt already failed; the live retry of the same triple
+	// is attempt 2, past the cap of 1
+	if _, err := st.DB().Exec(`UPDATE tool_calls SET status = 'failed' WHERE task_id = 't1'`); err != nil {
+		t.Fatal(err)
+	}
+	insertReceiptlessToolCall(t, st, "t1", "fs_write", "W1", hashA)
+	insertReceiptlessToolCall(t, st, "t1", "memory_write", "W1", HashArgs([]byte("b")))
+	m := NewMachine(st.Queries, st)
+	notifier := &fakeNotifier{}
+	r := newResume(st, m, notifier, w1Max)
+	task, err := st.Queries.GetTaskByID(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetTaskByID: %v", err)
+	}
+	if err := r.ProcessTask(ctx, task); err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+	if got := taskStatus(t, st, "t1"); got != StatusBlockedUser {
+		t.Fatalf("status = %q, want %q", got, StatusBlockedUser)
+	}
+	if len(notifier.calls) != 1 || notifier.calls[0].kind != EventW1RetryCapExceeded || !strings.Contains(notifier.calls[0].message, "fs_write") {
+		t.Errorf("notify = %+v, want one W1 cap notice naming fs_write", notifier.calls)
 	}
 }
