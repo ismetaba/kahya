@@ -142,20 +142,27 @@ func (s *Server) HandleConfirm(ctx context.Context, traceID string, args MemoryC
 	}
 	b.WriteString("---\n")
 	b.WriteString(body)
-	if err := os.WriteFile(abs, []byte(b.String()), 0o600); err != nil {
-		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: write %s: %w", relPath, err)
-	}
 
 	repoRoot, err := gitRepoRoot(s.MemoryDir)
 	if err != nil {
-		restoreMemoryFile(abs, raw, true, s.Log)
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: %w", err)
+	}
+	// FIX-FINAL crash-orphan-note-precommitted-as-user-edit: journal the
+	// rewrite before it lands (intent.go).
+	intent, err := s.recordWriteIntent(repoRoot, abs, "memory_confirm", traceID, []byte(b.String()))
+	if err != nil {
+		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: record write intent: %w", err)
+	}
+	if err := os.WriteFile(abs, []byte(b.String()), 0o600); err != nil {
+		s.undoWrite(intent, abs, raw, true)
+		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: write %s: %w", relPath, err)
 	}
 	commitSHA, err := gitCommitPath(repoRoot, abs, "memory_confirm: "+relPath)
 	if err != nil {
-		restoreMemoryFile(abs, raw, true, s.Log)
+		s.undoWrite(intent, abs, raw, true)
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: %w", err)
 	}
+	s.clearWriteIntent(intent)
 	episodeID, err := s.Index.ReindexFile(ctx, traceID, relPath)
 	if err != nil {
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: reindex %s: %w", relPath, err)

@@ -95,7 +95,7 @@ type Server struct {
 	// ReindexFile, ledger). brain.db is single-writer and the memory
 	// repo's git index is single anyway, so two concurrent memory_write/
 	// memory_forget calls racing .git/index.lock is never valid: a loser
-	// used to be able to return an error AFTER writeMemoryFile already put
+	// used to be able to return an error AFTER the note write already put
 	// real bytes on disk, leaving an untracked file with no commit, no
 	// reindex, and no ledger row - a filesystem write invisible to the
 	// audit ledger. Holding mu across the whole sequence makes every call
@@ -403,8 +403,22 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 
-	prevContent, hadPrev, err := writeMemoryFile(abs, args.Content)
+	repoRoot, err := gitRepoRoot(s.MemoryDir)
 	if err != nil {
+		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
+	}
+	newContent, prevContent, hadPrev, err := composeMemoryFile(abs, args.Content)
+	if err != nil {
+		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
+	}
+	// FIX-FINAL crash-orphan-note-precommitted-as-user-edit: journal the
+	// write before any byte lands (intent.go); no journal, no write.
+	intent, err := s.recordWriteIntent(repoRoot, abs, "memory_write", traceID, newContent)
+	if err != nil {
+		return MemoryWriteOutput{}, fmt.Errorf("memory_write: record write intent: %w", err)
+	}
+	if err := writeComposedMemoryFile(abs, newContent); err != nil {
+		s.undoWrite(intent, abs, prevContent, hadPrev)
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
 	if secretLane {
@@ -413,7 +427,7 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 		// write would otherwise redirect it unseen). Anything else undoes
 		// the write and refuses.
 		if landed, err := onDiskRelPath(s.MemoryDir, relPath); err != nil || landed != relPath {
-			restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
+			s.undoWrite(intent, abs, prevContent, hadPrev)
 			if err != nil {
 				return refuse("secret_path_unresolved", MsgMemoryWriteSecretLaneRefused, err, "")
 			}
@@ -421,16 +435,12 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 		}
 	}
 
-	repoRoot, err := gitRepoRoot(s.MemoryDir)
-	if err != nil {
-		restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
-		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
-	}
 	commitSHA, err := gitCommitPath(repoRoot, abs, "memory_write: "+relPath)
 	if err != nil {
-		restoreMemoryFile(abs, prevContent, hadPrev, s.Log)
+		s.undoWrite(intent, abs, prevContent, hadPrev)
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
+	s.clearWriteIntent(intent)
 
 	episodeID, err := s.Index.ReindexFile(ctx, traceID, relPath)
 	if err != nil {
@@ -503,7 +513,14 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 		if !found {
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: heading %q not found in %s", heading, relPath)
 		}
+		// FIX-FINAL crash-orphan-note-precommitted-as-user-edit: journal
+		// the edit before it lands (intent.go).
+		intent, err := s.recordWriteIntent(repoRoot, abs, "memory_forget", traceID, []byte(newContent))
+		if err != nil {
+			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: record write intent: %w", err)
+		}
 		if err := os.WriteFile(abs, []byte(newContent), 0o600); err != nil {
+			s.undoWrite(intent, abs, raw, true)
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: write %s: %w", relPath, err)
 		}
 		commitSHA, err = gitCommitPath(repoRoot, abs, fmt.Sprintf("memory_forget: %s (%s)", relPath, heading))
@@ -512,9 +529,10 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 			// restore the WORKING TREE bytes we just edited (raw is the
 			// pre-edit content read above) so no partial edit is left on
 			// disk uncommitted.
-			restoreMemoryFile(abs, raw, true, s.Log)
+			s.undoWrite(intent, abs, raw, true)
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: %w", err)
 		}
+		s.clearWriteIntent(intent)
 	} else {
 		trashRel := filepath.ToSlash(filepath.Join(".trash", fmt.Sprintf("%d-%s", time.Now().Unix(), filepath.Base(relPath))))
 		// Resolve trashAbs through resolveMemoryPath (not a raw
@@ -711,41 +729,45 @@ func resolveMemoryPath(memoryDir, rel string) (string, error) {
 	return candidate, nil
 }
 
-// writeMemoryFile writes content to abs: a brand new file gets a fresh
-// "kahya_source_tier: agent_derived" front-matter block wrapping content
-// verbatim; an existing file has its OWN leading front matter stripped
-// (stripLeadingFrontMatter - discarding whatever tier it used to declare,
-// never inspecting or preserving it) and gets a fresh agent_derived block
-// re-added around [old body, "\n\n---\n\n", content] - so every file this
-// tool ever touches is guaranteed to read back as agent_derived
-// (HANDOFF §5 memory #1 quarantine: "there is no argument to claim a
-// higher tier", including by pointing `file` at an existing
+// composeMemoryFile builds the bytes memory_write writes to abs: a brand
+// new file gets a fresh "kahya_source_tier: agent_derived" front-matter
+// block wrapping content verbatim; an existing file has its OWN leading
+// front matter stripped (stripLeadingFrontMatter - discarding whatever tier
+// it used to declare, never inspecting or preserving it) and gets a fresh
+// agent_derived block re-added around [old body, "\n\n---\n\n", content] -
+// so every file this tool ever touches is guaranteed to read back as
+// agent_derived (HANDOFF §5 memory #1 quarantine: "there is no argument to
+// claim a higher tier", including by pointing `file` at an existing
 // higher-tier document to smuggle agent text in under its trust level).
 //
-// Returns the file's PRIOR bytes and whether it existed before this call
+// It also returns the file's PRIOR bytes and whether it existed before
 // (hadPrev), so a caller that must undo the write after a LATER step fails
 // (git add/commit) can restore exactly the prior on-disk state - via
-// restoreMemoryFile - without a second read.
-func writeMemoryFile(abs, content string) (prevContent []byte, hadPrev bool, err error) {
+// restoreMemoryFile - without a second read. The bytes are journalled
+// (recordWriteIntent) before writeComposedMemoryFile writes them.
+func composeMemoryFile(abs, content string) (newContent, prevContent []byte, hadPrev bool, err error) {
 	existingRaw, readErr := os.ReadFile(abs)
 	isNew := errors.Is(readErr, os.ErrNotExist)
 	if readErr != nil && !isNew {
-		return nil, false, fmt.Errorf("read %s: %w", abs, readErr)
+		return nil, nil, false, fmt.Errorf("read %s: %w", abs, readErr)
 	}
 
 	body := content
 	if !isNew {
 		body = stripLeadingFrontMatter(string(existingRaw)) + "\n\n---\n\n" + content
 	}
-	newContent := "---\nkahya_source_tier: agent_derived\n---\n" + body
+	return []byte("---\nkahya_source_tier: agent_derived\n---\n" + body), existingRaw, !isNew, nil
+}
 
+// writeComposedMemoryFile writes composeMemoryFile's bytes to abs.
+func writeComposedMemoryFile(abs string, newContent []byte) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return nil, false, fmt.Errorf("mkdir %s: %w", filepath.Dir(abs), err)
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(abs), err)
 	}
-	if err := os.WriteFile(abs, []byte(newContent), 0o600); err != nil {
-		return nil, false, fmt.Errorf("write %s: %w", abs, err)
+	if err := os.WriteFile(abs, newContent, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", abs, err)
 	}
-	return existingRaw, !isNew, nil
+	return nil
 }
 
 // restoreMemoryFile is HandleWrite/HandleForget's best-effort undo for the
@@ -756,7 +778,7 @@ func writeMemoryFile(abs, content string) (prevContent []byte, hadPrev bool, err
 // otherwise. Any restore error is only logged - this is best-effort
 // cleanup on a path that is already returning the ORIGINAL git error, and a
 // failed cleanup must never mask or replace that error.
-func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger) {
+func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger) error {
 	var restoreErr error
 	if hadPrev {
 		restoreErr = os.WriteFile(abs, prevContent, 0o600)
@@ -769,6 +791,7 @@ func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger)
 	if restoreErr != nil {
 		log.Error("memory_restore_error", "path", abs, "err", restoreErr.Error())
 	}
+	return restoreErr
 }
 
 // stripLeadingFrontMatter removes a leading "---\n...\n---\n" block from
@@ -778,7 +801,7 @@ func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger)
 // recognition kahyad/internal/indexer.StripFrontMatter uses: mcp/memory
 // cannot import that package (kahyad/internal/*, see render.go's package
 // doc), and this package only ever needs to know where the body starts
-// (to prepend a fresh tier block, see writeMemoryFile) - never the old
+// (to prepend a fresh tier block, see composeMemoryFile) - never the old
 // tier value - so it does not attempt any YAML parsing at all.
 func stripLeadingFrontMatter(content string) string {
 	const delim = "---"

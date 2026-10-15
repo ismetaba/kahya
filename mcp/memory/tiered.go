@@ -129,8 +129,24 @@ func (s *Server) HandleWriteTiered(ctx context.Context, traceID string, args Tie
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return TieredWriteOutput{}, fmt.Errorf("memory: mkdir %s: %w", filepath.Dir(abs), err)
 	}
+	repoRoot, err := gitRepoRoot(s.MemoryDir)
+	if err != nil {
+		return TieredWriteOutput{}, fmt.Errorf("memory: %w", err)
+	}
+	prefix := args.CommitPrefix
+	if prefix == "" {
+		prefix = "memory_write_tiered"
+	}
+	// FIX-FINAL crash-orphan-note-precommitted-as-user-edit: journal the
+	// note before it lands (intent.go), so a crash before the commit never
+	// lets a nightly author=user pre-commit claim an external_doc note.
+	intent, err := s.recordWriteIntent(repoRoot, abs, prefix, traceID, []byte(content))
+	if err != nil {
+		return TieredWriteOutput{}, fmt.Errorf("memory: record write intent: %w", err)
+	}
 	fh, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		s.clearWriteIntent(intent)
 		return TieredWriteOutput{}, fmt.Errorf("memory: create %s: %w", target, err)
 	}
 	_, werr := fh.WriteString(content)
@@ -138,30 +154,22 @@ func (s *Server) HandleWriteTiered(ctx context.Context, traceID string, args Tie
 		werr = cerr
 	}
 	if werr != nil {
-		restoreMemoryFile(abs, nil, false, s.Log)
+		s.undoWrite(intent, abs, nil, false)
 		return TieredWriteOutput{}, fmt.Errorf("memory: write %s: %w", target, werr)
 	}
 	if args.SecretLane {
 		if landed, err := onDiskRelPath(s.MemoryDir, target); err != nil || landed != target {
-			restoreMemoryFile(abs, nil, false, s.Log)
+			s.undoWrite(intent, abs, nil, false)
 			return TieredWriteOutput{}, fmt.Errorf("%w: stored as %q", ErrTieredSecretGlobMissing, landed)
 		}
 	}
 
-	repoRoot, err := gitRepoRoot(s.MemoryDir)
-	if err != nil {
-		restoreMemoryFile(abs, nil, false, s.Log)
-		return TieredWriteOutput{}, fmt.Errorf("memory: %w", err)
-	}
-	prefix := args.CommitPrefix
-	if prefix == "" {
-		prefix = "memory_write_tiered"
-	}
 	commitSHA, err := gitCommitPath(repoRoot, abs, prefix+": "+target)
 	if err != nil {
-		restoreMemoryFile(abs, nil, false, s.Log)
+		s.undoWrite(intent, abs, nil, false)
 		return TieredWriteOutput{}, fmt.Errorf("memory: %w", err)
 	}
+	s.clearWriteIntent(intent)
 	episodeID, err := s.Index.ReindexFile(ctx, traceID, target)
 	if err != nil {
 		return TieredWriteOutput{File: target, CommitSHA: commitSHA}, fmt.Errorf("memory: reindex %s: %w", target, err)

@@ -74,3 +74,20 @@ func TestChunkNeighbourReaderWired(t *testing.T) {
 		t.Fatal("SetChunkReader must run before srv.Run")
 	}
 }
+
+// TestBootRecoversPendingMemoryWritesBeforeTicks (FIX-FINAL crash-orphan-
+// note-precommitted-as-user-edit): kahyad commits, as kahyad, every memory
+// note it wrote but never committed before a crash - at boot, before the
+// scheduler ticks (and the nightly jobs they can trigger) start.
+func TestBootRecoversPendingMemoryWritesBeforeTicks(t *testing.T) {
+	rec := onlyCallSite(t, "srv", "RecoverPendingMemoryWrites", "context.Background(), bootTraceID")
+	ticks := onlyCallSite(t, "sched", "StartTicks", "")
+	if rec.offset > ticks.offset {
+		t.Fatal("RecoverPendingMemoryWrites must run before sched.StartTicks")
+	}
+	for _, setter := range []string{"SetMCPMemory", "SetMCPMemorySecretLane", "SetMemoryLane", "SetLocation"} {
+		if s := onlyCallSite(t, "srv", setter, ""); s.offset > rec.offset {
+			t.Errorf("srv.%s runs after RecoverPendingMemoryWrites, which builds the memory server once", setter)
+		}
+	}
+}

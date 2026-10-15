@@ -855,7 +855,20 @@ a cloud model, without changing anything in §2-§6 above:
   <kahyad@local>` as `memory_confirm: <path>` (never `user` - a review is
   user_asserted, not user_edit), reindexed (its chunks then pass the
   for_injection tier filter) and ledgered `memory_confirm {file,
-  previous_tier, commit_sha}`; a failing commit restores the bytes. The
+  previous_tier, commit_sha}`; a failing commit restores the bytes.
+  Every kahyad memory write (memory_write, the ingest note writer, memory
+  confirm, memory_forget-by-heading) first journals a write-ahead intent
+  (repo-relative path + sha256 of the exact bytes, durably under
+  `<git-dir>/kahya-pending/`; no journal, no write) and removes it once
+  the commit landed or the write was undone. At boot and at the top of
+  every nightly author=user pre-commit (inside the repo lock), a
+  still-dirty file whose bytes equal its intent's is committed as kahyad
+  (`<op> (recovered): <path>`, ledger `memory.write_recovered`, reindexed),
+  so a crash between write and commit can no longer turn an
+  agent_derived/external_doc note into user_edit; an intent whose file was
+  edited since (the user's edit wins), removed or already committed is
+  dropped, and a failed recovery fails the pre-commit closed (FIX-FINAL
+  crash-orphan-note-precommitted-as-user-edit). The
   path is resolved to the name the volume stores (`memory.StoredRelPath`),
   so an NFD/NFC or case variant confirms the existing note - one episode,
   the stored spelling in the commit, ledger and answer (FIX-FINAL

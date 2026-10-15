@@ -196,6 +196,17 @@ type RepoLocker interface {
 	LockMemoryRepo() (unlock func())
 }
 
+// PendingWriteRecoverer is the optional RepoLocker extension (kahyad's
+// server implements it) that commits, as author kahyad, every memory note
+// kahyad wrote but never committed before a crash - called by the
+// author=user pre-commit inside the lock, BEFORE it stages anything
+// (FIX-FINAL crash-orphan-note-precommitted-as-user-edit). An error means
+// an unresolved kahyad write may still be dirty: the pre-commit fails
+// closed and commits nothing as the user that night.
+type PendingWriteRecoverer interface {
+	RecoverPendingMemoryWritesLocked(ctx context.Context, traceID string) error
+}
+
 type Consolidator struct {
 	Cfg Config
 
@@ -1035,6 +1046,12 @@ func (c *Consolidator) preCommitUserEdits(ctx context.Context, traceID, memRel, 
 	if c.RepoLock != nil {
 		unlock := c.RepoLock.LockMemoryRepo()
 		defer unlock()
+		if r, ok := c.RepoLock.(PendingWriteRecoverer); ok {
+			if err := r.RecoverPendingMemoryWritesLocked(ctx, traceID); err != nil {
+				c.logError("consolidation_pending_write_recovery_failed", "trace_id", traceID, "err", err.Error())
+				return fmt.Errorf("consolidation: recover pending memory writes: %w", err)
+			}
+		}
 	}
 	dirty, err := IsDirtyUnder(ctx, c.Git, c.Cfg.KahyaDir, memRel)
 	if err != nil {

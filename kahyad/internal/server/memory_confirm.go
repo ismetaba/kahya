@@ -11,6 +11,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -31,6 +32,31 @@ func (s *Server) LockMemoryRepo() func() {
 		return func() {}
 	}
 	return m.LockRepo()
+}
+
+// RecoverPendingMemoryWrites commits, as author kahyad, every memory note
+// kahyad wrote but never committed before a crash (FIX-FINAL
+// crash-orphan-note-precommitted-as-user-edit, mcp/memory intent.go).
+// main.go runs it at boot, after every memory setter and before the
+// scheduler ticks start. No memory server wired = nothing to recover.
+func (s *Server) RecoverPendingMemoryWrites(ctx context.Context, traceID string) error {
+	m := s.memoryServer()
+	if m == nil {
+		return nil
+	}
+	return m.RecoverPendingWrites(ctx, traceID)
+}
+
+// RecoverPendingMemoryWritesLocked is RecoverPendingMemoryWrites for a
+// caller already holding LockMemoryRepo's lock: consolidation's author=user
+// pre-commit runs it first, inside the lock, and commits nothing as the
+// user when it fails.
+func (s *Server) RecoverPendingMemoryWritesLocked(ctx context.Context, traceID string) error {
+	m := s.memoryServer()
+	if m == nil {
+		return nil
+	}
+	return m.RecoverPendingWritesLocked(ctx, traceID)
 }
 
 // memoryServer returns the ONE mcp/memory.Server this kahyad process writes

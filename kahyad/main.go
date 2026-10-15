@@ -1518,6 +1518,14 @@ func run() int {
 		log.Error("anchor_push_tick_register_failed", "err", err.Error())
 	}
 
+	// FIX-FINAL crash-orphan-note-precommitted-as-user-edit: a memory note
+	// kahyad wrote but never committed before a crash is committed as
+	// kahyad now (its intent journal), before any tick or nightly job can
+	// commit it as the user. After every memory setter (the memory server
+	// is built once, from them).
+	if err := srv.RecoverPendingMemoryWrites(context.Background(), bootTraceID); err != nil {
+		log.Error("memory_pending_write_recovery_failed", "err", err.Error())
+	}
 	sched.StartTicks()
 	defer sched.StopTicks()
 
