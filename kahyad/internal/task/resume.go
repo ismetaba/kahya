@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -277,10 +278,11 @@ func (r *Resume) Scan(ctx context.Context) (int, error) {
 //     mid-side-effect (or the interrupted call already has a durable
 //     receipt, from Receipts.Execute's own idempotent-replay guarantee) ->
 //     requeue for resume directly.
-//   - EVERY receipt-less row is marked failed, then (FIX-FINAL
-//     resume-scan-ignores-older-receiptless-w2: not only the newest row -
-//     FIX-I-4's ErrReceiptPersistFailed can leave an OLDER W2/W3 row
-//     'executing' while the task continues):
+//   - Otherwise the outcome is decided from EVERY listed receipt-less row
+//     (FIX-FINAL resume-scan-ignores-older-receiptless-w2: not only the
+//     newest row - FIX-I-4's ErrReceiptPersistFailed can leave an OLDER
+//     W2/W3 row 'executing' while the task continues) before anything is
+//     written:
 //   - Any receipt-less row is class W2/W3 -> blocked_user + the exact
 //     Turkish W2/W3 string naming the newest such row's tool. No
 //     auto-retry at all (HANDOFF §6 W4: "yalniz W1 oto-tekrar, W2/W3
@@ -290,6 +292,11 @@ func (r *Resume) Scan(ctx context.Context) (int, error) {
 //     task.retry.w1_max_auto -> blocked_user + the exact Turkish W1-cap
 //     string for the newest such row; all within the cap -> requeue for
 //     resume (auto-retry).
+//   - A block is made durable FIRST (the blocked_user transition), then
+//     every row is marked failed, then the notice is sent; a requeue
+//     marks every row first and enqueues only when all marks landed
+//     (FIX-FINAL resume-scan-partial-mark-loses-w2-block). Any failure
+//     leaves the rows a later scan needs to reach the same decision.
 //
 // FIX-I-2: every "requeue" outcome above first passes the crash-resume cap
 // (requeueOrBlock): a task whose crash re-dispatches (tasks.crash_resumes)
@@ -309,20 +316,28 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 		return r.requeueOrBlock(ctx, t)
 	}
 
+	// FIX-FINAL resume-scan-partial-mark-loses-w2-block: decide from the
+	// listed rows BEFORE writing anything, make a block durable FIRST, and
+	// only then mark the rows failed. Marking first (and stopping at the
+	// first failed mark) left a newer W2/W3 row already 'failed' when a
+	// later mark or the transition failed, so the next scan saw only the
+	// remaining W1 rows and auto-requeued the task: a W2/W3 interruption
+	// auto-retried on an error path (HANDOFF §6 W4 "W2/W3 asla"). Now a
+	// failed transition leaves every row receipt-less for the next scan
+	// (same rows -> same block), and once the task is blocked_user it is
+	// outside the scan whatever a later mark does.
+	//
 	// rows are newest first (ListReceiptlessToolCalls ORDER BY id DESC).
 	for _, row := range rows {
-		if err := r.toolCalls.MarkToolCallFailed(ctx, sqlcgen.MarkToolCallFailedParams{
-			FinishedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
-		}); err != nil {
-			return fmt.Errorf("mark tool_calls failed (id=%d): %w", row.ID, err)
-		}
-	}
-	for _, row := range rows {
 		if row.Class != string(ClassW1) {
-			return r.blockOnReceiptless(ctx, traceID, t.ID, row.ToolName)
+			return r.blockThenMark(ctx, traceID, t.ID, rows, func() error {
+				return r.notifyReceiptless(ctx, traceID, t.ID, row.ToolName)
+			})
 		}
 	}
 
+	// All W1: CountToolCallAttempts counts every row of the triple whatever
+	// its status, so it is the same before and after the marks.
 	type triple struct{ tool, argsHash string }
 	counted := make(map[triple]bool, len(rows))
 	for _, row := range rows {
@@ -338,11 +353,46 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 			return fmt.Errorf("count tool_calls attempts: %w", err)
 		}
 		if int(attempts) > r.w1MaxAuto {
-			return r.blockOnW1CapExceeded(ctx, traceID, t.ID, row.ToolName, attempts)
+			tool := row.ToolName
+			return r.blockThenMark(ctx, traceID, t.ID, rows, func() error {
+				return r.notifyW1CapExceeded(ctx, traceID, t.ID, tool, attempts)
+			})
 		}
 	}
 
+	// Requeue: every row must be marked failed first; on any failed mark
+	// nothing is enqueued and the next scan (only W1 rows can remain)
+	// recomputes the outcome.
+	if err := r.markAllFailed(ctx, rows); err != nil {
+		return err
+	}
 	return r.requeueOrBlock(ctx, t)
+}
+
+// blockThenMark is ProcessTask's block path: transition to blocked_user
+// (on error nothing is marked - fail-closed), then mark every receipt-less
+// row failed (all attempted, errors joined), then send the notice even if
+// a mark failed. Do not put the marks and Machine.Transition in one tx:
+// the transition's ledger write needs the single pooled connection.
+func (r *Resume) blockThenMark(ctx context.Context, traceID, taskID string, rows []sqlcgen.ToolCall, notify func() error) error {
+	if err := r.machine.Transition(ctx, traceID, taskID, StatusBlockedUser); err != nil {
+		return fmt.Errorf("transition to blocked_user: %w", err)
+	}
+	markErr := r.markAllFailed(ctx, rows)
+	return errors.Join(markErr, notify())
+}
+
+// markAllFailed marks every row failed, attempting all of them.
+func (r *Resume) markAllFailed(ctx context.Context, rows []sqlcgen.ToolCall) error {
+	var errs []error
+	for _, row := range rows {
+		if err := r.toolCalls.MarkToolCallFailed(ctx, sqlcgen.MarkToolCallFailedParams{
+			FinishedAt: sql.NullString{String: r.nowRFC3339(), Valid: true}, ID: row.ID,
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("mark tool_calls failed (id=%d): %w", row.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // requeueOrBlock is ProcessTask's single requeue point (FIX-I-2): within the
@@ -360,12 +410,9 @@ func (r *Resume) requeueOrBlock(ctx context.Context, t sqlcgen.Task) error {
 	return r.enqueueResume(ctx, t.TraceID, t.ID)
 }
 
-// blockOnW1CapExceeded implements the W1-past-cap branch: transition the
-// task to blocked_user and notify with the exact Turkish string.
-func (r *Resume) blockOnW1CapExceeded(ctx context.Context, traceID, taskID, tool string, attempts int64) error {
-	if err := r.machine.Transition(ctx, traceID, taskID, StatusBlockedUser); err != nil {
-		return fmt.Errorf("transition to blocked_user: %w", err)
-	}
+// notifyW1CapExceeded is the W1-past-cap notice (the task is already
+// blocked_user, blockThenMark): the exact Turkish string.
+func (r *Resume) notifyW1CapExceeded(ctx context.Context, traceID, taskID, tool string, attempts int64) error {
 	msg := fmt.Sprintf(MsgW1RetryCapExceededFmt, taskID, tool, attempts, taskID)
 	return r.notify(ctx, traceID, EventW1RetryCapExceeded, msg, taskID, tool, attempts)
 }
@@ -386,14 +433,11 @@ func (r *Resume) blockOnResumeCapExceeded(ctx context.Context, traceID, taskID s
 	})
 }
 
-// blockOnReceiptless implements the W2/W3-receipt-less branch: transition
-// the task to blocked_user and notify with the exact Turkish string.
-// There is no attempt count in this message - there is no cap, because
-// there is no auto-retry at all for W2/W3 (HANDOFF §6 W4 ⚑).
-func (r *Resume) blockOnReceiptless(ctx context.Context, traceID, taskID, tool string) error {
-	if err := r.machine.Transition(ctx, traceID, taskID, StatusBlockedUser); err != nil {
-		return fmt.Errorf("transition to blocked_user: %w", err)
-	}
+// notifyReceiptless is the W2/W3-receipt-less notice (the task is already
+// blocked_user, blockThenMark): the exact Turkish string. There is no
+// attempt count in this message - there is no cap, because there is no
+// auto-retry at all for W2/W3 (HANDOFF §6 W4 ⚑).
+func (r *Resume) notifyReceiptless(ctx context.Context, traceID, taskID, tool string) error {
 	msg := fmt.Sprintf(MsgW2W3ReceiptlessFmt, taskID, tool, taskID)
 	return r.notify(ctx, traceID, EventW2W3Receiptless, msg, taskID, tool, 0)
 }
