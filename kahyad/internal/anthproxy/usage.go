@@ -317,15 +317,66 @@ func PriceFor(model string, at time.Time) (PriceRow, error) {
 	return PriceRow{}, fmt.Errorf("anthproxy: no pricing row for model %q at %s", model, at.Format(time.RFC3339))
 }
 
+// IterationUsage is one attempt in a response's usage.iterations array
+// (server-side fallbacks): per the API docs usage.iterations is the
+// per-attempt billing source of truth, while top-level usage covers only
+// the attempt that produced the returned message. Type is "message" for
+// the requested model's attempt and "fallback_message" for a fallback
+// model's; Model names the attempt's model when present (the bundled
+// CLI's own cost code reads the same fields).
+type IterationUsage struct {
+	Type                     string `json:"type"`
+	Model                    string `json:"model"`
+	InputTokens              int64  `json:"input_tokens"`
+	OutputTokens             int64  `json:"output_tokens"`
+	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
+}
+
+// Usage returns the entry's token counts as a Usage.
+func (it IterationUsage) Usage() Usage {
+	return Usage{
+		InputTokens:              it.InputTokens,
+		OutputTokens:             it.OutputTokens,
+		CacheCreationInputTokens: it.CacheCreationInputTokens,
+		CacheReadInputTokens:     it.CacheReadInputTokens,
+	}
+}
+
+// SumIterations adds up every attempt's tokens (the tokens all attempts
+// together consumed - the governor's ceiling counts them all).
+func SumIterations(iters []IterationUsage) Usage {
+	var u Usage
+	for _, it := range iters {
+		u.InputTokens += it.InputTokens
+		u.OutputTokens += it.OutputTokens
+		u.CacheCreationInputTokens += it.CacheCreationInputTokens
+		u.CacheReadInputTokens += it.CacheReadInputTokens
+	}
+	return u
+}
+
 // nonStreamUsage is the subset of a non-stream /v1/messages JSON response
 // this file cares about.
 type nonStreamUsage struct {
 	Usage struct {
-		InputTokens              int64 `json:"input_tokens"`
-		OutputTokens             int64 `json:"output_tokens"`
-		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		InputTokens              int64            `json:"input_tokens"`
+		OutputTokens             int64            `json:"output_tokens"`
+		CacheCreationInputTokens int64            `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64            `json:"cache_read_input_tokens"`
+		Iterations               []IterationUsage `json:"iterations"`
 	} `json:"usage"`
+}
+
+// ParseNonStreamIterations extracts usage.iterations from a complete
+// (non-SSE) /v1/messages JSON response body; nil when absent or
+// unparseable (metering never fails a request).
+func ParseNonStreamIterations(body []byte) []IterationUsage {
+	var v nonStreamUsage
+	if err := json.Unmarshal(body, &v); err != nil {
+		return nil
+	}
+	return v.Usage.Iterations
 }
 
 // ParseNonStreamUsage extracts Usage from a complete (non-SSE) /v1/messages
@@ -351,17 +402,25 @@ type sseMessageStart struct {
 	Type    string `json:"type"`
 	Message struct {
 		Usage struct {
-			InputTokens              int64 `json:"input_tokens"`
-			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			InputTokens              int64            `json:"input_tokens"`
+			CacheCreationInputTokens int64            `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int64            `json:"cache_read_input_tokens"`
+			Iterations               []IterationUsage `json:"iterations"`
 		} `json:"usage"`
 	} `json:"message"`
 }
 
+// sseMessageDelta's input/cache fields are pointers: message_delta may
+// carry the final (cumulative) input/cache counts too, and only a field
+// that is present overwrites message_start's value.
 type sseMessageDelta struct {
 	Type  string `json:"type"`
 	Usage struct {
-		OutputTokens int64 `json:"output_tokens"`
+		OutputTokens             int64            `json:"output_tokens"`
+		InputTokens              *int64           `json:"input_tokens"`
+		CacheCreationInputTokens *int64           `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     *int64           `json:"cache_read_input_tokens"`
+		Iterations               []IterationUsage `json:"iterations"`
 	} `json:"usage"`
 }
 
@@ -370,7 +429,8 @@ type sseMessageDelta struct {
 // step 2) — it never buffers or waits for the stream to finish; proxy.go
 // feeds it each line as the response is relayed to the client unbuffered.
 type SSEUsageAccumulator struct {
-	u Usage
+	u     Usage
+	iters []IterationUsage
 }
 
 // Feed processes one raw line of the SSE stream. Non-"data: " lines (blank
@@ -403,6 +463,9 @@ func (a *SSEUsageAccumulator) Feed(line string) {
 		a.u.InputTokens = ms.Message.Usage.InputTokens
 		a.u.CacheCreationInputTokens = ms.Message.Usage.CacheCreationInputTokens
 		a.u.CacheReadInputTokens = ms.Message.Usage.CacheReadInputTokens
+		if len(ms.Message.Usage.Iterations) > 0 {
+			a.iters = ms.Message.Usage.Iterations
+		}
 	case "message_delta":
 		var md sseMessageDelta
 		if err := json.Unmarshal([]byte(data), &md); err != nil {
@@ -413,8 +476,26 @@ func (a *SSEUsageAccumulator) Feed(line string) {
 		// observed before the stream ends is the final count, so Feed
 		// simply overwrites rather than summing.
 		a.u.OutputTokens = md.Usage.OutputTokens
+		if md.Usage.InputTokens != nil {
+			a.u.InputTokens = *md.Usage.InputTokens
+		}
+		if md.Usage.CacheCreationInputTokens != nil {
+			a.u.CacheCreationInputTokens = *md.Usage.CacheCreationInputTokens
+		}
+		if md.Usage.CacheReadInputTokens != nil {
+			a.u.CacheReadInputTokens = *md.Usage.CacheReadInputTokens
+		}
+		if len(md.Usage.Iterations) > 0 {
+			// The final per-attempt breakdown (message_delta's usage is
+			// cumulative, like its output_tokens).
+			a.iters = md.Usage.Iterations
+		}
 	}
 }
+
+// Iterations returns the latest usage.iterations the stream carried (nil
+// when it carried none).
+func (a *SSEUsageAccumulator) Iterations() []IterationUsage { return a.iters }
 
 // Usage returns the usage accumulated so far. Call once the stream has
 // ended for the final total.

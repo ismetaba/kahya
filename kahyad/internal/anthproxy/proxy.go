@@ -202,7 +202,52 @@ const (
 const (
 	MsgModelNotAllowed = "Izin verilmeyen model kimligi - istek reddedildi."
 	MsgPathNotAllowed  = "Izin verilmeyen uc nokta - istek reddedildi."
+	// MsgRoutingFieldNotAllowed is the 400 body for a request carrying a
+	// model-routing field the proxy does not allowlist and price (a
+	// client "fallbacks" on a non-Fable body, a non-standard "speed").
+	MsgRoutingFieldNotAllowed = "Izin verilmeyen model yonlendirme alani - istek reddedildi."
 )
+
+// disallowedRoutingField reports the first top-level member of body that
+// would route or price the call outside the model allowlist (FIX-FINAL
+// proxy-fallbacks-bypass-allowlist-and-pricing): a "fallbacks" member on a
+// body whose model is not a Fable id (a Fable body's fallbacks are always
+// overwritten with Fable5FallbackModel by shapeFable5Body; any other
+// model's server-side fallback could name an un-allowlisted model and
+// would be billed at the requested model's row), or a "speed" member
+// other than the JSON string "standard" (fast mode is a 2x price the
+// pricing table does not carry). Member names are matched the way
+// encoding/json folds them. A body topLevelFields cannot read returns ""
+// - the model allowlist refuses it anyway.
+func disallowedRoutingField(body []byte) string {
+	doc, ok := topLevelFields(body)
+	if !ok {
+		return ""
+	}
+	var model string
+	var speed json.RawMessage
+	var hasFallbacks, hasSpeed bool
+	for k, v := range doc {
+		switch foldJSONName(k) {
+		case foldJSONName("model"):
+			_ = json.Unmarshal(v, &model)
+		case foldJSONName("fallbacks"):
+			hasFallbacks = true
+		case foldJSONName("speed"):
+			speed, hasSpeed = v, true
+		}
+	}
+	if hasFallbacks && !fable5Models[model] {
+		return "fallbacks"
+	}
+	if hasSpeed {
+		var v string
+		if json.Unmarshal(speed, &v) != nil || v != "standard" {
+			return "speed"
+		}
+	}
+	return ""
+}
 
 // allowedPaths are the only upstream endpoints a worker may reach through
 // this proxy (owner decision G11-4: widened only after a live
@@ -660,6 +705,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FIX-FINAL proxy-fallbacks-bypass-allowlist-and-pricing: the
+	// allowlist below checks only the top-level "model"; a body's own
+	// "fallbacks" (non-Fable) or a non-standard "speed" would reach or
+	// price models outside it. Checked on the ORIGINAL body, before Fable
+	// shaping and before any budget reservation; like a model reject, it
+	// does not fail the task.
+	if field := disallowedRoutingField(bodyBytes); field != "" {
+		if p.cfg.EventLedger != nil {
+			reqModel, _ := probeRequest(bodyBytes)
+			_ = p.cfg.EventLedger.LogEvent(ctx, p.cfg.TraceID, EventModelRejected, map[string]any{
+				"task_id": p.cfg.TaskID, "model": reqModel, "field": field,
+			})
+		}
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", MsgRoutingFieldNotAllowed)
+		return
+	}
+
 	// W4-04 step 7: Fable-5 request shaping happens HERE, before the body
 	// is probed for governor sizing/model routing or ever reaches the
 	// retry transport - every downstream consumer (governor, upstream,
@@ -1039,6 +1101,15 @@ func (b *usageCapturingBody) Close() error {
 	return err
 }
 
+// iterations returns the response's usage.iterations (server-side
+// fallback attempts), nil when it carried none.
+func (b *usageCapturingBody) iterations() []IterationUsage {
+	if b.isSSE {
+		return b.sse.Iterations()
+	}
+	return ParseNonStreamIterations(b.jsonBuf.Bytes())
+}
+
 func (b *usageCapturingBody) feedSSE(chunk []byte) {
 	b.partial = append(b.partial, chunk...)
 	for {
@@ -1107,6 +1178,22 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 			}
 		}
 		usd := u.CostUSD(row)
+		if iters := wrapped.iterations(); len(iters) > 0 && encoding == "" {
+			// FIX-FINAL proxy-fallbacks-bypass-allowlist-and-pricing:
+			// usage.iterations is the per-attempt billing source of truth
+			// (top-level usage covers only the attempt that produced the
+			// message). Fail-closed: bill the larger of the top-level
+			// usage at the requested row and the per-attempt sum at each
+			// attempt's own row, and count the larger token total against
+			// the ceiling - a refused attempt is never dropped.
+			iterUSD := p.priceIterations(iters, data.Model)
+			if iterUSD > usd {
+				usd = iterUSD
+			}
+			if sum := SumIterations(iters); sum.BillableCeilingTokens() > u.BillableCeilingTokens() {
+				u = sum
+			}
+		}
 		if encoding != "" && status < 400 {
 			// FIX-I-11 (review), fail-closed: whatever the parser saw was
 			// compressed bytes, not usage. Bill the governor's
@@ -1145,6 +1232,32 @@ func (p *Proxy) wrapResponseBody(resp *http.Response) error {
 	}
 	resp.Body = wrapped
 	return nil
+}
+
+// priceIterations prices every usage.iterations entry at its own model's
+// row (an entry without a model is the requested model's attempt). An
+// unpriceable model is billed at MaxPriceRow and ledgered
+// EventPriceUnknown, never $0.
+func (p *Proxy) priceIterations(iters []IterationUsage, requested string) float64 {
+	now := p.cfg.Now()
+	var total float64
+	for _, it := range iters {
+		model := requested
+		if it.Model != "" {
+			model = CanonicalModel(it.Model)
+		}
+		row, err := PriceFor(model, now)
+		if err != nil {
+			row = MaxPriceRow(now)
+			if p.cfg.EventLedger != nil {
+				_ = p.cfg.EventLedger.LogEvent(context.Background(), p.cfg.TraceID, EventPriceUnknown, map[string]any{
+					"task_id": p.cfg.TaskID, "model": model, "billed_as": row.Model, "iteration": it.Type,
+				})
+			}
+		}
+		total += it.Usage().CostUSD(row)
+	}
+	return total
 }
 
 // undecodedContentEncoding returns resp's Content-Encoding when the body

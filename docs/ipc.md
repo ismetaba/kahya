@@ -249,8 +249,9 @@ note.
 **FIX-I-10 — model + path allowlist, never $0 pricing.** The worker's
 CLI writes the proxied body, so the proxy re-checks it in Go
 (`ServeHTTP` order, G00 C-8: local auth 401 → path allowlist 404 → egress
-gate 403 → passthrough credential presence 401 → body → Fable-5 shaping →
-model allowlist 400 → governor 503 → keychain 503 → upstream):
+gate 403 → passthrough credential presence 401 → body → routing-field
+check 400 → Fable-5 shaping → model allowlist 400 → governor 503 →
+keychain 503 → upstream):
 
 - **Paths:** only `/v1/messages` and `/v1/messages/count_tokens` (the URL
   path; the CLI's `?beta=true` query is fine). Anything else (files,
@@ -268,6 +269,22 @@ model allowlist 400 → governor 503 → keychain 503 → upstream):
   `"Izin verilmeyen model kimligi - istek reddedildi."` and ledger
   `proxy.model_rejected` `{task_id, model}`, before any budget
   reservation. A rejection does not fail the task by itself.
+- **Routing fields (FIX-FINAL proxy-fallbacks-bypass-allowlist-and-pricing):**
+  checked on the original body, before Fable-5 shaping: a `fallbacks`
+  member on a body whose model is not a Fable id (a Fable body's own value
+  is always overwritten with `[{"model":"claude-opus-4-8"}]`), or a
+  `speed` member other than `"standard"` (fast mode is a 2x price the
+  table does not carry), is `400` with `"Izin verilmeyen model yonlendirme
+  alani - istek reddedildi."` and ledger `proxy.model_rejected` `{task_id,
+  model, field}`, before any reservation.
+- **Per-attempt billing:** when a response carries `usage.iterations`
+  (server-side fallback attempts; top-level `usage` covers only the
+  attempt that produced the message), the `model_call` is billed at the
+  larger of the top-level usage at the requested model's row and the sum
+  of every attempt at its own model's row (an unpriceable attempt model:
+  `MaxPriceRow` + `proxy.price_unknown`), and the larger token total
+  counts against the per-task ceiling - a refused Fable attempt is never
+  dropped.
 - **One exact-key body parser (review fix):** every body-derived decision
   (model allowlist + pricing, Fable-5 shaping, the governor's
   `max_tokens` estimate) reads the top-level object through
