@@ -1948,3 +1948,59 @@ func TestLoadFailsClosedOnInvalidExtraction(t *testing.T) {
 		t.Fatalf("Load() at the bounds error = %v, want nil", err)
 	}
 }
+
+// TestLoadHafizaGraphDefaultsAndFileOverrides (FIX-MEM-1, decision
+// MEM-1.a): the <olgular> graph section is on with one hop, 12 lines and
+// 1200 runes by default, and the four keys are real config.yaml keys.
+func TestLoadHafizaGraphDefaultsAndFileOverrides(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.HafizaGraphEnabled || cfg.HafizaGraphHops != 1 || cfg.HafizaFactsMaxLines != 12 || cfg.HafizaFactsMaxRunes != 1200 {
+		t.Fatalf("defaults = enabled %v, hops %d, lines %d, runes %d; want true, 1, 12, 1200",
+			cfg.HafizaGraphEnabled, cfg.HafizaGraphHops, cfg.HafizaFactsMaxLines, cfg.HafizaFactsMaxRunes)
+	}
+	writeConfigYAML(t, home, "hafiza_graph_enabled: false\nhafiza_graph_hops: 2\nhafiza_facts_max_lines: 5\nhafiza_facts_max_runes: 600\n")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.HafizaGraphEnabled || cfg.HafizaGraphHops != 2 || cfg.HafizaFactsMaxLines != 5 || cfg.HafizaFactsMaxRunes != 600 {
+		t.Fatalf("overrides = enabled %v, hops %d, lines %d, runes %d; want false, 2, 5, 600",
+			cfg.HafizaGraphEnabled, cfg.HafizaGraphHops, cfg.HafizaFactsMaxLines, cfg.HafizaFactsMaxRunes)
+	}
+}
+
+// TestLoadFailsClosedOnInvalidHafizaGraph (FIX-MEM-1): a hop count outside
+// 0..2 or a facts-section bound outside its range fails Load instead of
+// being silently replaced by a default.
+func TestLoadFailsClosedOnInvalidHafizaGraph(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, key string }{
+		{"hops_negative", "hafiza_graph_hops: -1\n", "hafiza_graph_hops"},
+		{"hops_three", "hafiza_graph_hops: 3\n", "hafiza_graph_hops"},
+		{"lines_zero", "hafiza_facts_max_lines: 0\n", "hafiza_facts_max_lines"},
+		{"lines_over", fmt.Sprintf("hafiza_facts_max_lines: %d\n", MaxHafizaFactsMaxLines+1), "hafiza_facts_max_lines"},
+		{"runes_zero", "hafiza_facts_max_runes: 0\n", "hafiza_facts_max_runes"},
+		{"runes_over_block", fmt.Sprintf("hafiza_facts_max_runes: %d\n", MaxHafizaFactsMaxRunes+1), "hafiza_facts_max_runes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			writeConfigYAML(t, home, tc.yaml)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("Load() error = %v, want a %s validation error", err, tc.key)
+			}
+		})
+	}
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeConfigYAML(t, home, fmt.Sprintf("hafiza_graph_hops: 0\nhafiza_facts_max_lines: %d\nhafiza_facts_max_runes: %d\n", MaxHafizaFactsMaxLines, MaxHafizaFactsMaxRunes))
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() at the bounds error = %v, want nil", err)
+	}
+}

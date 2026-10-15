@@ -33,6 +33,7 @@ import (
 	"kahya/kahyad/internal/eval"
 	"kahya/kahyad/internal/extract"
 	"kahya/kahyad/internal/factengine"
+	"kahya/kahyad/internal/graph"
 	"kahya/kahyad/internal/halt"
 	"kahya/kahyad/internal/indexer"
 	"kahya/kahyad/internal/logx"
@@ -621,6 +622,13 @@ func run() int {
 	// model); the later G13 graph/extract/ingest steps reuse it.
 	laneClassifier := memlane.Classifier{Store: st.Queries, MemoryDir: cfg.MemoryDir, SecretGlobs: pol.SecretLaneGlobs, Matcher: ritual.PolicyGlobMatcher{}}
 	srv.SetMemoryLane(&laneClassifier)
+	// G13 MEM-1: the retrieval graph layer - the for_injection <hafiza>
+	// block's <olgular> section (config hafiza_graph_enabled, decision
+	// MEM-1.a: on, one hop). Read-only over brain.db; every fact passes
+	// factengine.InjectionEligible and, this block being cloud-bound,
+	// laneClassifier (a secret-path fact never enters it).
+	graphReader := &graph.Graph{Store: st.Queries, Lane: laneClassifier, Log: log}
+	srv.SetGraph(graphReader)
 	srv.SetMCPMemorySecretLane(memory.SecretLaneSeam{
 		Classifier: server.NewMemoryContentClassifier(),
 		Marker:     server.NewMemorySensitiveMarker(egressGate),

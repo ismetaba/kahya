@@ -589,6 +589,46 @@ a cloud model, without changing anything in §2-§6 above:
   GET-only `/v1/entity/{id}` pattern conflicts with the any-method
   `/v1/entity/merge|split` patterns in Go's ServeMux. Both are control
   routes.
+- **Graph facts in `<hafiza>` (FIX-MEM-1, G13).** The `for_injection:true`
+  block of `POST /v1/memory/search` (the one the worker's
+  `UserPromptSubmit` hook injects - a CLOUD model's input) gains an
+  `<olgular>` section after the chunk lines, inside the same `<hafiza>`
+  wrapper and the same 4000-rune budget:
+  `- [olgu#<id>] <subject> | <predicate> | <object> (p=<0.80>, <tier>[, söylenti][, <valid_from>→<valid_to>])`
+  (`", söylenti"` for a reported fact; a date-only bound is printed as the
+  date, an unknown bound empty, no validity part when both are unknown).
+  `kahyad/internal/graph.Graph.Neighbourhood` seeds the walk from the
+  query's words (each token and 2-gram, keyed by `factengine.AliasKey` -
+  `Emre'nin` → `emre`, keys under 3 runes skipped) and from the facts
+  citing the filtered chunk hits' episodes, reads the seeds' own facts
+  (hop 0) and `hafiza_graph_hops` hops further through the other end of
+  each KEPT fact. A fact is kept only when `factengine.InjectionEligible`
+  (active, p >= 0.3, never an unconfirmed `agent_derived` fact - HANDOFF §5
+  memory #1/#3) AND `memlane.CloudEligible` (no secret-path citation, at
+  least one resolvable citation, text not secret - fail-closed). In this
+  cloud lane the walk itself only follows what may leave the machine: a
+  query word seeds an entity only when it is one of the entity's visible
+  names (the subject/object string of a cloud-eligible fact on its own
+  side - an alias the extractor took from a secret note never seeds), an
+  episode seed only comes from a cloud-eligible fact, and a hop only goes
+  through a kept fact. Ranking: hop, then confidence, `valid_from` desc, id;
+  at most `hafiza_facts_max_lines` (12) lines / `hafiza_facts_max_runes`
+  (1200) runes, chunk lines dropped first to make room. The
+  `hafiza_injected` row gains `fact_ids` (exactly the facts in the block)
+  and `entity_ids` (every entity the walk read); `block`/`block_sha256`
+  cover the whole block, `<olgular>` included (§5 safety #4). The response
+  gains `facts` (`fact_id, subject, predicate, object, source_tier,
+  confidence_p, valid_from, valid_to`) on `for_injection:true` only; the
+  raw `for_injection:false` search never reads the graph. A graph error is
+  logged `hafiza_graph_failed` and the chunks are injected alone. Config
+  (decision MEM-1.a): `hafiza_graph_enabled` (true; false = the block is
+  byte-identical to the chunk-only one and the graph is never read),
+  `hafiza_graph_hops` (1, 0..2), `hafiza_facts_max_lines` (12, 1..50),
+  `hafiza_facts_max_runes` (1200, 1..4000). JSONL `graph_neighbourhood
+  {seed_entities, hop0_facts, hop1_facts, hop2_facts, kept, cloud_lane,
+  duration_ms}` (the query text at debug only). The restore drill's
+  `RunEquivalence` proves the chunk half only (`<olgular>` is facts-table
+  state, not retrieval).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

@@ -130,9 +130,21 @@ func runesEqual(a, b []rune) bool {
 // order and scores, so the second RenderKept call keeps every hit it is
 // given. The returned kept hits carry the trimmed Text.
 func RenderKeptDeduped(hits []Hit, k, overlapRunes int) (block string, kept []Hit) {
-	_, selected := RenderKept(hits, k)
-	if len(selected) == 0 {
-		return "", nil
+	block, kept, _ = RenderKeptDedupedWithFacts(hits, nil, k, overlapRunes, 0, 0)
+	return block, kept
+}
+
+// RenderKeptDedupedWithFacts is RenderKeptDeduped plus the <olgular> graph
+// facts section (FIX-MEM-1): the hits and facts are picked exactly as
+// RenderKeptWithFacts picks them (so the facts section's room is taken out
+// of the chunk budget first), the overlap is removed among the picked hits
+// only, and the result is rendered again. With no facts it is
+// byte-identical to RenderKeptDeduped. Trimming only shortens chunk lines,
+// so the second pass keeps every hit and fact the first pass picked.
+func RenderKeptDedupedWithFacts(hits []Hit, facts []FactLine, k, overlapRunes, maxFactLines, maxFactsRunes int) (block string, keptHits []Hit, keptFacts []FactLine) {
+	_, selected, selectedFacts := RenderKeptWithFacts(hits, facts, k, maxFactLines, maxFactsRunes)
+	if len(selected) == 0 && len(selectedFacts) == 0 {
+		return "", nil, nil
 	}
-	return RenderKept(DedupeOverlap(selected, overlapRunes), k)
+	return RenderKeptWithFacts(DedupeOverlap(selected, overlapRunes), selectedFacts, k, maxFactLines, maxFactsRunes)
 }

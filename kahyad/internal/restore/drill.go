@@ -14,9 +14,11 @@
 //     test (drill_test.go) can build the whole BUILD -> BACKUP -> RESTORE ->
 //     REINDEX -> COMPARE cycle hermetically over temp/scratch dbs without
 //     booting a child kahyad. The block RunEquivalence returns is byte-exact
-//     what the server's /v1/memory/search for_injection response carries and
-//     ledgers (HANDOFF S5 safety #4), because it goes through the SAME
-//     search+memory packages the server does.
+//     the chunk half of what the server's /v1/memory/search for_injection
+//     response carries and ledgers (HANDOFF S5 safety #4), because it goes
+//     through the SAME search+memory packages the server does (the
+//     server's <olgular> graph-facts section, FIX-MEM-1, is not retrieval
+//     and not part of the proof - see RunEquivalence).
 //   - Normalize: the NARROW volatile-field masker (trace_id + RFC3339/Nano
 //     timestamps only) applied to both blocks before the byte-compare, so a
 //     spurious volatile difference never fails the drill while any REAL
@@ -128,8 +130,11 @@ type InjectionResult struct {
 //     MaxBlockRunes=4000, the chunker overlap between consecutive chunks
 //     rendered once - FIX-MEM-8 / EK-MEM-B) the server uses.
 //
-// The returned Block is therefore byte-identical to what the server would
-// inject/ledger for the same query against the same db when the server runs
+// The returned Block is therefore byte-identical to the CHUNK half of what
+// the server would inject/ledger for the same query against the same db
+// (the server's <olgular> sub-block - FIX-MEM-1, kahyad/internal/graph - is
+// facts-table state, not retrieval, and is not part of the equivalence
+// proof; with no graph facts the two blocks are equal) when the server runs
 // the committed default fusion config with the embedder down (the drill
 // wires no embedder, and a recency weight the server activated through
 // search.Searcher.ActivateFusionConfig - FIX-MEM-8 - is not applied here),

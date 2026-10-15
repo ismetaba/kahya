@@ -123,6 +123,10 @@ type Server struct {
 	mcpSecretLane memory.SecretLaneSeam
 	memLane       *memlane.Classifier
 
+	// graph is the retrieval graph layer (G13 MEM-1, memory_graph.go): the
+	// for_injection <hafiza> block's <olgular> section. nil until SetGraph.
+	graph GraphReader
+
 	// taskStore wires POST /v1/task's tasks-table persistence (W12-07 step
 	// 4). See SetTaskStore's doc comment.
 	taskStore TaskStore
@@ -931,6 +935,9 @@ type memorySearchResponse struct {
 	// traceability: the injected block and the ledgered block must be
 	// byte-identical, sha256-verifiable).
 	HafizaBlock string `json:"hafiza_block,omitempty"`
+	// Facts are the graph facts the block's <olgular> section carries
+	// (FIX-MEM-1) - for_injection:true only, exactly the ledgered fact_ids.
+	Facts []memorySearchFactItem `json:"facts,omitempty"`
 }
 
 type errorResponse struct {
@@ -1041,18 +1048,37 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		for i, h := range filtered {
 			memHits[i] = memory.Hit{ChunkID: h.ChunkID, Path: h.Path, Seq: h.Seq, Text: h.Text, Score: h.Score, SourceTier: h.SourceTier}
 		}
+		// FIX-MEM-1: the graph facts about the entities the query names (or
+		// the hits' notes cite) - trust-filtered (factengine.
+		// InjectionEligible) and, this block being the one a CLOUD model
+		// receives, lane-filtered (memlane: a secret-path fact never enters).
+		// An enrichment only: a graph error injects the chunks alone.
+		graphOn := s.graph != nil && s.cfg.HafizaGraphEnabled
+		var factLines []memory.FactLine
+		var entityIDs []int64
+		if graphOn {
+			factLines, entityIDs = s.hafizaGraphFacts(r.Context(), traceID, req.Query, filtered)
+		}
 		// FIX-MEM-8: the chunker's overlap between two consecutive chunks of
-		// one note is rendered once (memory.RenderKeptDeduped trims the later
-		// chunk's prefix, never drops a hit - decision MEM-8.a). It runs
-		// after the tier filter above, so no quarantined chunk comes back
-		// (HANDOFF §5 memory #1). The raw results above stay untrimmed.
-		block, kept := memory.RenderKeptDeduped(memHits, memory.DefaultTopK, indexer.OverlapRunes)
+		// one note is rendered once (memory.RenderKeptDedupedWithFacts trims
+		// the later chunk's prefix, never drops a hit - decision MEM-8.a). It
+		// runs after the tier filter above, so no quarantined chunk comes
+		// back (HANDOFF §5 memory #1). The raw results above stay untrimmed.
+		// With no facts the block is byte-identical to the chunk-only one.
+		block, kept, keptFacts := memory.RenderKeptDedupedWithFacts(memHits, factLines, memory.DefaultTopK, indexer.OverlapRunes, s.cfg.HafizaFactsMaxLines, s.cfg.HafizaFactsMaxRunes)
 		resp.HafizaBlock = block
+		factIDs := make([]int64, len(keptFacts))
+		for i, f := range keptFacts {
+			factIDs[i] = f.FactID
+			resp.Facts = append(resp.Facts, memorySearchFactItemFrom(f))
+		}
 
 		// W12-05 step 1c/HANDOFF §5 safety #4: ledger the EXACT injected
 		// bytes (forensic poisoning traceability) - chunk_ids is only the
 		// chunks that actually survived RenderKept's top-k/budget trim,
-		// never the broader filtered candidate pool.
+		// never the broader filtered candidate pool; fact_ids likewise only
+		// the facts the block carries, entity_ids the entities the graph
+		// walk read (both present whenever the graph layer is on).
 		if s.eventLogger != nil {
 			chunkIDs := make([]int64, len(kept))
 			for i, h := range kept {
@@ -1064,6 +1090,13 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 				"chunk_ids":    chunkIDs,
 				"block_sha256": hex.EncodeToString(sum[:]),
 				"block":        block,
+			}
+			if graphOn {
+				if entityIDs == nil {
+					entityIDs = []int64{}
+				}
+				payload["fact_ids"] = factIDs
+				payload["entity_ids"] = entityIDs
 			}
 			if err := s.eventLogger.LogEvent(r.Context(), traceID, "hafiza_injected", payload); err != nil {
 				s.log.With(traceID).Warn("hafiza_injected_ledger_error", "err", err.Error())

@@ -9,10 +9,10 @@
 // types via narrow interfaces - the same pattern kahyad/internal/server
 // already uses for Searcher/Reindexer).
 //
-// render.go implements only the <hafiza> block renderer (W12-05 step 2);
-// dedupe.go removes the chunker's overlap between consecutive chunks before
-// rendering (FIX-MEM-8); server.go implements the three tool
-// registrations/handlers.
+// render.go implements only the <hafiza> block renderer (W12-05 step 2),
+// including its <olgular> graph-facts sub-block (FIX-MEM-1); dedupe.go
+// removes the chunker's overlap between consecutive chunks before rendering
+// (FIX-MEM-8); server.go implements the three tool registrations/handlers.
 package memory
 
 import (
@@ -108,13 +108,82 @@ func Render(hits []Hit, k int) string {
 // drifting from) Render's own selection logic to figure out which hits
 // survived.
 func RenderKept(hits []Hit, k int) (block string, kept []Hit) {
-	if len(hits) == 0 {
-		return "", nil
-	}
+	block, kept, _ = RenderKeptWithFacts(hits, nil, k, 0, 0)
+	return block, kept
+}
+
+// FactLine is one graph fact for the <olgular> sub-block. It mirrors
+// kahyad/internal/graph.FactLine (minus the walk bookkeeping) for the same
+// import-boundary reason Hit mirrors search.Hit (see the package doc):
+// kahyad/internal/server converts at the one call site that has both types.
+// The caller has already applied the trust filter
+// (factengine.InjectionEligible - HANDOFF §5 memory #1/#3) and, for a cloud
+// block, the lane filter (memlane) - the renderer only formats.
+type FactLine struct {
+	FactID        int64
+	Subject       string
+	Predicate     string
+	Object        string
+	SourceTier    string
+	Evidentiality string
+	// ConfidenceP is the probability form of the fact's confidence; the
+	// block prints it with 2 decimals.
+	ConfidenceP float64
+	// ValidFrom/ValidTo are the stored RFC3339 bounds, "" when NULL.
+	ValidFrom string
+	ValidTo   string
+}
+
+// Facts-section budget (FIX-MEM-1, W12-05's 400/4000 discipline extended):
+// at most MaxFactLines lines and MaxFactsRunes runes (the whole
+// <olgular>...</olgular> section), each subject/predicate/object cut at
+// MaxFactFieldRunes runes with an ellipsis. The section lives INSIDE the
+// same MaxBlockRunes envelope; chunk lines are dropped first to make room.
+const (
+	MaxFactLines      = 12
+	MaxFactsRunes     = 1200
+	MaxFactFieldRunes = 120
+)
+
+// evidentialityReported is factengine.Reported (hearsay); such a fact line
+// carries the Turkish ", söylenti" marker.
+const evidentialityReported = "reported"
+
+// midnightUTCSuffix is what factengine appends to a date-only validity
+// bound when it stores it (RFC3339 UTC); the block prints such a bound as
+// the bare date.
+const midnightUTCSuffix = "T00:00:00Z"
+
+// RenderKeptWithFacts is RenderKept plus an <olgular> sub-block of graph
+// facts (FIX-MEM-1). With no facts the result is BYTE-IDENTICAL to
+// RenderKept (RenderKept is this function with facts == nil). Format:
+//
+//	<hafiza>
+//	- [<path>#<seq>] <text>
+//	<olgular>
+//	- [olgu#<id>] <subject> | <predicate> | <object> (p=<0.80>, <tier>[, söylenti][, <valid_from>→<valid_to>])
+//	</olgular>
+//	</hafiza>
+//
+// e.g. "- [olgu#12] Emre | works_at | Acme (p=0.80, user_asserted,
+// 2026-05-01→)". ", söylenti" marks a reported (hearsay) fact. The validity
+// part is left out when both bounds are unknown; otherwise an unknown bound
+// is printed empty ("2026-05-01→" = still valid, "→2026-06-01" = start
+// unknown); a date-only bound is printed as the bare date.
+//
+// Facts keep the caller's order (the graph walk's ranking). Budget: the
+// first maxFactLines facts (<= 0 = MaxFactLines) are formatted and trailing
+// ones dropped until the section is within maxFactsRunes (<= 0 =
+// MaxFactsRunes); then the chunk lines are picked exactly as RenderKept
+// picks them (score sort, top k) and trailing chunk lines are dropped until
+// the whole block fits MaxBlockRunes; only when no chunk line is left and it
+// still does not fit are trailing fact lines dropped. A block with fact
+// lines but no chunk line is just the <olgular> section inside <hafiza>.
+// keptHits/keptFacts are exactly what the block carries.
+func RenderKeptWithFacts(hits []Hit, facts []FactLine, k, maxFactLines, maxFactsRunes int) (block string, keptHits []Hit, keptFacts []FactLine) {
 	if k <= 0 {
 		k = DefaultTopK
 	}
-
 	sorted := make([]Hit, len(hits))
 	copy(sorted, hits)
 	// Stable sort: hits arriving in an already-deterministic order (the
@@ -125,28 +194,96 @@ func RenderKept(hits []Hit, k int) (block string, kept []Hit) {
 	if len(sorted) > k {
 		sorted = sorted[:k]
 	}
-
-	lines := make([]string, len(sorted))
+	chunkLines := make([]string, len(sorted))
 	for i, h := range sorted {
-		lines[i] = fmt.Sprintf("- [%s#%d] %s", h.Path, h.Seq, truncateRunes(h.Text, MaxTextRunes))
+		chunkLines[i] = fmt.Sprintf("- [%s#%d] %s", h.Path, h.Seq, truncateRunes(h.Text, MaxTextRunes))
 	}
 
-	// Drop trailing entries (never re-truncate an individual line further)
-	// until the WHOLE wrapped block fits the rune budget.
-	for len(lines) > 0 {
-		blk := wrapHafiza(lines)
+	factLines, keptFacts := factSection(facts, maxFactLines, maxFactsRunes)
+
+	// Drop trailing chunk lines first (never re-truncate a line further),
+	// then trailing fact lines, until the WHOLE block fits the rune budget.
+	for len(chunkLines) > 0 || len(factLines) > 0 {
+		blk := wrapHafiza(chunkLines, factLines)
 		if utf8.RuneCountInString(blk) <= MaxBlockRunes {
-			return blk, sorted[:len(lines)]
+			return blk, sorted[:len(chunkLines)], keptFacts[:len(factLines)]
 		}
-		lines = lines[:len(lines)-1]
+		if len(chunkLines) > 0 {
+			chunkLines = chunkLines[:len(chunkLines)-1]
+		} else {
+			factLines = factLines[:len(factLines)-1]
+		}
 	}
-	return "", nil
+	return "", nil, nil
 }
 
-// wrapHafiza joins lines with the literal <hafiza>/</hafiza> wrapper this
-// package's doc comment and W12-05 step 2 fix byte-exact.
-func wrapHafiza(lines []string) string {
-	return "<hafiza>\n" + strings.Join(lines, "\n") + "\n</hafiza>"
+// factSection formats facts into <olgular> lines within the line and rune
+// budgets (dropping trailing facts), returning the lines and the facts they
+// carry.
+func factSection(facts []FactLine, maxLines, maxRunes int) ([]string, []FactLine) {
+	if len(facts) == 0 {
+		return nil, nil
+	}
+	if maxLines <= 0 {
+		maxLines = MaxFactLines
+	}
+	if maxRunes <= 0 {
+		maxRunes = MaxFactsRunes
+	}
+	if len(facts) > maxLines {
+		facts = facts[:maxLines]
+	}
+	lines := make([]string, len(facts))
+	for i, f := range facts {
+		lines[i] = factLine(f)
+	}
+	for len(lines) > 0 && utf8.RuneCountInString(wrapOlgular(lines)) > maxRunes {
+		lines = lines[:len(lines)-1]
+	}
+	return lines, facts[:len(lines)]
+}
+
+// factLine is one <olgular> bullet (see RenderKeptWithFacts for the
+// format).
+func factLine(f FactLine) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "- [olgu#%d] %s | %s | %s (p=%.2f, %s",
+		f.FactID,
+		truncateRunes(f.Subject, MaxFactFieldRunes),
+		truncateRunes(f.Predicate, MaxFactFieldRunes),
+		truncateRunes(f.Object, MaxFactFieldRunes),
+		f.ConfidenceP, f.SourceTier)
+	if f.Evidentiality == evidentialityReported {
+		b.WriteString(", söylenti")
+	}
+	if f.ValidFrom != "" || f.ValidTo != "" {
+		b.WriteString(", " + validityBound(f.ValidFrom) + "→" + validityBound(f.ValidTo))
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// validityBound prints a stored validity bound: a date-only bound
+// (midnight UTC) as the bare date, anything else as stored.
+func validityBound(s string) string {
+	return strings.TrimSuffix(s, midnightUTCSuffix)
+}
+
+// wrapHafiza joins chunk lines (and, when there are any, the <olgular>
+// section) with the literal <hafiza>/</hafiza> wrapper this package's doc
+// comment and W12-05 step 2 fix byte-exact.
+func wrapHafiza(chunkLines, factLines []string) string {
+	parts := make([]string, 0, len(chunkLines)+1)
+	parts = append(parts, chunkLines...)
+	if len(factLines) > 0 {
+		parts = append(parts, wrapOlgular(factLines))
+	}
+	return "<hafiza>\n" + strings.Join(parts, "\n") + "\n</hafiza>"
+}
+
+// wrapOlgular is the facts section's own wrapper.
+func wrapOlgular(lines []string) string {
+	return "<olgular>\n" + strings.Join(lines, "\n") + "\n</olgular>"
 }
 
 // truncateRunes returns s unchanged if it has at most max runes, otherwise

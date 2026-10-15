@@ -134,6 +134,22 @@ type Config struct {
 	// indexer and consolidation skip those) or a non-ASCII rune.
 	SecretLaneMemoryDir string `yaml:"secret_lane_memory_dir"`
 
+	// HafizaGraphEnabled (FIX-MEM-1, decision MEM-1.a: true) adds the
+	// <olgular> graph-facts section to the for_injection <hafiza> block
+	// (kahyad/internal/graph). false is the regression switch: the block is
+	// byte-identical to the chunk-only block and the graph is never read.
+	HafizaGraphEnabled bool `yaml:"hafiza_graph_enabled"`
+	// HafizaGraphHops is how far the graph walk goes past the seed
+	// entities' own facts (decision MEM-1.a: 1; 0 = the seeds' own facts
+	// only). Load fails outside 0..MaxHafizaGraphHops.
+	HafizaGraphHops int `yaml:"hafiza_graph_hops"`
+	// HafizaFactsMaxLines / HafizaFactsMaxRunes bound the <olgular> section
+	// (default 12 lines / 1200 runes, inside the block's 4000-rune budget;
+	// chunk lines make room first). Load fails outside
+	// 1..MaxHafizaFactsMaxLines / 1..MaxHafizaFactsMaxRunes.
+	HafizaFactsMaxLines int `yaml:"hafiza_facts_max_lines"`
+	HafizaFactsMaxRunes int `yaml:"hafiza_facts_max_runes"`
+
 	// EgressPort is the W3-05 egress proxy's listen port
 	// (127.0.0.1:<EgressPort>) - the single gate every off-box byte
 	// passes through (HANDOFF S5 safety #1). Default 3128 (the
@@ -888,6 +904,10 @@ type fileConfig struct {
 	SearchRecencyWeight           *float64        `yaml:"search_recency_weight"`
 	SearchRecencyHalfLifeDays     *int            `yaml:"search_recency_half_life_days"`
 	SecretLaneMemoryDir           *string         `yaml:"secret_lane_memory_dir"`
+	HafizaGraphEnabled            *bool           `yaml:"hafiza_graph_enabled"`
+	HafizaGraphHops               *int            `yaml:"hafiza_graph_hops"`
+	HafizaFactsMaxLines           *int            `yaml:"hafiza_facts_max_lines"`
+	HafizaFactsMaxRunes           *int            `yaml:"hafiza_facts_max_runes"`
 	EgressPort                    *int            `yaml:"egress_port"`
 	DockerImageTag                *string         `yaml:"docker_image_tag"`
 	DockerImageDigestPath         *string         `yaml:"docker_image_digest_path"`
@@ -1070,6 +1090,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSecretLaneMemoryDir(cfg.SecretLaneMemoryDir); err != nil {
+		return Config{}, err
+	}
+	if err := validateHafizaGraph(cfg.HafizaGraphHops, cfg.HafizaFactsMaxLines, cfg.HafizaFactsMaxRunes); err != nil {
 		return Config{}, err
 	}
 	if err := validateExtraction(cfg.ExtractionBatchMaxEpisodes, cfg.ExtractionChunksPerCall); err != nil {
@@ -1382,6 +1405,36 @@ func validateSearchRecency(weight float64, halfLifeDays int) error {
 	return nil
 }
 
+// G13 MEM-1 <hafiza> graph-layer defaults (decision MEM-1.a) and bounds.
+// The defaults equal kahya/mcp/memory.MaxFactLines/MaxFactsRunes and
+// MaxHafizaFactsMaxRunes equals memory.MaxBlockRunes (the whole block's
+// budget); kahyad's TestHafizaGraphDefaultsMatchPackages pins both, and
+// MaxHafizaGraphHops equals kahyad/internal/graph.MaxHops.
+const (
+	DefaultHafizaGraphHops     = 1
+	DefaultHafizaFactsMaxLines = 12
+	DefaultHafizaFactsMaxRunes = 1200
+	MaxHafizaGraphHops         = 2
+	MaxHafizaFactsMaxLines     = 50
+	MaxHafizaFactsMaxRunes     = 4000
+)
+
+// validateHafizaGraph fails Load closed (FIX-MEM-1) on a hop count outside
+// 0..MaxHafizaGraphHops or a facts-section bound outside its range: a zero
+// would otherwise be silently replaced by the renderer's default.
+func validateHafizaGraph(hops, maxLines, maxRunes int) error {
+	if hops < 0 || hops > MaxHafizaGraphHops {
+		return fmt.Errorf("config: hafiza_graph_hops must be 0..%d, got %d", MaxHafizaGraphHops, hops)
+	}
+	if maxLines < 1 || maxLines > MaxHafizaFactsMaxLines {
+		return fmt.Errorf("config: hafiza_facts_max_lines must be 1..%d, got %d", MaxHafizaFactsMaxLines, maxLines)
+	}
+	if maxRunes < 1 || maxRunes > MaxHafizaFactsMaxRunes {
+		return fmt.Errorf("config: hafiza_facts_max_runes must be 1..%d, got %d", MaxHafizaFactsMaxRunes, maxRunes)
+	}
+	return nil
+}
+
 // DefaultSecretLaneMemoryDir is secret_lane_memory_dir's default
 // (FIX-U-3); it equals kahya/mcp/memory.DefaultSecretLaneDir (pinned by
 // kahyad's TestSecretLaneMemoryDirDefaultMatchesMemoryPackage).
@@ -1492,6 +1545,12 @@ func defaults(home, env string) Config {
 		SearchRecencyHalfLifeDays: DefaultSearchRecencyHalfLifeDays,
 		// FIX-U-3: memory_write's secret-lane redirect target.
 		SecretLaneMemoryDir: DefaultSecretLaneMemoryDir,
+		// FIX-MEM-1 (decision MEM-1.a): the <olgular> graph section is on,
+		// one hop.
+		HafizaGraphEnabled:  true,
+		HafizaGraphHops:     DefaultHafizaGraphHops,
+		HafizaFactsMaxLines: DefaultHafizaFactsMaxLines,
+		HafizaFactsMaxRunes: DefaultHafizaFactsMaxRunes,
 		// B-1 approval loop defaults (config.Config's own doc comments).
 		ApprovalWaitSeconds:     300,
 		AutonomyBootstrapLevels: map[string]int{"memory_search/R/global": 1},
@@ -1928,6 +1987,18 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 	if fc.SecretLaneMemoryDir != nil {
 		cfg.SecretLaneMemoryDir = *fc.SecretLaneMemoryDir
+	}
+	if fc.HafizaGraphEnabled != nil {
+		cfg.HafizaGraphEnabled = *fc.HafizaGraphEnabled
+	}
+	if fc.HafizaGraphHops != nil {
+		cfg.HafizaGraphHops = *fc.HafizaGraphHops
+	}
+	if fc.HafizaFactsMaxLines != nil {
+		cfg.HafizaFactsMaxLines = *fc.HafizaFactsMaxLines
+	}
+	if fc.HafizaFactsMaxRunes != nil {
+		cfg.HafizaFactsMaxRunes = *fc.HafizaFactsMaxRunes
 	}
 	if fc.EgressPort != nil {
 		cfg.EgressPort = *fc.EgressPort
