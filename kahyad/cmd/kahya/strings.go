@@ -13,6 +13,17 @@ const (
 	// route that doesn't exist yet. Exit code 2.
 	MsgDaemonUnreachable = "kahyad'a ulaşılamıyor (%s). Başlatmak için: make install-agent"
 
+	// MsgTaskRejected frames kahyad's own JSON refusal of POST /v1/task
+	// (FIX-FINAL TUX-7): kahyad answered, so it is not "unreachable". A
+	// Turkish daemon body (the 403 control-secret refusal, the 409 halted
+	// before start) reads naturally inside it; an English technical detail
+	// stays English after the Turkish frame (HANDOFF §3). Exit code 2.
+	MsgTaskRejected = "Görev başlatılamadı: %s"
+
+	// MsgTaskDaemonRestarting replaces MsgTaskRejected for kahyad's 503
+	// "kahyad is shutting down" (FIX-FINAL TUX-7). Exit code 2.
+	MsgTaskDaemonRestarting = "kahyad yeniden başlatılıyor; birazdan tekrar deneyin."
+
 	// MsgEmptyQuestion is printed when a one-shot prompt is empty/whitespace
 	// after joining argv and trimming - rejected locally, before any dial.
 	// Exit code 2.

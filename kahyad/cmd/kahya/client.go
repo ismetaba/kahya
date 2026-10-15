@@ -59,11 +59,12 @@ func resolveSocket() (string, error) {
 
 // unreachableError renders as the exact MsgDaemonUnreachable string (socket
 // path substituted) for any failure that means the CLI could not carry out
-// a request against kahyad at all: a dial failure, a non-2xx/unexpected
-// response, or (until W12-07 lands /v1/task) the 404 that route currently
-// answers. Task spec: "ask/REPL must fail GRACEFULLY with the Turkish
-// daemon-error string, NOT crash" - every such case is funneled through
-// this one type so callers render one Turkish line and exit 2, uniformly.
+// a request against kahyad at all: a dial failure, or a non-JSON /
+// unexpectedly shaped response (a kahyad JSON {"error"} refusal of
+// /v1/task is MsgTaskRejected instead, FIX-FINAL TUX-7). Task spec:
+// "ask/REPL must fail GRACEFULLY with the Turkish daemon-error string, NOT
+// crash" - every such case is funneled through this one type so callers
+// render one Turkish line and exit 2, uniformly.
 type unreachableError struct {
 	sock string
 	err  error
@@ -129,8 +130,9 @@ func newClient(sock string) *Client {
 // as config.ControlSecretHeader - this CLI is a human surface, and every
 // control route requires it. A missing/unreadable/malformed secret file
 // is silently ignored: this is the UX side, kahyad is the authority and
-// answers such a request 403 with its own Turkish message, which every
-// caller already prints via apiError.
+// answers such a request 403 with its own Turkish message, which the
+// JSON-reading callers print via apiError (streamTask too, inside
+// MsgTaskRejected - FIX-FINAL TUX-7).
 func (c *Client) newRequest(ctx context.Context, method, path, traceID string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://kahyad"+path, body)
 	if err != nil {
@@ -1796,10 +1798,21 @@ func (c *Client) streamTask(ctx context.Context, traceID string, reqBody streamT
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		// Covers both a genuine transport problem and (until W12-07 lands
-		// the real handler) today's 404 - both fail gracefully as
-		// "daemon unreachable" per the task spec, rather than a raw HTTP
-		// status leaking to the user.
+		// FIX-FINAL TUX-7: kahyad's own JSON refusal ({"error": ...}: the
+		// 403 control-secret refusal, a 503 shutdown, the 409 halted-before-
+		// start answer) means kahyad answered - it is shown in a Turkish
+		// frame, never as "unreachable, run make install-agent" while
+		// `kahya health` says the daemon is up.
+		if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+			if msg := apiError(resp.Body); msg != "" {
+				if resp.StatusCode == http.StatusServiceUnavailable && msg == "kahyad is shutting down" {
+					return taskResult{}, errors.New(MsgTaskDaemonRestarting)
+				}
+				return taskResult{}, fmt.Errorf(MsgTaskRejected, msg)
+			}
+		}
+		// A transport-level surprise (a non-JSON or shapeless answer, the
+		// pre-W12-07 404): "daemon unreachable", never a raw HTTP status.
 		return taskResult{}, &unreachableError{sock: c.sock, err: fmt.Errorf("task: status=%d content-type=%q", resp.StatusCode, resp.Header.Get("Content-Type"))}
 	}
 
