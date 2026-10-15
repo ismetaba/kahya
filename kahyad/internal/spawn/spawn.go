@@ -682,6 +682,9 @@ var providerRoutingExactNames = map[string]bool{
 	"CLAUDE_CODE_HOST_AUTH_ENV_VAR":            true,
 	"CLAUDE_CODE_HOST_CREDS_FILE":              true,
 	"AWS_BEARER_TOKEN_BEDROCK":                 true,
+	// BuildEnv pins it to 0 itself (FIX-FINAL worker-cli-loads-claudeai-
+	// connectors); an inherited value must not ride along before it.
+	"ENABLE_CLAUDEAI_MCP_SERVERS": true,
 }
 
 // isProviderRoutingEnv reports whether an inherited variable could route
@@ -795,6 +798,16 @@ func BuildEnv(cfg Config, env Envelope) []string {
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_BUG_COMMAND=1",
+		// FIX-FINAL worker-cli-loads-claudeai-connectors: with a claude.ai
+		// login (passthrough) the bundled CLI otherwise GETs
+		// api.anthropic.com/v1/mcp_servers with the user's OAuth bearer -
+		// a host from its OAuth config, NOT ANTHROPIC_BASE_URL, so the
+		// request bypasses kahyad's proxy - and registers each connector as
+		// an MCP server in the session. Its headless reconcile path fetches
+		// even under --strict-mcp-config (which the worker also sets, to
+		// keep connectors out of the tool list), so the switch is needed
+		// at the source.
+		"ENABLE_CLAUDEAI_MCP_SERVERS=0",
 		// FIX-I-10: the bundled CLI's own auxiliary calls (summaries,
 		// titles, compaction helpers) default to a DATED Haiku id the
 		// proxy's allowlist and pricing table do not list. Pin them to an

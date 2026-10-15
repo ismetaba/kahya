@@ -60,6 +60,32 @@ func Canonicalize(name string) string {
 	return rest[idx+2:]
 }
 
+// KahyaMCPServerName is the one MCP server name the worker reaches
+// kahyad's tools under (worker/kahya_worker/__main__.py mcp_servers key):
+// every tool kahyad serves arrives as "mcp__kahya_memory__<tool>".
+const KahyaMCPServerName = "kahya_memory"
+
+// foreignMCPServer reports whether name carries an SDK-style
+// "mcp__<server>__" prefix for a server other than KahyaMCPServerName - a
+// claude.ai connector (mcp__claude_ai_*) or an enterprise managed-mcp
+// server. kahyad has no executor or gate for those tools; Canonicalize
+// would strip the server segment and could collide with a policy tool
+// name ("mcp__claude_ai_X__fs_read" -> "fs_read"), letting the worker CLI
+// run the remote tool on an ALLOW. Check denies them as unknown tools
+// (FIX-FINAL worker-cli-loads-claudeai-connectors, defense in depth).
+func foreignMCPServer(name string) bool {
+	const prefix = "mcp__"
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	rest := name[len(prefix):]
+	idx := strings.Index(rest, "__")
+	if idx < 0 {
+		return false
+	}
+	return rest[:idx] != KahyaMCPServerName
+}
+
 // Ladder levels (HANDOFF S4: L0 Gozlemci .. L4 Kahya).
 const (
 	L0 = 0
@@ -674,8 +700,15 @@ func (e *Engine) consumePendingApproval(ctx context.Context, id, decision string
 // "Baglayici politika karari kahyad'da verilir"). Every call writes
 // exactly one events row (kind="policy_decision") regardless of outcome.
 func (e *Engine) Check(ctx context.Context, in CheckInput) (Decision, error) {
-	in.Tool = Canonicalize(in.Tool)
 	scope := normalizeScope(in.Scope)
+	if foreignMCPServer(in.Tool) {
+		// Ledgered under the raw name: the canonical one could read as a
+		// real policy tool.
+		d := Decision{Result: ResultDeny, Reason: ReasonUnknownTool, Rule: RuleLadderV1, Scope: scope}
+		e.ledgerDecision(ctx, in, "", scope, 0, d)
+		return d, nil
+	}
+	in.Tool = Canonicalize(in.Tool)
 
 	tool, ok := e.policy.ToolsByName[in.Tool]
 	if !ok {

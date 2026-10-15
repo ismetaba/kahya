@@ -769,6 +769,15 @@ class TestBuildOptionsBuiltinToolsDisabled(unittest.TestCase):
         self.assertEqual(cmd[k + 1], "default")
         m = cmd.index("--mcp-config")
         self.assertIn("kahya_memory", json.loads(cmd[m + 1])["mcpServers"])
+        # FIX-FINAL worker-cli-loads-claudeai-connectors: only the
+        # --mcp-config servers load (no claude.ai connectors, no enterprise
+        # managed-mcp servers).
+        self.assertIn("--strict-mcp-config", cmd)
+
+    def test_strict_mcp_config_on_actor_and_resume(self) -> None:
+        for options in (self._options(), self._options(resume=True, session_id="sess-1")):
+            self.assertIs(options.strict_mcp_config, True)
+            self.assertEqual(set(options.mcp_servers), {"kahya_memory"})
 
 
 class TestBuildOptionsApprovalWait(unittest.TestCase):
@@ -1012,6 +1021,9 @@ class TestReaderMode(unittest.TestCase):
         self.assertEqual([c for c in cmd if c.startswith("--setting-sources")], ["--setting-sources="])
         self.assertEqual(cmd[cmd.index("--tools") + 1], "")
         self.assertNotIn("--mcp-config", cmd)
+        # FIX-FINAL worker-cli-loads-claudeai-connectors.
+        self.assertIs(options.strict_mcp_config, True)
+        self.assertIn("--strict-mcp-config", cmd)
 
     def test_reader_deny_all_tools_denies_everything(self) -> None:
         import asyncio

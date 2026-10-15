@@ -652,6 +652,26 @@ func TestBuildEnvDisablesCLISideChannelEgress(t *testing.T) {
 	}
 }
 
+// TestBuildEnvDisablesClaudeAIConnectors (FIX-FINAL worker-cli-loads-
+// claudeai-connectors): with a claude.ai login the bundled CLI fetches the
+// user's connectors from api.anthropic.com/v1/mcp_servers (bypassing
+// ANTHROPIC_BASE_URL) and adds them to the session. BuildEnv pins
+// ENABLE_CLAUDEAI_MCP_SERVERS=0, exactly once, even when the parent shell
+// exports it enabled.
+func TestBuildEnvDisablesClaudeAIConnectors(t *testing.T) {
+	t.Setenv("ENABLE_CLAUDEAI_MCP_SERVERS", "1")
+	got := BuildEnv(Config{Socket: "/s.sock", LogDir: "/logs", CredentialMode: "passthrough"}, Envelope{TaskID: "t", TraceID: "tr"})
+	var vals []string
+	for _, kv := range got {
+		if v, ok := strings.CutPrefix(kv, "ENABLE_CLAUDEAI_MCP_SERVERS="); ok {
+			vals = append(vals, v)
+		}
+	}
+	if len(vals) != 1 || vals[0] != "0" {
+		t.Errorf("ENABLE_CLAUDEAI_MCP_SERVERS entries = %q, want exactly [\"0\"]", vals)
+	}
+}
+
 // TestBuildEnvSetsPythonPathForRealVenvLayout is BLOCKER 1's BuildEnv-level
 // unit test: when cfg.Cmd[0] sits inside a real ".venv/bin/..." layout
 // (the shape config.defaultWorkerCmd produces), BuildEnv must add a

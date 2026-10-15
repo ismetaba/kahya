@@ -197,8 +197,11 @@ func TestW12Acceptance(t *testing.T) {
 	})
 
 	// B-15: the real bundled CLI, started by the real worker with
-	// tools=[] + disallowed_tools + setting_sources=[], must define NO
-	// Claude Code built-in tool in any model call, while the kahya_memory
+	// tools=[] + disallowed_tools + setting_sources=[] + strict_mcp_config,
+	// must define NO tool but the kahya_memory MCP tools in any model call
+	// (no built-in, no claude.ai connector - the hermetic dummy token lacks
+	// the user:mcp_servers scope, so the connector path itself is pinned by
+	// the worker/spawn unit tests), while the kahya_memory
 	// MCP tools stay defined on the main (hafiza-carrying) call - the
 	// hermetic proof that --tools "" removes only the built-in set.
 	t.Run("builtin_tools_absent", func(t *testing.T) {
@@ -210,8 +213,11 @@ func TestW12Acceptance(t *testing.T) {
 				continue
 			}
 			for _, name := range requestToolNames(t, req.Body) {
-				if !strings.HasPrefix(name, "mcp__") {
-					t.Errorf("request %d (%s) defines non-MCP tool %q: Claude Code built-in tools must be removed from the worker session (B-15)", i, req.Path, name)
+				// FIX-FINAL worker-cli-loads-claudeai-connectors: not just
+				// "an MCP tool" - a claude.ai connector (mcp__claude_ai_*)
+				// or enterprise managed-mcp tool must not be defined either.
+				if !strings.HasPrefix(name, "mcp__kahya_memory__") {
+					t.Errorf("request %d (%s) defines tool %q outside the kahya_memory MCP server: the worker session must define only kahya_memory MCP tools (B-15, strict_mcp_config)", i, req.Path, name)
 				}
 			}
 		}

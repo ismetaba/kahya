@@ -1585,6 +1585,18 @@ is loaded; the CLI auto-allowed its read-only built-ins (Read/Glob/Grep
 inside cwd) without ever calling `can_use_tool`, which is why omission plus
 this gate was not enough. A built-in tool name reaching `/policy/check` is
 therefore only ever a defense-in-depth event, denied as an unknown tool.
+Both sessions also set `strict_mcp_config=True` (`--strict-mcp-config`), so
+only the `--mcp-config` servers load (`kahya_memory`, or none for the
+Reader) — never the user's claude.ai connectors or an enterprise
+managed-mcp server — and `spawn.BuildEnv` pins
+`ENABLE_CLAUDEAI_MCP_SERVERS=0`, because the CLI otherwise fetches the
+connector list from `api.anthropic.com/v1/mcp_servers` with the user's
+OAuth bearer, bypassing `ANTHROPIC_BASE_URL`, even under strict mode
+(FIX-FINAL worker-cli-loads-claudeai-connectors). A tool name with an
+`mcp__<server>__` prefix for any server but `kahya_memory` is denied as an
+unknown tool before canonicalization (`policy.Engine.Check`), so a
+connector tool whose bare name collides with a policy tool
+(`mcp__claude_ai_X__fs_read`) can never be allowed.
 `scope` is optional (defaults to
 `"global"`) — the ladder's third key dimension alongside `tool`; `class`
 is never accepted from the caller, only ever resolved from the loaded

@@ -554,6 +554,14 @@ def _build_options(envelope: Envelope, socket_path: str, mcp_bridge: str) -> Cla
         disallowed_tools=list(BUILTIN_TOOLS_DISALLOWED),
         # B-15 fix: no settings.json / CLAUDE.md (see WORKER_SETTING_SOURCES).
         setting_sources=list(WORKER_SETTING_SOURCES),
+        # FIX-FINAL worker-cli-loads-claudeai-connectors: --strict-mcp-config,
+        # so ONLY the --mcp-config servers below (kahya_memory) are loaded -
+        # never the user's claude.ai connectors or an enterprise
+        # managed-mcp config, whose tools and traffic sit outside kahyad's
+        # gate. The connector FETCH itself is switched off by kahyad's
+        # ENABLE_CLAUDEAI_MCP_SERVERS=0 (spawn.BuildEnv): the CLI's headless
+        # reconcile path fetches even under strict mode.
+        strict_mcp_config=True,
         mcp_servers={
             "kahya_memory": {
                 "type": "stdio",
@@ -769,6 +777,10 @@ def _build_reader_options(envelope: Envelope) -> ClaudeAgentOptions:
         # CLAUDE.md reach the Reader either).
         disallowed_tools=list(BUILTIN_TOOLS_DISALLOWED),
         setting_sources=list(WORKER_SETTING_SOURCES),
+        # FIX-FINAL worker-cli-loads-claudeai-connectors: no MCP server at
+        # all may load into the Reader - not a claude.ai connector, not an
+        # enterprise managed-mcp server (see _build_options).
+        strict_mcp_config=True,
         mcp_servers={},
         allowed_tools=[],
         permission_mode="default",
