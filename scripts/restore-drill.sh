@@ -186,8 +186,19 @@ INTEG="$(sqlite3 "$RESTORE_DB" 'PRAGMA integrity_check;')"
 echo "    integrity_check: ok"
 
 # --- 5. boot the scratch kahyad (migrations run; verify user_version) --------
-echo "==> booting scratch kahyad (KAHYA_ENV=restore)"
-KAHYA_ENV=restore "$KAHYAD_BIN" >/tmp/kahyad-restore-drill.log 2>&1 &
+# FIX-FINAL ops-restore-drill-egress-port-collision: every profile reads
+# prod's config.yaml, so the scratch daemon inherited prod's egress_port
+# (default 3128), which the running prod daemon holds - it died with
+# egress_proxy_start_failed before binding its socket and the drill could
+# never pass. It gets its own free loopback port.
+RESTORE_EGRESS_PORT="$("$PYTHON3" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+PROD_EGRESS_PORT="$(sed -n 's/^egress_port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$PROD_APP_SUPPORT/config.yaml" 2>/dev/null | head -1)"
+PROD_EGRESS_PORT="${PROD_EGRESS_PORT:-3128}"
+if [ -z "$RESTORE_EGRESS_PORT" ] || [ "$RESTORE_EGRESS_PORT" = "$PROD_EGRESS_PORT" ]; then
+	fail "could not pick an egress port for the scratch kahyad distinct from production's ($PROD_EGRESS_PORT)"
+fi
+echo "==> booting scratch kahyad (KAHYA_ENV=restore, passive, egress port $RESTORE_EGRESS_PORT)"
+KAHYA_ENV=restore KAHYA_EGRESS_PORT="$RESTORE_EGRESS_PORT" "$KAHYAD_BIN" >/tmp/kahyad-restore-drill.log 2>&1 &
 RESTORE_PID=$!
 cleanup() {
 	kill "$RESTORE_PID" 2>/dev/null
@@ -199,6 +210,7 @@ for _ in $(seq 1 50); do
 	if [ -S "$RESTORE_SOCK" ] && curl -s --unix-socket "$RESTORE_SOCK" -o /dev/null -w '%{http_code}' http://x/health 2>/dev/null | grep -q '^200$'; then
 		break
 	fi
+	kill -0 "$RESTORE_PID" 2>/dev/null || fail "scratch kahyad exited during boot (see /tmp/kahyad-restore-drill.log)"
 	sleep 0.2
 done
 [ -S "$RESTORE_SOCK" ] || fail "scratch kahyad did not come up on $RESTORE_SOCK (see /tmp/kahyad-restore-drill.log)"

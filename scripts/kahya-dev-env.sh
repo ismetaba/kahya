@@ -25,6 +25,10 @@ DEV_DATA_DIR="${HOME}/Library/Application Support/Kahya-dev"
 DEV_LOG_DIR="${DEV_DATA_DIR}/logs"
 DEV_DB="${DEV_DATA_DIR}/brain.db"
 DEV_SOCK="${DEV_DATA_DIR}/kahyad-dev.sock"
+# The dev daemon's own egress-proxy port (prod's config.yaml egress_port,
+# default 3128, is shared and held by a running prod daemon). Override with
+# KAHYA_DEV_EGRESS_PORT; rendered into the dev plist too.
+DEV_EGRESS_PORT="${KAHYA_DEV_EGRESS_PORT:-3129}"
 DEV_MEM_DIR="${HOME}/Kahya-dev/memory"
 DEV_BACKUP_DIR="${HOME}/Kahya-dev/backups"
 DEV_POLICY="${REPO_ROOT}/policy.dev.yaml"
@@ -74,7 +78,10 @@ else
 	fi
 	echo "    migrating dev brain.db via a short-lived KAHYA_ENV=dev kahyad boot"
 	rm -f "${DEV_SOCK}"
-	KAHYA_ENV=dev KAHYA_POLICY_PATH="${DEV_POLICY}" "${KAHYAD_BIN}" \
+	# FIX-FINAL ops-restore-drill-egress-port-collision: config.yaml (and so
+	# egress_port, default 3128) is shared with prod, which holds that port
+	# while it runs - the dev daemon gets its own.
+	KAHYA_ENV=dev KAHYA_EGRESS_PORT="${DEV_EGRESS_PORT}" KAHYA_POLICY_PATH="${DEV_POLICY}" "${KAHYAD_BIN}" \
 		>"${DEV_LOG_DIR}/provision.out.log" 2>"${DEV_LOG_DIR}/provision.err.log" &
 	KAHYAD_PID=$!
 	# Wait for the dev socket to appear (migrations run at boot, before the
@@ -101,6 +108,7 @@ fi
 mkdir -p "${LAUNCH_AGENTS_DIR}"
 sed -e "s#__KAHYA_REPO_ROOT__#${REPO_ROOT}#g" \
 	-e "s#__KAHYA_DEV_LOG_DIR__#${DEV_LOG_DIR}#g" \
+	-e "s#__KAHYA_DEV_EGRESS_PORT__#${DEV_EGRESS_PORT}#g" \
 	"${PLIST_SRC}" > "${PLIST_DST}"
 echo "    rendered dev launchd plist: ${PLIST_DST} (label com.kahya.dev — NOT loaded)"
 

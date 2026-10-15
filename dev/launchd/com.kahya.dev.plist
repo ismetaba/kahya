@@ -12,10 +12,18 @@
     * Data:   ~/Library/Application Support/Kahya-dev/  (prod: .../Kahya/)
     * Memory: ~/Kahya-dev/            (prod: ~/Kahya/)
     * Policy: policy.dev.yaml, deny-all egress (prod: policy.yaml)
+    * Egress-proxy port: KAHYA_EGRESS_PORT (default 3129; prod: config.yaml
+      egress_port, default 3128). config.yaml is SHARED with prod, so
+      without this the dev daemon could not bind its egress proxy while
+      prod runs (FIX-FINAL ops-restore-drill-egress-port-collision). The
+      kahya-egress-fwd Docker sidecar stays prod's: dev's needs_network
+      traffic is denied there (unknown token) - fail-closed, and the dev
+      policy denies all egress anyway.
 
-  All of that separation follows automatically from KAHYA_ENV=dev (the
-  generic profile resolution in kahyad/internal/config), so this plist only
-  has to set that one env var plus KAHYA_POLICY_PATH. RunAtLoad is FALSE and
+  All of that separation but the egress port follows automatically from
+  KAHYA_ENV=dev (the generic profile resolution in kahyad/internal/config),
+  so this plist only has to set that one env var plus KAHYA_POLICY_PATH and
+  KAHYA_EGRESS_PORT. RunAtLoad is FALSE and
   KeepAlive is FALSE on purpose: the dev profile is loaded on demand for a
   red-team drill, not kept alive like production. scripts/kahya-dev-env.sh
   substitutes the __KAHYA_*__ placeholders and provisions the dev profile;
@@ -35,6 +43,8 @@
 		<string>dev</string>
 		<key>KAHYA_POLICY_PATH</key>
 		<string>__KAHYA_REPO_ROOT__/policy.dev.yaml</string>
+		<key>KAHYA_EGRESS_PORT</key>
+		<string>__KAHYA_DEV_EGRESS_PORT__</string>
 	</dict>
 	<key>KeepAlive</key>
 	<false/>
