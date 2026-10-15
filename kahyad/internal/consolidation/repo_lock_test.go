@@ -54,10 +54,12 @@ func TestPreCommitWaitsForMemoryRepoLock(t *testing.T) {
 	lock := &chanRepoLock{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	logger := &fakeEventStore{}
 	c := &Consolidator{
-		Cfg:         Config{KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(), Now: fixedNow(t)},
-		Git:         backup.NewExecGitRunner(),
-		RepoLock:    lock,
-		Cloud:       SessionFunc(func(context.Context, string, map[string]string) (map[string]string, error) { return map[string]string{}, nil }),
+		Cfg:      Config{KahyaDir: repo, MemoryDir: filepath.Join(repo, "memory"), WorktreeParentDir: t.TempDir(), Now: fixedNow(t)},
+		Git:      backup.NewExecGitRunner(),
+		RepoLock: lock,
+		Cloud: SessionFunc(func(context.Context, string, map[string]string) (map[string]string, error) {
+			return map[string]string{}, nil
+		}),
 		EventLogger: logger,
 		EventReader: logger,
 		Reindexer:   &fakeReindexer{},
