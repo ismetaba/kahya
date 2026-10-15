@@ -139,3 +139,70 @@ func TestBuildEnvKeepsWorkerCLIOwnOAuthToken(t *testing.T) {
 		t.Error("CLAUDE_CODE_OAUTH_TOKEN is in secretEnvDenylist; owner decision G11-1/G11-2 keeps it")
 	}
 }
+
+// TestBuildEnvStripsProviderRouting (FIX-FINAL worker-env-proxy-bypass-
+// vars): an inherited provider switch or alternate base URL makes the
+// bundled CLI send model calls to Bedrock/Vertex/Foundry/a host socket
+// without ANTHROPIC_BASE_URL, bypassing the per-task proxy (secret-lane
+// backstop, allowlist, governor, egress). None may survive BuildEnv, in
+// either credential mode; ANTHROPIC_BASE_URL is exactly the configured
+// proxy, once; CLAUDE_CODE_OAUTH_TOKEN still passes (owner decision).
+func TestBuildEnvStripsProviderRouting(t *testing.T) {
+	routing := map[string]string{
+		"CLAUDE_CODE_USE_BEDROCK":                  "1",
+		"CLAUDE_CODE_USE_VERTEX":                   "1",
+		"CLAUDE_CODE_USE_FOUNDRY":                  "1",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS":            "1",
+		"CLAUDE_CODE_USE_MANTLE":                   "1",
+		"CLAUDE_CODE_USE_GATEWAY":                  "1",
+		"CLAUDE_CODE_USE_FUTUREPROVIDER":           "1",
+		"ANTHROPIC_BEDROCK_BASE_URL":               "https://bedrock-runtime.example",
+		"ANTHROPIC_VERTEX_BASE_URL":                "https://vertex.example",
+		"ANTHROPIC_FOUNDRY_BASE_URL":               "https://foundry.example",
+		"ANTHROPIC_AWS_BASE_URL":                   "https://aws.example",
+		"ANTHROPIC_BEDROCK_MANTLE_BASE_URL":        "https://mantle.example",
+		"ANTHROPIC_FOUNDRY_RESOURCE":               "res",
+		"ANTHROPIC_FOUNDRY_API_KEY":                "k",
+		"ANTHROPIC_VERTEX_PROJECT_ID":              "p",
+		"ANTHROPIC_UNIX_SOCKET":                    "/tmp/x.sock",
+		"ANTHROPIC_BETAS":                          "some-beta",
+		"ANTHROPIC_BASE_URL":                       "https://parent-shell.example",
+		"CLAUDE_CODE_SKIP_BEDROCK_AUTH":            "1",
+		"CLAUDE_CODE_SKIP_VERTEX_AUTH":             "1",
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1",
+		"CLAUDE_CODE_API_BASE_URL":                 "https://x.example",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":     "1",
+		"CLAUDE_CODE_HOST_AUTH_ENV_VAR":            "X",
+		"CLAUDE_CODE_HOST_CREDS_FILE":              "/tmp/c",
+		"AWS_BEARER_TOKEN_BEDROCK":                 "b",
+	}
+	for name, v := range routing {
+		t.Setenv(name, v)
+	}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "worker-own-oauth-token")
+	for _, mode := range []string{"passthrough", "keychain"} {
+		cfg := Config{Socket: "/s.sock", LogDir: "/logs", AnthropicBaseURL: "http://127.0.0.1:1", APIKey: "kahya-task-abc", CredentialMode: mode}
+		got := BuildEnv(cfg, Envelope{TaskID: "t", TraceID: "tr"})
+		resolved, present := resolveEnv(got)
+		for name := range routing {
+			if name == "ANTHROPIC_BASE_URL" {
+				continue
+			}
+			if present[name] {
+				t.Errorf("%s: worker env keeps provider-routing %s=%q", mode, name, resolved[name])
+			}
+		}
+		n := 0
+		for _, kv := range got {
+			if strings.HasPrefix(kv, "ANTHROPIC_BASE_URL=") {
+				n++
+			}
+		}
+		if n != 1 || resolved["ANTHROPIC_BASE_URL"] != cfg.AnthropicBaseURL {
+			t.Errorf("%s: ANTHROPIC_BASE_URL occurs %d times, resolved %q; want exactly once = %q", mode, n, resolved["ANTHROPIC_BASE_URL"], cfg.AnthropicBaseURL)
+		}
+		if resolved["CLAUDE_CODE_OAUTH_TOKEN"] != "worker-own-oauth-token" {
+			t.Errorf("%s: CLAUDE_CODE_OAUTH_TOKEN = %q, want it passed through (owner decision G11-1/G11-2)", mode, resolved["CLAUDE_CODE_OAUTH_TOKEN"])
+		}
+	}
+}

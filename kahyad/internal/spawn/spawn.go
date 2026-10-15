@@ -633,6 +633,21 @@ func killGroup(cmd *exec.Cmd) {
 //     parent shell must not re-route the worker CLI's calls; BuildEnv pins
 //     the auxiliary pair itself (CLIAuxiliaryModel).
 //
+// On top of these exact names, filterSecretEnv drops every inherited
+// variable that routes the bundled CLI's model calls somewhere other than
+// ANTHROPIC_BASE_URL (FIX-FINAL worker-env-proxy-bypass-vars; see
+// isProviderRoutingEnv): the provider switches CLAUDE_CODE_USE_* (Bedrock,
+// Vertex, Foundry, Anthropic-AWS, Mantle, Gateway), every inherited
+// ANTHROPIC_* name (ANTHROPIC_{BEDROCK,VERTEX,FOUNDRY,AWS,...}_BASE_URL,
+// ANTHROPIC_UNIX_SOCKET, ANTHROPIC_BETAS, provider project/resource/key
+// vars - BuildEnv appends every ANTHROPIC_* the worker needs itself),
+// CLAUDE_CODE_SKIP_*_AUTH, and a few host-transport names. With any of
+// them set the CLI sends the model call to Bedrock/Vertex/Foundry/a host
+// socket directly, bypassing kahyad's per-task proxy and with it the
+// secret-lane backstop (B-6/U-4), the model allowlist and pricing
+// (I-10), the egress gate and the governor. Model routing is Go's
+// decision; the worker's only upstream is the per-task proxy.
+//
 // CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT listed (owner decision
 // G11-1/G11-2; G00 H-2(b) not applied): kahyad does not strip the worker
 // CLI's own credential variable. It is not a way to hand the worker a REAL
@@ -657,14 +672,45 @@ var secretEnvDenylist = map[string]bool{
 	"ANTHROPIC_DEFAULT_FABLE_MODEL":  true,
 }
 
+// providerRoutingExactNames are the non-prefix provider/transport routing
+// variables isProviderRoutingEnv drops (bundled CLI host-managed transport
+// and Bedrock bearer auth).
+var providerRoutingExactNames = map[string]bool{
+	"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": true,
+	"CLAUDE_CODE_API_BASE_URL":                 true,
+	"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":     true,
+	"CLAUDE_CODE_HOST_AUTH_ENV_VAR":            true,
+	"CLAUDE_CODE_HOST_CREDS_FILE":              true,
+	"AWS_BEARER_TOKEN_BEDROCK":                 true,
+}
+
+// isProviderRoutingEnv reports whether an inherited variable could route
+// the worker CLI's model calls around ANTHROPIC_BASE_URL (see
+// secretEnvDenylist's doc comment). Prefix rules, so a newer CLI's
+// CLAUDE_CODE_USE_<NEWPROVIDER> or ANTHROPIC_<NEW>_BASE_URL is covered
+// too. CLAUDE_CODE_OAUTH_TOKEN does not match any rule (owner decision
+// G11-1/G11-2).
+func isProviderRoutingEnv(name string) bool {
+	switch {
+	case strings.HasPrefix(name, "ANTHROPIC_"):
+		return true
+	case strings.HasPrefix(name, "CLAUDE_CODE_USE_"):
+		return true
+	case strings.HasPrefix(name, "CLAUDE_CODE_SKIP_") && strings.HasSuffix(name, "_AUTH"):
+		return true
+	}
+	return providerRoutingExactNames[name]
+}
+
 // filterSecretEnv returns a copy of in with every entry whose NAME (the
-// part before "=") appears in secretEnvDenylist removed, preserving the
-// relative order of everything else. It never mutates in.
+// part before "=") appears in secretEnvDenylist, or is a provider-routing
+// variable (isProviderRoutingEnv), removed, preserving the relative order
+// of everything else. It never mutates in.
 func filterSecretEnv(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, kv := range in {
 		name, _, _ := strings.Cut(kv, "=")
-		if secretEnvDenylist[name] {
+		if secretEnvDenylist[name] || isProviderRoutingEnv(name) {
 			continue
 		}
 		out = append(out, kv)

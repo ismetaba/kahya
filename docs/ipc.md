@@ -133,6 +133,21 @@ kahyad's per-boot control secret (`<socket>.secret`), which is never in the
 worker env (`spawn.secretEnvDenylist` strips `KAHYA_CONTROL_SECRET` /
 `KAHYA_CONTROL_SECRET_PATH` defensively; neither exists today).
 
+Provider and transport routing is never inherited (FIX-FINAL
+worker-env-proxy-bypass-vars, `spawn.isProviderRoutingEnv`): every
+inherited `ANTHROPIC_*` name (BuildEnv appends each one the worker needs
+itself), every `CLAUDE_CODE_USE_*` provider switch (Bedrock, Vertex,
+Foundry, Anthropic-AWS, Mantle, Gateway, and any future one),
+`CLAUDE_CODE_SKIP_*_AUTH`, `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`,
+`CLAUDE_CODE_API_BASE_URL`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`,
+`CLAUDE_CODE_HOST_AUTH_ENV_VAR`, `CLAUDE_CODE_HOST_CREDS_FILE` and
+`AWS_BEARER_TOKEN_BEDROCK` are stripped. Any of them would make the
+bundled CLI send model calls to Bedrock/Vertex/Foundry or a host socket
+without `ANTHROPIC_BASE_URL`, bypassing the per-task proxy (secret-lane
+backstop, model allowlist, governor, egress gate). The worker's only
+upstream is that proxy; `CLAUDE_CODE_OAUTH_TOKEN` is unaffected (owner
+decision G11-1/G11-2).
+
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 
 HANDOFF §4 assumes kahyad reads a real Anthropic API key from the macOS
