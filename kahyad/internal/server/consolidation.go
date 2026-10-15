@@ -23,6 +23,9 @@ import (
 // no adapter.
 type ConsolidationRunner interface {
 	Show(ctx context.Context) (diff string, found bool, err error)
+	// PendingRunSummary is the pending suggestion's own night summary
+	// (FIX-B-5 phase 3); found=false when that night wrote none.
+	PendingRunSummary(ctx context.Context) (consolidation.RunTotals, bool, error)
 	Approve(ctx context.Context, traceID string) error
 	Reject(ctx context.Context, traceID string) error
 }
@@ -35,10 +38,13 @@ func (s *Server) SetConsolidation(r ConsolidationRunner) {
 	s.consolidation = r
 }
 
-// consolidationShowResponse is GET /v1/consolidation's JSON body.
+// consolidationShowResponse is GET /v1/consolidation's JSON body. Summary
+// (FIX-B-5 phase 3) is the pending night's {files, batches, deferred}; it is
+// left out when that night wrote none.
 type consolidationShowResponse struct {
-	Found bool   `json:"found"`
-	Diff  string `json:"diff,omitempty"`
+	Found   bool                     `json:"found"`
+	Diff    string                   `json:"diff,omitempty"`
+	Summary *consolidation.RunTotals `json:"summary,omitempty"`
 }
 
 // handleConsolidationShow implements GET /v1/consolidation: renders the
@@ -59,9 +65,19 @@ func (s *Server) handleConsolidationShow(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resp := consolidationShowResponse{Found: found, Diff: diff}
+	if found {
+		// The summary line is informational: a ledger read error leaves it
+		// out (logged) and still shows the diff.
+		if sum, ok, serr := s.consolidation.PendingRunSummary(r.Context()); serr != nil {
+			s.log.With(traceIDFromContext(r)).Warn("consolidation_summary_unavailable", "err", serr.Error())
+		} else if ok {
+			resp.Summary = &sum
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(consolidationShowResponse{Found: found, Diff: diff})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // consolidationActionResponse is POST /v1/consolidation/approve|reject's

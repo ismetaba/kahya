@@ -119,27 +119,35 @@ func lastCommitTimes(ctx context.Context, git backup.GitRunner, repoDir, memRelT
 	return times, nil
 }
 
-// orderCandidates orders one lane's files for batching (keys of changed are
-// NormalizePathKey'd memory-relative paths): changed files first, then the
-// same-directory neighbours of changed files, then the rest by git commit
-// time, newest first (ties by path). Within the first two tiers files are
-// sorted by (dir, name), so files of one directory stay adjacent and the
-// greedy packing mostly puts a topic's files into the same batch. A file
-// larger than maxFileBytes is left out and reported in skipped (sorted).
-func orderCandidates(files map[string]string, changed map[string]bool, mtime func(rel string) int64, maxFileBytes int) (ordered, skipped []string) {
-	var first, rest []string
+// orderCandidates orders one lane's files for batching (keys of deferred
+// and changed are NormalizePathKey'd memory-relative paths): the files the
+// last night deferred first (phase 3's rolling cursor: a corpus larger than
+// one night's max_batches_per_lane rotates over several nights instead of
+// starving its tail), then changed files, then the same-directory
+// neighbours of both, then the rest by git commit time, newest first (ties
+// by path). Within the first three tiers files are sorted by (dir, name),
+// so files of one directory stay adjacent and the greedy packing mostly
+// puts a topic's files into the same batch. A file larger than
+// maxFileBytes is left out and reported in skipped (sorted).
+func orderCandidates(files map[string]string, deferred, changed map[string]bool, mtime func(rel string) int64, maxFileBytes int) (ordered, skipped []string) {
+	var carried, first, rest []string
 	dirs := make(map[string]bool)
 	for _, rel := range sortedKeys(files) {
 		if maxFileBytes > 0 && len(files[rel]) > maxFileBytes {
 			skipped = append(skipped, rel)
 			continue
 		}
-		if changed[NormalizePathKey(rel)] {
+		key := NormalizePathKey(rel)
+		switch {
+		case deferred[key]:
+			carried = append(carried, rel)
+		case changed[key]:
 			first = append(first, rel)
-			dirs[path.Dir(rel)] = true
+		default:
+			rest = append(rest, rel)
 			continue
 		}
-		rest = append(rest, rel)
+		dirs[path.Dir(rel)] = true
 	}
 	var neighbours, others []string
 	for _, rel := range rest {
@@ -158,6 +166,7 @@ func orderCandidates(files map[string]string, changed map[string]bool, mtime fun
 			return path.Base(s[i]) < path.Base(s[j])
 		})
 	}
+	byDirName(carried)
 	byDirName(first)
 	byDirName(neighbours)
 	if mtime == nil {
@@ -170,7 +179,8 @@ func orderCandidates(files map[string]string, changed map[string]bool, mtime fun
 		}
 		return others[i] < others[j]
 	})
-	ordered = make([]string, 0, len(first)+len(neighbours)+len(others))
+	ordered = make([]string, 0, len(carried)+len(first)+len(neighbours)+len(others))
+	ordered = append(ordered, carried...)
 	ordered = append(ordered, first...)
 	ordered = append(ordered, neighbours...)
 	ordered = append(ordered, others...)

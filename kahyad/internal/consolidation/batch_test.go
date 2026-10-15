@@ -130,7 +130,7 @@ func TestOrderCandidatesChangedFirstThenNeighboursThenMtime(t *testing.T) {
 		"c/old.md": 100, "c/new.md": 300, "d/newest.md": 500, "d/tie-b.md": 200, "d/tie-a.md": 200,
 		"kök.md": 50, "g/unrelated.md": 400,
 	}
-	ordered, skipped := orderCandidates(files, changed, func(rel string) int64 { return mtimes[rel] }, 50)
+	ordered, skipped := orderCandidates(files, nil, changed, func(rel string) int64 { return mtimes[rel] }, 50)
 	want := []string{
 		// changed, by (dir, name)
 		"a/changed.md", "b/changed.md", "f/değişti.md", "g/sub/nested.md",
@@ -147,7 +147,7 @@ func TestOrderCandidatesChangedFirstThenNeighboursThenMtime(t *testing.T) {
 		t.Fatalf("skipped = %q, want %q (above max_file_bytes, changed or not)", skipped, wantSkipped)
 	}
 	// No changed set: everything by commit time.
-	ordered, _ = orderCandidates(map[string]string{"x/a.md": "", "y/b.md": "", "z/c.md": ""}, nil,
+	ordered, _ = orderCandidates(map[string]string{"x/a.md": "", "y/b.md": "", "z/c.md": ""}, nil, nil,
 		func(rel string) int64 { return map[string]int64{"x/a.md": 1, "y/b.md": 3, "z/c.md": 2}[rel] }, 0)
 	if want := []string{"y/b.md", "z/c.md", "x/a.md"}; !reflect.DeepEqual(ordered, want) {
 		t.Fatalf("ordered without a changed set = %q, want %q", ordered, want)

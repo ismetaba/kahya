@@ -15,8 +15,9 @@ import (
 // fixture and records every POST /v1/consolidation/approve|reject call -
 // standing in for kahyad across this file's tests.
 type consolidationFakeServer struct {
-	found bool
-	diff  string
+	found   bool
+	diff    string
+	summary map[string]any // FIX-B-5: nil = no "summary" key
 
 	notFoundOnAction bool
 	approveCalls     int
@@ -26,7 +27,11 @@ type consolidationFakeServer struct {
 func (f *consolidationFakeServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/consolidation", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"found": f.found, "diff": f.diff})
+		body := map[string]any{"found": f.found, "diff": f.diff}
+		if f.summary != nil {
+			body["summary"] = f.summary
+		}
+		json.NewEncoder(w).Encode(body)
 	})
 	mux.HandleFunc("/v1/consolidation/approve", func(w http.ResponseWriter, r *http.Request) {
 		f.approveCalls++
@@ -164,5 +169,36 @@ func TestConsolidationUsageOnBadSubcommand(t *testing.T) {
 	}
 	if got := strings.TrimSpace(stderr.String()); got != MsgConsolidationUsage {
 		t.Errorf("stderr = %q, want exactly %q", got, MsgConsolidationUsage)
+	}
+}
+
+// TestConsolidationShowPrintsRunSummaryLine (FIX-B-5 phase 3): `kahya
+// consolidation show` starts with the byte-exact Turkish summary of the
+// night that produced the suggestion, then the diff; without a summary
+// there is no such line.
+func TestConsolidationShowPrintsRunSummaryLine(t *testing.T) {
+	if MsgConsolidationRunSummaryFmt != "Bu gece: %d dosya, %d parça; %d dosya ertelendi" {
+		t.Fatalf("MsgConsolidationRunSummaryFmt = %q, want the byte-exact handbook text", MsgConsolidationRunSummaryFmt)
+	}
+	diff := "--- a/memory/note.md\n+++ b/memory/note.md\n"
+	fake := &consolidationFakeServer{found: true, diff: diff, summary: map[string]any{"files": 12, "batches": 3, "deferred": 4}}
+	sock := startFakeServer(t, fake.handler())
+	t.Setenv("KAHYA_SOCKET", sock)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"consolidation", "show"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr=%s)", code, stderr.String())
+	}
+	if want := "Bu gece: 12 dosya, 3 parça; 4 dosya ertelendi\n" + diff; stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+
+	fake.summary = nil
+	stdout.Reset()
+	if code := run([]string{"consolidation", "show"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if stdout.String() != diff {
+		t.Fatalf("stdout without a summary = %q, want only the diff", stdout.String())
 	}
 }

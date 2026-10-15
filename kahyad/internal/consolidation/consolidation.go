@@ -30,6 +30,7 @@ package consolidation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -368,8 +369,12 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// (read-only git). Ordering only: a failure degrades to "everything
 	// changed" / "no commit times" with a JSONL warning, never changes what
 	// is sent to which lane.
-	changed := c.changedFiles(ctx, traceID, files, memRelToRepo)
-	mtimeOf := c.commitTimes(ctx, traceID, memRelToRepo)
+	// Phase 3: the files the last night deferred come first tonight.
+	sel := selection{
+		deferred: c.deferredFromLastRun(ctx, traceID),
+		changed:  c.changedFiles(ctx, traceID, files, memRelToRepo),
+		mtimeOf:  c.commitTimes(ctx, traceID, memRelToRepo),
+	}
 
 	baseSHA, err := CurrentHead(ctx, c.Git, c.Cfg.KahyaDir)
 	if err != nil {
@@ -393,6 +398,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 
 	rewrites := make(map[string]string, len(files))
 	skippedSecretLane := false
+	var cloudRun, localRun laneResult
 
 	// FIX-P-7 + FIX-B-5: each lane is consolidated in batches (runLane); a
 	// batch's rewrite may only name files from that batch's own input
@@ -403,7 +409,7 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// otherwise be applied whenever the local lane is skipped. A batch whose
 	// response is merely malformed is dropped alone (decision G06-7).
 	if len(cloudFiles) > 0 {
-		cr, err := c.runLane(ctx, traceID, LaneCloud, c.Cloud, cloudFiles, c.cloudBatchTokenBudget(), changed, mtimeOf)
+		cr, err := c.runLane(ctx, traceID, LaneCloud, c.Cloud, cloudFiles, c.cloudBatchTokenBudget(), sel)
 		if err != nil {
 			c.cleanupWorktreeAndBranch(ctx, worktreeDir, branch)
 			if errors.Is(err, ErrRewriteUnknownPath) {
@@ -412,10 +418,12 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 			return fmt.Errorf("consolidation: cloud-lane session: %w", err)
 		}
 		mergeRewrites(rewrites, cr.rewrites)
+		cloudRun = cr
 	}
 
 	if len(localFiles) > 0 {
-		lr, localErr := c.runLane(ctx, traceID, LaneLocal, c.Local, localFiles, c.localBatchTokenBudget(), changed, mtimeOf)
+		lr, localErr := c.runLane(ctx, traceID, LaneLocal, c.Local, localFiles, c.localBatchTokenBudget(), sel)
+		localRun = lr
 		if localErr != nil {
 			if errors.Is(localErr, mlx.ErrLocalModelUnavailable) {
 				// FAIL-CLOSED, NEVER a cloud fallback (HANDOFF §4 ⚑): the
@@ -446,6 +454,10 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 			mergeRewrites(rewrites, lr.rewrites)
 		}
 	}
+
+	// FIX-B-5 phase 3: tonight's numbers (also the next night's rolling
+	// cursor: its deferred files are read back from this trace).
+	c.ledgerRunSummary(ctx, traceID, len(cloudFiles), cloudRun, len(localFiles), localRun)
 
 	// Last structural check before anything is written to the worktree:
 	// the merged set names only files that were read from disk.
@@ -608,6 +620,14 @@ const (
 	EventBatchDropped = "consolidation.batch_dropped"
 )
 
+// selection is the batch-ordering input shared by both lanes (FIX-B-5):
+// orderCandidates' deferred and changed sets and its commit-time lookup.
+type selection struct {
+	deferred map[string]bool
+	changed  map[string]bool
+	mtimeOf  func(rel string) int64
+}
+
 // laneResult is what runLane did with one lane tonight.
 type laneResult struct {
 	rewrites    map[string]string // merged rewrites of every completed batch
@@ -635,9 +655,9 @@ type laneResult struct {
 // far: for mlx.ErrLocalModelUnavailable the caller keeps the completed
 // batches (res.remaining lists the files not reached); everything else
 // fails the night.
-func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess Session, laneFiles map[string]string, budget int, changed map[string]bool, mtimeOf func(rel string) int64) (laneResult, error) {
+func (c *Consolidator) runLane(ctx context.Context, traceID, lane string, sess Session, laneFiles map[string]string, budget int, sel selection) (laneResult, error) {
 	res := laneResult{rewrites: make(map[string]string, len(laneFiles))}
-	ordered, overFileCap := orderCandidates(laneFiles, changed, mtimeOf, c.maxFileBytes())
+	ordered, overFileCap := orderCandidates(laneFiles, sel.deferred, sel.changed, sel.mtimeOf, c.maxFileBytes())
 	batches, overBudget := buildBatches(ordered, laneFiles, budget)
 	res.skipped = append(append([]string{}, overFileCap...), overBudget...)
 	sort.Strings(res.skipped)
@@ -738,6 +758,122 @@ func nonNil(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// EventRunSummary is ledgered once per night that ran both lanes' batches
+// (FIX-B-5 phase 3), also when the night ends without a diff: {files,
+// batches, deferred} totals (files consolidated, model calls answered,
+// files deferred) plus a per-lane breakdown under "cloud" and "local"
+// ({files, sent_files, batches, completed, dropped, est_tokens_in,
+// bytes_out, skipped, deferred, remaining}). The latest row's trace is the
+// "last night" deferredFromLastRun reads back, and the pending night's row
+// is the summary `kahya consolidation show` prints (PendingRunSummary).
+const EventRunSummary = "consolidation.run_summary"
+
+// RunTotals is one night's summary as `kahya consolidation show` prints it
+// (EventRunSummary's top-level totals).
+type RunTotals struct {
+	Files    int `json:"files"`
+	Batches  int `json:"batches"`
+	Deferred int `json:"deferred"`
+}
+
+// laneSummary is one lane's part of EventRunSummary.
+func laneSummary(laneFiles int, r laneResult) map[string]any {
+	return map[string]any{
+		"files": laneFiles, "sent_files": r.sentFiles, "batches": r.completed + r.dropped,
+		"completed": r.completed, "dropped": r.dropped, "est_tokens_in": r.estTokensIn, "bytes_out": r.bytesOut,
+		"skipped": len(r.skipped), "deferred": len(r.deferred), "remaining": len(r.remaining),
+	}
+}
+
+// ledgerRunSummary logs (JSONL consolidation_run_summary) and ledgers the
+// night's EventRunSummary. Best-effort: a failed write never fails the
+// night (the next night then just has no deferred files to start with).
+func (c *Consolidator) ledgerRunSummary(ctx context.Context, traceID string, cloudFiles int, cloud laneResult, localFiles int, local laneResult) {
+	t := RunTotals{
+		Files:    cloud.sentFiles + local.sentFiles,
+		Batches:  cloud.completed + cloud.dropped + local.completed + local.dropped,
+		Deferred: len(cloud.deferred) + len(local.deferred),
+	}
+	c.logInfo("consolidation_run_summary", "trace_id", traceID, "files", t.Files, "batches", t.Batches, "deferred", t.Deferred,
+		"dropped", cloud.dropped+local.dropped, "skipped", len(cloud.skipped)+len(local.skipped),
+		"cloud_est_tokens_in", cloud.estTokensIn, "cloud_bytes_out", cloud.bytesOut,
+		"local_est_tokens_in", local.estTokensIn, "local_bytes_out", local.bytesOut)
+	if c.EventLogger != nil {
+		_ = c.EventLogger.LogEvent(ctx, traceID, EventRunSummary, map[string]any{
+			"files": t.Files, "batches": t.Batches, "deferred": t.Deferred,
+			LaneCloud: laneSummary(cloudFiles, cloud), LaneLocal: laneSummary(localFiles, local),
+		})
+	}
+}
+
+// deferredFromLastRun is orderCandidates' deferred set (FIX-B-5 phase 3):
+// the files the last night (the latest EventRunSummary's trace) deferred,
+// in either lane. Nothing when that night deferred nothing, so an older
+// night's deferrals - already processed by a later night - are not
+// prioritized again. Ordering only: a ledger read error logs and returns
+// nothing.
+func (c *Consolidator) deferredFromLastRun(ctx context.Context, traceID string) map[string]bool {
+	if c.EventReader == nil {
+		return nil
+	}
+	sums, err := c.EventReader.ListEventsByKind(ctx, EventRunSummary)
+	if err != nil {
+		c.logWarn("consolidation_deferred_unavailable", "trace_id", traceID, "err", err.Error())
+		return nil
+	}
+	if len(sums) == 0 {
+		return nil
+	}
+	last := sums[len(sums)-1].TraceID
+	rows, err := c.EventReader.ListEventsByKind(ctx, EventBatchesDeferred)
+	if err != nil {
+		c.logWarn("consolidation_deferred_unavailable", "trace_id", traceID, "err", err.Error())
+		return nil
+	}
+	out := make(map[string]bool)
+	for _, r := range rows {
+		if r.TraceID != last {
+			continue
+		}
+		var p struct {
+			Files []string `json:"files"`
+		}
+		if json.Unmarshal([]byte(r.Payload), &p) != nil {
+			continue
+		}
+		for _, f := range p.Files {
+			out[NormalizePathKey(f)] = true
+		}
+	}
+	return out
+}
+
+// PendingRunSummary returns the pending suggestion's own night summary
+// (FIX-B-5 phase 3) - what `kahya consolidation show` prints above the
+// diff. found=false (nil error) when nothing is pending or that night
+// wrote no summary (a suggestion from before FIX-B-5).
+func (c *Consolidator) PendingRunSummary(ctx context.Context) (RunTotals, bool, error) {
+	pending, err := FindPending(ctx, c.EventReader)
+	if err != nil || pending == nil {
+		return RunTotals{}, false, err
+	}
+	rows, err := c.EventReader.ListEventsByKind(ctx, EventRunSummary)
+	if err != nil {
+		return RunTotals{}, false, fmt.Errorf("consolidation: list %s events: %w", EventRunSummary, err)
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].TraceID != pending.TraceID {
+			continue
+		}
+		var t RunTotals
+		if err := json.Unmarshal([]byte(rows[i].Payload), &t); err != nil {
+			return RunTotals{}, false, fmt.Errorf("consolidation: decode %s payload (event id %d): %w", EventRunSummary, rows[i].ID, err)
+		}
+		return t, true, nil
+	}
+	return RunTotals{}, false, nil
 }
 
 // changedFiles is orderCandidates' changed set (FIX-B-5): the files changed

@@ -370,7 +370,7 @@ func runConsolidation(client *Client, args []string, stdin io.Reader, stdout, st
 }
 
 func runConsolidationShow(client *Client, stdout, stderr io.Writer) int {
-	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
+	found, diff, summary, err := client.ShowConsolidation(context.Background(), traceid.New())
 	if err != nil {
 		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2
@@ -379,12 +379,16 @@ func runConsolidationShow(client *Client, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, MsgConsolidationEmpty)
 		return 0
 	}
+	if summary != nil {
+		// FIX-B-5: one line on the night that produced this suggestion.
+		fmt.Fprintf(stdout, MsgConsolidationRunSummaryFmt+"\n", summary.Files, summary.Batches, summary.Deferred)
+	}
 	fmt.Fprint(stdout, diff)
 	return 0
 }
 
 func runConsolidationApprove(client *Client, stdin io.Reader, stdout, stderr io.Writer) int {
-	found, diff, err := client.ShowConsolidation(context.Background(), traceid.New())
+	found, diff, _, err := client.ShowConsolidation(context.Background(), traceid.New())
 	if err != nil {
 		fmt.Fprintln(stderr, wrapServerError(MsgConsolidationFailed, err))
 		return 2

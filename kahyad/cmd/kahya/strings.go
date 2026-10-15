@@ -276,6 +276,12 @@ const (
 	MsgConsolidationApproved = "Konsolidasyon onaylandı."
 	MsgConsolidationRejected = "Konsolidasyon reddedildi."
 
+	// MsgConsolidationRunSummaryFmt is `kahya consolidation show`'s first
+	// line (FIX-B-5 phase 3; byte-exact handbook text): the night that
+	// produced the pending suggestion - files consolidated, model calls
+	// (batches), files deferred to the next night.
+	MsgConsolidationRunSummaryFmt = "Bu gece: %d dosya, %d parça; %d dosya ertelendi"
+
 	// ---- W5-04: kahya fact confirm|retract, kahya entity merge|split ----
 
 	// MsgFactUsage is printed when `kahya fact` is given anything other

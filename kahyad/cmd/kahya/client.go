@@ -763,33 +763,43 @@ func (c *Client) Halt(ctx context.Context, traceID, taskID string) (int, error) 
 // consolidationShowResponse mirrors kahyad's GET /v1/consolidation JSON
 // body (kahyad/internal/server.consolidationShowResponse, W5-02).
 type consolidationShowResponse struct {
-	Found bool   `json:"found"`
-	Diff  string `json:"diff,omitempty"`
+	Found   bool                  `json:"found"`
+	Diff    string                `json:"diff,omitempty"`
+	Summary *ConsolidationSummary `json:"summary,omitempty"`
+}
+
+// ConsolidationSummary mirrors kahyad/internal/consolidation.RunTotals: the
+// pending suggestion's night (FIX-B-5) - files consolidated, model calls
+// (batches) and files deferred to the next night.
+type ConsolidationSummary struct {
+	Files    int `json:"files"`
+	Batches  int `json:"batches"`
+	Deferred int `json:"deferred"`
 }
 
 // ShowConsolidation calls GET /v1/consolidation (`kahya consolidation
-// show`).
-func (c *Client) ShowConsolidation(ctx context.Context, traceID string) (found bool, diff string, err error) {
+// show`). summary is nil when kahyad sent none.
+func (c *Client) ShowConsolidation(ctx context.Context, traceID string) (found bool, diff string, summary *ConsolidationSummary, err error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/v1/consolidation", traceID, nil)
 	if err != nil {
-		return false, "", err
+		return false, "", nil, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return false, "", err
+		return false, "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		if msg := apiError(resp.Body); msg != "" {
-			return false, "", fmt.Errorf("%s", msg)
+			return false, "", nil, fmt.Errorf("%s", msg)
 		}
-		return false, "", &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: status %d", resp.StatusCode)}
+		return false, "", nil, &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: status %d", resp.StatusCode)}
 	}
 	var sr consolidationShowResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return false, "", &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: decode response: %w", err)}
+		return false, "", nil, &unreachableError{sock: c.sock, err: fmt.Errorf("consolidation: decode response: %w", err)}
 	}
-	return sr.Found, sr.Diff, nil
+	return sr.Found, sr.Diff, sr.Summary, nil
 }
 
 // consolidationActionResponse mirrors kahyad's POST /v1/consolidation/
