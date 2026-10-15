@@ -42,6 +42,26 @@ var defaultCloudReaderModel = router.SelectModel(router.RouteInput{
 	Intent: router.IntentReader, Lane: router.LaneNormal,
 }).Model
 
+// factExtractCloudModel is the cloud model for JobTypeFactExtract: the §4
+// table's "Çıkarım · geri-yazım" row (router.IntentExtract, today
+// router.ModelHaiku - claude-haiku-5-5, decision MEM-3.b), derived from the
+// router like defaultCloudReaderModel, never a literal. Haiku 5.5 has no
+// server-side fallback and rejects budget_tokens / sampling parameters /
+// prefill: the reader-mode worker sends none of them and the proxy adds
+// none (only the Fable models are shaped).
+var factExtractCloudModel = router.SelectModel(router.RouteInput{
+	Intent: router.IntentExtract, Lane: router.LaneNormal,
+}).Model
+
+// cloudModelFor is the model a jobType's cloud call uses when
+// WorkerCloudModel.Model is unset.
+func cloudModelFor(jobType string) string {
+	if jobType == JobTypeFactExtract {
+		return factExtractCloudModel
+	}
+	return defaultCloudReaderModel
+}
+
 // separatorBetweenInstructionsAndContent joins a job type's system-style
 // instructions and the untrusted content itself into envelope.Prompt's
 // single wire field (the envelope schema carries one prompt string, not a
@@ -72,7 +92,8 @@ type WorkerCloudModel struct {
 	AnthropicBaseURL string
 	APIKey           string
 
-	// Model defaults to defaultCloudReaderModel when empty.
+	// Model defaults to cloudModelFor(jobType) when empty
+	// (defaultCloudReaderModel, or factExtractCloudModel for the extractor).
 	Model string
 	// Timeout defaults to defaultCloudReaderTimeout when <= 0.
 	Timeout time.Duration
@@ -94,7 +115,7 @@ func (m WorkerCloudModel) Read(ctx context.Context, jobType string, rawBytes []b
 	}
 	model := m.Model
 	if model == "" {
-		model = defaultCloudReaderModel
+		model = cloudModelFor(jobType)
 	}
 	timeout := m.Timeout
 	if timeout <= 0 {
