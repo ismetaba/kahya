@@ -3785,14 +3785,16 @@ const listUnextractedEpisodes = `-- name: ListUnextractedEpisodes :many
 SELECT id, source, source_path, source_tier, created_at
 FROM episodes
 WHERE status = 'active'
-  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> ?)
+  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> ?1)
+  AND id > ?2
 ORDER BY id ASC
-LIMIT ?
+LIMIT ?3
 `
 
 type ListUnextractedEpisodesParams struct {
 	ExtractorVer sql.NullString `json:"extractor_ver"`
-	Limit        int64          `json:"limit"`
+	AfterID      int64          `json:"after_id"`
+	RowLimit     int64          `json:"row_limit"`
 }
 
 type ListUnextractedEpisodesRow struct {
@@ -3804,12 +3806,14 @@ type ListUnextractedEpisodesRow struct {
 }
 
 // Active episodes the nightly fact-extraction job (MEM-3) has not processed
-// under the current extractor version (NULL or a different version).
+// under the current extractor version (NULL or a different version), with
+// an id above after_id (kahyad/internal/extract's rolling start point; 0 =
+// from the lowest id).
 // Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
 // parser does not see a parameter after IS NOT and would generate a method
 // that binds one argument too few.
 func (q *Queries) ListUnextractedEpisodes(ctx context.Context, arg ListUnextractedEpisodesParams) ([]ListUnextractedEpisodesRow, error) {
-	rows, err := q.db.QueryContext(ctx, listUnextractedEpisodes, arg.ExtractorVer, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, listUnextractedEpisodes, arg.ExtractorVer, arg.AfterID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -4065,6 +4069,17 @@ type RenewOutboxLeaseParams struct {
 // have its lease resurrected.
 func (q *Queries) RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, renewOutboxLease, arg.LeaseUntil, arg.ID)
+	return err
+}
+
+const resetAllEpisodeExtraction = `-- name: ResetAllEpisodeExtraction :exec
+UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE status = 'active'
+`
+
+// `kahya memory extract --all` (MEM-3): every active episode is pending
+// again (a new extractor version rollout).
+func (q *Queries) ResetAllEpisodeExtraction(ctx context.Context) error {
+	_, err := q.db.ExecContext(ctx, resetAllEpisodeExtraction)
 	return err
 }
 

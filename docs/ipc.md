@@ -518,6 +518,35 @@ a cloud model, without changing anything in §2-§6 above:
   one rune of an NFD name), so only the OR makes folding a pure superset -
   it only ever adds secret paths, and over-matching only keeps a note on
   the machine.
+- **Fact extraction (FIX-MEM-3, G13; ordering per G00 H-7).**
+  `kahyad/internal/extract.Runner` turns memory episodes into facts and
+  entities through the toolless Reader (`reader.Runner.RunExtract`,
+  schema `fact_extract_v1`) and `factengine`. For every call (at most
+  `extraction_chunks_per_call` chunks) the bytes go through, in this order:
+  (1) the episode's `source_path` against `secret_lane_globs`
+  (`memlane.PathIsSecret`; no path at all counts as secret) - a hit forces
+  the local model; (2) `factengine.GuardCloudExtraction` (deterministic
+  pre-pass, then local Qwen, fail-closed) over exactly
+  `reader.RenderExtractInput(chunks)` - a hit forces the local model and
+  ledgers `extract.cloud_guard_blocked{episode_id, chunk_id}`; (3) the
+  Reader classifies the same bytes again and only a normal verdict reaches
+  the cloud model (`claude-haiku-5-5` through the per-task forward proxy). A
+  local model that cannot run, or any classification error, skips the
+  episode (`extract.skipped{reason:"local_unavailable"}`, `extracted_at`
+  stays NULL, retried next run) - never the cloud. Facts are written
+  `agent_derived` (the call site's provenance; `external_doc` for a later
+  ingest) with session `extract:fact_extract_v1:episode:<id>` (a
+  re-extraction is one evidence row), the verbatim `quote`, the evidence
+  string `episode:<id>,chunk:<id>` and the entity links of
+  `ResolveEntityForExtraction`/`AddAlias` (a subject/object is linked only
+  when byte-equal to a name or alias of the same answer). A call that went
+  local on its CONTENT (ordinary path) writes its evidence rows without the
+  episode citation, so `memlane` never lets those facts into a cloud
+  `<hafiza>` block or a Telegram card. A retraction closes only an
+  unconfirmed fact of no more trust than the extraction's provenance (else
+  `extract.retraction_skipped`). An edited note is pending again (the
+  indexer resets `extracted_at` when the content hash changes; a `reindex
+  --full` of unchanged bytes keeps it).
 - **Local model supervision** (`kahyad/internal/mlx.Supervisor`, reusing
   `kahyad/internal/mlxsup`'s generic spawn/health-poll engine verbatim):
   fail-closed free-memory check (`kahyad/internal/mlx.HasSufficientMemory`,

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -725,5 +726,68 @@ func TestReindexEmptyTraceIDMintsAndUsesOneConsistentID(t *testing.T) {
 	}
 	if gotTraceID == "" {
 		t.Error("ledger event trace_id is empty, want a freshly minted one")
+	}
+}
+
+// markExtracted stamps note.md's episode as fact-extracted (MEM-3's marker)
+// and returns its id.
+func markExtracted(t *testing.T, st *store.Store, relPath string) int64 {
+	t.Helper()
+	var id int64
+	if err := st.DB().QueryRow(`SELECT id FROM episodes WHERE source_path = ?`, relPath).Scan(&id); err != nil {
+		t.Fatalf("episode for %s: %v", relPath, err)
+	}
+	if _, err := st.DB().Exec(`UPDATE episodes SET extracted_at = '2026-10-14T00:00:00Z', extractor_ver = 'fact_extract_v1' WHERE id = ?`, id); err != nil {
+		t.Fatalf("mark extracted: %v", err)
+	}
+	return id
+}
+
+func extractionMarker(t *testing.T, st *store.Store, id int64) (extractedAt, ver sql.NullString) {
+	t.Helper()
+	if err := st.DB().QueryRow(`SELECT extracted_at, extractor_ver FROM episodes WHERE id = ?`, id).Scan(&extractedAt, &ver); err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	return extractedAt, ver
+}
+
+// TestProcessFileChangedContentResetsExtractionMarker (G13 MEM-3): an edited
+// note is pending fact extraction again.
+func TestProcessFileChangedContentResetsExtractionMarker(t *testing.T) {
+	memDir := t.TempDir()
+	writeFixture(t, memDir, "note.md", "# Baslik\n\nEmre Acme'de calisiyor.\n")
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+	if _, err := idx.Reindex(context.Background(), "", false); err != nil {
+		t.Fatalf("first Reindex: %v", err)
+	}
+	id := markExtracted(t, st, "note.md")
+
+	writeFixture(t, memDir, "note.md", "# Baslik\n\nEmre artik Acme'de calismiyor.\n")
+	if _, err := idx.Reindex(context.Background(), "", false); err != nil {
+		t.Fatalf("second Reindex: %v", err)
+	}
+	if at, ver := extractionMarker(t, st, id); at.Valid || ver.Valid {
+		t.Fatalf("extraction marker after an edit = %v / %v, want NULL (pending again)", at, ver)
+	}
+}
+
+// TestFullReindexOfUnchangedContentKeepsExtractionMarker: `kahya reindex
+// --full` re-chunks every note but must not make unchanged text pending
+// again (that would re-buy every model call).
+func TestFullReindexOfUnchangedContentKeepsExtractionMarker(t *testing.T) {
+	memDir := t.TempDir()
+	writeFixture(t, memDir, "note.md", "# Baslik\n\nDegismeyen icerik.\n")
+	st := newTestStore(t)
+	idx := New(st.DB(), memDir, newTestLogger(t))
+	if _, err := idx.Reindex(context.Background(), "", false); err != nil {
+		t.Fatalf("first Reindex: %v", err)
+	}
+	id := markExtracted(t, st, "note.md")
+	if res, err := idx.Reindex(context.Background(), "", true); err != nil || res.FilesIndexed != 1 {
+		t.Fatalf("full Reindex = %+v, %v", res, err)
+	}
+	if at, ver := extractionMarker(t, st, id); !at.Valid || ver.String != "fact_extract_v1" {
+		t.Fatalf("extraction marker after a full reindex of unchanged bytes = %v / %v, want kept", at, ver)
 	}
 }

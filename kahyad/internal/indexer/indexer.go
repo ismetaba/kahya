@@ -520,6 +520,17 @@ func (idx *Indexer) processFile(ctx context.Context, e fileEntry, full bool) (fi
 		}); err != nil {
 			return 0, 0, fmt.Errorf("update episode for %s: %w", e.relPath, err)
 		}
+		// G13 MEM-3: changed content is pending fact extraction again (the
+		// nightly fact-extraction job re-extracts it), in the same
+		// transaction as the new chunks. Only a real content change resets
+		// it: a `kahya reindex --full` of unchanged bytes (or a resurrected
+		// file with its old bytes) keeps the marker, so it never re-buys
+		// model calls for text already extracted.
+		if !existing.SourceHash.Valid || existing.SourceHash.String != hash {
+			if err := qtx.ResetEpisodeExtraction(ctx, episodeID); err != nil {
+				return 0, 0, fmt.Errorf("reset extraction marker for %s: %w", e.relPath, err)
+			}
+		}
 	}
 
 	for seq, text := range chunkTexts {

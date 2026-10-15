@@ -793,10 +793,10 @@ var ErrSecretLaneCloudExtraction = errors.New(secretlane.MsgSecretLaneCloudBlock
 // GuardCloudExtraction classifies text (kahyad/internal/secretlane's
 // deterministic-pre-pass-then-local-Qwen classifier) and fails closed
 // with ErrSecretLaneCloudExtraction whenever it is secret-lane content -
-// the fact-extraction call site (a future W12-09 cloud-routed extractor
-// session, or any other candidate-producing code path) MUST call this
-// BEFORE routing text to the cloud Haiku and must never proceed past a
-// non-nil error here. A nil error means either the deterministic pre-pass
+// the fact-extraction call site (kahyad/internal/extract, G13 MEM-3, over
+// the exact bytes its Reader call would send; or any other candidate-
+// producing code path) MUST call this BEFORE routing text to the cloud
+// Haiku and must never proceed past a non-nil error here. A nil error means either the deterministic pre-pass
 // found nothing AND classification is not required at all, or the local
 // classifier itself ran and found the content ordinary - either way, safe
 // to extract normally.

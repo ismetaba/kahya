@@ -255,24 +255,42 @@ func TestMemoryV2QueriesBindEveryParameter(t *testing.T) {
 		t.Fatalf("ListFactsCitingEpisodes(nil) = %+v, %v; want none", rows, err)
 	}
 
-	pending, err := q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v1"), Limit: 10})
+	pending, err := q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v1"), RowLimit: 10})
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("ListUnextractedEpisodes = %+v, %v; want both episodes pending", pending, err)
 	}
 	if err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: ep.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v1"), Limit: 10}); err != nil || len(pending) != 1 || pending[0].ID != noPath.ID {
+	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v1"), RowLimit: 10}); err != nil || len(pending) != 1 || pending[0].ID != noPath.ID {
 		t.Fatalf("after MarkEpisodeExtracted(v1) = %+v, %v; want only the other episode", pending, err)
 	}
-	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v2"), Limit: 10}); err != nil || len(pending) != 2 {
+	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v2"), RowLimit: 10}); err != nil || len(pending) != 2 {
 		t.Fatalf("under a new extractor version = %+v, %v; want both pending again", pending, err)
+	}
+	// FIX-MEM-3: after_id is the extractor's rolling start point and
+	// row_limit the batch cap - both must bind.
+	lo, hi := min(ep.ID, noPath.ID), max(ep.ID, noPath.ID)
+	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v2"), AfterID: lo, RowLimit: 10}); err != nil || len(pending) != 1 || pending[0].ID != hi {
+		t.Fatalf("after_id=%d = %+v, %v; want only episode %d", lo, pending, err, hi)
+	}
+	if pending, err = q.ListUnextractedEpisodes(ctx, sqlcgen.ListUnextractedEpisodesParams{ExtractorVer: ns("v2"), RowLimit: 1}); err != nil || len(pending) != 1 || pending[0].ID != lo {
+		t.Fatalf("row_limit=1 = %+v, %v; want only episode %d", pending, err, lo)
 	}
 	if err := q.ResetEpisodeExtraction(ctx, ep.ID); err != nil {
 		t.Fatal(err)
 	}
 	if e, err := q.GetEpisodeByID(ctx, ep.ID); err != nil || e.ExtractedAt.Valid || e.ExtractorVer.Valid {
 		t.Fatalf("after ResetEpisodeExtraction = %+v, %v; want NULL markers", e, err)
+	}
+	if err := q.MarkEpisodeExtracted(ctx, sqlcgen.MarkEpisodeExtractedParams{ExtractedAt: ns(now), ExtractorVer: ns("v1"), ID: noPath.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.ResetAllEpisodeExtraction(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := q.GetEpisodeByID(ctx, noPath.ID); err != nil || e.ExtractedAt.Valid || e.ExtractorVer.Valid {
+		t.Fatalf("after ResetAllEpisodeExtraction = %+v, %v; want NULL markers", e, err)
 	}
 
 	if _, err := s.DB().Exec(`INSERT INTO tasks (id, trace_id, state, lane, updated_at, created_at) VALUES ('t1', 'tr-1', 'done', 'secret', ?, ?)`, now, now); err != nil {

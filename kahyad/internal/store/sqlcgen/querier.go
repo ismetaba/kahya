@@ -609,7 +609,9 @@ type Querier interface {
 	// needs no timezone conversion for the same reason).
 	ListUncooledEpisodesOlderThan(ctx context.Context, createdAt string) ([]ListUncooledEpisodesOlderThanRow, error)
 	// Active episodes the nightly fact-extraction job (MEM-3) has not processed
-	// under the current extractor version (NULL or a different version).
+	// under the current extractor version (NULL or a different version), with
+	// an id above after_id (kahyad/internal/extract's rolling start point; 0 =
+	// from the lowest id).
 	// Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
 	// parser does not see a parameter after IS NOT and would generate a method
 	// that binds one argument too few.
@@ -667,6 +669,9 @@ type Querier interface {
 	// already marked delivered (or that somehow no longer exists) must never
 	// have its lease resurrected.
 	RenewOutboxLease(ctx context.Context, arg RenewOutboxLeaseParams) error
+	// `kahya memory extract --all` (MEM-3): every active episode is pending
+	// again (a new extractor version rollout).
+	ResetAllEpisodeExtraction(ctx context.Context) error
 	ResetEpisodeExtraction(ctx context.Context, id int64) error
 	// Undoes a ClaimEvalLabelAnswer whose evidence write then failed, so the
 	// user can tap again instead of being stuck "answered" with no evidence.

@@ -1303,22 +1303,30 @@ WHERE ev.fact_id = ? AND ep.source_path IS NOT NULL;
 
 -- name: ListUnextractedEpisodes :many
 -- Active episodes the nightly fact-extraction job (MEM-3) has not processed
--- under the current extractor version (NULL or a different version).
+-- under the current extractor version (NULL or a different version), with
+-- an id above after_id (kahyad/internal/extract's rolling start point; 0 =
+-- from the lowest id).
 -- Spelled "IS NULL OR <> ?" rather than "IS NOT ?": sqlc v1.30.0's sqlite
 -- parser does not see a parameter after IS NOT and would generate a method
 -- that binds one argument too few.
 SELECT id, source, source_path, source_tier, created_at
 FROM episodes
 WHERE status = 'active'
-  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> ?)
+  AND (extracted_at IS NULL OR extractor_ver IS NULL OR extractor_ver <> sqlc.arg(extractor_ver))
+  AND id > sqlc.arg(after_id)
 ORDER BY id ASC
-LIMIT ?;
+LIMIT sqlc.arg(row_limit);
 
 -- name: MarkEpisodeExtracted :exec
 UPDATE episodes SET extracted_at = ?, extractor_ver = ? WHERE id = ?;
 
 -- name: ResetEpisodeExtraction :exec
 UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE id = ?;
+
+-- name: ResetAllEpisodeExtraction :exec
+-- `kahya memory extract --all` (MEM-3): every active episode is pending
+-- again (a new extractor version rollout).
+UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE status = 'active';
 
 -- name: ListQuarantinedFacts :many
 -- `kahya fact list --quarantined` (MEM-5): agent_derived facts nobody
