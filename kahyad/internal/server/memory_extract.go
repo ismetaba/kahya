@@ -11,6 +11,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"kahya/kahyad/internal/extract"
@@ -93,12 +95,14 @@ func (s *Server) handleMemoryExtract(w http.ResponseWriter, r *http.Request) {
 		// variant of an existing note's path is resolved to the name the
 		// volume stores (a path that does not exist keeps its spelling, so
 		// ExtractFile still answers 404).
-		stored, err := memory.StoredRelPath(s.cfg.MemoryDir, relPath)
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "resolve note path: "+err.Error())
-			return
+		if _, lerr := os.Lstat(filepath.Join(s.cfg.MemoryDir, filepath.FromSlash(relPath))); lerr == nil {
+			stored, err := memory.StoredRelPath(s.cfg.MemoryDir, relPath)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "resolve note path: "+err.Error())
+				return
+			}
+			relPath = stored
 		}
-		relPath = stored
 	}
 
 	if !s.inflight.begin() {
