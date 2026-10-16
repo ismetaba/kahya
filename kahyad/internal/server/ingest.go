@@ -53,6 +53,17 @@ func (w memoryNoteWriter) HandleWriteTiered(ctx context.Context, traceID string,
 	return m.HandleWriteTiered(ctx, traceID, args)
 }
 
+// HandleForget retracts a superseded interrupted ingest note (FIX-FINAL
+// ingest-superseded-orphan-note-stays-active) through the same memory
+// server and mutex.
+func (w memoryNoteWriter) HandleForget(ctx context.Context, traceID string, args memory.MemoryForgetArgs) (memory.MemoryForgetOutput, error) {
+	m := w.s.memoryServer()
+	if m == nil {
+		return memory.MemoryForgetOutput{}, errors.New("server: memory repo not wired (SetMCPMemory)")
+	}
+	return m.HandleForget(ctx, traceID, args)
+}
+
 // ingestRequest is POST /v1/ingest's body.
 type ingestRequest struct {
 	ContentB64 string `json:"content_b64"`

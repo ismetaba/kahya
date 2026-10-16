@@ -758,4 +758,9 @@ const (
 	// CLOUD Reader read the document and the note was stored on the secret
 	// lane only because its summary looked sensitive (%s = the note).
 	MsgIngestSecretAfterCloudRead = "Belge bulut modeliyle okundu; özeti hassas göründüğü için not gizli şeride kaydedildi: %s"
+	// MsgIngestSupersededFmt (FIX-FINAL ingest-superseded-orphan-note-
+	// stays-active): an interrupted earlier ingest of the same document had
+	// left a note, which this ingest retracted to the memory trash (%s = that
+	// note; one line per note).
+	MsgIngestSupersededFmt = "Bu belgenin yarım kalmış önceki alımının notu hafıza çöpüne taşındı: %s"
 )

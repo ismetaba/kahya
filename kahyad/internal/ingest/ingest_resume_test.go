@@ -42,12 +42,12 @@ func TestIngestRetryAfterFactsFailureResumesOnTheNote(t *testing.T) {
 // cancelAfterNoteWriter cancels the request context right after the real
 // note commit - a client Ctrl-C, the request deadline or a shutdown.
 type cancelAfterNoteWriter struct {
-	inner  NoteWriter
+	NoteWriter
 	cancel context.CancelFunc
 }
 
 func (c cancelAfterNoteWriter) HandleWriteTiered(ctx context.Context, traceID string, args memory.TieredWriteArgs) (memory.TieredWriteOutput, error) {
-	out, err := c.inner.HandleWriteTiered(ctx, traceID, args)
+	out, err := c.NoteWriter.HandleWriteTiered(ctx, traceID, args)
 	c.cancel()
 	return out, err
 }
@@ -60,7 +60,7 @@ func TestIngestCancelAfterNoteCommitStillCompletes(t *testing.T) {
 	f.answer = acmeAnswer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f.runner.Memory = cancelAfterNoteWriter{inner: f.memSrv, cancel: cancel}
+	f.runner.Memory = cancelAfterNoteWriter{NoteWriter: f.memSrv, cancel: cancel}
 	res, err := f.runner.Ingest(ctx, "tr-ingest", Request{Content: []byte(acmeDoc), SourceRef: "a.txt"})
 	if err != nil {
 		t.Fatalf("ingest cancelled after the note commit = %v, want it to complete", err)

@@ -20,6 +20,8 @@ type ingestFake struct {
 	lane string
 	// readerLane is the answer's reader_lane ("" = omitted).
 	readerLane string
+	// superseded is the answer's superseded list (nil = omitted).
+	superseded []string
 	status     int
 	errorRes   map[string]any
 }
@@ -42,6 +44,9 @@ func (f *ingestFake) handler() http.Handler {
 			"chunks": 1, "facts": 2, "entities": 3, "source_tier": "external_doc"}
 		if f.readerLane != "" {
 			res["reader_lane"] = f.readerLane
+		}
+		if f.superseded != nil {
+			res["superseded"] = f.superseded
 		}
 		json.NewEncoder(w).Encode(res)
 	})
@@ -216,5 +221,26 @@ func TestIngestCLINoteMovedToSecretAfterCloudReadIsHonest(t *testing.T) {
 	fake = &ingestFake{lane: "secret"}
 	if code, out, _ := runIngestCLI(t, fake, "x\n", "-"); code != 0 || strings.Contains(out, "yalnız yerel model") || strings.Contains(out, "bulut modeliyle") {
 		t.Fatalf("no reader_lane: exit %d, stdout %q - want no claim about the model", code, out)
+	}
+}
+
+// TestIngestCLINamesRetractedEarlierNotes (FIX-FINAL ingest-superseded-
+// orphan-note-stays-active): when kahyad retracted the note an interrupted
+// earlier ingest of the same document had left, the CLI says so - one
+// Turkish line per note, before the quarantine hint.
+func TestIngestCLINamesRetractedEarlierNotes(t *testing.T) {
+	fake := &ingestFake{lane: "secret", readerLane: "secret", superseded: []string{"ingest/2026-10-08-not.md"}}
+	code, out, errOut := runIngestCLI(t, fake, "tahlil sonuçları\n", "-", "--secret")
+	if code != 0 {
+		t.Fatalf("exit = %d %q", code, errOut)
+	}
+	want := "Bu belgenin yarım kalmış önceki alımının notu hafıza çöpüne taşındı: ingest/2026-10-08-not.md\n" +
+		"Not ve olgular onaysız (external_doc); otomatik hatırlatmaya girmesi için: kahya memory confirm gizli/ingest/2026-10-08-not.md\n"
+	if !strings.HasSuffix(out, want) {
+		t.Fatalf("stdout =\n%q\nwant suffix\n%q", out, want)
+	}
+	fake = &ingestFake{lane: "normal"}
+	if _, out, _ := runIngestCLI(t, fake, "x\n", "-"); strings.Contains(out, "çöpüne") {
+		t.Fatalf("no superseded notes: stdout %q names one", out)
 	}
 }

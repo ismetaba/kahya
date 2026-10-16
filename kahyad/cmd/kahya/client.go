@@ -1270,6 +1270,9 @@ type ingestResult struct {
 	Entities   int    `json:"entities"`
 	SourceTier string `json:"source_tier"`
 	RawPath    string `json:"raw_path"`
+	// Superseded are interrupted earlier notes of the document kahyad
+	// retracted to the memory trash.
+	Superseded []string `json:"superseded"`
 }
 
 // ingestError is a kahyad refusal of POST /v1/ingest: its text (Turkish

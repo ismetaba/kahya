@@ -14,7 +14,12 @@
 //     - but no ingest.done) is resumed on that note at step 5 instead of a
 //     "-2" duplicate, when the note is stored at least as restrictively as
 //     this run's lane asks (FIX-FINAL ingest-retry-after-midpipeline-
-//     failure-duplicates-note);
+//     failure-duplicates-note); every OTHER interrupted note of the same
+//     document - a normal-lane orphan a secret-lane retry supersedes, or
+//     an older duplicate - is retracted (memory_forget: moved to the memory
+//     trash, its episode removed) before the note step, and a retraction
+//     that fails fails the ingest closed (FIX-FINAL ingest-superseded-
+//     orphan-note-stays-active);
 //  3. the lane: a source file path that policy.yaml's secret_lane_globs
 //     cover (Request.SourcePaths, an absolute SourceRef, and their
 //     symlink-resolved forms - matched with memlane's folded, fail-closed
@@ -95,6 +100,22 @@ const (
 	// resumes on that note instead of writing a "-2" duplicate (FIX-FINAL
 	// ingest-retry-after-midpipeline-failure-duplicates-note).
 	EventNoteWritten = "ingest.note_written"
+	// EventSuperseded is ledgered for every interrupted note of the
+	// document a retry retracted: {sha256, file, commit_sha (the
+	// memory_forget commit), lane (the retry's), reason} (FIX-FINAL
+	// ingest-superseded-orphan-note-stays-active).
+	EventSuperseded = "ingest.superseded"
+)
+
+// Supersede reasons (ingest.superseded "reason"): secret_lane = a
+// normal-lane note retracted because the document's note is now stored
+// secret-lane (a secret-lane retry, or a resume on a secret-lane note) -
+// no cloud-readable copy of a document classified secret stays active;
+// duplicate = another interrupted note of the same document stored at
+// least as restrictively (one note per document).
+const (
+	SupersedeReasonSecretLane = "secret_lane"
+	SupersedeReasonDuplicate  = "duplicate"
 )
 
 // Lane reasons (ingest.done "lane_reason"): why the note's lane is what it
@@ -188,9 +209,12 @@ type DocReader interface {
 var _ DocReader = (*reader.Runner)(nil)
 
 // NoteWriter is the memory-repo writer ingest needs - *memory.Server (and
-// kahyad's process-wide memory server adapter) satisfies it.
+// kahyad's process-wide memory server adapter) satisfies it. HandleForget
+// (whole file: moved to the memory trash, committed, its episode removed)
+// retracts a superseded interrupted note.
 type NoteWriter interface {
 	HandleWriteTiered(ctx context.Context, traceID string, args memory.TieredWriteArgs) (memory.TieredWriteOutput, error)
+	HandleForget(ctx context.Context, traceID string, args memory.MemoryForgetArgs) (memory.MemoryForgetOutput, error)
 }
 
 var _ NoteWriter = (*memory.Server)(nil)
@@ -280,6 +304,9 @@ type Result struct {
 	SourceTier string `json:"source_tier"`
 	RawPath    string `json:"raw_path,omitempty"`
 	SHA256     string `json:"sha256"`
+	// Superseded are the interrupted earlier notes of this document the
+	// ingest retracted to the memory trash (EventSuperseded).
+	Superseded []string `json:"superseded,omitempty"`
 }
 
 // Runner is the ingest pipeline (one per kahyad process).
@@ -340,7 +367,7 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	} else if file != "" {
 		return fail(ingestError(ReasonDuplicate, fmt.Sprintf(MsgIngestDuplicateFmt, file), nil), map[string]any{"file": file})
 	}
-	orphan, err := r.findInterrupted(ctx, traceID, digest)
+	orphans, err := r.findInterrupted(ctx, traceID, digest)
 	if err != nil {
 		return fail(ingestError(ReasonLookupFailed, fmt.Sprintf(MsgIngestFailedFmt, "önceki alımlar okunamadı"), err), nil)
 	}
@@ -391,25 +418,54 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	// Reader's title last.
 	rel := NoteDir + "/" + now.In(r.location()).Format("2006-01-02") + "-" + slugify(firstNonEmpty(req.Title, labelTitle(req.SourceRef), out.Title)) + ".md"
 	var note memory.TieredWriteOutput
-	resumed, superseded := false, ""
-	if orphan.File != "" && (orphan.Lane == router.LaneSecret || lane == router.LaneNormal) {
-		// FIX-FINAL ingest-retry-after-midpipeline-failure-duplicates-note:
-		// an earlier run of this document committed its note and stopped
-		// before ingest.done. Resume on that note (stored at least as
-		// restrictively as this run's lane asks) instead of writing a "-2"
-		// duplicate; its lane is where it is stored.
-		note = memory.TieredWriteOutput{File: orphan.File, EpisodeID: orphan.EpisodeID, CommitSHA: orphan.CommitSHA}
-		if orphan.Lane == router.LaneSecret && lane != router.LaneSecret {
-			lane, laneReason = router.LaneSecret, orphan.LaneReason
+	// FIX-FINAL ingest-retry-after-midpipeline-failure-duplicates-note: an
+	// earlier run of this document committed its note and stopped before
+	// ingest.done. Resume on such a note stored at least as restrictively
+	// as this run's lane asks instead of writing a "-2" duplicate: the
+	// newest secret-lane one for any lane (once a copy of the document is
+	// stored secret-lane, that copy wins), else - for a normal run - the
+	// newest normal-lane one; its lane is where it is stored.
+	resume := -1
+	for i, o := range orphans {
+		if o.Lane == router.LaneSecret {
+			resume = i
+			break
 		}
-		resumed = true
+	}
+	if resume < 0 && lane == router.LaneNormal && len(orphans) > 0 {
+		resume = 0
+	}
+	if resume >= 0 && orphans[resume].Lane == router.LaneSecret && lane != router.LaneSecret {
+		lane, laneReason = router.LaneSecret, orphans[resume].LaneReason
+	}
+	// FIX-FINAL ingest-superseded-orphan-note-stays-active: every other
+	// interrupted note of this document is retracted BEFORE the note step -
+	// a normal-lane orphan of a document whose note is now secret-lane
+	// must not stay an active, cloud-readable, nightly-extracted episode,
+	// and one document keeps one note. Retracting first means a later
+	// failure leaves no active superseded copy; a retraction that fails
+	// fails the ingest closed (no fresh note, no ingest.done) and the
+	// retry finds the same orphans again.
+	var retire []interruptedIngest
+	for i, o := range orphans {
+		if i != resume {
+			retire = append(retire, o)
+		}
+	}
+	superseded, file, err := r.retractOrphans(ctx, traceID, digest, lane, retire)
+	if err != nil {
+		extra := map[string]any{"lane": lane, "superseded": file}
+		if len(superseded) > 0 {
+			extra["retracted"] = superseded
+		}
+		return fail(ingestError(ReasonNoteWriteFailed, fmt.Sprintf(MsgIngestFailedFmt, "önceki yarım alım geri alınamadı"), err), extra)
+	}
+	resumed := resume >= 0
+	if resumed {
+		orphan := orphans[resume]
+		note = memory.TieredWriteOutput{File: orphan.File, EpisodeID: orphan.EpisodeID, CommitSHA: orphan.CommitSHA}
 		r.logInfo(traceID, "ingest_resumed", "file", note.File, "episode_id", note.EpisodeID, "orphan_trace_id", orphan.TraceID)
 	} else {
-		if orphan.File != "" {
-			// a normal-lane orphan, and this run is secret-lane: the note
-			// must be stored under the secret dir - write a fresh one.
-			superseded = orphan.File
-		}
 		note, err = r.Memory.HandleWriteTiered(ctx, traceID, memory.TieredWriteArgs{
 			RelPath: rel, Tier: factengine.TierExternalDoc, SecretLane: lane == router.LaneSecret, CommitPrefix: "ingest", Body: body,
 			FrontMatter: []memory.FrontMatterField{
@@ -472,6 +528,7 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	res := Result{
 		File: note.File, EpisodeID: note.EpisodeID, CommitSHA: note.CommitSHA, Lane: lane, ReaderLane: readerLane, Chunks: chunks,
 		Facts: st.Facts, Entities: st.Entities, SourceTier: factengine.TierExternalDoc, RawPath: rawPath, SHA256: digest,
+		Superseded: superseded,
 	}
 	payload := map[string]any{
 		"file": res.File, "episode_id": res.EpisodeID, "lane": lane, "lane_reason": laneReason, "reader_lane": readerLane,
@@ -484,7 +541,7 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	if resumed {
 		payload["resumed"] = true
 	}
-	if superseded != "" {
+	if len(superseded) > 0 {
 		payload["superseded"] = superseded
 	}
 	r.ledger(ctx, traceID, EventDone, payload)
@@ -628,17 +685,18 @@ type interruptedIngest struct {
 	EpisodeID                                  int64
 }
 
-// findInterrupted returns the newest interrupted ingest of digest whose
-// note is (or, reindexed, becomes) an active episode; the zero value when
-// none. A note an ingest.done names is complete, not interrupted.
-func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) (interruptedIngest, error) {
+// findInterrupted returns every interrupted ingest of digest whose note is
+// (or, reindexed, becomes) an active episode, newest first (the order of
+// their ingest.note_written rows); none when there is none. A note an
+// ingest.done names is complete, not interrupted.
+func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([]interruptedIngest, error) {
 	rows, err := r.Store.ListEventsByKind(ctx, EventNoteWritten)
 	if err != nil {
-		return interruptedIngest{}, err
+		return nil, err
 	}
 	done, err := r.Store.ListIngestDoneBySHA256(ctx, digest)
 	if err != nil {
-		return interruptedIngest{}, err
+		return nil, err
 	}
 	completed := make(map[string]bool, len(done))
 	for _, ev := range done {
@@ -649,6 +707,8 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) (i
 			completed[p.File] = true
 		}
 	}
+	var out []interruptedIngest
+	seen := map[string]bool{}
 	for i := len(rows) - 1; i >= 0; i-- { // newest first
 		var p struct {
 			SHA256     string `json:"sha256"`
@@ -657,33 +717,16 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) (i
 			Lane       string `json:"lane"`
 			LaneReason string `json:"lane_reason"`
 		}
-		if json.Unmarshal([]byte(rows[i].Payload), &p) != nil || p.SHA256 != digest || p.File == "" || completed[p.File] {
+		if json.Unmarshal([]byte(rows[i].Payload), &p) != nil || p.SHA256 != digest || p.File == "" || completed[p.File] || seen[p.File] {
 			continue
 		}
-		ep, err := r.Store.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
-			Source: extract.SourceMemoryFile, SourcePath: sql.NullString{String: p.File, Valid: true},
-		})
-		if errors.Is(err, sql.ErrNoRows) {
-			// committed but never indexed (the reindex after the commit
-			// failed): index it now, when an indexer is wired
-			if r.Index == nil {
-				continue
-			}
-			if _, rerr := r.Index.ReindexFile(ctx, traceID, p.File); rerr != nil {
-				return interruptedIngest{}, rerr
-			}
-			ep, err = r.Store.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
-				Source: extract.SourceMemoryFile, SourcePath: sql.NullString{String: p.File, Valid: true},
-			})
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-		}
+		seen[p.File] = true
+		epID, active, err := r.activeEpisode(ctx, traceID, p.File)
 		if err != nil {
-			return interruptedIngest{}, err
+			return nil, err
 		}
-		if ep.Status != "active" {
-			continue // removed since: not resumable
+		if !active {
+			continue // removed since (or never indexable): not resumable
 		}
 		lane := p.Lane
 		if lane != router.LaneSecret {
@@ -692,9 +735,63 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) (i
 		if r.Lane.PathIsSecret(p.File) {
 			lane = router.LaneSecret
 		}
-		return interruptedIngest{File: p.File, CommitSHA: p.CommitSHA, Lane: lane, LaneReason: p.LaneReason, TraceID: rows[i].TraceID, EpisodeID: ep.ID}, nil
+		out = append(out, interruptedIngest{File: p.File, CommitSHA: p.CommitSHA, Lane: lane, LaneReason: p.LaneReason, TraceID: rows[i].TraceID, EpisodeID: epID})
 	}
-	return interruptedIngest{}, nil
+	return out, nil
+}
+
+// activeEpisode reports the note's episode id and whether it is active. A
+// committed note that was never indexed (the reindex after the commit
+// failed, or kahyad died first) is indexed now when an indexer is wired;
+// without one it is reported not active.
+func (r *Runner) activeEpisode(ctx context.Context, traceID, file string) (int64, bool, error) {
+	key := sqlcgen.GetEpisodeBySourceAndPathParams{Source: extract.SourceMemoryFile, SourcePath: sql.NullString{String: file, Valid: true}}
+	ep, err := r.Store.GetEpisodeBySourceAndPath(ctx, key)
+	if errors.Is(err, sql.ErrNoRows) {
+		if r.Index == nil {
+			return 0, false, nil
+		}
+		if _, rerr := r.Index.ReindexFile(ctx, traceID, file); rerr != nil {
+			return 0, false, rerr
+		}
+		ep, err = r.Store.GetEpisodeBySourceAndPath(ctx, key)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return ep.ID, ep.Status == "active", nil
+}
+
+// retractOrphans retracts each superseded interrupted note (memory_forget
+// of the whole file: moved to the memory trash, committed by kahyad, its
+// episode removed - the indexer, memory_search, <hafiza> and the nightly
+// extraction never see it again) and ledgers EventSuperseded for each. It
+// runs under context.WithoutCancel: a disconnect must not stop it between
+// the trash commit and the episode's removal. It stops at the first
+// failure and returns the files retracted so far plus the file that failed.
+func (r *Runner) retractOrphans(ctx context.Context, traceID, digest, lane string, orphans []interruptedIngest) ([]string, string, error) {
+	ctx = context.WithoutCancel(ctx)
+	var done []string
+	for _, o := range orphans {
+		out, err := r.Memory.HandleForget(ctx, traceID, memory.MemoryForgetArgs{File: o.File})
+		if err != nil {
+			return done, o.File, fmt.Errorf("ingest: retract superseded note %s: %w", o.File, err)
+		}
+		reason := SupersedeReasonDuplicate
+		if o.Lane != router.LaneSecret && lane == router.LaneSecret {
+			reason = SupersedeReasonSecretLane
+		}
+		r.ledger(ctx, traceID, EventSuperseded, map[string]any{
+			"sha256": digest, "file": o.File, "commit_sha": out.CommitSHA, "lane": lane, "reason": reason,
+			"orphan_trace_id": o.TraceID,
+		})
+		r.logInfo(traceID, "ingest_superseded", "file", o.File, "reason", reason, "commit_sha", out.CommitSHA)
+		done = append(done, o.File)
+	}
+	return done, "", nil
 }
 
 // renderNoteBody is the note's markdown, built ONLY from validated fields:

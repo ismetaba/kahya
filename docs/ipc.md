@@ -979,7 +979,19 @@ a cloud model, without changing anything in §2-§6 above:
   `ingest.done`, e.g. a failed facts write or a cancellation) is resumed
   on that note: no `-2` duplicate, `ingest.done` gains `resumed: true`;
   a normal-lane orphan is superseded by a fresh secret-lane note when the
-  retry is secret-lane (`superseded`). After the commit the remaining
+  retry is secret-lane. Every interrupted note of the document the retry
+  does not resume on (that superseded normal-lane orphan, or an older
+  duplicate) is retracted BEFORE the note step - memory_forget of the
+  whole file: moved to `memory/.trash/`, committed by kahyad, its episode
+  removed, so no cloud-readable, nightly-extracted copy of a document now
+  classified secret stays active - and ledgered `ingest.superseded
+  {sha256, file, commit_sha, lane, reason: secret_lane | duplicate}`;
+  `ingest.done` and the answer carry `superseded: [<note>...]` and the CLI
+  prints `"Bu belgenin yarım kalmış önceki alımının notu hafıza çöpüne
+  taşındı: %s"` per note. A retraction that fails fails the ingest closed
+  (`ingest.failed {reason: note_write_failed, superseded: <note>}`, no
+  fresh note, no `ingest.done`; the retry finds the orphan again) (FIX-FINAL
+  ingest-superseded-orphan-note-stays-active). After the commit the remaining
   local steps run under `context.WithoutCancel` (2 min bound), so a client
   disconnect or shutdown no longer strands the note (FIX-FINAL
   ingest-retry-after-midpipeline-failure-duplicates-note). The lane is decided LOCALLY before any cloud byte. First the

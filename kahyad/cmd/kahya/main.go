@@ -1175,6 +1175,9 @@ func runIngest(client *Client, args []string, stdin io.Reader, stdout, stderr io
 	case res.Lane == "secret" && res.ReaderLane == "normal":
 		fmt.Fprintf(stdout, MsgIngestSecretAfterCloudRead+"\n", res.File)
 	}
+	for _, f := range res.Superseded {
+		fmt.Fprintf(stdout, MsgIngestSupersededFmt+"\n", f)
+	}
 	fmt.Fprintf(stdout, MsgIngestQuarantineHint+"\n", res.File)
 	return 0
 }
