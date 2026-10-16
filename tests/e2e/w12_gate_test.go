@@ -46,6 +46,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"kahya/tests/e2e/mockanthropic"
+	"kahya/tests/hermetic"
 )
 
 // evNoteRelPath / decoyRelPath are the two fixture files' names, both under
@@ -581,7 +582,10 @@ func buildCLIEnv(homeDir, sockPath string) []string {
 func startKahyad(t *testing.T, bin string, env []string, homeDir string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(bin)
-	cmd.Env = env
+	// FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: a
+	// fake launchctl first on the child's PATH; the test fails if this
+	// daemon ever runs launchctl (gui/<uid> is the user's real domain).
+	cmd.Env = hermetic.TrapLaunchctl(t, env, homeDir)
 	outPath := filepath.Join(homeDir, fmt.Sprintf("kahyad.stdout.%d.log", time.Now().UnixNano()))
 	errPath := filepath.Join(homeDir, fmt.Sprintf("kahyad.stderr.%d.log", time.Now().UnixNano()))
 	outFile, err := os.Create(outPath)

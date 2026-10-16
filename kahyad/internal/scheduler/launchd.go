@@ -213,8 +213,8 @@ var currentUIDFn = func() string { return strconv.Itoa(os.Getuid()) }
 // gui/$UID) exactly matches jobs (task spec step 5). It is idempotent: a
 // job whose rendered plist content is UNCHANGED from what's already on
 // disk is left completely alone — no bootout/bootstrap cycle, no
-// launchctl call at all — so repeated Sync calls (every kahyad boot, plus
-// every manual `kahyad -sync-jobs`) never needlessly restart an
+// launchctl call at all — so repeated Sync calls (every prod kahyad boot,
+// plus every manual `kahyad -sync-jobs`) never needlessly restart an
 // already-correct LaunchAgent. A job whose plist is new or changed gets
 // `launchctl bootout` (errors ignored — "not loaded" is the expected,
 // common case for a brand-new job) followed by `launchctl bootstrap`
@@ -224,6 +224,13 @@ var currentUIDFn = func() string { return strconv.Itoa(os.Getuid()) }
 // "com.kahya.job.<name>.plist" shape (jobNameFromPlistFileName) — kahyad's
 // own com.kahya.kahyad.plist, installed separately by `make
 // install-agent` into the very same directory, is never touched.
+//
+// gui/<uid> and the com.kahya.job.<name> labels are the USER's, whatever
+// opts.LaunchAgentsDir says: callers run Sync only for the prod profile in
+// the account's own home (kahyad main.go launchdSyncSkipReason, FIX-FINAL
+// ops-config-r2-hermetic-boot-replaces-real-launchd-jobs) - a dev or
+// hermetic daemon with a temp HOME would otherwise replace the user's
+// loaded jobs with plists from its own tree.
 func Sync(jobs []config.JobConfig, opts SyncOptions, runner Runner, jsonl *logx.Logger) error {
 	if err := os.MkdirAll(opts.LaunchAgentsDir, 0o700); err != nil {
 		return fmt.Errorf("scheduler: create LaunchAgents dir %s: %w", opts.LaunchAgentsDir, err)

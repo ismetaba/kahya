@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -95,7 +96,74 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 // automated coverage precisely because scheduler.NewExecRunner() was
 // called inline here with no way to substitute it). Production code never
 // reassigns this; it always resolves to the real scheduler.NewExecRunner().
+// The boot-time sync uses the same seam; both are gated by
+// launchdSyncSkipReason first.
 var syncJobsRunnerFn = scheduler.NewExecRunner
+
+// accountHomeDirFn resolves the home directory of the account this process
+// runs as, from the user database (getpwuid), never from $HOME. A test seam
+// like syncJobsRunnerFn: a test that drives a real Sync through a fake
+// Runner under a temp HOME makes that temp HOME the "account home".
+var accountHomeDirFn = func() (string, error) {
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	if u.HomeDir == "" {
+		return "", errors.New("user database has no home directory for this account")
+	}
+	return u.HomeDir, nil
+}
+
+// launchdSyncSkipReason is why this process must not touch launchd's
+// gui/<uid> domain at all ("" = it may sync the job LaunchAgents) - FIX-FINAL
+// ops-config-r2-hermetic-boot-replaces-real-launchd-jobs. The domain and the
+// com.kahya.job.<name> labels belong to the user, not to a HOME or a
+// profile: a hermetic harness daemon (KAHYA_ENV=dev, a temp HOME) that ran
+// scheduler.Sync with the real launchctl booted out the user's production
+// job agents and bootstrapped its temp-dir plists in their place, and prod's
+// content-equal Sync never repaired it. So only the prod profile
+// (cfg.ManagesLaunchdJobs) running in the account's own home directory
+// syncs; a HOME that is not the account's home (any harness that boots prod
+// by mistake) or an account home that cannot be resolved refuses too
+// (fail-closed: the plists already installed stay as they are).
+func launchdSyncSkipReason(cfg config.Config, home string) string {
+	if !cfg.ManagesLaunchdJobs() {
+		return "non_prod_profile"
+	}
+	account, err := accountHomeDirFn()
+	if err != nil {
+		return "account_home_unresolved"
+	}
+	if !sameDirectory(home, account) {
+		return "home_not_account_home"
+	}
+	return ""
+}
+
+// sameDirectory reports whether a and b name the same directory, comparing
+// cleaned absolute paths after resolving symlinks where they resolve.
+func sameDirectory(a, b string) bool {
+	norm := func(p string) string {
+		if p == "" {
+			return ""
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			p = r
+		}
+		return filepath.Clean(p)
+	}
+	na, nb := norm(a), norm(b)
+	return na != "" && na == nb
+}
+
+// MsgSyncJobsSkippedFmt is `kahyad -sync-jobs`' stderr line when
+// launchdSyncSkipReason refuses (exit 0: nothing failed, nothing was done);
+// %s is the reason code.
+const MsgSyncJobsSkippedFmt = "kahyad -sync-jobs: launchd işleri eşitlenmedi (%s) — yalnız üretim profili, hesabın kendi ev dizininde eşitler."
 
 // runSyncJobs implements the standalone `kahyad -sync-jobs` mode (W4-01
 // task spec step 5): load config, sync ~/Library/LaunchAgents' set of
@@ -104,7 +172,9 @@ var syncJobsRunnerFn = scheduler.NewExecRunner
 // touches neither, so it is safe to run even while a real kahyad is
 // already up). Idempotent: safe to run repeatedly, e.g. from a shell
 // script after editing config.yaml's jobs: section, without restarting
-// the daemon.
+// the daemon. Like the boot-time sync it runs only for the prod profile in
+// the account's own home (launchdSyncSkipReason); anywhere else it writes
+// nothing, calls no launchctl and exits 0 with MsgSyncJobsSkippedFmt.
 //
 // MINOR 5: the launchctl Runner is resolved via syncJobsRunnerFn (not a
 // direct scheduler.NewExecRunner() call) so main_test.go's
@@ -139,6 +209,14 @@ func runSyncJobs(stdout, stderr io.Writer) int {
 	if err != nil {
 		log.Error("sync_jobs_home_dir_failed", "err", err.Error())
 		return 1
+	}
+	// FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: the
+	// same gate as the boot-time sync - nothing is written, nothing reaches
+	// launchctl.
+	if reason := launchdSyncSkipReason(cfg, home); reason != "" {
+		log.Info("sync_jobs_skipped", "reason", reason, "env", cfg.Env)
+		fmt.Fprintf(stderr, MsgSyncJobsSkippedFmt+"\n", reason)
+		return 0
 	}
 	opts := scheduler.SyncOptions{
 		LaunchAgentsDir: filepath.Join(home, "Library", "LaunchAgents"),
@@ -1590,10 +1668,12 @@ func run() int {
 
 	// Startup sync (task spec step 5): keep ~/Library/LaunchAgents' set of
 	// com.kahya.job.<name> plists in exact sync with cfg.Jobs on every
-	// normal boot too - not only via the standalone `kahyad -sync-jobs`
-	// flag (runSyncJobs below, for scripting/idempotent re-sync without a
-	// full daemon restart). Best-effort: a launchctl hiccup here must
-	// never prevent the rest of the daemon from serving.
+	// normal PROD boot too - not only via the standalone `kahyad
+	// -sync-jobs` flag (runSyncJobs above, for scripting/idempotent re-sync
+	// without a full daemon restart). Best-effort: a launchctl hiccup here
+	// must never prevent the rest of the daemon from serving. The in-daemon
+	// job registry (sched.LoadJobs above) is unaffected by the gates below:
+	// a triggered job still runs in every profile.
 	schedSyncOpts := scheduler.SyncOptions{
 		LaunchAgentsDir: filepath.Join(home, "Library", "LaunchAgents"),
 		JobLogDir:       filepath.Join(home, "Library", "Logs", "Kahya"),
@@ -1601,10 +1681,16 @@ func run() int {
 	}
 	// FIX-FINAL ops-restore-scratch-kills-prod-workers: a passive boot
 	// shares prod's config.yaml and HOME - it must never rewrite prod's
-	// ~/Library/LaunchAgents job plists.
+	// ~/Library/LaunchAgents job plists. FIX-FINAL ops-config-r2-hermetic-
+	// boot-replaces-real-launchd-jobs: neither may any other non-prod
+	// profile (a dev or hermetic-harness daemon) nor a daemon whose HOME is
+	// not the account's own home (launchdSyncSkipReason) - gui/<uid> and
+	// the job labels are the user's, whatever HOME says.
 	if cfg.PassiveBoot() {
 		log.Info("job_sync_skipped", "reason", "passive_restore_profile")
-	} else if err := scheduler.Sync(cfg.Jobs, schedSyncOpts, scheduler.NewExecRunner(), log); err != nil {
+	} else if reason := launchdSyncSkipReason(cfg, home); reason != "" {
+		log.Info("job_sync_skipped", "reason", reason, "env", cfg.Env)
+	} else if err := scheduler.Sync(cfg.Jobs, schedSyncOpts, syncJobsRunnerFn(), log); err != nil {
 		log.Error("job_sync_failed", "err", err.Error())
 	}
 

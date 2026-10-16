@@ -133,6 +133,10 @@ func TestRunSyncJobsRendersAndBootstrapsConfiguredJobs(t *testing.T) {
 	origRunnerFn := syncJobsRunnerFn
 	syncJobsRunnerFn = func() scheduler.Runner { return fake }
 	defer func() { syncJobsRunnerFn = origRunnerFn }()
+	// FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: a
+	// sync runs only in the account's own home - this test's temp HOME
+	// stands in for it (the fake Runner never reaches launchctl).
+	asAccountHome(t, home)
 
 	var stdout, stderr bytes.Buffer
 	code := runSyncJobs(&stdout, &stderr)

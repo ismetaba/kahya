@@ -45,6 +45,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"kahya/tests/hermetic"
 )
 
 // repoRoot locates the repo root from this file's own location
@@ -192,7 +194,10 @@ func (d *daemon) start() {
 	writeConfigYAML(t, d.dirs.homeDir, d.opts)
 	policyPath := writeFixturePolicyYAML(t, root, d.dirs.homeDir, d.opts.anthropicUpstreamURL)
 
-	env := buildKahyadEnv(d.dirs, policyPath, d.opts.extraEnv)
+	// FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: a
+	// fake launchctl first on the child's PATH; the test fails if this
+	// daemon ever runs launchctl (gui/<uid> is the user's real domain).
+	env := hermetic.TrapLaunchctl(t, buildKahyadEnv(d.dirs, policyPath, d.opts.extraEnv), d.dirs.homeDir)
 
 	cmd := exec.Command(kahyadBin)
 	cmd.Env = env

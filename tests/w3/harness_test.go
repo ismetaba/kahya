@@ -31,6 +31,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"kahya/tests/hermetic"
 )
 
 // repoRoot locates the repo root from this file's own location
@@ -181,7 +183,10 @@ func bootKahyad(t *testing.T, opts daemonOpts) *daemon {
 	// for filesystem isolation (fs_write/fs_read's own "~" expansion must
 	// never touch the real user's actual home directory).
 	symlinkRealDotDirs(t, homeDir, ".colima", ".lima", ".docker")
-	env := buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath, extraEnv)
+	// FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: a
+	// fake launchctl first on the child's PATH; the test fails if this
+	// daemon ever runs launchctl (gui/<uid> is the user's real domain).
+	env := hermetic.TrapLaunchctl(t, buildKahyadEnv(homeDir, dataDir, memDir, sockPath, policyPath, extraEnv), homeDir)
 
 	cmd := exec.Command(kahyadBin)
 	cmd.Env = env

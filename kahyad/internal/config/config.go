@@ -1303,8 +1303,22 @@ func Load() (Config, error) {
 // LaunchAgents. Such a daemon kills no worker, resumes / dispatches no
 // task, runs no Telegram poller, syncs no launchd job, anchors nothing and
 // refuses POST /v1/task - it serves only what the drill needs (/health,
-// /v1/reindex, /v1/memory/search). Prod and dev are unchanged.
+// /v1/reindex, /v1/memory/search). Every non-prod profile (dev too) also
+// syncs no launchd job (ManagesLaunchdJobs).
 func (c Config) PassiveBoot() bool { return c.Env == EnvRestore }
+
+// ManagesLaunchdJobs reports whether this profile may install, replace or
+// remove the com.kahya.job.<name> LaunchAgents (FIX-FINAL ops-config-r2-
+// hermetic-boot-replaces-real-launchd-jobs): prod only. launchd's gui/<uid>
+// domain and the job labels belong to the USER - not to a HOME directory or
+// a KAHYA_ENV profile - so a dev, restore or hermetic-harness daemon (a temp
+// HOME) that synced would `bootout` prod's loaded jobs and `bootstrap`
+// plists from its own tree in their place (pointing at its temp log dir and
+// its checkout's kahya-trigger), and prod's content-equal Sync never
+// repairs that. Every launchd job dials prod's socket through kahya-trigger
+// anyway, so a non-prod sync is never useful. kahyad additionally refuses
+// when HOME is not the account's own home (main.go launchdSyncSkipReason).
+func (c Config) ManagesLaunchdJobs() bool { return c.Env == EnvProd }
 
 // reconcileConfigDrivenJobCalendars rewrites the CalendarSpec of the
 // "truth-ritual" and "morning-briefing" cfg.Jobs entries (if present) from

@@ -2150,6 +2150,28 @@ func TestPassiveBootOnlyForRestore(t *testing.T) {
 	}
 }
 
+// TestManagesLaunchdJobsOnlyInProd (FIX-FINAL ops-config-r2-hermetic-boot-
+// replaces-real-launchd-jobs): launchd's gui/<uid> domain and the
+// com.kahya.job.<name> labels are the user's, so only the prod profile may
+// sync them - never dev, restore or any other profile (a hermetic harness
+// boots dev with a temp HOME).
+func TestManagesLaunchdJobsOnlyInProd(t *testing.T) {
+	for env, want := range map[string]bool{EnvProd: true, EnvDev: false, EnvRestore: false, "redteam": false} {
+		if got := (Config{Env: env}).ManagesLaunchdJobs(); got != want {
+			t.Errorf("Config{Env: %q}.ManagesLaunchdJobs() = %v, want %v", env, got, want)
+		}
+	}
+	clearEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.ManagesLaunchdJobs() {
+		t.Errorf("an unset KAHYA_ENV loads Env=%q, which must manage launchd jobs", cfg.Env)
+	}
+}
+
 // TestResolveSocketMatchesLoad (FIX-FINAL ops-config-load-gates-halt-and-
 // jobs): ResolveSocket shares Load's layering, so for every valid config
 // they name the same socket.

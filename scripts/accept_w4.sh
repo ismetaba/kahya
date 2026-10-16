@@ -113,6 +113,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# FIX-FINAL ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: launchd's
+# gui/<uid> domain and the com.kahya.job.* labels are the USER's, not this
+# scratch HOME's. Every daemon below gets a fake launchctl first on its PATH
+# (it records the call and exits 1, never reaching the real one); any call
+# fails the gate (checked with the prod-safety check at the end).
+LAUNCHCTL_TRAP_BIN="$SCRATCH_BASE/launchctl-trap/bin"
+LAUNCHCTL_TRAP_CALLS="$SCRATCH_BASE/launchctl-trap/launchctl.calls"
+mkdir -p "$LAUNCHCTL_TRAP_BIN"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 1\n' "$LAUNCHCTL_TRAP_CALLS" > "$LAUNCHCTL_TRAP_BIN/launchctl"
+chmod 700 "$LAUNCHCTL_TRAP_BIN/launchctl"
+
 # free_port prints a currently-free 127.0.0.1 TCP port (bind, read, release
 # - the standard, if TOCTOU-imperfect, idiom this whole codebase's own Go
 # tests already use).
@@ -172,7 +183,7 @@ prepare_daemon() {
 launch_daemon() {
 	local name="$1"; shift
 	env -i \
-		HOME="$D_HOME" PATH="$PATH" \
+		HOME="$D_HOME" PATH="$LAUNCHCTL_TRAP_BIN:$PATH" \
 		KAHYA_ENV=dev \
 		KAHYA_DATA_DIR="$D_DATA" KAHYA_MEMORY_DIR="$D_MEM" KAHYA_SOCKET="$D_SOCK" \
 		KAHYA_POLICY_PATH="$D_POLICY" KAHYA_LOG_LEVEL=info \
@@ -582,6 +593,11 @@ log ""
 log "prod brain.db MAX(events.id) after run: $PROD_MAX_AFTER (before was $PROD_MAX_BEFORE)"
 if [ "$PROD_MAX_BEFORE" != "$PROD_MAX_AFTER" ]; then
 	log "PROD SAFETY VIOLATION: prod brain.db event count changed during this run ($PROD_MAX_BEFORE -> $PROD_MAX_AFTER)"
+	FAILS=$((FAILS+1))
+fi
+if [ -s "$LAUNCHCTL_TRAP_CALLS" ]; then
+	log "PROD SAFETY VIOLATION: a scratch kahyad ran launchctl (it must never touch the user's gui/<uid> launchd domain):"
+	tee -a "$RUN_LOG" < "$LAUNCHCTL_TRAP_CALLS"
 	FAILS=$((FAILS+1))
 fi
 
