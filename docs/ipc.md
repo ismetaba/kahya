@@ -570,6 +570,27 @@ a cloud model, without changing anything in §2-§6 above:
   G02-2) the task is escalated, the output still returned; a hit that
   cannot be marked or escalated returns no output
   (`mcp/fs.MsgSecretLaneOutputRefused`, ledger `secret_lane_read_refused`).
+- **Path globs under APFS name folding (FIX-FINAL
+  attacker2-apfs-fold-glob-bypass).** macOS APFS looks names up under
+  full Unicode case folding: `~/.zſhrc` (long s) opens `~/.zshrc`,
+  `Application ſupport` opens `Application Support`, `ß`/`ẞ` open `ss`
+  and the ff/fi/fl/ffi/ffl/st ligatures open their letters - which
+  `strings.ToLower` does not do, and `mcp/fs.Canonicalize` keeps the
+  caller's spelling. Every deny-glob and secret-lane PATH matcher
+  therefore compares names with one key, `mcp/fs/pathfold.Fold` (NFC,
+  lower-case, `golang.org/x/text/cases.Fold`, NFC; checked against the
+  test machine's own volume by `TestFoldCoversAPFSNameEquivalence`), ORed
+  onto the byte-exact and lower-cased matches (folding changes what `?`
+  or a character class means): `mcp/fs.MatchesAnyGlobCI` /
+  `PathCoversSecretGlob` (fs_read/fs_write/fs_delete, shell_host,
+  shell_docker, shortcuts_run, the Telegram fs card gate), mcp/shell's
+  workdir scope checks, and `memlane.MatchesSecretGlob` (memlane,
+  consolidation, briefing's file gate - which also fails closed on a glob
+  error now - and the Telegram memory-tool gate). A not-yet-existing
+  target is covered too: APFS folds both ways, so a created `~/.zſhrc` is
+  the file zsh opens. An fs_read glob error now counts as secret-lane.
+  `mcp/memory`'s glob COVERAGE check for a secret note stays byte-exact
+  (it must hold for byte-exact consumers too).
 - **Mid-task escalation at `memory_write` (FIX-U-3, G00 U-3).** The agent's
   `memory_write` content is classified LOCALLY before a single byte is
   written (`mcp/memory.SecretLaneSeam`, the SAME deterministic

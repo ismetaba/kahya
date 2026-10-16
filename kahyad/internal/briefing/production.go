@@ -10,6 +10,7 @@ import (
 	"context"
 	"time"
 
+	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store/sqlcgen"
 )
@@ -17,16 +18,29 @@ import (
 // PolicyGlobMatcher is the production GlobMatcher: policy.yaml's
 // secret_lane_globs (already `~`-expanded by policy.Load - HANDOFF §4 ⚑
 // "policy.yaml globlari yalniz dosya yollari icin"), matched via
-// policy.MatchGlob - the SAME doublestar matcher every other glob check in
-// this codebase uses, never a second copy.
+// memlane.MatchesSecretGlob over policy.MatchGlob - the SAME rule memlane,
+// consolidation and the Telegram memory-tool gate apply, never a second
+// copy: byte-exact OR folded (macOS APFS's case folding included, FIX-FINAL
+// attacker2-apfs-fold-glob-bypass - the collector reports a file under the
+// name the volume stores, which a byte-exact match missed for
+// "~/Documents/Saglik/..." against "~/Documents/saglik/**"), and a glob
+// that cannot be evaluated drops the item (fail-closed; it used to count
+// as no match).
 type PolicyGlobMatcher struct {
 	Globs []string
+}
+
+// policyMatcher adapts policy.MatchGlob to memlane.GlobMatcher.
+type policyMatcher struct{}
+
+func (policyMatcher) Match(pattern, path string) (bool, error) {
+	return policy.MatchGlob(pattern, path)
 }
 
 // MatchesSecretLane implements GlobMatcher.
 func (m PolicyGlobMatcher) MatchesSecretLane(path string) bool {
 	for _, g := range m.Globs {
-		if ok, err := policy.MatchGlob(g, path); err == nil && ok {
+		if memlane.MatchesSecretGlob(policyMatcher{}, g, path) {
 			return true
 		}
 	}

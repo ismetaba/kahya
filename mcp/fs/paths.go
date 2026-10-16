@@ -25,6 +25,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"golang.org/x/text/unicode/norm"
+
+	"kahya/mcp/fs/pathfold"
 )
 
 // CanonicalPath is Canonicalize's result.
@@ -246,26 +248,41 @@ func firstForbiddenRune(s string) (rune, bool) {
 }
 
 // MatchesAnyGlobCI reports whether path matches any pattern in globs,
-// case-INSENSITIVELY (lowercase-compare on both sides before matching) —
-// HANDOFF §5 safety #6 gotcha: APFS is case-insensitive but
-// case-preserving, so "~/library/launchagents/x" must deny exactly like
-// "~/Library/LaunchAgents/x" or the mandatory Day-1 deny globs are
-// trivially bypassable by case alone. path should already be a
+// case-INSENSITIVELY — HANDOFF §5 safety #6 gotcha: APFS is
+// case-insensitive but case-preserving, so "~/library/launchagents/x" must
+// deny exactly like "~/Library/LaunchAgents/x" or the mandatory Day-1 deny
+// globs are trivially bypassable by case alone. path should already be a
 // CanonicalPath.Match value (NFC-normalized); globs are policy.yaml's
 // already ~-expanded glob list. Matching uses the same doublestar/v4
 // matcher kahyad/internal/policy/loader.go validated the pattern syntax
 // with (MatchGlob's doc comment) — this package cannot import that
 // package directly (internal import boundary), so it calls doublestar
 // itself, but on the identical pattern syntax.
+//
+// A glob covers path when ANY of three comparisons holds (FIX-FINAL
+// attacker2-apfs-fold-glob-bypass): byte-exact, lower-cased
+// (pathfold.Lower, the pre-fix rule) or APFS-folded (pathfold.Fold: full
+// Unicode case folding). The folded half closes the APFS spellings
+// strings.ToLower leaves alone - "~/.zſhrc" (long s), "Application
+// ſupport", "ß"/"ẞ" for "ss", the ff/fi/fl/ffi/ffl/st ligatures - which
+// open the protected file while missing a lower-cased glob, including for
+// a target that does not exist yet (APFS folds both ways, so a created
+// "~/.zſhrc" is the file zsh opens as ~/.zshrc). The other two halves stay
+// because folding can change what a glob means next to '?' or inside a
+// character class ("ß" becomes two runes): the OR only ever adds matches.
+// Any glob error is returned; every caller treats it as a hit
+// (fail-closed).
 func MatchesAnyGlobCI(path string, globs []string) (bool, error) {
-	lowerPath := strings.ToLower(path)
+	lowerPath, foldPath := pathfold.Lower(path), pathfold.Fold(path)
 	for _, g := range globs {
-		ok, err := doublestar.Match(strings.ToLower(g), lowerPath)
-		if err != nil {
-			return false, fmt.Errorf("fs: glob %q: %w", g, err)
-		}
-		if ok {
-			return true, nil
+		for _, pair := range [3][2]string{{g, path}, {pathfold.Lower(g), lowerPath}, {pathfold.Fold(g), foldPath}} {
+			ok, err := doublestar.Match(pair[0], pair[1])
+			if err != nil {
+				return false, fmt.Errorf("fs: glob %q: %w", g, err)
+			}
+			if ok {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

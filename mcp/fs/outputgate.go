@@ -14,6 +14,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+
+	"kahya/mcp/fs/pathfold"
 )
 
 // MsgSecretLaneOutputRefused is the Turkish tool error a tool returns when
@@ -88,20 +90,22 @@ func (g OutputGate) Check(ctx context.Context, traceID, taskID, tool string, pat
 // a secret glob, or p is the literal root of one or an ancestor of that
 // root (a git repo, or a container workdir, that holds a secret dir).
 // Each root is checked as written and in its canonical form; comparisons
-// are case-insensitive (APFS). A glob error counts as covered
-// (fail-closed).
+// use APFS's name equivalence (pathfold.Fold - full Unicode case folding,
+// a superset of the lower-casing it replaced, FIX-FINAL attacker2-apfs-
+// fold-glob-bypass), so "~/Documentſ" still holds ~/Documents/saglik. A
+// glob error counts as covered (fail-closed).
 func PathCoversSecretGlob(home, p string, globs []string) bool {
 	if hit, err := MatchesAnyGlobCI(p, globs); err != nil || hit {
 		return true
 	}
-	lp := strings.ToLower(strings.TrimRight(p, "/"))
+	lp := pathfold.Fold(strings.TrimRight(p, "/"))
 	for _, root := range secretGlobLiteralRoots(globs) {
 		forms := []string{root}
 		if cp, err := Canonicalize(home, root); err == nil && cp.Match != root {
 			forms = append(forms, cp.Match)
 		}
 		for _, f := range forms {
-			lf := strings.ToLower(strings.TrimRight(f, "/"))
+			lf := pathfold.Fold(strings.TrimRight(f, "/"))
 			if lp == lf || lp == "" || strings.HasPrefix(lf, lp+"/") {
 				return true
 			}

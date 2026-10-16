@@ -109,6 +109,36 @@ func TestPathIsSecretFoldsCaseAndNormalization(t *testing.T) {
 	}
 }
 
+// TestPathIsSecretFoldsAPFSSpellings (FIX-FINAL attacker2-apfs-fold-glob-
+// bypass): APFS also folds long s, sharp s and the ff/fi/fl/st ligatures
+// onto their ASCII spelling, so a note stored as "\ufb01nans-2026.md" (fi
+// ligature) or "finan\u017f.md" (long s) is a finans*.md note, and a '?'
+// that stood for a sharp s keeps matching (the textnorm half).
+func TestPathIsSecretFoldsAPFSSpellings(t *testing.T) {
+	c := newClassifier(nil)
+	for rel, want := range map[string]bool{
+		"\ufb01nans-2026.md":  true, // fi ligature
+		"finan\u017f.md":      true, // long s
+		"FINAN\u017f-x.md":    true,
+		"gizli/\u017fifre.md": true,
+		"notes/\ufb01nans.md": false,
+		"inbox/\u017fiir.md":  false,
+	} {
+		if got := c.PathIsSecret(rel); got != want {
+			t.Errorf("PathIsSecret(%q) = %v, want %v", rel, got, want)
+		}
+	}
+	sharp := Classifier{MemoryDir: testMemoryDir, SecretGlobs: []string{"/m/strasse/**", "/m/stra?e/**"}, Matcher: policyMatcher{}}
+	for _, rel := range []string{"Stra\u00dfe/a.md", "STRA\u1e9eE/a.md", "strasse/a.md"} {
+		if !sharp.PathIsSecret(rel) {
+			t.Errorf("PathIsSecret(%q) under sharp-s globs = false, want true", rel)
+		}
+	}
+	if got := FoldForSecretGlob("/m/Gi\u017fli/\ufb01nans/**"); got != "/m/gisli/finans/**" {
+		t.Errorf("FoldForSecretGlob = %q, want /m/gisli/finans/**", got)
+	}
+}
+
 // rawOnlySecretCases are secret-lane globs whose meaning depends on the
 // exact spelling: the byte-exact match holds, the folded one does not.
 // A negated character class stops excluding the folded rune ("X" folds

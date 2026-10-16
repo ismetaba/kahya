@@ -72,3 +72,24 @@ func TestShortcutWithSecretInputPathEscalates(t *testing.T) {
 		t.Fatalf("escalations = %d, want 1 (secret-lane input path)", esc.n)
 	}
 }
+
+// TestShortcutWithAPFSFoldedSecretInputPathEscalates (FIX-FINAL
+// attacker2-apfs-fold-glob-bypass): the long-s / ligature spelling APFS
+// opens as the secret file is a secret-lane input path too.
+func TestShortcutWithAPFSFoldedSecretInputPathEscalates(t *testing.T) {
+	for _, in := range []string{
+		"/Users/kahya/Documents/\u017faglik/tahlil.pdf",
+		"/Users/kahya/Document\u017f/saglik/tahlil.pdf",
+	} {
+		r, _, _, _ := newTestRunner()
+		esc := &countingEscalator{}
+		r.SecretLaneGlobs = []string{"/Users/kahya/Documents/saglik/**"}
+		r.OutputGate = mcpfs.OutputGate{Escalator: esc}
+		if _, err := r.RunShortcut(context.Background(), "tr", "task-1", ShortcutInput{Name: "Ozetle", InputPath: in}); err != nil {
+			t.Fatalf("RunShortcut(%q): %v", in, err)
+		}
+		if esc.n != 1 {
+			t.Fatalf("%q: escalations = %d, want 1 (secret-lane input path)", in, esc.n)
+		}
+	}
+}

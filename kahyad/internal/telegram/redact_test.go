@@ -367,6 +367,24 @@ func assertOnlyRedactedTitle(t *testing.T, r redactFixture, tool string, forbidd
 	}
 }
 
+// TestFsCardAPFSFoldedSecretGlobPathRedacted (FIX-FINAL attacker2-apfs-
+// fold-glob-bypass): an fs_write / fs_delete card whose path is the long-s
+// or ligature spelling APFS opens as a secret-glob file is redacted like
+// the plain spelling.
+func TestFsCardAPFSFoldedSecretGlobPathRedacted(t *testing.T) {
+	for trace, path := range map[string]string{
+		"trace-fold-long-s": "~/Finan\u017f/plan.txt",
+		"trace-fold-nested": "~/FINAN\u017f/a/plan.txt",
+	} {
+		r := newRedactFixture(t)
+		r.deliver(t, "fs_write", policy.ClassW2, fsWriteInput(t, path, "market listesi"), trace)
+		assertOnlyRedactedTitle(t, r, "fs_write", []string{"plan.txt", "market"}, redactReasonGlob)
+	}
+	r := newRedactFixture(t)
+	r.deliver(t, "fs_delete", policy.ClassW1, []byte(`{"path":"~/Finan\u017f/plan.txt"}`), "trace-fold-del")
+	assertOnlyRedactedTitle(t, r, "fs_delete", []string{"plan.txt"}, redactReasonGlob)
+}
+
 const testIBAN = "TR33 0006 1005 1978 6457 8413 26"
 
 // TestFsDeleteOldContentWithIBANRedacted (FIX-P-6): fs_delete carries no

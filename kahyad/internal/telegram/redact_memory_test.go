@@ -27,6 +27,10 @@ func TestMemoryToolSecretGlobCardRedacted(t *testing.T) {
 		{"write_gizli", "memory_write", `{"content":"` + clean + `","file":"gizli/notes/randevular.md"}`, true, redactReasonGlob},
 		{"write_gizli_casefold", "memory_write", `{"content":"` + clean + `","file":"GİZLİ/x.md"}`, true, redactReasonGlob},
 		{"write_finans", "memory_write", `{"content":"` + clean + `","file":"finans-2026.md"}`, true, redactReasonGlob},
+		// FIX-FINAL attacker2-apfs-fold-glob-bypass: APFS opens the fi
+		// ligature / long-s spelling as finans*.md.
+		{"write_finans_ligature", "memory_write", `{"content":"` + clean + `","file":"\ufb01nans-2026.md"}`, true, redactReasonGlob},
+		{"forget_finans_long_s", "memory_forget", `{"file":"finan\u017f.md"}`, true, redactReasonGlob},
 		{"forget_gizli", "memory_forget", `{"file":"gizli/notes/randevular.md"}`, true, redactReasonGlob},
 		{"write_inbox", "memory_write", `{"content":"` + clean + `","file":"inbox/x.md"}`, false, ""},
 		{"write_default_file", "memory_write", `{"content":"` + clean + `"}`, false, ""},

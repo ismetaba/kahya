@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	mcpfs "kahya/mcp/fs"
+	"kahya/mcp/fs/pathfold"
 )
 
 // Turkish, user/model-facing deny reasons for the workdir scope gate — none
@@ -61,15 +62,21 @@ var systemDenyDirs = []string{
 // which is where Kâhya's own data dir, config.Config.DataDir, lives).
 var sensitiveHomeSubtreeNames = []string{".ssh", ".aws", ".gnupg", ".config", "Library"}
 
+// foldKey is the comparison key of every *CI helper below: APFS's name
+// equivalence (pathfold.Fold - full Unicode case folding, a superset of
+// the strings.ToLower it replaced, FIX-FINAL attacker2-apfs-fold-glob-
+// bypass), so "~/.ſsh" (long s) is ~/.ssh here exactly as it is on disk.
+func foldKey(p string) string { return pathfold.Fold(p) }
+
 // isAncestorOrSelfCI reports whether target equals root, or sits somewhere
-// underneath it — case-INSENSITIVELY (APFS is case-insensitive but
-// case-preserving; mirrors mcp/fs.MatchesAnyGlobCI's identical rationale),
-// so this decision cannot be bypassed by case alone.
+// underneath it — case-INSENSITIVELY under APFS's own folding (mirrors
+// mcp/fs.MatchesAnyGlobCI's identical rationale), so this decision cannot
+// be bypassed by case or by an APFS-folded spelling.
 func isAncestorOrSelfCI(root, target string) bool {
 	root = filepath.Clean(root)
 	target = filepath.Clean(target)
-	rootLower := strings.ToLower(root)
-	targetLower := strings.ToLower(target)
+	rootLower := foldKey(root)
+	targetLower := foldKey(target)
 	if rootLower == targetLower {
 		return true
 	}
@@ -110,11 +117,11 @@ func isStrictlyUnderCI(root, target string) bool {
 	if root == "." || root == "/" {
 		return false
 	}
-	prefix := strings.ToLower(root)
+	prefix := foldKey(root)
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	return strings.HasPrefix(strings.ToLower(target), prefix)
+	return strings.HasPrefix(foldKey(target), prefix)
 }
 
 // isStrictlyUnderAnyCI is isStrictlyUnderCI applied to every non-empty root.
@@ -148,9 +155,9 @@ func isStrictAncestorOfAnyCI(target string, roots []string) bool {
 // equalsAnyCI reports whether target, cleaned and case-folded, equals any
 // non-empty root (cleaned and case-folded the same way).
 func equalsAnyCI(target string, roots []string) bool {
-	t := strings.ToLower(filepath.Clean(target))
+	t := foldKey(filepath.Clean(target))
 	for _, root := range roots {
-		if root != "" && strings.ToLower(filepath.Clean(root)) == t {
+		if root != "" && foldKey(filepath.Clean(root)) == t {
 			return true
 		}
 	}

@@ -514,7 +514,12 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 
 	secretLane, glenErr := MatchesAnyGlobCI(cp.Match, s.SecretLaneGlobs)
 	if glenErr != nil {
+		// Fail-closed (FIX-FINAL attacker2-apfs-fold-glob-bypass): a glob
+		// that cannot be evaluated means the path rule's answer is
+		// unknown, so the read is treated as secret-lane - it used to fall
+		// through to the content check alone.
 		s.Log.Warn("fs_read_secret_lane_glob_error", "err", glenErr.Error())
+		secretLane = true
 	}
 	// W3-10 gate-test fix: the path-glob check above is HANDOFF's
 	// file-path-only rule; this is the SEPARATE, content-based half (see

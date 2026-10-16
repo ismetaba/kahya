@@ -39,9 +39,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
+
+	"kahya/mcp/fs/pathfold"
 )
 
 // undoRecord is one pending (not-yet-undone, not-yet-expired) undo entry,
@@ -165,10 +166,11 @@ var ErrUndoBlocked = errors.New("not attempted: a newer operation on the same pa
 // for concurrent use: one chain per undo call.
 type UndoChain struct {
 	s *Server
-	// failed holds the case-folded canonical paths a newer operation in
-	// this chain could not undo. Folded because APFS is case-insensitive by
-	// default: over-blocking a distinct case-variant file on a
-	// case-sensitive volume is the fail-closed direction.
+	// failed holds the folded canonical paths (pathfold.Fold, APFS's name
+	// equivalence) a newer operation in this chain could not undo. Folded
+	// because APFS is case-insensitive by default: over-blocking a distinct
+	// case-variant file on a case-sensitive volume is the fail-closed
+	// direction.
 	failed map[string]bool
 }
 
@@ -178,7 +180,7 @@ func (s *Server) NewUndoChain() *UndoChain {
 	return &UndoChain{s: s, failed: make(map[string]bool)}
 }
 
-func undoPathKey(canonicalPath string) string { return strings.ToLower(canonicalPath) }
+func undoPathKey(canonicalPath string) string { return pathfold.Fold(canonicalPath) }
 
 // UndoOp is Server.UndoOp under the chain rule above. A blocked operation's
 // record is left in place (nothing ran).

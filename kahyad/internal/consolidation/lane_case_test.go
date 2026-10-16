@@ -140,6 +140,28 @@ func TestPartitionByLaneCaseVariantSecretPathsGoLocal(t *testing.T) {
 	}
 }
 
+// TestPartitionByLaneAPFSFoldedSecretPathsGoLocal (FIX-FINAL attacker2-
+// apfs-fold-glob-bypass): a note stored under an APFS-folded spelling of a
+// secret-lane path (fi ligature, long s) is the local lane's.
+func TestPartitionByLaneAPFSFoldedSecretPathsGoLocal(t *testing.T) {
+	const memDir = "/Users/u/Kahya/memory"
+	globs := []string{"/Users/u/Kahya/memory/finans*.md", "/Users/u/Kahya/memory/gizli/**"}
+	files := map[string]string{
+		"\ufb01nans-2026.md":  "user secret",
+		"finan\u017f.md":      "user secret",
+		"gizli/\ufb02at.md":   "user secret",
+		"notes/\ufb01nans.md": "ordinary",
+		"inbox/\u017fiir.md":  "ordinary",
+	}
+	cloud, local := PartitionByLane(files, memDir, globs, PolicyGlobMatcher{})
+	for rel, content := range files {
+		_, isLocal := local[rel]
+		if wantLocal := content == "user secret"; isLocal != wantLocal {
+			t.Errorf("%s: local = %v, want %v (cloud = %v)", rel, isLocal, wantLocal, keys(cloud))
+		}
+	}
+}
+
 // TestPartitionByLaneKeepsByteExactSecretMatch (FIX-U-3 review, round 2):
 // the folded match is ORed onto the byte-exact one, never in its place. A
 // user glob whose meaning depends on the exact spelling - a negated

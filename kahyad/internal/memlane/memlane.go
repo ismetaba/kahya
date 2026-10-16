@@ -25,9 +25,10 @@
 // Fail-closed throughout: a store read error is returned (the caller then
 // refuses), a glob that cannot be evaluated - or no matcher at all -
 // makes the path secret, and a path is secret when the byte-exact match
-// OR the case-/normalisation-folded one holds (MatchesSecretGlob), so a
-// variant spelling of a secret path on a case-insensitive volume is secret
-// too and nothing a byte-exact match covers is ever normal. (The ritual copy
+// OR a case-/normalisation-folded one holds (MatchesSecretGlob, with APFS's
+// full case folding), so a variant spelling of a secret path on a
+// case-insensitive volume is secret too and nothing a byte-exact match
+// covers is ever normal. (The ritual copy
 // treated a glob match error as "no match"; policy.Load validates every
 // glob at boot, so that never happened in practice, but this package
 // never fails open.)
@@ -50,6 +51,7 @@ import (
 	"kahya/kahyad/internal/secretlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/textnorm"
+	"kahya/mcp/fs/pathfold"
 )
 
 // Store is the brain.db read surface Classify needs - *sqlcgen.Queries
@@ -168,18 +170,22 @@ func (c Classifier) AbsPathIsSecret(absPath string) bool {
 }
 
 // MatchesSecretGlob is the ONE memory-side secret-lane path rule
-// (memlane.PathIsSecret, consolidation.PartitionByLane): absPath is secret
-// under glob g when the byte-exact match OR the folded match
-// (FoldForSecretGlob on both glob and path) holds. The byte-exact half is
-// never dropped, because folding can change what a glob means: a negated
-// class "[!a-z]" stops excluding a folded "X" (or a dotted capital I,
-// folded to "i"), and a '?' standing for the combining mark of a
-// decomposed (NFD) name has no rune left once NFC composes it. A folded-
-// only rule would call such a byte-exact secret path normal (FIX-U-3
-// review, round 2). With the OR the rule is a superset of byte-exact
-// matching: folding only ever ADDS secret paths, and over-matching only
-// keeps a note on the machine. Fail-closed: a nil matcher, or an error
-// from either match, counts as a match.
+// (memlane.PathIsSecret, consolidation.PartitionByLane, briefing's file
+// gate, the Telegram memory-tool card gate): absPath is secret under glob g
+// when the byte-exact match, the Turkish/lower-case folded match
+// (textnorm.Fold on both sides) OR the APFS-folded match
+// (FoldForSecretGlob on both sides) holds. The byte-exact half is never
+// dropped, because folding can change what a glob means: a negated class
+// "[!a-z]" stops excluding a folded "X" (or a dotted capital I, folded to
+// "i"), and a '?' standing for the combining mark of a decomposed (NFD)
+// name has no rune left once NFC composes it. A folded-only rule would
+// call such a byte-exact secret path normal (FIX-U-3 review, round 2). The
+// textnorm half stays next to the APFS one for the same reason: full case
+// folding turns "ß" into two runes, so a '?' that stood for it no longer
+// matches. With the OR the rule is a superset of byte-exact matching:
+// folding only ever ADDS secret paths, and over-matching only keeps a note
+// on the machine. Fail-closed: a nil matcher, or an error from any match,
+// counts as a match.
 func MatchesSecretGlob(m GlobMatcher, g, absPath string) bool {
 	if m == nil {
 		return true
@@ -187,21 +193,27 @@ func MatchesSecretGlob(m GlobMatcher, g, absPath string) bool {
 	if ok, err := m.Match(g, absPath); err != nil || ok {
 		return true
 	}
+	if ok, err := m.Match(textnorm.Fold(g), textnorm.Fold(absPath)); err != nil || ok {
+		return true
+	}
 	ok, err := m.Match(FoldForSecretGlob(g), FoldForSecretGlob(absPath))
 	return err != nil || ok
 }
 
-// FoldForSecretGlob is the folding MatchesSecretGlob's second match
-// applies to BOTH a secret_lane_globs pattern and the path it is matched
-// against: textnorm.Fold - NFC normalisation, the Turkish dotted/dotless I
-// family collapsed onto "i", then Unicode lowercase. It is a superset of
-// what an APFS volume treats as the same name (case- and normalisation-
-// insensitive), so a case or normalisation variant of a secret path is
-// secret too (mcp/fs.MatchesAnyGlobCI's rationale, HANDOFF S5 safety #6).
-// It is never used ON ITS OWN to decide a path is normal: inside a
-// character class or next to a '?' it can change a glob's meaning, which
-// is why MatchesSecretGlob keeps the byte-exact match.
-func FoldForSecretGlob(s string) string { return textnorm.Fold(s) }
+// FoldForSecretGlob is the coarsest folding MatchesSecretGlob applies to
+// BOTH a secret_lane_globs pattern and the path it is matched against:
+// textnorm.Fold (NFC, the Turkish dotted/dotless I family collapsed onto
+// "i", Unicode lowercase), then mcp/fs/pathfold.Fold - the full Unicode
+// case folding macOS APFS looks names up with (FIX-FINAL attacker2-apfs-
+// fold-glob-bypass: long s, sharp s and the ff/fi/fl/st ligatures, which
+// lower-casing leaves alone, open the same file as their ASCII spelling).
+// It is a superset of what an APFS volume treats as the same name, so any
+// spelling that opens a secret path is secret too (mcp/fs.MatchesAnyGlobCI
+// folds the same way, HANDOFF S5 safety #6). It is never used ON ITS OWN
+// to decide a path is normal: inside a character class or next to a '?'
+// it can change a glob's meaning, which is why MatchesSecretGlob keeps the
+// byte-exact and textnorm matches.
+func FoldForSecretGlob(s string) string { return pathfold.Fold(textnorm.Fold(s)) }
 
 // Classify decides whether fact f may leave the machine: path half first
 // (any cited secret path excludes; no resolvable citation excludes), then
