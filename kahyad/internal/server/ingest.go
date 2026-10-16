@@ -64,6 +64,17 @@ func (w memoryNoteWriter) HandleForget(ctx context.Context, traceID string, args
 	return m.HandleForget(ctx, traceID, args)
 }
 
+// FindIngestNotes finds an earlier ingest's notes of a document by their
+// front matter (FIX-FINAL ingest-kill-between-note-commit-and-note-
+// written-duplicates) through the same memory server and mutex.
+func (w memoryNoteWriter) FindIngestNotes(ctx context.Context, traceID, noteDir, digest string) ([]memory.IngestNoteRef, error) {
+	m := w.s.memoryServer()
+	if m == nil {
+		return nil, errors.New("server: memory repo not wired (SetMCPMemory)")
+	}
+	return m.FindIngestNotes(ctx, traceID, noteDir, digest)
+}
+
 // ingestRequest is POST /v1/ingest's body.
 type ingestRequest struct {
 	ContentB64 string `json:"content_b64"`

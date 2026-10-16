@@ -987,8 +987,18 @@ a cloud model, without changing anything in §2-§6 above:
   committed - ledger `ingest.note_written {sha256, file, episode_id,
   commit_sha, lane, lane_reason}`, written right after the commit - but no
   `ingest.done`, e.g. a failed facts write or a cancellation) is resumed
-  on that note: no `-2` duplicate, `ingest.done` gains `resumed: true`;
-  a normal-lane orphan is superseded by a fresh secret-lane note when the
+  on that note: no `-2` duplicate, `ingest.done` gains `resumed: true`.
+  Such a note is also found WITHOUT its `ingest.note_written` row - a kill
+  between the note's commit and that row, a crash before the commit, or a
+  failed row insert: every ingest note carries `kahya_source_sha256`,
+  `kahya_lane_reason` and `kahya_lane` in its leading front matter, and the
+  memory server's `FindIngestNotes` (under the repo lock, after the same
+  pending-write recovery boot runs, so a journalled uncommitted note is
+  first committed as kahyad) lists the committed notes under `ingest/` and
+  `<secret_lane_memory_dir>/ingest/` that name the document's SHA-256 (JSONL
+  `ingest_orphan_found {orphan_source: front_matter}`; FIX-FINAL
+  ingest-kill-between-note-commit-and-note-written-duplicates). A
+  normal-lane orphan is superseded by a fresh secret-lane note when the
   retry is secret-lane. Every interrupted note of the document the retry
   does not resume on (that superseded normal-lane orphan, or an older
   duplicate) is retracted BEFORE the note step - memory_forget of the

@@ -11,7 +11,9 @@
 //     resolution never races a nightly run) and an already-ingested
 //     document (same SHA-256, its note still active) is refused; an
 //     INTERRUPTED earlier ingest of it (note committed - ingest.note_written
-//     - but no ingest.done) is resumed on that note at step 5 instead of a
+//     - or, when that row is missing, found by the note's own
+//     kahya_source_sha256 front matter - but no ingest.done) is resumed on
+//     that note at step 5 instead of a
 //     "-2" duplicate, when the note is stored at least as restrictively as
 //     this run's lane asks (FIX-FINAL ingest-retry-after-midpipeline-
 //     failure-duplicates-note); every OTHER interrupted note of the same
@@ -98,7 +100,10 @@ const (
 	// committed (step 5), before its facts and ingest.done: a retry of the
 	// same document after a failure or cancellation between the two
 	// resumes on that note instead of writing a "-2" duplicate (FIX-FINAL
-	// ingest-retry-after-midpipeline-failure-duplicates-note).
+	// ingest-retry-after-midpipeline-failure-duplicates-note). It is not
+	// the only way the note is found: a note with no such row (a kill
+	// before it, a failed insert) is found by its own front matter
+	// (NoteWriter.FindIngestNotes).
 	EventNoteWritten = "ingest.note_written"
 	// EventSuperseded is ledgered for every interrupted note of the
 	// document a retry retracted: {sha256, file, commit_sha (the
@@ -211,10 +216,13 @@ var _ DocReader = (*reader.Runner)(nil)
 // NoteWriter is the memory-repo writer ingest needs - *memory.Server (and
 // kahyad's process-wide memory server adapter) satisfies it. HandleForget
 // (whole file: moved to the memory trash, committed, its episode removed)
-// retracts a superseded interrupted note.
+// retracts a superseded interrupted note; FindIngestNotes finds the notes
+// an earlier ingest of a document wrote by their kahya_source_sha256 front
+// matter (after the pending-write recovery), whatever the ledger says.
 type NoteWriter interface {
 	HandleWriteTiered(ctx context.Context, traceID string, args memory.TieredWriteArgs) (memory.TieredWriteOutput, error)
 	HandleForget(ctx context.Context, traceID string, args memory.MemoryForgetArgs) (memory.MemoryForgetOutput, error)
+	FindIngestNotes(ctx context.Context, traceID, noteDir, digest string) ([]memory.IngestNoteRef, error)
 }
 
 var _ NoteWriter = (*memory.Server)(nil)
@@ -472,6 +480,11 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 				{Key: "kahya_source_ref", Value: req.SourceRef},
 				{Key: "kahya_source_sha256", Value: digest},
 				{Key: "kahya_ingested_at", Value: now.UTC().Format(time.RFC3339)},
+				// why the note's lane is what it is: an orphan found by its
+				// front matter alone (no ingest.note_written row) resumes
+				// with it (FIX-FINAL ingest-kill-between-note-commit-and-
+				// note-written-duplicates)
+				{Key: "kahya_lane_reason", Value: laneReason},
 				{Key: "kahya_lane", Value: lane},
 			},
 		})
@@ -686,9 +699,13 @@ type interruptedIngest struct {
 }
 
 // findInterrupted returns every interrupted ingest of digest whose note is
-// (or, reindexed, becomes) an active episode, newest first (the order of
-// their ingest.note_written rows); none when there is none. A note an
-// ingest.done names is complete, not interrupted.
+// (or, reindexed, becomes) an active episode: first the notes
+// ingest.note_written rows name, newest first, then every other committed
+// note whose own front matter names the digest (NoteWriter.FindIngestNotes
+// - a kill between the note's commit and its row, a crash before the
+// commit, a failed row insert; FIX-FINAL ingest-kill-between-note-commit-
+// and-note-written-duplicates), newest first; none when there is none. A
+// note an ingest.done names is complete, not interrupted.
 func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([]interruptedIngest, error) {
 	rows, err := r.Store.ListEventsByKind(ctx, EventNoteWritten)
 	if err != nil {
@@ -736,6 +753,43 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 			lane = router.LaneSecret
 		}
 		out = append(out, interruptedIngest{File: p.File, CommitSHA: p.CommitSHA, Lane: lane, LaneReason: p.LaneReason, TraceID: rows[i].TraceID, EpisodeID: epID})
+	}
+	notes, err := r.Memory.FindIngestNotes(ctx, traceID, NoteDir, digest)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range notes {
+		if completed[n.File] || seen[n.File] {
+			continue
+		}
+		seen[n.File] = true
+		if n.CommitSHA == "" {
+			// never committed after the recovery: not a note kahyad
+			// finished writing - leave it to the user's own pre-commit
+			r.logWarn(traceID, "ingest_orphan_uncommitted_skipped", "file", n.File)
+			continue
+		}
+		epID, active, err := r.activeEpisode(ctx, traceID, n.File)
+		if err != nil {
+			return nil, err
+		}
+		if !active {
+			continue
+		}
+		lane, laneReason := router.LaneNormal, n.LaneReason
+		if n.Lane == router.LaneSecret || r.Lane.PathIsSecret(n.File) {
+			lane = router.LaneSecret
+		}
+		if laneReason == "" {
+			// a note written before kahya_lane_reason existed: a secret one
+			// is secret by its path under the secret-lane dir
+			laneReason = LaneReasonReader
+			if lane == router.LaneSecret {
+				laneReason = LaneReasonPathGlob
+			}
+		}
+		r.logInfo(traceID, "ingest_orphan_found", "file", n.File, "orphan_source", "front_matter", "lane", lane)
+		out = append(out, interruptedIngest{File: n.File, CommitSHA: n.CommitSHA, Lane: lane, LaneReason: laneReason, EpisodeID: epID})
 	}
 	return out, nil
 }
