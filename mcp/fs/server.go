@@ -521,6 +521,13 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 		s.Log.Warn("fs_read_secret_lane_glob_error", "err", glenErr.Error())
 		secretLane = true
 	}
+	// FIX-FINAL attacker2-fsread-memory-repo-encoded-secret: the git
+	// directory of a work tree that holds a secret-glob directory is
+	// secret-lane by path - its objects are compressed, so the content
+	// half below never sees the notes inside them.
+	if !secretLane && PathInSecretRepoGitDir(s.Home, cp.Match, s.SecretLaneGlobs) {
+		secretLane = true
+	}
 	// W3-10 gate-test fix: the path-glob check above is HANDOFF's
 	// file-path-only rule; this is the SEPARATE, content-based half (see
 	// Server.ContentClassifier's own doc comment) — a path-glob miss does

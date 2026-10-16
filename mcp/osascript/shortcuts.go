@@ -67,7 +67,8 @@ func (r *Runner) RunShortcut(ctx context.Context, traceID, taskID string, in Sho
 	// secret-lane file is a path hit for the output gate.
 	inputSecret := false
 	if canonInputPath != "" && len(r.SecretLaneGlobs) > 0 {
-		if hit, gerr := mcpfs.MatchesAnyGlobCI(canonInputPath, r.SecretLaneGlobs); gerr != nil || hit {
+		if hit, gerr := mcpfs.MatchesAnyGlobCI(canonInputPath, r.SecretLaneGlobs); gerr != nil || hit ||
+			mcpfs.PathInSecretRepoGitDir(r.Home, canonInputPath, r.SecretLaneGlobs) {
 			inputSecret = true
 		}
 	}

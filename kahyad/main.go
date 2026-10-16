@@ -704,8 +704,10 @@ func run() int {
 	// interpreter prefix and the dylibs it links).
 	denyGlobs := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
 	log.Info("self_protect_deny_globs", "count", len(denyGlobs)-len(pol.FSWriteDenyGlobs), "policy_count", len(pol.FSWriteDenyGlobs))
-	// FIX-FINAL ingest-raw-copy-outside-secret-globs: fs_read also treats
-	// the raw ingest store as secret-lane by path (wiredFSSecretLaneGlobs).
+	// FIX-FINAL ingest-raw-copy-outside-secret-globs / attacker2-fsread-
+	// memory-repo-encoded-secret: fs_read also treats kahyad's own copies of
+	// secret notes (raw ingest store, the memory repo's .git, .trash,
+	// backups, brain.db) as secret-lane by path (wiredFSSecretLaneGlobs).
 	fsTool := mcpfs.New(home, denyGlobs, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg), filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
 	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
@@ -1855,15 +1857,19 @@ func wiredFSDenyGlobs(policyGlobs []string, cfg config.Config) []string {
 
 // wiredFSSecretLaneGlobs is the secret-lane glob list kahyad hands the
 // file-reading tools: policy.yaml's secret_lane_globs (first, unchanged,
-// never aliased) plus the config-derived raw ingest store globs
-// (config.IngestRawSecretLaneGlobs), so a raw copy of any ingested
-// document - a secret-lane one included - escalates the reading task by
-// path (FIX-FINAL ingest-raw-copy-outside-secret-globs). In deny-all mode
-// (policyGlobs nil) the raw-store globs still apply. memlane,
-// consolidation, ritual and briefing keep pol.SecretLaneGlobs: they only
-// see memory_dir paths, and config.Load refuses a raw dir inside it.
+// never aliased) plus the config-derived globs over every copy of a secret
+// note kahyad itself keeps where no policy glob reaches - the raw ingest
+// store (config.IngestRawSecretLaneGlobs: FIX-FINAL ingest-raw-copy-
+// outside-secret-globs) and the memory repo's git directory, memory_forget's
+// .trash, the backups and brain.db (config.KahyaInternalSecretLaneGlobs:
+// FIX-FINAL attacker2-fsread-memory-repo-encoded-secret) - so reading any of
+// them escalates the reading task by path. In deny-all mode (policyGlobs
+// nil) the derived globs still apply. memlane, consolidation, ritual and
+// briefing keep pol.SecretLaneGlobs: they only see memory_dir notes (the
+// indexer skips the dot dirs, and config.Load refuses a raw dir inside it).
 func wiredFSSecretLaneGlobs(policyGlobs []string, cfg config.Config) []string {
-	return append(append([]string{}, policyGlobs...), cfg.IngestRawSecretLaneGlobs()...)
+	globs := append(append([]string{}, policyGlobs...), cfg.IngestRawSecretLaneGlobs()...)
+	return append(globs, cfg.KahyaInternalSecretLaneGlobs()...)
 }
 
 // hostPortFromURL resolves rawURL's host and port (defaulting to 80/443

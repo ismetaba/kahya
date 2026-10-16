@@ -114,6 +114,38 @@ func PathCoversSecretGlob(home, p string, globs []string) bool {
 	return false
 }
 
+// PathInSecretRepoGitDir reports whether canonical path p lies inside a git
+// directory - a path component named ".git" (APFS-folded) - whose work tree,
+// the directory holding that ".git", is or holds a secret-glob directory
+// (PathCoversSecretGlob). Such a gitdir keeps every secret note of that work
+// tree as zlib-compressed objects and packs the content classifier cannot
+// read, and its index names each note with its blob id (FIX-FINAL
+// attacker2-fsread-memory-repo-encoded-secret), so it is secret-lane by
+// path: ~/Kahya/.git, and equally a clone like ~/Kahya-restore/.git whose
+// memory dir a policy glob covers, which no config-derived glob names. A
+// gitdir kept elsewhere (a .git FILE's target, a bare repository) is only
+// covered by an explicit glob (config.KahyaInternalSecretLaneGlobs for the
+// memory repo). No globs = false.
+func PathInSecretRepoGitDir(home, p string, globs []string) bool {
+	if len(globs) == 0 {
+		return false
+	}
+	parts := strings.Split(p, "/")
+	for i := 1; i < len(parts); i++ {
+		if pathfold.Fold(parts[i]) != ".git" {
+			continue
+		}
+		workTree := strings.Join(parts[:i], "/")
+		if workTree == "" {
+			workTree = "/"
+		}
+		if PathCoversSecretGlob(home, workTree, globs) {
+			return true
+		}
+	}
+	return false
+}
+
 // secretGlobLiteralRoots is the literal (meta-free) leading directory of
 // every absolute glob: "/u/Documents/saglik/**" -> "/u/Documents/saglik",
 // "/u/Kahya/memory/finans*.md" -> "/u/Kahya/memory". "/" roots are

@@ -876,11 +876,61 @@ func pythonVenvDir(argv0 string) string {
 // from config, like SelfProtectDenyGlobs, so a relocated ingest_raw_dir
 // stays covered.
 func (c Config) IngestRawSecretLaneGlobs() []string {
+	return secretLaneCopyGlobs([]string{c.IngestRawDir}, nil)
+}
+
+// KahyaInternalSecretLaneGlobs returns the secret-lane path globs covering
+// the copies of memory notes kahyad itself keeps in a form the
+// deterministic content classifier cannot see through (FIX-FINAL
+// attacker2-fsread-memory-repo-encoded-secret): the memory repository's
+// git directory - KahyaDir/.git/** and, when memory_dir is a repository of
+// its own, MemoryDir/.git/** (zlib-compressed loose objects and packs, and
+// the index, which lists every gizli/** path with its blob id) -,
+// memory_forget's MemoryDir/.trash/** copies (a trashed finans*.md note
+// keeps its bytes under a name no glob covers), the backups (BackupDir/**:
+// VACUUM INTO copies of brain.db) and brain.db itself with its WAL, SHM and
+// rollback journal (chunks.text holds every indexed note). fs_read of any of
+// these returned a secret note's bytes at lane=normal with no sensitive mark.
+// Each path in its as-given and symlink-resolved forms; unset paths are
+// skipped. DataDir as a whole is NOT covered (its tmp/ holds the audio an
+// STT run hands the worker).
+func (c Config) KahyaInternalSecretLaneGlobs() []string {
+	var subtrees []string
+	for _, d := range []string{c.KahyaDir, c.MemoryDir} {
+		if d != "" {
+			subtrees = append(subtrees, filepath.Join(d, ".git"))
+		}
+	}
+	if c.MemoryDir != "" {
+		subtrees = append(subtrees, filepath.Join(c.MemoryDir, ".trash"))
+	}
+	subtrees = append(subtrees, c.BackupDir)
+	var files []string
+	if c.DBPath != "" {
+		files = []string{c.DBPath, c.DBPath + "-wal", c.DBPath + "-shm", c.DBPath + "-journal"}
+	}
+	return secretLaneCopyGlobs(subtrees, files)
+}
+
+// secretLaneCopyGlobs builds de-duplicated secret-lane globs: "<dir>/**"
+// for every subtree and the exact path for every file, each in its
+// as-given and symlink-resolved forms (selfProtectForms; empty and
+// relative paths yield nothing).
+func secretLaneCopyGlobs(subtrees, files []string) []string {
 	var globs []string
-	for _, form := range selfProtectForms(c.IngestRawDir) {
-		g := filepath.Join(form, "**")
+	add := func(g string) {
 		if !slices.Contains(globs, g) {
 			globs = append(globs, g)
+		}
+	}
+	for _, d := range subtrees {
+		for _, form := range selfProtectForms(d) {
+			add(filepath.Join(form, "**"))
+		}
+	}
+	for _, f := range files {
+		for _, form := range selfProtectForms(f) {
+			add(form)
 		}
 	}
 	return globs

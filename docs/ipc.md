@@ -507,7 +507,21 @@ a cloud model, without changing anything in §2-§6 above:
 - **Mid-task escalation at `fs_read` (FIX-B-6).** A NORMAL-lane task whose
   worker reads a file that is secret-lane by path glob OR by content
   (`secretlane.ClassifyDeterministic`, no Qwen) is escalated before a
-  single byte is returned, in this fixed order: `secret_lane_read` ledger
+  single byte is returned. The path half also covers every copy of a
+  secret note kahyad itself keeps in a form the content check cannot see
+  through (FIX-FINAL attacker2-fsread-memory-repo-encoded-secret): the
+  memory repo's git directory (`<kahya_dir>/.git/**` and
+  `<memory_dir>/.git/**` - zlib-compressed objects and packs, and the
+  index that names every `gizli/**` note with its blob id),
+  memory_forget's `<memory_dir>/.trash/**`, the backups
+  (`<backup_dir>/**`) and brain.db with its `-wal`/`-shm`/`-journal`
+  (`config.KahyaInternalSecretLaneGlobs`, appended by
+  `wiredFSSecretLaneGlobs` for fs_read and the tool output gates; the
+  data dir's `tmp/` is not covered), plus any path inside a `.git`
+  directory whose work tree is or holds a secret-glob directory
+  (`mcp/fs.PathInSecretRepoGitDir`: a clone such as `~/Kahya-restore`
+  too); a secret-lane glob that cannot be evaluated counts as a hit. The
+  order is fixed: `secret_lane_read` ledger
   row (`task_id`, `category`), durable sensitive-read mark (FIX-B-7),
   sticky `tasks.lane='secret'` via `mcp/fs.LaneEscalator` →
   `kahyad/internal/server.NewFSLaneEscalator` (ledger
@@ -565,8 +579,9 @@ a cloud model, without changing anything in §2-§6 above:
   stdout+stderr are classified - for `stat` the argv paths and stderr
   instead, its stdout being filesystem metadata whose space-separated
   device/inode pair the card rule read as a Luhn-valid number about one
-  time in ten (FIX-FINAL shell-host-stat-output-false-secret-escalation). The globs are policy.yaml's plus the raw
-  ingest store (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
+  time in ten (FIX-FINAL shell-host-stat-output-false-secret-escalation). The globs are policy.yaml's plus kahyad's
+  own copies - the raw ingest store, the memory repo's `.git`, `.trash`,
+  the backups and brain.db (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
   G02-2) the task is escalated, the output still returned; a hit that
   cannot be marked or escalated returns no output
   (`mcp/fs.MsgSecretLaneOutputRefused`, ledger `secret_lane_read_refused`).

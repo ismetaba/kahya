@@ -269,3 +269,46 @@ func TestSelfProtectDenyGlobsSkipsRelativeAndEmptyPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestKahyaInternalSecretLaneGlobsCoverOwnCopiesInBothForms (FIX-FINAL
+// attacker2-fsread-memory-repo-encoded-secret): the derived secret-lane
+// globs cover the memory repo's .git (at the repo root and at memory_dir),
+// memory_forget's .trash, the backups and brain.db with its side files -
+// as configured and through a symlinked home - and an unset config yields
+// none.
+func TestKahyaInternalSecretLaneGlobsCoverOwnCopiesInBothForms(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-home")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link-home")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	kahya := filepath.Join(link, "Kahya")
+	cfg := Config{
+		KahyaDir: kahya, MemoryDir: filepath.Join(kahya, "memory"), BackupDir: filepath.Join(kahya, "backups"),
+		DataDir: filepath.Join(link, "data"), DBPath: filepath.Join(link, "data", "brain.db"),
+	}
+	globs := cfg.KahyaInternalSecretLaneGlobs()
+	for _, root := range []string{link, mustEvalSymlinks(t, real)} {
+		for _, p := range []string{
+			"Kahya/.git/index", "Kahya/.git/objects/ab/cd", "Kahya/memory/.git/HEAD",
+			"Kahya/memory/.trash/1760000000-finans.md", "Kahya/backups/brain-20261014.db",
+			"data/brain.db", "data/brain.db-wal", "data/brain.db-shm", "data/brain.db-journal",
+		} {
+			if !selfProtectHit(t, globs, filepath.Join(root, p)) {
+				t.Errorf("%s is not covered; globs %v", filepath.Join(root, p), globs)
+			}
+		}
+		for _, p := range []string{"Kahya/memory/inbox/a.md", "data/tmp/rec.wav", "data/logs/kahyad.log", "Kahya/.gitignore"} {
+			if selfProtectHit(t, globs, filepath.Join(root, p)) {
+				t.Errorf("%s must not be secret-lane by path", filepath.Join(root, p))
+			}
+		}
+	}
+	if g := (Config{}).KahyaInternalSecretLaneGlobs(); len(g) != 0 {
+		t.Errorf("an unset config yields globs %v, want none", g)
+	}
+}

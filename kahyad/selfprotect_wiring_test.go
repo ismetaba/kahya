@@ -217,3 +217,50 @@ func TestWiredFSSecretLaneGlobsCoverIngestRawStore(t *testing.T) {
 		}
 	}
 }
+
+// TestWiredFSSecretLaneGlobsCoverKahyaOwnCopies (FIX-FINAL attacker2-
+// fsread-memory-repo-encoded-secret): the memory repo keeps every secret
+// note as compressed git objects and packs (and lists it in the index),
+// memory_forget keeps a trashed note under .trash, and the backups and
+// brain.db hold every indexed chunk - none of them under a policy.yaml
+// glob. The wired fs_read / tool globs cover all of them (also in deny-all
+// mode), and nothing else of the data dir (its tmp/ holds STT audio).
+func TestWiredFSSecretLaneGlobsCoverKahyaOwnCopies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_POLICY_PATH"} {
+		t.Setenv(k, "")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	pol, err := policy.Load(filepath.Join("..", "policy.yaml"))
+	if err != nil {
+		t.Fatalf("policy.Load: %v", err)
+	}
+	covered := []string{
+		filepath.Join(cfg.KahyaDir, ".git", "index"),
+		filepath.Join(cfg.KahyaDir, ".git", "objects", "ab", strings.Repeat("c", 38)),
+		filepath.Join(cfg.KahyaDir, ".git", "objects", "pack", "pack-"+strings.Repeat("d", 40)+".pack"),
+		filepath.Join(cfg.MemoryDir, ".trash", "1760000000-finans.md"),
+		filepath.Join(cfg.BackupDir, "brain-20261014.db"),
+		cfg.DBPath, cfg.DBPath + "-wal", cfg.DBPath + "-shm", cfg.DBPath + "-journal",
+	}
+	for _, p := range covered {
+		if hit, _ := mcpfs.MatchesAnyGlobCI(p, pol.SecretLaneGlobs); hit {
+			t.Fatalf("fixture: %s is already covered by policy.yaml alone", p)
+		}
+		for _, globs := range [][]string{wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg), wiredFSSecretLaneGlobs(nil, cfg)} {
+			if hit, err := mcpfs.MatchesAnyGlobCI(p, globs); err != nil || !hit {
+				t.Errorf("%s is not secret-lane by path (hit=%v err=%v)", p, hit, err)
+			}
+		}
+	}
+	for _, p := range []string{filepath.Join(cfg.TmpDir(), "rec.wav"), filepath.Join(cfg.MemoryDir, "inbox", "a.md")} {
+		if hit, _ := mcpfs.MatchesAnyGlobCI(p, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg)); hit {
+			t.Errorf("%s must not be secret-lane by path", p)
+		}
+	}
+}
