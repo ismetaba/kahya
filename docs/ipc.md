@@ -930,7 +930,17 @@ a cloud model, without changing anything in §2-§6 above:
   confirm, memory_forget-by-heading) first journals a write-ahead intent
   (repo-relative path + sha256 of the exact bytes, durably under
   `<git-dir>/kahya-pending/`; no journal, no write) and removes it once
-  the commit landed or the write was undone. At boot and at the top of
+  the commit landed or the write was undone. The note bytes are written
+  just as durably before the commit: a temp file in that journal directory,
+  fsynced (F_FULLFSYNC), then renamed onto the note (onto the spelling the
+  volume stores) - a new ingest note is linked, never over a file that
+  appeared meanwhile - and the directory fsynced; an undo restores the
+  prior bytes the same way. After a kill, kernel panic or power loss a
+  note therefore holds its prior bytes or exactly the journalled ones,
+  never a torn mix the recovery would drop as "changed" and the nightly
+  pre-commit would take as the user's edit; a temp file left behind is
+  removed by the next recovery (FIX-FINAL
+  intent-journal-torn-write-recovered-as-user-edit). At boot and at the top of
   every nightly author=user pre-commit (inside the repo lock), a
   still-dirty file whose bytes equal its intent's is committed as kahyad
   (`<op> (recovered): <path>`, ledger `memory.write_recovered`, reindexed),

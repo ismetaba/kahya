@@ -19,10 +19,11 @@ func crashAfterWrite(t *testing.T, s *Server, repoRoot, rel string, content []by
 		t.Fatal(err)
 	}
 	resolvedAbs := filepath.Join(resolvedRoot, "memory", rel)
-	if _, err := s.recordWriteIntent(resolvedRoot, resolvedAbs, "memory_write", "trace-crashed", content); err != nil {
+	h, err := s.recordWriteIntent(resolvedRoot, resolvedAbs, "memory_write", "trace-crashed", content)
+	if err != nil {
 		t.Fatalf("recordWriteIntent: %v", err)
 	}
-	if err := writeComposedMemoryFile(abs, content); err != nil {
+	if _, err := writeNoteDurable(h.pendingDir, abs, content, false); err != nil {
 		t.Fatal(err)
 	}
 	return abs

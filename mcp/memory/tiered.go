@@ -126,9 +126,6 @@ func (s *Server) HandleWriteTiered(ctx context.Context, traceID string, args Tie
 	if err != nil {
 		return TieredWriteOutput{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return TieredWriteOutput{}, fmt.Errorf("memory: mkdir %s: %w", filepath.Dir(abs), err)
-	}
 	repoRoot, err := gitRepoRoot(s.MemoryDir)
 	if err != nil {
 		return TieredWriteOutput{}, fmt.Errorf("memory: %w", err)
@@ -144,18 +141,16 @@ func (s *Server) HandleWriteTiered(ctx context.Context, traceID string, args Tie
 	if err != nil {
 		return TieredWriteOutput{}, fmt.Errorf("memory: record write intent: %w", err)
 	}
-	fh, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		s.clearWriteIntent(intent)
-		return TieredWriteOutput{}, fmt.Errorf("memory: create %s: %w", target, err)
-	}
-	_, werr := fh.WriteString(content)
-	if cerr := fh.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr != nil {
-		s.undoWrite(intent, abs, nil, false)
-		return TieredWriteOutput{}, fmt.Errorf("memory: write %s: %w", target, werr)
+	// Linked into place (never over an existing file: a name taken since
+	// freeNoteName fails like O_EXCL did), temp-written and fsynced first
+	// (FIX-FINAL intent-journal-torn-write-recovered-as-user-edit).
+	if placed, err := s.writeIntendedNote(intent, abs, []byte(content), true); err != nil {
+		if placed {
+			s.undoWrite(intent, abs, nil, false)
+		} else {
+			s.clearWriteIntent(intent)
+		}
+		return TieredWriteOutput{}, fmt.Errorf("memory: write %s: %w", target, err)
 	}
 	if args.SecretLane {
 		if landed, err := onDiskRelPath(s.MemoryDir, target); err != nil || landed != target {

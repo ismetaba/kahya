@@ -417,7 +417,7 @@ func (s *Server) HandleWriteForTask(ctx context.Context, traceID, taskID string,
 	if err != nil {
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: record write intent: %w", err)
 	}
-	if err := writeComposedMemoryFile(abs, newContent); err != nil {
+	if _, err := s.writeIntendedNote(intent, abs, newContent, false); err != nil {
 		s.undoWrite(intent, abs, prevContent, hadPrev)
 		return MemoryWriteOutput{}, fmt.Errorf("memory_write: %w", err)
 	}
@@ -519,7 +519,7 @@ func (s *Server) HandleForget(ctx context.Context, traceID string, args MemoryFo
 		if err != nil {
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: record write intent: %w", err)
 		}
-		if err := os.WriteFile(abs, []byte(newContent), 0o600); err != nil {
+		if _, err := s.writeIntendedNote(intent, abs, []byte(newContent), false); err != nil {
 			s.undoWrite(intent, abs, raw, true)
 			return MemoryForgetOutput{}, fmt.Errorf("memory_forget: write %s: %w", relPath, err)
 		}
@@ -744,7 +744,7 @@ func resolveMemoryPath(memoryDir, rel string) (string, error) {
 // (hadPrev), so a caller that must undo the write after a LATER step fails
 // (git add/commit) can restore exactly the prior on-disk state - via
 // restoreMemoryFile - without a second read. The bytes are journalled
-// (recordWriteIntent) before writeComposedMemoryFile writes them.
+// (recordWriteIntent) before writeIntendedNote writes them.
 func composeMemoryFile(abs, content string) (newContent, prevContent []byte, hadPrev bool, err error) {
 	existingRaw, readErr := os.ReadFile(abs)
 	isNew := errors.Is(readErr, os.ErrNotExist)
@@ -759,33 +759,27 @@ func composeMemoryFile(abs, content string) (newContent, prevContent []byte, had
 	return []byte("---\nkahya_source_tier: agent_derived\n---\n" + body), existingRaw, !isNew, nil
 }
 
-// writeComposedMemoryFile writes composeMemoryFile's bytes to abs.
-func writeComposedMemoryFile(abs string, newContent []byte) error {
-	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(abs), err)
-	}
-	if err := os.WriteFile(abs, newContent, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", abs, err)
-	}
-	return nil
-}
-
 // restoreMemoryFile is HandleWrite/HandleForget's best-effort undo for the
 // "file write succeeded, a later git add/commit failed" case (Blocker: a
 // losing git call must never leave bytes on disk that are neither
 // committed, reindexed, nor ledgered). It removes abs if it did not exist
 // before the mutation (hadPrev false), or restores its prior bytes
-// otherwise. Any restore error is only logged - this is best-effort
-// cleanup on a path that is already returning the ORIGINAL git error, and a
-// failed cleanup must never mask or replace that error.
-func restoreMemoryFile(abs string, prevContent []byte, hadPrev bool, log Logger) error {
+// otherwise - as durably as the write itself (writeNoteDurable through the
+// journal directory pendingDir, or the removal followed by a directory
+// fsync), so an undone write never comes back after a power loss. Any
+// restore error is only logged - this is best-effort cleanup on a path that
+// is already returning the ORIGINAL git error, and a failed cleanup must
+// never mask or replace that error.
+func restoreMemoryFile(pendingDir, abs string, prevContent []byte, hadPrev bool, log Logger) error {
 	var restoreErr error
 	if hadPrev {
-		restoreErr = os.WriteFile(abs, prevContent, 0o600)
+		_, restoreErr = writeNoteDurable(pendingDir, abs, prevContent, false)
 	} else {
 		restoreErr = os.Remove(abs)
 		if errors.Is(restoreErr, os.ErrNotExist) {
 			restoreErr = nil
+		} else if restoreErr == nil {
+			restoreErr = syncDir(filepath.Dir(abs))
 		}
 	}
 	if restoreErr != nil {

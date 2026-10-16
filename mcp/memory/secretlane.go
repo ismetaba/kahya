@@ -169,7 +169,7 @@ func (s *Server) secretGlobCovers(relPath string) bool {
 // memoryDir) with every component that already exists on disk replaced by
 // the name its directory entry actually carries; the first missing
 // component and everything after it are kept as given (os.MkdirAll /
-// os.WriteFile create them with exactly those names).
+// writeNoteDurable create them with exactly those names).
 //
 // Why (FIX-U-3 review): macOS APFS is case- and normalisation-insensitive
 // but preserving. When a "Gizli/" directory already exists, writing

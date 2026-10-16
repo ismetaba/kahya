@@ -153,7 +153,7 @@ func (s *Server) HandleConfirm(ctx context.Context, traceID string, args MemoryC
 	if err != nil {
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: record write intent: %w", err)
 	}
-	if err := os.WriteFile(abs, []byte(b.String()), 0o600); err != nil {
+	if _, err := s.writeIntendedNote(intent, abs, []byte(b.String()), false); err != nil {
 		s.undoWrite(intent, abs, raw, true)
 		return MemoryConfirmOutput{}, fmt.Errorf("memory_confirm: write %s: %w", relPath, err)
 	}
