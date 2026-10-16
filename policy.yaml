@@ -101,6 +101,12 @@ tools:
 secret_lane_globs:
   - "~/Kahya/memory/finans*.md"
   - "~/Kahya/memory/gizli/**"
+  # FIX-FINAL adv2-restore-drill-leaves-uncovered-secret-clone: the restore
+  # drill's ~/Kahya-restore clone carries the same secret notes (and is its
+  # scratch daemon's own memory dir); the drill removes it on exit, these
+  # keep a leftover clone secret by path.
+  - "~/Kahya-restore/memory/finans*.md"
+  - "~/Kahya-restore/memory/gizli/**"
   - "~/Documents/saglik/**"
   - "~/Documents/kimlik/**"
 

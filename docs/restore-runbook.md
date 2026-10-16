@@ -30,6 +30,17 @@ Paths referenced (defaults; a `config.yaml` override moves them):
 | control socket | `.../Kahya/kahyad.sock` | `.../Kahya-restore/kahyad-restore.sock` |
 | backups | `~/Kahya/backups/brain-YYYYMMDD.db` | (source of the restore) |
 
+**The scratch profile is ephemeral.** `~/Kahya-restore` is a full clone of
+`~/Kahya`, including the secret-lane `memory/gizli/**` and `finans*.md` notes,
+and `Kahya-restore/brain.db` is a copy of the ledger. The automated drill
+removes both trees on every exit path, whether it passes, fails or is
+interrupted (FIX-FINAL adv2-restore-drill-leaves-uncovered-secret-clone).
+After a manual rehearsal, stop the scratch kahyad and remove them yourself:
+`rm -rf ~/Kahya-restore ~/Library/Application\ Support/Kahya-restore`.
+Until you do, policy.yaml's `secret_lane_globs` also cover
+`~/Kahya-restore/memory/{gizli/**,finans*.md}`, so a leftover clone is still
+secret by path for `fs_read`, `ls`/`stat` and `shell_host`.
+
 ---
 
 ## 1 · Clone the memory repo from the private remote

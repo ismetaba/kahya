@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"kahya/kahyad/internal/config"
+	mcpfs "kahya/mcp/fs"
 )
 
 // repoRoot locates the repository root from this test file's own path
@@ -377,6 +378,61 @@ func TestPolicyFixturesCarryGizliSecretGlob(t *testing.T) {
 	}
 	if len(doc.SecretLaneGlobs) != 0 {
 		t.Errorf("%s: secret_lane_globs = %v, want empty (Gate 3 keeps it empty on purpose)", w3, doc.SecretLaneGlobs)
+	}
+}
+
+// TestRestorePolicyCoversRestoreMemoryDir (FIX-FINAL adv2-restore-drill-
+// leaves-uncovered-secret-clone): the restore drill clones ~/Kahya - its
+// gizli/** and finans*.md notes included - into ~/Kahya-restore, which no
+// secret glob covered: a leftover clone (a killed drill run) was a plaintext
+// copy of the secret notes that fs_read, ls/stat and shell_host treated as
+// an ordinary path. policy.yaml (the restore profile's policy) and
+// policy.dev.yaml now cover the restore profile's own memory dir: its
+// secret-lane dir, its finans*.md family, and so the clone's repo root for
+// shell_host (mcp/fs.PathCoversSecretGlob) - and still not an ordinary note.
+func TestRestorePolicyCoversRestoreMemoryDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("KAHYA_ENV", "restore")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if want := filepath.Join(home, "Kahya-restore", "memory"); cfg.MemoryDir != want {
+		t.Fatalf("restore MemoryDir = %q, want %q (the drill's clone)", cfg.MemoryDir, want)
+	}
+	for _, name := range []string{"policy.yaml", "policy.dev.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			pol, err := Load(filepath.Join(repoRoot(t), name))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", name, err)
+			}
+			covered := func(p string) bool {
+				for _, g := range pol.SecretLaneGlobs {
+					if ok, err := MatchGlob(g, p); err == nil && ok {
+						return true
+					}
+				}
+				return false
+			}
+			for _, p := range []string{
+				filepath.Join(cfg.MemoryDir, filepath.FromSlash(cfg.SecretLaneMemoryDir), "notes", "inbox", "2026-10-15.md"),
+				filepath.Join(cfg.MemoryDir, "finans-2026.md"),
+			} {
+				if !covered(p) {
+					t.Errorf("%s is not covered by %s's secret_lane_globs %v", p, name, pol.SecretLaneGlobs)
+				}
+			}
+			if ordinary := filepath.Join(cfg.MemoryDir, "inbox", "2026-10-15.md"); covered(ordinary) {
+				t.Errorf("an ordinary restore-clone note %s is covered", ordinary)
+			}
+			if !mcpfs.PathCoversSecretGlob(home, filepath.Join(home, "Kahya-restore"), pol.SecretLaneGlobs) {
+				t.Errorf("the ~/Kahya-restore repo root does not hold a secret-glob dir under %s (shell_host git -C would be a path miss)", name)
+			}
+		})
 	}
 }
 

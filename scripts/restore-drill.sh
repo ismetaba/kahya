@@ -41,6 +41,13 @@
 #   - Drill artifacts that contain memory content (the reference <hafiza> block
 #     in reference.json) are written under ~/Kahya/backups/drill/ ONLY -- never
 #     committed to this code repo.
+#   - The scratch profile is EPHEMERAL (FIX-FINAL
+#     adv2-restore-drill-leaves-uncovered-secret-clone): ~/Kahya-restore is a
+#     full clone of ~/Kahya (memory/gizli/** and finans*.md notes included)
+#     and Kahya-restore/brain.db a copy of the ledger, so an EXIT trap
+#     installed before the clone stops the scratch daemon and removes both
+#     trees on every exit path - success, any failed check, an interrupt.
+#     /tmp/kahyad-restore-drill.log stays as the debugging artifact.
 #
 # Exit: nonzero on any failed check.
 set -uo pipefail
@@ -95,6 +102,21 @@ if [ "$RESTORE_APP_SUPPORT" = "$PROD_APP_SUPPORT" ] || \
 fi
 
 fail() { echo "DRILL FAIL: $*" >&2; exit 1; }
+
+# cleanup stops the scratch daemon (if step 5 started it); set -u safe before
+# that. scrub_scratch removes both scratch trees - only ever the guarded
+# scratch paths (the prod-path guard above already exited 3 otherwise), and
+# only after cleanup, so the daemon can neither hold files nor recreate its
+# socket there.
+RESTORE_PID=""
+cleanup() {
+	if [ -n "${RESTORE_PID:-}" ]; then
+		kill "$RESTORE_PID" 2>/dev/null
+		wait "$RESTORE_PID" 2>/dev/null
+		RESTORE_PID=""
+	fi
+}
+scrub_scratch() { rm -rf "$RESTORE_KAHYA" "$RESTORE_APP_SUPPORT"; }
 
 echo "=== W78-05 restore drill (make restore-drill) -- $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
@@ -173,6 +195,9 @@ PYEOF
 echo "    reference: events=$REF_EVENTS episodes=$REF_EPISODES -> $REFERENCE_JSON"
 
 # --- 2. fresh clone of ~/Kahya into the scratch memory repo ------------------
+# From here on every exit path stops the scratch daemon and removes both
+# scratch trees (FIX-FINAL adv2-restore-drill-leaves-uncovered-secret-clone).
+trap 'cleanup; scrub_scratch' EXIT
 echo "==> cloning $PROD_KAHYA -> $RESTORE_KAHYA"
 rm -rf "$RESTORE_KAHYA"
 git clone --quiet "$PROD_KAHYA" "$RESTORE_KAHYA" || fail "git clone $PROD_KAHYA failed"
@@ -203,11 +228,6 @@ fi
 echo "==> booting scratch kahyad (KAHYA_ENV=restore, passive, egress port $RESTORE_EGRESS_PORT)"
 KAHYA_ENV=restore KAHYA_EGRESS_PORT="$RESTORE_EGRESS_PORT" "$KAHYAD_BIN" >/tmp/kahyad-restore-drill.log 2>&1 &
 RESTORE_PID=$!
-cleanup() {
-	kill "$RESTORE_PID" 2>/dev/null
-	wait "$RESTORE_PID" 2>/dev/null
-}
-trap cleanup EXIT
 
 for _ in $(seq 1 50); do
 	if [ -S "$RESTORE_SOCK" ] && curl -s --unix-socket "$RESTORE_SOCK" -o /dev/null -w '%{http_code}' http://x/health 2>/dev/null | grep -q '^200$'; then
@@ -283,9 +303,9 @@ echo "    ledger survives: events $R_EVENTS>=$REF_EVENTS, episodes $R_EPISODES>=
 # FIX-FINAL ops-restore-scratch-pollutes-prod-anchor-remote: a restore
 # profile clears anchor_remote / anchor_local_fallback_path (config.Load), so
 # its forked ledger can never land a checkpoint on prod's anchor remote. Stop
-# it (the graceful-shutdown push included) and prove nothing was pushed.
+# it (the graceful-shutdown push included) and prove nothing was pushed. The
+# EXIT trap still removes the scratch trees afterwards.
 cleanup
-trap - EXIT
 if grep -q -e '"anchor_pushed"' -e 'anchor_local_fallback_written' /tmp/kahyad-restore-drill.log; then
 	fail "the scratch kahyad anchored its forked ledger (see /tmp/kahyad-restore-drill.log) -- prod's anchor remote may now hold a diverged checkpoint"
 fi
