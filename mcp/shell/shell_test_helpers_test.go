@@ -198,6 +198,10 @@ type fakeExecutor struct {
 	gitConfigList    *Result
 	gitConfigListErr error
 
+	// hostResult, if set, answers shell_host's ls/stat calls (nil => an
+	// empty successful result).
+	hostResult *Result
+
 	// lastEnv is the env of the most recent RunEnv call (nil for Run).
 	lastEnv []string
 }
@@ -234,6 +238,9 @@ func (f *fakeExecutor) RunEnv(ctx context.Context, name string, args []string, s
 		return res, err
 	}
 
+	if (name == "ls" || name == "stat") && f.hostResult != nil {
+		return *f.hostResult, nil
+	}
 	if len(args) == 0 {
 		return Result{}, nil
 	}

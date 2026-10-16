@@ -183,3 +183,53 @@ func TestShellHostLsOfSecretPathEscalates(t *testing.T) {
 		t.Fatalf("escalations = %d, want 1 for an ls under the secret glob", esc.count())
 	}
 }
+
+// TestShellHostLsStdoutIsPathCheckedNotContentClassified (FIX-FINAL
+// adv2-ls-epoch-names-false-escalation, orchestrator decision): ls and stat
+// are metadata-only. ls stdout (entry names) is never content-classified -
+// a name the content rule would flag (an epoch-millisecond number) does not
+// escalate - but every listed name, joined with its directory, is matched
+// against the secret globs: a name from stdout (the receipt-replay path
+// returns stored stdout) and a name only the directory itself shows whole
+// (a newline inside it splits the stdout line) both escalate. stderr and
+// the argv paths stay content-classified.
+func TestShellHostLsStdoutIsPathCheckedNotContentClassified(t *testing.T) {
+	home, _ := repoFixture(t)
+	mem := filepath.Join(home, "Kahya", "memory")
+	foto := filepath.Join(home, "foto")
+	odd := filepath.Join(home, "odd")
+	for _, d := range []string{mem, foto, odd} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(odd, "finans\nx.md"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name           string
+		target         string
+		stdout, stderr string
+		wantEscalation bool
+	}{
+		{"epoch name in stdout", foto, "1760000063352.jpg\n", "", false},
+		{"content hit in stderr", foto, "", "ls: 1760000063352: x\n", true},
+		{"secret-glob name in stdout", mem, "finans-2026.md\ninbox\n", "", true},
+		{"newline-split name only the directory shows", odd, "finans\nx.md\n", "", true},
+		{"ordinary listing", mem, "inbox\nnotlar.md\n", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			esc := &gateEscalator{}
+			h := newTestHostExec(home, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, newFakeLogger(),
+				&fakeExecutor{hostResult: &Result{Stdout: []byte(tc.stdout), Stderr: []byte(tc.stderr)}})
+			h.SecretLaneGlobs = []string{filepath.Join(mem, "finans*.md"), filepath.Join(odd, "finans*.md")}
+			h.OutputGate = mcpfs.OutputGate{Classifier: substringClassifier{"1760000063352"}, Escalator: esc}
+			if _, err := h.Handle(context.Background(), "tr", "task-1", HostExecArgs{Command: "ls", Args: []string{tc.target}}); err != nil {
+				t.Fatal(err)
+			}
+			if got := esc.count() == 1; got != tc.wantEscalation {
+				t.Fatalf("escalations = %d, want escalation=%v", esc.count(), tc.wantEscalation)
+			}
+		})
+	}
+}

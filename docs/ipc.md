@@ -581,10 +581,19 @@ a cloud model, without changing anything in §2-§6 above:
   `shell_docker` workdir under or holding one (escalated BEFORE the
   container runs, so a `needs_network` run's egress is already
   sensitive-marked), a `shortcuts_run --input-path` under one; otherwise
-  stdout+stderr are classified - for `stat` the argv paths and stderr
-  instead, its stdout being filesystem metadata whose space-separated
-  device/inode pair the card rule read as a Luhn-valid number about one
-  time in ten (FIX-FINAL shell-host-stat-output-false-secret-escalation). The globs are policy.yaml's plus kahyad's
+  stdout+stderr are classified - for the metadata-only `stat` and `ls` the
+  argv paths and stderr instead: stat's stdout is filesystem metadata whose
+  space-separated device/inode pair the card rule read as a Luhn-valid
+  number about one time in ten (FIX-FINAL
+  shell-host-stat-output-false-secret-escalation), and ls's is entry names,
+  where ordinary epoch-millisecond names (`1760000063352.jpg`) pass the
+  card rule about one time in nine (FIX-FINAL
+  adv2-ls-epoch-names-false-escalation, orchestrator decision). Every name
+  `ls` lists - each stdout line and each entry the directory holds -
+  is PATH-checked instead: joined with its directory and matched against
+  the secret globs (a listed `finans*.md` note or secret-glob directory
+  escalates); a lexicon word in a listed name outside every glob no longer
+  does. git keeps content classification. The globs are policy.yaml's plus kahyad's
   own copies - the raw ingest store, the memory repo's `.git`, `.trash`,
   the backups and brain.db (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
   G02-2) the task is escalated, the output still returned; a hit that

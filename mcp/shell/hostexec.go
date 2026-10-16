@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -315,26 +316,79 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 // gateOutput runs the secret-lane output gate (FIX-FINAL
 // tool-output-secret-lane-unclassified) for one shell_host result.
 //
-// `stat` is the one exception to classifying stdout (FIX-FINAL
-// shell-host-stat-output-false-secret-escalation): its stdout is
-// filesystem-generated metadata (device, inode, mode, links, owner,
-// group, rdev, size, the four dates, blksize, blocks, flags) plus %N,
-// which is exactly the argv path validate built. macOS prints device and
-// inode separated by one space ("16777232 9083813"), which the card-number
-// rule joins into a 15-16 digit candidate that passes Luhn about one time
-// in ten - so ~10% of plain `stat` calls escalated an ordinary coding
-// task. For stat the classified texts are therefore the argv paths (every
-// non-metadata byte stat can echo) and stderr; the path half of the gate
-// (pathHit) is unchanged.
+// `ls` and `stat` are metadata-only commands, and their stdout is never
+// content-classified (FIX-FINAL shell-host-stat-output-false-secret-
+// escalation for stat; FIX-FINAL adv2-ls-epoch-names-false-escalation for
+// ls, orchestrator decision). stat's stdout is filesystem-generated
+// metadata plus %N (the argv path): macOS prints device and inode separated
+// by one space ("16777232 9083813"), which the card-number rule joined into
+// a Luhn-passing candidate about one time in ten. ls's stdout is directory
+// entry names, and ordinary epoch-millisecond names (1760000063352.jpg,
+// TypeORM's 1697040000000-CreateUsers.ts) pass the card rule plus Luhn
+// about one time in nine - so an ls of a photo or migrations directory
+// escalated a normal coding task and the proxy backstop then refused its
+// next cloud call. For both, the classified texts are the argv paths
+// (every byte the model itself named) and stderr; the names ls lists are
+// PATH-checked instead (listedNameHit: each name joined with its directory
+// against the secret globs, the rule HANDOFF gives paths), on top of the
+// unchanged target check (pathHit). The cost, accepted by the orchestrator
+// decision: a lexicon word in a listed name outside every secret glob (a
+// "tahlil sonuclari.pdf" in ~/Downloads) no longer escalates the task.
+// Content-returning commands (git show / log -p / diff / status) keep
+// content classification.
 func (h *HostExec) gateOutput(ctx context.Context, traceID, taskID string, plan hostExecPlan, out HostExecOutput) error {
 	texts := []string{out.Stdout, out.Stderr}
-	if len(plan.argv) > 0 && plan.argv[0] == "stat" {
+	pathHit := h.pathHit(plan)
+	if len(plan.argv) > 0 && (plan.argv[0] == "stat" || plan.argv[0] == "ls") {
 		texts = append(append([]string(nil), plan.argv[1:]...), out.Stderr)
+		if !pathHit && plan.argv[0] == "ls" {
+			pathHit = h.listedNameHit(plan, out.Stdout)
+		}
 	}
-	_, err := h.OutputGate.Check(ctx, traceID, taskID, "shell_host", h.pathHit(plan),
+	_, err := h.OutputGate.Check(ctx, traceID, taskID, "shell_host", pathHit,
 		func(kind string, payload map[string]any) { logAndLedger(ctx, h.Ledger, h.Log, traceID, kind, payload) },
 		texts...)
 	return err
+}
+
+// listedNameHit reports whether an ls of plan's targets listed a name that
+// is secret-lane by path: for every target that is a directory, each line
+// of stdout (the bytes returned - on the receipt-replay path the stored
+// ones) and each entry the directory holds now (os.ReadDir, so a name with
+// a newline that splits its stdout line is still checked whole) is joined
+// with the target and matched against the secret globs (MatchesAnyGlobCI;
+// a glob error is a hit). A listed secret-glob directory counts too
+// ("<dir>/**" matches the directory itself). A directory that cannot be
+// read adds no names beyond stdout's.
+func (h *HostExec) listedNameHit(plan hostExecPlan, stdout string) bool {
+	if len(h.SecretLaneGlobs) == 0 {
+		return false
+	}
+	lines := strings.Split(stdout, "\n")
+	for i, target := range plan.paths {
+		if i+1 >= len(plan.argv) {
+			break
+		}
+		fi, err := os.Stat(plan.argv[i+1])
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		names := append([]string(nil), lines...)
+		if entries, rerr := os.ReadDir(plan.argv[i+1]); rerr == nil {
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			if hit, err := mcpfs.MatchesAnyGlobCI(filepath.Join(target, name), h.SecretLaneGlobs); err != nil || hit {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pathHit reports whether the validated command reads below a secret-lane
@@ -428,8 +482,9 @@ type hostExecPlan struct {
 	// (inherited, unchanged behavior) for ls/stat, which run no config.
 	env []string
 	// gitArgs are git's trailing arguments after the subcommand, and paths
-	// ls/stat's canonical targets in Match form - the secret-lane output
-	// gate's path inputs (FIX-FINAL tool-output-secret-lane-unclassified).
+	// ls/stat's canonical targets in Match form (paths[i] is argv[i+1]'s
+	// Match twin) - the secret-lane output gate's path inputs (FIX-FINAL
+	// tool-output-secret-lane-unclassified).
 	gitArgs []string
 	paths   []string
 }

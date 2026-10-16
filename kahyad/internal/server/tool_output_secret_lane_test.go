@@ -374,3 +374,101 @@ func TestShellHostStatSecretPathOrNameStillEscalates(t *testing.T) {
 		}
 	}
 }
+
+// TestShellHostLsEpochNamesNeverEscalate (FIX-FINAL adv2-ls-epoch-names-
+// false-escalation): ls stdout is directory entry names, and ordinary
+// epoch-millisecond names (1760000063352.jpg) pass the card rule plus Luhn
+// about one time in nine, so an ls of a photo or migrations directory
+// escalated a normal coding task and the proxy backstop then refused its
+// next cloud call. The fixture keeps adding such names until the RAW ls
+// stdout classifies secret (red on the old gate), then lists the directory
+// through the production gate: the task stays normal and unmarked.
+func TestShellHostLsEpochNamesNeverEscalate(t *testing.T) {
+	home, st, pc, tracker, gate := shellHostSecretFixture(t)
+	dir := filepath.Join(home, "Documents", "foto")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tripped := false
+	for ms := int64(1760000000000); ms < 1760000000000+400 && !tripped; ms++ {
+		name := fmt.Sprintf("%d.jpg", ms)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tripped = secretlane.ClassifyDeterministic(name).SecretLane
+	}
+	if !tripped {
+		t.Fatal("no epoch-millisecond name trips the card rule; the fixture exercises nothing")
+	}
+	raw, err := exec.Command("ls", dir).Output()
+	if err != nil || !secretlane.ClassifyDeterministic(string(raw)).SecretLane {
+		t.Fatalf("precondition: the raw ls stdout must classify secret (err %v)", err)
+	}
+	host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+	host.SecretLaneGlobs = []string{filepath.Join(home, "Documents", "saglik", "**")}
+	host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+	out, err := host.Handle(context.Background(), "trace-sh", "task-sh", mcpshell.HostExecArgs{Command: "ls", Args: []string{"~/Documents/foto"}})
+	if err != nil || out.ExitCode != 0 || !strings.Contains(out.Stdout, "1760000000000.jpg") {
+		t.Fatalf("ls: %+v %v", out, err)
+	}
+	if lane, _ := taskLane(t, st, "task-sh"); lane != "normal" {
+		t.Errorf("ls of epoch-named files escalated the task to %q", lane)
+	}
+	if marked, _ := tracker.IsMarkedCtx(context.Background(), "trace-sh"); marked {
+		t.Error("ls of epoch-named files marked the session sensitive")
+	}
+}
+
+// TestShellHostLsListedSecretNameEscalates: ls stdout is path-checked
+// instead - every listed name joined with its directory is matched against
+// the secret globs, so a listing that names a secret-glob file (a
+// finans*.md note in the memory dir) or a secret-glob directory still
+// escalates; an ls target under a glob and a lexicon word in an argv path
+// still do too.
+func TestShellHostLsListedSecretNameEscalates(t *testing.T) {
+	home, st, pc, tracker, gate := shellHostSecretFixture(t)
+	// The globs name the canonical (symlink-resolved) home, as policy.Load's
+	// ~-expansion of the real home does; ls targets canonicalize the same way.
+	home, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := filepath.Join(home, "Kahya", "memory")
+	for _, p := range []string{filepath.Join(mem, "finans-2026.md"), filepath.Join(mem, "inbox", "a.md")} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	named := filepath.Join(home, "Documents", "kan tahlili")
+	if err := os.MkdirAll(named, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	globs := []string{filepath.Join(mem, "finans*.md"), filepath.Join(home, "Documents", "saglik", "**")}
+	for i, tc := range []struct {
+		target string
+		secret bool
+	}{
+		{"~/Kahya/memory", true},          // lists finans-2026.md
+		{"~/Documents", true},             // lists the saglik directory itself
+		{"~/Documents/saglik", true},      // target under the glob
+		{"~/Documents/kan tahlili", true}, // lexicon word in the argv path
+		{"~/Kahya/memory/inbox", false},
+	} {
+		taskID, traceID := fmt.Sprintf("task-ls-%d", i), fmt.Sprintf("trace-ls-%d", i)
+		insertLaneTask(t, st, taskID, traceID, "normal")
+		host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+		host.SecretLaneGlobs = globs
+		host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+		if _, err := host.Handle(context.Background(), traceID, taskID, mcpshell.HostExecArgs{Command: "ls", Args: []string{tc.target}}); err != nil {
+			t.Fatalf("ls %s: %v", tc.target, err)
+		}
+		lane, _ := taskLane(t, st, taskID)
+		marked, _ := tracker.IsMarkedCtx(context.Background(), traceID)
+		if tc.secret != (lane == "secret") || tc.secret != marked {
+			t.Errorf("ls %s: lane=%q marked=%v, want secret=%v", tc.target, lane, marked, tc.secret)
+		}
+	}
+}
