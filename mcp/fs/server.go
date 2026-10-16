@@ -1162,6 +1162,8 @@ func rootReadFileConfined(ancestorDir, rel string) ([]byte, error) {
 // checkpoints it via `git hash-object -w` (no working-tree/index side
 // effects); otherwise (or on any git failure) falls back to copying the
 // pre-image under s.UndoDir/<task_id>/<op_id> (B-8: per operation). A
+// secret-lane pre-image (secretLanePreImage) always takes the copy, never
+// the git object store. A
 // target that did not exist before this write (HadPrev false) needs
 // neither: its "pre-image" is simply "absent", and undo_write's own
 // HadPrev-false branch knows to remove (to Trash) the file this write
@@ -1188,7 +1190,9 @@ func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID, opID stri
 	}
 
 	if repoRoot, ok := gitRepoRootFor(filepath.Dir(cp.Op)); ok {
-		if sha, gitErr := gitHashObjectW(repoRoot, cp.Op); gitErr == nil {
+		if reason := s.secretLanePreImage(cp, data); reason != "" {
+			s.Log.With(traceID).Info("fs_write_git_checkpoint_skipped", "path", cp.Match, "reason", reason)
+		} else if sha, gitErr := gitHashObjectW(repoRoot, cp.Op); gitErr == nil {
 			rec.GitRepoRoot, rec.GitBlobSHA = repoRoot, sha
 			return rec, nil
 		} else {
@@ -1202,6 +1206,40 @@ func (s *Server) checkpointPreImage(cp CanonicalPath, taskID, traceID, opID stri
 	}
 	rec.CopyPath = copyPath
 	return rec, nil
+}
+
+// secretLanePreImage reports why the pre-image of cp (data) must not be
+// checkpointed into a git object store, or "" when it may be (FIX-FINAL
+// fs-undo-copy-and-trash-escape-secret-path-glob, review round 1). A blob
+// written by `git hash-object -w` is a zlib-compressed copy the content
+// classifier cannot read, at <gitdir>/objects/<sha> - a path no secret glob
+// covers whenever the gitdir lives outside the work tree (--separate-git-
+// dir, a .git file) or the glob has a wildcard directory (~/code/*/.env), so
+// fs_read of it would return the secret file's bytes at lane=normal. Such a
+// pre-image goes to the UndoDir copy instead, which is secret-lane by path
+// (inCopyStore here, config.FSUndoSecretLaneGlobs in kahyad). Secret-lane
+// means what fs_read would decide for the file itself: a secret glob hit
+// (a glob error counts, fail-closed), a secret repo's git directory, one of
+// this package's copy stores, or - when a ContentClassifier is wired -
+// secret-lane content.
+func (s *Server) secretLanePreImage(cp CanonicalPath, data []byte) string {
+	if hit, err := MatchesAnyGlobCI(cp.Match, s.SecretLaneGlobs); err != nil {
+		return "secret_lane_glob_error"
+	} else if hit {
+		return "secret_lane_glob"
+	}
+	if PathInSecretRepoGitDir(s.Home, cp.Match, s.SecretLaneGlobs) {
+		return "secret_repo_git_dir"
+	}
+	if s.inCopyStore(cp.Match) {
+		return "copy_store"
+	}
+	if s.ContentClassifier != nil {
+		if secret, _ := s.ContentClassifier.ClassifySecretLane(string(data)); secret {
+			return "secret_lane_content"
+		}
+	}
+	return ""
 }
 
 // copyPreImage writes the non-git fallback pre-image copy to

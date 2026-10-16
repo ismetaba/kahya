@@ -521,7 +521,10 @@ a cloud model, without changing anything in §2-§6 above:
   directory whose work tree is or holds a secret-glob directory
   (`mcp/fs.PathInSecretRepoGitDir`: a clone such as `~/Kahya-restore`
   too), plus fs_write's undo pre-image copies (`<data_dir>/undo/**`, the
-  op id comes back in the tool result) and the Trash fs_delete moves files
+  op id comes back in the tool result; a secret-lane pre-image - by path
+  or content - always goes there, never into a work tree's git object
+  store, whose compressed blob under an out-of-tree gitdir or a
+  wildcard-directory glob no secret glob covers) and the Trash fs_delete moves files
   to (`~/.Trash/**`, the whole Trash - a task reading from it is
   escalated; `config.FSUndoSecretLaneGlobs`, and in mcp/fs itself
   whatever is wired; FIX-FINAL fs-undo-copy-and-trash-escape-secret-
@@ -2135,7 +2138,8 @@ first boot). `{}` disables it.
   the trace newest-first (`--last` = newest only), demotes each
   `(tool, scope)` once per call, and runs each op's recipe in that LIFO
   order (`mcp/fs.Server.UndoOp`, records keyed by `op_id`, pre-image copies
-  at `undo/<task_id>/<op_id>` - secret-lane by path, and removed by the
+  at `undo/<task_id>/<op_id>` - secret-lane by path, the only checkpoint a
+  secret-lane pre-image gets (`fs_write_git_checkpoint_skipped`), and removed by the
   window's expiry even when a kahyad restart lost the in-memory record,
   FIX-FINAL fs-undo-copy-and-trash-escape-secret-path-glob); the response and the CLI report one line
   per op — `executed | failed | no_record | unsupported` — and the CLI
