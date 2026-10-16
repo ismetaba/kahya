@@ -550,7 +550,13 @@ a cloud model, without changing anything in §2-§6 above:
   secret-glob directory (its history carries the notes - `git -C ~/Kahya
   log -p`, and equally `-C ~/Kahya/memory/inbox`, `-C ~/Kahya/backups` or
   `-C ~/Kahya/.git`; a resolution error or an alternate object store is a
-  hit), a git path argument (a `<rev>:` prefix stripped, checked against
+  hit; a repository whose config, in any scope, names another work tree
+  through `core.worktree` is refused before git runs - git honours it even
+  for a gitdir planted outside any `.git` and discovered as bare, which
+  would let `git diff` print `~/Kahya`'s work tree while every path check
+  saw only the planted directory, FIX-FINAL
+  shell-host-core-worktree-redirect; a submodule's own work tree is
+  refused with it), a git path argument (a `<rev>:` prefix stripped, checked against
   the `-C` dir and every resolved root since `<rev>:<path>` is
   toplevel-relative) or an `ls`/`stat` target under a secret glob, a
   `shell_docker` workdir under or holding one (escalated BEFORE the

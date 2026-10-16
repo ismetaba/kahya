@@ -231,6 +231,69 @@ func TestShellHostRepoIdentityEscalatesLane(t *testing.T) {
 	}
 }
 
+// TestShellHostCoreWorktreeRedirectRefused (FIX-FINAL shell-host-core-
+// worktree-redirect): a small gitdir a worker can plant with fs_write
+// outside **/.git/** and ~/Kahya/** (HEAD, refs, objects, index and a
+// config with core.bare=false + core.worktree=~/Kahya) made `git -C
+// ~/code/y/gd diff HEAD` diff that gitdir's tree against ~/Kahya's REAL work
+// tree and print the gizli note at lane=normal - gitRepoRoots resolved only
+// the planted directory. The repo-config scan now refuses core.worktree in
+// any scope before git runs: no output, a hostexec_denied row naming the
+// key, the task untouched.
+func TestShellHostCoreWorktreeRedirectRefused(t *testing.T) {
+	_, st, pc, tracker, gate := shellHostSecretFixture(t)
+	home, globs := kahyaRepoFixture(t)
+	gd := filepath.Join(home, "code", "y", "gd")
+	stage := filepath.Join(home, "code", "stage")
+	if err := os.MkdirAll(filepath.Join(stage, "memory", "gizli"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "memory", "gizli", "not.md"), []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	// The bytes a worker could fs_write under ~/code/y/gd; git only builds them.
+	git("init", "-q", "--bare", gd)
+	git("--git-dir="+gd, "--work-tree="+stage, "add", ".")
+	git("--git-dir="+gd, "--work-tree="+stage, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+	git("--git-dir="+gd, "config", "core.bare", "false")
+	git("--git-dir="+gd, "config", "core.worktree", filepath.Join(home, "Kahya"))
+	if err := os.RemoveAll(stage); err != nil {
+		t.Fatal(err)
+	}
+	git("--git-dir="+gd, "read-tree", "HEAD")
+	if out, _ := exec.Command("git", "-C", gd, "diff", "HEAD").CombinedOutput(); !strings.Contains(string(out), "Annemin randevu takvimi") {
+		t.Fatalf("control: plain git does not read ~/Kahya's work tree through the plant: %q", out)
+	}
+
+	host := mcpshell.NewHostExec(home, pc, st, NewFSLogger(testLogger(t)), nil)
+	host.SecretLaneGlobs = globs
+	host.OutputGate = NewToolOutputGate(st.Queries, st, gate, LaneSourceShellHost)
+	out, err := host.Handle(context.Background(), "trace-sh", "task-sh", mcpshell.HostExecArgs{
+		Command: "git", RepoPath: "~/code/y/gd", Args: []string{"diff", "HEAD"},
+	})
+	if err == nil || strings.Contains(out.Stdout, "Annemin randevu takvimi") {
+		t.Fatalf("shell_host ran git through a core.worktree redirect: err=%v stdout=%q", err, out.Stdout)
+	}
+	if n := countEventsWhere(t, st, "hostexec_denied", "json_extract(payload, '$.reason') = ?", "dangerous_git_config:core.worktree"); n != 1 {
+		t.Fatalf("hostexec_denied rows with reason dangerous_git_config:core.worktree = %d, want 1", n)
+	}
+	if n := countEventsOfKind(t, st, "hostexec_exec"); n != 0 {
+		t.Fatalf("hostexec_exec rows = %d, want 0 (git must never run)", n)
+	}
+	if lane, _ := taskLane(t, st, "task-sh"); lane != "normal" {
+		t.Errorf("task lane = %q, want normal (nothing was returned)", lane)
+	}
+	if marked, _ := tracker.IsMarkedCtx(context.Background(), "trace-sh"); marked {
+		t.Error("a refused call marked the session sensitive")
+	}
+}
+
 // TestShellHostStatMetadataNeverEscalates (FIX-FINAL shell-host-stat-
 // output-false-secret-escalation): macOS `stat` prints device and inode
 // separated by one space, which the card-number rule joins into a Luhn-

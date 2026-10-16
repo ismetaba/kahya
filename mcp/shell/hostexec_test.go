@@ -508,6 +508,7 @@ func TestDangerousGitConfigRe(t *testing.T) {
 	dangerous := []string{
 		"core.fsmonitor", "core.fsmonitorhookversion", "core.hookspath", "core.pager", "core.sshcommand",
 		"core.editor", "core.askpass", "core.alternaterefscommand", "core.gitproxy",
+		"core.worktree", "CORE.WORKTREE",
 		"diff.external", "diff.tc.textconv", "diff.tc.command", "diff.a.b.textconv",
 		"filter.ev.clean", "filter.ev.smudge", "filter.ev.process", "filter.a.b.clean", "FILTER.EV.CLEAN",
 		"gpg.program", "gpg.ssh.program", "gpg.x509.program", "credential.helper", "credential.https://h.helper",

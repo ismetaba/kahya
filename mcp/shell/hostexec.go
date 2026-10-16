@@ -26,7 +26,9 @@
 // refused outright when the repo's own config (every scope git reads:
 // .git/config, config.worktree, included files) holds a program-running
 // key (gitRepoConfigSafe) — filter.<d>.clean runs even under
-// --no-ext-diff --no-textconv, so no flag can neutralize it.
+// --no-ext-diff --no-textconv, so no flag can neutralize it — or names
+// another work tree (core.worktree), which no path check of the -C
+// directory would see.
 package shell
 
 import (
@@ -110,17 +112,31 @@ const gitNoSubmoduleRecursionFlag = "--ignore-submodules=all"
 func gitScrubbedEnv() []string { return gitsafe.Env() }
 
 // dangerousGitConfigRe matches every repo config key (any scope git reads:
-// local, worktree, included files) that makes git run a program, or that
-// points git at another config file. Keys come from a program-free
-// `git config -z --list --show-scope` read; a match => deny (the -c
-// neutralizers cannot override filter.<d>.*). Subsection names may contain
-// dots ([filter "a.b"] => filter.a.b.clean), so the subsection part is `.+`,
-// never `[^.]+`. pager.<cmd> and core.pager never run here (git output is a
-// pipe, not a TTY) and are denied anyway: a clean repo config never needs
-// them. Matching is case-insensitive (git lowercases section/key names, not
+// local, worktree, included files) that makes git run a program, that
+// points git at another config file, or that points git at another WORK
+// TREE. Keys come from a program-free `git config -z --list --show-scope`
+// read; a match => deny (the -c neutralizers cannot override
+// filter.<d>.*). Subsection names may contain dots ([filter "a.b"] =>
+// filter.a.b.clean), so the subsection part is `.+`, never `[^.]+`.
+// pager.<cmd> and core.pager never run here (git output is a pipe, not a
+// TTY) and are denied anyway: a clean repo config never needs them.
+// Matching is case-insensitive (git lowercases section/key names, not
 // subsections).
+//
+// core.worktree (FIX-FINAL shell-host-core-worktree-redirect): git honours
+// it for a normal .git/config and for a gitdir it discovers as a bare
+// repository alike (setup_bare_git_dir -> setup_explicit_git_dir), so a
+// small gitdir planted with fs_write outside **/.git/** and ~/Kahya/**
+// (HEAD, refs, objects, index, `core.bare=false`, `core.worktree=~/Kahya`)
+// made `git -C <that dir> diff HEAD` print ~/Kahya's real work-tree bytes
+// - gizli/** notes included - while pathHit only ever saw the planted
+// directory. git's own parser decides what the key says, so refusing the
+// key outright cannot be fooled by config syntax. The accepted cost: a
+// submodule's gitdir (.git/modules/<n>/config) carries core.worktree, so
+// shell_host git run inside a submodule work tree is refused too; running
+// it from the superproject still works (fail-closed).
 var dangerousGitConfigRe = regexp.MustCompile(`(?i)^(` +
-	`core\.(fsmonitor|hookspath|pager|sshcommand|editor|askpass|alternaterefscommand|gitproxy)|` +
+	`core\.(fsmonitor|hookspath|pager|sshcommand|editor|askpass|alternaterefscommand|gitproxy|worktree)|` +
 	`diff\.external|diff\..+\.(command|textconv)|` +
 	`filter\..+\.(clean|smudge|process)|` +
 	`gpg\.(.+\.)?program|credential\.(.+\.)?helper|` +

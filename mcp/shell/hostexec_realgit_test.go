@@ -522,3 +522,107 @@ func TestGitScrubbedEnvBlocksLazyFetchProgram(t *testing.T) {
 	}
 	assertMarkerAbsent(t, marker, "hardened git show in a partial clone")
 }
+
+// TestHandle_GitRealCoreWorktreeRedirectRefused (FIX-FINAL
+// shell-host-core-worktree-redirect): a gitdir that names ANOTHER work
+// tree through core.worktree made shell_host's `git diff` print that work
+// tree's bytes while every path check only ever saw the gitdir. Three
+// plants are refused before git runs - a small gitdir planted outside any
+// .git directory (git discovers it as a bare repository and still honours
+// core.worktree), a normal repo's .git/config, and the per-worktree
+// config.worktree - each with reason dangerous_git_config:core.worktree.
+// The control proves every plant really redirects plain git.
+func TestHandle_GitRealCoreWorktreeRedirectRefused(t *testing.T) {
+	requireRealGit(t)
+	clearInheritedGitEnv(t)
+	const secret = "gizli-satir-worktree-redirect"
+
+	cases := []struct {
+		name  string
+		plant func(t *testing.T, home, target string) (repoPath string)
+		args  []string
+	}{
+		{"bare-discovered gitdir outside .git", func(t *testing.T, home, target string) string {
+			gd := filepath.Join(home, "code", "y", "gd")
+			stage := filepath.Join(home, "code", "stage")
+			if err := os.MkdirAll(stage, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(stage, "note.md"), []byte("old\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fixtureGit(t, filepath.Join(home, "code"), "init", "-q", "--bare", gd)
+			fixtureGit(t, stage, "--git-dir="+gd, "--work-tree="+stage, "add", "note.md")
+			fixtureGit(t, stage, "--git-dir="+gd, "--work-tree="+stage, "commit", "-q", "-m", "x")
+			fixtureGit(t, stage, "--git-dir="+gd, "config", "core.bare", "false")
+			fixtureGit(t, stage, "--git-dir="+gd, "config", "core.worktree", target)
+			fixtureGit(t, stage, "--git-dir="+gd, "read-tree", "HEAD")
+			return gd
+		}, []string{"diff", "HEAD"}},
+		{"normal repo .git/config", func(t *testing.T, home, target string) string {
+			_, repo := realGitRepo(t)
+			own := filepath.Join(home, "code", "own")
+			if err := os.Rename(repo, own); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(own, "note.md"), []byte("old\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fixtureGit(t, own, "add", "note.md")
+			fixtureGit(t, own, "commit", "-q", "-m", "note")
+			fixtureGit(t, own, "config", "core.worktree", target)
+			return own
+		}, []string{"diff"}},
+		{"per-worktree config.worktree", func(t *testing.T, home, target string) string {
+			_, repo := realGitRepo(t)
+			own := filepath.Join(home, "code", "wtcfg")
+			if err := os.Rename(repo, own); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(own, "note.md"), []byte("old\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fixtureGit(t, own, "add", "note.md")
+			fixtureGit(t, own, "commit", "-q", "-m", "note")
+			fixtureGit(t, own, "config", "extensions.worktreeConfig", "true")
+			fixtureGit(t, own, "config", "--worktree", "core.worktree", target)
+			return own
+		}, []string{"diff"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home, _ := realGitRepo(t)
+			target := filepath.Join(home, "Kahya")
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(target, "note.md"), []byte(secret+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			repoPath := tc.plant(t, home, target)
+
+			// Control: plain git really reads the other work tree.
+			ctl := exec.Command("git", append([]string{"-C", repoPath}, tc.args...)...)
+			ctl.Env = realGitFixtureEnv()
+			if out, _ := ctl.CombinedOutput(); !strings.Contains(string(out), secret) {
+				t.Fatalf("control: plain `git %v` did not print the redirected work tree (fixture does not exercise the channel): %q", tc.args, out)
+			}
+
+			ledger := &fakeLedger{}
+			out, err := newRealGitHostExec(home, ledger).Handle(context.Background(), "trace-wt", "task-1", HostExecArgs{Command: "git", RepoPath: repoPath, Args: tc.args})
+			if !errors.Is(err, errGitRepoConfigUnsafe) {
+				t.Fatalf("err = %v (stdout %q), want errGitRepoConfigUnsafe", err, out.Stdout)
+			}
+			if strings.Contains(out.Stdout, secret) {
+				t.Fatalf("the redirected work tree's bytes were returned: %q", out.Stdout)
+			}
+			denied := ledger.find("hostexec_denied")
+			if len(denied) != 1 || denied[0].payload["reason"] != reasonGitDangerousConfigPrefix+"core.worktree" {
+				t.Fatalf("hostexec_denied events = %+v, want one with reason %q", denied, reasonGitDangerousConfigPrefix+"core.worktree")
+			}
+			if len(ledger.find("hostexec_exec")) != 0 {
+				t.Fatal("a refused repo must never reach hostexec_exec")
+			}
+		})
+	}
+}
