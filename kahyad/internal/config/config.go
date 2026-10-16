@@ -1292,8 +1292,27 @@ func Load() (Config, error) {
 		cfg.AnchorLocalFallbackPath = ""
 	}
 
+	// FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs:
+	// for the same reason a non-prod daemon inherited prod's Telegram
+	// identity and long-polled prod's bot (getUpdates/getMe are not
+	// egress-gated): it consumed prod's approval callbacks and its 409
+	// conflicts took prod's bot offline for as long as it ran. A non-prod
+	// profile gets no Telegram identity - unless it is dev AND carries the
+	// dev-only TelegramTokenOverrideEnvVar (the hermetic tests/w3 gates:
+	// a fake Bot API named by their own temp HOME's config.yaml). The bot
+	// then resolves to telegram_disabled ("not configured").
+	if cfg.Env != EnvProd && !(cfg.Env == EnvDev && os.Getenv(TelegramTokenOverrideEnvVar) != "") {
+		cfg.TelegramChatID, cfg.TelegramUserID = 0, 0
+	}
+
 	return cfg, nil
 }
+
+// TelegramTokenOverrideEnvVar is the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE
+// (W3-10's hermetic gate seam; kahyad main.go devTelegramTokenSource
+// honors it only under KAHYA_ENV=dev). Its presence is also what lets a dev
+// profile keep the Telegram ids config.yaml names (Load).
+const TelegramTokenOverrideEnvVar = "KAHYA_TELEGRAM_TOKEN_OVERRIDE"
 
 // PassiveBoot reports whether this daemon must boot passively (FIX-FINAL
 // ops-restore-scratch-kills-prod-workers): the restore drill's scratch

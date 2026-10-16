@@ -16,6 +16,14 @@
 # It deliberately does NOT load/start any launchd agent and does NOT touch the
 # production daemon: installing/loading the dev agent and running a live drill
 # are left to the operator (see the printed instructions at the end).
+#
+# The dev daemon reads prod's shared config.yaml but never acts on prod's
+# identities (FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-
+# jobs): it loads with no Telegram chat/user id and never reads the real
+# kahya.telegram Keychain item (no second long-poller on prod's bot), and it
+# syncs no com.kahya.job.* LaunchAgent. Only the dev-only
+# KAHYA_TELEGRAM_TOKEN_OVERRIDE (hermetic tests) re-enables a dev bot; this
+# script and the dev plist never set it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

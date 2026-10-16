@@ -14,7 +14,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS", "KAHYA_TIMEZONE"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS", "KAHYA_TIMEZONE", "KAHYA_TELEGRAM_TOKEN_OVERRIDE", "KAHYA_ANCHOR_KEY_OVERRIDE", "KAHYA_ANCHOR_REMOTE", "KAHYA_ANCHOR_LOCAL_FALLBACK_PATH"} {
 		t.Setenv(k, "")
 	}
 }
@@ -2147,6 +2147,58 @@ func TestPassiveBootOnlyForRestore(t *testing.T) {
 		if got := (Config{Env: env}).PassiveBoot(); got != want {
 			t.Errorf("Config{Env: %q}.PassiveBoot() = %v, want %v", env, got, want)
 		}
+	}
+}
+
+// TestNonProdProfileNeverPollsProdTelegram (FIX-FINAL adv2-dev-profile-
+// side-by-side-shares-prod-bot-anchor-jobs): every profile reads prod's
+// config.yaml, so a KAHYA_ENV=dev daemon (kahya-dev-env.sh's provisioning
+// boot, the com.kahya.dev agent) inherited prod's telegram_chat_id/user_id
+// and long-polled prod's bot - competing for its approval callbacks and
+// tripping getUpdates conflicts that take prod's bot offline. A non-prod
+// profile now loads with no Telegram identity, unless it is dev AND carries
+// the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE (tests/w3: a fake Bot API in a
+// temp HOME's own config.yaml). The env overrides are cleared too.
+func TestNonProdProfileNeverPollsProdTelegram(t *testing.T) {
+	const ids = "telegram_chat_id: 111\ntelegram_user_id: 222\n"
+	for _, tc := range []struct {
+		name, env, override string
+		viaEnv              bool
+		wantKept            bool
+	}{
+		{"prod", "", "", false, true},
+		{"prod_with_override", "", "tok", false, true},
+		{"dev", "dev", "", false, false},
+		{"dev_env_ids", "dev", "", true, false},
+		{"dev_with_override", "dev", "tok", false, true},
+		{"restore_with_override", "restore", "tok", false, false},
+		{"other_profile_with_override", "redteam", "tok", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("KAHYA_ENV", tc.env)
+			t.Setenv("KAHYA_TELEGRAM_TOKEN_OVERRIDE", tc.override)
+			if tc.viaEnv {
+				t.Setenv("KAHYA_TELEGRAM_CHAT_ID", "111")
+				t.Setenv("KAHYA_TELEGRAM_USER_ID", "222")
+			} else {
+				writeConfigYAML(t, home, ids)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			kept := cfg.TelegramChatID == 111 && cfg.TelegramUserID == 222
+			cleared := cfg.TelegramChatID == 0 && cfg.TelegramUserID == 0
+			if tc.wantKept && !kept {
+				t.Errorf("env=%q: chat=%d user=%d, want prod's ids kept", tc.env, cfg.TelegramChatID, cfg.TelegramUserID)
+			}
+			if !tc.wantKept && !cleared {
+				t.Errorf("env=%q: chat=%d user=%d, want both cleared (a non-prod daemon must never poll prod's bot)", tc.env, cfg.TelegramChatID, cfg.TelegramUserID)
+			}
+		})
 	}
 }
 

@@ -1980,7 +1980,7 @@ func buildCredentialSource(cfg config.Config, log *logx.Logger) anthproxy.Creden
 // so a hermetic child-kahyad gate test never needs a real BotFather token
 // or Keychain item. Ignored — loudly — outside dev, exactly like the
 // Anthropic key override.
-const telegramTokenOverrideEnvVar = "KAHYA_TELEGRAM_TOKEN_OVERRIDE"
+const telegramTokenOverrideEnvVar = config.TelegramTokenOverrideEnvVar
 
 // devTelegramTokenSource wraps a real telegram.TokenReader (secrets.
 // NewTelegram()) with the dev-only override above.
@@ -1990,6 +1990,13 @@ type devTelegramTokenSource struct {
 	log  *logx.Logger
 }
 
+// Read returns the override under dev, else the real token in prod only.
+// FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs: only
+// prod ever reads the real kahya.telegram item - a dev daemon without the
+// override, and every other non-prod profile, gets an error instead
+// (telegram.New then resolves to a disabled bot), so no second long-poller
+// ever runs on prod's bot. config.Load already clears such a profile's
+// Telegram ids; this is the Keychain-side backstop.
 func (s devTelegramTokenSource) Read() (string, error) {
 	if override := os.Getenv(telegramTokenOverrideEnvVar); override != "" {
 		if s.env == config.EnvDev {
@@ -1998,6 +2005,9 @@ func (s devTelegramTokenSource) Read() (string, error) {
 		if s.log != nil {
 			s.log.Warn("telegram_token_override_ignored", "reason", "KAHYA_TELEGRAM_TOKEN_OVERRIDE set outside KAHYA_ENV=dev")
 		}
+	}
+	if s.env != config.EnvProd {
+		return "", fmt.Errorf("KAHYA_ENV=%s never reads the real kahya.telegram Keychain item (dev: set %s)", s.env, telegramTokenOverrideEnvVar)
 	}
 	return s.real.Read()
 }

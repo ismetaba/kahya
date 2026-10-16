@@ -79,6 +79,7 @@ type Server struct {
 	updates   []queuedUpdate
 	updateSeq int
 	notify    chan struct{} // closed + replaced on every push (broadcast-wakeup idiom)
+	requests  int           // every request route saw, any method
 }
 
 // New starts a new fake Telegram Bot API server bound to an ephemeral
@@ -113,6 +114,14 @@ func (s *Server) EditedMessages() []EditedMessage {
 	out := make([]EditedMessage, len(s.edited))
 	copy(out, s.edited)
 	return out
+}
+
+// Requests is how many Bot API requests (any method, getMe and getUpdates
+// included) reached this fake so far.
+func (s *Server) Requests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requests
 }
 
 // Responded returns every answerCallbackQuery response text recorded so
@@ -168,6 +177,9 @@ func (s *Server) wakeLocked() {
 // exact URL shape gopkg.in/telebot.v4's Bot.Raw builds
 // (b.URL + "/bot" + b.Token + "/" + method).
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.requests++
+	s.mu.Unlock()
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(path, "/", 2)
 	if len(parts) != 2 || !strings.HasPrefix(parts[0], "bot") {

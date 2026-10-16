@@ -85,6 +85,12 @@ type daemonOpts struct {
 	// telegramChatID/telegramUserID as the Go-side allowlist pair.
 	telegramURL                    string
 	telegramChatID, telegramUserID int64
+	// telegramWithoutOverride boots with telegramURL/ids configured but
+	// WITHOUT the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE - the shape of a
+	// real-HOME dev daemon beside prod (FIX-FINAL adv2-dev-profile-side-by-
+	// side-shares-prod-bot-anchor-jobs): the bot must stay disabled, so
+	// bootKahyad does not wait for telegram_online.
+	telegramWithoutOverride bool
 
 	// anthropicUpstreamURL, when non-empty, points cfg.anthropic_upstream_url
 	// at a mockanthropic.Server and patches ITS host:port into the fixture
@@ -162,6 +168,11 @@ func bootKahyad(t *testing.T, opts daemonOpts) *daemon {
 	policyPath := writeFixturePolicyYAML(t, root, homeDir, opts.anthropicUpstreamURL)
 
 	extraEnv := opts.extraEnv
+	if opts.telegramWithoutOverride {
+		// buildKahyadEnv always appends the override; a later empty value
+		// wins (exec.Cmd keeps the last duplicate), i.e. unset.
+		extraEnv = append(append([]string{}, extraEnv...), "KAHYA_TELEGRAM_TOKEN_OVERRIDE=")
+	}
 	// The child kahyad runs with HOME redirected to a temp dir (below), so
 	// the `docker` CLI it execs (mcp/shell.Runner/EgressNetworkEnsurer) can
 	// no longer resolve ~/.docker/config.json's current context (colima,
@@ -224,7 +235,7 @@ func bootKahyad(t *testing.T, opts daemonOpts) *daemon {
 	}
 	t.Cleanup(func() { stopProcess(d.cmd) })
 	waitForHealth(t, d.client, homeDir)
-	if opts.telegramURL != "" {
+	if opts.telegramURL != "" && !opts.telegramWithoutOverride {
 		// FIX-P-5: the bot's getMe now runs inside Start (concurrently
 		// with srv.Run), and a card produced before it succeeds falls back
 		// locally instead of reaching the fake Bot API - wait for the
