@@ -85,6 +85,7 @@ func TestShellDockerGrantNeverRedeemsForADifferentInvocation(t *testing.T) {
 			exec := &recordingDockerExec{}
 			r := mcpshell.NewRunner(home, "kahya-sandbox:test", "sha256:abc", nil, nil, NewFSPolicyClient(engine, func() bool { return false }), st, NewFSLogger(testLogger(t)))
 			r.Exec, r.DigestChecker, r.Health = exec, fixedDigest{"sha256:abc"}, alwaysHealthy{}
+			r.OwnerID = mcpshell.OwnerIDForDataDir(home)
 
 			approved := mcpshell.RunInput{Script: "rm -rf ./*\n", Workdir: "~/scratch"}
 			if _, err := r.Run(context.Background(), "trace-sd", "task-sd", approved); err == nil {

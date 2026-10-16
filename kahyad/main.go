@@ -789,6 +789,14 @@ func run() int {
 		log.Error("shell_pinned_digest_load_failed", "path", cfg.DockerImageDigestPath, "err", err.Error())
 	}
 	shellRunner := mcpshell.NewRunner(home, cfg.DockerImageTag, pinnedDigest, denyGlobs, cfg.ShellWorkdirRoots, fsPolicyClient, st, server.NewFSLogger(log))
+	// FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-sandbox-
+	// container: every container this daemon starts carries its own
+	// kahya.owner label (derived from its data dir: stable across restarts,
+	// distinct per profile and harness), and its shutdown sweep and halt
+	// kill only containers with that label - never prod's, from a dev,
+	// restore or hermetic-harness daemon on the same Docker runtime.
+	shellRunner.OwnerID = mcpshell.OwnerIDForDataDir(cfg.DataDir)
+	log.Info("shell_container_owner", "owner_id", shellRunner.OwnerID)
 
 	// W3-05: needs_network:true jobs attach to the kahya-egress internal
 	// Docker network instead of being refused outright (W3-04's
@@ -820,7 +828,14 @@ func run() int {
 	hostExec.Receipts = recExec
 	hostExec.SecretLaneGlobs = toolSecretGlobs
 	hostExec.OutputGate = server.NewToolOutputGate(st.Queries, st, egressGate, server.LaneSourceShellHost)
-	srv.SetShellTool(mcpshell.New(shellRunner, hostExec))
+	shellSrv := mcpshell.New(shellRunner, hostExec)
+	if cfg.PassiveBoot() {
+		// FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-sandbox-
+		// container: the restore drill's passive scratch daemon runs no task,
+		// so it has no container to reap - no shutdown sweep at all.
+		shellSrv.SkipShutdownSweep = "passive_restore_profile"
+	}
+	srv.SetShellTool(shellSrv)
 	if shellRunner.Health != nil && !shellRunner.Health.Healthy(context.Background()) {
 		log.Warn("docker_unavailable_at_boot", "hint", "make docker-up")
 	} else {

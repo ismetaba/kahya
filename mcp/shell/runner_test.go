@@ -18,6 +18,7 @@ func newTestRunner(home string, denyGlobs []string, pc *fakePolicyClient, ledger
 		Policy: pc, Ledger: ledger, Log: log,
 		Exec: exec, DigestChecker: digest, Health: health,
 		EnvLookup: func(string) (string, bool) { return "", false },
+		OwnerID:   testOwnerID,
 	}
 	r.SetTimeoutUnit(time.Millisecond) // every test runs fast; no real 300s wait anywhere
 	return r
@@ -48,7 +49,7 @@ func baseFixture(t *testing.T) (home, workdir string) {
 func TestBuildDockerRunArgs_NonNegotiableFlags(t *testing.T) {
 	args := buildDockerRunArgs(dockerRunSpec{
 		ImageTag: "kahya-sandbox:0.1.0", ContainerName: "kahya-sandbox-abc123", TaskID: "task-1",
-		Workdir: "/canonical/workdir",
+		OwnerID: "0123456789abcdef", Workdir: "/canonical/workdir",
 	})
 	joined := " " + strings.Join(args, " ") + " "
 
@@ -63,6 +64,7 @@ func TestBuildDockerRunArgs_NonNegotiableFlags(t *testing.T) {
 		" --cap-drop ALL ",
 		" --security-opt no-new-privileges ",
 		" --label kahya.task_id=task-1 ",
+		" --label kahya.owner=0123456789abcdef ",
 		" --name kahya-sandbox-abc123 ",
 		" --rm ",
 	} {
@@ -793,7 +795,7 @@ func TestRun_TimeoutKillsContainer(t *testing.T) {
 
 func TestKillAllLabeled_KillsEveryListedContainer(t *testing.T) {
 	exec := &fakeExecutor{psOutput: "cid1\ncid2\n"}
-	r := &Runner{Exec: exec}
+	r := &Runner{Exec: exec, OwnerID: testOwnerID}
 	if err := r.KillAllLabeled(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -801,8 +803,10 @@ func TestKillAllLabeled_KillsEveryListedContainer(t *testing.T) {
 	if len(psCalls) != 1 {
 		t.Fatalf("expected one docker ps call, got %d", len(psCalls))
 	}
-	if !strings.Contains(strings.Join(psCalls[0].args, " "), "label=kahya.task_id") {
-		t.Fatalf("docker ps must filter by label=kahya.task_id: %v", psCalls[0].args)
+	// FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-sandbox-
+	// container: the task-label filter is ANDed with this daemon's owner.
+	if got, want := strings.Join(psCalls[0].args, " "), "ps -q --filter label=kahya.task_id --filter label=kahya.owner="+testOwnerID; got != want {
+		t.Fatalf("docker ps args = %q, want %q", got, want)
 	}
 	killCalls := exec.callsFor("kill")
 	if len(killCalls) != 2 {

@@ -29,9 +29,12 @@
 #     prod brain.db and prod's config.yaml, so it kills no worker (the copy's
 #     worker_pgid rows are prod's running workers), resumes / dispatches no
 #     task, runs no Telegram poller, syncs no LaunchAgent, refuses POST
-#     /v1/task and never anchors (FIX-FINAL
-#     ops-restore-scratch-pollutes-prod-anchor-remote) - it never touches
-#     prod's processes, bot or anchor remote.
+#     /v1/task, never anchors (FIX-FINAL
+#     ops-restore-scratch-pollutes-prod-anchor-remote) and sweeps no sandbox
+#     container at shutdown (every daemon kills only containers with its own
+#     kahya.owner label anyway - FIX-FINAL
+#     ops-config-r2-nonprod-shutdown-kills-every-sandbox-container) - it
+#     never touches prod's processes, containers, bot or anchor remote.
 #   - A guard refuses to run if the scratch target resolves to the production
 #     App Support dir or ~/Kahya (mirrors kahyad/internal/restore.GuardNotProd
 #     and config.refuseNonProdProfileOpeningProdDB).

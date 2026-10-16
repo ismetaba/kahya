@@ -174,7 +174,8 @@ type Server struct {
 	// mcp/memory's/mcp/fs's own tools (buildMCPHandler). nil until
 	// SetShellTool is called - see shell.go. Server.Shutdown calls
 	// shellServer.Shutdown to kill every kahya.task_id-labeled container
-	// this daemon may have left running (this task's spec step 7).
+	// this daemon (its kahya.owner label) may have left running (this
+	// task's spec step 7).
 	shellServer *mcpshell.Server
 
 	// osascriptServer is the W3-09 osascript MCP tool set (applescript_run/
@@ -717,10 +718,15 @@ func (s *Server) Shutdown() error {
 	err := s.http.Shutdown(ctx)
 
 	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled
-	// kahya.task_id" - best-effort, never fails shutdown itself over a
-	// docker-daemon hiccup.
+	// kahya.task_id" - only the ones THIS daemon owns (kahya.owner, FIX-FINAL
+	// ops-config-r2-nonprod-shutdown-kills-every-sandbox-container: the
+	// Docker runtime is shared with every other profile and harness), none
+	// at all on a passive restore boot - best-effort, never fails shutdown
+	// itself over a docker-daemon hiccup.
 	if s.shellServer != nil {
-		if killErr := s.shellServer.Shutdown(ctx); killErr != nil {
+		if reason := s.shellServer.SkipShutdownSweep; reason != "" {
+			s.log.Info("shell_shutdown_kill_skipped", "reason", reason)
+		} else if killErr := s.shellServer.Shutdown(ctx); killErr != nil {
 			s.log.Warn("shell_shutdown_kill_failed", "err", killErr.Error())
 		}
 	}

@@ -29,7 +29,9 @@ var shellOwnedTools = map[string]bool{
 // Call before Prepare(); buildMCPHandler registers shellSrv's tools onto
 // the SAME shared MCP server memory's/fs's tools use whenever shellSrv is
 // non-nil. Server.Shutdown calls shellSrv.Shutdown to kill every
-// kahya.task_id-labeled container this daemon may have left running.
+// kahya.task_id-labeled container this daemon owns (the kahya.owner label,
+// mcp/shell.Runner.OwnerID) and may have left running - none at all when
+// shellSrv.SkipShutdownSweep is set (a passive restore boot).
 func (s *Server) SetShellTool(shellSrv *mcpshell.Server) {
 	s.shellServer = shellSrv
 }

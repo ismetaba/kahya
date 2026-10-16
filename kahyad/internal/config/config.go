@@ -1301,10 +1301,12 @@ func Load() (Config, error) {
 // worker_pgid names prod's running workers, 'executing' tasks and pending
 // outbox rows are prod's, and config.yaml names prod's Telegram bot and
 // LaunchAgents. Such a daemon kills no worker, resumes / dispatches no
-// task, runs no Telegram poller, syncs no launchd job, anchors nothing and
-// refuses POST /v1/task - it serves only what the drill needs (/health,
-// /v1/reindex, /v1/memory/search). Every non-prod profile (dev too) also
-// syncs no launchd job (ManagesLaunchdJobs).
+// task, runs no Telegram poller, syncs no launchd job, anchors nothing,
+// sweeps no sandbox container at shutdown and refuses POST /v1/task - it
+// serves only what the drill needs (/health, /v1/reindex,
+// /v1/memory/search). Every non-prod profile (dev too) also syncs no launchd
+// job (ManagesLaunchdJobs), and every daemon's container sweep and halt kill
+// only its own containers (mcp/shell Runner.OwnerID).
 func (c Config) PassiveBoot() bool { return c.Env == EnvRestore }
 
 // ManagesLaunchdJobs reports whether this profile may install, replace or

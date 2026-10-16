@@ -28,6 +28,12 @@ const (
 type Server struct {
 	Runner   *Runner
 	HostExec *HostExec
+	// SkipShutdownSweep, when non-empty, is why this daemon must not sweep
+	// containers at shutdown at all (kahyad sets "passive_restore_profile"
+	// for the restore drill's passive scratch boot - FIX-FINAL
+	// ops-config-r2-nonprod-shutdown-kills-every-sandbox-container); Shutdown
+	// then issues no docker call.
+	SkipShutdownSweep string
 }
 
 // New constructs a Server from an already-configured Runner/HostExec
@@ -72,12 +78,14 @@ func (s *Server) MCPServer(impl *mcp.Implementation) *mcp.Server {
 	return srv
 }
 
-// Shutdown kills every kahya.task_id-labeled container this daemon may
-// have left running (this task's spec step 7) — called from kahyad's own
-// graceful-shutdown path (kahyad/internal/server/shell.go /
-// server.go's Shutdown).
+// Shutdown kills every kahya.task_id-labeled container THIS daemon owns
+// (Runner.OwnerID, the kahya.owner label) and may have left running (this
+// task's spec step 7) — never another profile's or harness's — and nothing
+// at all under SkipShutdownSweep. Called from kahyad's own
+// graceful-shutdown path (kahyad/internal/server/shell.go / server.go's
+// Shutdown).
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s == nil || s.Runner == nil {
+	if s == nil || s.Runner == nil || s.SkipShutdownSweep != "" {
 		return nil
 	}
 	return s.Runner.KillAllLabeled(ctx)

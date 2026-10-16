@@ -117,7 +117,103 @@ func newLiveRunner(t *testing.T) (*Runner, *fakeLogger) {
 	}
 	log := newFakeLogger()
 	r := NewRunner(home, liveImageTag, digest, nil, nil, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, log)
+	r.OwnerID = liveOwnerID(t)
 	return r, log
+}
+
+// liveOwnerID is a fresh kahya.owner value for one live test, so a sweep it
+// drives can only ever match its own containers.
+func liveOwnerID(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// startLabeledSleeper runs a detached alpine container (never pulled:
+// --pull=never) with the given labels and registers its forced removal.
+func startLabeledSleeper(t *testing.T, labels ...string) string {
+	t.Helper()
+	args := []string{"run", "-d", "--pull=never", "--rm"}
+	for _, l := range labels {
+		args = append(args, "--label", l)
+	}
+	args = append(args, "alpine", "sleep", "300")
+	res, err := processExecutor{}.Run(context.Background(), "docker", args, nil)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("docker %v: %v exit=%d %s", args, err, res.ExitCode, res.Stderr)
+	}
+	id := strings.TrimSpace(string(res.Stdout))
+	t.Cleanup(func() { _, _ = processExecutor{}.Run(context.Background(), "docker", []string{"rm", "-f", id}, nil) })
+	return id
+}
+
+// containerRunning reports whether docker still lists id as running.
+func containerRunning(t *testing.T, id string) bool {
+	t.Helper()
+	res, err := processExecutor{}.Run(context.Background(), "docker", []string{"ps", "-q", "--no-trunc", "--filter", "id=" + id}, nil)
+	if err != nil {
+		t.Fatalf("docker ps: %v", err)
+	}
+	return strings.TrimSpace(string(res.Stdout)) != ""
+}
+
+// waitStopped polls (bounded) until id is no longer running.
+func waitStopped(t *testing.T, id string) bool {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for containerRunning(t, id) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return true
+}
+
+// TestLive_ContainerSweepsKillOnlyOwnContainers (FIX-FINAL ops-config-r2-
+// nonprod-shutdown-kills-every-sandbox-container): on one shared Docker
+// runtime, this daemon's shutdown sweep (KillAllLabeled) and its halt
+// (KillLabeled) kill only containers carrying ITS kahya.owner label - a
+// container another daemon owns (prod, seen from a dev/restore/harness
+// daemon) with the very same task id, and a pre-fix unowned one, keep
+// running.
+func TestLive_ContainerSweepsKillOnlyOwnContainers(t *testing.T) {
+	requireDockerTests(t)
+	r, _ := newLiveRunner(t)
+	taskID := "task-owner-" + liveOwnerID(t)
+	foreign := liveOwnerID(t)
+
+	mine := startLabeledSleeper(t, "kahya.task_id="+taskID, OwnerLabel+"="+r.OwnerID)
+	theirs := startLabeledSleeper(t, "kahya.task_id="+taskID, OwnerLabel+"="+foreign)
+	unowned := startLabeledSleeper(t, "kahya.task_id="+taskID)
+
+	if err := r.KillLabeled(context.Background(), taskID); err != nil {
+		t.Fatalf("KillLabeled: %v", err)
+	}
+	if !waitStopped(t, mine) {
+		t.Error("the halt left this daemon's own container running")
+	}
+	for name, id := range map[string]string{"foreign-owned": theirs, "unowned": unowned} {
+		if !containerRunning(t, id) {
+			t.Errorf("the halt killed a %s container with the same task id", name)
+		}
+	}
+
+	mine2 := startLabeledSleeper(t, "kahya.task_id=other-"+taskID, OwnerLabel+"="+r.OwnerID)
+	if err := r.KillAllLabeled(context.Background()); err != nil {
+		t.Fatalf("KillAllLabeled: %v", err)
+	}
+	if !waitStopped(t, mine2) {
+		t.Error("the shutdown sweep left this daemon's own container running")
+	}
+	for name, id := range map[string]string{"foreign-owned": theirs, "unowned": unowned} {
+		if !containerRunning(t, id) {
+			t.Errorf("the shutdown sweep killed a %s container", name)
+		}
+	}
 }
 
 func TestLive_MountPolicyAndReadOnlyRoot(t *testing.T) {

@@ -51,12 +51,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -133,7 +135,52 @@ const (
 	// reasonDockerDown is the EXACT string this task's spec quotes
 	// verbatim — do not reword.
 	reasonDockerDown = "Docker çalışmıyor — 'make docker-up' ile başlatın"
+	// reasonNoContainerOwner fires when this Runner has no OwnerID
+	// (FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-sandbox-
+	// container): every container must carry its daemon's kahya.owner label,
+	// so an unowned one is never started (kahyad always wires OwnerID; this
+	// is the fail-closed floor for a misconfigured build).
+	reasonNoContainerOwner = "shell_docker reddedildi: bu kahyad için konteyner sahibi kimliği (kahya.owner) yapılandırılmamış; sahipsiz konteyner başlatılmaz."
 )
+
+// OwnerLabel is the container label naming the kahyad instance that started
+// a sandbox container (FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-
+// sandbox-container). Every container sweep and kill ANDs it with the
+// kahya.task_id filter (ownedContainerListArgs).
+const OwnerLabel = "kahya.owner"
+
+// OwnerIDForDataDir is a kahyad instance's container owner id: the first 16
+// hex characters of sha256 over its cleaned, absolute, symlink-resolved data
+// dir ("" for an empty dir). Stable across restarts (a restarted prod daemon
+// still reaps its own crash leftovers) and distinct per profile and per
+// hermetic harness, which all run their own data dir on the one shared
+// Docker runtime - and share prod's task ids when they boot on a copy of
+// prod's brain.db (the restore drill).
+func OwnerIDForDataDir(dataDir string) string {
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	p := filepath.Clean(dataDir)
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:8])
+}
+
+// ownedContainerListArgs is THE `docker ps` argv every container sweep and
+// kill in this codebase uses: taskLabelFilter (label=kahya.task_id, any
+// value or one task's) ANDed with this daemon's own kahya.owner label -
+// Docker ANDs repeated label filters, so another daemon's containers (and a
+// pre-fix unowned one) never match. tests/invariants
+// TestNoUnscopedSandboxContainerSweep pins that no other kahya.task_id
+// filter exists.
+func ownedContainerListArgs(ownerID, taskLabelFilter string) []string {
+	return []string{"ps", "-q", "--filter", taskLabelFilter, "--filter", "label=" + OwnerLabel + "=" + ownerID}
+}
 
 // RunInput is shell_docker's invocation contract (this task's spec,
 // verbatim): {script, workdir, timeout_s, needs_network, env_allowlist}.
@@ -395,6 +442,17 @@ type Runner struct {
 	SecretLaneGlobs []string
 	OutputGate      mcpfs.OutputGate
 
+	// OwnerID labels every container this Runner starts
+	// (kahya.owner=<OwnerID>) and scopes every container sweep and kill to
+	// that label (FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-
+	// sandbox-container): kahyad sets it from its own data dir
+	// (OwnerIDForDataDir), so the shutdown sweep or a halt of a dev,
+	// restore or hermetic-harness daemon - same Docker runtime, and on a
+	// restore copy the same task ids - never kills prod's containers. Empty
+	// = Run refuses (no unowned container) and the sweeps kill nothing
+	// (never an unscoped kill).
+	OwnerID string
+
 	// timeoutUnit scales RunInput.TimeoutS into a time.Duration (defaults
 	// to time.Second; tests shrink this to time.Millisecond so a
 	// timeout/kill test runs in milliseconds, never a real 300s wait —
@@ -521,6 +579,16 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		return r.replayedRun(ctx, traceID, taskID, stored), nil
 	}
 
+	// FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-sandbox-
+	// container: before any docker/egress work, an owner-less Runner starts
+	// nothing (its container could not be scoped by the sweeps).
+	if strings.TrimSpace(r.OwnerID) == "" {
+		logAndLedger(ctx, r.Ledger, r.Log, traceID, "shell_docker_owner_unset", map[string]any{
+			"event": "shell_docker_owner_unset", "tool": "shell_docker", "task_id": taskID,
+		})
+		return RunOutput{}, errors.New(reasonNoContainerOwner)
+	}
+
 	// egressToken is the per-task egress-proxy credential this run's
 	// container gets (BLOCKER B/C fix), minted only when an
 	// EgressTokenRegistrar is actually wired — an unminted (empty) token
@@ -613,6 +681,7 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 		containerName := containerNameFor(taskID)
 		spec := dockerRunSpec{
 			ImageTag: r.ImageTag, ContainerName: containerName, TaskID: taskID, TraceID: traceID,
+			OwnerID: r.OwnerID,
 			Workdir: cp.Op, EnvPairs: r.resolveEnv(ctx, traceID, taskID, in.EnvAllowlist),
 		}
 		if in.NeedsNetwork {
@@ -766,13 +835,21 @@ func (r *Runner) replayedRun(ctx context.Context, traceID, taskID string, out Ru
 }
 
 // KillAllLabeled kills every container carrying the kahya.task_id label
-// (this task's spec step 7: "on kahyad shutdown, kill all containers
-// labeled kahya.task_id") — queried fresh via `docker ps`, NOT from an
+// AND this daemon's own kahya.owner label (this task's spec step 7: "on
+// kahyad shutdown, kill all containers labeled kahya.task_id"; FIX-FINAL
+// ops-config-r2-nonprod-shutdown-kills-every-sandbox-container: only the
+// ones THIS daemon owns - the Docker runtime is shared with every other
+// profile and harness) — queried fresh via `docker ps`, NOT from an
 // in-process registry, so it also catches containers a crashed/restarted
-// kahyad process left behind. Call from kahyad's own graceful-shutdown
-// path (kahyad/internal/server/shell.go).
+// kahyad process left behind (OwnerID is stable across restarts). Call
+// from kahyad's own graceful-shutdown path (kahyad/internal/server/
+// shell.go). With no OwnerID it kills nothing and returns an error: never
+// an unscoped sweep.
 func (r *Runner) KillAllLabeled(ctx context.Context) error {
-	res, err := r.Exec.Run(ctx, "docker", []string{"ps", "-q", "--filter", "label=kahya.task_id"}, nil)
+	if strings.TrimSpace(r.OwnerID) == "" {
+		return errors.New("shell_docker: no container owner id configured; refusing an unscoped container sweep")
+	}
+	res, err := r.Exec.Run(ctx, "docker", ownedContainerListArgs(r.OwnerID, "label=kahya.task_id"), nil)
 	if err != nil {
 		return fmt.Errorf("shell_docker: list kahya.task_id-labeled containers: %w", err)
 	}
@@ -787,7 +864,11 @@ func (r *Runner) KillAllLabeled(ctx context.Context) error {
 
 // KillLabeled kills every container carrying the EXACT
 // `kahya.task_id=<taskID>` label value (unlike KillAllLabeled's blanket
-// "the label key is present, any value" filter) — the W6-03 emergency-halt
+// "the label key is present, any value" filter) AND this daemon's own
+// kahya.owner label (FIX-FINAL ops-config-r2-nonprod-shutdown-kills-every-
+// sandbox-container: a halt sent to a restore or dev daemon - which share
+// prod's task ids on a copy of prod's brain.db - never kills prod's
+// container; with no OwnerID nothing is killed) — the W6-03 emergency-halt
 // executor's own per-task container-kill step (HANDOFF §6 W6 flag: "ilgili
 // Docker konteynerleri öldürülür"). Best-effort and NEVER returns an error:
 // halt is best-effort-complete (this task's own spec step 3: "continue past
@@ -800,10 +881,13 @@ func (r *Runner) KillAllLabeled(ctx context.Context) error {
 // its own `docker kill` runs is likewise ignored — best-effort, not a
 // signal to stop killing the rest of the list.
 func (r *Runner) KillLabeled(ctx context.Context, taskID string) error {
+	if strings.TrimSpace(r.OwnerID) == "" {
+		return nil
+	}
 	if r.Health != nil && !r.Health.Healthy(ctx) {
 		return nil
 	}
-	res, err := r.Exec.Run(ctx, "docker", []string{"ps", "-q", "--filter", "label=kahya.task_id=" + taskID}, nil)
+	res, err := r.Exec.Run(ctx, "docker", ownedContainerListArgs(r.OwnerID, "label=kahya.task_id="+taskID), nil)
 	if err != nil || res.ExitCode != 0 {
 		return nil
 	}
@@ -865,7 +949,10 @@ type dockerRunSpec struct {
 	// JSONL/ledger grep against a specific trace can correlate straight
 	// back to the container that ran for it, without a second join
 	// through the tasks table.
-	TraceID  string
+	TraceID string
+	// OwnerID carries the kahya.owner label (Runner.OwnerID) every sweep
+	// and kill filters on.
+	OwnerID  string
 	Workdir  string // host-side canonical path (CanonicalPath.Op)
 	EnvPairs map[string]string
 	// Network overrides the default "none" — Run sets this to
@@ -894,7 +981,9 @@ type dockerRunSpec struct {
 // every container") + `--label kahya.trace_id=<tid>` (W6-03: the halt
 // executor's own container-kill step filters on the task_id label; the
 // trace_id label is a second, independent correlation key so a JSONL/
-// ledger grep against one trace finds the container directly), `--rm`
+// ledger grep against one trace finds the container directly) + `--label
+// kahya.owner=<owner>` (the daemon that started it; every sweep and kill
+// is scoped to it), `--rm`
 // (auto-remove on exit so sandbox containers never accumulate — HANDOFF
 // gives no container-retention requirement).
 // The Docker socket is never mounted (this task's own gotcha, HANDOFF §5
@@ -923,6 +1012,7 @@ func buildDockerRunArgs(spec dockerRunSpec) []string {
 		"--name", spec.ContainerName,
 		"--label", "kahya.task_id=" + spec.TaskID,
 		"--label", "kahya.trace_id=" + spec.TraceID,
+		"--label", OwnerLabel + "=" + spec.OwnerID,
 	}
 	args = appendSortedEnvPairs(args, spec.ProxyEnvPairs)
 	args = appendSortedEnvPairs(args, spec.EnvPairs)
