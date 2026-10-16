@@ -912,6 +912,31 @@ func (c Config) KahyaInternalSecretLaneGlobs() []string {
 	return secretLaneCopyGlobs(subtrees, files)
 }
 
+// UndoDir is fs_write's fallback pre-image copy root (mcp/fs.Server.UndoDir):
+// <DataDir>/undo, one copy per operation under <task_id>/<op_id>.
+func (c Config) UndoDir() string {
+	return filepath.Join(c.DataDir, "undo")
+}
+
+// FSUndoSecretLaneGlobs returns the secret-lane globs over the two places
+// fs_write and fs_delete move a file's bytes to (FIX-FINAL fs-undo-copy-and-
+// trash-escape-secret-path-glob): the pre-image copies under UndoDir()/**
+// (the op id comes back in FsWriteOutput.OpID, so the path is predictable)
+// and the Trash, trashDir/** (mcp/fs.Server.TrashDir; the path comes back
+// in FsDeleteOutput.TrashPath, without the secret directory's name). A copy
+// of a secret-glob file kept there is secret-lane by path like its source,
+// so fs_read of it escalates the task instead of falling back to the content
+// check. The whole Trash is covered - also a file the user trashed in Finder
+// - so a task that reads from the Trash is escalated (fail-closed). Unset or
+// relative paths yield nothing.
+func (c Config) FSUndoSecretLaneGlobs(trashDir string) []string {
+	var undo string
+	if c.DataDir != "" {
+		undo = c.UndoDir()
+	}
+	return secretLaneCopyGlobs([]string{undo, trashDir}, nil)
+}
+
 // secretLaneCopyGlobs builds de-duplicated secret-lane globs: "<dir>/**"
 // for every subtree and the exact path for every file, each in its
 // as-given and symlink-resolved forms (selfProtectForms; empty and

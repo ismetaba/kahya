@@ -204,14 +204,14 @@ func TestWiredFSSecretLaneGlobsCoverIngestRawStore(t *testing.T) {
 		t.Fatalf("fixture: %s is already covered by policy.yaml alone", raw)
 	}
 	in := append([]string{}, pol.SecretLaneGlobs...)
-	wired := wiredFSSecretLaneGlobs(in, cfg)
+	wired := wiredFSSecretLaneGlobs(in, cfg, "")
 	if !slices.Equal(in, pol.SecretLaneGlobs) {
 		t.Fatal("wiredFSSecretLaneGlobs mutated its input")
 	}
 	if !slices.Equal(wired[:len(pol.SecretLaneGlobs)], pol.SecretLaneGlobs) {
 		t.Fatal("wired secret-lane globs must start with policy.yaml's own list, unchanged")
 	}
-	for _, globs := range [][]string{wired, wiredFSSecretLaneGlobs(nil, cfg)} {
+	for _, globs := range [][]string{wired, wiredFSSecretLaneGlobs(nil, cfg, "")} {
 		if hit, err := mcpfs.MatchesAnyGlobCI(raw, globs); err != nil || !hit {
 			t.Errorf("raw ingest copy %s is not secret-lane by path (hit=%v err=%v)", raw, hit, err)
 		}
@@ -252,15 +252,57 @@ func TestWiredFSSecretLaneGlobsCoverKahyaOwnCopies(t *testing.T) {
 		if hit, _ := mcpfs.MatchesAnyGlobCI(p, pol.SecretLaneGlobs); hit {
 			t.Fatalf("fixture: %s is already covered by policy.yaml alone", p)
 		}
-		for _, globs := range [][]string{wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg), wiredFSSecretLaneGlobs(nil, cfg)} {
+		for _, globs := range [][]string{wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg, ""), wiredFSSecretLaneGlobs(nil, cfg, "")} {
 			if hit, err := mcpfs.MatchesAnyGlobCI(p, globs); err != nil || !hit {
 				t.Errorf("%s is not secret-lane by path (hit=%v err=%v)", p, hit, err)
 			}
 		}
 	}
 	for _, p := range []string{filepath.Join(cfg.TmpDir(), "rec.wav"), filepath.Join(cfg.MemoryDir, "inbox", "a.md")} {
-		if hit, _ := mcpfs.MatchesAnyGlobCI(p, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg)); hit {
+		if hit, _ := mcpfs.MatchesAnyGlobCI(p, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg, "")); hit {
 			t.Errorf("%s must not be secret-lane by path", p)
+		}
+	}
+}
+
+// TestWiredFSSecretLaneGlobsCoverUndoAndTrash (FIX-FINAL fs-undo-copy-and-
+// trash-escape-secret-path-glob): fs_write's pre-image copies
+// (<DataDir>/undo/<task>/<op_id>) and fs_delete's Trash entries hold a
+// secret-glob file's bytes under names no policy.yaml glob covers; the wired
+// fs_read / tool-output globs cover both trees (also in deny-all mode), and
+// the trash dir main.go passes is mcp/fs's own.
+func TestWiredFSSecretLaneGlobsCoverUndoAndTrash(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", "dev")
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_POLICY_PATH"} {
+		t.Setenv(k, "")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	pol, err := policy.Load(filepath.Join("..", "policy.yaml"))
+	if err != nil {
+		t.Fatalf("policy.Load: %v", err)
+	}
+	trash := mcpfs.TrashDirFor(home)
+	if got := mcpfs.New(home, nil, nil, cfg.UndoDir(), nil, nil, nil, nil).TrashDir; got != trash {
+		t.Fatalf("mcpfs.New TrashDir = %q, want TrashDirFor(home) = %q", got, trash)
+	}
+	for _, p := range []string{
+		filepath.Join(cfg.UndoDir(), "task-2", strings.Repeat("ab", 32)),
+		filepath.Join(cfg.UndoDir(), "_unscoped", strings.Repeat("cd", 16)),
+		filepath.Join(trash, "kontrol.md"),
+		filepath.Join(trash, "kontrol-1.md"),
+	} {
+		if hit, _ := mcpfs.MatchesAnyGlobCI(p, pol.SecretLaneGlobs); hit {
+			t.Fatalf("fixture: %s is already covered by policy.yaml alone", p)
+		}
+		for _, globs := range [][]string{wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg, trash), wiredFSSecretLaneGlobs(nil, cfg, trash)} {
+			if hit, err := mcpfs.MatchesAnyGlobCI(p, globs); err != nil || !hit {
+				t.Errorf("%s is not secret-lane by path (hit=%v err=%v)", p, hit, err)
+			}
 		}
 	}
 }

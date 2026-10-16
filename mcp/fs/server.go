@@ -67,6 +67,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"kahya/mcp/fs/pathfold"
 	"kahya/mcp/internal/gitsafe"
 )
 
@@ -284,6 +285,11 @@ type ContentClassifier interface {
 	ClassifySecretLane(text string) (secret bool, category string)
 }
 
+// TrashDirFor is the Trash fs_delete moves files to for home (~/.Trash) -
+// New's default Server.TrashDir; kahyad names it in its secret-lane globs
+// (FIX-FINAL fs-undo-copy-and-trash-escape-secret-path-glob).
+func TrashDirFor(home string) string { return filepath.Join(home, ".Trash") }
+
 // New constructs a Server. home is the real (or, in tests, fake) user
 // home directory; log may be nil (defaults to a no-op Logger);
 // sensitiveMarker may be nil (see the Server.SensitiveMarker field's doc
@@ -296,7 +302,7 @@ func New(home string, denyGlobs, secretLaneGlobs []string, undoDir string, polic
 		Home:            home,
 		DenyGlobs:       denyGlobs,
 		SecretLaneGlobs: secretLaneGlobs,
-		TrashDir:        filepath.Join(home, ".Trash"),
+		TrashDir:        TrashDirFor(home),
 		UndoDir:         undoDir,
 		Policy:          policy,
 		Ledger:          ledger,
@@ -528,6 +534,15 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 	if !secretLane && PathInSecretRepoGitDir(s.Home, cp.Match, s.SecretLaneGlobs) {
 		secretLane = true
 	}
+	// FIX-FINAL fs-undo-copy-and-trash-escape-secret-path-glob: this
+	// package's own copy stores - fs_write's pre-image copies (UndoDir) and
+	// fs_delete's Trash - hold the bytes of whatever file was written or
+	// deleted, a secret-glob file included, under names no secret glob
+	// covers; they are secret-lane by path here too, whatever kahyad wires
+	// (it also lists both trees in its secret globs).
+	if !secretLane && s.inCopyStore(cp.Match) {
+		secretLane = true
+	}
 	// W3-10 gate-test fix: the path-glob check above is HANDOFF's
 	// file-path-only rule; this is the SEPARATE, content-based half (see
 	// Server.ContentClassifier's own doc comment) — a path-glob miss does
@@ -605,6 +620,29 @@ func (s *Server) HandleReadForTask(ctx context.Context, traceID, taskID string, 
 		Size:          int64(len(data)),
 		SecretLane:    secretLane,
 	}, nil
+}
+
+// inCopyStore reports whether canonical path p is, or lies under, UndoDir
+// or TrashDir (each as configured and canonicalized), compared under APFS
+// name folding (pathfold.Fold).
+func (s *Server) inCopyStore(p string) bool {
+	key := pathfold.Fold(strings.TrimRight(p, "/"))
+	for _, d := range []string{s.UndoDir, s.TrashDir} {
+		if d == "" || !filepath.IsAbs(d) {
+			continue
+		}
+		forms := []string{filepath.Clean(d)}
+		if cp, err := Canonicalize(s.Home, d); err == nil && cp.Match != forms[0] {
+			forms = append(forms, cp.Match)
+		}
+		for _, f := range forms {
+			fk := pathfold.Fold(strings.TrimRight(f, "/"))
+			if key == fk || strings.HasPrefix(key, fk+"/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HandleWrite implements fs_write (class W1) — the full gate chain this

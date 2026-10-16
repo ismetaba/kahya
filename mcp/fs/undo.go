@@ -444,9 +444,19 @@ func (s *Server) ledgerUndoExecuted(ctx context.Context, traceID, tool, canonica
 // tool's window, a legacy pre-0022 row with op_id "", or fs_delete's
 // record — which has no CopyPath to purge) — then simply a no-op beyond
 // forgetting the registry entry.
+//
+// FIX-FINAL fs-undo-copy-and-trash-escape-secret-path-glob: the registry is
+// in memory only, so after a kahyad restart the persisted undo-window
+// sweep's call for a window opened before it found no record and left the
+// pre-image copy (possibly of a secret-glob file) on disk for good. For an
+// fs_write op with no record, the copy at UndoDir/<task>/<op_id> - the name
+// copyPreImage gives it - is removed (an op id that is not plain hex, i.e.
+// not one copyPreImage could have used verbatim, touches nothing), and the
+// task directory too once it is empty.
 func (s *Server) PurgeExpired(traceID, taskID, tool, opID string) {
 	rec, ok := s.registry.Get(opID)
 	if !ok {
+		s.purgeOrphanCopy(traceID, taskID, tool, opID)
 		return
 	}
 	if rec.CopyPath != "" {
@@ -455,4 +465,22 @@ func (s *Server) PurgeExpired(traceID, taskID, tool, opID string) {
 		}
 	}
 	s.registry.Delete(opID)
+}
+
+// purgeOrphanCopy removes the pre-image copy of an fs_write op this Server
+// holds no record of (PurgeExpired's restart case).
+func (s *Server) purgeOrphanCopy(traceID, taskID, tool, opID string) {
+	if tool != "fs_write" || s.UndoDir == "" || opID == "" || normalizeOpID(opID) != opID {
+		return
+	}
+	dir := filepath.Join(s.UndoDir, taskDirName(taskID))
+	copyPath := filepath.Join(dir, opID)
+	if err := os.Remove(copyPath); err != nil {
+		if !os.IsNotExist(err) {
+			s.Log.With(traceID).Warn("fs_undo_purge_error", "path", copyPath, "task_id", taskID, "tool", tool, "op_id", opID, "err", err.Error())
+		}
+		return
+	}
+	s.Log.With(traceID).Info("fs_undo_orphan_copy_purged", "path", copyPath, "task_id", taskID, "op_id", opID)
+	_ = os.Remove(dir) // only succeeds when no other op's copy is left
 }

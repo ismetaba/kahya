@@ -705,10 +705,12 @@ func run() int {
 	denyGlobs := wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg)
 	log.Info("self_protect_deny_globs", "count", len(denyGlobs)-len(pol.FSWriteDenyGlobs), "policy_count", len(pol.FSWriteDenyGlobs))
 	// FIX-FINAL ingest-raw-copy-outside-secret-globs / attacker2-fsread-
-	// memory-repo-encoded-secret: fs_read also treats kahyad's own copies of
-	// secret notes (raw ingest store, the memory repo's .git, .trash,
-	// backups, brain.db) as secret-lane by path (wiredFSSecretLaneGlobs).
-	fsTool := mcpfs.New(home, denyGlobs, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg), filepath.Join(cfg.DataDir, "undo"), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
+	// memory-repo-encoded-secret / fs-undo-copy-and-trash-escape-secret-
+	// path-glob: fs_read also treats kahyad's own copies of secret notes
+	// (raw ingest store, the memory repo's .git, .trash, backups, brain.db,
+	// fs_write's undo pre-images, the Trash) as secret-lane by path
+	// (wiredFSSecretLaneGlobs).
+	fsTool := mcpfs.New(home, denyGlobs, wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg, mcpfs.TrashDirFor(home)), cfg.UndoDir(), fsPolicyClient, st, server.NewFSLogger(log), server.NewEgressSensitiveMarker(egressGate))
 	// W3-10 gate-test fix: fs_read's secret-lane detection was path-glob
 	// only (HANDOFF's ordering invariant scopes policy.yaml's globs to
 	// paths) - this wires the SEPARATE, content-based half so a file whose
@@ -822,7 +824,7 @@ func run() int {
 	// shell_host and the osascript tools classify the bytes they return
 	// (and their secret-lane path inputs) with fs_read's seam - escalate,
 	// mark, never release on an unrecorded hit.
-	toolSecretGlobs := wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg)
+	toolSecretGlobs := wiredFSSecretLaneGlobs(pol.SecretLaneGlobs, cfg, fsTool.TrashDir)
 	shellRunner.SecretLaneGlobs = toolSecretGlobs
 	shellRunner.OutputGate = server.NewToolOutputGate(st.Queries, st, egressGate, server.LaneSourceShellDocker)
 
@@ -1867,9 +1869,15 @@ func wiredFSDenyGlobs(policyGlobs []string, cfg config.Config) []string {
 // nil) the derived globs still apply. memlane, consolidation, ritual and
 // briefing keep pol.SecretLaneGlobs: they only see memory_dir notes (the
 // indexer skips the dot dirs, and config.Load refuses a raw dir inside it).
-func wiredFSSecretLaneGlobs(policyGlobs []string, cfg config.Config) []string {
+//
+// trashDir is mcp/fs's Trash (mcpfs.TrashDirFor(home)): with the undo
+// pre-image root (config.FSUndoSecretLaneGlobs) it is where fs_delete and
+// fs_write move a secret-glob file's bytes (FIX-FINAL fs-undo-copy-and-
+// trash-escape-secret-path-glob).
+func wiredFSSecretLaneGlobs(policyGlobs []string, cfg config.Config, trashDir string) []string {
 	globs := append(append([]string{}, policyGlobs...), cfg.IngestRawSecretLaneGlobs()...)
-	return append(globs, cfg.KahyaInternalSecretLaneGlobs()...)
+	globs = append(globs, cfg.KahyaInternalSecretLaneGlobs()...)
+	return append(globs, cfg.FSUndoSecretLaneGlobs(trashDir)...)
 }
 
 // hostPortFromURL resolves rawURL's host and port (defaulting to 80/443

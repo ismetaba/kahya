@@ -312,3 +312,39 @@ func TestKahyaInternalSecretLaneGlobsCoverOwnCopiesInBothForms(t *testing.T) {
 		t.Errorf("an unset config yields globs %v, want none", g)
 	}
 }
+
+// TestFSUndoSecretLaneGlobsCoverUndoAndTrash (FIX-FINAL fs-undo-copy-and-
+// trash-escape-secret-path-glob): <DataDir>/undo/** and <trash>/** are
+// covered as configured and symlink-resolved; nothing else of the data dir
+// is, and unset paths yield none.
+func TestFSUndoSecretLaneGlobsCoverUndoAndTrash(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-home")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link-home")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{DataDir: filepath.Join(link, "data")}
+	if cfg.UndoDir() != filepath.Join(link, "data", "undo") {
+		t.Fatalf("UndoDir = %q", cfg.UndoDir())
+	}
+	globs := cfg.FSUndoSecretLaneGlobs(filepath.Join(link, ".Trash"))
+	for _, root := range []string{link, mustEvalSymlinks(t, real)} {
+		for _, p := range []string{"data/undo/task-1/" + strings.Repeat("ab", 32), ".Trash/kontrol.md"} {
+			if !selfProtectHit(t, globs, filepath.Join(root, p)) {
+				t.Errorf("%s is not covered; globs %v", filepath.Join(root, p), globs)
+			}
+		}
+		for _, p := range []string{"data/tmp/rec.wav", "data/logs/kahyad.log", "Documents/x.md"} {
+			if selfProtectHit(t, globs, filepath.Join(root, p)) {
+				t.Errorf("%s must not be secret-lane by path", filepath.Join(root, p))
+			}
+		}
+	}
+	if g := (Config{}).FSUndoSecretLaneGlobs(""); len(g) != 0 {
+		t.Errorf("an unset config yields globs %v, want none", g)
+	}
+}
