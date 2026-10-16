@@ -592,11 +592,14 @@ a cloud model, without changing anything in §2-§6 above:
   where ordinary epoch-millisecond names (`1760000063352.jpg`) pass the
   card rule about one time in nine (FIX-FINAL
   adv2-ls-epoch-names-false-escalation, orchestrator decision). Every name
-  `ls` lists - each stdout line and each entry the directory holds -
-  is PATH-checked instead: joined with its directory and matched against
-  the secret globs (a listed `finans*.md` note or secret-glob directory
-  escalates); a lexicon word in a listed name outside every glob no longer
-  does. git keeps content classification. The globs are policy.yaml's plus kahyad's
+  `ls` lists - each stdout line and each entry the directory holds that
+  ls prints, i.e. not a hidden (dot) entry, since shell_host ls takes no
+  flags - is PATH-checked instead: joined with its directory and matched
+  against the secret globs (a listed `finans*.md` note or secret-glob
+  directory escalates, a kahyad copy store such as `backups` too); a
+  lexicon word in a listed name outside every glob no longer does. A plain
+  `ls ~` stays normal although `~/.Trash/**` is a wired glob (FIX-FINAL
+  adv2-ls-epoch-names-false-escalation, review round 1). git keeps content classification. The globs are policy.yaml's plus kahyad's
   own copies - the raw ingest store, the memory repo's `.git`, `.trash`,
   the backups and brain.db (`wiredFSSecretLaneGlobs`). As for fs_read (owner decision
   G02-2) the task is escalated, the output still returned; a hit that

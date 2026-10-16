@@ -233,3 +233,56 @@ func TestShellHostLsStdoutIsPathCheckedNotContentClassified(t *testing.T) {
 		})
 	}
 }
+
+// TestShellHostLsSkipsHiddenEntriesPlainLsNeverPrints (FIX-FINAL adv2-ls-
+// epoch-names-false-escalation, review round 1): shell_host ls takes no
+// flags, so it never prints a dot entry - but listedNameHit path-checked
+// every os.ReadDir entry, hidden ones included, and the wired Trash glob
+// "<home>/.Trash/**" also matches the directory itself, so every plain
+// `ls ~` (every Mac has ~/.Trash) escalated a normal task to the secret
+// lane. Hidden on-disk entries are no longer path-checked; a hidden name
+// that does come back in stdout still is, and a visible secret-glob
+// directory - in stdout or only on disk - still escalates.
+func TestShellHostLsSkipsHiddenEntriesPlainLsNeverPrints(t *testing.T) {
+	home, _ := repoFixture(t)
+	dir := filepath.Join(home, "h")
+	for _, d := range []string{".Trash", ".git", ".x\nfinans.md", "Documents"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vis := filepath.Join(home, "v")
+	for _, d := range []string{"saglik", "Documents"} {
+		if err := os.MkdirAll(filepath.Join(vis, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	globs := []string{
+		filepath.Join(dir, ".Trash", "**"), filepath.Join(dir, ".git", "**"), filepath.Join(dir, "*finans.md"),
+		filepath.Join(vis, "saglik", "**"),
+	}
+	for _, tc := range []struct {
+		name           string
+		target, stdout string
+		wantEscalation bool
+	}{
+		{"hidden entries plain ls never prints", dir, "Documents\n", false},
+		{"a hidden name that is in stdout", dir, ".Trash\nDocuments\n", true},
+		{"visible secret-glob directory in stdout", vis, "Documents\nsaglik\n", true},
+		{"visible secret-glob directory only on disk", vis, "Documents\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			esc := &gateEscalator{}
+			h := newTestHostExec(home, &fakePolicyClient{decision: allowDecision("tok")}, &fakeLedger{}, newFakeLogger(),
+				&fakeExecutor{hostResult: &Result{Stdout: []byte(tc.stdout)}})
+			h.SecretLaneGlobs = globs
+			h.OutputGate = mcpfs.OutputGate{Classifier: substringClassifier{"never-present"}, Escalator: esc}
+			if _, err := h.Handle(context.Background(), "tr", "task-1", HostExecArgs{Command: "ls", Args: []string{tc.target}}); err != nil {
+				t.Fatal(err)
+			}
+			if got := esc.count() == 1; got != tc.wantEscalation {
+				t.Fatalf("escalations = %d, want escalation=%v", esc.count(), tc.wantEscalation)
+			}
+		})
+	}
+}

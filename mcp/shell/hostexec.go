@@ -354,12 +354,22 @@ func (h *HostExec) gateOutput(ctx context.Context, traceID, taskID string, plan 
 // listedNameHit reports whether an ls of plan's targets listed a name that
 // is secret-lane by path: for every target that is a directory, each line
 // of stdout (the bytes returned - on the receipt-replay path the stored
-// ones) and each entry the directory holds now (os.ReadDir, so a name with
-// a newline that splits its stdout line is still checked whole) is joined
-// with the target and matched against the secret globs (MatchesAnyGlobCI;
-// a glob error is a hit). A listed secret-glob directory counts too
-// ("<dir>/**" matches the directory itself). A directory that cannot be
-// read adds no names beyond stdout's.
+// ones) and each entry the directory holds now that ls prints (os.ReadDir,
+// so a name with a newline that splits its stdout line is still checked
+// whole) is joined with the target and matched against the secret globs
+// (MatchesAnyGlobCI; a glob error is a hit). A listed secret-glob directory
+// counts too ("<dir>/**" matches the directory itself). A directory that
+// cannot be read adds no names beyond stdout's.
+//
+// A hidden on-disk entry (a name starting with ".") is not added
+// (FIX-FINAL adv2-ls-epoch-names-false-escalation, review round 1):
+// shell_host ls takes no flags (validatePlainPaths), so it never prints
+// one - and kahyad's own copy-store globs name hidden directories every
+// home or memory repo holds (mcp/fs's "<home>/.Trash/**", which also
+// matches ~/.Trash itself, "<memory_dir>/.git/**", ".trash/**"), so
+// checking them escalated every plain `ls ~` on a Mac to the secret lane
+// while the output named nothing secret. A hidden name that does come
+// back in stdout (an ls that implies -A, as for root) is still checked.
 func (h *HostExec) listedNameHit(plan hostExecPlan, stdout string) bool {
 	if len(h.SecretLaneGlobs) == 0 {
 		return false
@@ -376,7 +386,9 @@ func (h *HostExec) listedNameHit(plan hostExecPlan, stdout string) bool {
 		names := append([]string(nil), lines...)
 		if entries, rerr := os.ReadDir(plan.argv[i+1]); rerr == nil {
 			for _, e := range entries {
-				names = append(names, e.Name())
+				if !strings.HasPrefix(e.Name(), ".") {
+					names = append(names, e.Name())
+				}
 			}
 		}
 		for _, name := range names {
