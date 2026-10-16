@@ -20,10 +20,13 @@
 # The dev daemon reads prod's shared config.yaml but never acts on prod's
 # identities (FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-
 # jobs): it loads with no Telegram chat/user id and never reads the real
-# kahya.telegram Keychain item (no second long-poller on prod's bot), and it
-# syncs no com.kahya.job.* LaunchAgent. Only the dev-only
-# KAHYA_TELEGRAM_TOKEN_OVERRIDE (hermetic tests) re-enables a dev bot; this
-# script and the dev plist never set it.
+# kahya.telegram Keychain item (no second long-poller on prod's bot), it
+# syncs no com.kahya.job.* LaunchAgent, and it anchors nothing: no
+# anchor_remote, no anchor_local_fallback_path, no real kahya.anchor deploy key
+# (FIX-FINAL ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-
+# telegram). Only the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE /
+# KAHYA_ANCHOR_KEY_OVERRIDE (hermetic tests) re-enable a dev bot / a dev
+# anchor remote; this script and the dev plist never set them.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

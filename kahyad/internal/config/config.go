@@ -1285,11 +1285,24 @@ func Load() (Config, error) {
 	// verify` then failed with a permanent digest_mismatch / remote_ahead
 	// false tamper alarm. A restore scratch ledger is a fork of prod by
 	// construction: with no remote, Pusher.Run is a no-op and the Verifier
-	// checks local consistency only. Restore-only: the dev harnesses rely
-	// on anchor_remote under KAHYA_ENV=dev.
-	if cfg.Env == EnvRestore {
-		cfg.AnchorRemote = ""
+	// checks local consistency only.
+	//
+	// FIX-FINAL ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-
+	// telegram: restore-only was not enough - a real-HOME KAHYA_ENV=dev
+	// daemon (kahya-dev-env.sh's provisioning boot, the com.kahya.dev agent)
+	// appended its own ledger's line to prod's append-only fallback file at
+	// boot and at shutdown, before any remote check (permanent false
+	// forensic evidence), and could push into prod's remote. Every non-prod
+	// profile therefore drops the fallback path (prod's file; no harness
+	// sets one), and keeps the remote only when it is dev AND carries the
+	// dev-only AnchorKeyOverrideEnvVar - the hermetic W4/W6 gates and
+	// scripts/accept_w4.sh, whose temp HOME's own config.yaml names their
+	// own file:// remote. One anchor repo belongs to exactly one brain.db.
+	if cfg.Env != EnvProd {
 		cfg.AnchorLocalFallbackPath = ""
+		if !(cfg.Env == EnvDev && os.Getenv(AnchorKeyOverrideEnvVar) != "") {
+			cfg.AnchorRemote = ""
+		}
 	}
 
 	// FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs:
@@ -1307,6 +1320,13 @@ func Load() (Config, error) {
 
 	return cfg, nil
 }
+
+// AnchorKeyOverrideEnvVar is the dev-only KAHYA_ANCHOR_KEY_OVERRIDE
+// (kahyad/internal/anchor.AnchorKeyOverrideEnvVar, the same literal - that
+// package does not import config; kahyad TestOverrideEnvVarNamesAgree pins
+// them equal). Its presence is what lets a dev profile keep anchor_remote
+// (Load).
+const AnchorKeyOverrideEnvVar = "KAHYA_ANCHOR_KEY_OVERRIDE"
 
 // TelegramTokenOverrideEnvVar is the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE
 // (W3-10's hermetic gate seam; kahyad main.go devTelegramTokenSource

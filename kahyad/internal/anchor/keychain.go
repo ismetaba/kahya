@@ -1,6 +1,7 @@
 package anchor
 
 import (
+	"fmt"
 	"os"
 
 	"kahya/kahyad/internal/secrets"
@@ -53,7 +54,7 @@ type devOverrideWarner func()
 // devOverridableDeployKey wraps real (the production AnchorDeployKey()
 // reader) with the dev-only override above - resolveDeployKey's own return
 // value. Read tries the override FIRST (only ever taking effect when
-// env=="dev"), falling through to the real Keychain read otherwise -
+// env=="dev"), falling through to the real Keychain read in prod only -
 // exactly the same order/semantics as main.go's devTelegramTokenSource.
 type devOverridableDeployKey struct {
 	real DeployKeyReader
@@ -61,6 +62,14 @@ type devOverridableDeployKey struct {
 	warn devOverrideWarner
 }
 
+// Read returns the override under dev, else the real key in prod only.
+// FIX-FINAL ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-
+// telegram: only prod ever reads the real kahya.anchor deploy key. A dev
+// daemon without the override, and every other non-prod profile, get an
+// error instead (the push fails before any SSH), so a side-by-side dev or
+// restore daemon can never authenticate as prod's anchor identity.
+// config.Load already drops such a profile's anchor_remote; this is the
+// Keychain-side backstop.
 func (d devOverridableDeployKey) Read() (string, error) {
 	if override := os.Getenv(AnchorKeyOverrideEnvVar); override != "" {
 		if d.env == "dev" {
@@ -69,6 +78,9 @@ func (d devOverridableDeployKey) Read() (string, error) {
 		if d.warn != nil {
 			d.warn()
 		}
+	}
+	if d.env != "prod" {
+		return "", fmt.Errorf("anchor: KAHYA_ENV=%s never reads the real kahya.anchor deploy key (dev: set %s)", d.env, AnchorKeyOverrideEnvVar)
 	}
 	return d.real.Read()
 }

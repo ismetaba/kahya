@@ -1646,6 +1646,14 @@ func run() int {
 	// alarm reaches Telegram exactly like every other alarm-class event
 	// does.
 	anchorRepoDir := filepath.Join(cfg.DataDir, "anchor-repo")
+	// FIX-FINAL ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-
+	// telegram: config.Load drops a non-prod profile's anchor remote (unless
+	// dev carries the dev-only key override) and always its fallback path,
+	// so Pusher.Run is a no-op here and verify checks local consistency
+	// only - say so once.
+	if cfg.Env != config.EnvProd && cfg.AnchorRemote == "" {
+		log.Info("anchor_disabled", "reason", "non_prod_profile", "env", cfg.Env)
+	}
 	anchorGitRunner := anchor.NewExecGitRunner()
 	warnAnchorKeyOverrideIgnored := func() {
 		log.Warn("anchor_key_override_ignored", "reason", "KAHYA_ANCHOR_KEY_OVERRIDE set outside KAHYA_ENV=dev")

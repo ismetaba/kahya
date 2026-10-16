@@ -50,14 +50,51 @@ func TestDevOverridableDeployKeyIgnoresOverrideOutsideDev(t *testing.T) {
 	}
 }
 
-// TestDevOverridableDeployKeyFallsThroughWhenUnset proves an unset override
-// env var never changes behavior at all - the real reader is always
-// consulted.
-func TestDevOverridableDeployKeyFallsThroughWhenUnset(t *testing.T) {
-	t.Setenv(AnchorKeyOverrideEnvVar, "")
-	d := devOverridableDeployKey{real: fakeDeployKeyReader{}, env: "dev"}
+// countingDeployKeyReader stands in for the real kahya.anchor Keychain
+// read and counts how often it was consulted.
+type countingDeployKeyReader struct{ reads int }
 
-	if _, err := d.Read(); err == nil {
-		t.Fatal("Read() error = nil, want the real (failing) reader consulted when no override is set")
+func (c *countingDeployKeyReader) Read() (string, error) {
+	c.reads++
+	return "real-anchor-deploy-key", nil
+}
+
+// TestDeployKeyNeverReadsRealKeychainOutsideProd (FIX-FINAL ops-config-r2-
+// dev-profile-anchors-into-prod-and-polls-prod-telegram): only prod reads
+// the real kahya.anchor deploy key. A dev daemon gets the dev-only override
+// or an error (its push fails before SSH), and every other profile never
+// honors the override and never reads the real key - defense in depth
+// under config.Load, which already drops a non-prod profile's anchor remote.
+// (Replaces TestDevOverridableDeployKeyFallsThroughWhenUnset: dev without
+// the override used to fall through to the real Keychain item.)
+func TestDeployKeyNeverReadsRealKeychainOutsideProd(t *testing.T) {
+	for _, tc := range []struct {
+		name, env, override string
+		want                string
+		wantErr, wantWarn   bool
+		wantRealReads       int
+	}{
+		{"prod", "prod", "", "real-anchor-deploy-key", false, false, 1},
+		{"prod_ignores_override", "prod", "dev-key", "real-anchor-deploy-key", false, true, 1},
+		{"dev_override", "dev", "dev-key", "dev-key", false, false, 0},
+		{"dev_without_override", "dev", "", "", true, false, 0},
+		{"restore_with_override", "restore", "dev-key", "", true, true, 0},
+		{"other_profile", "redteam", "", "", true, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(AnchorKeyOverrideEnvVar, tc.override)
+			real := &countingDeployKeyReader{}
+			warned := false
+			got, err := devOverridableDeployKey{real: real, env: tc.env, warn: func() { warned = true }}.Read()
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Errorf("Read() = %q, %v; want %q (error %v)", got, err, tc.want, tc.wantErr)
+			}
+			if real.reads != tc.wantRealReads {
+				t.Errorf("real Keychain reads = %d, want %d", real.reads, tc.wantRealReads)
+			}
+			if warned != tc.wantWarn {
+				t.Errorf("override-ignored warning = %v, want %v", warned, tc.wantWarn)
+			}
+		})
 	}
 }

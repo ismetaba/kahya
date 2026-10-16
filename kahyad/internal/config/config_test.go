@@ -2109,32 +2109,82 @@ func TestLoadIngestDefaultsAndValidation(t *testing.T) {
 // restore drill's scratch daemon inherited prod's anchor_remote and pushed
 // its forked ledger's checkpoint there - a permanent false tamper alarm on
 // prod's next verify. Under KAHYA_ENV=restore the remote and the local
-// fallback file are cleared (file and env layers alike); dev keeps them
-// (the hermetic harnesses rely on that).
+// fallback file are cleared (file and env layers alike), even with the
+// dev-only anchor key override set. The dev profile's rule is
+// TestNonProdProfileNeverAnchorsIntoProd.
 func TestRestoreProfileNeverAnchors(t *testing.T) {
-	for _, env := range []string{EnvRestore, EnvDev} {
-		t.Run(env, func(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KAHYA_ENV", EnvRestore)
+	t.Setenv("KAHYA_ANCHOR_KEY_OVERRIDE", "dev-placeholder-key")
+	writeConfigYAML(t, home, "anchor_remote: git@example.invalid:kahya/anchor.git\nanchor_local_fallback_path: /tmp/kahya-anchor-fallback.jsonl\n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AnchorRemote != "" || cfg.AnchorLocalFallbackPath != "" {
+		t.Fatalf("restore: remote=%q fallback=%q, want both empty", cfg.AnchorRemote, cfg.AnchorLocalFallbackPath)
+	}
+	t.Setenv("KAHYA_ANCHOR_REMOTE", "git@example.invalid:kahya/env.git")
+	if cfg, err = Load(); err != nil || cfg.AnchorRemote != "" {
+		t.Fatalf("restore with KAHYA_ANCHOR_REMOTE: remote=%q err=%v, want empty", cfg.AnchorRemote, err)
+	}
+}
+
+// TestNonProdProfileNeverAnchorsIntoProd (FIX-FINAL ops-config-r2-dev-
+// profile-anchors-into-prod-and-polls-prod-telegram): the restore-only
+// clearing above left a real-HOME KAHYA_ENV=dev daemon (kahya-dev-env.sh's
+// provisioning boot, the com.kahya.dev agent) with prod's anchor_remote and
+// anchor_local_fallback_path: its boot push appended the dev ledger's line
+// to prod's append-only (chflags sappnd) fallback file before any remote
+// check - permanent false forensic evidence - and could push to prod's
+// remote. Every non-prod profile now loses the fallback path, and keeps
+// the remote only as dev WITH the dev-only KAHYA_ANCHOR_KEY_OVERRIDE (the
+// hermetic W4/W6 gates and accept_w4.sh: their own temp HOME's file://
+// remote). Env layers are cleared too. Prod is unchanged.
+func TestNonProdProfileNeverAnchorsIntoProd(t *testing.T) {
+	const remote = "git@example.invalid:kahya/anchor.git"
+	for _, tc := range []struct {
+		name, env, override string
+		viaEnv              bool
+		wantRemote          bool
+		wantFallback        bool
+	}{
+		{"prod", "", "", false, true, true},
+		{"prod_with_override", "", "key", false, true, true},
+		{"dev", "dev", "", false, false, false},
+		{"dev_env_layer", "dev", "", true, false, false},
+		{"dev_with_override", "dev", "key", false, true, false},
+		{"dev_with_override_env_layer", "dev", "key", true, true, false},
+		{"restore_with_override", "restore", "key", false, false, false},
+		{"other_profile_with_override", "redteam", "key", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			clearEnv(t)
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			t.Setenv("KAHYA_ENV", env)
-			writeConfigYAML(t, home, "anchor_remote: git@example.invalid:kahya/anchor.git\nanchor_local_fallback_path: /tmp/kahya-anchor-fallback.jsonl\n")
+			t.Setenv("KAHYA_ENV", tc.env)
+			t.Setenv("KAHYA_ANCHOR_KEY_OVERRIDE", tc.override)
+			fallback := filepath.Join(home, "prod-anchors.log")
+			if tc.viaEnv {
+				t.Setenv("KAHYA_ANCHOR_REMOTE", remote)
+				t.Setenv("KAHYA_ANCHOR_LOCAL_FALLBACK_PATH", fallback)
+			} else {
+				writeConfigYAML(t, home, "anchor_remote: "+remote+"\nanchor_local_fallback_path: "+fallback+"\n")
+			}
 			cfg, err := Load()
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}
-			if env == EnvRestore {
-				if cfg.AnchorRemote != "" || cfg.AnchorLocalFallbackPath != "" {
-					t.Fatalf("restore: remote=%q fallback=%q, want both empty", cfg.AnchorRemote, cfg.AnchorLocalFallbackPath)
-				}
-				t.Setenv("KAHYA_ANCHOR_REMOTE", "git@example.invalid:kahya/env.git")
-				if cfg, err = Load(); err != nil || cfg.AnchorRemote != "" {
-					t.Fatalf("restore with KAHYA_ANCHOR_REMOTE: remote=%q err=%v, want empty", cfg.AnchorRemote, err)
-				}
-				return
+			if got := cfg.AnchorRemote == remote; got != tc.wantRemote {
+				t.Errorf("env=%q override=%q: AnchorRemote = %q, want kept=%v", tc.env, tc.override, cfg.AnchorRemote, tc.wantRemote)
 			}
-			if cfg.AnchorRemote == "" {
-				t.Fatalf("dev: remote=%q, want the remote kept", cfg.AnchorRemote)
+			if got := cfg.AnchorLocalFallbackPath == fallback; got != tc.wantFallback {
+				t.Errorf("env=%q override=%q: AnchorLocalFallbackPath = %q, want kept=%v", tc.env, tc.override, cfg.AnchorLocalFallbackPath, tc.wantFallback)
+			}
+			if !tc.wantRemote && cfg.AnchorRemote != "" || !tc.wantFallback && cfg.AnchorLocalFallbackPath != "" {
+				t.Errorf("env=%q: a cleared anchor field kept another value (remote=%q fallback=%q)", tc.env, cfg.AnchorRemote, cfg.AnchorLocalFallbackPath)
 			}
 		})
 	}

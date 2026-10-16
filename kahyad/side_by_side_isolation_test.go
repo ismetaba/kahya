@@ -4,6 +4,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"kahya/kahyad/internal/anchor"
+	"kahya/kahyad/internal/config"
 )
 
 // xmlCommentRE matches one <!-- ... --> comment (non-greedy, multi-line).
@@ -34,18 +37,33 @@ var realHomeSideBySideBoots = []string{
 }
 
 // TestRealHomeSideBySideProfilesNeverCarryDevOnlyOverrides (FIX-FINAL
-// adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs): a non-prod
-// daemon keeps prod's Telegram identity only under the dev-only token
-// override (config.Load) - which exists for the hermetic temp-HOME gates.
-// The real-HOME side-by-side boots must never set it, or the dev daemon
-// would long-poll prod's bot again.
+// adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs, ops-config-r2-
+// dev-profile-anchors-into-prod-and-polls-prod-telegram): a non-prod daemon
+// keeps prod's Telegram identity only under the dev-only token override,
+// and its anchor remote only under the dev-only anchor key override
+// (config.Load) - both exist for the hermetic temp-HOME gates. The
+// real-HOME side-by-side boots must never set either, or the dev daemon
+// would long-poll prod's bot or anchor into prod's remote again.
 func TestRealHomeSideBySideProfilesNeverCarryDevOnlyOverrides(t *testing.T) {
 	for _, rel := range realHomeSideBySideBoots {
 		src := codeOnly(rel, readRepoFile(t, rel))
-		for _, override := range []string{telegramTokenOverrideEnvVar} {
+		for _, override := range []string{telegramTokenOverrideEnvVar, anchor.AnchorKeyOverrideEnvVar} {
 			if strings.Contains(src, override) {
-				t.Errorf("%s sets %s: a real-HOME %s daemon would act on prod's identity", rel, override, "side-by-side")
+				t.Errorf("%s sets %s: a real-HOME side-by-side daemon would act on prod's identity", rel, override)
 			}
 		}
+	}
+}
+
+// TestOverrideEnvVarNamesAgree: config.Load's anchor clearing and the anchor
+// package's deploy-key override read the same variable (the anchor package
+// does not import config), and main.go's Telegram override constant is
+// config's.
+func TestOverrideEnvVarNamesAgree(t *testing.T) {
+	if config.AnchorKeyOverrideEnvVar != anchor.AnchorKeyOverrideEnvVar {
+		t.Errorf("config.AnchorKeyOverrideEnvVar = %q, anchor.AnchorKeyOverrideEnvVar = %q", config.AnchorKeyOverrideEnvVar, anchor.AnchorKeyOverrideEnvVar)
+	}
+	if telegramTokenOverrideEnvVar != config.TelegramTokenOverrideEnvVar {
+		t.Errorf("telegramTokenOverrideEnvVar = %q, want config's %q", telegramTokenOverrideEnvVar, config.TelegramTokenOverrideEnvVar)
 	}
 }

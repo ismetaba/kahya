@@ -83,9 +83,20 @@ anchor_interval_hours: 6                            # optional; 6 is the default
 
 Restart kahyad (or `launchctl kickstart -k gui/$(id -u)/com.kahya.kahyad`).
 Until `anchor_remote` is set, every anchor push is a permanent no-op
-(kahyad/internal/anchor.Pusher.Run's own doc comment) — this is also
-exactly why dev/test never pushes to a real remote: `anchor_remote`
-defaults to empty.
+(kahyad/internal/anchor.Pusher.Run's own doc comment).
+
+Only the prod daemon anchors with these settings. Every profile reads this
+same config.yaml, but a non-prod daemon (`KAHYA_ENV=dev`, the restore
+drill's `KAHYA_ENV=restore`, any other profile) loads with no
+`anchor_local_fallback_path` and no `anchor_remote`, and never reads the
+real `kahya.anchor` deploy key. The single exception is a dev daemon that
+carries the dev-only `KAHYA_ANCHOR_KEY_OVERRIDE`: the hermetic W4/W6 gates
+and `scripts/accept_w4.sh` set it, together with a throwaway `file://`
+remote in their own temp HOME. `scripts/kahya-dev-env.sh` and the
+com.kahya.dev agent never set it, so a dev daemon running beside prod
+never appends to prod's fallback file and never pushes to prod's remote
+(FIX-FINAL ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-telegram).
+One anchor repo belongs to exactly one brain.db.
 
 ## 4 · Confirm it works
 

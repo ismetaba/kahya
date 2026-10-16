@@ -20,13 +20,17 @@
       traffic is denied there (unknown token) - fail-closed, and the dev
       policy denies all egress anyway.
 
-    * Telegram / LaunchAgents: none. The dev daemon reads prod's shared
-      config.yaml, but a non-prod profile loads with no Telegram chat/user
-      id, never reads the real kahya.telegram Keychain item (so it never
-      long-polls prod's bot) and syncs no com.kahya.job.* LaunchAgent
-      (FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs).
-      Only the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE (hermetic tests)
-      re-enables a dev bot; this plist never sets it.
+    * Telegram / LaunchAgents / anchor: none. The dev daemon reads prod's
+      shared config.yaml, but a non-prod profile loads with no Telegram
+      chat/user id, never reads the real kahya.telegram Keychain item (so
+      it never long-polls prod's bot), syncs no com.kahya.job.* LaunchAgent
+      (FIX-FINAL adv2-dev-profile-side-by-side-shares-prod-bot-anchor-jobs)
+      and anchors nothing: no anchor_remote, no anchor_local_fallback_path,
+      no real kahya.anchor deploy key (FIX-FINAL
+      ops-config-r2-dev-profile-anchors-into-prod-and-polls-prod-telegram).
+      Only the dev-only KAHYA_TELEGRAM_TOKEN_OVERRIDE /
+      KAHYA_ANCHOR_KEY_OVERRIDE (hermetic tests) re-enable a dev bot / a dev
+      anchor remote; this plist never sets them.
 
   All of that separation but the egress port follows automatically from
   KAHYA_ENV=dev (the generic profile resolution in kahyad/internal/config),
