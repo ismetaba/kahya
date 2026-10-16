@@ -187,6 +187,99 @@ func (execRunner) Run(args ...string) error {
 	return nil
 }
 
+// LoadedPathReader is an optional Runner capability (the real execRunner
+// has it; a test fake may not): the plist path launchd loaded a service
+// from. Sync uses it to repair a job whose on-disk plist is already right
+// but whose LOADED definition came from somewhere else (FIX-FINAL
+// ops-config-r2-hermetic-boot-replaces-real-launchd-jobs: a hermetic daemon
+// with a temp HOME once bootstrapped its own temp-dir plists under the
+// user's labels, and the content-equality shortcut alone never repaired
+// that).
+type LoadedPathReader interface {
+	// LoadedPlistPath returns the path `launchctl print <serviceTarget>`
+	// reports; loaded=false (and no error) when launchd knows no such
+	// service.
+	LoadedPlistPath(serviceTarget string) (path string, loaded bool, err error)
+}
+
+// launchctlNoSuchService is `launchctl print`'s exit status for a service
+// the domain does not know ("Could not find service ...").
+const launchctlNoSuchService = 113
+
+// LoadedPlistPath runs the read-only `launchctl print <serviceTarget>`.
+func (execRunner) LoadedPlistPath(serviceTarget string) (string, bool, error) {
+	out, err := exec.Command("launchctl", "print", serviceTarget).CombinedOutput()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == launchctlNoSuchService {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("launchctl print %s: %w: %s", serviceTarget, err, strings.TrimSpace(string(out)))
+	}
+	p, ok := parseLaunchctlPrintPath(out)
+	if !ok {
+		return "", true, fmt.Errorf("launchctl print %s: no top-level path line", serviceTarget)
+	}
+	return p, true, nil
+}
+
+// parseLaunchctlPrintPath extracts the service's own top-level
+// "\tpath = <plist>" line from `launchctl print` output (nested sections are
+// indented deeper and "stdout path = ..." has another key).
+func parseLaunchctlPrintPath(out []byte) (string, bool) {
+	for _, line := range strings.Split(string(out), "\n") {
+		if rest, ok := strings.CutPrefix(line, "\tpath = "); ok {
+			if p := strings.TrimSpace(rest); p != "" {
+				return p, true
+			}
+		}
+	}
+	return "", false
+}
+
+// loadedElsewhere reports why a job whose on-disk plist is already current
+// must still be re-bootstrapped: "not_loaded" (launchd has no such service)
+// or "loaded_from_other_plist" (its definition came from another file, e.g.
+// a hermetic test's temp HOME). "" means it is loaded from path - or that
+// this runner cannot tell (no LoadedPathReader, or a launchctl print
+// failure, which is logged), in which case nothing is touched.
+func loadedElsewhere(runner Runner, serviceTarget, path string, jsonl *logx.Logger, jobName string) (reason, loadedPath string) {
+	r, ok := runner.(LoadedPathReader)
+	if !ok {
+		return "", ""
+	}
+	loadedPath, loaded, err := r.LoadedPlistPath(serviceTarget)
+	if err != nil {
+		if jsonl != nil {
+			jsonl.Warn("job_load_check_failed", "job_name", jobName, "err", err.Error())
+		}
+		return "", ""
+	}
+	if !loaded {
+		return "not_loaded", ""
+	}
+	if !samePlistPath(loadedPath, path) {
+		return "loaded_from_other_plist", loadedPath
+	}
+	return "", loadedPath
+}
+
+// samePlistPath compares two plist paths after cleaning them and resolving
+// symlinks where they resolve (a deleted temp file keeps its cleaned form).
+func samePlistPath(a, b string) bool {
+	norm := func(p string) string {
+		p = filepath.Clean(p)
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		if dir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+			return filepath.Join(dir, filepath.Base(p))
+		}
+		return p
+	}
+	return norm(a) == norm(b)
+}
+
 // SyncOptions bundles Sync's fixed inputs, independent of the jobs list
 // itself.
 type SyncOptions struct {
@@ -212,10 +305,14 @@ var currentUIDFn = func() string { return strconv.Itoa(os.Getuid()) }
 // of com.kahya.job.<name> LaunchAgents on disk (and bootstrapped into
 // gui/$UID) exactly matches jobs (task spec step 5). It is idempotent: a
 // job whose rendered plist content is UNCHANGED from what's already on
-// disk is left completely alone — no bootout/bootstrap cycle, no
-// launchctl call at all — so repeated Sync calls (every prod kahyad boot,
-// plus every manual `kahyad -sync-jobs`) never needlessly restart an
-// already-correct LaunchAgent. A job whose plist is new or changed gets
+// disk is left alone — no bootout/bootstrap cycle; with a LoadedPathReader
+// runner (the real one) only a read-only `launchctl print` confirms launchd
+// runs it from that very file — so repeated Sync calls (every prod kahyad
+// boot, plus every manual `kahyad -sync-jobs`) never needlessly restart an
+// already-correct LaunchAgent. An unchanged job that launchd does not run
+// from that file (not loaded, or loaded from another plist - FIX-FINAL
+// ops-config-r2-hermetic-boot-replaces-real-launchd-jobs) is re-bootstrapped
+// from it (JSONL job_load_repaired). A job whose plist is new or changed gets
 // `launchctl bootout` (errors ignored — "not loaded" is the expected,
 // common case for a brand-new job) followed by `launchctl bootstrap`
 // (this one's error DOES propagate — a failed install is a real
@@ -251,16 +348,23 @@ func Sync(jobs []config.JobConfig, opts SyncOptions, runner Runner, jsonl *logx.
 		}
 		path := filepath.Join(opts.LaunchAgentsDir, plistFileName(job.Name))
 
+		label := labelFor(job.Name)
 		existing, readErr := os.ReadFile(path)
 		if readErr == nil && string(existing) == rendered {
-			continue // idempotent: content unchanged, nothing to do
-		}
-
-		if err := os.WriteFile(path, []byte(rendered), 0o600); err != nil {
+			// Idempotent: content unchanged - unless launchd runs this
+			// label from another plist (or not at all), which only a
+			// bootout+bootstrap of OUR file repairs.
+			reason, loadedPath := loadedElsewhere(runner, "gui/"+uid+"/"+label, path, jsonl, job.Name)
+			if reason == "" {
+				continue
+			}
+			if jsonl != nil {
+				jsonl.Warn("job_load_repaired", "job_name", job.Name, "reason", reason, "loaded_path", loadedPath, "plist", path)
+			}
+		} else if err := os.WriteFile(path, []byte(rendered), 0o600); err != nil {
 			return fmt.Errorf("scheduler: write plist %s: %w", path, err)
 		}
 
-		label := labelFor(job.Name)
 		_ = runner.Run("bootout", "gui/"+uid+"/"+label) // ignore: "not loaded" is expected for a new/never-installed job
 		if err := runner.Run("bootstrap", "gui/"+uid, path); err != nil {
 			return fmt.Errorf("scheduler: bootstrap job %q: %w", job.Name, err)
