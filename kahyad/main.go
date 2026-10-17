@@ -1568,6 +1568,11 @@ func run() int {
 	taskDispatcher.SetAnthproxyOpener(func(_ context.Context, taskID, traceID string) (string, string, func() error, error) {
 		return srv.NewTaskProxy(taskID, traceID)
 	})
+	// FIX-FINAL tux-resumed-task-answer-never-delivered: a redispatched
+	// task's answer goes to the background-result channel once it reached
+	// 'done' (HANDOFF §4 IPC: Hammerspoon + Telegram, Telegram behind its
+	// FIX-U-5 gate); before, it reached no surface at all.
+	taskDispatcher.SetResultDelivery(localDelivery)
 
 	// ctx below is the TICK's own context (scheduler.runTickRecovered: a
 	// context.Background() derivative); FIX-I-5: both closures also check

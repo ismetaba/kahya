@@ -50,3 +50,18 @@ func TestUserActionNoticesReachAUserSurface(t *testing.T) {
 		t.Errorf("the speaker's notices must stay local and never re-enter the Speaker: %q", speakerSite)
 	}
 }
+
+// TestResumedTaskAnswerReachesTheBackgroundChannel (FIX-FINAL
+// tux-resumed-task-answer-never-delivered): the outbox dispatcher hands a
+// redispatched task's answer to localDelivery (Hammerspoon + Telegram).
+func TestResumedTaskAnswerReachesTheBackgroundChannel(t *testing.T) {
+	set := onlyCallSite(t, "taskDispatcher", "SetResultDelivery", "localDelivery")
+	disp := onlyCallSite(t, "outbox", "NewDispatcher", "")
+	if set.offset < disp.offset {
+		t.Error("SetResultDelivery is called before the dispatcher exists")
+	}
+	run := onlyCallSite(t, "srv", "Run", "")
+	if set.offset > run.offset {
+		t.Error("SetResultDelivery must be wired before srv.Run")
+	}
+}

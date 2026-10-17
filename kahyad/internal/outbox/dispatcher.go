@@ -25,6 +25,12 @@
 // A worker's own terminal error line fails the task (FIX-I-2's first-spawn
 // rule, server.decidePostSpawn).
 //
+// FIX-FINAL tux-resumed-task-answer-never-delivered: a redispatch that
+// reached 'done' hands the worker's answer to the background-result channel
+// (SetResultDelivery; HANDOFF §4 IPC), once, asynchronously - before, the
+// run had no OnDelta callback and the answer the user was told would come
+// was dropped.
+//
 // This package depends on kahyad/internal/task (for the status enum,
 // Machine, and the outbox payload shape), never the other way around -
 // kahyad/internal/task never imports this package, so there is no import
@@ -55,9 +61,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"kahya/kahyad/internal/spawn"
 	"kahya/kahyad/internal/store/sqlcgen"
@@ -211,6 +220,40 @@ var _ LiveRegistry = (*task.LiveRegistry)(nil)
 // cloud-lane task through the outbox).
 type AnthproxyOpener func(ctx context.Context, taskID, traceID string) (baseURL, apiKey string, closeFn func() error, err error)
 
+// ResultDelivery is the background-result channel a redispatched task's
+// answer goes to (FIX-FINAL tux-resumed-task-answer-never-delivered; HANDOFF
+// §4 IPC: "arka-plan görev sonuçları aynı kanaldan trace_id ile döner").
+// main.go wires localDelivery (ui.FanOutDelivery: Telegram behind its
+// FIX-U-5 session + content gate, the Hammerspoon banner locally). text is
+// shown; spoken is the short id-free line the local Speaker says instead
+// (orchestrator decision (a): speech never reads task ids, trace ids, hex
+// or CLI commands aloud). Returns true iff some surface took the text.
+type ResultDelivery interface {
+	SendNotice(ctx context.Context, traceID, text, spoken string) bool
+}
+
+// User-facing texts of the resumed-answer delivery (Turkish, byte-exact,
+// pinned in resume_result_test.go).
+const (
+	// MsgResumedAnswerFmt: %s = task id, %s = the answer (bounded).
+	MsgResumedAnswerFmt = "Devam ettirilen görev tamamlandı (%s). Cevap:\n\n%s"
+	// MsgResumedAnswerSpoken is what the Speaker says for it.
+	MsgResumedAnswerSpoken = "Devam ettirilen bir görev tamamlandı; cevabı bildirimde."
+	// MsgResumedAnswerTruncated ends an answer cut at maxResumedAnswerRunes.
+	MsgResumedAnswerTruncated = "\n\n… (cevabın devamı kısaltıldı)"
+)
+
+// maxResumedAnswerRunes bounds the delivered answer so the whole notice
+// stays under Telegram's 4096-character message limit (a longer text is
+// refused by sendMessage and would reach Telegram not at all).
+const maxResumedAnswerRunes = 3500
+
+// EventResumeResultDelivered is ledgered once per redispatch that reached
+// 'done' while a ResultDelivery is wired: {task_id, outbox_id, bytes,
+// delivered, truncated?, reason?}. It never carries the answer text - the
+// ledger is append-only and anchored; the text goes to the channel only.
+const EventResumeResultDelivered = "outbox.resume_result_delivered"
+
 // Dispatcher is the W4-02 outbox redelivery loop.
 type Dispatcher struct {
 	store           Store
@@ -219,6 +262,12 @@ type Dispatcher struct {
 	spawnCfg        spawn.Config
 	live            LiveRegistry
 	anthproxyOpener AnthproxyOpener
+	// resultDelivery receives a redispatched task's answer once it reached
+	// 'done' (SetResultDelivery). nil = no delivery.
+	resultDelivery ResultDelivery
+	// deliveries tracks the asynchronous answer deliveries still running,
+	// so tests can wait for them; production never waits.
+	deliveries sync.WaitGroup
 
 	batchSize     int
 	leaseDuration time.Duration
@@ -294,6 +343,12 @@ func (d *Dispatcher) shuttingDown() bool { return d.baseCtx != nil && d.baseCtx.
 // SetAnthproxyOpener wires opener - see AnthproxyOpener's own doc
 // comment. Safe to leave unset (nil is the pre-W4-04 default posture).
 func (d *Dispatcher) SetAnthproxyOpener(opener AnthproxyOpener) { d.anthproxyOpener = opener }
+
+// SetResultDelivery wires the background-result channel a redispatched
+// task's answer is delivered on (FIX-FINAL
+// tux-resumed-task-answer-never-delivered) - see ResultDelivery. nil (the
+// default) delivers nothing; call before the first tick.
+func (d *Dispatcher) SetResultDelivery(r ResultDelivery) { d.resultDelivery = r }
 
 // SetClock overrides Dispatcher's clock (tests only).
 func (d *Dispatcher) SetClock(now func() time.Time) { d.now = now }
@@ -632,7 +687,13 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	// workerPID is the pid OnStart persisted as tasks.worker_pgid; it is
 	// cleared again once spawn.Run returned (FIX-I-13).
 	var workerPID int
+	// answer collects the worker's answer, delta by delta (handleTask's
+	// answerText pattern), for the background-result delivery below
+	// (FIX-FINAL tux-resumed-task-answer-never-delivered). Read only after
+	// spawn.Run returned.
+	var answer strings.Builder
 	outcome, runErr := spawn.Run(runCtx, spawnCfg, env, spawn.Callbacks{
+		OnDelta: func(text string) { answer.WriteString(text) },
 		OnStart: func(pid int) {
 			workerPID = pid
 			if d.live != nil {
@@ -717,6 +778,11 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 			d.ledgerRaw(recordCtx, t.TraceID, "outbox.transition_failed", map[string]any{
 				"event": "outbox.transition_failed", "task_id": t.ID, "err": err.Error(),
 			})
+		} else {
+			// Only a task that really reached 'done' has an answer to hand
+			// over: a halt, a concurrent terminal transition or any non-clean
+			// run (crash, timeout, worker error, re-park) delivers nothing.
+			d.deliverResumedAnswer(recordCtx, t, row, answer.String())
 		}
 		d.markDelivered(recordCtx, row.ID)
 		return
@@ -786,6 +852,53 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		"shutdown": d.shuttingDown(),
 	})
 	d.markDelivered(recordCtx, row.ID)
+}
+
+// deliverResumedAnswer hands a redispatched task's answer to the
+// background-result channel (FIX-FINAL tux-resumed-task-answer-never-
+// delivered): MsgCloudParked and the shutdown notice promise the task
+// carries on by itself, but the resumed run's answer reached no surface -
+// the task became 'done' and the text was gone. Called once, after the
+// transition to 'done' succeeded. Asynchronous, so the serial dispatcher
+// (G10-3) never waits on a Telegram send or an `hs` exec; ctx is already
+// detached from the tick's cancellation (recordCtx). An empty answer is
+// ledgered, not sent. A secret-lane task never gets here (refuseSecretLane);
+// a task whose session was marked sensitive mid-run reaches Telegram only as
+// the FIX-U-5 redaction notice.
+func (d *Dispatcher) deliverResumedAnswer(ctx context.Context, t sqlcgen.Task, row sqlcgen.Outbox, answer string) {
+	if d.resultDelivery == nil {
+		return
+	}
+	payload := map[string]any{
+		"event": EventResumeResultDelivered, "task_id": t.ID, "outbox_id": row.ID, "bytes": len(answer),
+	}
+	if strings.TrimSpace(answer) == "" {
+		payload["delivered"] = false
+		payload["reason"] = "empty"
+		d.ledgerRaw(ctx, t.TraceID, EventResumeResultDelivered, payload)
+		return
+	}
+	text, truncated := resumedAnswerText(t.ID, answer)
+	if truncated {
+		payload["truncated"] = true
+	}
+	delivery := d.resultDelivery
+	d.deliveries.Add(1)
+	go func() {
+		defer d.deliveries.Done()
+		payload["delivered"] = delivery.SendNotice(ctx, t.TraceID, text, MsgResumedAnswerSpoken)
+		d.ledgerRaw(ctx, t.TraceID, EventResumeResultDelivered, payload)
+	}()
+}
+
+// resumedAnswerText renders the delivered notice: MsgResumedAnswerFmt with
+// the answer cut at maxResumedAnswerRunes runes (then MsgResumedAnswerTruncated).
+func resumedAnswerText(taskID, answer string) (string, bool) {
+	if utf8.RuneCountInString(answer) <= maxResumedAnswerRunes {
+		return fmt.Sprintf(MsgResumedAnswerFmt, taskID, answer), false
+	}
+	runes := []rune(answer)
+	return fmt.Sprintf(MsgResumedAnswerFmt, taskID, string(runes[:maxResumedAnswerRunes])) + MsgResumedAnswerTruncated, true
 }
 
 // ackUnspawned is G10-E1 for a claimed row whose worker kahyad never started

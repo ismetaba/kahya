@@ -1685,6 +1685,25 @@ whose worker crashes on every attempt is redispatched exactly
 `task_max_crash_resumes` times and then moves to `blocked_user` (on its
 4th crash with the default 3).
 
+**A resumed task's answer is delivered (FIX-FINAL
+tux-resumed-task-answer-never-delivered):** `MsgCloudParked` and the
+shutdown notice tell the user the task carries on by itself, but a
+redispatched run had no `OnDelta` callback, so its answer reached no
+surface (the task became `done`, nothing more). The dispatcher now collects
+the deltas and, once the transition to `done` succeeded, hands
+`"Devam ettirilen görev tamamlandı (%s). Cevap:\n\n%s"` (task id, the
+answer cut at 3500 runes plus `"\n\n… (cevabın devamı kısaltıldı)"`, so the
+notice fits one Telegram message) to the background-result channel once,
+asynchronously (`Dispatcher.SetResultDelivery`, main.go wires
+`localDelivery`: Telegram behind its FIX-U-5 gate, the Hammerspoon banner
+locally). The Speaker says `"Devam ettirilen bir görev tamamlandı; cevabı
+bildirimde."` instead of the text (`ui.FanOutDelivery.SendNotice`). Ledger
+`outbox.resume_result_delivered{task_id, outbox_id, bytes, delivered,
+truncated?, reason?}` never carries the text; an empty answer is ledgered
+`delivered:false, reason:"empty"` and not sent. A crash, a timeout, a
+worker error line, a re-park, a halt or a refused `done` transition
+delivers nothing; a secret-lane task never reaches the worker here.
+
 **The backoff schedule holds; one pending resume per task (FIX-I-8):** a
 parked task's next attempt belongs to the row `CloudRetry.park` enqueued
 at `next_retry_at`. Any other due row for it (a resume-scan or `resolve

@@ -200,7 +200,16 @@ func (h *HSCli) NotifyText(ctx context.Context, traceID, text string) bool {
 // for the notification banner itself; the full text is never lost -
 // every caller of this method already ledgered/persisted the complete
 // result before ever reaching here (see this package's own doc comment).
+// It is SendNotice with no separate spoken text.
 func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool {
+	return h.SendNotice(ctx, traceID, text, "")
+}
+
+// SendNotice is SendNotification for a notice whose shown text should not
+// be read aloud as is (FIX-FINAL tux-resumed-task-answer-never-delivered):
+// the banner shows text, and the Speaker says spoken instead - a short,
+// id-free Turkish line. spoken "" speaks text itself (SendNotification).
+func (h *HSCli) SendNotice(ctx context.Context, traceID, text, spoken string) bool {
 	// FIX-FINAL TUX-10: a background result (the morning briefing) carries
 	// its own "trace_id: <id>" line for Telegram (W5-01); locally kahyaNotify
 	// already appends "iz: <id>", so the banner showed the id twice under two
@@ -208,9 +217,12 @@ func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool
 	// hex characters aloud. The local banner and the speech drop that line.
 	text = stripTraceLine(text, traceID)
 	ok := h.NotifyText(ctx, traceID, text)
+	if spoken == "" {
+		spoken = text
+	}
 
-	// W6-05: speak the SAME full text, AFTER the visual notification
-	// above has already been dispatched - regardless of whether that
+	// W6-05: speak the full text (or the caller's spoken line), AFTER the
+	// visual notification above has already been dispatched - regardless of whether that
 	// hs.notify exec itself succeeded (this package's own "never loses
 	// the underlying event just because ONE delivery surface failed" doc
 	// comment: a failed VISUAL banner must not also silently swallow a
@@ -225,7 +237,7 @@ func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool
 	// notification speech goes through here; Lane is always
 	// notify.LaneNormal and Force is always false.
 	if h.Speaker != nil {
-		h.Speaker.Speak(ctx, notify.SpeakRequest{TraceID: traceID, Text: text, Lane: notify.LaneNormal})
+		h.Speaker.Speak(ctx, notify.SpeakRequest{TraceID: traceID, Text: spoken, Lane: notify.LaneNormal})
 	}
 
 	return ok
@@ -266,6 +278,12 @@ type Delivery interface {
 	SendNotification(ctx context.Context, traceID, text string) bool
 }
 
+// NoticeSender is a Delivery that can also be told what to SAY instead of
+// the shown text (HSCli.SendNotice).
+type NoticeSender interface {
+	SendNotice(ctx context.Context, traceID, text, spoken string) bool
+}
+
 // FanOutDelivery calls BOTH Primary (typically the Telegram bot - the
 // REMOTE half of HANDOFF §4 IPC's delivery channel) and Local (typically
 // an *HSCli - the LOCAL half) for every SendNotification call, returning
@@ -277,6 +295,23 @@ type Delivery interface {
 type FanOutDelivery struct {
 	Primary Delivery
 	Local   Delivery
+}
+
+// SendNotice is SendNotification with a separate spoken line: Primary
+// (Telegram, which never speaks) gets text; Local gets SendNotice when it
+// is a NoticeSender (the Speaker says spoken), else plain text.
+func (f FanOutDelivery) SendNotice(ctx context.Context, traceID, text, spoken string) bool {
+	primaryOK := false
+	if f.Primary != nil {
+		primaryOK = f.Primary.SendNotification(ctx, traceID, text)
+	}
+	localOK := false
+	if ns, ok := f.Local.(NoticeSender); ok {
+		localOK = ns.SendNotice(ctx, traceID, text, spoken)
+	} else if f.Local != nil {
+		localOK = f.Local.SendNotification(ctx, traceID, text)
+	}
+	return primaryOK || localOK
 }
 
 // SendNotification implements Delivery.
