@@ -168,8 +168,9 @@ func (p *Pusher) Run(ctx context.Context, traceID string) error {
 
 // writeLocalFallbacks appends, oldest first, every anchor_log row whose
 // line is not yet in anchor.local_fallback_path, marking each row
-// (local_fallback_at) as it lands - so each row's line is written exactly
-// once, however many push attempts it takes. The line is the same
+// (local_fallback_at) once its line is synced to disk (appendAnchorLine:
+// the line is never less durable than the mark) - so each row's line is
+// written exactly once, however many push attempts it takes. The line is the same
 // row-derived line the remote gets (anchorLineForRow). It stops at the
 // first failure (order is preserved) and leaves the rest for the next
 // tick; a failure is logged (JSONL anchor_local_fallback_failed), never

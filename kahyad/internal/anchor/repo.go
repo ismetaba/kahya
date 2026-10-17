@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -294,18 +295,49 @@ func parseAnchorLines(content string) ([]anchorLine, error) {
 	return out, nil
 }
 
+// syncFile makes an appended anchor line durable: (*os.File).Sync, which on
+// darwin is F_FULLFSYNC (falling back to fsync where the volume does not
+// support it). A test seam.
+var syncFile = (*os.File).Sync
+
 // appendAnchorLine appends one already-newline-terminated anchor line to
 // path, creating the file if it does not exist (task spec: "ALSO append
 // every anchor line there with O_APPEND" for the local fallback path;
-// reused for the anchor repo's own anchors.log too).
+// reused for the anchor repo's own anchors.log too), and syncs it before
+// returning (FIX-FINAL anchor-local-fallback-append-not-fsynced-before-
+// mark): the caller then commits anchor_log.local_fallback_at to brain.db,
+// whose commits are synchronous=FULL + F_FULLFSYNC - the line must be at
+// least as durable as the mark that says it was written, or a power cut
+// in between loses the offline record for good (kahyad never re-reads the
+// file; the mark alone dedupes). A write, sync or close failure is an
+// append failure: the caller leaves the row unmarked and retries on the
+// next tick (a line that landed but failed to sync is then appended once
+// more - a duplicate line beats a lost one). When the open created the
+// file, its directory is synced too, best-effort: the runbook pre-creates
+// the fallback file and its root-owned directory may not be readable.
 func appendAnchorLine(path, line string) error {
+	_, statErr := os.Lstat(path)
+	created := errors.Is(statErr, fs.ErrNotExist)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("anchor: open %s for append: %w", path, err)
 	}
-	defer f.Close()
 	if _, err := f.WriteString(line); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("anchor: append to %s: %w", path, err)
+	}
+	if err := syncFile(f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("anchor: sync %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("anchor: close %s: %w", path, err)
+	}
+	if created {
+		if d, err := os.Open(filepath.Dir(path)); err == nil {
+			_ = d.Sync()
+			_ = d.Close()
+		}
 	}
 	return nil
 }

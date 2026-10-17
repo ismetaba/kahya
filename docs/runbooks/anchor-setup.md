@@ -176,9 +176,12 @@ Every anchor line is now appended here the moment kahyad records the
 anchor — before and independently of the remote push — exactly once per
 anchor (`anchor_log.local_fallback_at`), so an offline period still leaves
 a local append-only record. The line is byte-identical to the one the
-remote gets (its timestamp is the anchor's `anchored_at`, UTC). A failed
-write (`anchor_local_fallback_failed` in the JSONL log) is retried on the
-next tick and never blocks the remote push. kahyad never reads this file
+remote gets (its timestamp is the anchor's `anchored_at`, UTC). Each
+line is fsynced (F_FULLFSYNC) before `local_fallback_at` is committed, so
+a power cut can never leave brain.db saying a line was written that the
+file lost. A failed write or sync (`anchor_local_fallback_failed` in the
+JSONL log) is retried on the next tick (a line that landed but failed to
+sync may then appear twice) and never blocks the remote push. kahyad never reads this file
 (it is `0622`, write-only for your uid); `kahya ledger verify` uses the git
 remote. The fallback needs `anchor_remote`: with no remote configured
 kahyad anchors nothing and writes nothing here.

@@ -1,6 +1,7 @@
 package anchor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -166,5 +167,59 @@ func TestPusherRunNoRemoteConfiguredIgnoresFallbackPath(t *testing.T) {
 	}
 	if _, err := os.Stat(fallback); !os.IsNotExist(err) {
 		t.Errorf("fallback stat err = %v, want not-exist (no local-only mode, G07-1)", err)
+	}
+}
+
+// TestPusherLocalFallbackUnsyncedAppendIsNeverMarked (FIX-FINAL anchor-
+// local-fallback-append-not-fsynced-before-mark): the fallback line is
+// fsynced (F_FULLFSYNC on darwin) before anchor_log.local_fallback_at is
+// committed - brain.db's mark is FULL + F_FULLFSYNC durable, so an
+// unsynced line could be lost to a power cut while the mark survived and
+// the line was never appended again. A failing sync is a failed append:
+// the row stays unmarked (JSONL anchor_local_fallback_failed) and the next
+// tick appends and marks it (one duplicate line beats a lost record).
+func TestPusherLocalFallbackUnsyncedAppendIsNeverMarked(t *testing.T) {
+	st := newTestStore(t)
+	unreachable := "file://" + filepath.Join(t.TempDir(), "does-not-exist.git")
+	fallback := filepath.Join(t.TempDir(), "anchor.log")
+	logDir := t.TempDir()
+	jsonl, err := logx.New(logDir, "boot0000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("logx.New: %v", err)
+	}
+	defer jsonl.Close()
+	pusher := newPusher(st.Queries, nil, nil, NewExecGitRunner(), nil, unreachable, filepath.Join(t.TempDir(), "anchor-repo"), fallback, 6)
+	pusher.SetJSONLLogger(jsonl)
+
+	var synced []string
+	prev := syncFile
+	t.Cleanup(func() { syncFile = prev })
+	syncFile = func(f *os.File) error {
+		synced = append(synced, f.Name())
+		return errors.New("simulated fsync failure")
+	}
+
+	logTestEvent(t, st, "test.one")
+	const failTrace = "trace-fallback-unsynced"
+	runPusher(t, pusher, failTrace)
+	if len(synced) == 0 || synced[0] != fallback {
+		t.Fatalf("synced files = %v, want the fallback file %s synced before the mark", synced, fallback)
+	}
+	if rows := anchorRows(t, st); len(rows) != 1 || rows[0].LocalFallbackAt.Valid {
+		t.Fatalf("rows = %+v, want local_fallback_at NULL after an unsynced append", rows)
+	}
+
+	syncFile = prev
+	runPusher(t, pusher, "trace-fallback-synced")
+	if rows := anchorRows(t, st); !rows[0].LocalFallbackAt.Valid {
+		t.Fatal("local_fallback_at still NULL after a synced retry")
+	}
+	lines := fallbackLines(t, fallback)
+	if want := fmt.Sprintf("1 %s ", anchorRows(t, st)[0].DigestHex); len(lines) == 0 || !strings.HasPrefix(lines[len(lines)-1], want) {
+		t.Fatalf("fallback = %q, want its last line to anchor event 1", lines)
+	}
+	_ = jsonl.Close()
+	if !jsonlHasEvent(t, logDir, "anchor_local_fallback_failed", failTrace) {
+		t.Errorf("no anchor_local_fallback_failed JSONL line with trace_id %q", failTrace)
 	}
 }
