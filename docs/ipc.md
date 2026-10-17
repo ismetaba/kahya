@@ -873,15 +873,21 @@ a cloud model, without changing anything in §2-§6 above:
   retraction (`factengine.RetractFact`, which now takes a
   `RetractionKind`) records why the fact was closed in
   `facts.retraction_kind` (migration 0027; NULL while active) and when in
-  `facts.retracted_at`: `ended` = it held and no longer does (an
-  extraction answer with `retraction: true` - corrected instead when the
-  quote it cites is a correction phrase -, the `"artık ... değil"`
-  shape of `factengine.ClassifyRetraction`, `kahya fact retract
-  --sona-erdi`); `corrected` = it was wrong (the correction phrases
-  `"düzeltiyorum"`, `"yanlış hatırlıyorsun"`, `"hayır, öyle değil"`,
-  `"hayır yanlış"` - a text with both shapes is a correction - and plain
-  `kahya fact retract`). A user denial means corrected: `DenyFact`
-  (`kahya fact deny`, the ritual Yanlış answer) re-records an ended
+  `facts.retracted_at`: `ended` = it held and no longer does (a
+  cloud-lane extraction answer with `retraction: true` - corrected instead
+  when the quote it cites is a correction phrase -, the `"artık ...
+  değil"` shape of `factengine.ClassifyRetraction`, `kahya fact retract
+  --sona-erdi`); a LOCAL-lane extraction's retraction (a secret-lane path,
+  or secret content on an ordinary path) is always `corrected` and its
+  quote is never consulted - an ended fact's window end and retraction
+  time are shown in the cloud lane too, and only the secret note would
+  have supplied them (the same rule that keeps a local call's quote and
+  validity window off the shared row); `corrected` = it was wrong (the
+  correction phrases `"düzeltiyorum"`, `"yanlış hatırlıyorsun"`, `"hayır,
+  öyle değil"`, `"hayır yanlış"` - a text with both shapes is a
+  correction - and plain `kahya fact retract`). A user denial means
+  corrected: `DenyFact` (`kahya fact deny`, the ritual Yanlış answer)
+  re-records an ended
   retraction as corrected, and an ended request on a fact that carries a
   denial is recorded corrected. An ended retraction keeps an earlier
   `valid_to` the fact already had (else `valid_to` = the retraction time);

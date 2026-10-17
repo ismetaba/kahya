@@ -550,7 +550,8 @@ func (r *Runner) extractEpisode(ctx context.Context, traceID string, episodeID i
 // + AddAlias, MEM-2), then each fact (WriteFact, or RetractFact for a
 // retraction), linking a fact's subject/object to an entity only when the
 // string is byte-equal to an entity name or alias in the SAME answer. A
-// local-lane answer (cloudLane false) writes no quote and no validity window.
+// local-lane answer (cloudLane false) writes no quote and no validity
+// window, and its retractions are recorded corrected, never ended (retract).
 //
 // Entity identity is lane-scoped too (factengine package doc, migration
 // 0025): a cloud-lane answer resolves its names in the cloud view and its
@@ -593,7 +594,7 @@ func (r *Runner) apply(ctx context.Context, traceID string, episodeID, evidenceE
 
 	for _, f := range out.Facts {
 		if f.Retraction {
-			done, err := r.retract(ctx, traceID, episodeID, sessionID, prov, f)
+			done, err := r.retract(ctx, traceID, episodeID, sessionID, prov, cloudLane, f)
 			if err != nil {
 				return st, err
 			}
@@ -741,7 +742,17 @@ func cloudLaneOnly(cloudLane bool, v string) string {
 // "yanlış hatırlıyorsun", ...), then it is RetractionCorrected (the note
 // says the fact was wrong; never shown as history). factengine also
 // records it as corrected when the user had denied the fact.
-func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, sessionID string, prov factengine.Provenance, f reader.ExtractFactV1) (bool, error) {
+//
+// Only a CLOUD-lane call's retraction may be ended (cloudLane: ordinary
+// path, content classified normal). An ended fact is history every as_of /
+// known_as_of read shows - its window end and retraction time - in the
+// cloud lane too (the fact row is shared and the retraction's evidence row
+// cites no episode, so memlane cannot tell it came from a secret note), so
+// a LOCAL-lane call's retraction (a secret path, or secret content on an
+// ordinary path) is always recorded RetractionCorrected and its quote is
+// never consulted: the fact just closes, as before 0027 - the same rule
+// that keeps a local call's quote and validity window off the row.
+func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, sessionID string, prov factengine.Provenance, cloudLane bool, f reader.ExtractFactV1) (bool, error) {
 	active, err := r.Store.GetActiveFactByTriple(ctx, sqlcgen.GetActiveFactByTripleParams{Subject: f.Subject, Predicate: f.Predicate, Object: f.Object})
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -755,7 +766,11 @@ func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, s
 		})
 		return false, nil
 	}
-	if _, err := r.Engine.RetractFact(ctx, traceID, f.Subject, f.Predicate, f.Object, sessionID, extractedRetractionKind(f.Quote)); err != nil {
+	kind := factengine.RetractionCorrected
+	if cloudLane {
+		kind = extractedRetractionKind(f.Quote)
+	}
+	if _, err := r.Engine.RetractFact(ctx, traceID, f.Subject, f.Predicate, f.Object, sessionID, kind); err != nil {
 		if errors.Is(err, factengine.ErrNoActiveFact) {
 			return false, nil
 		}
@@ -764,8 +779,9 @@ func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, s
 	return true, nil
 }
 
-// extractedRetractionKind is the kind of an extracted retraction: ended,
-// or corrected when its cited quote is a correction phrase.
+// extractedRetractionKind is the kind of a cloud-lane call's extracted
+// retraction: ended, or corrected when its cited quote is a correction
+// phrase.
 func extractedRetractionKind(quote string) factengine.RetractionKind {
 	if k, ok := factengine.ClassifyRetraction(quote); ok && k == factengine.RetractionCorrected {
 		return factengine.RetractionCorrected
