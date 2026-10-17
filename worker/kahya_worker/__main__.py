@@ -52,6 +52,22 @@ from .system_prompt import SYSTEM_PROMPT
 MSG_ENVELOPE_INVALID = "Görev zarfı geçersiz."
 MSG_MODEL_CALL_FAILED_FMT = "Model çağrısı başarısız oldu. Ayrıntı: kahya log --trace {trace_id}"
 
+# FIX-FINAL tux-worker-config-env-refusal-silent-resume-loop: the terminal
+# error lines of a start the user's OWN Claude Code configuration refused
+# (_check_cli_config_env). Without a line, kahyad took the exit for a crash:
+# the task stayed 'executing', the resume scan respawned the same doomed
+# worker task_max_crash_resumes times and the user finally read a notice
+# blaming worker crashes. {source} is the file (home shown as "~"), {name}
+# the variable - never its value.
+MSG_CLI_CONFIG_ENV_REFUSED_FMT = (
+    "Claude Code yapılandırması ({source}) {name} ortam değişkenini ayarlıyor; Kâhya işçisi güvenlik "
+    "gereği başlatılmadı — bu anahtarı oradan kaldırıp yeniden deneyin. Ayrıntı: kahya log --trace {trace_id}"
+)
+MSG_CLI_CONFIG_UNREADABLE_FMT = (
+    "Claude Code yapılandırması ({source}) okunamadı; Kâhya işçisi güvenlik gereği başlatılmadı — "
+    "dosyayı düzeltip yeniden deneyin. Ayrıntı: kahya log --trace {trace_id}"
+)
+
 # W6-02: the byte-exact Turkish error for an empty/whitespace-only
 # transcript (tasks/w6-voice/W6-02-ptt-whisper.md step 3) - an empty
 # transcript is NEVER submitted to the task loop as a prompt; this is the
@@ -361,10 +377,53 @@ def _cli_global_config_path() -> str:
     return os.path.join(base, f".claude{suffix}.json")
 
 
+class _ConfigEnvRefusal(str):
+    """A config-env refusal: the English log detail (the str value) plus the
+    Turkish terminal error line the user sees (user_message). The str form
+    keeps _check_credential_env's ``str | None`` contract."""
+
+    def __new__(cls, detail: str, fmt: str, **fields: str) -> "_ConfigEnvRefusal":
+        obj = super().__new__(cls, detail)
+        obj._fmt = fmt
+        obj._fields = fields
+        return obj
+
+    def user_message(self, trace_id: str) -> str:
+        return self._fmt.format(trace_id=trace_id, **self._fields)
+
+
+_PLAIN_ENV_NAME_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _display_env_name(name: str) -> str:
+    """A refused config key as the user sees it: as is when it is a plain
+    env-var name, else JSON-quoted and bounded (a key could hold a newline)."""
+    if _PLAIN_ENV_NAME_RE.fullmatch(name):
+        return name
+    return json.dumps(name[:64], ensure_ascii=False)
+
+
+def _display_path(path: str) -> str:
+    """path with the home directory shown as "~"."""
+    home = os.path.expanduser("~")
+    if home and home != "~" and path.startswith(home.rstrip(os.sep) + os.sep):
+        return "~" + path[len(home.rstrip(os.sep)):]
+    return path
+
+
+class _DropInUnlistable(ValueError):
+    """managed-settings.d exists but cannot be listed."""
+
+    def __init__(self, path: str, err: OSError) -> None:
+        super().__init__(f"managed-settings.d: {err}")
+        self.path = path
+
+
 def _cli_config_sources() -> list[tuple[str, str]]:
     """(label, path) of every file whose `env` map the pinned CLI applies
-    regardless of --setting-sources. Raises ValueError when the
-    managed-settings.d drop-in directory exists but cannot be listed."""
+    regardless of --setting-sources. Raises _DropInUnlistable (a ValueError)
+    when the managed-settings.d drop-in directory exists but cannot be
+    listed."""
     sources = [("globalConfig", _cli_global_config_path())]
     sources.append(("managed-settings.json", os.path.join(_MANAGED_SETTINGS_DIR, "managed-settings.json")))
     drop_in = os.path.join(_MANAGED_SETTINGS_DIR, "managed-settings.d")
@@ -373,7 +432,7 @@ def _cli_config_sources() -> list[tuple[str, str]]:
     except (FileNotFoundError, NotADirectoryError):
         names = []
     except OSError as e:
-        raise ValueError(f"managed-settings.d: {e}") from e
+        raise _DropInUnlistable(drop_in, e) from e
     for n in names:
         sources.append(("managed-settings.d/" + n, os.path.join(drop_in, n)))
     try:
@@ -423,22 +482,40 @@ def _read_config_env(path: str) -> tuple[bool, dict[str, Any] | None]:
     raise ValueError(str(last_err))
 
 
-def _check_cli_config_env() -> str | None:
-    """Returns a description naming the source label and the variable (never
-    its value) of the first CLI config-file env entry that would reroute
-    the worker's model calls, or None."""
+def _check_cli_config_env() -> _ConfigEnvRefusal | None:
+    """Returns a refusal naming the source label and the variable (never its
+    value) of the first CLI config-file env entry that would reroute the
+    worker's model calls, or None. Unlike the other startup checks, this one
+    is about the user's own environment (their ~/.claude.json, the org's
+    managed settings), so the refusal carries a Turkish user message
+    (FIX-FINAL tux-worker-config-env-refusal-silent-resume-loop)."""
     try:
         sources = _cli_config_sources()
+    except _DropInUnlistable as e:
+        return _ConfigEnvRefusal(
+            f"CLI config source {e}; refusing to start", MSG_CLI_CONFIG_UNREADABLE_FMT, source=_display_path(e.path)
+        )
     except ValueError as e:
-        return f"CLI config source {e}; refusing to start"
+        return _ConfigEnvRefusal(
+            f"CLI config source {e}; refusing to start", MSG_CLI_CONFIG_UNREADABLE_FMT, source=_MANAGED_SETTINGS_DIR
+        )
     for label, path in sources:
         try:
             _, env = _read_config_env(path)
         except ValueError as e:
-            return f"CLI config source {label} is unreadable ({e}); refusing to start"
+            return _ConfigEnvRefusal(
+                f"CLI config source {label} is unreadable ({e}); refusing to start",
+                MSG_CLI_CONFIG_UNREADABLE_FMT,
+                source=_display_path(path),
+            )
         for name in sorted(env or {}):
             if _config_env_name_refused(str(name)):
-                return f"CLI config source {label} sets env {name}; the worker may only reach kahyad's per-task proxy"
+                return _ConfigEnvRefusal(
+                    f"CLI config source {label} sets env {name}; the worker may only reach kahyad's per-task proxy",
+                    MSG_CLI_CONFIG_ENV_REFUSED_FMT,
+                    source=_display_path(path),
+                    name=_display_env_name(str(name)),
+                )
     return None
 
 
@@ -605,7 +682,17 @@ def main(argv: list[str] | None = None) -> int:
     credential_mode = os.environ.get("KAHYA_CREDENTIAL_MODE") or _CREDENTIAL_MODE_KEYCHAIN
     env_err = _check_credential_env(credential_mode, envelope.mode)
     if env_err is not None:
-        wlog.log("error", "worker_env_invalid", detail=env_err, credential_mode=credential_mode)
+        wlog.log("error", "worker_env_invalid", detail=str(env_err), credential_mode=credential_mode)
+        # FIX-FINAL tux-worker-config-env-refusal-silent-resume-loop: a
+        # refusal the user's own CLI config caused gets its Turkish terminal
+        # error line, so kahyad fails the task once (decidePostSpawn's
+        # worker-error rule) instead of looping it through crash resumes.
+        # Every other cause is a should-never-happen internal invariant
+        # (kahyad sets and strips these vars itself): exit 2 with no line,
+        # kahyad's generic unexpected-exit text.
+        if isinstance(env_err, _ConfigEnvRefusal):
+            trace_id = os.environ.get("KAHYA_TRACE_ID", envelope.trace_id)
+            _print_protocol_line({"type": "error", "message": env_err.user_message(trace_id)})
         return 2
 
     socket_path = os.environ.get("KAHYA_SOCKET", "")

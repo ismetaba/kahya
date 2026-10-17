@@ -238,7 +238,14 @@ class TestStartupEnvAssertions(unittest.TestCase):
             del env["ANTHROPIC_API_KEY"]
         return env
 
-    def _assert_env_invalid(self, env: dict[str, str], detail_needle: str) -> None:
+    def _assert_env_invalid(self, env: dict[str, str], detail_needle: str, user_message: str | None = None) -> None:
+        """A refused start exits 2 with one worker_env_invalid log line. An
+        internal-invariant refusal prints nothing on stdout (kahyad reports
+        its generic unexpected-exit text); a refusal the user's own CLI
+        config caused prints exactly one Turkish terminal error line,
+        user_message (FIX-FINAL
+        tux-worker-config-env-refusal-silent-resume-loop)."""
+
         def refuse_real_client(options=None):
             # A startup-env refusal must exit before any SDK client exists;
             # never let a regression here spawn the real bundled CLI.
@@ -249,7 +256,13 @@ class TestStartupEnvAssertions(unittest.TestCase):
             code, out = run_main_with(dict(VALID_ENVELOPE), env, client_factory=refuse_real_client)
             lines = read_jsonl(os.path.join(log_dir, "worker.jsonl"))
         self.assertEqual(code, 2)
-        self.assertEqual(out, "")
+        if user_message is None:
+            self.assertEqual(out, "")
+        else:
+            self.assertEqual(
+                [json.loads(l) for l in out.splitlines() if l.strip()],
+                [{"type": "error", "message": user_message}],
+            )
         invalid = [l for l in lines if l.get("event") == "worker_env_invalid"]
         self.assertEqual(len(invalid), 1, lines)
         self.assertIn(detail_needle, invalid[0].get("detail", ""))
@@ -293,6 +306,7 @@ class TestStartupEnvAssertions(unittest.TestCase):
         send model calls around kahyad's per-task proxy. The worker reads
         the same files and exits 2 before any SDK client exists; the log
         names the source and the variable, never the value."""
+        trace = VALID_ENVELOPE["trace_id"]
         bad_env = {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:47702"}}
         cases = [
             ("globalConfig", lambda h, cfg, root: (os.path.join(h, ".claude.json"), bad_env)),
@@ -315,12 +329,21 @@ class TestStartupEnvAssertions(unittest.TestCase):
                     overrides = {"HOME": home}
                     if use_cfg:
                         overrides["CLAUDE_CONFIG_DIR"] = cfg
+                    name = next(iter(doc["env"]))
+                    # The user sees which file sets which name (never the
+                    # value), with the home directory shown as "~".
+                    shown = "~" + path[len(home):] if path.startswith(home + os.sep) else path
+                    want = (
+                        f"Claude Code yapılandırması ({shown}) {name} ortam değişkenini ayarlıyor; "
+                        "Kâhya işçisi güvenlik gereği başlatılmadı — bu anahtarı oradan kaldırıp yeniden deneyin. "
+                        f"Ayrıntı: kahya log --trace {trace}"
+                    )
+                    self.assertNotIn(str(doc["env"][name]), want)
                     with mock.patch.object(worker_main, "_MANAGED_SETTINGS_DIR", os.path.join(root, "ClaudeCode")), \
                             mock.patch.object(worker_main, "_MANAGED_PREFERENCES_DIR", os.path.join(root, "Managed Preferences")):
                         with tempfile.TemporaryDirectory() as log_dir:
                             env = self._passthrough_env(log_dir, **overrides)
-                        self._assert_env_invalid(env, "CLI config source " + label)
-                        name = next(iter(doc["env"]))
+                        self._assert_env_invalid(env, "CLI config source " + label, user_message=want)
                         with tempfile.TemporaryDirectory() as log_dir:
                             env = dict(env, KAHYA_LOG_DIR=log_dir)
                             run_main_with(dict(VALID_ENVELOPE), env, client_factory=lambda options=None: None)
@@ -340,7 +363,81 @@ class TestStartupEnvAssertions(unittest.TestCase):
                         f.write(body)
                     with tempfile.TemporaryDirectory() as log_dir:
                         env = self._passthrough_env(log_dir, HOME=home)
-                    self._assert_env_invalid(env, "CLI config source globalConfig is unreadable")
+                    self._assert_env_invalid(
+                        env,
+                        "CLI config source globalConfig is unreadable",
+                        user_message=(
+                            "Claude Code yapılandırması (~/.claude.json) okunamadı; Kâhya işçisi güvenlik gereği "
+                            "başlatılmadı — dosyayı düzeltip yeniden deneyin. Ayrıntı: kahya log --trace "
+                            + VALID_ENVELOPE["trace_id"]
+                        ),
+                    )
+
+    def test_cli_config_drop_in_dir_unlistable_refuses_start_with_turkish_line(self) -> None:
+        """FIX-FINAL tux-worker-config-env-refusal-silent-resume-loop: a
+        managed-settings.d directory that exists but cannot be listed is the
+        user's environment too, so it gets the Turkish line naming it."""
+        with tempfile.TemporaryDirectory() as root:
+            managed = os.path.join(root, "ClaudeCode")
+            drop_in = os.path.join(managed, "managed-settings.d")
+            os.makedirs(drop_in)
+            real_listdir = os.listdir
+
+            def failing_listdir(path):
+                if path == drop_in:
+                    raise PermissionError(13, "Permission denied")
+                return real_listdir(path)
+
+            home = os.path.join(root, "home")
+            os.makedirs(home)
+            with mock.patch.object(worker_main, "_MANAGED_SETTINGS_DIR", managed), \
+                    mock.patch.object(worker_main, "_MANAGED_PREFERENCES_DIR", os.path.join(root, "Managed Preferences")), \
+                    mock.patch.object(worker_main.os, "listdir", failing_listdir):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, HOME=home)
+                self._assert_env_invalid(
+                    env,
+                    "CLI config source managed-settings.d",
+                    user_message=(
+                        f"Claude Code yapılandırması ({drop_in}) okunamadı; Kâhya işçisi güvenlik gereği "
+                        "başlatılmadı — dosyayı düzeltip yeniden deneyin. Ayrıntı: kahya log --trace "
+                        + VALID_ENVELOPE["trace_id"]
+                    ),
+                )
+
+    def test_cli_config_refusal_texts_are_pinned(self) -> None:
+        """The two Turkish refusal templates, byte-exact (docs/ipc.md quotes
+        them)."""
+        self.assertEqual(
+            worker_main.MSG_CLI_CONFIG_ENV_REFUSED_FMT,
+            "Claude Code yapılandırması ({source}) {name} ortam değişkenini ayarlıyor; Kâhya işçisi güvenlik "
+            "gereği başlatılmadı — bu anahtarı oradan kaldırıp yeniden deneyin. Ayrıntı: kahya log --trace {trace_id}",
+        )
+        self.assertEqual(
+            worker_main.MSG_CLI_CONFIG_UNREADABLE_FMT,
+            "Claude Code yapılandırması ({source}) okunamadı; Kâhya işçisi güvenlik gereği başlatılmadı — "
+            "dosyayı düzeltip yeniden deneyin. Ayrıntı: kahya log --trace {trace_id}",
+        )
+
+    def test_cli_config_refusal_shows_an_odd_key_name_quoted(self) -> None:
+        """A refused key that is not a plain env-var name is shown JSON-quoted
+        and bounded, never raw (a config key could hold a newline)."""
+        with tempfile.TemporaryDirectory() as root:
+            home = os.path.join(root, "home")
+            write_config(os.path.join(home, ".claude.json"), {"env": {"ANTHROPIC_\nX": "v"}})
+            with mock.patch.object(worker_main, "_MANAGED_SETTINGS_DIR", os.path.join(root, "ClaudeCode")), \
+                    mock.patch.object(worker_main, "_MANAGED_PREFERENCES_DIR", os.path.join(root, "Managed Preferences")):
+                with tempfile.TemporaryDirectory() as log_dir:
+                    env = self._passthrough_env(log_dir, HOME=home)
+                self._assert_env_invalid(
+                    env,
+                    "CLI config source globalConfig",
+                    user_message=(
+                        'Claude Code yapılandırması (~/.claude.json) "ANTHROPIC_\\nX" ortam değişkenini ayarlıyor; '
+                        "Kâhya işçisi güvenlik gereği başlatılmadı — bu anahtarı oradan kaldırıp yeniden deneyin. "
+                        "Ayrıntı: kahya log --trace " + VALID_ENVELOPE["trace_id"]
+                    ),
+                )
 
     def test_cli_config_clean_env_is_accepted(self) -> None:
         """A config env map without routing names (and a .config.json that

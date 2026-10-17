@@ -171,7 +171,23 @@ present, else `${CLAUDE_CONFIG_DIR or HOME}/.claude.json`),
 `managed-settings.d/*.json`, the `com.anthropic.claudecode` MDM plists
 (per-user and device) and `<cfg>/remote-settings.json`. With the env
 strip and this check together, the worker's only upstream is the
-per-task proxy.
+per-task proxy. Because this refusal comes from the user's own
+environment, it is the one startup refusal with a terminal stdout line
+(FIX-FINAL tux-worker-config-env-refusal-silent-resume-loop):
+`{"type":"error","message":"Claude Code yapılandırması ({source})
+{name} ortam değişkenini ayarlıyor; Kâhya işçisi güvenlik gereği
+başlatılmadı — bu anahtarı oradan kaldırıp yeniden deneyin. Ayrıntı: kahya
+log --trace {trace_id}"}`, or for an unreadable source `"Claude Code
+yapılandırması ({source}) okunamadı; Kâhya işçisi güvenlik gereği
+başlatılmadı — dosyayı düzeltip yeniden deneyin. Ayrıntı: kahya log
+--trace {trace_id}"` (`{source}` is the file, the home directory shown as
+`~`; `{name}` the variable, JSON-quoted when it is not a plain env-var
+name; never the value). kahyad therefore fails the task once (the
+worker-error rule, `decidePostSpawn` / `outbox.redispatch_worker_error`)
+instead of reading the exit as a crash and respawning the same doomed
+worker `task_max_crash_resumes` times. The internal-invariant refusals
+(missing `ANTHROPIC_BASE_URL`, token/key shape, process-env routing that
+kahyad strips itself) keep their silent exit 2.
 
 ### W12-08 note — OWNER AUTH DECISION (HANDOFF deviation)
 
