@@ -997,7 +997,19 @@ a cloud model, without changing anything in §2-§6 above:
   first committed as kahyad) lists the committed notes under `ingest/` and
   `<secret_lane_memory_dir>/ingest/` that name the document's SHA-256 (JSONL
   `ingest_orphan_found {orphan_source: front_matter}`; FIX-FINAL
-  ingest-kill-between-note-commit-and-note-written-duplicates). A
+  ingest-kill-between-note-commit-and-note-written-duplicates). A row
+  names a path, and note names are freed and reused (a user's memory
+  forget or a retraction frees `<day>-<slug>.md`, and another document
+  ingested under the same label takes it): an `ingest.note_written` row
+  counts only while the note at its path still carries the document's
+  `kahya_source_sha256` (the `FindIngestNotes` set) - another document's
+  note is never resumed on or retracted, and a note whose front matter was
+  edited away is no longer the document's (JSONL `ingest_orphan_row_skipped`).
+  A row whose note is gone from disk while its episode is still active (the
+  user deleted it, or a retraction's trash commit landed and its reindex
+  failed) has that stale episode reindexed away
+  (`ingest_orphan_stale_episode_removed`), so the retry converges with no
+  restart (FIX-FINAL ingest-superseded-orphan-note-stays-active, review). A
   normal-lane orphan is superseded by a fresh secret-lane note when the
   retry is secret-lane. Every interrupted note of the document the retry
   does not resume on (that superseded normal-lane orphan, or an older

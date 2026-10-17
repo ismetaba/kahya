@@ -12,8 +12,10 @@
 //     document (same SHA-256, its note still active) is refused; an
 //     INTERRUPTED earlier ingest of it (note committed - ingest.note_written
 //     - or, when that row is missing, found by the note's own
-//     kahya_source_sha256 front matter - but no ingest.done) is resumed on
-//     that note at step 5 instead of a
+//     kahya_source_sha256 front matter - but no ingest.done; a row counts
+//     only while the note at its path still carries that front matter, as
+//     note names are freed and reused, and a row whose note is gone has its
+//     stale episode dropped) is resumed on that note at step 5 instead of a
 //     "-2" duplicate, when the note is stored at least as restrictively as
 //     this run's lane asks (FIX-FINAL ingest-retry-after-midpipeline-
 //     failure-duplicates-note); every OTHER interrupted note of the same
@@ -706,7 +708,29 @@ type interruptedIngest struct {
 // commit, a failed row insert; FIX-FINAL ingest-kill-between-note-commit-
 // and-note-written-duplicates), newest first; none when there is none. A
 // note an ingest.done names is complete, not interrupted.
+//
+// A row names a PATH, and note names are freed and reused (<day>-<slug>.md:
+// a user's memory forget, or this pipeline's own retraction, frees one,
+// and a different document ingested under the same label takes it). So a
+// row counts only while the note at its path still carries this
+// document's kahya_source_sha256 in its leading front matter (the
+// FindIngestNotes set): another document's note is never resumed on (its
+// episode would collect this document's facts) or retracted, and a note
+// that lost its front matter is no longer this document's. A row whose
+// note is gone from disk while its episode is still active (the user
+// deleted it, or a retraction's trash commit landed and its reindex
+// failed) has that stale episode dropped (dropStaleEpisode), so the retry
+// converges with no restart (FIX-FINAL ingest-superseded-orphan-note-
+// stays-active, review).
 func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([]interruptedIngest, error) {
+	notes, err := r.Memory.FindIngestNotes(ctx, traceID, NoteDir, digest)
+	if err != nil {
+		return nil, err
+	}
+	own := make(map[string]bool, len(notes))
+	for _, n := range notes {
+		own[n.File] = true
+	}
 	rows, err := r.Store.ListEventsByKind(ctx, EventNoteWritten)
 	if err != nil {
 		return nil, err
@@ -738,6 +762,15 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 			continue
 		}
 		seen[p.File] = true
+		if !own[p.File] {
+			// not (or no longer) this document's note: gone, or its name
+			// reused by another document, or its front matter edited away
+			if err := r.dropStaleEpisode(ctx, traceID, p.File); err != nil {
+				return nil, err
+			}
+			r.logInfo(traceID, "ingest_orphan_row_skipped", "file", p.File, "orphan_trace_id", rows[i].TraceID)
+			continue
+		}
 		epID, active, err := r.activeEpisode(ctx, traceID, p.File)
 		if err != nil {
 			return nil, err
@@ -753,10 +786,6 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 			lane = router.LaneSecret
 		}
 		out = append(out, interruptedIngest{File: p.File, CommitSHA: p.CommitSHA, Lane: lane, LaneReason: p.LaneReason, TraceID: rows[i].TraceID, EpisodeID: epID})
-	}
-	notes, err := r.Memory.FindIngestNotes(ctx, traceID, NoteDir, digest)
-	if err != nil {
-		return nil, err
 	}
 	for _, n := range notes {
 		if completed[n.File] || seen[n.File] {
@@ -817,6 +846,44 @@ func (r *Runner) activeEpisode(ctx context.Context, traceID, file string) (int64
 		return 0, false, err
 	}
 	return ep.ID, ep.Status == "active", nil
+}
+
+// dropStaleEpisode re-syncs the index for a note an ingest.note_written row
+// names that is no longer this document's note (findInterrupted): when the
+// file is gone from disk (Lane.MemoryDir) while its episode is still
+// active - the user deleted the half-ingested note, or a retraction's
+// memory_forget committed the move to the trash and then failed to
+// reindex - it is reindexed, which marks the episode removed, so its stale
+// chunks leave memory_search and the nightly extraction. A note still on
+// disk (its name reused by another document, or its front matter edited
+// away) is never touched. Without an indexer or a memory dir it does
+// nothing; a stat or reindex error is returned (the caller fails closed).
+func (r *Runner) dropStaleEpisode(ctx context.Context, traceID, file string) error {
+	if r.Index == nil || r.Lane.MemoryDir == "" {
+		return nil
+	}
+	if _, err := os.Lstat(filepath.Join(r.Lane.MemoryDir, filepath.FromSlash(file))); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("ingest: stat earlier note %s: %w", file, err)
+	}
+	ep, err := r.Store.GetEpisodeBySourceAndPath(ctx, sqlcgen.GetEpisodeBySourceAndPathParams{
+		Source: extract.SourceMemoryFile, SourcePath: sql.NullString{String: file, Valid: true},
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if ep.Status != "active" {
+		return nil
+	}
+	if _, err := r.Index.ReindexFile(ctx, traceID, file); err != nil {
+		return fmt.Errorf("ingest: drop the stale episode of %s: %w", file, err)
+	}
+	r.logInfo(traceID, "ingest_orphan_stale_episode_removed", "file", file, "episode_id", ep.ID)
+	return nil
 }
 
 // retractOrphans retracts each superseded interrupted note (memory_forget
