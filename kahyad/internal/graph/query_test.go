@@ -88,8 +88,32 @@ func TestFactQueryIncludeQuarantinedLabels(t *testing.T) {
 	}
 }
 
+// retract retracts the active triple as kind at the given instant (the
+// engine clock is moved there and back to the real clock afterwards).
+func (f *fixture) retract(subj, pred, obj string, kind factengine.RetractionKind, at string) {
+	f.t.Helper()
+	ts := mustTime(f.t, at)
+	f.fe.SetClock(func() time.Time { return ts })
+	defer f.fe.SetClock(time.Now)
+	if _, err := f.fe.RetractFact(context.Background(), "tr-retract", subj, pred, obj, "", kind); err != nil {
+		f.t.Fatalf("RetractFact(%s %s %s, %s): %v", subj, pred, obj, kind, err)
+	}
+}
+
+// endedOf maps each returned fact id to its Ended mark.
+func endedOf(rs []FactRecord) map[int64]bool {
+	out := map[int64]bool{}
+	for _, r := range rs {
+		out[r.FactID] = r.Ended
+	}
+	return out
+}
+
 // TestFactQueryAsOfBitemporal: as_of keeps the facts valid at that instant
-// (valid_from <= as_of < valid_to), an unknown bound counts as open.
+// (valid_from <= as_of < valid_to), an unknown bound counts as open. A fact
+// that ENDED (retracted as factengine.RetractionEnded) is valid inside its
+// window too and comes back marked Ended; a CORRECTED one never comes back
+// (FIX-FINAL fact-history-ended-vs-corrected).
 func TestFactQueryAsOfBitemporal(t *testing.T) {
 	f := newFixture(t)
 	ep := f.episode("people/emre.md")
@@ -100,25 +124,196 @@ func TestFactQueryAsOfBitemporal(t *testing.T) {
 		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t"}))
 	later := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Beta", Provenance: factengine.ProvenanceExternalDoc,
 		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-06-01T00:00:00Z"}))
+	ended := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "member_of", Object: "Kulüp", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z"}))
+	f.retract("Emre", "member_of", "Kulüp", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	corrected := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "owns", Object: "tekne", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z"}))
+	f.retract("Emre", "owns", "tekne", factengine.RetractionCorrected, "2026-05-01T00:00:00Z")
 
 	march := f.query(FactQuery{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z")})
-	if !sameIDs(recIDs(march), []int64{window, open}) {
-		t.Fatalf("as_of 2026-03 = %v, want [%d %d] (window + open start)", recIDs(march), window, open)
+	if !sameIDs(recIDs(march), []int64{window, open, ended}) {
+		t.Fatalf("as_of 2026-03 = %v, want [%d %d %d] (window + open start + the ended fact; never the corrected %d)", recIDs(march), window, open, ended, corrected)
+	}
+	if marks := endedOf(march); !marks[ended] || marks[window] || marks[open] {
+		t.Fatalf("as_of 2026-03 Ended marks = %v, want only %d", marks, ended)
+	}
+	for _, r := range march {
+		if r.FactID == ended && (r.RetractedAt != "2026-05-01T00:00:00Z" || r.ValidTo != "2026-05-01T00:00:00Z" || r.Quarantined) {
+			t.Fatalf("ended record = %+v, want retracted_at/valid_to 2026-05-01, not quarantined", r)
+		}
 	}
 	july := f.query(FactQuery{EntityID: emre, AsOf: mustTime(t, "2026-07-01T00:00:00Z")})
 	if !sameIDs(recIDs(july), []int64{open, later}) {
-		t.Fatalf("as_of 2026-07 = %v, want [%d %d] (the window has ended)", recIDs(july), open, later)
+		t.Fatalf("as_of 2026-07 = %v, want [%d %d] (the window and the ended fact are over)", recIDs(july), open, later)
 	}
 	// valid_to is exclusive: the window does not hold at its own end.
 	if end := f.query(FactQuery{EntityID: emre, AsOf: mustTime(t, "2026-06-01T00:00:00Z")}); !sameIDs(recIDs(end), []int64{open, later}) {
 		t.Fatalf("as_of = valid_to: %v, want [%d %d]", recIDs(end), open, later)
 	}
+	if end := f.query(FactQuery{EntityID: emre, AsOf: mustTime(t, "2026-05-01T00:00:00Z")}); !sameIDs(recIDs(end), []int64{window, open}) {
+		t.Fatalf("as_of = the ended fact's valid_to: %v, want [%d %d]", recIDs(end), window, open)
+	}
 	// since/until bound valid_from; an unknown valid_from never matches.
+	// Without as_of/known_as_of nothing ended comes back.
 	if got := f.query(FactQuery{EntityID: emre, Since: mustTime(t, "2026-05-01T00:00:00Z")}); !reflect.DeepEqual(recIDs(got), []int64{later}) {
 		t.Fatalf("since 2026-05 = %v, want [%d]", recIDs(got), later)
 	}
 	if got := f.query(FactQuery{EntityID: emre, Until: mustTime(t, "2026-06-01T00:00:00Z")}); !reflect.DeepEqual(recIDs(got), []int64{window}) {
-		t.Fatalf("until 2026-06 = %v, want [%d]", recIDs(got), window)
+		t.Fatalf("until 2026-06 = %v, want [%d] (no ended fact without as_of/known_as_of)", recIDs(got), window)
+	}
+	if got := f.query(FactQuery{EntityID: emre, Until: mustTime(t, "2026-06-01T00:00:00Z"), AsOf: mustTime(t, "2026-03-01T00:00:00Z")}); !sameIDs(recIDs(got), []int64{window, ended}) {
+		t.Fatalf("until 2026-06 + as_of 2026-03 = %v, want [%d %d]", recIDs(got), window, ended)
+	}
+}
+
+// TestFactQueryWithoutPointInTimeReturnsNoRetractedFact: without as_of /
+// known_as_of the answer is exactly the pre-FIX one - active facts only, in
+// both lanes and with include_quarantined.
+func TestFactQueryWithoutPointInTimeReturnsNoRetractedFact(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	active := f.fact("Emre", emre, "works_at", "Beta", 0, ep)
+	f.fact("Emre", emre, "works_at", "Acme", 0, ep)
+	f.retract("Emre", "works_at", "Acme", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	f.fact("Emre", emre, "lives_in", "Moda", 0, ep)
+	f.retract("Emre", "lives_in", "Moda", factengine.RetractionCorrected, "2026-05-01T00:00:00Z")
+	for _, q := range []FactQuery{{EntityID: emre}, {EntityID: emre, CloudLane: true}, {EntityID: emre, IncludeQuarantined: true}, {Predicate: "works_at"}} {
+		if got := f.query(q); !reflect.DeepEqual(recIDs(got), []int64{active}) || got[0].Ended {
+			t.Fatalf("query %+v = %+v, want only the active %d", q, got, active)
+		}
+	}
+}
+
+// TestFactQueryNeverReturnsACorrectedFact: a fact retracted as wrong never
+// comes back - not inside its old window, not at a known_as_of before its
+// retraction, not with include_quarantined, in neither lane.
+func TestFactQueryNeverReturnsACorrectedFact(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	f.fe.SetClock(func() time.Time { return mustTime(t, "2026-02-01T00:00:00Z") })
+	corrected := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z"}))
+	f.fe.SetClock(time.Now)
+	f.retract("Emre", "works_at", "Acme", factengine.RetractionCorrected, "2026-05-01T00:00:00Z")
+	for _, q := range []FactQuery{
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z"), IncludeQuarantined: true},
+		{EntityID: emre, KnownAsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+		{EntityID: emre, KnownAsOf: mustTime(t, "2026-03-01T00:00:00Z"), CloudLane: true},
+		{Subject: "Emre", AsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+	} {
+		if got := f.query(q); len(got) != 0 {
+			t.Fatalf("query %+v = %+v, want no fact (corrected %d)", q, got, corrected)
+		}
+	}
+}
+
+// TestFactQueryNeverReturnsALegacyRetractedFact: a retraction written
+// before 0027 has no kind on file; it counts as corrected (fail-closed: its
+// history is never shown).
+func TestFactQueryNeverReturnsALegacyRetractedFact(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	f.fe.SetClock(func() time.Time { return mustTime(t, "2026-02-01T00:00:00Z") })
+	legacy := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z"}))
+	f.fe.SetClock(time.Now)
+	// What a pre-0027 RetractFact left: status + valid_to, no kind, no time.
+	if _, err := f.st.DB().Exec(`UPDATE facts SET status = 'retracted', valid_to = '2026-05-01T00:00:00Z' WHERE id = ?`, legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []FactQuery{
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z"), IncludeQuarantined: true},
+		{EntityID: emre, KnownAsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+	} {
+		if got := f.query(q); len(got) != 0 {
+			t.Fatalf("query %+v = %+v, want no fact (legacy retraction %d)", q, got, legacy)
+		}
+	}
+}
+
+// TestFactQueryKnownAsOfBeforeAndAfterTheRetraction: known_as_of answers
+// what Kâhya knew then - an ended fact is in it from its creation until
+// its retraction (created_at <= T < retracted_at), marked Ended; a
+// corrected one with the same timeline never is.
+func TestFactQueryKnownAsOfBeforeAndAfterTheRetraction(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	f.fe.SetClock(func() time.Time { return mustTime(t, "2026-04-10T09:00:00Z") })
+	ended := f.fact("Emre", emre, "works_at", "Acme", 0, ep)
+	f.fact("Emre", emre, "lives_in", "Moda", 0, ep)
+	f.fe.SetClock(time.Now)
+	f.retract("Emre", "works_at", "Acme", factengine.RetractionEnded, "2026-06-01T00:00:00Z")
+	f.retract("Emre", "lives_in", "Moda", factengine.RetractionCorrected, "2026-06-01T00:00:00Z")
+
+	for _, cloud := range []bool{false, true} {
+		got := f.query(FactQuery{EntityID: emre, KnownAsOf: mustTime(t, "2026-05-01T00:00:00Z"), CloudLane: cloud})
+		if !reflect.DeepEqual(recIDs(got), []int64{ended}) || !got[0].Ended || got[0].KnownSince != "2026-04-10T09:00:00Z" || got[0].RetractedAt != "2026-06-01T00:00:00Z" {
+			t.Fatalf("cloud=%v known_as_of 2026-05 (before the retraction) = %+v, want only the ended %d", cloud, got, ended)
+		}
+	}
+	if got := f.query(FactQuery{EntityID: emre, KnownAsOf: mustTime(t, "2026-07-01T00:00:00Z")}); len(got) != 0 {
+		t.Fatalf("known_as_of 2026-07 (after the retraction) = %+v, want none", got)
+	}
+	// The retraction instant itself: already retracted then.
+	if got := f.query(FactQuery{EntityID: emre, KnownAsOf: mustTime(t, "2026-06-01T00:00:00Z")}); len(got) != 0 {
+		t.Fatalf("known_as_of = retracted_at: %+v, want none", got)
+	}
+	if got := f.query(FactQuery{EntityID: emre, KnownAsOf: mustTime(t, "2026-04-01T00:00:00Z")}); len(got) != 0 {
+		t.Fatalf("known_as_of 2026-04-01 (before it was known) = %+v, want none", got)
+	}
+}
+
+// TestFactQueryEndedFactTrustAndLaneRules: an ended fact goes through the
+// same trust filter as an active one (an unconfirmed extraction only with
+// include_quarantined, labelled) and the same lane filter (a secret-path
+// ended fact never reaches the cloud lane).
+func TestFactQueryEndedFactTrustAndLaneRules(t *testing.T) {
+	f := newFixture(t)
+	normal := f.episode("people/emre.md")
+	secret := f.episode("finans-emre.md")
+	emre := f.entity("Emre", "person")
+	f.quarantinedFact("Emre", emre, "lives_in", "Moda", normal)
+	f.retract("Emre", "lives_in", "Moda", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	hidden := f.fact("Emre", emre, "has_loan_at", "BankX", 0, secret)
+	f.retract("Emre", "has_loan_at", "BankX", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	asOf := mustTime(t, "2026-03-01T00:00:00Z")
+
+	if got := f.query(FactQuery{EntityID: emre, AsOf: asOf, CloudLane: true}); len(got) != 0 {
+		t.Fatalf("cloud as_of = %+v, want none (quarantined ended fact hidden, secret one dropped)", got)
+	}
+	got := f.query(FactQuery{EntityID: emre, AsOf: asOf, IncludeQuarantined: true, CloudLane: true})
+	if len(got) != 1 || !got[0].Ended || !got[0].Quarantined || got[0].Object != "Moda" {
+		t.Fatalf("cloud as_of include_quarantined = %+v, want the quarantined ended fact only, labelled", got)
+	}
+	local := f.query(FactQuery{EntityID: emre, AsOf: asOf})
+	if !reflect.DeepEqual(recIDs(local), []int64{hidden}) || !local[0].Ended {
+		t.Fatalf("local as_of = %+v, want the secret-path ended fact %d", local, hidden)
+	}
+}
+
+// TestNeighbourhoodNeverInjectsAnEndedFact: an ended fact is history for
+// the structured reads only - the <hafiza> walk keeps InjectionEligible
+// (active) facts, as before.
+func TestNeighbourhoodNeverInjectsAnEndedFact(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	acme := f.entity("Acme", "org")
+	active := f.fact("Emre", emre, "lives_in", "Moda", 0, ep)
+	f.fact("Emre", emre, "works_at", "Acme", acme, ep)
+	f.retract("Emre", "works_at", "Acme", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	for _, cloud := range []bool{false, true} {
+		lines, _ := f.walk("Emre", []int64{ep}, Options{Hops: 2, CloudLane: cloud})
+		if !reflect.DeepEqual(factIDs(lines), []int64{active}) {
+			t.Fatalf("cloud=%v walk = %v, want only the active %d", cloud, factIDs(lines), active)
+		}
 	}
 }
 

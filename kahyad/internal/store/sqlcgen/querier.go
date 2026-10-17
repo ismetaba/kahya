@@ -708,6 +708,11 @@ type Querier interface {
 	// transaction) changed the hash, so 0 rows are affected and the episode
 	// stays pending.
 	MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtractedParams) (int64, error)
+	// 0027: a user denial of a fact already retracted as 'ended' (kahya fact
+	// deny, a ritual Yanlis answer) says it never held - it becomes
+	// 'corrected' and never shows as history again. Only 'ended' rows change
+	// (NULL - a pre-0027 retraction - already counts as corrected).
+	MarkFactRetractionCorrected(ctx context.Context, arg MarkFactRetractionCorrectedParams) (int64, error)
 	// Terminal success: the re-spawned worker exited 0 (task spec step 7).
 	MarkOutboxDelivered(ctx context.Context, arg MarkOutboxDeliveredParams) error
 	MarkToolCallExecuting(ctx context.Context, arg MarkToolCallExecutingParams) error
@@ -767,7 +772,11 @@ type Querier interface {
 	// valid_to set, status='retracted' - NEVER a DELETE. The caller
 	// (kahyad/internal/factengine/retract.go) always inserts a negative
 	// evidence row in the SAME logical operation, never this alone.
-	RetractFact(ctx context.Context, arg RetractFactParams) error
+	// 0027: the retraction records its kind ('ended' = the fact held and no
+	// longer does; 'corrected' = it was wrong) and its own transaction time.
+	// Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
+	// caller reports "no active fact".
+	RetractFact(ctx context.Context, arg RetractFactParams) (int64, error)
 	// W6-03 halt executor step 3.5 ("invalidate pending approvals ... and
 	// REVOKE their one-time tokens"): burns every not-yet-consumed
 	// approval_tokens row for taskID via the SAME "UPDATE ... WHERE

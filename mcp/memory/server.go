@@ -629,7 +629,7 @@ func (s *Server) MCPServer(impl *mcp.Implementation) *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "fact_query",
-		Description: "Yapılandırılmış olguları (özne-yüklem-nesne) varlık, yüklem ve zaman (as_of / known_as_of / since / until) filtresiyle sorgular; onaysız ajan çıkarımları yalnız include_quarantined=true ile ve 'quarantined' etiketiyle döner.",
+		Description: FactQueryToolDescription,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args FactQueryArgs) (*mcp.CallToolResult, FactQueryOutput, error) {
 		out, err := s.HandleFactQuery(ctx, traceIDFromRequest(req), args)
 		return nil, out, err

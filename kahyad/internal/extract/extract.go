@@ -151,7 +151,7 @@ var _ ReaderRunner = (*reader.Runner)(nil)
 // *factengine.Engine satisfies it.
 type FactEngine interface {
 	WriteFact(ctx context.Context, traceID string, c factengine.Candidate) (int64, error)
-	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error)
+	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string, kind factengine.RetractionKind) (factengine.Retraction, error)
 	ResolveEntityForExtraction(ctx context.Context, traceID, name, kind string, cloudLane bool) (entityID int64, created, provisional bool, err error)
 	AddAlias(ctx context.Context, traceID string, entityID int64, alias string, cloudLane bool) (bool, error)
 }
@@ -733,6 +733,14 @@ func cloudLaneOnly(cloudLane bool, v string) string {
 // extraction's provenance and no user confirmed it (a model reading a note
 // never closes a user's fact; the user does, with `kahya fact retract`).
 // No active fact is a no-op (a re-extraction after the first retraction).
+// The answer's retraction:true means the relation ENDED ("artık ...
+// değil", "ayrıldı"), so the fact is retracted as factengine.
+// RetractionEnded: its validity window stays queryable history (FIX-FINAL
+// fact-history-ended-vs-corrected) - unless the verbatim quote the answer
+// cites is a correction phrase (factengine.ClassifyRetraction: "düzeltiyorum",
+// "yanlış hatırlıyorsun", ...), then it is RetractionCorrected (the note
+// says the fact was wrong; never shown as history). factengine also
+// records it as corrected when the user had denied the fact.
 func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, sessionID string, prov factengine.Provenance, f reader.ExtractFactV1) (bool, error) {
 	active, err := r.Store.GetActiveFactByTriple(ctx, sqlcgen.GetActiveFactByTripleParams{Subject: f.Subject, Predicate: f.Predicate, Object: f.Object})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -747,13 +755,22 @@ func (r *Runner) retract(ctx context.Context, traceID string, episodeID int64, s
 		})
 		return false, nil
 	}
-	if _, err := r.Engine.RetractFact(ctx, traceID, f.Subject, f.Predicate, f.Object, sessionID); err != nil {
+	if _, err := r.Engine.RetractFact(ctx, traceID, f.Subject, f.Predicate, f.Object, sessionID, extractedRetractionKind(f.Quote)); err != nil {
 		if errors.Is(err, factengine.ErrNoActiveFact) {
 			return false, nil
 		}
 		return false, fmt.Errorf("retract %q %q %q: %w", f.Subject, f.Predicate, f.Object, err)
 	}
 	return true, nil
+}
+
+// extractedRetractionKind is the kind of an extracted retraction: ended,
+// or corrected when its cited quote is a correction phrase.
+func extractedRetractionKind(quote string) factengine.RetractionKind {
+	if k, ok := factengine.ClassifyRetraction(quote); ok && k == factengine.RetractionCorrected {
+		return factengine.RetractionCorrected
+	}
+	return factengine.RetractionEnded
 }
 
 // tierRank orders HANDOFF §5 memory #1's source-trust lattice (higher =

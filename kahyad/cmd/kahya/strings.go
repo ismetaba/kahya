@@ -763,4 +763,20 @@ const (
 	// left a note, which this ingest retracted to the memory trash (%s = that
 	// note; one line per note).
 	MsgIngestSupersededFmt = "Bu belgenin yarım kalmış önceki alımının notu hafıza çöpüne taşındı: %s"
+
+	// FIX-FINAL fact-history-ended-vs-corrected (owner decision 2026-10-16).
+	// MsgFactRetractUsage is `kahya fact retract`'s own usage (wrong arity,
+	// -h). MsgFactRetractEndedHelp is the --sona-erdi help text.
+	MsgFactRetractUsage     = "kullanım: kahya fact retract [--sona-erdi] <özne> <yüklem> <nesne> [oturum_id]"
+	MsgFactRetractEndedHelp = "olgu doğruydu ama artık geçerli değil: sona erdi olarak kapat (geçmiş sorgularında --as-of / --known-as-of ile görünür); bayraksız geri çekme yanlış kaydın düzeltilmesidir ve olgu bir daha hiç gösterilmez"
+	// MsgFactEnded is `kahya fact retract --sona-erdi`'s success line (%d =
+	// the fact id); MsgFactEndedDowngraded replaces it when kahyad recorded
+	// a correction instead because the user had denied that fact before.
+	// The plain retraction keeps MsgFactRetracted.
+	MsgFactEnded           = "Olgu sona erdi olarak kapatıldı: %d"
+	MsgFactEndedDowngraded = "Olgu daha önce reddedildiği için düzeltme olarak kapatıldı (geçmişte gösterilmez): %d"
+	// MsgFactEndedSuffix marks an ended fact in `kahya fact query --as-of /
+	// --known-as-of` rows, after MsgEntityFactUnconfirmedSuffix; it is ", " +
+	// mcp/memory.FactEndedLabel (pinned by TestFactEndedSuffixMatchesMCPLabel).
+	MsgFactEndedSuffix = ", sona erdi"
 )

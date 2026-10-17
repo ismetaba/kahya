@@ -1034,7 +1034,7 @@ UPDATE episodes SET cooled_at = ? WHERE id = ?;
 -- LinksCloudLane), 0 otherwise.
 INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud;
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at;
 
 -- W5-04 (memory-correctness-engine) queries below: the single fact-write
 -- path (kahyad/internal/factengine) is the ONLY caller of InsertFact
@@ -1045,7 +1045,7 @@ RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence
 -- name: GetFact :one
 -- Looked up by kahya fact confirm/retract (CLI, over UDS) and by the
 -- engine's own recompute-from-evidence path.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE id = ?;
 
@@ -1059,7 +1059,7 @@ WHERE id = ?;
 -- than reviving the closed one in place - the retracted row stays exactly
 -- as HANDOFF S5 memory #3 requires (closed, never deleted, never
 -- reopened).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -1080,12 +1080,25 @@ UPDATE facts SET confidence = ?, updated_at = ? WHERE id = ?;
 -- memory #1).
 UPDATE facts SET confirmed_at = ?, updated_at = ? WHERE id = ?;
 
--- name: RetractFact :exec
+-- name: RetractFact :execrows
 -- Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
 -- valid_to set, status='retracted' - NEVER a DELETE. The caller
 -- (kahyad/internal/factengine/retract.go) always inserts a negative
 -- evidence row in the SAME logical operation, never this alone.
-UPDATE facts SET status = 'retracted', valid_to = ?, updated_at = ? WHERE id = ?;
+-- 0027: the retraction records its kind ('ended' = the fact held and no
+-- longer does; 'corrected' = it was wrong) and its own transaction time.
+-- Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
+-- caller reports "no active fact".
+UPDATE facts SET status = 'retracted', retraction_kind = ?, retracted_at = ?, valid_to = ?, updated_at = ?
+WHERE id = ? AND status = 'active';
+
+-- name: MarkFactRetractionCorrected :execrows
+-- 0027: a user denial of a fact already retracted as 'ended' (kahya fact
+-- deny, a ritual Yanlis answer) says it never held - it becomes
+-- 'corrected' and never shows as history again. Only 'ended' rows change
+-- (NULL - a pre-0027 retraction - already counts as corrected).
+UPDATE facts SET retraction_kind = 'corrected', updated_at = ?
+WHERE id = ? AND status = 'retracted' AND retraction_kind = 'ended';
 
 -- name: ListEvidenceByFact :many
 -- Every evidence row for one fact, in insertion order - the engine's
@@ -1199,7 +1212,7 @@ WHERE id = ?;
 -- unfiltered (kahyad/internal/ritual/select.go applies the secret-lane
 -- exclusion/priority policy entirely in Go, never in SQL, so the policy
 -- stays readable/testable as plain code, not buried in a query).
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC;
@@ -1379,7 +1392,7 @@ LIMIT 1;
 -- One graph hop: every active fact touching entity_id as subject OR object.
 -- Tier/confirmed/threshold eligibility is applied in Go
 -- (factengine.InjectionEligible) so the predicate lives in ONE place.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
 ORDER BY confidence DESC, updated_at DESC
@@ -1390,7 +1403,7 @@ LIMIT ?;
 -- a side a CLOUD-lane extraction call linked (subject_link_cloud /
 -- object_link_cloud). A link a local-lane call wrote - possibly through an
 -- alias only a secret note carries - is never followed for a cloud reader.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active'
   AND ((subject_entity_id = ? AND subject_link_cloud = 1) OR (object_entity_id = ? AND object_link_cloud = 1))
@@ -1458,7 +1471,7 @@ UPDATE episodes SET extracted_at = NULL, extractor_ver = NULL WHERE status = 'ac
 -- max_id > 0 keeps only ids at or below it (fact ids only grow): `kahya
 -- fact confirm --all-quarantined --since S --upto N --yes` confirms only
 -- what the dry run listed (FIX-FINAL TUX-2); 0 = no upper bound.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND source_tier NOT IN ('user_edit', 'user_asserted') AND confirmed_at IS NULL
   AND created_at >= sqlc.arg(created_since)
@@ -1470,7 +1483,7 @@ LIMIT sqlc.arg(row_limit);
 -- `kahya fact list` without --quarantined (MEM-5): every active fact created
 -- at or after created_since (same text bound as ListQuarantinedFacts),
 -- newest first.
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND created_at >= sqlc.arg(created_since)
 ORDER BY id DESC

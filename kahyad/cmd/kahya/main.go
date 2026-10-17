@@ -629,7 +629,10 @@ func printFactBulk(stdout, stderr io.Writer, countFmt string, done []int64, fail
 // (G13 MEM-4 phase 4) over GET /v1/fact/query: the user's LOCAL view of
 // the fact graph (secret-lane facts included; quarantined ones only with
 // --quarantined, marked ", onaysız"). "What X knew about Y before May" is
-// --subject X --known-as-of 2026-05-01T00:00:00Z.
+// --subject X --known-as-of 2026-05-01T00:00:00Z. With --as-of /
+// --known-as-of an ENDED fact (`kahya fact retract --sona-erdi`, an
+// extracted "artık ... değil") comes back too, marked ", sona erdi"
+// (FIX-FINAL fact-history-ended-vs-corrected); a corrected one never does.
 func runFactQuery(client *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fact query", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -680,6 +683,9 @@ func runFactQuery(client *Client, args []string, stdout, stderr io.Writer) int {
 		suffix := ""
 		if f.Quarantined {
 			suffix = MsgEntityFactUnconfirmedSuffix
+		}
+		if f.Ended {
+			suffix += MsgFactEndedSuffix
 		}
 		fmt.Fprintf(stdout, MsgFactQueryRow+"\n", f.FactID, f.Subject, f.Predicate, f.Object, f.ConfidenceP, f.SourceTier, factQueryValidity(f.ValidFrom, f.ValidTo), suffix)
 	}
@@ -829,26 +835,67 @@ func runFactDeny(client *Client, args []string, stdout, stderr io.Writer) int {
 	return printFactBulk(stdout, stderr, MsgFactDeniedMany, res.Denied, res.Failed)
 }
 
-// runFactRetract implements `kahya fact retract <özne> <yüklem> <nesne>
-// [oturum_id]`: closes the ACTIVE fact matching that triple
-// (status=retracted, valid_to set, negative evidence row - never a
-// delete, HANDOFF S5 memory #3).
+// runFactRetract implements `kahya fact retract [--sona-erdi] <özne>
+// <yüklem> <nesne> [oturum_id]`: closes the ACTIVE fact matching that
+// triple (status=retracted, valid_to set, negative evidence row - never a
+// delete, HANDOFF S5 memory #3). By default the retraction is a CORRECTION
+// (the fact was wrong - e.g. undoing a mistaken confirm): it is never shown
+// again. --sona-erdi (FIX-FINAL fact-history-ended-vs-corrected) records
+// that the fact held and has ENDED, so `kahya fact query --as-of` still
+// finds it inside its window. The flag may stand anywhere among the
+// positional arguments (only that exact token is a flag: an object that
+// happens to start with "-" stays positional); "--" ends the flags.
 func runFactRetract(client *Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) < 3 || len(args) > 4 {
-		fmt.Fprintln(stderr, MsgFactUsage)
+	fs := flag.NewFlagSet("fact retract", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	setTurkishUsage(fs, stderr, MsgFactRetractUsage)
+	fs.Bool("sona-erdi", false, MsgFactRetractEndedHelp)
+	ended := false
+	var pos []string
+	flagsDone := false
+	for _, a := range args {
+		switch {
+		case flagsDone:
+			pos = append(pos, a)
+		case a == "--":
+			flagsDone = true
+		case a == "--sona-erdi" || a == "-sona-erdi":
+			ended = true
+		case isHelpArg(a):
+			fs.Usage()
+			return 2
+		default:
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) < 3 || len(pos) > 4 {
+		fmt.Fprintln(stderr, MsgFactRetractUsage)
 		return 2
 	}
-	subject, predicate, object := args[0], args[1], args[2]
+	subject, predicate, object := pos[0], pos[1], pos[2]
 	sessionID := ""
-	if len(args) == 4 {
-		sessionID = args[3]
+	if len(pos) == 4 {
+		sessionID = pos[3]
 	}
-	id, err := client.RetractFact(context.Background(), traceid.New(), subject, predicate, object, sessionID)
+	kind := retractionKindCorrected
+	if ended {
+		kind = retractionKindEnded
+	}
+	id, recorded, err := client.RetractFact(context.Background(), traceid.New(), subject, predicate, object, sessionID, kind)
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return 2
 	}
-	fmt.Fprintf(stdout, MsgFactRetracted+"\n", id)
+	switch {
+	case ended && recorded == retractionKindEnded:
+		fmt.Fprintf(stdout, MsgFactEnded+"\n", id)
+	case ended:
+		// kahyad recorded a correction (the user had denied this fact):
+		// say so rather than claim the history the user asked for.
+		fmt.Fprintf(stdout, MsgFactEndedDowngraded+"\n", id)
+	default:
+		fmt.Fprintf(stdout, MsgFactRetracted+"\n", id)
+	}
 	return 0
 }
 

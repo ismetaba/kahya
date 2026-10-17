@@ -309,7 +309,8 @@ type Store interface {
 	GetFact(ctx context.Context, id int64) (sqlcgen.Fact, error)
 	UpdateFactConfidence(ctx context.Context, arg sqlcgen.UpdateFactConfidenceParams) error
 	ConfirmFact(ctx context.Context, arg sqlcgen.ConfirmFactParams) error
-	RetractFact(ctx context.Context, arg sqlcgen.RetractFactParams) error
+	RetractFact(ctx context.Context, arg sqlcgen.RetractFactParams) (int64, error)
+	MarkFactRetractionCorrected(ctx context.Context, arg sqlcgen.MarkFactRetractionCorrectedParams) (int64, error)
 	ListEvidenceByFact(ctx context.Context, factID int64) ([]sqlcgen.ListEvidenceByFactRow, error)
 	GetEvidenceByFactSessionPolarity(ctx context.Context, arg sqlcgen.GetEvidenceByFactSessionPolarityParams) (sqlcgen.GetEvidenceByFactSessionPolarityRow, error)
 	InsertEvidence(ctx context.Context, arg sqlcgen.InsertEvidenceParams) (sqlcgen.InsertEvidenceRow, error)
@@ -785,9 +786,25 @@ func (e *Engine) ConfirmFact(ctx context.Context, traceID string, factID int64) 
 // in retract.go): a denied-but-still-active fact can still be reasserted
 // later and its confidence can recover, whereas a RETRACTED fact is
 // closed for good. An id that names no fact is ErrFactNotFound.
+//
+// A denial says the fact was WRONG (FIX-FINAL fact-history-ended-vs-
+// corrected): on a fact already retracted as ended it re-records the
+// retraction as corrected FIRST (before the evidence row, so a failure
+// leaves nothing shown as history), and a later ended retraction of a
+// denied active fact is recorded as corrected by RetractFact. This is the
+// `kahya fact deny` and the ritual Yanlış answer's corrected half.
 func (e *Engine) DenyFact(ctx context.Context, traceID string, factID int64, sessionID string) error {
-	if _, err := e.requireFact(ctx, factID); err != nil {
+	fact, err := e.requireFact(ctx, factID)
+	if err != nil {
 		return err
+	}
+	corrected := false
+	if fact.Status == "retracted" {
+		n, err := e.store.MarkFactRetractionCorrected(ctx, sqlcgen.MarkFactRetractionCorrectedParams{UpdatedAt: e.nowRFC3339(), ID: factID})
+		if err != nil {
+			return fmt.Errorf("factengine: deny fact %d: mark retraction corrected: %w", factID, err)
+		}
+		corrected = n > 0
 	}
 	if err := e.addEvidence(ctx, factID, 0, sessionID, -1, DenialLogOdds); err != nil {
 		return fmt.Errorf("factengine: deny fact %d: %w", factID, err)
@@ -796,7 +813,11 @@ func (e *Engine) DenyFact(ctx context.Context, traceID string, factID int64, ses
 		return fmt.Errorf("factengine: recompute confidence for fact %d: %w", factID, err)
 	}
 	if e.ledger != nil {
-		_ = e.ledger.LogEvent(ctx, traceID, EventFactDenied, map[string]any{"fact_id": factID, "session_id": sessionID})
+		payload := map[string]any{"fact_id": factID, "session_id": sessionID}
+		if corrected {
+			payload["retraction_kind"] = string(RetractionCorrected)
+		}
+		_ = e.ledger.LogEvent(ctx, traceID, EventFactDenied, payload)
 	}
 	return nil
 }

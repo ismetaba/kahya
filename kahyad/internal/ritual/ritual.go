@@ -30,7 +30,11 @@
 //     comment names this exact call site.
 //   - Yanlis (false): factengine.DenyFact - the fixed -2.94 negative
 //     evidence row (HANDOFF S5 memory #3: "kullanici reddi guveni
-//     dusurur").
+//     dusurur"). The answer says the fact was WRONG, so it is a
+//     correction for the fact's history (FIX-FINAL fact-history-ended-vs-
+//     corrected): DenyFact re-records an ended retraction as corrected, and
+//     a later ended retraction of the denied fact is recorded as corrected,
+//     so it never shows in an as_of / known_as_of fact_query.
 //   - Emin degilim (unsure): no evidence row at all - the label is
 //     recorded, confidence is untouched.
 package ritual

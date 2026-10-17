@@ -27,6 +27,18 @@ var ErrGraphUnavailable = errors.New("graf katmanı bu kurulumda kullanılamıyo
 // known_as_of that is not RFC3339.
 var ErrFactQueryBadTime = errors.New("fact_query: since/until/as_of/known_as_of must be RFC3339")
 
+// FactQueryToolDescription is fact_query's tool description (byte-exact
+// Turkish): the FIX-MEM-4 text plus the history rule of FIX-FINAL
+// fact-history-ended-vs-corrected.
+const FactQueryToolDescription = "Yapılandırılmış olguları (özne-yüklem-nesne) varlık, yüklem ve zaman (as_of / known_as_of / since / until) filtresiyle sorgular; onaysız ajan çıkarımları yalnız include_quarantined=true ile ve 'quarantined' etiketiyle döner. as_of / known_as_of ile o anda geçerli olup sonradan sona ermiş olgular da 'sona erdi' etiketiyle döner; yanlış olduğu için düzeltilmiş olgular hiç dönmez."
+
+// FactEndedLabel is the byte-exact Turkish label fact_query puts on an
+// ENDED fact (FactRecord.Label; FIX-FINAL fact-history-ended-vs-
+// corrected): a fact that held during its validity window and was later
+// retracted as no longer holding. Only an as_of / known_as_of query returns
+// one. kahyad/cmd/kahya's MsgFactEndedSuffix is ", " + this label.
+const FactEndedLabel = "sona erdi"
+
 // Tool result bounds.
 const (
 	DefaultEntityLookupK = 10
@@ -68,8 +80,8 @@ type FactQueryArgs struct {
 	EntityID  int64  `json:"entity_id,omitempty" jsonschema:"entity_lookup'tan gelen varlik id; ozne ya da nesne olarak o varligi anan olgular"`
 	Since     string `json:"since,omitempty" jsonschema:"RFC3339; valid_from >= since"`
 	Until     string `json:"until,omitempty" jsonschema:"RFC3339; valid_from < until"`
-	AsOf      string `json:"as_of,omitempty" jsonschema:"RFC3339; bu anda GECERLI olan olgular (valid_from <= as_of < valid_to)"`
-	KnownAsOf string `json:"known_as_of,omitempty" jsonschema:"RFC3339; bu tarihte BILINEN olgular (created_at <= known_as_of)"`
+	AsOf      string `json:"as_of,omitempty" jsonschema:"RFC3339; bu anda GECERLI olan olgular (valid_from <= as_of < valid_to); o anda gecerli olup sonradan sona ermis olgular da 'sona erdi' etiketiyle doner"`
+	KnownAsOf string `json:"known_as_of,omitempty" jsonschema:"RFC3339; bu tarihte BILINEN ve henuz geri cekilmemis olgular (created_at <= known_as_of); sonradan sona ermis olanlar 'sona erdi' etiketiyle doner"`
 	MinTier   string `json:"min_tier,omitempty" jsonschema:"user_edit|user_asserted|external_doc|screen|agent_derived - en dusuk kabul edilen guven katmani"`
 	// IncludeQuarantined (decision MEM-4.a) also returns the facts the
 	// trust filter would hide - unconfirmed agent_derived ones and ones
@@ -112,6 +124,14 @@ type FactRecord struct {
 	Evidence        string `json:"evidence,omitempty"`
 	SubjectEntityID int64  `json:"subject_entity_id,omitempty"`
 	ObjectEntityID  int64  `json:"object_entity_id,omitempty"`
+	// Ended marks a fact that held during [valid_from, valid_to) and was
+	// later retracted as no longer holding (only an as_of / known_as_of
+	// query returns one); Label is then FactEndedLabel and RetractedAt the
+	// retraction's time (when Kâhya learned it ended). A fact that was
+	// retracted as WRONG (a correction) is never returned at all.
+	Ended       bool   `json:"ended,omitempty"`
+	Label       string `json:"label,omitempty"`
+	RetractedAt string `json:"retracted_at,omitempty"`
 }
 
 // FactQueryOutput is fact_query's output.
@@ -173,6 +193,13 @@ func (s *Server) HandleFactQuery(ctx context.Context, traceID string, args FactQ
 	}
 	if facts == nil {
 		facts = []FactRecord{}
+	}
+	for i := range facts {
+		if facts[i].Ended {
+			facts[i].Label = FactEndedLabel
+		} else {
+			facts[i].Label = ""
+		}
 	}
 	return FactQueryOutput{Facts: facts}, nil
 }

@@ -88,3 +88,34 @@ func TestEntityLookupArgsValidatedAndClamped(t *testing.T) {
 		t.Fatalf("default k = %d, want %d", g.lastK, DefaultEntityLookupK)
 	}
 }
+
+// TestFactQueryLabelsEndedFactsSonaErdi (FIX-FINAL fact-history-ended-vs-
+// corrected): an ended fact always carries the byte-exact Turkish label
+// "sona erdi"; any other fact carries none, whatever the reader set.
+func TestFactQueryLabelsEndedFactsSonaErdi(t *testing.T) {
+	if FactEndedLabel != "sona erdi" {
+		t.Fatalf("FactEndedLabel = %q, want the byte-exact \"sona erdi\"", FactEndedLabel)
+	}
+	g := &fakeGraphReader{facts: []FactRecord{{FactID: 1}, {FactID: 2, Ended: true, RetractedAt: "2026-08-01T00:00:00Z"}, {FactID: 3, Label: "stale"}}}
+	s := New(t.TempDir(), &fakeSearcher{}, &fakeIndexer{}, nil, nil)
+	s.SetGraph(g)
+	out, err := s.HandleFactQuery(context.Background(), "tr", FactQueryArgs{AsOf: "2026-06-01T00:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64]string{1: "", 2: "sona erdi", 3: ""}
+	for _, f := range out.Facts {
+		if f.Label != want[f.FactID] {
+			t.Errorf("fact %d label = %q, want %q", f.FactID, f.Label, want[f.FactID])
+		}
+	}
+}
+
+// TestFactQueryToolDescriptionStatesTheHistoryRule: the tool description
+// keeps the FIX-MEM-4 text and states the history rule byte-exact.
+func TestFactQueryToolDescriptionStatesTheHistoryRule(t *testing.T) {
+	const want = "Yapılandırılmış olguları (özne-yüklem-nesne) varlık, yüklem ve zaman (as_of / known_as_of / since / until) filtresiyle sorgular; onaysız ajan çıkarımları yalnız include_quarantined=true ile ve 'quarantined' etiketiyle döner. as_of / known_as_of ile o anda geçerli olup sonradan sona ermiş olgular da 'sona erdi' etiketiyle döner; yanlış olduğu için düzeltilmiş olgular hiç dönmez."
+	if FactQueryToolDescription != want {
+		t.Fatalf("FactQueryToolDescription = %q, want %q", FactQueryToolDescription, want)
+	}
+}

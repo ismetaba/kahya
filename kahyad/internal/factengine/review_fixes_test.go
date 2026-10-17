@@ -113,10 +113,11 @@ func TestMergeRejectsUnrelatedAndRetractedEvidence(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	retractedID, err := e.RetractFact(ctx, "trace", "Emre", "works_on", "gold-token NATS", sess)
+	retracted, err := e.RetractFact(ctx, "trace", "Emre", "works_on", "gold-token NATS", sess, RetractionCorrected)
 	if err != nil {
 		t.Fatalf("RetractFact: %v", err)
 	}
+	retractedID := retracted.FactID
 	if _, err := e.MergeEntities(ctx, "trace", dstID, srcID, retractedID, "user"); !errors.Is(err, ErrMergeEvidenceUnusable) {
 		t.Fatalf("merge citing RETRACTED fact: err = %v, want ErrMergeEvidenceUnusable", err)
 	}

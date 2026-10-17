@@ -725,7 +725,8 @@ a cloud model, without changing anything in §2-§6 above:
   shared by every note stating the same triple and another note's citation
   can make it cloud-eligible later. A retraction closes only an
   unconfirmed fact of no more trust than the extraction's provenance (else
-  `extract.retraction_skipped`). An edited note is pending again (the
+  `extract.retraction_skipped`), and records it as ENDED (see "Fact
+  history: ended vs corrected" below). An edited note is pending again (the
   indexer resets `extracted_at` when the content hash changes; a `reindex
   --full` of unchanged bytes keeps it), and the stamp itself is a
   compare-and-set on the `source_hash` read before the chunks: a note
@@ -863,9 +864,57 @@ a cloud model, without changing anything in §2-§6 above:
   time/tier/limit, 503 unwired) → `{"facts": [{fact_id, subject, predicate,
   object, source_tier, evidentiality, confidence_p, quarantined, valid_from,
   valid_to, known_since, quote, evidence, subject_entity_id,
-  object_entity_id}], "trace_id"}`, printed `"Olgular (%d):"` /
+  object_entity_id, ended?, retracted_at?}], "trace_id"}`, printed `"Olgular (%d):"` /
   `"#%d  %s | %s | %s  (p=%.2f, %s%s%s)"` (e.g. `(p=0.80, user_asserted,
-  2026-05-01→, onaysız)`) / `"Eşleşen olgu yok."`.
+  2026-05-01→, onaysız)`) / `"Eşleşen olgu yok."`. Point-in-time queries
+  also answer ENDED facts - see the next bullet.
+- **Fact history: ended vs corrected (FIX-FINAL
+  fact-history-ended-vs-corrected, owner decision 2026-10-16).** Every
+  retraction (`factengine.RetractFact`, which now takes a
+  `RetractionKind`) records why the fact was closed in
+  `facts.retraction_kind` (migration 0027; NULL while active) and when in
+  `facts.retracted_at`: `ended` = it held and no longer does (an
+  extraction answer with `retraction: true` - corrected instead when the
+  quote it cites is a correction phrase -, the `"artık ... değil"`
+  shape of `factengine.ClassifyRetraction`, `kahya fact retract
+  --sona-erdi`); `corrected` = it was wrong (the correction phrases
+  `"düzeltiyorum"`, `"yanlış hatırlıyorsun"`, `"hayır, öyle değil"`,
+  `"hayır yanlış"` - a text with both shapes is a correction - and plain
+  `kahya fact retract`). A user denial means corrected: `DenyFact`
+  (`kahya fact deny`, the ritual Yanlış answer) re-records an ended
+  retraction as corrected, and an ended request on a fact that carries a
+  denial is recorded corrected. An ended retraction keeps an earlier
+  `valid_to` the fact already had (else `valid_to` = the retraction time);
+  the negative evidence row is unchanged. A pre-0027 retraction (kind NULL)
+  counts as corrected. `POST /v1/fact/retract {subject, predicate, object,
+  session_id?, kind?}` (`kind` "ended" | "corrected", "" = corrected, else
+  400 before any read) → `{"ok":true,"id":N,"kind":"<recorded>"}`; the CLI
+  prints `"Olgu geri çekildi: %d"` (unchanged), `"Olgu sona erdi olarak
+  kapatıldı: %d"`, or - an ended request kahyad recorded as a correction -
+  `"Olgu daha önce reddedildiği için düzeltme olarak kapatıldı (geçmişte
+  gösterilmez): %d"`; usage `"kullanım: kahya fact retract [--sona-erdi]
+  <özne> <yüklem> <nesne> [oturum_id]"` (the flag may stand anywhere among
+  the positionals; `--` ends flags). `fact_query` / `GET /v1/fact/query`
+  with `as_of` or `known_as_of` (and only then) also return ENDED facts:
+  `as_of` inside `[valid_from, valid_to)` (an unknown start open, the end
+  required), `known_as_of` with `created_at <= T < retracted_at` (known
+  then, not yet retracted then); both bounds apply together; since/until,
+  min_tier, the lane filter and the trust filter
+  (`factengine.HistoryEligible`: the tier half of `InjectionEligible` and
+  the log-odds without the retraction's own negative row above the
+  threshold; `include_quarantined` adds the rest, labelled) apply as for
+  active facts. An ended fact comes back with `ended: true`,
+  `retracted_at` and - in the MCP output only - `label: "sona erdi"`
+  (`memory.FactEndedLabel`, byte-exact); its `confidence_p` is the stored
+  one (its retraction's negative row included). The CLI appends `", sona
+  erdi"` (after `", onaysız"`). A corrected or kind-less fact is never
+  returned, not even with `include_quarantined`; without as_of /
+  known_as_of nothing changes. Ended facts are never injected:
+  `InjectionEligible` stays active-only, so the `<hafiza>` walk, profile
+  cards and `entity_lookup` top facts are unchanged, and `fact_query`
+  results are never written back into them (G00 H-6). The `fact_query`
+  tool description (`memory.FactQueryToolDescription`) and the
+  `as_of`/`known_as_of` argument descriptions state the rule.
 - **Human review of facts (FIX-MEM-5 phase 1, G13).** Control routes only
   (G03; a live worker is refused even with the control secret, G00 C-16):
   `POST /v1/fact/confirm` takes exactly one of `{"fact_id": N}` (answered

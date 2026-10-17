@@ -145,6 +145,8 @@ type Fact struct {
 	Quote            sql.NullString `json:"quote"`
 	SubjectLinkCloud int64          `json:"subject_link_cloud"`
 	ObjectLinkCloud  int64          `json:"object_link_cloud"`
+	RetractionKind   sql.NullString `json:"retraction_kind"`
+	RetractedAt      sql.NullString `json:"retracted_at"`
 }
 
 type LedgerChainBase struct {

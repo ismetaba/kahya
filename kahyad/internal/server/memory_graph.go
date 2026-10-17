@@ -157,6 +157,7 @@ func toMemoryFactRecord(f graph.FactRecord) memory.FactRecord {
 		SourceTier: f.SourceTier, Evidentiality: f.Evidentiality, ConfidenceP: f.ConfidenceP,
 		Quarantined: f.Quarantined, ValidFrom: f.ValidFrom, ValidTo: f.ValidTo, KnownSince: f.KnownSince,
 		Quote: f.Quote, Evidence: f.Evidence, SubjectEntityID: f.SubjectEntityID, ObjectEntityID: f.ObjectEntityID,
+		Ended: f.Ended, RetractedAt: f.RetractedAt,
 	}
 }
 
@@ -183,13 +184,20 @@ type factQueryItem struct {
 	Evidence        string  `json:"evidence,omitempty"`
 	SubjectEntityID int64   `json:"subject_entity_id,omitempty"`
 	ObjectEntityID  int64   `json:"object_entity_id,omitempty"`
+	// Ended / RetractedAt (FIX-FINAL fact-history-ended-vs-corrected): an
+	// ended fact an as_of / known_as_of query returned, and when it was
+	// retracted. The CLI renders its Turkish label.
+	Ended       bool   `json:"ended,omitempty"`
+	RetractedAt string `json:"retracted_at,omitempty"`
 }
 
 // handleFactQuery answers GET /v1/fact/query (G13 MEM-4 phase 4, `kahya
 // fact query`): the same graph.QueryFacts the fact_query tool uses, but in
 // the LOCAL lane - this is the user's own surface (a control route, never a
 // worker's), so secret-path facts are listed too, and quarantined ones with
-// quarantined=1, labelled. Parameters: subject, predicate, object, entity
+// quarantined=1, labelled. With as_of / known_as_of an ended fact comes
+// back with ended:true (FIX-FINAL fact-history-ended-vs-corrected); a
+// corrected one never does. Parameters: subject, predicate, object, entity
 // (an id, or a name resolved through the folded alias key), since, until,
 // as_of, known_as_of (RFC3339), min_tier, quarantined (1|true), limit
 // (1..graph.MaxFactQueryLimit).
@@ -256,6 +264,7 @@ func (s *Server) handleFactQuery(w http.ResponseWriter, r *http.Request) {
 			SourceTier: f.SourceTier, Evidentiality: f.Evidentiality, ConfidenceP: f.ConfidenceP,
 			Quarantined: f.Quarantined, ValidFrom: f.ValidFrom, ValidTo: f.ValidTo, KnownSince: f.KnownSince,
 			Quote: f.Quote, Evidence: f.Evidence, SubjectEntityID: f.SubjectEntityID, ObjectEntityID: f.ObjectEntityID,
+			Ended: f.Ended, RetractedAt: f.RetractedAt,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")

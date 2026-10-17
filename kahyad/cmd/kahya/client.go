@@ -877,6 +877,8 @@ type factActionResponse struct {
 	OK    bool   `json:"ok"`
 	ID    int64  `json:"id,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Kind is the retraction kind POST /v1/fact/retract recorded.
+	Kind string `json:"kind,omitempty"`
 }
 
 // factAction POSTs body (already-marshaled JSON) to path and decodes a
@@ -884,31 +886,37 @@ type factActionResponse struct {
 // fact/entity routes below uses, mirroring consolidationAction's identical
 // shape.
 func (c *Client) factAction(ctx context.Context, traceID, path string, body any) (int64, error) {
+	ar, err := c.factActionResult(ctx, traceID, path, body)
+	return ar.ID, err
+}
+
+// factActionResult is factAction returning the whole OK answer.
+func (c *Client) factActionResult(ctx context.Context, traceID, path string, body any) (factActionResponse, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
-		return 0, fmt.Errorf("%s: marshal request: %w", path, err)
+		return factActionResponse{}, fmt.Errorf("%s: marshal request: %w", path, err)
 	}
 	req, err := c.newRequest(ctx, http.MethodPost, path, traceID, bytes.NewReader(b))
 	if err != nil {
-		return 0, err
+		return factActionResponse{}, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return 0, err
+		return factActionResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	var ar factActionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
-		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
+		return factActionResponse{}, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: decode response: %w", path, err)}
 	}
 	if !ar.OK {
 		if ar.Error != "" {
-			return 0, fmt.Errorf("%s", ar.Error)
+			return factActionResponse{}, fmt.Errorf("%s", ar.Error)
 		}
-		return 0, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
+		return factActionResponse{}, &unreachableError{sock: c.sock, err: fmt.Errorf("%s: status %d", path, resp.StatusCode)}
 	}
-	return ar.ID, nil
+	return ar, nil
 }
 
 // ConfirmFact calls POST /v1/fact/confirm (`kahya fact confirm <id>`).
@@ -1020,12 +1028,23 @@ func (c *Client) ListFacts(ctx context.Context, traceID string, params url.Value
 	return out.Facts, out.Truncated, nil
 }
 
-// RetractFact calls POST /v1/fact/retract (`kahya fact retract <özne>
-// <yüklem> <nesne> [oturum_id]`), returning the retracted fact's id.
-func (c *Client) RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error) {
-	return c.factAction(ctx, traceID, "/v1/fact/retract", map[string]any{
-		"subject": subject, "predicate": predicate, "object": object, "session_id": sessionID,
+// Retraction kinds POST /v1/fact/retract takes and answers (kahyad's
+// factengine.RetractionEnded / RetractionCorrected).
+const (
+	retractionKindEnded     = "ended"
+	retractionKindCorrected = "corrected"
+)
+
+// RetractFact calls POST /v1/fact/retract (`kahya fact retract
+// [--sona-erdi] <özne> <yüklem> <nesne> [oturum_id]`) with kind
+// retractionKindEnded or retractionKindCorrected, returning the retracted
+// fact's id and the kind kahyad recorded (corrected for an ended request on
+// a fact the user had denied).
+func (c *Client) RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID, kind string) (int64, string, error) {
+	ar, err := c.factActionResult(ctx, traceID, "/v1/fact/retract", map[string]any{
+		"subject": subject, "predicate": predicate, "object": object, "session_id": sessionID, "kind": kind,
 	})
+	return ar.ID, ar.Kind, err
 }
 
 // MergeEntities calls POST /v1/entity/merge (`kahya entity merge <a> <b>
@@ -1150,6 +1169,10 @@ type factQueryRow struct {
 	ValidFrom   string  `json:"valid_from"`
 	ValidTo     string  `json:"valid_to"`
 	KnownSince  string  `json:"known_since"`
+	// Ended: an ended fact an --as-of / --known-as-of query returned
+	// (printed with MsgFactEndedSuffix).
+	Ended       bool   `json:"ended"`
+	RetractedAt string `json:"retracted_at"`
 }
 
 // QueryFacts calls GET /v1/fact/query?<params> (`kahya fact query`).

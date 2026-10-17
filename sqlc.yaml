@@ -104,6 +104,10 @@ sql:
       # DROP/CREATE of the partial unique index - columns the Task and
       # ToolCall models carry, so it MUST be here.
       - "kahyad/migrations/0026_tool_calls_worker_run.sql"
+      # 0027 (FIX-FINAL fact-history-ended-vs-corrected) is plain ALTER
+      # TABLE ADD COLUMN (facts.retraction_kind/retracted_at) - columns the
+      # Fact model carries and RetractFact writes, so it MUST be here.
+      - "kahyad/migrations/0027_fact_retraction_kind.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

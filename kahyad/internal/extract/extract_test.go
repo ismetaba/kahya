@@ -225,9 +225,52 @@ func TestExtractEpisodeRetractionClosesActiveFact(t *testing.T) {
 	if fact.Status != "retracted" || !fact.ValidTo.Valid {
 		t.Fatalf("fact status/valid_to = %q/%v, want retracted with valid_to", fact.Status, fact.ValidTo)
 	}
+	// FIX-FINAL fact-history-ended-vs-corrected: retraction:true says the
+	// relation ENDED - its window stays queryable history.
+	if fact.RetractionKind.String != string(factengine.RetractionEnded) || !fact.RetractedAt.Valid {
+		t.Fatalf("fact retraction_kind/retracted_at = %v/%v, want ended with a time", fact.RetractionKind, fact.RetractedAt)
+	}
 	// Re-running the retraction is a no-op (nothing active any more).
 	if st, err := f.runner.ExtractEpisode(ctx, "tr-3", epID, factengine.ProvenanceAgentDerived); err != nil || st.Retractions != 0 || st.Episodes != 1 {
 		t.Fatalf("second retraction run = %+v, %v", st, err)
+	}
+}
+
+// TestExtractEpisodeRetractionCitingACorrectionIsRecordedCorrected
+// (FIX-FINAL fact-history-ended-vs-corrected): an extracted retraction is an
+// ending, except when the quote it cites is a correction phrase - then the
+// note says the fact was wrong and it is recorded corrected.
+func TestExtractEpisodeRetractionCitingACorrectionIsRecordedCorrected(t *testing.T) {
+	for _, c := range []struct {
+		quote string
+		want  factengine.RetractionKind
+	}{
+		{"Düzeltiyorum, Emre Acme'de değil", factengine.RetractionCorrected},
+		{"Emre artık Acme'de değil", factengine.RetractionEnded},
+		{"", factengine.RetractionEnded},
+	} {
+		t.Run(string(c.want)+"_"+c.quote, func(t *testing.T) {
+			retract := false
+			f := newFixture(t, func(n int, chunks []reader.ExtractChunk, forceSecret bool) (reader.FactExtractV1, string, error) {
+				out, lane, err := emreAcme(n, chunks, forceSecret)
+				if retract {
+					out.Facts[0].Retraction, out.Facts[0].Quote = true, c.quote
+				}
+				return out, lane, err
+			})
+			epID, _ := f.seedEpisode("inbox/a.md", "Emre Acme'de. "+c.quote)
+			ctx := context.Background()
+			if _, err := f.runner.ExtractEpisode(ctx, "tr-1", epID, factengine.ProvenanceAgentDerived); err != nil {
+				t.Fatal(err)
+			}
+			retract = true
+			if st, err := f.runner.ExtractEpisode(ctx, "tr-2", epID, factengine.ProvenanceAgentDerived); err != nil || st.Retractions != 1 {
+				t.Fatalf("retraction run = %+v, %v", st, err)
+			}
+			if got := f.onlyFact(); got.RetractionKind.String != string(c.want) {
+				t.Fatalf("quote %q: retraction_kind = %v, want %s", c.quote, got.RetractionKind, c.want)
+			}
+		})
 	}
 }
 

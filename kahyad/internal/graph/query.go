@@ -54,10 +54,17 @@ type FactQuery struct {
 	// fact with no valid_from never matches a bound).
 	Since, Until time.Time
 	// AsOf keeps the facts VALID at that instant: valid_from <= as_of (or
-	// unknown) and valid_to > as_of (or unknown).
+	// unknown) and valid_to > as_of (or unknown). With AsOf (or KnownAsOf)
+	// set, an ENDED fact (retracted as factengine.RetractionEnded) is a
+	// candidate too: AsOf keeps it when its window [valid_from, valid_to)
+	// contains AsOf (its valid_to is always set; an unknown valid_from is
+	// open). A CORRECTED fact, or a pre-0027 retraction (no kind on file),
+	// is never returned (FIX-FINAL fact-history-ended-vs-corrected).
 	AsOf time.Time
 	// KnownAsOf keeps the facts already KNOWN then: created_at <=
-	// known_as_of (transaction time).
+	// known_as_of (transaction time). An ended fact must also have been
+	// still active then: retracted_at > known_as_of. With both AsOf and
+	// KnownAsOf, an ended fact must pass both.
 	KnownAsOf time.Time
 	// MinTier is the trust-lattice floor (factengine.TierRank).
 	MinTier string
@@ -92,6 +99,11 @@ type FactRecord struct {
 	Evidence        string
 	SubjectEntityID int64
 	ObjectEntityID  int64
+	// Ended marks a fact that held and no longer does (retracted as
+	// factengine.RetractionEnded); only an AsOf / KnownAsOf query returns
+	// one. RetractedAt is then the retraction's transaction time.
+	Ended       bool
+	RetractedAt string
 }
 
 // EntityRecord is one entity_lookup result.
@@ -110,6 +122,13 @@ type EntityRecord struct {
 // (InjectionEligible unless IncludeQuarantined) and, with CloudLane, the
 // lane filter (Go), ordered by confidence desc, updated_at desc, id asc and
 // cut at Limit. The ordering and filters are deterministic.
+//
+// With AsOf or KnownAsOf the ENDED facts are candidates too (see
+// FactQuery.AsOf/KnownAsOf), each marked Ended; their trust filter is
+// factengine.HistoryEligible (IncludeQuarantined adds the rest, labelled
+// Quarantined), and the lane filter is the same. Without either bound the
+// answer is active facts only, exactly as before. A corrected or pre-0027
+// retracted fact is never a candidate.
 func (g *Graph) QueryFacts(ctx context.Context, traceID string, q FactQuery) ([]FactRecord, error) {
 	if g == nil || g.DB == nil || g.Store == nil {
 		return nil, errors.New("graph: no store wired")
@@ -172,6 +191,10 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 	if w.opts.CloudLane {
 		cloudOnly = 1
 	}
+	withEnded := 0
+	if q.historyBound() {
+		withEnded = 1
+	}
 	for _, e := range entityIDs {
 		subj, obj := "", ""
 		if exact {
@@ -180,16 +203,17 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		rows, err := g.DB.QueryContext(w.ctx, `
 			SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance,
 			       valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at,
-			       confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+			       confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud,
+			       retraction_kind, retracted_at
 			FROM facts
-			WHERE status = 'active'
+			WHERE (status = 'active' OR (? = 1 AND status = 'retracted' AND retraction_kind = 'ended'))
 			  AND (? = '' OR subject = ?) AND (? = '' OR predicate = ?) AND (? = '' OR object = ?)
 			  AND (? = 0
 			       OR (subject_entity_id = ? AND (? = 0 OR subject_link_cloud = 1))
 			       OR (object_entity_id = ? AND (? = 0 OR object_link_cloud = 1)))
 			ORDER BY confidence DESC, updated_at DESC, id ASC
 			LIMIT ?`,
-			subj, subj, q.Predicate, q.Predicate, obj, obj, e, e, cloudOnly, e, cloudOnly, factQueryScanCap)
+			withEnded, subj, subj, q.Predicate, q.Predicate, obj, obj, e, e, cloudOnly, e, cloudOnly, factQueryScanCap)
 		if err != nil {
 			return nil, fmt.Errorf("graph: fact query: %w", err)
 		}
@@ -197,7 +221,8 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 			var f sqlcgen.Fact
 			if err := rows.Scan(&f.ID, &f.Subject, &f.Predicate, &f.Object, &f.SourceTier, &f.Evidentiality, &f.Confidence, &f.Importance,
 				&f.ValidFrom, &f.ValidTo, &f.Status, &f.Evidence, &f.ExtractorVer, &f.UpdatedAt, &f.CreatedAt,
-				&f.ConfirmedAt, &f.SubjectEntityID, &f.ObjectEntityID, &f.Quote, &f.SubjectLinkCloud, &f.ObjectLinkCloud); err != nil {
+				&f.ConfirmedAt, &f.SubjectEntityID, &f.ObjectEntityID, &f.Quote, &f.SubjectLinkCloud, &f.ObjectLinkCloud,
+				&f.RetractionKind, &f.RetractedAt); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("graph: fact query scan: %w", err)
 			}
@@ -231,10 +256,26 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		if !exact && !foldedMatch(q, f) {
 			continue
 		}
-		if !q.timeMatch(f) || !q.tierMatch(f) {
+		var ended, eligible bool
+		switch {
+		case f.Status == "active":
+			if !q.timeMatch(f) {
+				continue
+			}
+			eligible = factengine.InjectionEligible(f)
+		case factengine.IsEnded(f) && q.historyBound():
+			if !q.endedTimeMatch(f) {
+				continue
+			}
+			ended, eligible = true, factengine.HistoryEligible(f)
+		default:
+			// A corrected or kind-less (pre-0027) retraction: never, even if
+			// the SQL ever let one through (fail-closed).
 			continue
 		}
-		eligible := factengine.InjectionEligible(f)
+		if !q.tierMatch(f) {
+			continue
+		}
 		if !eligible && !q.IncludeQuarantined {
 			continue
 		}
@@ -245,9 +286,46 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		if !ok {
 			continue
 		}
-		out = append(out, w.toRecord(f, !eligible))
+		rec := w.toRecord(f, !eligible)
+		if ended {
+			rec.Ended, rec.RetractedAt = true, f.RetractedAt.String
+		}
+		out = append(out, rec)
 	}
 	return out, nil
+}
+
+// historyBound reports whether q asks a point-in-time question (AsOf or
+// KnownAsOf) - the only queries that may answer ended facts.
+func (q FactQuery) historyBound() bool { return !q.AsOf.IsZero() || !q.KnownAsOf.IsZero() }
+
+// endedTimeMatch is timeMatch for an ENDED fact: the same since/until
+// bounds on valid_from; AsOf inside its window [valid_from, valid_to) with
+// valid_to REQUIRED (RetractFact always sets it; a missing or unparsable one
+// fails closed); KnownAsOf requires created_at <= known_as_of < retracted_at
+// (known then, and not yet retracted then; a missing or unparsable
+// retracted_at fails closed).
+func (q FactQuery) endedTimeMatch(f sqlcgen.Fact) bool {
+	if !q.validFromMatch(f) {
+		return false
+	}
+	if !q.AsOf.IsZero() {
+		to, ok := parseStored(f.ValidTo)
+		if !ok || !to.After(q.AsOf) || !validFromNotAfter(f, q.AsOf) {
+			return false
+		}
+	}
+	if !q.KnownAsOf.IsZero() {
+		known, err := time.Parse(time.RFC3339Nano, f.CreatedAt)
+		if err != nil || known.After(q.KnownAsOf) {
+			return false
+		}
+		retracted, ok := parseStored(f.RetractedAt)
+		if !ok || !retracted.After(q.KnownAsOf) {
+			return false
+		}
+	}
+	return true
 }
 
 func foldedMatch(q FactQuery, f sqlcgen.Fact) bool {
@@ -260,15 +338,11 @@ func foldedMatch(q FactQuery, f sqlcgen.Fact) bool {
 // timeMatch applies the four bitemporal bounds; a stored timestamp that
 // does not parse never satisfies a bound (fail-closed for a filter).
 func (q FactQuery) timeMatch(f sqlcgen.Fact) bool {
-	from, fromOK := parseStored(f.ValidFrom)
-	if !q.Since.IsZero() && (!fromOK || from.Before(q.Since)) {
-		return false
-	}
-	if !q.Until.IsZero() && (!fromOK || !from.Before(q.Until)) {
+	if !q.validFromMatch(f) {
 		return false
 	}
 	if !q.AsOf.IsZero() {
-		if f.ValidFrom.Valid && f.ValidFrom.String != "" && (!fromOK || from.After(q.AsOf)) {
+		if !validFromNotAfter(f, q.AsOf) {
 			return false
 		}
 		if f.ValidTo.Valid && f.ValidTo.String != "" {
@@ -285,6 +359,30 @@ func (q FactQuery) timeMatch(f sqlcgen.Fact) bool {
 		}
 	}
 	return true
+}
+
+// validFromMatch applies Since (inclusive) / Until (exclusive) to
+// valid_from; a fact with no (or an unparsable) valid_from never matches a
+// bound.
+func (q FactQuery) validFromMatch(f sqlcgen.Fact) bool {
+	from, fromOK := parseStored(f.ValidFrom)
+	if !q.Since.IsZero() && (!fromOK || from.Before(q.Since)) {
+		return false
+	}
+	if !q.Until.IsZero() && (!fromOK || !from.Before(q.Until)) {
+		return false
+	}
+	return true
+}
+
+// validFromNotAfter reports valid_from <= t, an unknown valid_from being
+// open (the start of the fact is not known) and an unparsable one failing.
+func validFromNotAfter(f sqlcgen.Fact, t time.Time) bool {
+	if !f.ValidFrom.Valid || f.ValidFrom.String == "" {
+		return true
+	}
+	from, ok := parseStored(f.ValidFrom)
+	return ok && !from.After(t)
 }
 
 func (q FactQuery) tierMatch(f sqlcgen.Fact) bool {

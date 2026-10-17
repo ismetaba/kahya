@@ -349,7 +349,7 @@ func (q *Queries) DeleteChunksByEpisode(ctx context.Context, episodeID int64) er
 }
 
 const getActiveFactByTriple = `-- name: GetActiveFactByTriple :one
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE subject = ? AND predicate = ? AND object = ? AND status = 'active'
 ORDER BY id DESC
@@ -396,6 +396,8 @@ func (q *Queries) GetActiveFactByTriple(ctx context.Context, arg GetActiveFactBy
 		&i.Quote,
 		&i.SubjectLinkCloud,
 		&i.ObjectLinkCloud,
+		&i.RetractionKind,
+		&i.RetractedAt,
 	)
 	return i, err
 }
@@ -757,7 +759,7 @@ func (q *Queries) GetEvidenceByFactSessionPolarity(ctx context.Context, arg GetE
 
 const getFact = `-- name: GetFact :one
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE id = ?
 `
@@ -794,6 +796,8 @@ func (q *Queries) GetFact(ctx context.Context, id int64) (Fact, error) {
 		&i.Quote,
 		&i.SubjectLinkCloud,
 		&i.ObjectLinkCloud,
+		&i.RetractionKind,
+		&i.RetractedAt,
 	)
 	return i, err
 }
@@ -1767,7 +1771,7 @@ func (q *Queries) InsertEvidence(ctx context.Context, arg InsertEvidenceParams) 
 const insertFact = `-- name: InsertFact :one
 INSERT INTO facts (subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+RETURNING id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 `
 
 type InsertFactParams struct {
@@ -1852,6 +1856,8 @@ func (q *Queries) InsertFact(ctx context.Context, arg InsertFactParams) (Fact, e
 		&i.Quote,
 		&i.SubjectLinkCloud,
 		&i.ObjectLinkCloud,
+		&i.RetractionKind,
+		&i.RetractedAt,
 	)
 	return i, err
 }
@@ -2323,7 +2329,7 @@ func (q *Queries) ListActiveEntityIDsByAliasFolded(ctx context.Context, aliasFol
 
 const listActiveFacts = `-- name: ListActiveFacts :many
 
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active'
 ORDER BY id ASC
@@ -2368,6 +2374,8 @@ func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
 			&i.Quote,
 			&i.SubjectLinkCloud,
 			&i.ObjectLinkCloud,
+			&i.RetractionKind,
+			&i.RetractedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2383,7 +2391,7 @@ func (q *Queries) ListActiveFacts(ctx context.Context) ([]Fact, error) {
 }
 
 const listActiveFactsCreatedSince = `-- name: ListActiveFactsCreatedSince :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND created_at >= ?1
 ORDER BY id DESC
@@ -2429,6 +2437,8 @@ func (q *Queries) ListActiveFactsCreatedSince(ctx context.Context, arg ListActiv
 			&i.Quote,
 			&i.SubjectLinkCloud,
 			&i.ObjectLinkCloud,
+			&i.RetractionKind,
+			&i.RetractedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -3362,7 +3372,7 @@ func (q *Queries) ListFactIDsByEpisode(ctx context.Context, episodeID sql.NullIn
 }
 
 const listFactsByEntityCloudLinks = `-- name: ListFactsByEntityCloudLinks :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active'
   AND ((subject_entity_id = ? AND subject_link_cloud = 1) OR (object_entity_id = ? AND object_link_cloud = 1))
@@ -3411,6 +3421,8 @@ func (q *Queries) ListFactsByEntityCloudLinks(ctx context.Context, arg ListFacts
 			&i.Quote,
 			&i.SubjectLinkCloud,
 			&i.ObjectLinkCloud,
+			&i.RetractionKind,
+			&i.RetractedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -3426,7 +3438,7 @@ func (q *Queries) ListFactsByEntityCloudLinks(ctx context.Context, arg ListFacts
 }
 
 const listFactsByEntityHop = `-- name: ListFactsByEntityHop :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND (subject_entity_id = ? OR object_entity_id = ?)
 ORDER BY confidence DESC, updated_at DESC
@@ -3473,6 +3485,8 @@ func (q *Queries) ListFactsByEntityHop(ctx context.Context, arg ListFactsByEntit
 			&i.Quote,
 			&i.SubjectLinkCloud,
 			&i.ObjectLinkCloud,
+			&i.RetractionKind,
+			&i.RetractedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -3858,7 +3872,7 @@ func (q *Queries) ListProvisionalEntitiesByFolded(ctx context.Context, arg ListP
 }
 
 const listQuarantinedFacts = `-- name: ListQuarantinedFacts :many
-SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud
+SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance, valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at, confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud, retraction_kind, retracted_at
 FROM facts
 WHERE status = 'active' AND source_tier NOT IN ('user_edit', 'user_asserted') AND confirmed_at IS NULL
   AND created_at >= ?1
@@ -3914,6 +3928,8 @@ func (q *Queries) ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedF
 			&i.Quote,
 			&i.SubjectLinkCloud,
 			&i.ObjectLinkCloud,
+			&i.RetractionKind,
+			&i.RetractedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -4453,6 +4469,28 @@ func (q *Queries) MarkEpisodeExtracted(ctx context.Context, arg MarkEpisodeExtra
 	return result.RowsAffected()
 }
 
+const markFactRetractionCorrected = `-- name: MarkFactRetractionCorrected :execrows
+UPDATE facts SET retraction_kind = 'corrected', updated_at = ?
+WHERE id = ? AND status = 'retracted' AND retraction_kind = 'ended'
+`
+
+type MarkFactRetractionCorrectedParams struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        int64  `json:"id"`
+}
+
+// 0027: a user denial of a fact already retracted as 'ended' (kahya fact
+// deny, a ritual Yanlis answer) says it never held - it becomes
+// 'corrected' and never shows as history again. Only 'ended' rows change
+// (NULL - a pre-0027 retraction - already counts as corrected).
+func (q *Queries) MarkFactRetractionCorrected(ctx context.Context, arg MarkFactRetractionCorrectedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markFactRetractionCorrected, arg.UpdatedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const markOutboxDelivered = `-- name: MarkOutboxDelivered :exec
 UPDATE outbox
 SET dispatched_at = ?
@@ -4678,23 +4716,39 @@ func (q *Queries) ResetTaskCrashResumes(ctx context.Context, arg ResetTaskCrashR
 	return err
 }
 
-const retractFact = `-- name: RetractFact :exec
-UPDATE facts SET status = 'retracted', valid_to = ?, updated_at = ? WHERE id = ?
+const retractFact = `-- name: RetractFact :execrows
+UPDATE facts SET status = 'retracted', retraction_kind = ?, retracted_at = ?, valid_to = ?, updated_at = ?
+WHERE id = ? AND status = 'active'
 `
 
 type RetractFactParams struct {
-	ValidTo   sql.NullString `json:"valid_to"`
-	UpdatedAt string         `json:"updated_at"`
-	ID        int64          `json:"id"`
+	RetractionKind sql.NullString `json:"retraction_kind"`
+	RetractedAt    sql.NullString `json:"retracted_at"`
+	ValidTo        sql.NullString `json:"valid_to"`
+	UpdatedAt      string         `json:"updated_at"`
+	ID             int64          `json:"id"`
 }
 
 // Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
 // valid_to set, status='retracted' - NEVER a DELETE. The caller
 // (kahyad/internal/factengine/retract.go) always inserts a negative
 // evidence row in the SAME logical operation, never this alone.
-func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) error {
-	_, err := q.db.ExecContext(ctx, retractFact, arg.ValidTo, arg.UpdatedAt, arg.ID)
-	return err
+// 0027: the retraction records its kind ('ended' = the fact held and no
+// longer does; 'corrected' = it was wrong) and its own transaction time.
+// Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
+// caller reports "no active fact".
+func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, retractFact,
+		arg.RetractionKind,
+		arg.RetractedAt,
+		arg.ValidTo,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const revokeApprovalTokensByTask = `-- name: RevokeApprovalTokensByTask :execrows

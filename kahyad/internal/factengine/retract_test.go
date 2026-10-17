@@ -65,12 +65,16 @@ func TestRetractionFixtureClosesFactAndExcludesFromInjection(t *testing.T) {
 		t.Fatalf("DetectRetraction(%q) = false, want true", quote)
 	}
 
-	retractedID, err := e.RetractFact(ctx, "trace-2", "user", "likes", "kahve", sessionID)
+	kind, ok := ClassifyRetraction(quote)
+	if !ok || kind != RetractionEnded {
+		t.Fatalf("ClassifyRetraction(%q) = (%q, %v), want ended", quote, kind, ok)
+	}
+	res, err := e.RetractFact(ctx, "trace-2", "user", "likes", "kahve", sessionID, kind)
 	if err != nil {
 		t.Fatalf("RetractFact error = %v", err)
 	}
-	if retractedID != factID {
-		t.Fatalf("RetractFact returned fact %d, want %d", retractedID, factID)
+	if res.FactID != factID || res.Kind != RetractionEnded {
+		t.Fatalf("RetractFact = %+v, want fact %d recorded ended", res, factID)
 	}
 
 	after, err := e.GetFact(ctx, factID)
@@ -102,7 +106,7 @@ func TestRetractionFixtureClosesFactAndExcludesFromInjection(t *testing.T) {
 
 func TestRetractFactNoActiveFactReturnsError(t *testing.T) {
 	e, _ := newTestEngine(t)
-	if _, err := e.RetractFact(context.Background(), "trace", "nobody", "likes", "nothing", "sess"); err != ErrNoActiveFact {
+	if _, err := e.RetractFact(context.Background(), "trace", "nobody", "likes", "nothing", "sess", RetractionCorrected); err != ErrNoActiveFact {
 		t.Fatalf("RetractFact on nonexistent fact error = %v, want ErrNoActiveFact", err)
 	}
 }

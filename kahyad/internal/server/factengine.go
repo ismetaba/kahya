@@ -35,7 +35,7 @@ import (
 // with no adapter.
 type FactEngineRunner interface {
 	ConfirmFact(ctx context.Context, traceID string, factID int64) error
-	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string) (int64, error)
+	RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string, kind factengine.RetractionKind) (factengine.Retraction, error)
 	MergeEntities(ctx context.Context, traceID string, dstEntityID, srcEntityID, evidenceFactID int64, actor string) (int64, error)
 	SplitEntities(ctx context.Context, traceID string, mergeLedgerID int64, actor string) (int64, error)
 	// G13 MEM-5 phase 1.
@@ -59,6 +59,10 @@ type factActionResponse struct {
 	OK    bool   `json:"ok"`
 	ID    int64  `json:"id,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Kind is the retraction kind POST /v1/fact/retract recorded ("ended"
+	// or "corrected"; FIX-FINAL fact-history-ended-vs-corrected). Empty on
+	// every other route.
+	Kind string `json:"kind,omitempty"`
 }
 
 // factConfirmRequest is POST /v1/fact/confirm's body - exactly one
@@ -343,19 +347,25 @@ func (s *Server) handleFactList(w http.ResponseWriter, r *http.Request) {
 // factRetractRequest is POST /v1/fact/retract's body: the (subject,
 // predicate, object) triple identifying the ACTIVE fact to close, plus
 // the session_id the retraction utterance came from (negative evidence
-// is attributed to it, same as any other evidence row).
+// is attributed to it, same as any other evidence row), plus the
+// retraction kind (FIX-FINAL fact-history-ended-vs-corrected): "ended"
+// (`kahya fact retract --sona-erdi`: the fact held and no longer does) or
+// "corrected" (it was wrong); "" (an older client) = corrected, the
+// fail-closed reading (a corrected fact is never shown again).
 type factRetractRequest struct {
 	Subject   string `json:"subject"`
 	Predicate string `json:"predicate"`
 	Object    string `json:"object"`
 	SessionID string `json:"session_id"`
+	Kind      string `json:"kind"`
 }
 
-// handleFactRetract implements `kahya fact retract <id>` - the CLI
-// resolves the fact id to its (subject, predicate, object) triple first
-// (GET-then-POST, mirroring runApprove's "show the target before acting"
-// shape) so this route's contract stays symmetric with
-// factengine.RetractFact's own triple-keyed signature.
+// handleFactRetract implements `kahya fact retract [--sona-erdi] <özne>
+// <yüklem> <nesne> [oturum_id]`: the route is triple-keyed, symmetric with
+// factengine.RetractFact's own signature. The answer is {"ok":true,"id":N,
+// "kind":"ended"|"corrected"} - the kind actually recorded (an ended
+// request on a fact the user had denied is recorded as corrected); a kind
+// other than ended/corrected is a 400 before anything is read.
 func (s *Server) handleFactRetract(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -374,13 +384,24 @@ func (s *Server) handleFactRetract(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "subject/predicate/object are required")
 		return
 	}
+	kind := factengine.RetractionCorrected
+	if req.Kind != "" {
+		k, err := factengine.ParseRetractionKind(req.Kind)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		kind = k
+	}
 	traceID := traceIDFromContext(r)
-	factID, err := s.factEngine.RetractFact(r.Context(), traceID, req.Subject, req.Predicate, req.Object, req.SessionID)
+	res, err := s.factEngine.RetractFact(r.Context(), traceID, req.Subject, req.Predicate, req.Object, req.SessionID, kind)
 	if err != nil {
 		writeFactActionError(w, err)
 		return
 	}
-	writeFactActionOK(w, factID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(factActionResponse{OK: true, ID: res.FactID, Kind: string(res.Kind)})
 }
 
 // entityMergeRequest is POST /v1/entity/merge's body: `kahya entity merge
