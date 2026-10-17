@@ -2041,6 +2041,10 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 	// approval.PromptLiteral comparison is UX only (an immediate local
 	// rejection without a round trip for the common "evet"/"y" mistakes).
 	var typed string
+	// w3Mismatch: a W3 answer other than byte-exact "onayla" - still a deny
+	// (W3-06), now with the reason printed (FIX-FINAL
+	// tux-w3-typo-retry-hint-leads-to-silent-reject).
+	w3Mismatch := false
 	if detail.Class == "W3" {
 		typed, err = approval.ReadTrimmedLine(r, stdout, PromptW3Literal)
 		if err == nil {
@@ -2048,6 +2052,7 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 				decision = approval.DecisionApprove
 			} else {
 				decision = approval.DecisionDeny
+				w3Mismatch = true
 			}
 		}
 	} else {
@@ -2062,6 +2067,10 @@ func runApprove(client *Client, args []string, stdin io.Reader, stdout, stderr i
 		if _, err := client.PolicyFeedback(context.Background(), traceID, "deny", id, "", ""); err != nil {
 			fmt.Fprintln(stderr, wrapServerError(MsgApprovalDecisionFailed, err))
 			return 2
+		}
+		if w3Mismatch {
+			// The prompt has no trailing newline when stdin is piped.
+			fmt.Fprintf(stdout, "\n"+MsgApproveW3TypedMismatchDeniedFmt+"\n", strconv.Quote(typed))
 		}
 		fmt.Fprintln(stdout, MsgApprovalDenied)
 		return 1

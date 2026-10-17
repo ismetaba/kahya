@@ -206,6 +206,14 @@ const (
 	// consumed and the approval still waits (%s = the id).
 	MsgApprovalW3TypedMismatchFmt = "Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı. Onay hâlâ bekliyor; tekrar denemek için: kahya approve %s"
 
+	// MsgApproveW3TypedMismatchDeniedFmt is `kahya approve <id>`'s line for
+	// a W3 answer that was not exactly "onayla" (FIX-FINAL
+	// tux-w3-typo-retry-hint-leads-to-silent-reject): the W3-06 deny still
+	// happens (one deny feedback, exit 1, then MsgApprovalDenied), but the
+	// user now sees why and what was typed (%s = strconv.Quote of the
+	// answer, so a capital letter or a trailing space is visible).
+	MsgApproveW3TypedMismatchDeniedFmt = "Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı (yazılan: %s); bu onay reddedildi."
+
 	// MsgApprovalLookupFailed frames an English kahyad error when `kahya
 	// approve <id>` / `kahya approvals show <id>` cannot load the pending
 	// approval - typically an id copied from a notice after it expired or

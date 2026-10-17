@@ -2167,6 +2167,12 @@ waits): `kahya approvals decide` exits 3 with the Turkish
 `"Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı. Onay
 hâlâ bekliyor; tekrar denemek için: kahya approve <id>"`, and the
 Hammerspoon card shows it and re-opens the dialog (FIX-FINAL TUX-4).
+`kahya approve <id>` keeps W3-06's contract - any W3 answer other than
+byte-exact `onayla` is one deny feedback and exit 1 - but no longer
+silently: before `"Reddedildi."` it prints `"Onaylanmadı: W3 için tam
+olarak küçük harfle \"onayla\" yazılmalı (yazılan: %s); bu onay
+reddedildi."` with the answer Go-quoted, so a capital letter or a trailing
+space is visible (FIX-FINAL tux-w3-typo-retry-hint-leads-to-silent-reject).
 
 **First-run autonomy (`autonomy_bootstrap_levels`):** at boot kahyad seeds
 the configured `"tool/class/scope": level` rows (default

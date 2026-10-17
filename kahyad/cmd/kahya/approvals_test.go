@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -175,5 +176,46 @@ func TestApproveW3RejectsEvetAcceptsOnayla(t *testing.T) {
 				t.Fatalf("feedback surface = %v, want %q", fake.feedbackCalls[0]["surface"], tc.wantSurf)
 			}
 		})
+	}
+}
+
+// TestApproveW3TypoDeniesWithTurkishReason (FIX-FINAL
+// tux-w3-typo-retry-hint-leads-to-silent-reject): `kahya approve` on a W3
+// id still denies any answer other than byte-exact "onayla" (W3-06: one
+// deny, exit 1), but no longer silently - it says why and shows exactly
+// what was typed (a capital letter or a trailing space is visible), the
+// same reason the Hammerspoon / `approvals decide` path gives (TUX-4).
+func TestApproveW3TypoDeniesWithTurkishReason(t *testing.T) {
+	for _, tc := range []struct{ name, input, typed string }{
+		{"button_label", "Onayla\n", "Onayla"},
+		{"trailing_space", "onayla \n", "onayla "},
+		{"evet", "evet\n", "evet"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &approvalsFakeServer{id: "id-w3-typo-" + tc.name, tool: "mail_send", class: "W3", rendered: "mesaj govdesi"}
+			sock := startFakeServer(t, fake.handler())
+			t.Setenv("KAHYA_SOCKET", sock)
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"approve", fake.id}, strings.NewReader(tc.input), &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("exit = %d, want 1 (stderr %q)", code, stderr.String())
+			}
+			if len(fake.feedbackCalls) != 1 || fake.feedbackCalls[0]["kind"] != "deny" {
+				t.Fatalf("feedback calls = %+v, want exactly one deny", fake.feedbackCalls)
+			}
+			want := "mesaj govdesi\n" + PromptW3Literal + "\n" +
+				"Onaylanmadı: W3 için tam olarak küçük harfle \"onayla\" yazılmalı (yazılan: " + strconv.Quote(tc.typed) + "); bu onay reddedildi.\n" +
+				MsgApprovalDenied + "\n"
+			if stdout.String() != want {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+			}
+		})
+	}
+	// The accepted word prints no reason.
+	fake := &approvalsFakeServer{id: "id-w3-typo-ok", tool: "mail_send", class: "W3", rendered: "mesaj govdesi"}
+	t.Setenv("KAHYA_SOCKET", startFakeServer(t, fake.handler()))
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"approve", fake.id}, strings.NewReader("onayla\n"), &stdout, &stderr); code != 0 || strings.Contains(stdout.String(), "Onaylanmadı") {
+		t.Fatalf("onayla: exit %d stdout %q", code, stdout.String())
 	}
 }
