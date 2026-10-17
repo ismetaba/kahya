@@ -16,20 +16,25 @@
 //     only while the note at its path still carries that front matter, as
 //     note names are freed and reused, and a row whose note is gone has its
 //     stale episode dropped) is resumed on that note at step 5 instead of a
-//     "-2" duplicate, when the note is stored at least as restrictively as
-//     this run's lane asks (FIX-FINAL ingest-retry-after-midpipeline-
-//     failure-duplicates-note); every OTHER interrupted note of the same
-//     document - a normal-lane orphan a secret-lane retry supersedes, or
-//     an older duplicate - is retracted (memory_forget: moved to the memory
-//     trash, its episode removed) before the note step, and a retraction
-//     that fails fails the ingest closed (FIX-FINAL ingest-superseded-
-//     orphan-note-stays-active);
+//     "-2" duplicate, when the note is stored as restrictively as this
+//     run's lane asks - a secret-lane run resumes only on a note STORED
+//     under the secret-lane dir, never on a normal-dir note whose front
+//     matter merely claims secret (FIX-FINAL ingest-retry-after-
+//     midpipeline-failure-duplicates-note); every OTHER interrupted note of
+//     the same document - a normal-lane orphan a secret-lane retry
+//     supersedes, or an older duplicate - is retracted (memory_forget:
+//     moved to the memory trash, its episode removed) before the note
+//     step, and a retraction that fails fails the ingest closed (FIX-FINAL
+//     ingest-superseded-orphan-note-stays-active);
 //  3. the lane: a source file path that policy.yaml's secret_lane_globs
 //     cover (Request.SourcePaths, an absolute SourceRef, and their
 //     symlink-resolved forms - matched with memlane's folded, fail-closed
 //     rule, the Go-enforced path half of the H-7 order, FIRST), --secret,
-//     or a deterministic secret hit in the user's own title/source label,
-//     forces the local lane; otherwise the Reader
+//     a deterministic secret hit in the user's own title/source label, or
+//     an interrupted earlier ingest of the document that was secret-lane
+//     (step 2: stored secret-lane, or its ledger row / kahya_lane front
+//     matter says so - a plain retry does not repeat --secret), forces the
+//     local lane; otherwise the Reader
 //     classifies the document LOCALLY (reader.RunDocIngest: deterministic
 //     pre-pass over the whole text, local classifier over every window,
 //     fail-closed) BEFORE any byte can reach a cloud model; an unavailable
@@ -386,7 +391,24 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	// secret_lane_globs entry covers is secret-lane by its path alone (as
 	// fs_read and the extractor treat it), whatever a model says about its
 	// content. Then --secret, and the user's own labels - a deterministic
-	// secret hit there keeps the document local too.
+	// secret hit there keeps the document local too. Then an interrupted
+	// earlier ingest of this document that was secret-lane (stored under the
+	// secret-lane dir, or its ledger row / kahya_lane front matter says so):
+	// --secret is not repeated on a plain retry, and the first run's local
+	// verdict must not be re-asked of a classifier whose normal answer would
+	// send the whole document to the cloud Reader (a COMPLETED secret
+	// ingest is refused as a duplicate before any model call; FIX-FINAL
+	// ingest-superseded-orphan-note-stays-active, review).
+	secretOrphan := -1 // the newest stored secret-lane one, else the newest one that says secret
+	for i, o := range orphans {
+		if o.StoredSecret {
+			secretOrphan = i
+			break
+		}
+		if secretOrphan < 0 && o.Lane == router.LaneSecret {
+			secretOrphan = i
+		}
+	}
 	laneReason := LaneReasonReader
 	forceSecret := true
 	switch {
@@ -394,6 +416,9 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 		laneReason = LaneReasonPathGlob
 	case req.LaneHint == LaneHintSecret, secretlane.ClassifyDeterministic(req.Title + "\n" + req.SourceRef).SecretLane:
 		laneReason = LaneReasonForced
+	case secretOrphan >= 0:
+		laneReason = orphans[secretOrphan].LaneReason
+		r.logInfo(traceID, "ingest_lane_from_orphan", "file", orphans[secretOrphan].File, "lane_reason", laneReason)
 	default:
 		forceSecret = false
 	}
@@ -428,25 +453,26 @@ func (r *Runner) Ingest(ctx context.Context, traceID string, req Request) (Resul
 	// Reader's title last.
 	rel := NoteDir + "/" + now.In(r.location()).Format("2006-01-02") + "-" + slugify(firstNonEmpty(req.Title, labelTitle(req.SourceRef), out.Title)) + ".md"
 	var note memory.TieredWriteOutput
+	// An orphan that was secret-lane already kept the Reader local (step
+	// 3); its lane only ever raises this run's.
+	if secretOrphan >= 0 && lane != router.LaneSecret {
+		lane, laneReason = router.LaneSecret, orphans[secretOrphan].LaneReason
+	}
 	// FIX-FINAL ingest-retry-after-midpipeline-failure-duplicates-note: an
 	// earlier run of this document committed its note and stopped before
-	// ingest.done. Resume on such a note stored at least as restrictively
-	// as this run's lane asks instead of writing a "-2" duplicate: the
-	// newest secret-lane one for any lane (once a copy of the document is
-	// stored secret-lane, that copy wins), else - for a normal run - the
-	// newest normal-lane one; its lane is where it is stored.
+	// ingest.done. Resume on such a note stored as restrictively as this
+	// run's lane asks instead of writing a "-2" duplicate: a secret-lane run
+	// on the newest note STORED secret-lane (by its path - a normal-dir note
+	// whose front matter claims secret is a cloud-readable copy and is
+	// retracted below, never reported secret; once a copy of the document
+	// is stored secret-lane, that copy wins), a normal run on the newest
+	// normal-lane one.
 	resume := -1
 	for i, o := range orphans {
-		if o.Lane == router.LaneSecret {
+		if o.StoredSecret == (lane == router.LaneSecret) {
 			resume = i
 			break
 		}
-	}
-	if resume < 0 && lane == router.LaneNormal && len(orphans) > 0 {
-		resume = 0
-	}
-	if resume >= 0 && orphans[resume].Lane == router.LaneSecret && lane != router.LaneSecret {
-		lane, laneReason = router.LaneSecret, orphans[resume].LaneReason
 	}
 	// FIX-FINAL ingest-superseded-orphan-note-stays-active: every other
 	// interrupted note of this document is retracted BEFORE the note step -
@@ -696,8 +722,40 @@ const postNoteTimeout = 2 * time.Minute
 // interruptedIngest is an earlier ingest of the same content whose note
 // was committed (ingest.note_written) but which never reached ingest.done.
 type interruptedIngest struct {
-	File, CommitSHA, Lane, LaneReason, TraceID string
-	EpisodeID                                  int64
+	File, CommitSHA, LaneReason, TraceID string
+	// StoredSecret: the note is stored under a secret-lane path
+	// (Lane.PathIsSecret) - the ONLY proof that this copy is not
+	// cloud-readable. A secret-lane run resumes only on such a note.
+	StoredSecret bool
+	// Lane is the earlier run's lane: secret when the note is stored
+	// secret-lane OR its ledger row or its kahya_lane front matter says
+	// secret (each only ever raises it - a front-matter claim on a
+	// normal-dir note is not a secret-lane copy, but the document it names
+	// was read secret-lane, so a retry keeps it local).
+	Lane      string
+	EpisodeID int64
+}
+
+// orphanLane is an orphan's raise-only lane (interruptedIngest.Lane) and
+// its lane reason ("" = written before kahya_lane_reason existed: a
+// secret-lane note is secret by its path, a normal one by the Reader).
+func orphanLane(storedSecret bool, claims []string, reason string) (string, string) {
+	lane := router.LaneNormal
+	if storedSecret {
+		lane = router.LaneSecret
+	}
+	for _, c := range claims {
+		if c == router.LaneSecret {
+			lane = router.LaneSecret
+		}
+	}
+	if reason == "" {
+		reason = LaneReasonReader
+		if storedSecret {
+			reason = LaneReasonPathGlob
+		}
+	}
+	return lane, reason
 }
 
 // findInterrupted returns every interrupted ingest of digest whose note is
@@ -727,9 +785,9 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 	if err != nil {
 		return nil, err
 	}
-	own := make(map[string]bool, len(notes))
+	own := make(map[string]memory.IngestNoteRef, len(notes))
 	for _, n := range notes {
-		own[n.File] = true
+		own[n.File] = n
 	}
 	rows, err := r.Store.ListEventsByKind(ctx, EventNoteWritten)
 	if err != nil {
@@ -762,7 +820,8 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 			continue
 		}
 		seen[p.File] = true
-		if !own[p.File] {
+		fm, ok := own[p.File]
+		if !ok {
 			// not (or no longer) this document's note: gone, or its name
 			// reused by another document, or its front matter edited away
 			if err := r.dropStaleEpisode(ctx, traceID, p.File); err != nil {
@@ -778,14 +837,12 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 		if !active {
 			continue // removed since (or never indexable): not resumable
 		}
-		lane := p.Lane
-		if lane != router.LaneSecret {
-			lane = router.LaneNormal
-		}
-		if r.Lane.PathIsSecret(p.File) {
-			lane = router.LaneSecret
-		}
-		out = append(out, interruptedIngest{File: p.File, CommitSHA: p.CommitSHA, Lane: lane, LaneReason: p.LaneReason, TraceID: rows[i].TraceID, EpisodeID: epID})
+		stored := r.Lane.PathIsSecret(p.File)
+		lane, laneReason := orphanLane(stored, []string{p.Lane, fm.Lane}, p.LaneReason)
+		out = append(out, interruptedIngest{
+			File: p.File, CommitSHA: p.CommitSHA, LaneReason: laneReason, TraceID: rows[i].TraceID,
+			StoredSecret: stored, Lane: lane, EpisodeID: epID,
+		})
 	}
 	for _, n := range notes {
 		if completed[n.File] || seen[n.File] {
@@ -805,20 +862,12 @@ func (r *Runner) findInterrupted(ctx context.Context, traceID, digest string) ([
 		if !active {
 			continue
 		}
-		lane, laneReason := router.LaneNormal, n.LaneReason
-		if n.Lane == router.LaneSecret || r.Lane.PathIsSecret(n.File) {
-			lane = router.LaneSecret
-		}
-		if laneReason == "" {
-			// a note written before kahya_lane_reason existed: a secret one
-			// is secret by its path under the secret-lane dir
-			laneReason = LaneReasonReader
-			if lane == router.LaneSecret {
-				laneReason = LaneReasonPathGlob
-			}
-		}
-		r.logInfo(traceID, "ingest_orphan_found", "file", n.File, "orphan_source", "front_matter", "lane", lane)
-		out = append(out, interruptedIngest{File: n.File, CommitSHA: n.CommitSHA, Lane: lane, LaneReason: laneReason, EpisodeID: epID})
+		stored := r.Lane.PathIsSecret(n.File)
+		lane, laneReason := orphanLane(stored, []string{n.Lane}, n.LaneReason)
+		r.logInfo(traceID, "ingest_orphan_found", "file", n.File, "orphan_source", "front_matter", "lane", lane, "stored_secret", stored)
+		out = append(out, interruptedIngest{
+			File: n.File, CommitSHA: n.CommitSHA, LaneReason: laneReason, StoredSecret: stored, Lane: lane, EpisodeID: epID,
+		})
 	}
 	return out, nil
 }
@@ -902,7 +951,7 @@ func (r *Runner) retractOrphans(ctx context.Context, traceID, digest, lane strin
 			return done, o.File, fmt.Errorf("ingest: retract superseded note %s: %w", o.File, err)
 		}
 		reason := SupersedeReasonDuplicate
-		if o.Lane != router.LaneSecret && lane == router.LaneSecret {
+		if !o.StoredSecret && lane == router.LaneSecret {
 			reason = SupersedeReasonSecretLane
 		}
 		r.ledger(ctx, traceID, EventSuperseded, map[string]any{

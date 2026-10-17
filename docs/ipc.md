@@ -1011,7 +1011,13 @@ a cloud model, without changing anything in §2-§6 above:
   (`ingest_orphan_stale_episode_removed`), so the retry converges with no
   restart (FIX-FINAL ingest-superseded-orphan-note-stays-active, review). A
   normal-lane orphan is superseded by a fresh secret-lane note when the
-  retry is secret-lane. Every interrupted note of the document the retry
+  retry is secret-lane. Only a note's PATH proves a secret-lane copy: a
+  secret-lane retry resumes only on a note under
+  `<secret_lane_memory_dir>/ingest/`, and a note in `ingest/` whose
+  `kahya_lane` front matter claims secret (a hand edit, a rewrite, a note
+  moved out of the secret dir) is a cloud-readable copy, retracted with
+  `reason: secret_lane` and replaced under the secret dir - never resumed
+  on and reported `lane: secret`. Every interrupted note of the document the retry
   does not resume on (that superseded normal-lane orphan, or an older
   duplicate) is retracted BEFORE the note step - memory_forget of the
   whole file: moved to `memory/.trash/`, committed by kahyad, its episode
@@ -1036,7 +1042,14 @@ a cloud model, without changing anything in §2-§6 above:
   the local model (`lane_reason: path_glob`), whatever a classifier says
   about the content, as fs_read and the extractor treat that path. Then
   `lane_hint:"secret"` (`--secret`) or a deterministic hit in the user's
-  own title/source label forces the local model; otherwise
+  own title/source label forces the local model; so does an interrupted
+  earlier ingest of the same document that was secret-lane - its note
+  stored under the secret dir, or its `ingest.note_written` lane or
+  `kahya_lane` front matter says secret (each only ever raises) - so a
+  plain retry of a `--secret` (or locally-classified secret) ingest never
+  sends the document to the cloud Reader (`lane_reason` = the orphan's
+  own; JSONL `ingest_lane_from_orphan`; no local model = 503
+  `local_unavailable`, never a cloud fallback); otherwise
   `reader.RunDocIngest` classifies the whole document (deterministic
   pre-pass, then the local classifier window by window) and only a normal
   verdict goes to the cloud Reader (`doc_ingest_v1`); an unavailable local

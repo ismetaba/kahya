@@ -202,11 +202,13 @@ func crashedIngestNote(t *testing.T, f *fixture, rel, lane string) {
 
 // TestIngestFrontMatterOrphanKeepsItsSecretLane: a secret-lane note found
 // only by its front matter (no ledger row) is resumed as secret-lane - its
-// facts keep no free text - whatever lane the retry's Reader decided.
+// facts keep no free text - and the plain retry is read by the local model
+// only (cloudForbid: the orphan keeps the document local; FIX-FINAL
+// ingest-superseded-orphan-note-stays-active, review).
 func TestIngestFrontMatterOrphanKeepsItsSecretLane(t *testing.T) {
 	f := newFixture(t)
 	f.runner.Index = f.idx
-	f.answer = acmeAnswer(t)
+	f.answer, f.cloudForbid = acmeAnswer(t), true
 	f.runner.Memory = killAfterNoteWriter{NoteWriter: f.memSrv}
 	ingestUntilKilled(t, f, Request{Content: []byte(acmeDoc), SourceRef: "a.txt", LaneHint: LaneHintSecret})
 	f.runner.Memory = f.memSrv
