@@ -158,10 +158,14 @@ func DetectRetraction(text string) bool {
 //     the fact already carried (the fact ended then, not now). An ended
 //     request on a fact that carries a user denial (DenyFact: `kahya fact
 //     deny`, a ritual Yanlış answer) is recorded as RetractionCorrected -
-//     the user said it was wrong, so it never shows as history.
+//     the user said it was wrong, so it never shows as history. The store's
+//     guarded UPDATE decides this atomically with the denial check (a
+//     denial cannot slip in between a read and the write); a denial landing
+//     after the UPDATE is caught by DenyFact, which re-marks the row.
 //   - RetractionCorrected sets valid_to to the retraction time.
 //
-// Any other kind is ErrUnknownRetractionKind and nothing is written.
+// The returned Retraction.Kind is the kind the UPDATE recorded. Any other
+// kind is ErrUnknownRetractionKind and nothing is written.
 func (e *Engine) RetractFact(ctx context.Context, traceID, subject, predicate, object, sessionID string, kind RetractionKind) (Retraction, error) {
 	requested, err := ParseRetractionKind(string(kind))
 	if err != nil {
@@ -177,38 +181,33 @@ func (e *Engine) RetractFact(ctx context.Context, traceID, subject, predicate, o
 		return Retraction{}, fmt.Errorf("factengine: retract lookup: %w", err)
 	}
 
-	recorded := requested
-	if requested == RetractionEnded {
-		denied, err := e.hasUserDenial(ctx, fact.ID)
-		if err != nil {
-			return Retraction{}, fmt.Errorf("factengine: retract evidence check for fact %d: %w", fact.ID, err)
-		}
-		if denied {
-			recorded = RetractionCorrected
-		}
-	}
-
 	nowT := e.now().UTC()
 	now := nowT.Format(time.RFC3339Nano)
-	validTo := now
-	if recorded == RetractionEnded && fact.ValidTo.Valid {
+	endedValidTo := now
+	if fact.ValidTo.Valid {
 		if t, err := time.Parse(time.RFC3339Nano, fact.ValidTo.String); err == nil && t.Before(nowT) {
-			validTo = fact.ValidTo.String
+			endedValidTo = fact.ValidTo.String
 		}
 	}
-	n, err := e.store.RetractFact(ctx, sqlcgen.RetractFactParams{
-		RetractionKind: sql.NullString{String: string(recorded), Valid: true},
-		RetractedAt:    sql.NullString{String: now, Valid: true},
-		ValidTo:        sql.NullString{String: validTo, Valid: true},
-		UpdatedAt:      now,
-		ID:             fact.ID,
+	got, err := e.store.RetractFact(ctx, sqlcgen.RetractFactParams{
+		RequestedKind: string(requested),
+		EndedValidTo:  endedValidTo,
+		RetractedAt:   now,
+		UpdatedAt:     now,
+		ID:            fact.ID,
 	})
+	if errors.Is(err, sql.ErrNoRows) {
+		// A concurrent retraction closed it between the lookup and here.
+		return Retraction{}, ErrNoActiveFact
+	}
 	if err != nil {
 		return Retraction{}, fmt.Errorf("factengine: retract fact %d: %w", fact.ID, err)
 	}
-	if n == 0 {
-		// A concurrent retraction closed it between the lookup and here.
-		return Retraction{}, ErrNoActiveFact
+	recorded, err := ParseRetractionKind(got.String)
+	if err != nil {
+		// The CHECK constraint makes this unreachable; never report a kind
+		// the row does not carry.
+		return Retraction{}, fmt.Errorf("factengine: retract fact %d recorded kind: %w", fact.ID, err)
 	}
 
 	if err := e.addEvidence(ctx, fact.ID, 0, sessionID, -1, DenialLogOdds); err != nil {
@@ -232,23 +231,6 @@ func (e *Engine) RetractFact(ctx context.Context, traceID, subject, predicate, o
 	return Retraction{FactID: fact.ID, Kind: recorded}, nil
 }
 
-// hasUserDenial reports whether factID carries a negative evidence row. On
-// an ACTIVE fact every negative row is a user denial (DenyFact): the only
-// other writer of one is RetractFact, which closes the fact, and a closed
-// fact is never reopened (a re-assertion mints a fresh row).
-func (e *Engine) hasUserDenial(ctx context.Context, factID int64) (bool, error) {
-	rows, err := e.store.ListEvidenceByFact(ctx, factID)
-	if err != nil {
-		return false, err
-	}
-	for _, r := range rows {
-		if r.Polarity < 0 {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // IsEnded reports whether f was retracted as RetractionEnded (it held and
 // no longer does). A corrected fact, or a pre-0027 retraction with no kind
 // on file, is not.
@@ -256,25 +238,39 @@ func IsEnded(f sqlcgen.Fact) bool {
 	return f.Status == "retracted" && f.RetractionKind.Valid && f.RetractionKind.String == string(RetractionEnded)
 }
 
-// HistoryEligible is the trust predicate for an ENDED fact in the
-// structured reads' history (graph.QueryFacts with as_of / known_as_of):
-// the counterpart of InjectionEligible for a fact that is no longer
-// active. It never makes a fact injectable - InjectionEligible stays
-// status=active only, so an ended fact never reaches <hafiza> or a profile
-// card.
+// IsHistory reports whether f - carrying negativeEvidence negative
+// evidence rows (evidence.polarity < 0) - may be shown as history at all:
+// an ENDED retraction whose ONLY negative row is its retraction's own.
+// RetractFact records an ended kind only on a fact with no negative row
+// and adds exactly one; every further negative row is a user denial
+// (DenyFact), and a denial means corrected (DenyFact re-marks the row).
+// So any other count - a denial whose re-mark failed or never ran, or a
+// retraction whose own evidence row is missing - is treated as corrected:
+// never shown (fail-closed). This is the read side's half of the
+// ended-vs-corrected rule; the structured reads call it before anything
+// else, and neither include_quarantined nor a lane can reopen it.
+func IsHistory(f sqlcgen.Fact, negativeEvidence int64) bool {
+	return IsEnded(f) && negativeEvidence == 1
+}
+
+// HistoryEligible is the trust predicate for a history fact in the
+// structured reads (graph.QueryFacts with as_of / known_as_of): the
+// counterpart of InjectionEligible for a fact that is no longer active. It
+// never makes a fact injectable - InjectionEligible stays status=active
+// only, so an ended fact never reaches <hafiza> or a profile card.
 //
-//	eligible <=> IsEnded
+//	eligible <=> IsHistory(f, negativeEvidence)
 //	             AND log-odds without the retraction's own negative row
 //	                 (confidence - DenialLogOdds) >= InjectionThresholdLogOdds
 //	             AND (tier in {user_edit, user_asserted} OR confirmed)
 //
-// The confidence half discounts exactly the one negative row RetractFact
-// adds (an ended fact carries no user denial - RetractFact records a denied
-// fact as corrected and DenyFact flips an ended one), so it holds for every
-// ended fact whose positive evidence held, and fails closed for a row with
-// any further negative evidence.
-func HistoryEligible(f sqlcgen.Fact) bool {
-	if !IsEnded(f) {
+// IsHistory pins the fact's negative evidence to exactly the retraction's
+// own row, so the confidence half discounts exactly that row: it holds for
+// every ended fact whose positive evidence held. A fact failing IsHistory
+// is never eligible (and is never shown, even as quarantined - see
+// IsHistory).
+func HistoryEligible(f sqlcgen.Fact, negativeEvidence int64) bool {
+	if !IsHistory(f, negativeEvidence) {
 		return false
 	}
 	if f.Confidence-DenialLogOdds < InjectionThresholdLogOdds {

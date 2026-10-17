@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/pressly/goose/v3"
@@ -86,6 +87,11 @@ func TestMigration0027DownRestoresPreviousSchema(t *testing.T) {
 // MarkFactRetractionCorrected run against the real schema with every
 // parameter their generated methods bind (sqlc v1.30.0 can silently drop
 // one), close only an active fact, and flip only an ended retraction.
+// RetractFact decides the kind itself, atomically with the denial check
+// (FIX-FINAL fact-history-ended-vs-corrected, review): an 'ended' request
+// is recorded ended (valid_to = ended_valid_to) only while the fact has no
+// negative evidence row; otherwise it is recorded corrected (valid_to = the
+// retraction time). RETURNING is the recorded kind.
 func TestRetractionKindQueriesBindEveryParameter(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(testCfg(t))
@@ -108,33 +114,45 @@ func TestRetractionKindQueriesBindEveryParameter(t *testing.T) {
 		}
 		return f.ID
 	}
-	ns := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
-	retract := func(id int64, kind string) int64 {
+	retract := func(id int64, kind string) (string, error) {
 		t.Helper()
-		n, err := q.RetractFact(ctx, sqlcgen.RetractFactParams{
-			RetractionKind: ns(kind), RetractedAt: ns("2026-06-01T10:00:00Z"), ValidTo: ns("2026-05-01T00:00:00Z"),
+		got, err := q.RetractFact(ctx, sqlcgen.RetractFactParams{
+			RequestedKind: kind, EndedValidTo: "2026-05-01T00:00:00Z", RetractedAt: "2026-06-01T10:00:00Z",
 			UpdatedAt: "2026-06-01T10:00:01Z", ID: id,
 		})
-		if err != nil {
-			t.Fatalf("RetractFact(%d, %s): %v", id, kind, err)
-		}
-		return n
+		return got.String, err
 	}
-	ended, corrected := insert("Acme"), insert("Beta")
-	if n := retract(ended, "ended"); n != 1 {
-		t.Fatalf("RetractFact(active) rows = %d, want 1", n)
+	ended, corrected, denied := insert("Acme"), insert("Beta"), insert("Delta")
+	if got, err := retract(ended, "ended"); err != nil || got != "ended" {
+		t.Fatalf("RetractFact(active, ended) = %q, %v; want ended", got, err)
 	}
-	if n := retract(ended, "corrected"); n != 0 {
-		t.Fatalf("RetractFact(already retracted) rows = %d, want 0", n)
+	if _, err := retract(ended, "corrected"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("RetractFact(already retracted) err = %v, want sql.ErrNoRows", err)
 	}
-	retract(corrected, "corrected")
-	f, err := q.GetFact(ctx, ended)
-	if err != nil {
+	if got, err := retract(corrected, "corrected"); err != nil || got != "corrected" {
+		t.Fatalf("RetractFact(active, corrected) = %q, %v", got, err)
+	}
+	// A user denial on file: an ended request is recorded corrected.
+	if _, err := q.InsertEvidence(ctx, sqlcgen.InsertEvidenceParams{FactID: denied, SessionID: sql.NullString{String: "ritual-1", Valid: true},
+		Polarity: -1, Weight: -2.94, CreatedAt: "2026-03-01T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
-	if f.Status != "retracted" || f.RetractionKind.String != "ended" || f.RetractedAt.String != "2026-06-01T10:00:00Z" ||
-		f.ValidTo.String != "2026-05-01T00:00:00Z" || f.UpdatedAt != "2026-06-01T10:00:01Z" {
-		t.Fatalf("retracted row = %+v", f)
+	if got, err := retract(denied, "ended"); err != nil || got != "corrected" {
+		t.Fatalf("RetractFact(denied, ended) = %q, %v; want corrected", got, err)
+	}
+	for id, want := range map[int64][2]string{
+		ended:     {"ended", "2026-05-01T00:00:00Z"},
+		corrected: {"corrected", "2026-06-01T10:00:00Z"},
+		denied:    {"corrected", "2026-06-01T10:00:00Z"},
+	} {
+		f, err := q.GetFact(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Status != "retracted" || f.RetractionKind.String != want[0] || f.RetractedAt.String != "2026-06-01T10:00:00Z" ||
+			f.ValidTo.String != want[1] || f.UpdatedAt != "2026-06-01T10:00:01Z" {
+			t.Fatalf("retracted row %d = %+v, want kind %s valid_to %s", id, f, want[0], want[1])
+		}
 	}
 
 	mark := func(id int64) int64 {

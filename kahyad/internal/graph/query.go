@@ -58,8 +58,9 @@ type FactQuery struct {
 	// set, an ENDED fact (retracted as factengine.RetractionEnded) is a
 	// candidate too: AsOf keeps it when its window [valid_from, valid_to)
 	// contains AsOf (its valid_to is always set; an unknown valid_from is
-	// open). A CORRECTED fact, or a pre-0027 retraction (no kind on file),
-	// is never returned (FIX-FINAL fact-history-ended-vs-corrected).
+	// open). A CORRECTED fact, a pre-0027 retraction (no kind on file), or
+	// an ended one carrying a user denial (factengine.IsHistory) is never
+	// returned (FIX-FINAL fact-history-ended-vs-corrected).
 	AsOf time.Time
 	// KnownAsOf keeps the facts already KNOWN then: created_at <=
 	// known_as_of (transaction time). An ended fact must also have been
@@ -128,7 +129,9 @@ type EntityRecord struct {
 // factengine.HistoryEligible (IncludeQuarantined adds the rest, labelled
 // Quarantined), and the lane filter is the same. Without either bound the
 // answer is active facts only, exactly as before. A corrected or pre-0027
-// retracted fact is never a candidate.
+// retracted fact, or an ended one with a negative evidence row besides its
+// retraction's own (a user denial: factengine.IsHistory), is never a
+// candidate - not even with IncludeQuarantined.
 func (g *Graph) QueryFacts(ctx context.Context, traceID string, q FactQuery) ([]FactRecord, error) {
 	if g == nil || g.DB == nil || g.Store == nil {
 		return nil, errors.New("graph: no store wired")
@@ -195,18 +198,25 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 	if q.historyBound() {
 		withEnded = 1
 	}
+	negatives := map[int64]int64{}
 	for _, e := range entityIDs {
 		subj, obj := "", ""
 		if exact {
 			subj, obj = q.Subject, q.Object
 		}
+		// An ended fact is a candidate only while its one negative evidence
+		// row is its retraction's own (factengine.IsHistory: a further one is
+		// a user denial, which means corrected); the count is re-checked in Go.
 		rows, err := g.DB.QueryContext(w.ctx, `
 			SELECT id, subject, predicate, object, source_tier, evidentiality, confidence, importance,
 			       valid_from, valid_to, status, evidence, extractor_ver, updated_at, created_at,
 			       confirmed_at, subject_entity_id, object_entity_id, quote, subject_link_cloud, object_link_cloud,
-			       retraction_kind, retracted_at
+			       retraction_kind, retracted_at,
+			       (SELECT count(*) FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0) AS negative_evidence
 			FROM facts
-			WHERE (status = 'active' OR (? = 1 AND status = 'retracted' AND retraction_kind = 'ended'))
+			WHERE (status = 'active'
+			       OR (? = 1 AND status = 'retracted' AND retraction_kind = 'ended'
+			           AND (SELECT count(*) FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0) = 1))
 			  AND (? = '' OR subject = ?) AND (? = '' OR predicate = ?) AND (? = '' OR object = ?)
 			  AND (? = 0
 			       OR (subject_entity_id = ? AND (? = 0 OR subject_link_cloud = 1))
@@ -219,16 +229,18 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 		}
 		for rows.Next() {
 			var f sqlcgen.Fact
+			var negs int64
 			if err := rows.Scan(&f.ID, &f.Subject, &f.Predicate, &f.Object, &f.SourceTier, &f.Evidentiality, &f.Confidence, &f.Importance,
 				&f.ValidFrom, &f.ValidTo, &f.Status, &f.Evidence, &f.ExtractorVer, &f.UpdatedAt, &f.CreatedAt,
 				&f.ConfirmedAt, &f.SubjectEntityID, &f.ObjectEntityID, &f.Quote, &f.SubjectLinkCloud, &f.ObjectLinkCloud,
-				&f.RetractionKind, &f.RetractedAt); err != nil {
+				&f.RetractionKind, &f.RetractedAt, &negs); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("graph: fact query scan: %w", err)
 			}
 			if !seen[f.ID] {
 				seen[f.ID] = true
 				cands = append(cands, f)
+				negatives[f.ID] = negs
 			}
 		}
 		err = rows.Err()
@@ -263,14 +275,15 @@ func (g *Graph) queryFactsPass(w *walk, q FactQuery, entityIDs []int64, exact bo
 				continue
 			}
 			eligible = factengine.InjectionEligible(f)
-		case factengine.IsEnded(f) && q.historyBound():
+		case factengine.IsHistory(f, negatives[f.ID]) && q.historyBound():
 			if !q.endedTimeMatch(f) {
 				continue
 			}
-			ended, eligible = true, factengine.HistoryEligible(f)
+			ended, eligible = true, factengine.HistoryEligible(f, negatives[f.ID])
 		default:
-			// A corrected or kind-less (pre-0027) retraction: never, even if
-			// the SQL ever let one through (fail-closed).
+			// A corrected or kind-less (pre-0027) retraction, or an ended one
+			// carrying a user denial: never, even if the SQL ever let one
+			// through (fail-closed).
 			continue
 		}
 		if !q.tierMatch(f) {

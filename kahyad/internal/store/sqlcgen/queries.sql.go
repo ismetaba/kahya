@@ -4716,17 +4716,28 @@ func (q *Queries) ResetTaskCrashResumes(ctx context.Context, arg ResetTaskCrashR
 	return err
 }
 
-const retractFact = `-- name: RetractFact :execrows
-UPDATE facts SET status = 'retracted', retraction_kind = ?, retracted_at = ?, valid_to = ?, updated_at = ?
-WHERE id = ? AND status = 'active'
+const retractFact = `-- name: RetractFact :one
+UPDATE facts SET status = 'retracted',
+    retraction_kind = CASE
+        WHEN CAST(?1 AS TEXT) = 'ended'
+             AND NOT EXISTS (SELECT 1 FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0)
+        THEN 'ended' ELSE 'corrected' END,
+    valid_to = CASE
+        WHEN CAST(?1 AS TEXT) = 'ended'
+             AND NOT EXISTS (SELECT 1 FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0)
+        THEN CAST(?2 AS TEXT) ELSE CAST(?3 AS TEXT) END,
+    retracted_at = CAST(?3 AS TEXT),
+    updated_at = CAST(?4 AS TEXT)
+WHERE id = ?5 AND status = 'active'
+RETURNING retraction_kind
 `
 
 type RetractFactParams struct {
-	RetractionKind sql.NullString `json:"retraction_kind"`
-	RetractedAt    sql.NullString `json:"retracted_at"`
-	ValidTo        sql.NullString `json:"valid_to"`
-	UpdatedAt      string         `json:"updated_at"`
-	ID             int64          `json:"id"`
+	RequestedKind string `json:"requested_kind"`
+	EndedValidTo  string `json:"ended_valid_to"`
+	RetractedAt   string `json:"retracted_at"`
+	UpdatedAt     string `json:"updated_at"`
+	ID            int64  `json:"id"`
 }
 
 // Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
@@ -4735,20 +4746,27 @@ type RetractFactParams struct {
 // evidence row in the SAME logical operation, never this alone.
 // 0027: the retraction records its kind ('ended' = the fact held and no
 // longer does; 'corrected' = it was wrong) and its own transaction time.
-// Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
-// caller reports "no active fact".
-func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, retractFact,
-		arg.RetractionKind,
+// The kind is decided HERE, atomically with the denial check: an 'ended'
+// request is recorded 'ended' only while the fact carries no negative
+// evidence row (on an active fact every such row is a user denial, and a
+// denial means 'corrected'); otherwise - or for any other request - it is
+// 'corrected' with valid_to = the retraction time. An ended retraction's
+// valid_to is ended_valid_to (the caller keeps an earlier end). A denial
+// landing after this statement is caught by DenyFact re-marking the row
+// (MarkFactRetractionCorrected). Only an ACTIVE row is closed: no row
+// (sql.ErrNoRows) = a concurrent retraction won, the caller reports "no
+// active fact". RETURNING is the kind actually recorded.
+func (q *Queries) RetractFact(ctx context.Context, arg RetractFactParams) (sql.NullString, error) {
+	row := q.db.QueryRowContext(ctx, retractFact,
+		arg.RequestedKind,
+		arg.EndedValidTo,
 		arg.RetractedAt,
-		arg.ValidTo,
 		arg.UpdatedAt,
 		arg.ID,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	var retraction_kind sql.NullString
+	err := row.Scan(&retraction_kind)
+	return retraction_kind, err
 }
 
 const revokeApprovalTokensByTask = `-- name: RevokeApprovalTokensByTask :execrows

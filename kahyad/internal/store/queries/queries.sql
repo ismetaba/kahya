@@ -1080,17 +1080,36 @@ UPDATE facts SET confidence = ?, updated_at = ? WHERE id = ?;
 -- memory #1).
 UPDATE facts SET confirmed_at = ?, updated_at = ? WHERE id = ?;
 
--- name: RetractFact :execrows
+-- name: RetractFact :one
 -- Closes a fact (HANDOFF S5 memory #3: "Artik sevmiyorum" -> geri-cekme):
 -- valid_to set, status='retracted' - NEVER a DELETE. The caller
 -- (kahyad/internal/factengine/retract.go) always inserts a negative
 -- evidence row in the SAME logical operation, never this alone.
 -- 0027: the retraction records its kind ('ended' = the fact held and no
 -- longer does; 'corrected' = it was wrong) and its own transaction time.
--- Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
--- caller reports "no active fact".
-UPDATE facts SET status = 'retracted', retraction_kind = ?, retracted_at = ?, valid_to = ?, updated_at = ?
-WHERE id = ? AND status = 'active';
+-- The kind is decided HERE, atomically with the denial check: an 'ended'
+-- request is recorded 'ended' only while the fact carries no negative
+-- evidence row (on an active fact every such row is a user denial, and a
+-- denial means 'corrected'); otherwise - or for any other request - it is
+-- 'corrected' with valid_to = the retraction time. An ended retraction's
+-- valid_to is ended_valid_to (the caller keeps an earlier end). A denial
+-- landing after this statement is caught by DenyFact re-marking the row
+-- (MarkFactRetractionCorrected). Only an ACTIVE row is closed: no row
+-- (sql.ErrNoRows) = a concurrent retraction won, the caller reports "no
+-- active fact". RETURNING is the kind actually recorded.
+UPDATE facts SET status = 'retracted',
+    retraction_kind = CASE
+        WHEN CAST(sqlc.arg(requested_kind) AS TEXT) = 'ended'
+             AND NOT EXISTS (SELECT 1 FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0)
+        THEN 'ended' ELSE 'corrected' END,
+    valid_to = CASE
+        WHEN CAST(sqlc.arg(requested_kind) AS TEXT) = 'ended'
+             AND NOT EXISTS (SELECT 1 FROM evidence ev WHERE ev.fact_id = facts.id AND ev.polarity < 0)
+        THEN CAST(sqlc.arg(ended_valid_to) AS TEXT) ELSE CAST(sqlc.arg(retracted_at) AS TEXT) END,
+    retracted_at = CAST(sqlc.arg(retracted_at) AS TEXT),
+    updated_at = CAST(sqlc.arg(updated_at) AS TEXT)
+WHERE id = sqlc.arg(id) AND status = 'active'
+RETURNING retraction_kind;
 
 -- name: MarkFactRetractionCorrected :execrows
 -- 0027: a user denial of a fact already retracted as 'ended' (kahya fact

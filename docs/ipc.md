@@ -889,7 +889,12 @@ a cloud model, without changing anything in §2-§6 above:
   corrected: `DenyFact` (`kahya fact deny`, the ritual Yanlış answer)
   re-records an ended
   retraction as corrected, and an ended request on a fact that carries a
-  denial is recorded corrected. An ended retraction keeps an earlier
+  denial is recorded corrected. The kind is decided inside the
+  retraction's own guarded UPDATE (`RetractFact :one ... RETURNING
+  retraction_kind`: ended only while the fact has no negative evidence
+  row), and `DenyFact` re-marks an ended retraction again after its
+  evidence row, so a denial racing a retraction never leaves the fact
+  ended. An ended retraction keeps an earlier
   `valid_to` the fact already had (else `valid_to` = the retraction time);
   the negative evidence row is unchanged. A pre-0027 retraction (kind NULL)
   counts as corrected. `POST /v1/fact/retract {subject, predicate, object,
@@ -909,10 +914,14 @@ a cloud model, without changing anything in §2-§6 above:
   (`factengine.HistoryEligible`: the tier half of `InjectionEligible` and
   the log-odds without the retraction's own negative row above the
   threshold; `include_quarantined` adds the rest, labelled) apply as for
-  active facts. An ended fact comes back with `ended: true`,
-  `retracted_at` and - in the MCP output only - `label: "sona erdi"`
-  (`memory.FactEndedLabel`, byte-exact); its `confidence_p` is the stored
-  one (its retraction's negative row included). The CLI appends `", sona
+  active facts. An ended fact is a candidate only while its one negative
+  evidence row is its retraction's own (`factengine.IsHistory`); a further
+  negative row is a user denial, so such a fact counts as corrected and is
+  never returned (fail-closed backstop). An ended fact comes back with
+  `ended: true`, `retracted_at` and - in the MCP output only -
+  `label: "sona erdi"` (`memory.FactEndedLabel`, byte-exact); its
+  `confidence_p` is the stored one (its retraction's negative row
+  included). The CLI appends `", sona
   erdi"` (after `", onaysız"`). A corrected or kind-less fact is never
   returned, not even with `include_quarantined`; without as_of /
   known_as_of nothing changes. Ended facts are never injected:

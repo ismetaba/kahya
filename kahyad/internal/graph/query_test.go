@@ -298,6 +298,49 @@ func TestFactQueryEndedFactTrustAndLaneRules(t *testing.T) {
 	}
 }
 
+// TestFactQueryNeverReturnsAnEndedFactCarryingADenial (FIX-FINAL fact-
+// history-ended-vs-corrected, review): an ended fact is history only while
+// its one negative evidence row is its retraction's own. A further negative
+// row is a user denial (it means corrected): the read side never shows such
+// a fact - not inside its window, not at a known_as_of before the
+// retraction, not with include_quarantined, in neither lane - even when the
+// row's kind still says ended (the state a denial racing the retraction
+// left before the write side decided the kind atomically).
+func TestFactQueryNeverReturnsAnEndedFactCarryingADenial(t *testing.T) {
+	f := newFixture(t)
+	ep := f.episode("people/emre.md")
+	emre := f.entity("Emre", "person")
+	f.fe.SetClock(func() time.Time { return mustTime(t, "2026-02-01T00:00:00Z") })
+	id := f.confirmed(f.factWith(factengine.Candidate{Subject: "Emre", Predicate: "works_at", Object: "Acme", Provenance: factengine.ProvenanceExternalDoc,
+		EpisodeID: ep, SubjectEntityID: emre, ExtractorVer: "t", ValidFrom: "2026-01-01T00:00:00Z"}))
+	f.fe.SetClock(time.Now)
+	f.retract("Emre", "works_at", "Acme", factengine.RetractionEnded, "2026-05-01T00:00:00Z")
+	queries := []FactQuery{
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z")},
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z"), CloudLane: true},
+		{EntityID: emre, AsOf: mustTime(t, "2026-03-01T00:00:00Z"), IncludeQuarantined: true, CloudLane: true},
+		{EntityID: emre, KnownAsOf: mustTime(t, "2026-03-01T00:00:00Z"), IncludeQuarantined: true},
+		{Subject: "Emre", AsOf: mustTime(t, "2026-03-01T00:00:00Z"), IncludeQuarantined: true},
+	}
+	// Control: the ended fact is history before the denial.
+	if got := f.query(queries[0]); !reflect.DeepEqual(recIDs(got), []int64{id}) || !got[0].Ended {
+		t.Fatalf("as_of before the denial = %+v, want the ended fact %d", got, id)
+	}
+	// A denial row the kind never caught up with (kind still 'ended').
+	if _, err := f.st.DB().Exec(`INSERT INTO evidence (fact_id, session_id, polarity, weight, created_at) VALUES (?, 'ritual-1', -1, ?, '2026-05-01T00:00:01Z')`, id, factengine.DenialLogOdds); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := f.st.DB().QueryRow(`SELECT retraction_kind FROM facts WHERE id = ?`, id).Scan(&kind); err != nil || kind != string(factengine.RetractionEnded) {
+		t.Fatalf("setup: kind = %q, %v; want still ended", kind, err)
+	}
+	for _, q := range queries {
+		if got := f.query(q); len(got) != 0 {
+			t.Fatalf("query %+v = %+v: an ended fact carrying a user denial came back as history", q, got)
+		}
+	}
+}
+
 // TestNeighbourhoodNeverInjectsAnEndedFact: an ended fact is history for
 // the structured reads only - the <hafiza> walk keeps InjectionEligible
 // (active) facts, as before.

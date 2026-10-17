@@ -774,9 +774,17 @@ type Querier interface {
 	// evidence row in the SAME logical operation, never this alone.
 	// 0027: the retraction records its kind ('ended' = the fact held and no
 	// longer does; 'corrected' = it was wrong) and its own transaction time.
-	// Only an ACTIVE row is closed: 0 rows = a concurrent retraction won, the
-	// caller reports "no active fact".
-	RetractFact(ctx context.Context, arg RetractFactParams) (int64, error)
+	// The kind is decided HERE, atomically with the denial check: an 'ended'
+	// request is recorded 'ended' only while the fact carries no negative
+	// evidence row (on an active fact every such row is a user denial, and a
+	// denial means 'corrected'); otherwise - or for any other request - it is
+	// 'corrected' with valid_to = the retraction time. An ended retraction's
+	// valid_to is ended_valid_to (the caller keeps an earlier end). A denial
+	// landing after this statement is caught by DenyFact re-marking the row
+	// (MarkFactRetractionCorrected). Only an ACTIVE row is closed: no row
+	// (sql.ErrNoRows) = a concurrent retraction won, the caller reports "no
+	// active fact". RETURNING is the kind actually recorded.
+	RetractFact(ctx context.Context, arg RetractFactParams) (sql.NullString, error)
 	// W6-03 halt executor step 3.5 ("invalidate pending approvals ... and
 	// REVOKE their one-time tokens"): burns every not-yet-consumed
 	// approval_tokens row for taskID via the SAME "UPDATE ... WHERE

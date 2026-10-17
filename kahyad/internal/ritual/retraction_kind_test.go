@@ -29,7 +29,11 @@ func TestAnswerYanlisMakesALaterEndedRetractionACorrection(t *testing.T) {
 	if res.FactID != factID || res.Kind != factengine.RetractionCorrected {
 		t.Fatalf("RetractFact(ended) after a Yanlış answer = %+v, want fact %d recorded corrected", res, factID)
 	}
-	if f := getFact(t, st, factID); factengine.IsEnded(f) || factengine.HistoryEligible(f) {
+	var negs int64
+	if err := st.DB().QueryRow(`SELECT count(*) FROM evidence WHERE fact_id = ? AND polarity < 0`, factID).Scan(&negs); err != nil {
+		t.Fatal(err)
+	}
+	if f := getFact(t, st, factID); factengine.IsEnded(f) || factengine.IsHistory(f, negs) || factengine.HistoryEligible(f, negs) {
 		t.Fatalf("fact after Yanlış + ended retraction = kind %v; must never count as ended history", f.RetractionKind)
 	}
 }

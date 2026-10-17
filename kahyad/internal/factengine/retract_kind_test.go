@@ -121,6 +121,13 @@ func TestRetractFactRecordsKindAndTime(t *testing.T) {
 	}
 }
 
+// historyEligible is HistoryEligible with f's negative evidence rows counted
+// from brain.db, as the structured reads count them.
+func historyEligible(t *testing.T, st *store.Store, f sqlcgen.Fact) bool {
+	t.Helper()
+	return HistoryEligible(f, int64(negativeRows(t, st, f.ID)))
+}
+
 func mustFact(t *testing.T, e *Engine, id int64) sqlcgen.Fact {
 	t.Helper()
 	got, err := e.GetFact(context.Background(), id)
@@ -168,8 +175,8 @@ func TestRetractFactEndedOnADeniedFactIsRecordedCorrected(t *testing.T) {
 	if err != nil || res.Kind != RetractionCorrected {
 		t.Fatalf("RetractFact(ended) on a denied fact = (%+v, %v), want recorded corrected", res, err)
 	}
-	if f := mustFact(t, e, id); f.RetractionKind.String != string(RetractionCorrected) || HistoryEligible(f) {
-		t.Fatalf("denied fact kind = %v, history eligible = %v; want corrected, never history", f.RetractionKind, HistoryEligible(f))
+	if f := mustFact(t, e, id); f.RetractionKind.String != string(RetractionCorrected) || historyEligible(t, st, f) {
+		t.Fatalf("denied fact kind = %v, history eligible = %v; want corrected, never history", f.RetractionKind, historyEligible(t, st, f))
 	}
 	var requested, reason string
 	if err := st.DB().QueryRow(`SELECT json_extract(payload, '$.requested_kind'), json_extract(payload, '$.kind_reason') FROM events WHERE trace_id = 'tr-ret' AND kind = ?`, EventFactRetracted).Scan(&requested, &reason); err != nil || requested != "ended" || reason != "user_denial" {
@@ -187,14 +194,14 @@ func TestDenyFactTurnsAnEndedRetractionIntoACorrection(t *testing.T) {
 	if _, err := e.RetractFact(ctx, "tr", "user", "likes", "kahve", "s1", RetractionEnded); err != nil {
 		t.Fatal(err)
 	}
-	if f := mustFact(t, e, id); !HistoryEligible(f) {
+	if f := mustFact(t, e, id); !historyEligible(t, st, f) {
 		t.Fatalf("ended user_asserted fact must be history-eligible: %+v", f)
 	}
 	if err := e.DenyFact(ctx, "tr-deny", id, "cli:tr-deny"); err != nil {
 		t.Fatal(err)
 	}
-	if f := mustFact(t, e, id); f.RetractionKind.String != string(RetractionCorrected) || HistoryEligible(f) || f.Status != "retracted" {
-		t.Fatalf("after deny: status %q kind %v eligible %v; want retracted, corrected, not history", f.Status, f.RetractionKind, HistoryEligible(f))
+	if f := mustFact(t, e, id); f.RetractionKind.String != string(RetractionCorrected) || historyEligible(t, st, f) || f.Status != "retracted" {
+		t.Fatalf("after deny: status %q kind %v eligible %v; want retracted, corrected, not history", f.Status, f.RetractionKind, historyEligible(t, st, f))
 	}
 	var marked string
 	if err := st.DB().QueryRow(`SELECT json_extract(payload, '$.retraction_kind') FROM events WHERE trace_id = 'tr-deny' AND kind = ?`, EventFactDenied).Scan(&marked); err != nil || marked != "corrected" {
@@ -252,7 +259,7 @@ func TestHistoryEligibleTrustRules(t *testing.T) {
 	want := map[int64]bool{user: true, agent: false, confirmed: true, legacy: false}
 	for id, eligible := range want {
 		f := mustFact(t, e, id)
-		if HistoryEligible(f) != eligible {
+		if historyEligible(t, st, f) != eligible {
 			t.Errorf("HistoryEligible(fact %d: tier %s confirmed %v kind %v) = %v, want %v", id, f.SourceTier, f.ConfirmedAt.Valid, f.RetractionKind, !eligible, eligible)
 		}
 		if InjectionEligible(f) {
