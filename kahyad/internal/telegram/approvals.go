@@ -340,6 +340,69 @@ func (b *Bot) sendApprovalCard(ctx context.Context, info policy.PendingApprovalI
 		Text: last, TraceID: info.TraceID, sentAt: b.clock(),
 	}
 	b.mu.Unlock()
+	// FIX-FINAL flake-r2-tux3-card-send-race: the id may have been decided
+	// on another surface (Hammerspoon, `kahya approve`, a halt) while the
+	// card was in flight - the decided / invalidated hooks found no card
+	// then and did nothing, so the card would land with live buttons. Read
+	// the decision AFTER storing: the engine records it before it fires
+	// either hook, so either this read sees it or the hook sees the card.
+	b.reconcileStoredCard(ctx, info.ID)
+}
+
+// reconcileStoredCard edits a just-stored card to the decision the engine
+// already recorded for id (FIX-FINAL flake-r2-tux3-card-send-race); an
+// undecided or unreadable row leaves it alone (a later hook finds the card;
+// a tap still fails closed at the engine).
+func (b *Bot) reconcileStoredCard(ctx context.Context, id string) {
+	if decision, ok := b.recordedDecision(ctx, id); ok {
+		b.applyRecordedDecision(ctx, id, decision)
+	}
+}
+
+// recordedDecision returns the decision the engine recorded for id, when
+// one is recorded and readable (pendingDecisionReader, *policy.Engine).
+func (b *Bot) recordedDecision(ctx context.Context, id string) (string, bool) {
+	dr, ok := b.engine.(pendingDecisionReader)
+	if !ok {
+		return "", false
+	}
+	decided, decision, err := dr.PendingApprovalDecision(ctx, id)
+	if err != nil || !decided {
+		return "", false
+	}
+	return decision, true
+}
+
+// applyRecordedDecision resolves id's card (check-and-set under b.mu: a
+// card some other path already resolved is left alone) and edits it to the
+// recorded decision - the W3-07 suffix for an approval or a denial, the
+// byte-exact halt text for an invalidation. It reports whether it edited.
+func (b *Bot) applyRecordedDecision(ctx context.Context, id, decision string) bool {
+	var suffix string
+	switch decision {
+	case policy.PendingDecisionApproved:
+		suffix = suffixApproved
+	case policy.PendingDecisionDenied:
+		suffix = suffixRejected
+	case policy.PendingDecisionInvalidated:
+	default:
+		return false
+	}
+	b.mu.Lock()
+	card, ok := b.cards[id]
+	if !ok || card.resolved {
+		b.mu.Unlock()
+		return false
+	}
+	card.resolved = true
+	card.resolvedAt = b.clock()
+	b.mu.Unlock()
+	if decision == policy.PendingDecisionInvalidated {
+		b.editCardText(ctx, card, msgApprovalInvalidatedHalt)
+	} else {
+		b.editCard(card, suffix)
+	}
+	return true
 }
 
 // handleCallback is the tele.OnCallback handler (registered in
@@ -419,6 +482,16 @@ func (b *Bot) handleCallback(c tele.Context) error {
 	}
 
 	if feedbackErr != nil {
+		// FIX-FINAL flake-r2-tux3-card-send-race: another surface may have
+		// decided this id first, its decided hook not yet at this card (it
+		// runs in its own goroutine). The tap then fails as "already
+		// consumed" - answer "Zaten işlendi." and stamp the recorded
+		// decision, never "süresi doldu" over an executed action.
+		if decision, ok := b.recordedDecision(context.Background(), id); ok {
+			b.respond(cb, traceID, msgAlreadyHandled)
+			b.applyRecordedDecision(context.Background(), id, decision)
+			return nil
+		}
 		// Every failure mode from Approve/Deny — unrecognized id, expired
 		// (TTL 10min), already consumed by a DIFFERENT surface, or (defense
 		// in depth — should be structurally unreachable, since a W3

@@ -2133,7 +2133,14 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
    `Engine.Approve` refuses an irreversible tool from any non-local
    surface, B-11). `Engine.Approve` persists a single-use **grant**
    (`approval_tokens.grant_kind='approval'`); the engine's decided hook
-   wakes the parked call at once (a 2 s DB probe is the fallback).
+   wakes the parked call at once (a 2 s DB probe is the fallback). A
+   Telegram card the same id has is edited to the decision (FIX-FINAL
+   TUX-3) - also when the id was decided while the card was still being
+   sent: the card is reconciled with the engine's recorded decision right
+   after it is stored (the decision suffix, or the halt text), and a tap
+   that fails because another surface decided first answers `"Zaten
+   işlendi."` with the recorded decision stamped, never `"⏰ Süresi
+   doldu"` (FIX-FINAL flake-r2-tux3-card-send-race).
 4. The same call re-checks **bound to its own pending id**
    (`RedeemPendingApprovalID` + `NoMintPending`: never a second pending
    row). `Engine.Check` **redeems** that id's grant and no other — never a
