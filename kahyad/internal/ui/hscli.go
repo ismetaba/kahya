@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"kahya/kahyad/internal/logx"
@@ -205,10 +206,35 @@ func (h *HSCli) SendNotification(ctx context.Context, traceID, text string) bool
 	return h.SendNotice(ctx, traceID, text, "")
 }
 
+// MsgSpokenNoticeFallback is what the Speaker says instead of a notice
+// whose text carries something speech must never read aloud (FIX-FINAL
+// tux-tts-speaks-task-ids-in-delivered-notices, orchestrator decision (a)):
+// a task id, a trace id or another long hex run, a `kahya ...` or `git -C`
+// command. The banner (and Telegram) still show the full text.
+const MsgSpokenNoticeFallback = "Kâhya'dan yeni bir bildirim var; ayrıntı ekranda."
+
+// unspeakableRe matches the parts of a notice speech must never read: a
+// task id (t_<hex>), any run of 16+ hex digits (trace ids, approval ids,
+// commit hashes - and long digit runs), a `kahya <subcommand>` command, a
+// `git -C` command, a `--flag`.
+var unspeakableRe = regexp.MustCompile(`\bt_[0-9a-f]{8,}|[0-9a-fA-F]{16,}|(?:^|[\s'"(` + "`" + `])kahya [a-z]|\bgit -C\b|(?:^|\s)--[a-z]`)
+
+// spokenSafe returns text when speech may read it, else
+// MsgSpokenNoticeFallback.
+func spokenSafe(text string) string {
+	if unspeakableRe.MatchString(text) {
+		return MsgSpokenNoticeFallback
+	}
+	return text
+}
+
 // SendNotice is SendNotification for a notice whose shown text should not
 // be read aloud as is (FIX-FINAL tux-resumed-task-answer-never-delivered):
 // the banner shows text, and the Speaker says spoken instead - a short,
 // id-free Turkish line. spoken "" speaks text itself (SendNotification).
+// Either way what is spoken passes spokenSafe: a text carrying an id or a
+// command is replaced by MsgSpokenNoticeFallback (FIX-FINAL
+// tux-tts-speaks-task-ids-in-delivered-notices).
 func (h *HSCli) SendNotice(ctx context.Context, traceID, text, spoken string) bool {
 	// FIX-FINAL TUX-10: a background result (the morning briefing) carries
 	// its own "trace_id: <id>" line for Telegram (W5-01); locally kahyaNotify
@@ -237,7 +263,7 @@ func (h *HSCli) SendNotice(ctx context.Context, traceID, text, spoken string) bo
 	// notification speech goes through here; Lane is always
 	// notify.LaneNormal and Force is always false.
 	if h.Speaker != nil {
-		h.Speaker.Speak(ctx, notify.SpeakRequest{TraceID: traceID, Text: spoken, Lane: notify.LaneNormal})
+		h.Speaker.Speak(ctx, notify.SpeakRequest{TraceID: traceID, Text: spokenSafe(spoken), Lane: notify.LaneNormal})
 	}
 
 	return ok

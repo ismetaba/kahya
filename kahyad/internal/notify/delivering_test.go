@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-type deliveredText struct{ traceID, text string }
+type deliveredText struct{ traceID, kind, text string }
 
 type deliverySink struct {
 	mu  sync.Mutex
@@ -18,9 +18,9 @@ type deliverySink struct {
 
 func newDeliverySink() *deliverySink { return &deliverySink{ch: make(chan struct{}, 16)} }
 
-func (d *deliverySink) deliver(_ context.Context, traceID, text string) {
+func (d *deliverySink) deliver(_ context.Context, traceID, kind, text string) {
 	d.mu.Lock()
-	d.got = append(d.got, deliveredText{traceID, text})
+	d.got = append(d.got, deliveredText{traceID, kind, text})
 	d.mu.Unlock()
 	d.ch <- struct{}{}
 }
@@ -67,8 +67,8 @@ func TestDeliveringNotifierDeliversListedKindsOnly(t *testing.T) {
 	sink.mu.Lock()
 	got := append([]deliveredText(nil), sink.got...)
 	sink.mu.Unlock()
-	if len(got) != 1 || got[0] != (deliveredText{"tr-1", msg}) {
-		t.Fatalf("delivered = %+v, want exactly the listed notice byte-exact", got)
+	if len(got) != 1 || got[0] != (deliveredText{"tr-1", "task.resume_cap_exceeded", msg}) {
+		t.Fatalf("delivered = %+v, want exactly the listed notice byte-exact, with its kind", got)
 	}
 
 	failing := &failingNotifier{}
@@ -89,9 +89,9 @@ func TestSpeakerVoiceMissingDeliveryDoesNotDeadlock(t *testing.T) {
 	setFakeSayEnv(t, dir, noYeldaVoiceList)
 	sink := newDeliverySink()
 	var s *Speaker
-	n := NewDelivering(&recordingNotifier{}, func(ctx context.Context, traceID, text string) {
+	n := NewDelivering(&recordingNotifier{}, func(ctx context.Context, traceID, kind, text string) {
 		s.Speak(ctx, SpeakRequest{TraceID: traceID, Text: text})
-		sink.deliver(ctx, traceID, text)
+		sink.deliver(ctx, traceID, kind, text)
 	}, EventVoiceMissing, EventVoiceProbeFailed)
 	s = NewSpeaker(SpeakerConfig{Enabled: true, SayBin: fakeSayBin, Voice: "Yelda"}, testLog(t), &recordingLedger{}, n)
 	done := make(chan struct{})

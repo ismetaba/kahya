@@ -617,7 +617,7 @@ func run() int {
 	// user to act (install Yelda), so they also reach the LOCAL banner -
 	// hsCli.NotifyText, never SendNotification (which re-enters the
 	// Speaker) and never Telegram (the voice is this machine's matter).
-	speakerNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, text string) {
+	speakerNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, _, text string) {
 		hsCli.NotifyText(ctx, traceID, text)
 	}, notify.EventVoiceMissing, notify.EventVoiceProbeFailed)
 	speaker := notify.NewSpeaker(notify.SpeakerConfig{
@@ -630,8 +630,12 @@ func run() int {
 	// and ledgered. They now also go out on the background-result channel
 	// (HANDOFF §4 IPC: Hammerspoon + Telegram, localDelivery; fixed text
 	// with ids only, behind tgBot's FIX-U-5 session gate), asynchronously.
-	taskNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, text string) {
-		localDelivery.SendNotification(ctx, traceID, text)
+	// FIX-FINAL tux-tts-speaks-task-ids-in-delivered-notices: the banner and
+	// Telegram keep the full text (the user copies the resolve command from
+	// it), but the Speaker says the kind's short, id-free line
+	// (task.SpokenNotice) - never the 34-character task id twice.
+	taskNotifier := notify.NewDelivering(notifier, func(ctx context.Context, traceID, kind, text string) {
+		localDelivery.SendNotice(ctx, traceID, text, task.SpokenNotice(kind))
 	}, task.EventResumeCapExceeded, task.EventW1RetryCapExceeded, task.EventW2W3Receiptless, task.EventCloudTaskFailed)
 	hsCli.Speaker = speaker
 	srv.SetSpeaker(speaker)

@@ -30,7 +30,7 @@ func TestUserActionNoticesReachAUserSurface(t *testing.T) {
 	var taskSite, speakerSite string
 	for _, s := range sites {
 		switch {
-		case strings.Contains(s.args, "localDelivery.SendNotification"):
+		case strings.Contains(s.args, "localDelivery.SendNotice"):
 			taskSite = s.args
 		case strings.Contains(s.args, "hsCli.NotifyText"):
 			speakerSite = s.args
@@ -48,6 +48,11 @@ func TestUserActionNoticesReachAUserSurface(t *testing.T) {
 	}
 	if strings.Contains(speakerSite, "SendNotification") || strings.Contains(speakerSite, "localDelivery") {
 		t.Errorf("the speaker's notices must stay local and never re-enter the Speaker: %q", speakerSite)
+	}
+	// FIX-FINAL tux-tts-speaks-task-ids-in-delivered-notices: the task
+	// notices are spoken as the kind's id-free line, never as shown.
+	if !strings.Contains(taskSite, "localDelivery.SendNotice(ctx, traceID, text, task.SpokenNotice(kind))") || strings.Contains(taskSite, "SendNotification") {
+		t.Errorf("the task notifier must deliver with task.SpokenNotice(kind) as the spoken line: %q", taskSite)
 	}
 }
 

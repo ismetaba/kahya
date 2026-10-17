@@ -14,22 +14,24 @@ import (
 //
 // Notify runs the inner Notifier first (the durable JSONL + ledger write
 // keeps its error semantics; its error is what Notify returns) and then,
-// only for a listed kind, calls deliver(ctx, traceID, message) with the
-// message unchanged - in its own goroutine, under a context that outlives
-// the caller's cancellation. Asynchronous on purpose: the Speaker notifies
+// only for a listed kind, calls deliver(ctx, traceID, kind, message) with
+// the message unchanged - in its own goroutine, under a context that
+// outlives the caller's cancellation. The kind lets the deliver func pick
+// what the Speaker says instead of the shown text (FIX-FINAL
+// tux-tts-speaks-task-ids-in-delivered-notices). Asynchronous on purpose: the Speaker notifies
 // while holding its voice mutex and HSCli.SendNotification calls back into
 // Speaker.Speak (a synchronous call would deadlock), and the task-state
 // paths (resume scan, cloud retry) must never wait on an `hs` or Telegram
 // exec. Alarm delegates to the inner Notifier only.
 type DeliveringNotifier struct {
 	inner   Notifier
-	deliver func(ctx context.Context, traceID, text string)
+	deliver func(ctx context.Context, traceID, kind, text string)
 	kinds   map[string]bool
 }
 
 // NewDelivering returns a DeliveringNotifier delivering the listed kinds.
 // A nil deliver makes it a pass-through.
-func NewDelivering(inner Notifier, deliver func(ctx context.Context, traceID, text string), kinds ...string) *DeliveringNotifier {
+func NewDelivering(inner Notifier, deliver func(ctx context.Context, traceID, kind, text string), kinds ...string) *DeliveringNotifier {
 	set := make(map[string]bool, len(kinds))
 	for _, k := range kinds {
 		set[k] = true
@@ -45,7 +47,7 @@ func (d *DeliveringNotifier) Notify(ctx context.Context, traceID, kind, message 
 	}
 	if d.deliver != nil && d.kinds[kind] {
 		dctx := context.WithoutCancel(ctx)
-		go d.deliver(dctx, traceID, message)
+		go d.deliver(dctx, traceID, kind, message)
 	}
 	return err
 }

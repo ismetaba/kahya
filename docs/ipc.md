@@ -1461,7 +1461,16 @@ background-result channel too (Hammerspoon + Telegram, `ui.FanOutDelivery`;
 Telegram behind its FIX-U-5 gate), not only logged and ledgered; the
 Speaker's `tts.voice_missing` / `tts.voice_probe_failed` notices go to the
 local banner only (`notify.DeliveringNotifier`, asynchronous - FIX-FINAL
-TUX-5). A status a
+TUX-5). With `tts.enabled` the Speaker does not read these notices as
+shown (FIX-FINAL tux-tts-speaks-task-ids-in-delivered-notices, orchestrator
+decision (a)): the banner and Telegram keep the full text, but speech says
+the kind's id-free line (`task.SpokenNotice`) - `"Bir görev senin kararını
+bekliyor; ayrıntı bildirimde."` for the three blocked_user notices, `"Bir
+görev bulut hatası nedeniyle kapatıldı; ayrıntı bildirimde."` for
+`task.failed` - and any other background notice whose text carries a task
+id, a 16+ hex/digit run, a `kahya …` / `git -C` command or a `--flag` is
+spoken as `"Kâhya'dan yeni bir bildirim var; ayrıntı ekranda."`
+(`ui.HSCli.SendNotice`). A status a
 proxy callback, the budget pause or a halt already set mid-run is never
 overridden. A **budget block** (task token ceiling, daily or monthly budget)
 moves the task to `blocked_user` too (owner decision G10-1: resumed only by
