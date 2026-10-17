@@ -1797,13 +1797,21 @@ func runUndo(client *Client, args []string, stdout, stderr io.Writer) int {
 // NON-INTERACTIVE additions (hammerspoon/kahya.lua's approval cards drive
 // these - see runApprovalsShow/runApprovalsDecide's own doc comments);
 // `kahya approve <id>`'s own interactive stdin-prompt flow is unchanged
-// and unaffected by either.
+// and unaffected by either. `list` takes no arguments (any extra one,
+// a help flag included, prints MsgApprovalsUsage, exit 2).
 func runApprovals(client *Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		return runApprovalsList(client, stdout, stderr)
 	}
 	switch args[0] {
 	case "list":
+		// FIX-FINAL tux-approvals-list-ignores-help-and-args: `list` takes
+		// no arguments - `approvals list -h` (or any extra word) printed the
+		// pending list, or "kahyad'a ulaşılamıyor", instead of the usage.
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, MsgApprovalsUsage)
+			return 2
+		}
 		return runApprovalsList(client, stdout, stderr)
 	case "show":
 		return runApprovalsShow(client, args[1:], stdout, stderr)

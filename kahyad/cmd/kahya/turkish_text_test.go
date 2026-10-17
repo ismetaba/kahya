@@ -240,6 +240,11 @@ func TestHelpFlagsNeverDialOrBecomeQuestions(t *testing.T) {
 		{[]string{"health", "-h"}, MsgHealthUsage},
 		{[]string{"task", "show", "-h"}, MsgTaskShowUsage},
 		{[]string{"job", "run", "-h"}, MsgJobUsage},
+		// FIX-FINAL tux-approvals-list-ignores-help-and-args: `approvals
+		// list` takes no arguments; it used to ignore them and dial.
+		{[]string{"approvals", "list", "-h"}, MsgApprovalsUsage},
+		{[]string{"approvals", "list", "--help"}, MsgApprovalsUsage},
+		{[]string{"approvals", "list", "x"}, MsgApprovalsUsage},
 	}
 	for _, tc := range cases {
 		var requests int
