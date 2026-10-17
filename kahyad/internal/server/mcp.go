@@ -359,11 +359,14 @@ func (s *Server) ensureTraceHeader(next http.Handler) http.Handler {
 //     secret hit escalates the attributed task's lane (NewMemoryLaneEscalator
 //     takes the task from the same pinned attribution) - independent of the
 //     taint gate above.
-//   - FIX-I-4: with receipts wired (SetReceipts) and a task id, a completed
-//     identical call of the same task is answered from its durable receipt
-//     before the policy check (receipts.go mcpReplayStoredResult), and a
-//     non-R call's handler runs inside Receipts.ExecuteDetached
-//     (mcpExecuteWithReceipt) - a resumed session never executes it twice.
+//   - FIX-I-4: with receipts wired (SetReceipts) and a task id, an
+//     identical call an EARLIER worker run of the same task completed is
+//     answered from its durable receipt before the policy check (receipts.go
+//     mcpReplayStoredResult), and a non-R call's handler runs inside
+//     Receipts.ExecuteDetached (mcpExecuteWithReceipt) - a resumed session
+//     never executes it twice. FIX-FINAL receipt-replay-per-run: only on
+//     resume, once per receipt per run; inside one live run an identical
+//     call executes again (task.WithRunPin pins the call's run below).
 //     The fs/shell/osascript tools do the same in their own gate chains.
 //   - Residuals (the sanctioned worker does neither): a forked worker
 //     child that calls setsid() is in a fresh, unregistered session and so
@@ -388,6 +391,14 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 			if !ok || callReq.Params == nil {
 				return next(ctx, method, req)
 			}
+			// FIX-FINAL receipt-replay-per-run: one run pin per tools/call,
+			// shared by the generic path below and every owned tool's own
+			// chain (fs/shell/osascript get this ctx through next). The
+			// call's first receipt step resolves the task's worker run and
+			// the rest of the call - its Execute after the policy check and
+			// any approval wait - reuses it, so the call is recorded under
+			// the run that issued it.
+			ctx = task.WithRunPin(ctx)
 
 			rawName := callReq.Params.Name
 			canonName := policy.Canonicalize(rawName)
@@ -462,11 +473,13 @@ func (s *Server) policyGateMiddleware() mcp.Middleware {
 				argBytes = []byte(callReq.Params.Arguments)
 			}
 
-			// FIX-I-4: with receipts wired and a task to key on, a completed
-			// identical call of the same task (canonical argument bytes) is
-			// answered from its durable receipt BEFORE the policy check - a
-			// resumed session re-issuing it executes nothing and needs no
-			// second approval. R-class tools never have a receipt (no row is
+			// FIX-I-4: with receipts wired and a task to key on, an identical
+			// call (canonical argument bytes) that an EARLIER worker run of
+			// the task completed is answered from its durable receipt BEFORE
+			// the policy check - a resumed session re-issuing it executes
+			// nothing and needs no second approval (FIX-FINAL
+			// receipt-replay-per-run: a repeat inside the live run is a miss
+			// and executes). R-class tools never have a receipt (no row is
 			// ever written for them), so for them this is always a miss.
 			receiptsOn := s.receipts != nil && taskID != ""
 			var rin task.ExecuteInput

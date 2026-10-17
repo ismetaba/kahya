@@ -29,10 +29,11 @@
 //  6. atomic write
 //  7. ledger
 //
-// FIX-I-4: fs_write/fs_delete also replay a completed identical call of the
-// same task from its durable receipt between steps 2 and 3 (no policy
-// decision, nothing executes), and run steps 5-7 as one effect inside
-// kahyad's tool_calls receipt lifecycle (receipts.go).
+// FIX-I-4: fs_write/fs_delete also replay an identical call an EARLIER
+// worker run of the same task completed (a resume; FIX-FINAL
+// receipt-replay-per-run) from its durable receipt between steps 2 and 3
+// (no policy decision, nothing executes), and run steps 5-7 as one effect
+// inside kahyad's tool_calls receipt lifecycle (receipts.go).
 //
 // kahyad's own /v1/mcp policyGateMiddleware (kahyad/internal/server/
 // mcp.go) is therefore told to skip its OWN generic Check+ConsumeToken
@@ -267,7 +268,8 @@ type Server struct {
 	ContentClassifier ContentClassifier
 
 	// Receipts is the FIX-I-4 receipt seam (receipts.go): fs_write and
-	// fs_delete replay a completed identical call before their policy check
+	// fs_delete replay an identical call an earlier worker run of the task
+	// completed before their policy check
 	// and run their effect inside kahyad's tool_calls lifecycle. nil (tests,
 	// standalone use) = the direct pre-FIX-I-4 path; kahyad always wires it.
 	Receipts ReceiptExecutor
@@ -371,10 +373,15 @@ type FsWriteOutput struct {
 	// for the consumed token - the key of its undo_windows row and of this
 	// package's undo record, and the op_id in its fs_write ledger line.
 	OpID string `json:"op_id"`
-	// Replayed is true when this is the stored result of an EARLIER,
-	// identical, completed fs_write of the same task (FIX-I-4 receipt
-	// replay): nothing was written this call.
+	// Replayed is true when this is the stored result of an identical
+	// fs_write that an EARLIER worker run of the same task completed - a
+	// resumed session re-issuing it (FIX-I-4 receipt replay, per run since
+	// FIX-FINAL receipt-replay-per-run): nothing was written this call. An
+	// identical call inside one live run is never replayed; it executes.
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote is MsgReplayedFromEarlierRun on a replayed result (the
+	// model-facing statement of the above), empty otherwise.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // FsDeleteArgs is fs_delete's input.
@@ -390,6 +397,8 @@ type FsDeleteOutput struct {
 	OpID string `json:"op_id"`
 	// Replayed: see FsWriteOutput.Replayed (nothing was moved this call).
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote: see FsWriteOutput.ReplayNote.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // denyGlobReason is the Turkish, user/model-facing deny reason for a
@@ -648,8 +657,9 @@ func (s *Server) inCopyStore(p string) bool {
 // HandleWrite implements fs_write (class W1) — the full gate chain this
 // package's doc comment describes, in order: canonicalize, deny-glob
 // (BEFORE any policy decision — HANDOFF §5 safety #6), receipt replay
-// (FIX-I-4: a completed identical call of the same task answers from its
-// receipt, before any policy decision), Check, ConsumeToken, then the
+// (FIX-I-4: an identical call an earlier worker run of the same task
+// completed answers from its receipt, before any policy decision), Check,
+// ConsumeToken, then the
 // effect inside the receipt lifecycle: pre-op checkpoint (git or fallback
 // copy), atomic write, undo record, ledger.
 func (s *Server) HandleWrite(ctx context.Context, traceID, taskID string, args FsWriteArgs) (FsWriteOutput, error) {
@@ -762,6 +772,7 @@ func (s *Server) replayedWrite(ctx context.Context, traceID, taskID string, out 
 		"event": "fs_write_replayed", "canonical_path": out.Path, "task_id": taskID,
 	})
 	out.Replayed = true
+	out.ReplayNote = MsgReplayedFromEarlierRun
 	return out
 }
 
@@ -771,6 +782,7 @@ func (s *Server) replayedDelete(ctx context.Context, traceID, taskID string, out
 		"event": "fs_delete_replayed", "canonical_path": out.Path, "trash_path": out.TrashPath, "task_id": taskID,
 	})
 	out.Replayed = true
+	out.ReplayNote = MsgReplayedFromEarlierRun
 	return out
 }
 

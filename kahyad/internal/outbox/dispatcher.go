@@ -95,6 +95,10 @@ const (
 	// stt): those are never resumed, so the task is failed and the row acked
 	// instead of a worker being re-spawned with resume:true.
 	EventResumeUnsupportedMode = "outbox.resume_unsupported_mode"
+	// EventWorkerRunFailed (FIX-FINAL receipt-replay-per-run) fires when a
+	// redispatch could not count its worker run (tasks.worker_run): no
+	// worker is spawned, and the row is acked for the counted resume scan.
+	EventWorkerRunFailed = "outbox.worker_run_failed"
 	// EventRedispatchCrashed (G10-E1) fires when a redispatched worker ended
 	// without a terminal line and nothing moved its task meanwhile (a crash,
 	// a kill, kahyad failing to run it): the row is acked and the task stays
@@ -152,6 +156,9 @@ type Store interface {
 	// ClearTaskWorkerPGID NULLs that column once spawn.Run returned
 	// (FIX-I-13; compare-and-set on the recorded pgid).
 	ClearTaskWorkerPGID(ctx context.Context, arg sqlcgen.ClearTaskWorkerPGIDParams) (int64, error)
+	// IncrementTaskWorkerRun counts a redispatched worker spawn as the task's
+	// next worker run (FIX-FINAL receipt-replay-per-run) - see processResume.
+	IncrementTaskWorkerRun(ctx context.Context, arg sqlcgen.IncrementTaskWorkerRunParams) (int64, error)
 }
 
 var _ Store = (*sqlcgen.Queries)(nil)
@@ -585,6 +592,24 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 		}
 	}
 
+	// FIX-FINAL receipt-replay-per-run: every redispatch - a crash resume, a
+	// cloud-retry redispatch, a `kahya task resolve --retry` - is the task's
+	// NEXT worker run, counted BEFORE the worker exists. The resumed
+	// session's tool calls are recorded under it, so a call an earlier run
+	// completed is answered from that run's receipt (once per receipt per
+	// run), while a call this run repeats executes normally. No run, no
+	// worker: the task is 'executing' and nothing ran, so the row is acked
+	// and the counted resume scan owns the retry (G10-E1, ackUnspawned).
+	workerRun, err := d.store.IncrementTaskWorkerRun(ctx, sqlcgen.IncrementTaskWorkerRunParams{UpdatedAt: d.nowRFC3339(), ID: t.ID})
+	if err != nil {
+		recordCtx := context.WithoutCancel(ctx)
+		d.ledgerRaw(recordCtx, t.TraceID, EventWorkerRunFailed, map[string]any{
+			"event": EventWorkerRunFailed, "task_id": t.ID, "outbox_id": row.ID, "err": err.Error(),
+		})
+		d.ackUnspawned(recordCtx, t, row, "worker_run", err)
+		return
+	}
+
 	// BLOCKER 2(b) fix: renew this row's lease every leaseDuration/3 for as
 	// long as spawn.Run (below) blocks, so a worker that runs longer than
 	// one lease period is never re-claimed purely because the lease
@@ -667,6 +692,7 @@ func (d *Dispatcher) processResume(ctx context.Context, row sqlcgen.Outbox) {
 	}
 	d.ledgerRaw(recordCtx, t.TraceID, EventResumeDispatched, map[string]any{
 		"event": EventResumeDispatched, "task_id": t.ID, "session_id": env.SessionID, "resume": env.Resume,
+		"worker_run": workerRun,
 	})
 
 	if runErr == nil && outcome.Status == spawn.StatusOK {

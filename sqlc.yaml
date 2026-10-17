@@ -99,6 +99,11 @@ sql:
       # facts.subject_link_cloud/object_link_cloud) plus a plain CREATE
       # INDEX - columns the Fact and EntityAlias models carry.
       - "kahyad/migrations/0025_memory_link_lanes.sql"
+      # 0026 (FIX-FINAL receipt-replay-per-run) is plain ALTER TABLE ADD
+      # COLUMN (tasks.worker_run, tool_calls.run/replayed_run) plus a plain
+      # DROP/CREATE of the partial unique index - columns the Task and
+      # ToolCall models carry, so it MUST be here.
+      - "kahyad/migrations/0026_tool_calls_worker_run.sql"
     queries: "kahyad/internal/store/queries"
     gen:
       go:

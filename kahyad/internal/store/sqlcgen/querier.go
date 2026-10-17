@@ -98,9 +98,14 @@ type Querier interface {
 	CountSensitiveReads(ctx context.Context) (int64, error)
 	// The per-(task_id, tool_name, args_hash) attempt count the resume scan
 	// compares against task.retry.w1_max_auto (task spec step 6: "at most
-	// w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
-	// every row ever inserted for this exact triple (every seq), regardless
-	// of its current status.
+	// w1_max_auto auto-retries per (task_id, tool_name, args_hash)"). Since
+	// FIX-FINAL receipt-replay-per-run one key may legitimately hold many
+	// receipts (an identical call repeated inside a live run executes each
+	// time), so this counts only the attempts that did NOT complete (intent,
+	// executing, failed) AFTER the key's latest receipt: completed live repeats
+	// never count against the cap, and every interrupted resume still adds one
+	// (the cap still ends a crash loop). The count includes the receipt-less
+	// row being decided, like before.
 	CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error)
 	CountUnansweredEvalLabelsByTrace(ctx context.Context, traceID string) (int64, error)
 	DeleteChunksByEpisode(ctx context.Context, episodeID int64) error
@@ -192,12 +197,6 @@ type Querier interface {
 	GetLedgerDigestState(ctx context.Context) (LedgerDigestState, error)
 	GetMergeLedger(ctx context.Context, id int64) (MergeLedger, error)
 	GetPendingApproval(ctx context.Context, id string) (PendingApproval, error)
-	// The idempotent-replay lookup (task spec step 4): the most recent
-	// status='receipt' row for this exact (task_id, tool_name, args_hash)
-	// triple, if any. A hit means "do not re-execute - return this stored
-	// receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
-	// the mechanism that makes resume double-execution-safe.
-	GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCallParams) (ToolCall, error)
 	// B-1: the most recent human-approval grant (grant_kind='approval') for
 	// this EXACT (task_id, tool, scope, approved_bytes_hash) that nothing has
 	// consumed or halt-revoked yet. Expiry is checked in Go (RFC3339Nano
@@ -206,6 +205,17 @@ type Querier interface {
 	// ConsumeApprovalToken (WHERE consumed_at IS NULL), so a concurrent
 	// redeemer that read the same row loses that UPDATE and redeems nothing.
 	GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeemableApprovalGrantParams) (ApprovalToken, error)
+	// The idempotent-replay lookup (task spec step 4, narrowed by FIX-FINAL
+	// receipt-replay-per-run, owner decision 2026-10-16): the OLDEST
+	// status='receipt' row for this exact (task_id, tool_name, args_hash)
+	// triple that an EARLIER worker run wrote (run < current_run) and the
+	// current run has not consumed yet (replayed_run < current_run). A hit
+	// means a resumed session is re-issuing a call an earlier run completed -
+	// return the stored receipt_json instead of executing again
+	// (kahyad/internal/task.Receipts), and consume the row with
+	// MarkToolCallReplayed. A receipt the CURRENT run wrote is never a hit: an
+	// identical call inside one live run executes normally.
+	GetReplayableReceiptToolCall(ctx context.Context, arg GetReplayableReceiptToolCallParams) (ToolCall, error)
 	GetSensitiveRead(ctx context.Context, sessionKey string) (SensitiveRead, error)
 	// W4-03 (taint tiers + Reader/Actor split) queries below. See
 	// migrations/0009_session_taint.sql for the schema and
@@ -245,6 +255,9 @@ type Querier interface {
 	// task) comes back as a NULL/invalid value, not an error - the resolver
 	// itself treats that as "unresolved" (fail-closed), not a query failure.
 	GetTaskSessionByTrace(ctx context.Context, traceID string) (sql.NullString, error)
+	// The task's current worker run (kahyad/internal/task.Receipts resolves it
+	// once per tool call; it is never taken from the worker).
+	GetTaskWorkerRun(ctx context.Context, id string) (int64, error)
 	// Update-half of an application-level upsert (the same "upsert (update
 	// half) then fall back to Insert on 0 rows" pattern UpdateAutonomyState/
 	// UpdateEpisodeContent above already use in this file) - the common case
@@ -259,6 +272,12 @@ type Querier interface {
 	// this task (kahyad/internal/task.Resume.enqueueResume) - never a cloud-park
 	// redispatch. Returns the new count.
 	IncrementTaskCrashResumes(ctx context.Context, arg IncrementTaskCrashResumesParams) (int64, error)
+	// FIX-FINAL receipt-replay-per-run (0026_tool_calls_worker_run): one more
+	// worker spawn (run) of this task, written BEFORE the worker starts - the
+	// first spawn (kahyad/internal/server handleTask) is run 1, every outbox
+	// redispatch (kahyad/internal/outbox processResume: crash resume, cloud-
+	// retry redispatch, resolve --retry) the next one. Returns the new run.
+	IncrementTaskWorkerRun(ctx context.Context, arg IncrementTaskWorkerRunParams) (int64, error)
 	// anchor_log queries: kahyad/internal/anchor/push.go is the only writer
 	// (InsertAnchorLog/MarkAnchorPushed/MarkAnchorLocalFallback); push.go and
 	// verify.go both read.
@@ -411,8 +430,9 @@ type Querier interface {
 	// (W1/W2/W3) tool-call ATTEMPT - seq lets the SAME (task_id, tool_name,
 	// args_hash) triple be re-attempted (a fresh row at a higher seq) after an
 	// earlier attempt at that exact triple was marked 'failed' by the resume
-	// scan, while the idempotent-replay lookup (GetReceiptToolCall below)
-	// only ever matches an attempt that reached 'receipt'.
+	// scan, while the idempotent-replay lookup (GetReplayableReceiptToolCall
+	// below) only ever matches an attempt that reached 'receipt'. run is the
+	// worker run that made the attempt (FIX-FINAL receipt-replay-per-run).
 	InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error)
 	// B-8 (0022_undo_windows_per_op.sql): one row per EXECUTED W1 operation,
 	// inserted by kahyad/internal/policy.Engine.ConsumeTokenOp only. op_id =
@@ -704,6 +724,10 @@ type Querier interface {
 	// same *sql.Tx as the caller-supplied effect function whenever that
 	// effect writes to brain.db itself.
 	MarkToolCallReceipt(ctx context.Context, arg MarkToolCallReceiptParams) error
+	// Consumes an earlier run's receipt for the current run (compare-and-set:
+	// 0 rows means another replay of this run consumed it first). Each earlier
+	// receipt is replayed at most once per run.
+	MarkToolCallReplayed(ctx context.Context, arg MarkToolCallReplayedParams) (int64, error)
 	// The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
 	// never-attempted triple).
 	NextToolCallSeq(ctx context.Context, arg NextToolCallSeqParams) (int64, error)

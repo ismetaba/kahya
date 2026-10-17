@@ -12,12 +12,16 @@ import (
 )
 
 // fakeReceipts mimics kahyad's task.Receipts closely enough for this
-// package (FIX-I-4): a receipt is stored per (task, tool, args hash) once an
-// effect succeeds; Replay answers it; Execute replays it too. persistErr
-// simulates "the effect ran, the receipt could not be written".
+// package (FIX-I-4, per worker run since FIX-FINAL receipt-replay-per-run):
+// a receipt is stored per (task, tool, args hash) under the current worker
+// run once an effect succeeds; Replay - and Execute - answer only a receipt
+// of an EARLIER run that the current run has not consumed yet (each at most
+// once per run); resume() starts the next run. persistErr simulates "the
+// effect ran, the receipt could not be written".
 type fakeReceipts struct {
 	mu           sync.Mutex
-	stored       map[string]json.RawMessage
+	run          int // current worker run; 0 means run 1
+	stored       map[string][]*fakeReceipt
 	replayCalls  int
 	executeCalls int
 	effectRuns   int
@@ -29,7 +33,41 @@ type fakeReceipts struct {
 	effectCtxCancelable bool
 }
 
+// fakeReceipt is one stored receipt and the runs that wrote/consumed it.
+type fakeReceipt struct {
+	raw              json.RawMessage
+	run, replayedRun int
+}
+
 func receiptKey(in ReceiptInput) string { return in.TaskID + "|" + in.Tool + "|" + in.ArgsHash }
+
+// resume starts the task's next worker run (the stand-in for kahyad's
+// tasks.worker_run bump at a redispatch).
+func (f *fakeReceipts) resume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.run = f.currentRunLocked() + 1
+}
+
+func (f *fakeReceipts) currentRunLocked() int {
+	if f.run == 0 {
+		return 1
+	}
+	return f.run
+}
+
+// replayableLocked consumes the oldest earlier-run receipt of in's key the
+// current run has not replayed yet.
+func (f *fakeReceipts) replayableLocked(in ReceiptInput) (json.RawMessage, bool) {
+	run := f.currentRunLocked()
+	for _, r := range f.stored[receiptKey(in)] {
+		if r.run < run && r.replayedRun < run {
+			r.replayedRun = run
+			return r.raw, true
+		}
+	}
+	return nil, false
+}
 
 func (f *fakeReceipts) Replay(_ context.Context, in ReceiptInput) (json.RawMessage, bool, error) {
 	f.mu.Lock()
@@ -38,7 +76,7 @@ func (f *fakeReceipts) Replay(_ context.Context, in ReceiptInput) (json.RawMessa
 	if f.replayErr != nil {
 		return nil, false, f.replayErr
 	}
-	raw, ok := f.stored[receiptKey(in)]
+	raw, ok := f.replayableLocked(in)
 	return raw, ok, nil
 }
 
@@ -46,7 +84,7 @@ func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func
 	f.mu.Lock()
 	f.executeCalls++
 	f.executed = append(f.executed, in)
-	if raw, ok := f.stored[receiptKey(in)]; ok {
+	if raw, ok := f.replayableLocked(in); ok {
 		f.mu.Unlock()
 		return raw, true, nil
 	}
@@ -65,9 +103,9 @@ func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func
 		return raw, false, f.persistErr
 	}
 	if f.stored == nil {
-		f.stored = make(map[string]json.RawMessage)
+		f.stored = make(map[string][]*fakeReceipt)
 	}
-	f.stored[receiptKey(in)] = raw
+	f.stored[receiptKey(in)] = append(f.stored[receiptKey(in)], &fakeReceipt{raw: raw, run: f.currentRunLocked()})
 	return raw, false, nil
 }
 
@@ -94,9 +132,13 @@ func newReceiptServer(t *testing.T) (*Server, string, *fakePolicyClient, *fakeLe
 }
 
 // TestHandleWriteReplaysReceiptWithoutSecondWrite is FIX-I-4's core fs test:
-// a resumed session re-issuing the SAME fs_write of the SAME task gets the
-// stored result - no second write, no second pre-image checkpoint, no second
-// policy decision (so no second approval and no token burnt).
+// a resumed session (the task's next worker run) re-issuing the SAME
+// fs_write of the SAME task gets the stored result - no second write, no
+// second pre-image checkpoint, no second policy decision (so no second
+// approval and no token burnt) - marked replayed:true with the model-facing
+// MsgReplayedFromEarlierRun. A further identical write of the resumed run
+// executes (FIX-FINAL receipt-replay-per-run: each earlier receipt is
+// replayed at most once per run).
 func TestHandleWriteReplaysReceiptWithoutSecondWrite(t *testing.T) {
 	s, home, pc, led, rex := newReceiptServer(t)
 	target := filepath.Join(home, "notlar.md")
@@ -114,6 +156,7 @@ func TestHandleWriteReplaysReceiptWithoutSecondWrite(t *testing.T) {
 	// rewrite it.
 	mustWriteFile(t, target, "kullanici duzenledi\n")
 
+	rex.resume()
 	out2, err := s.HandleWrite(context.Background(), "trace-1", "task-1", args)
 	if err != nil {
 		t.Fatalf("second (resumed) HandleWrite: %v", err)
@@ -121,7 +164,10 @@ func TestHandleWriteReplaysReceiptWithoutSecondWrite(t *testing.T) {
 	if !out2.Replayed {
 		t.Fatal("second identical write was not answered from its receipt")
 	}
-	out2.Replayed = false
+	if out2.ReplayNote != MsgReplayedFromEarlierRun {
+		t.Fatalf("replay note = %q, want %q", out2.ReplayNote, MsgReplayedFromEarlierRun)
+	}
+	out2.Replayed, out2.ReplayNote = false, ""
 	if out2 != out1 {
 		t.Fatalf("replayed result = %+v, want the stored %+v", out2, out1)
 	}
@@ -152,6 +198,37 @@ func TestHandleWriteReplaysReceiptWithoutSecondWrite(t *testing.T) {
 	}
 	if rex.effectCtxCancelable {
 		t.Fatal("the effect ran on a cancelable context: a dying worker/bridge would abandon a half-done write")
+	}
+
+	// The resumed run's NEXT identical write is a live repeat: it executes.
+	out3, err := s.HandleWrite(context.Background(), "trace-1", "task-1", args)
+	if err != nil || out3.Replayed || out3.ReplayNote != "" {
+		t.Fatalf("third identical write = (%+v, %v), want a fresh execution", out3, err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "eski\nmerhaba\n" {
+		t.Fatalf("file after the live repeat = %q, want the written content", b)
+	}
+	if pc.checkCalls != 2 || len(led.find("fs_write")) != 2 {
+		t.Fatalf("checks/executions after the live repeat = %d/%d, want 2/2", pc.checkCalls, len(led.find("fs_write")))
+	}
+}
+
+// TestHandleWriteLiveRepeatExecutesWithoutResume: inside one worker run an
+// identical fs_write is a legitimate repeat (FIX-FINAL
+// receipt-replay-per-run) - X, Y, X leaves X on disk.
+func TestHandleWriteLiveRepeatExecutesWithoutResume(t *testing.T) {
+	s, home, pc, led, _ := newReceiptServer(t)
+	for _, content := range []string{"X", "Y", "X"} {
+		out, err := s.HandleWrite(context.Background(), "trace-1", "task-1", FsWriteArgs{Path: "~/xyx.txt", ContentBase64: b64(content)})
+		if err != nil || out.Replayed {
+			t.Fatalf("HandleWrite(%s) = (%+v, %v), want an execution", content, out, err)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(home, "xyx.txt")); string(b) != "X" {
+		t.Fatalf("content = %q, want X", b)
+	}
+	if got := len(led.find("fs_write")); got != 3 || pc.checkCalls != 3 {
+		t.Fatalf("executions/checks = %d/%d, want 3/3", got, pc.checkCalls)
 	}
 }
 
@@ -200,10 +277,11 @@ func TestHandleWriteWithoutReceiptsRunsDirectly(t *testing.T) {
 }
 
 // TestHandleDeleteReplaysReceiptWithoutSecondMove: the resumed session's
-// second fs_delete finds the file already gone - it is answered from the
-// receipt (same Trash path), not failed and not moved again.
+// (next worker run's) second fs_delete finds the file already gone - it is
+// answered from the receipt (same Trash path), not failed and not moved
+// again.
 func TestHandleDeleteReplaysReceiptWithoutSecondMove(t *testing.T) {
-	s, home, pc, led, _ := newReceiptServer(t)
+	s, home, pc, led, rex := newReceiptServer(t)
 	s.TrashDir = filepath.Join(home, ".Trash")
 	mustWriteFile(t, filepath.Join(home, "sil.txt"), "bye")
 	args := FsDeleteArgs{Path: "~/sil.txt"}
@@ -212,11 +290,12 @@ func TestHandleDeleteReplaysReceiptWithoutSecondMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first HandleDelete: %v", err)
 	}
+	rex.resume()
 	out2, err := s.HandleDelete(context.Background(), "trace-1", "task-1", args)
 	if err != nil {
 		t.Fatalf("second (resumed) HandleDelete: %v - a completed delete must replay, not fail", err)
 	}
-	if !out2.Replayed || out2.TrashPath != out1.TrashPath || out2.Path != out1.Path {
+	if !out2.Replayed || out2.ReplayNote != MsgReplayedFromEarlierRun || out2.TrashPath != out1.TrashPath || out2.Path != out1.Path {
 		t.Fatalf("replayed delete = %+v, want the stored %+v marked Replayed", out2, out1)
 	}
 	if got := len(led.find("fs_delete")); got != 1 {

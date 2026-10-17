@@ -78,6 +78,18 @@ Binding decisions (HANDOFF, quote verbatim):
 4. Idempotent replay: before executing, look up `(task_id, tool_name, args_hash)` with
    `status=receipt`; on hit, return the stored `receipt_json` WITHOUT re-executing and append
    ledger event `tool.replayed`. This is the mechanism that makes resume double-execution-safe.
+   *Owner decision 2026-10-16 (FIX-FINAL receipt-replay-per-run, docs/ipc.md):* receipts
+   replay only on resume. The lookup above matched any receipt for the task's whole life, so a
+   legitimate repeat inside ONE live worker run (fs_write X, Y, X; re-running the same test
+   script; a second `git status`) got the stale receipt back. Now every `tool_calls` row records
+   the worker run that made it (`tool_calls.run`, migration 0026): the task's first spawn is
+   run 1 and every later spawn (outbox redispatch: crash resume, cloud-retry redispatch,
+   `resolve --retry`) increments `tasks.worker_run` kahyad-side before the worker starts. A
+   replay answers only a receipt of an EARLIER run that the current run has not consumed yet
+   (`tool_calls.replayed_run`), oldest first, each at most once per run; inside the current run
+   an identical call executes normally (new row, normal policy check/approval).
+   `idx_tool_calls_live_unique` covers only `intent`/`executing`, and the step-6 W1 cap counts
+   only the key's non-completed attempts after its latest receipt.
 5. Session capture: worker emits `{"event":"session_started","session_id":...}` on stdout at
    SDK init (W12-09 harness); kahyad persists it to `tasks.session_id`.
 6. Resume: on kahyad startup and on a periodic scan (plain `time.Ticker`; switch to the W4-01

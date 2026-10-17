@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 )
 
 // stubTool is a minimal stand-in for a real kahyad-owned side-effectful
@@ -38,6 +39,21 @@ func (s *stubTool) failingEffect(errMsg string) EffectFunc {
 
 func newReceipts(st *store.Store) *Receipts {
 	return NewReceipts(st.DB(), st.Queries, st)
+}
+
+// beginWorkerRun counts one more worker spawn of taskID (tasks.worker_run)
+// exactly as kahyad's spawn sites do before a worker starts (FIX-FINAL
+// receipt-replay-per-run) - a test's stand-in for "the task was resumed in
+// a new worker run". Returns the new run.
+func beginWorkerRun(t *testing.T, st *store.Store, taskID string) int64 {
+	t.Helper()
+	run, err := st.Queries.IncrementTaskWorkerRun(context.Background(), sqlcgen.IncrementTaskWorkerRunParams{
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), ID: taskID,
+	})
+	if err != nil {
+		t.Fatalf("IncrementTaskWorkerRun(%s): %v", taskID, err)
+	}
+	return run
 }
 
 func countToolCalls(t *testing.T, st *store.Store, taskID, status string) int {
@@ -83,12 +99,14 @@ func TestExecuteWritesIntentExecutingReceipt(t *testing.T) {
 }
 
 // TestReplayReturnsStoredReceiptAndExecutesZeroTimes is the spec's core
-// idempotency test: a second Execute call for the SAME (task_id,
-// tool_name, args_hash) triple must return the ALREADY-stored result
-// WITHOUT running the effect again.
+// idempotency test: a resumed run's Execute call for the SAME (task_id,
+// tool_name, args_hash) triple an earlier run completed must return the
+// ALREADY-stored result WITHOUT running the effect again (FIX-FINAL
+// receipt-replay-per-run: only a LATER run replays).
 func TestReplayReturnsStoredReceiptAndExecutesZeroTimes(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
 	r := newReceipts(st)
 	tool := &stubTool{}
 	in := ExecuteInput{
@@ -104,12 +122,20 @@ func TestReplayReturnsStoredReceiptAndExecutesZeroTimes(t *testing.T) {
 		t.Fatalf("Invocations after first call = %d, want 1", tool.Invocations)
 	}
 
+	beginWorkerRun(t, st, "t1") // the task is resumed: run 2
 	second, replayed, err := r.Execute(context.Background(), in, tool.effect("SHOULD-NEVER-RUN"))
 	if err != nil {
 		t.Fatalf("Execute() replay call error = %v", err)
 	}
 	if !replayed {
-		t.Fatal("Execute() replayed = false, want true on the second identical call")
+		t.Fatal("Execute() replayed = false, want true for the resumed run's identical call")
+	}
+	var receiptRun, replayedRun int64
+	if err := st.DB().QueryRow(`SELECT run, replayed_run FROM tool_calls WHERE task_id = 't1'`).Scan(&receiptRun, &replayedRun); err != nil {
+		t.Fatal(err)
+	}
+	if receiptRun != 1 || replayedRun != 2 {
+		t.Fatalf("receipt (run, replayed_run) = (%d, %d), want (1, 2): written by run 1, consumed by run 2", receiptRun, replayedRun)
 	}
 	// The stub effect passed to the SECOND call must never have run.
 	if tool.Invocations != 1 {
@@ -263,35 +289,44 @@ func TestExecuteInTxEffectDBWriteCommitsAtomicallyWithReceipt(t *testing.T) {
 	}
 }
 
-// TestConcurrentExecuteSameKeyRunsEffectExactlyOnce is the BLOCKER 1
-// regression test (task durability core hardening): 8 goroutines call
-// Execute() concurrently for the IDENTICAL (task_id, tool_name,
-// args_hash) triple. Before the fix, the replay check + seq allocation +
-// intent insert were three separate un-transacted statements, so more
-// than one goroutine could pass the replay guard and land at a distinct
-// seq, running the real effect more than once. The real effect must now
-// run EXACTLY ONCE - exactly one status=receipt tool_calls row - and
-// every other call must observe replayed=true against that SAME stored
-// result, never invoking the effect itself. Run under -race.
-func TestConcurrentExecuteSameKeyRunsEffectExactlyOnce(t *testing.T) {
+// TestConcurrentExecuteSameKeyNeverOverlapsWithinOneRun is the BLOCKER 1
+// regression test (task durability core hardening), re-scoped by FIX-FINAL
+// receipt-replay-per-run: 8 goroutines call Execute() concurrently for the
+// IDENTICAL (task_id, tool_name, args_hash) triple inside ONE worker run.
+// Before BLOCKER 1 the replay check + seq allocation + intent insert were
+// three separate un-transacted statements, so two goroutines' effects could
+// run at the SAME time. Inside one live run an identical call is a
+// legitimate repeat and executes - so all 8 run - but strictly one after
+// the other (the keyed mutex in-process, idx_tool_calls_live_unique's
+// one-in-flight-row rule in the DB): never two at once, one receipt row
+// each, no replay, no row left mid-flight. Run under -race.
+func TestConcurrentExecuteSameKeyNeverOverlapsWithinOneRun(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
 	r := newReceipts(st)
 	argsHash := HashArgs([]byte("concurrent-args"))
 
-	var invocations int64
+	var invocations, inFlight, maxInFlight int64
 	effect := func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
-		atomic.AddInt64(&invocations, 1)
+		n := atomic.AddInt64(&invocations, 1)
+		cur := atomic.AddInt64(&inFlight, 1)
+		for {
+			m := atomic.LoadInt64(&maxInFlight)
+			if cur <= m || atomic.CompareAndSwapInt64(&maxInFlight, m, cur) {
+				break
+			}
+		}
 		// Hold the "critical section" open briefly so a broken guard has
 		// every opportunity to let a second goroutine's effect run
 		// concurrently with this one.
 		time.Sleep(10 * time.Millisecond)
-		return json.Marshal(map[string]string{"result": "ran-once"})
+		atomic.AddInt64(&inFlight, -1)
+		return json.Marshal(map[string]int64{"result": n})
 	}
 
 	const n = 8
 	var wg sync.WaitGroup
-	results := make([]json.RawMessage, n)
 	replayedFlags := make([]bool, n)
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
@@ -299,10 +334,10 @@ func TestConcurrentExecuteSameKeyRunsEffectExactlyOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, replayed, err := r.Execute(context.Background(), ExecuteInput{
+			_, replayed, err := r.Execute(context.Background(), ExecuteInput{
 				TaskID: "t1", TraceID: "trace-1", ToolName: "concurrent_tool", Class: ClassW1, ArgsHash: argsHash,
 			}, effect)
-			results[i], replayedFlags[i], errs[i] = res, replayed, err
+			replayedFlags[i], errs[i] = replayed, err
 		}()
 	}
 	wg.Wait()
@@ -311,32 +346,81 @@ func TestConcurrentExecuteSameKeyRunsEffectExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Execute()[%d] error = %v", i, err)
 		}
-	}
-	if got := atomic.LoadInt64(&invocations); got != 1 {
-		t.Fatalf("effect invocations = %d, want exactly 1 (double-execution guard failed)", got)
-	}
-	replayedCount := 0
-	for _, rf := range replayedFlags {
-		if rf {
-			replayedCount++
+		if replayedFlags[i] {
+			t.Fatalf("Execute()[%d] replayed inside the run that wrote the receipt", i)
 		}
 	}
-	if replayedCount != n-1 {
-		t.Fatalf("replayed count = %d, want %d (n-1: every call but the real one)", replayedCount, n-1)
+	if got := atomic.LoadInt64(&invocations); got != n {
+		t.Fatalf("effect invocations = %d, want %d (each live repeat executes)", got, n)
 	}
-	for i := 1; i < n; i++ {
-		if string(results[i]) != string(results[0]) {
-			t.Errorf("results[%d] = %s, want identical to results[0] = %s", i, results[i], results[0])
+	if got := atomic.LoadInt64(&maxInFlight); got != 1 {
+		t.Fatalf("max concurrent effects = %d, want 1 (two executions of the identical call overlapped)", got)
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusReceipt); got != n {
+		t.Errorf("receipt-status tool_calls = %d, want %d (one row per executed call)", got, n)
+	}
+	if got := countToolCalls(t, st, "t1", CallStatusIntent) + countToolCalls(t, st, "t1", CallStatusExecuting); got != 0 {
+		t.Errorf("in-flight tool_calls = %d, want 0 (no row left mid-flight)", got)
+	}
+}
+
+// TestConcurrentExecuteAfterResumeConsumesEarlierReceiptOnce: run 1
+// completed the call once; in run 2, 8 concurrent identical calls get that
+// one receipt replayed exactly ONCE (each earlier receipt is consumed at most
+// once per run) and the other 7 execute - one at a time.
+func TestConcurrentExecuteAfterResumeConsumesEarlierReceiptOnce(t *testing.T) {
+	st := testStore(t)
+	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
+	r := newReceipts(st)
+	in := ExecuteInput{TaskID: "t1", TraceID: "trace-1", ToolName: "concurrent_tool", Class: ClassW1, ArgsHash: HashArgs([]byte("resume-concurrent"))}
+	tool := &stubTool{}
+	first, _, err := r.Execute(context.Background(), in, tool.effect("run-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginWorkerRun(t, st, "t1")
+
+	var invocations, inFlight, maxInFlight int64
+	effect := func(ctx context.Context, tx *sql.Tx) (json.RawMessage, error) {
+		atomic.AddInt64(&invocations, 1)
+		if cur := atomic.AddInt64(&inFlight, 1); cur > atomic.LoadInt64(&maxInFlight) {
+			atomic.StoreInt64(&maxInFlight, cur)
+		}
+		time.Sleep(5 * time.Millisecond)
+		atomic.AddInt64(&inFlight, -1)
+		return json.Marshal(map[string]string{"result": "run-2"})
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	var replays int64
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, replayed, err := r.Execute(context.Background(), in, effect)
+			errs[i] = err
+			if replayed {
+				atomic.AddInt64(&replays, 1)
+				if string(res) != string(first) {
+					errs[i] = errors.New("replayed result " + string(res) + " is not run 1's " + string(first))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Execute()[%d]: %v", i, err)
 		}
 	}
-	if got := countToolCalls(t, st, "t1", CallStatusReceipt); got != 1 {
-		t.Errorf("receipt-status tool_calls = %d, want exactly 1", got)
+	if replays != 1 || invocations != n-1 {
+		t.Fatalf("replays/executions = %d/%d, want 1/%d (run 1's one receipt answers one call of run 2)", replays, invocations, n-1)
 	}
-	if got := countToolCalls(t, st, "t1", CallStatusIntent); got != 0 {
-		t.Errorf("intent-status tool_calls = %d, want 0 (no row left mid-flight)", got)
-	}
-	if got := countToolCalls(t, st, "t1", CallStatusExecuting); got != 0 {
-		t.Errorf("executing-status tool_calls = %d, want 0 (no row left mid-flight)", got)
+	if maxInFlight != 1 {
+		t.Fatalf("max concurrent effects = %d, want 1", maxInFlight)
 	}
 }
 
@@ -474,12 +558,13 @@ func TestExecutePostEffectMarshalFailureLeavesRowFailedNotStranded(t *testing.T)
 }
 
 // TestExecuteInTxReplayAndClassRMatchExecute: the in-transaction entry
-// point shares prepare with Execute - a second call for the same key
-// replays the stored receipt without running the effect, and class R is
-// refused.
+// point shares prepare with Execute - a resumed run's call for the same key
+// replays the earlier run's stored receipt without running the effect (a
+// repeat in the same run executes), and class R is refused.
 func TestExecuteInTxReplayAndClassRMatchExecute(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
 	r := newReceipts(st)
 	tool := &stubTool{}
 	in := ExecuteInput{TaskID: "t1", TraceID: "trace-1", ToolName: "stub_write", Class: ClassW1, ArgsHash: HashArgs([]byte("intx-replay"))}
@@ -488,6 +573,7 @@ func TestExecuteInTxReplayAndClassRMatchExecute(t *testing.T) {
 	if err != nil || replayed {
 		t.Fatalf("first ExecuteInTx = (%s, %v, %v), want a fresh run", first, replayed, err)
 	}
+	beginWorkerRun(t, st, "t1")
 	second, replayed, err := r.ExecuteInTx(context.Background(), in, tool.effect("second"))
 	if err != nil {
 		t.Fatalf("second ExecuteInTx: %v", err)
@@ -498,9 +584,18 @@ func TestExecuteInTxReplayAndClassRMatchExecute(t *testing.T) {
 	if tool.Invocations != 1 {
 		t.Fatalf("Invocations = %d, want 1", tool.Invocations)
 	}
-	// Execute sees the same receipt (one lifecycle, two entry points).
-	if _, replayed, err := r.Execute(context.Background(), in, tool.effect("third")); err != nil || !replayed {
-		t.Fatalf("Execute after ExecuteInTx = (replayed=%v, %v), want a replay", replayed, err)
+	// Execute shares the lifecycle: run 1's one receipt is consumed for this
+	// run, so the next identical call of run 2 executes.
+	if _, replayed, err := r.Execute(context.Background(), in, tool.effect("third")); err != nil || replayed {
+		t.Fatalf("Execute after the consumed replay = (replayed=%v, %v), want a fresh execution", replayed, err)
+	}
+	// A third run replays BOTH earlier receipts once each, oldest first.
+	beginWorkerRun(t, st, "t1")
+	for i, want := range []string{string(first), `{"result":"third"}`} {
+		got, replayed, err := r.Execute(context.Background(), in, tool.effect("SHOULD-NOT-RUN"))
+		if err != nil || !replayed || string(got) != want {
+			t.Fatalf("run 3 call #%d = (%s, replayed=%v, %v), want %s replayed", i+1, got, replayed, err, want)
+		}
 	}
 	if _, _, err := r.ExecuteInTx(context.Background(), ExecuteInput{TaskID: "t1", ToolName: "r_tool", Class: ClassR, ArgsHash: "x"}, tool.effect("r")); !errors.Is(err, ErrReadOnlyClass) {
 		t.Fatalf("ExecuteInTx(class R) error = %v, want ErrReadOnlyClass", err)

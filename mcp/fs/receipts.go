@@ -6,10 +6,15 @@
 // scan, argv validator, ...):
 //
 //  1. ReplayReceipt BEFORE Policy.Check: a durable receipt for this exact
-//     (task, tool, canonical args hash) means a resumed session is
-//     re-issuing a call that already completed - the stored result is
-//     returned, no policy decision is taken, no approval is asked for again,
-//     no token is minted or consumed, and nothing executes.
+//     (task, tool, canonical args hash) that an EARLIER worker run of the
+//     task wrote (and the current run has not replayed yet) means a resumed
+//     session is re-issuing a call that already completed - the stored
+//     result is returned with replayed:true and MsgReplayedFromEarlierRun,
+//     no policy decision is taken, no approval is asked for again, no token
+//     is minted or consumed, and nothing executes. Which receipts count is
+//     kahyad's decision (task.Receipts, FIX-FINAL receipt-replay-per-run):
+//     an identical call inside the live run that wrote the receipt is a miss
+//     and executes normally.
 //  2. Policy.Check, Policy.ConsumeToken (unchanged).
 //  3. ExecuteWithReceipt runs the effect closure inside kahyad's
 //     tool_calls lifecycle: intent -> executing (the pre-op journal) ->
@@ -57,6 +62,14 @@ type ReceiptExecutor interface {
 	// instead (effect not run).
 	Execute(ctx context.Context, in ReceiptInput, effect func(ctx context.Context) (json.RawMessage, error)) (result json.RawMessage, replayed bool, err error)
 }
+
+// MsgReplayedFromEarlierRun is the model-facing note (Turkish, like the tool
+// descriptions) every replayed real-tool result carries next to
+// replayed:true (FIX-FINAL receipt-replay-per-run): kahyad replays a receipt
+// only for a call that an EARLIER, interrupted worker run of the task
+// completed, so the resumed model learns the call did not run again. Inside
+// one live run an identical call always executes and never carries it.
+const MsgReplayedFromEarlierRun = "Bu sonuç bu çağrıda yürütülmedi: görevin kesintiye uğrayan önceki bir çalışmasında tamamlanmış aynı çağrının makbuzundan döndü."
 
 // ReceiptArgsHash is the receipt key's args hash: sha256(hex) of the
 // canonical tool-input bytes.

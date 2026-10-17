@@ -40,8 +40,9 @@
 //  6. the ledger event (osascript_exec / osascript_timeout /
 //     osascript_automation_denied / osascript_scan_rejected).
 //
-// FIX-I-4: between steps 1 and 2 a completed identical run of the same task
-// is answered from its durable receipt (no policy decision, osascript does
+// FIX-I-4: between steps 1 and 2 an identical run an EARLIER worker run of
+// the same task completed (a resume; FIX-FINAL receipt-replay-per-run) is
+// answered from its durable receipt (no policy decision, osascript does
 // not run), and steps 4-6 run as one effect inside kahyad's tool_calls
 // receipt lifecycle (mcp/fs/receipts.go; Runner.Receipts).
 //
@@ -165,10 +166,13 @@ type ScriptOutput struct {
 	Reason   string             `json:"reason,omitempty"`
 	Reroute  *RerouteSuggestion `json:"reroute,omitempty"`
 	TimedOut bool               `json:"timed_out"`
-	// Replayed is true when this is the stored result of an EARLIER,
-	// identical, completed run of the same task (FIX-I-4 receipt replay):
-	// osascript did not run this call.
+	// Replayed is true when this is the stored result of an identical call
+	// that an EARLIER worker run of the same task completed (FIX-I-4
+	// receipt replay, per run since FIX-FINAL receipt-replay-per-run):
+	// osascript did not run this call. A repeat inside one live run runs.
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote is mcpfs.MsgReplayedFromEarlierRun on a replayed result.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // noopLogger is the default Logger when NewRunner is given none (mirrors
@@ -200,8 +204,9 @@ type Runner struct {
 	Exec   Executor
 
 	// Receipts is the FIX-I-4 receipt seam (mcp/fs/receipts.go) shared by
-	// applescript_run/jxa_run/shortcuts_run: a completed identical call of
-	// the same task is replayed before the policy decision, and the run
+	// applescript_run/jxa_run/shortcuts_run: an identical call an earlier
+	// worker run of the task completed is replayed before the policy
+	// decision, and the run
 	// itself executes inside kahyad's tool_calls lifecycle. nil = direct
 	// path (tests); kahyad always wires it.
 	Receipts ReceiptExecutor
@@ -372,6 +377,7 @@ func replayedScript(ctx context.Context, r *Runner, traceID, taskID, tool string
 		"event": "osascript_replayed", "tool": tool, "task_id": taskID, "trace_id": traceID,
 	})
 	out.Replayed = true
+	out.ReplayNote = mcpfs.MsgReplayedFromEarlierRun
 	return out
 }
 

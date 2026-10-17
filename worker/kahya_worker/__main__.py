@@ -650,9 +650,12 @@ def main(argv: list[str] | None = None) -> int:
 # always writes a new user message), so a resumed session is continued with
 # this fixed instruction instead. Model-facing (Turkish, like the system
 # prompt). Kahyad's receipt replay (kahyad/internal/task.Receipts: every
-# side-effectful kahyad-owned tool answers an already-completed identical call
-# from its durable receipt) is the BINDING double-execution guard; this text
-# is UX only (HANDOFF §5: security in the executor, never in the prompt).
+# side-effectful kahyad-owned tool answers an identical call that an EARLIER
+# worker run of the task completed from its durable receipt, once per receipt
+# per run - FIX-FINAL receipt-replay-per-run; a replayed result says so with
+# replayed:true and a replay note) is the BINDING double-execution guard;
+# this text is UX only (HANDOFF §5: security in the executor, never in the
+# prompt).
 RESUME_CONTINUATION_PROMPT = (
     "Bu oturum yarıda kesildi ve şimdi kaldığı yerden devam ettiriliyor. "
     "Önceki isteği baştan yapma; tamamlanmış araç çağrılarını tekrar yürütme. "

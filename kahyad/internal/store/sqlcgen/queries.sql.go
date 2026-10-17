@@ -295,7 +295,14 @@ func (q *Queries) CountSensitiveReads(ctx context.Context) (int64, error) {
 }
 
 const countToolCallAttempts = `-- name: CountToolCallAttempts :one
-SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?
+SELECT COUNT(*) FROM tool_calls AS c
+WHERE c.task_id = ?1 AND c.tool_name = ?2 AND c.args_hash = ?3
+  AND c.status <> 'receipt'
+  AND c.id > COALESCE((
+      SELECT MAX(r.id) FROM tool_calls AS r
+      WHERE r.task_id = ?1 AND r.tool_name = ?2 AND r.args_hash = ?3
+        AND r.status = 'receipt'
+  ), 0)
 `
 
 type CountToolCallAttemptsParams struct {
@@ -306,9 +313,14 @@ type CountToolCallAttemptsParams struct {
 
 // The per-(task_id, tool_name, args_hash) attempt count the resume scan
 // compares against task.retry.w1_max_auto (task spec step 6: "at most
-// w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
-// every row ever inserted for this exact triple (every seq), regardless
-// of its current status.
+// w1_max_auto auto-retries per (task_id, tool_name, args_hash)"). Since
+// FIX-FINAL receipt-replay-per-run one key may legitimately hold many
+// receipts (an identical call repeated inside a live run executes each
+// time), so this counts only the attempts that did NOT complete (intent,
+// executing, failed) AFTER the key's latest receipt: completed live repeats
+// never count against the cap, and every interrupted resume still adds one
+// (the cap still ends a crash loop). The count includes the receipt-less
+// row being decided, like before.
 func (q *Queries) CountToolCallAttempts(ctx context.Context, arg CountToolCallAttemptsParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countToolCallAttempts, arg.TaskID, arg.ToolName, arg.ArgsHash)
 	var count int64
@@ -922,45 +934,6 @@ func (q *Queries) GetPendingApproval(ctx context.Context, id string) (PendingApp
 	return i, err
 }
 
-const getReceiptToolCall = `-- name: GetReceiptToolCall :one
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
-FROM tool_calls
-WHERE task_id = ? AND tool_name = ? AND args_hash = ? AND status = 'receipt'
-ORDER BY seq DESC
-LIMIT 1
-`
-
-type GetReceiptToolCallParams struct {
-	TaskID   string `json:"task_id"`
-	ToolName string `json:"tool_name"`
-	ArgsHash string `json:"args_hash"`
-}
-
-// The idempotent-replay lookup (task spec step 4): the most recent
-// status='receipt' row for this exact (task_id, tool_name, args_hash)
-// triple, if any. A hit means "do not re-execute - return this stored
-// receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
-// the mechanism that makes resume double-execution-safe.
-func (q *Queries) GetReceiptToolCall(ctx context.Context, arg GetReceiptToolCallParams) (ToolCall, error) {
-	row := q.db.QueryRowContext(ctx, getReceiptToolCall, arg.TaskID, arg.ToolName, arg.ArgsHash)
-	var i ToolCall
-	err := row.Scan(
-		&i.ID,
-		&i.TaskID,
-		&i.Seq,
-		&i.ToolName,
-		&i.Class,
-		&i.ArgsHash,
-		&i.ApprovalTokenID,
-		&i.Status,
-		&i.ReceiptJson,
-		&i.StartedAt,
-		&i.FinishedAt,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
 const getRedeemableApprovalGrant = `-- name: GetRedeemableApprovalGrant :one
 SELECT token_hash, task_id, trace_id, tool, class, scope, approved_bytes_hash, minted_at, expires_at, consumed_at, revoked_at, grant_kind, pending_approval_id
 FROM approval_tokens
@@ -1010,6 +983,61 @@ func (q *Queries) GetRedeemableApprovalGrant(ctx context.Context, arg GetRedeema
 	return i, err
 }
 
+const getReplayableReceiptToolCall = `-- name: GetReplayableReceiptToolCall :one
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
+FROM tool_calls
+WHERE task_id = ?1 AND tool_name = ?2 AND args_hash = ?3
+  AND status = 'receipt'
+  AND run < ?4
+  AND replayed_run < ?4
+ORDER BY run ASC, seq ASC, id ASC
+LIMIT 1
+`
+
+type GetReplayableReceiptToolCallParams struct {
+	TaskID     string `json:"task_id"`
+	ToolName   string `json:"tool_name"`
+	ArgsHash   string `json:"args_hash"`
+	CurrentRun int64  `json:"current_run"`
+}
+
+// The idempotent-replay lookup (task spec step 4, narrowed by FIX-FINAL
+// receipt-replay-per-run, owner decision 2026-10-16): the OLDEST
+// status='receipt' row for this exact (task_id, tool_name, args_hash)
+// triple that an EARLIER worker run wrote (run < current_run) and the
+// current run has not consumed yet (replayed_run < current_run). A hit
+// means a resumed session is re-issuing a call an earlier run completed -
+// return the stored receipt_json instead of executing again
+// (kahyad/internal/task.Receipts), and consume the row with
+// MarkToolCallReplayed. A receipt the CURRENT run wrote is never a hit: an
+// identical call inside one live run executes normally.
+func (q *Queries) GetReplayableReceiptToolCall(ctx context.Context, arg GetReplayableReceiptToolCallParams) (ToolCall, error) {
+	row := q.db.QueryRowContext(ctx, getReplayableReceiptToolCall,
+		arg.TaskID,
+		arg.ToolName,
+		arg.ArgsHash,
+		arg.CurrentRun,
+	)
+	var i ToolCall
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.ToolName,
+		&i.Class,
+		&i.ArgsHash,
+		&i.ApprovalTokenID,
+		&i.Status,
+		&i.ReceiptJson,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.Run,
+		&i.ReplayedRun,
+	)
+	return i, err
+}
+
 const getSensitiveRead = `-- name: GetSensitiveRead :one
 SELECT session_key, trace_id, reason, marked_at FROM sensitive_reads WHERE session_key = ?
 `
@@ -1051,7 +1079,7 @@ func (q *Queries) GetSessionTaint(ctx context.Context, sessionID string) (Sessio
 
 const getTaskByID = `-- name: GetTaskByID :one
 
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE id = ?
 `
@@ -1084,6 +1112,7 @@ func (q *Queries) GetTaskByID(ctx context.Context, id string) (Task, error) {
 		&i.WorkerPgid,
 		&i.HaltedAt,
 		&i.CrashResumes,
+		&i.WorkerRun,
 	)
 	return i, err
 }
@@ -1185,6 +1214,19 @@ func (q *Queries) GetTaskSessionByTrace(ctx context.Context, traceID string) (sq
 	return session_id, err
 }
 
+const getTaskWorkerRun = `-- name: GetTaskWorkerRun :one
+SELECT worker_run FROM tasks WHERE id = ?
+`
+
+// The task's current worker run (kahyad/internal/task.Receipts resolves it
+// once per tool call; it is never taken from the worker).
+func (q *Queries) GetTaskWorkerRun(ctx context.Context, id string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getTaskWorkerRun, id)
+	var worker_run int64
+	err := row.Scan(&worker_run)
+	return worker_run, err
+}
+
 const incrementEgressBudget = `-- name: IncrementEgressBudget :execrows
 UPDATE egress_budget
 SET bytes = bytes + ?
@@ -1252,6 +1294,30 @@ func (q *Queries) IncrementTaskCrashResumes(ctx context.Context, arg IncrementTa
 	var crash_resumes int64
 	err := row.Scan(&crash_resumes)
 	return crash_resumes, err
+}
+
+const incrementTaskWorkerRun = `-- name: IncrementTaskWorkerRun :one
+UPDATE tasks
+SET worker_run = worker_run + 1, updated_at = ?
+WHERE id = ?
+RETURNING worker_run
+`
+
+type IncrementTaskWorkerRunParams struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+// FIX-FINAL receipt-replay-per-run (0026_tool_calls_worker_run): one more
+// worker spawn (run) of this task, written BEFORE the worker starts - the
+// first spawn (kahyad/internal/server handleTask) is run 1, every outbox
+// redispatch (kahyad/internal/outbox processResume: crash resume, cloud-
+// retry redispatch, resolve --retry) the next one. Returns the new run.
+func (q *Queries) IncrementTaskWorkerRun(ctx context.Context, arg IncrementTaskWorkerRunParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, incrementTaskWorkerRun, arg.UpdatedAt, arg.ID)
+	var worker_run int64
+	err := row.Scan(&worker_run)
+	return worker_run, err
 }
 
 const insertAnchorLog = `-- name: InsertAnchorLog :one
@@ -2020,7 +2086,7 @@ func (q *Queries) InsertSessionTaintTainted(ctx context.Context, arg InsertSessi
 const insertTask = `-- name: InsertTask :one
 INSERT INTO tasks (id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 `
 
 type InsertTaskParams struct {
@@ -2081,14 +2147,15 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (Task, e
 		&i.WorkerPgid,
 		&i.HaltedAt,
 		&i.CrashResumes,
+		&i.WorkerRun,
 	)
 	return i, err
 }
 
 const insertToolCallIntent = `-- name: InsertToolCallIntent :one
-INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?)
-RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run)
+VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?, ?)
+RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 `
 
 type InsertToolCallIntentParams struct {
@@ -2099,6 +2166,7 @@ type InsertToolCallIntentParams struct {
 	ArgsHash        string         `json:"args_hash"`
 	ApprovalTokenID sql.NullString `json:"approval_token_id"`
 	CreatedAt       string         `json:"created_at"`
+	Run             int64          `json:"run"`
 }
 
 // Step 1 of the intent -> executing -> {receipt, failed} lifecycle
@@ -2106,8 +2174,9 @@ type InsertToolCallIntentParams struct {
 // (W1/W2/W3) tool-call ATTEMPT - seq lets the SAME (task_id, tool_name,
 // args_hash) triple be re-attempted (a fresh row at a higher seq) after an
 // earlier attempt at that exact triple was marked 'failed' by the resume
-// scan, while the idempotent-replay lookup (GetReceiptToolCall below)
-// only ever matches an attempt that reached 'receipt'.
+// scan, while the idempotent-replay lookup (GetReplayableReceiptToolCall
+// below) only ever matches an attempt that reached 'receipt'. run is the
+// worker run that made the attempt (FIX-FINAL receipt-replay-per-run).
 func (q *Queries) InsertToolCallIntent(ctx context.Context, arg InsertToolCallIntentParams) (ToolCall, error) {
 	row := q.db.QueryRowContext(ctx, insertToolCallIntent,
 		arg.TaskID,
@@ -2117,6 +2186,7 @@ func (q *Queries) InsertToolCallIntent(ctx context.Context, arg InsertToolCallIn
 		arg.ArgsHash,
 		arg.ApprovalTokenID,
 		arg.CreatedAt,
+		arg.Run,
 	)
 	var i ToolCall
 	err := row.Scan(
@@ -2132,6 +2202,8 @@ func (q *Queries) InsertToolCallIntent(ctx context.Context, arg InsertToolCallIn
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.CreatedAt,
+		&i.Run,
+		&i.ReplayedRun,
 	)
 	return i, err
 }
@@ -3193,7 +3265,7 @@ func (q *Queries) ListEvidenceByFact(ctx context.Context, factID int64) ([]ListE
 }
 
 const listExecutingTasks = `-- name: ListExecutingTasks :many
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE status = 'executing'
   AND status != 'user_halted'
@@ -3243,6 +3315,7 @@ func (q *Queries) ListExecutingTasks(ctx context.Context) ([]Task, error) {
 			&i.WorkerPgid,
 			&i.HaltedAt,
 			&i.CrashResumes,
+			&i.WorkerRun,
 		); err != nil {
 			return nil, err
 		}
@@ -3549,7 +3622,7 @@ func (q *Queries) ListLastAskedAtAllFacts(ctx context.Context) ([]ListLastAskedA
 }
 
 const listNonTerminalTasks = `-- name: ListNonTerminalTasks :many
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE status NOT IN ('done', 'failed', 'user_halted')
 ORDER BY updated_at ASC
@@ -3589,6 +3662,7 @@ func (q *Queries) ListNonTerminalTasks(ctx context.Context) ([]Task, error) {
 			&i.WorkerPgid,
 			&i.HaltedAt,
 			&i.CrashResumes,
+			&i.WorkerRun,
 		); err != nil {
 			return nil, err
 		}
@@ -3855,7 +3929,7 @@ func (q *Queries) ListQuarantinedFacts(ctx context.Context, arg ListQuarantinedF
 }
 
 const listReceiptlessToolCalls = `-- name: ListReceiptlessToolCalls :many
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 FROM tool_calls
 WHERE task_id = ? AND status IN ('intent', 'executing')
 ORDER BY id DESC
@@ -3890,6 +3964,8 @@ func (q *Queries) ListReceiptlessToolCalls(ctx context.Context, taskID string) (
 			&i.StartedAt,
 			&i.FinishedAt,
 			&i.CreatedAt,
+			&i.Run,
+			&i.ReplayedRun,
 		); err != nil {
 			return nil, err
 		}
@@ -3956,7 +4032,7 @@ func (q *Queries) ListRitualLabeledFactsForEval(ctx context.Context) ([]ListRitu
 }
 
 const listTasksWithWorkerPGID = `-- name: ListTasksWithWorkerPGID :many
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE worker_pgid IS NOT NULL
 ORDER BY updated_at ASC
@@ -3994,6 +4070,7 @@ func (q *Queries) ListTasksWithWorkerPGID(ctx context.Context) ([]Task, error) {
 			&i.WorkerPgid,
 			&i.HaltedAt,
 			&i.CrashResumes,
+			&i.WorkerRun,
 		); err != nil {
 			return nil, err
 		}
@@ -4009,7 +4086,7 @@ func (q *Queries) ListTasksWithWorkerPGID(ctx context.Context) ([]Task, error) {
 }
 
 const listToolCallsByTask = `-- name: ListToolCallsByTask :many
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 FROM tool_calls
 WHERE task_id = ?
 ORDER BY seq ASC, id ASC
@@ -4038,6 +4115,8 @@ func (q *Queries) ListToolCallsByTask(ctx context.Context, taskID string) ([]Too
 			&i.StartedAt,
 			&i.FinishedAt,
 			&i.CreatedAt,
+			&i.Run,
+			&i.ReplayedRun,
 		); err != nil {
 			return nil, err
 		}
@@ -4449,6 +4528,28 @@ type MarkToolCallReceiptParams struct {
 func (q *Queries) MarkToolCallReceipt(ctx context.Context, arg MarkToolCallReceiptParams) error {
 	_, err := q.db.ExecContext(ctx, markToolCallReceipt, arg.ReceiptJson, arg.FinishedAt, arg.ID)
 	return err
+}
+
+const markToolCallReplayed = `-- name: MarkToolCallReplayed :execrows
+UPDATE tool_calls
+SET replayed_run = ?1
+WHERE id = ?2 AND status = 'receipt' AND replayed_run < ?1
+`
+
+type MarkToolCallReplayedParams struct {
+	CurrentRun int64 `json:"current_run"`
+	ID         int64 `json:"id"`
+}
+
+// Consumes an earlier run's receipt for the current run (compare-and-set:
+// 0 rows means another replay of this run consumed it first). Each earlier
+// receipt is replayed at most once per run.
+func (q *Queries) MarkToolCallReplayed(ctx context.Context, arg MarkToolCallReplayedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markToolCallReplayed, arg.CurrentRun, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const nextToolCallSeq = `-- name: NextToolCallSeq :one

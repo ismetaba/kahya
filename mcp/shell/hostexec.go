@@ -168,10 +168,14 @@ type HostExecOutput struct {
 	Stdout   string   `json:"stdout"`
 	Stderr   string   `json:"stderr"`
 	Argv     []string `json:"argv"`
-	// Replayed is true when this is the stored result of an EARLIER,
-	// identical, completed shell_host call of the same task (FIX-I-4
-	// receipt replay): nothing ran this call.
+	// Replayed is true when this is the stored result of an identical
+	// shell_host call that an EARLIER worker run of the same task completed
+	// (FIX-I-4 receipt replay, per run since FIX-FINAL
+	// receipt-replay-per-run): nothing ran this call. A repeat inside one
+	// live run (a second `git status` after a change) runs again.
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote is mcpfs.MsgReplayedFromEarlierRun on a replayed result.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // HostExec implements shell_host's full gate chain.
@@ -234,8 +238,9 @@ func (h *HostExec) Handle(ctx context.Context, traceID, taskID string, in HostEx
 	}
 	argv := plan.argv
 
-	// FIX-I-4: replay a completed identical call (keyed on the exact argv
-	// validate built - canonical paths, our fixed flags) before Check.
+	// FIX-I-4: replay an identical call an earlier worker run of the task
+	// completed (keyed on the exact argv validate built - canonical paths,
+	// our fixed flags) before Check.
 	argvJSON, _ := json.Marshal(argv)
 	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shell_host", ArgsHash: mcpfs.ReceiptArgsHash(argvJSON)}
 	var stored HostExecOutput
@@ -474,6 +479,7 @@ func (h *HostExec) replayed(ctx context.Context, traceID, taskID string, out Hos
 		"event": "hostexec_replayed", "tool": "shell_host", "argv": out.Argv, "task_id": taskID,
 	})
 	out.Replayed = true
+	out.ReplayNote = mcpfs.MsgReplayedFromEarlierRun
 	return out
 }
 

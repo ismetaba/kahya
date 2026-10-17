@@ -40,6 +40,8 @@ type ShortcutOutput struct {
 	TimedOut bool   `json:"timed_out"`
 	// Replayed: see ScriptOutput.Replayed (the shortcut did not run).
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote: see ScriptOutput.ReplayNote.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // RunShortcut implements shortcuts_run end to end: validate (mechanical,
@@ -156,6 +158,7 @@ func (r *Runner) replayedShortcut(ctx context.Context, traceID, taskID, name str
 		"event": "shortcuts_replayed", "shortcut_name": name, "task_id": taskID, "trace_id": traceID,
 	})
 	out.Replayed = true
+	out.ReplayNote = mcpfs.MsgReplayedFromEarlierRun
 	return out
 }
 

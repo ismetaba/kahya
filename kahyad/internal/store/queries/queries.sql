@@ -61,7 +61,7 @@ LIMIT 1;
 -- InsertTaskRow type.
 INSERT INTO tasks (id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes;
+RETURNING id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run;
 
 -- name: UpdateTaskState :exec
 UPDATE tasks
@@ -421,7 +421,7 @@ SELECT count(*) FROM sensitive_reads;
 -- reuses the existing Task model type here rather than emitting a second,
 -- differently-ordered Row type (the same convention InsertTask's own doc
 -- comment already established for lane/secret_category).
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE id = ?;
 
@@ -457,7 +457,7 @@ WHERE id = ? AND worker_pgid = ?;
 -- worker of a PREVIOUS kahyad process that died before spawn.Run returned
 -- (crash, SIGKILL), in any status (a callback may have parked/failed the
 -- task mid-run). Column list = tasks' physical order (reuses Task).
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE worker_pgid IS NOT NULL
 ORDER BY updated_at ASC;
@@ -480,7 +480,7 @@ WHERE id = ?;
 -- idempotent no-op HaltTask itself decides on a direct GetTaskByID lookup
 -- (task spec step 8) - this query is only ever consulted for the {all:true}
 -- fan-out, never for a single --task <id> halt.
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE status NOT IN ('done', 'failed', 'user_halted')
 ORDER BY updated_at ASC;
@@ -529,6 +529,22 @@ UPDATE tasks
 SET crash_resumes = 0, updated_at = ?
 WHERE id = ?;
 
+-- name: IncrementTaskWorkerRun :one
+-- FIX-FINAL receipt-replay-per-run (0026_tool_calls_worker_run): one more
+-- worker spawn (run) of this task, written BEFORE the worker starts - the
+-- first spawn (kahyad/internal/server handleTask) is run 1, every outbox
+-- redispatch (kahyad/internal/outbox processResume: crash resume, cloud-
+-- retry redispatch, resolve --retry) the next one. Returns the new run.
+UPDATE tasks
+SET worker_run = worker_run + 1, updated_at = ?
+WHERE id = ?
+RETURNING worker_run;
+
+-- name: GetTaskWorkerRun :one
+-- The task's current worker run (kahyad/internal/task.Receipts resolves it
+-- once per tool call; it is never taken from the worker).
+SELECT worker_run FROM tasks WHERE id = ?;
+
 -- name: SetTaskNextRetry :exec
 -- W4-04: writes tasks.next_retry_at when kahyad/internal/task.CloudRetry
 -- parks a task in 'bekliyor-yeniden-deneme' (the status change itself
@@ -557,7 +573,7 @@ WHERE id = ?;
 -- exact scenario this comment quotes: even a future change to this WHERE
 -- clause that loosens 'executing' can never accidentally resume a halted
 -- task without ALSO having to delete this line first.
-SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes
+SELECT id, trace_id, session_id, state, model, envelope, updated_at, created_at, lane, secret_category, status, next_retry_at, attempts, worker_pgid, halted_at, crash_resumes, worker_run
 FROM tasks
 WHERE status = 'executing'
   AND status != 'user_halted'
@@ -569,11 +585,12 @@ ORDER BY updated_at ASC;
 -- (W1/W2/W3) tool-call ATTEMPT - seq lets the SAME (task_id, tool_name,
 -- args_hash) triple be re-attempted (a fresh row at a higher seq) after an
 -- earlier attempt at that exact triple was marked 'failed' by the resume
--- scan, while the idempotent-replay lookup (GetReceiptToolCall below)
--- only ever matches an attempt that reached 'receipt'.
-INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at)
-VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?)
-RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at;
+-- scan, while the idempotent-replay lookup (GetReplayableReceiptToolCall
+-- below) only ever matches an attempt that reached 'receipt'. run is the
+-- worker run that made the attempt (FIX-FINAL receipt-replay-per-run).
+INSERT INTO tool_calls (task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run)
+VALUES (?, ?, ?, ?, ?, ?, 'intent', NULL, NULL, NULL, ?, ?)
+RETURNING id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run;
 
 -- name: NextToolCallSeq :one
 -- The next seq value for a (task_id, tool_name, args_hash) triple (1 for a
@@ -606,17 +623,33 @@ UPDATE tool_calls
 SET status = 'failed', finished_at = ?
 WHERE id = ?;
 
--- name: GetReceiptToolCall :one
--- The idempotent-replay lookup (task spec step 4): the most recent
+-- name: GetReplayableReceiptToolCall :one
+-- The idempotent-replay lookup (task spec step 4, narrowed by FIX-FINAL
+-- receipt-replay-per-run, owner decision 2026-10-16): the OLDEST
 -- status='receipt' row for this exact (task_id, tool_name, args_hash)
--- triple, if any. A hit means "do not re-execute - return this stored
--- receipt_json instead" (kahyad/internal/task.Receipts.Execute), which is
--- the mechanism that makes resume double-execution-safe.
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+-- triple that an EARLIER worker run wrote (run < current_run) and the
+-- current run has not consumed yet (replayed_run < current_run). A hit
+-- means a resumed session is re-issuing a call an earlier run completed -
+-- return the stored receipt_json instead of executing again
+-- (kahyad/internal/task.Receipts), and consume the row with
+-- MarkToolCallReplayed. A receipt the CURRENT run wrote is never a hit: an
+-- identical call inside one live run executes normally.
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 FROM tool_calls
-WHERE task_id = ? AND tool_name = ? AND args_hash = ? AND status = 'receipt'
-ORDER BY seq DESC
+WHERE task_id = sqlc.arg(task_id) AND tool_name = sqlc.arg(tool_name) AND args_hash = sqlc.arg(args_hash)
+  AND status = 'receipt'
+  AND run < sqlc.arg(current_run)
+  AND replayed_run < sqlc.arg(current_run)
+ORDER BY run ASC, seq ASC, id ASC
 LIMIT 1;
+
+-- name: MarkToolCallReplayed :execrows
+-- Consumes an earlier run's receipt for the current run (compare-and-set:
+-- 0 rows means another replay of this run consumed it first). Each earlier
+-- receipt is replayed at most once per run.
+UPDATE tool_calls
+SET replayed_run = sqlc.arg(current_run)
+WHERE id = sqlc.arg(id) AND status = 'receipt' AND replayed_run < sqlc.arg(current_run);
 
 -- name: ListReceiptlessToolCalls :many
 -- Every tool_calls row for task_id still stuck at 'intent'/'executing' -
@@ -626,7 +659,7 @@ LIMIT 1;
 -- examines EVERY row: FIX-I-4's ErrReceiptPersistFailed can leave an older
 -- W2/W3 row 'executing' while the task continues, and a later interrupted
 -- W1 call must not hide it (W2/W3 never auto-retry).
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 FROM tool_calls
 WHERE task_id = ? AND status IN ('intent', 'executing')
 ORDER BY id DESC;
@@ -634,14 +667,26 @@ ORDER BY id DESC;
 -- name: CountToolCallAttempts :one
 -- The per-(task_id, tool_name, args_hash) attempt count the resume scan
 -- compares against task.retry.w1_max_auto (task spec step 6: "at most
--- w1_max_auto auto-retries per (task_id, tool_name, args_hash)") - counts
--- every row ever inserted for this exact triple (every seq), regardless
--- of its current status.
-SELECT COUNT(*) FROM tool_calls WHERE task_id = ? AND tool_name = ? AND args_hash = ?;
+-- w1_max_auto auto-retries per (task_id, tool_name, args_hash)"). Since
+-- FIX-FINAL receipt-replay-per-run one key may legitimately hold many
+-- receipts (an identical call repeated inside a live run executes each
+-- time), so this counts only the attempts that did NOT complete (intent,
+-- executing, failed) AFTER the key's latest receipt: completed live repeats
+-- never count against the cap, and every interrupted resume still adds one
+-- (the cap still ends a crash loop). The count includes the receipt-less
+-- row being decided, like before.
+SELECT COUNT(*) FROM tool_calls AS c
+WHERE c.task_id = sqlc.arg(task_id) AND c.tool_name = sqlc.arg(tool_name) AND c.args_hash = sqlc.arg(args_hash)
+  AND c.status <> 'receipt'
+  AND c.id > COALESCE((
+      SELECT MAX(r.id) FROM tool_calls AS r
+      WHERE r.task_id = sqlc.arg(task_id) AND r.tool_name = sqlc.arg(tool_name) AND r.args_hash = sqlc.arg(args_hash)
+        AND r.status = 'receipt'
+  ), 0);
 
 -- name: ListToolCallsByTask :many
 -- `kahya task show <id>`'s tool_calls listing, oldest attempt first.
-SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at
+SELECT id, task_id, seq, tool_name, class, args_hash, approval_token_id, status, receipt_json, started_at, finished_at, created_at, run, replayed_run
 FROM tool_calls
 WHERE task_id = ?
 ORDER BY seq ASC, id ASC;

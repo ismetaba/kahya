@@ -9,13 +9,19 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	mcpfs "kahya/mcp/fs"
 )
 
-// fakeReceipts mirrors mcp/fs's receipts_test.go fake (FIX-I-4): one
-// receipt per (task, tool, args hash) once an effect succeeds.
+// fakeReceipts mirrors mcp/fs's receipts_test.go fake (FIX-I-4, per worker
+// run since FIX-FINAL receipt-replay-per-run): a receipt per executed call,
+// tagged with the current run; only an EARLIER run's receipt the current run
+// has not consumed yet is replayed (once per run); resume() starts the next
+// run.
 type fakeReceipts struct {
 	mu                  sync.Mutex
-	stored              map[string]json.RawMessage
+	run                 int // current worker run; 0 means run 1
+	stored              map[string][]*fakeReceipt
 	replayCalls         int
 	executeCalls        int
 	effectRuns          int
@@ -23,15 +29,44 @@ type fakeReceipts struct {
 	effectCtxCancelable bool
 }
 
+type fakeReceipt struct {
+	raw              json.RawMessage
+	run, replayedRun int
+}
+
 func (f *fakeReceipts) key(in ReceiptInput) string {
 	return in.TaskID + "|" + in.Tool + "|" + in.ArgsHash
+}
+
+func (f *fakeReceipts) resume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.run = f.currentRunLocked() + 1
+}
+
+func (f *fakeReceipts) currentRunLocked() int {
+	if f.run == 0 {
+		return 1
+	}
+	return f.run
+}
+
+func (f *fakeReceipts) replayableLocked(in ReceiptInput) (json.RawMessage, bool) {
+	run := f.currentRunLocked()
+	for _, r := range f.stored[f.key(in)] {
+		if r.run < run && r.replayedRun < run {
+			r.replayedRun = run
+			return r.raw, true
+		}
+	}
+	return nil, false
 }
 
 func (f *fakeReceipts) Replay(_ context.Context, in ReceiptInput) (json.RawMessage, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.replayCalls++
-	raw, ok := f.stored[f.key(in)]
+	raw, ok := f.replayableLocked(in)
 	return raw, ok, nil
 }
 
@@ -39,7 +74,7 @@ func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func
 	f.mu.Lock()
 	f.executeCalls++
 	f.hashes = append(f.hashes, in.ArgsHash)
-	if raw, ok := f.stored[f.key(in)]; ok {
+	if raw, ok := f.replayableLocked(in); ok {
 		f.mu.Unlock()
 		return raw, true, nil
 	}
@@ -53,9 +88,9 @@ func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func
 		return nil, false, err
 	}
 	if f.stored == nil {
-		f.stored = map[string]json.RawMessage{}
+		f.stored = map[string][]*fakeReceipt{}
 	}
-	f.stored[f.key(in)] = raw
+	f.stored[f.key(in)] = append(f.stored[f.key(in)], &fakeReceipt{raw: raw, run: f.currentRunLocked()})
 	return raw, false, nil
 }
 
@@ -88,9 +123,12 @@ func newReceiptRunner(t *testing.T) (*Runner, string, *rotatingPolicy, *fakeLedg
 	return r, workdir, pc, led, exec, digest, rex
 }
 
-// TestRunReplaysReceiptSkipsDocker: a resumed session re-issuing the SAME
-// shell_docker call of the SAME task gets the stored output - no second
-// container, no second policy decision, not even a digest/daemon check.
+// TestRunReplaysReceiptSkipsDocker: a resumed session (the task's next
+// worker run) re-issuing the SAME shell_docker call of the SAME task gets
+// the stored output - no second container, no second policy decision, not
+// even a digest/daemon check - marked with the replay note. Re-running the
+// same script inside one live run (tests after an edit) runs a fresh
+// container (FIX-FINAL receipt-replay-per-run).
 func TestRunReplaysReceiptSkipsDocker(t *testing.T) {
 	r, workdir, pc, led, exec, digest, rex := newReceiptRunner(t)
 	in := RunInput{Script: "make test", Workdir: workdir}
@@ -99,29 +137,36 @@ func TestRunReplaysReceiptSkipsDocker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	digestCallsAfterFirst := digest.calls
+	// The same script again inside the live run: a fresh container.
+	exec.runResult = Result{ExitCode: 1, Stdout: []byte("1 test failed\n")}
+	live, err := r.Run(context.Background(), "trace-1", "task-1", in)
+	if err != nil || live.Replayed || live.Stdout != "1 test failed\n" {
+		t.Fatalf("live repeat = (%+v, %v), want a fresh run with the new output", live, err)
+	}
+	digestCallsAfterLive := digest.calls
+	rex.resume()
 	out2, err := r.Run(context.Background(), "trace-1", "task-1", in)
 	if err != nil {
 		t.Fatalf("second (resumed) Run: %v", err)
 	}
-	if !out2.Replayed || out1.Replayed {
-		t.Fatalf("Replayed flags = %v/%v, want false/true", out1.Replayed, out2.Replayed)
+	if !out2.Replayed || out1.Replayed || out2.ReplayNote != mcpfs.MsgReplayedFromEarlierRun {
+		t.Fatalf("Replayed flags = %v/%v (note %q), want false/true with the replay note", out1.Replayed, out2.Replayed, out2.ReplayNote)
 	}
-	out2.Replayed = false
+	out2.Replayed, out2.ReplayNote = false, ""
 	if out2 != out1 {
-		t.Fatalf("replayed output = %+v, want the stored %+v", out2, out1)
+		t.Fatalf("replayed output = %+v, want run 1's first stored %+v", out2, out1)
 	}
-	if n := exec.callCount("run"); n != 1 {
-		t.Fatalf("docker run invocations = %d, want 1", n)
+	if n := exec.callCount("run"); n != 2 {
+		t.Fatalf("docker run invocations = %d, want 2 (run 1's two calls; the resumed one replayed)", n)
 	}
-	if digest.calls != digestCallsAfterFirst {
-		t.Fatalf("a replay consulted the digest checker (%d -> %d)", digestCallsAfterFirst, digest.calls)
+	if digest.calls != digestCallsAfterLive {
+		t.Fatalf("a replay consulted the digest checker (%d -> %d)", digestCallsAfterLive, digest.calls)
 	}
-	if pc.checkCalls != 1 || pc.consumeCalls != 1 {
-		t.Fatalf("Check/ConsumeToken = %d/%d, want 1/1", pc.checkCalls, pc.consumeCalls)
+	if pc.checkCalls != 2 || pc.consumeCalls != 2 {
+		t.Fatalf("Check/ConsumeToken = %d/%d, want 2/2 (the replay takes no decision)", pc.checkCalls, pc.consumeCalls)
 	}
-	if got := len(led.find("shell_exec")); got != 1 {
-		t.Fatalf("shell_exec ledger rows = %d, want 1", got)
+	if got := len(led.find("shell_exec")); got != 2 {
+		t.Fatalf("shell_exec ledger rows = %d, want 2", got)
 	}
 	if got := len(led.find("shell_docker_replayed")); got != 1 {
 		t.Fatalf("shell_docker_replayed = %d, want 1", got)
@@ -205,11 +250,12 @@ func TestHostExecReplaysReceiptSkipsExecutor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Handle: %v", err)
 	}
+	rex.resume()
 	out2, err := h.Handle(context.Background(), "trace-1", "task-1", in)
 	if err != nil {
-		t.Fatalf("second Handle: %v", err)
+		t.Fatalf("second (resumed) Handle: %v", err)
 	}
-	if !out2.Replayed || len(out2.Argv) != len(out1.Argv) {
+	if !out2.Replayed || out2.ReplayNote != mcpfs.MsgReplayedFromEarlierRun || len(out2.Argv) != len(out1.Argv) {
 		t.Fatalf("second Handle = %+v, want the stored %+v replayed", out2, out1)
 	}
 	if n := len(exec.callsNamed("stat")); n != 1 {

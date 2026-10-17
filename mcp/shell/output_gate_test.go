@@ -101,9 +101,10 @@ func TestShellDockerSecretWorkdirEscalatesBeforeRun(t *testing.T) {
 }
 
 // TestShellDockerReplayedSecretOutputEscalates: a receipt-replayed result
-// is gated too - stored stdout is never returned unclassified.
+// (the resumed run's re-issued call) is gated too - stored stdout is never
+// returned unclassified.
 func TestShellDockerReplayedSecretOutputEscalates(t *testing.T) {
-	r, workdir, _, _, exec, _, _ := newReceiptRunner(t)
+	r, workdir, _, _, exec, _, rex := newReceiptRunner(t)
 	exec.runResult = Result{Stdout: []byte("IBAN TR330006100519786457841326\n")}
 	esc := &gateEscalator{}
 	in := RunInput{Script: "cat x", Workdir: workdir}
@@ -111,6 +112,7 @@ func TestShellDockerReplayedSecretOutputEscalates(t *testing.T) {
 		t.Fatalf("first Run: %v", err)
 	}
 	r.OutputGate = mcpfs.OutputGate{Classifier: substringClassifier{"TR33"}, Escalator: esc}
+	rex.resume()
 	out, err := r.Run(context.Background(), "tr", "task-1", in)
 	if err != nil || !out.Replayed {
 		t.Fatalf("replay = %+v %v", out, err)

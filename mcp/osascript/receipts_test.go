@@ -6,32 +6,67 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	mcpfs "kahya/mcp/fs"
 )
 
-// fakeReceipts mirrors mcp/fs's receipts_test.go fake (FIX-I-4).
+// fakeReceipts mirrors mcp/fs's receipts_test.go fake (FIX-I-4, per worker
+// run since FIX-FINAL receipt-replay-per-run): only an EARLIER run's receipt
+// the current run has not consumed yet is replayed (once per run); resume()
+// starts the next run.
 type fakeReceipts struct {
 	mu                  sync.Mutex
-	stored              map[string]json.RawMessage
+	run                 int // current worker run; 0 means run 1
+	stored              map[string][]*fakeReceipt
 	executeCalls        int
 	effectRuns          int
 	effectCtxCancelable bool
+}
+
+type fakeReceipt struct {
+	raw              json.RawMessage
+	run, replayedRun int
 }
 
 func (f *fakeReceipts) key(in ReceiptInput) string {
 	return in.TaskID + "|" + in.Tool + "|" + in.ArgsHash
 }
 
+func (f *fakeReceipts) resume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.run = f.currentRunLocked() + 1
+}
+
+func (f *fakeReceipts) currentRunLocked() int {
+	if f.run == 0 {
+		return 1
+	}
+	return f.run
+}
+
+func (f *fakeReceipts) replayableLocked(in ReceiptInput) (json.RawMessage, bool) {
+	run := f.currentRunLocked()
+	for _, r := range f.stored[f.key(in)] {
+		if r.run < run && r.replayedRun < run {
+			r.replayedRun = run
+			return r.raw, true
+		}
+	}
+	return nil, false
+}
+
 func (f *fakeReceipts) Replay(_ context.Context, in ReceiptInput) (json.RawMessage, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	raw, ok := f.stored[f.key(in)]
+	raw, ok := f.replayableLocked(in)
 	return raw, ok, nil
 }
 
 func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func(context.Context) (json.RawMessage, error)) (json.RawMessage, bool, error) {
 	f.mu.Lock()
 	f.executeCalls++
-	if raw, ok := f.stored[f.key(in)]; ok {
+	if raw, ok := f.replayableLocked(in); ok {
 		f.mu.Unlock()
 		return raw, true, nil
 	}
@@ -45,9 +80,9 @@ func (f *fakeReceipts) Execute(ctx context.Context, in ReceiptInput, effect func
 		return nil, false, err
 	}
 	if f.stored == nil {
-		f.stored = map[string]json.RawMessage{}
+		f.stored = map[string][]*fakeReceipt{}
 	}
-	f.stored[f.key(in)] = raw
+	f.stored[f.key(in)] = append(f.stored[f.key(in)], &fakeReceipt{raw: raw, run: f.currentRunLocked()})
 	return raw, false, nil
 }
 
@@ -58,9 +93,11 @@ func newReceiptRunner() (*Runner, *fakePolicyClient, *fakeLedger, *fakeExecutor,
 	return r, pc, led, exec, rex
 }
 
-// TestRunApplescriptReplaysReceipt: a resumed session re-issuing the SAME
-// applescript_run of the SAME task gets the stored output - osascript does
-// not run again and no second policy decision (approval) is taken.
+// TestRunApplescriptReplaysReceipt: a resumed session (the task's next
+// worker run) re-issuing the SAME applescript_run of the SAME task gets the
+// stored output - osascript does not run again and no second policy
+// decision (approval) is taken. The same body again inside one live run
+// runs (FIX-FINAL receipt-replay-per-run).
 func TestRunApplescriptReplaysReceipt(t *testing.T) {
 	r, pc, led, exec, rex := newReceiptRunner()
 	in := ScriptInput{Script: `tell application "Notes" to make new note`, TargetApp: "Notes"}
@@ -69,25 +106,29 @@ func TestRunApplescriptReplaysReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
+	if live, err := r.RunApplescript(context.Background(), "trace-1", "task-1", in); err != nil || live.Replayed {
+		t.Fatalf("live repeat = (%+v, %v), want a fresh run", live, err)
+	}
+	rex.resume()
 	out2, err := r.RunApplescript(context.Background(), "trace-1", "task-1", in)
 	if err != nil {
 		t.Fatalf("second (resumed) run: %v", err)
 	}
-	if !out2.Replayed {
-		t.Fatal("second identical run was not answered from its receipt")
+	if !out2.Replayed || out2.ReplayNote != mcpfs.MsgReplayedFromEarlierRun {
+		t.Fatalf("resumed run = %+v, want it answered from its receipt with the replay note", out2)
 	}
-	out2.Replayed = false
+	out2.Replayed, out2.ReplayNote = false, ""
 	if out2.ExitCode != out1.ExitCode || out2.Stdout != out1.Stdout || out2.Stderr != out1.Stderr {
 		t.Fatalf("replayed output = %+v, want the stored %+v", out2, out1)
 	}
-	if n := exec.callCount(); n != 1 {
-		t.Fatalf("osascript invocations = %d, want 1", n)
+	if n := exec.callCount(); n != 2 {
+		t.Fatalf("osascript invocations = %d, want 2 (run 1's two; the resumed call replayed)", n)
 	}
-	if pc.checkCalls != 1 || pc.consumeCalls != 1 {
-		t.Fatalf("Check/ConsumeToken = %d/%d, want 1/1", pc.checkCalls, pc.consumeCalls)
+	if pc.checkCalls != 2 || pc.consumeCalls != 2 {
+		t.Fatalf("Check/ConsumeToken = %d/%d, want 2/2 (the replay takes no decision)", pc.checkCalls, pc.consumeCalls)
 	}
-	if got := len(led.find("osascript_exec")); got != 1 {
-		t.Fatalf("osascript_exec rows = %d, want 1", got)
+	if got := len(led.find("osascript_exec")); got != 2 {
+		t.Fatalf("osascript_exec rows = %d, want 2", got)
 	}
 	if got := len(led.find("osascript_replayed")); got != 1 {
 		t.Fatalf("osascript_replayed rows = %d, want 1", got)
@@ -151,14 +192,15 @@ func TestRunApplescriptAutomationDeniedKeepsOutputAndTypedError(t *testing.T) {
 }
 
 func TestRunShortcutReplaysReceipt(t *testing.T) {
-	r, pc, led, exec, _ := newReceiptRunner()
+	r, pc, led, exec, rex := newReceiptRunner()
 	in := ShortcutInput{Name: "Günlük Not"}
 	if _, err := r.RunShortcut(context.Background(), "trace-1", "task-1", in); err != nil {
 		t.Fatalf("first RunShortcut: %v", err)
 	}
+	rex.resume()
 	out, err := r.RunShortcut(context.Background(), "trace-1", "task-1", in)
-	if err != nil || !out.Replayed {
-		t.Fatalf("second RunShortcut = (%+v, %v), want a replay", out, err)
+	if err != nil || !out.Replayed || out.ReplayNote != mcpfs.MsgReplayedFromEarlierRun {
+		t.Fatalf("second (resumed) RunShortcut = (%+v, %v), want a replay with the note", out, err)
 	}
 	if n := exec.callCount(); n != 1 {
 		t.Fatalf("shortcuts invocations = %d, want 1", n)

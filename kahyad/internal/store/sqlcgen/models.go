@@ -228,6 +228,7 @@ type Task struct {
 	WorkerPgid     sql.NullInt64  `json:"worker_pgid"`
 	HaltedAt       sql.NullString `json:"halted_at"`
 	CrashResumes   int64          `json:"crash_resumes"`
+	WorkerRun      int64          `json:"worker_run"`
 }
 
 type ToolCall struct {
@@ -243,6 +244,8 @@ type ToolCall struct {
 	StartedAt       sql.NullString `json:"started_at"`
 	FinishedAt      sql.NullString `json:"finished_at"`
 	CreatedAt       string         `json:"created_at"`
+	Run             int64          `json:"run"`
+	ReplayedRun     int64          `json:"replayed_run"`
 }
 
 type UndoWindow struct {

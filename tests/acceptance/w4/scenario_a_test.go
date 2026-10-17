@@ -112,6 +112,23 @@ func TestScenarioA_KillResumeNoDoubleExecution(t *testing.T) {
 		t.Fatalf("no tool.replayed ledger event for trace_id=%s", traceID)
 	}
 
+	// FIX-FINAL receipt-replay-per-run: the killed worker was the task's
+	// run 1 (POST /v1/task's spawn), the redelivered one run 2 (the outbox
+	// dispatcher's): the one receipt was written by run 1 and replayed for
+	// run 2 - the replay happened because the call came from a LATER run.
+	var receiptRun, replayedRun, workerRun int64
+	if err := db.QueryRow(
+		`SELECT run, replayed_run FROM tool_calls WHERE task_id=? AND tool_name='w2_slow_stub' AND status='receipt'`, taskID,
+	).Scan(&receiptRun, &replayedRun); err != nil {
+		t.Fatalf("query receipt runs: %v", err)
+	}
+	if err := db.QueryRow(`SELECT worker_run FROM tasks WHERE id=?`, taskID).Scan(&workerRun); err != nil {
+		t.Fatalf("query tasks.worker_run: %v", err)
+	}
+	if receiptRun != 1 || replayedRun != 2 || workerRun != 2 {
+		t.Fatalf("receipt run/replayed_run = %d/%d, tasks.worker_run = %d; want 1/2 and 2 (written by the killed run 1, replayed for the resumed run 2)", receiptRun, replayedRun, workerRun)
+	}
+
 	// All events share the task's trace_id, and the sequence correlates
 	// spawn -> resume dispatch -> replay -> done under that ONE trace_id
 	// (task spec: `kahya log --trace <id>` shows spawn -> SIGKILL gap ->

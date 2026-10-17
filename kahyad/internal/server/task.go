@@ -137,6 +137,12 @@ type TaskStore interface {
 	// (FIX-I-13; compare-and-set on the recorded pgid) - a stale pgid names
 	// an unrelated process group once the pid is reused.
 	ClearTaskWorkerPGID(ctx context.Context, arg sqlcgen.ClearTaskWorkerPGIDParams) (int64, error)
+	// IncrementTaskWorkerRun counts this task's worker spawn (FIX-FINAL
+	// receipt-replay-per-run): handleTask's first spawn makes it run 1
+	// before the worker starts, so every tool call the worker makes is
+	// recorded under that run and a later (resumed) run replays its
+	// receipts instead of executing them again.
+	IncrementTaskWorkerRun(ctx context.Context, arg sqlcgen.IncrementTaskWorkerRunParams) (int64, error)
 }
 
 // SetTaskStore wires POST /v1/task's tasks-table persistence. Call before
@@ -1037,6 +1043,19 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	taskCtx, cancel := s.boundTaskContext(dbCtx, s.taskDeadline())
 	defer cancel()
 
+	// FIX-FINAL receipt-replay-per-run: this spawn is the task's worker run
+	// 1, counted BEFORE the worker exists - every tool call the worker makes
+	// is recorded under it (kahyad/internal/task.Receipts), and only a later
+	// run (an outbox redispatch) replays those receipts. No run, no worker
+	// (fail-closed): an uncounted spawn would record its calls under run 0
+	// and a resumed run could not tell them from its own.
+	workerRun, err := s.taskStore.IncrementTaskWorkerRun(persistCtx, sqlcgen.IncrementTaskWorkerRunParams{UpdatedAt: rfc3339Now(), ID: taskID})
+	if err != nil {
+		log.Error("task_worker_run_failed", "task_id", taskID, "err", err.Error())
+		writeSSE("error", map[string]string{"message": fmt.Sprintf(MsgTaskUnexpectedExit, traceID)})
+		return
+	}
+
 	spawnCfg := spawn.Config{
 		Cmd:    s.cfg.WorkerCmd,
 		Socket: s.cfg.Socket,
@@ -1095,7 +1114,7 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	outcome, runErr := spawn.Run(taskCtx, spawnCfg, envelope, spawn.Callbacks{
 		OnStart: func(pid int) {
 			workerPID = pid
-			log.Info("task_worker_started", "task_id", taskID, "pid", pid)
+			log.Info("task_worker_started", "task_id", taskID, "pid", pid, "worker_run", workerRun)
 			if s.taskLiveRegistry != nil {
 				// G03 / B-14: sid == pid (spawn.Run's Setsid), plus this
 				// task's trace_id, so this worker's own UDS calls (and every

@@ -55,9 +55,13 @@ func TestExecuteDetachedDoesNotHoldConnectionDuringEffect(t *testing.T) {
 	}
 }
 
+// TestExecuteDetachedReplaySecondCall: the call a resumed run re-issues is
+// answered from the earlier run's receipt - no second effect run,
+// tool.replayed ledgered with both runs (FIX-FINAL receipt-replay-per-run).
 func TestExecuteDetachedReplaySecondCall(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
 	r := newReceipts(st)
 	runs := 0
 	effect := func(context.Context) (json.RawMessage, error) {
@@ -69,6 +73,7 @@ func TestExecuteDetachedReplaySecondCall(t *testing.T) {
 	if err != nil || replayed {
 		t.Fatalf("first ExecuteDetached = (%s, replayed=%v, %v), want a fresh run", first, replayed, err)
 	}
+	beginWorkerRun(t, st, "t1")
 	second, replayed, err := r.ExecuteDetached(context.Background(), in, effect)
 	if err != nil {
 		t.Fatalf("second ExecuteDetached: %v", err)
@@ -82,17 +87,30 @@ func TestExecuteDetachedReplaySecondCall(t *testing.T) {
 	if n := eventCount(t, r, EventReplayed); n != 1 {
 		t.Fatalf("tool.replayed events = %d, want 1", n)
 	}
+	var payload string
+	if err := st.DB().QueryRow(`SELECT payload FROM events WHERE kind = ?`, EventReplayed).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	var p struct {
+		Run        int64 `json:"run"`
+		ReceiptRun int64 `json:"receipt_run"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil || p.Run != 2 || p.ReceiptRun != 1 {
+		t.Fatalf("tool.replayed payload = %s (%v), want run 2 replaying run 1's receipt", payload, err)
+	}
 	if n := countToolCalls(t, st, "t1", CallStatusReceipt); n != 1 {
 		t.Fatalf("receipt rows = %d, want 1", n)
 	}
 }
 
 // TestReplayBeforeAnyAttemptIsMiss: Replay claims nothing - a miss writes no
-// tool_calls row and no ledger row; after a completed attempt it answers the
-// stored result and ledgers tool.replayed.
+// tool_calls row and no ledger row; after a completed attempt it misses for
+// the same run and, once the task is resumed, answers the stored result and
+// ledgers tool.replayed.
 func TestReplayBeforeAnyAttemptIsMiss(t *testing.T) {
 	st := testStore(t)
 	insertTask(t, st, "t1")
+	beginWorkerRun(t, st, "t1")
 	r := newReceipts(st)
 	in := detachedInput("t1", "replay-miss")
 	res, hit, err := r.Replay(context.Background(), in)
@@ -116,6 +134,10 @@ func TestReplayBeforeAnyAttemptIsMiss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteDetached: %v", err)
 	}
+	if _, hit, err := r.Replay(context.Background(), in); err != nil || hit {
+		t.Fatalf("Replay in the run that wrote the receipt = (hit=%v, %v), want a miss (a live repeat executes)", hit, err)
+	}
+	beginWorkerRun(t, st, "t1")
 	res, hit, err = r.Replay(context.Background(), in)
 	if err != nil || !hit || string(res) != string(stored) {
 		t.Fatalf("Replay after a receipt = (%s, hit=%v, %v), want the stored %s", res, hit, err, stored)

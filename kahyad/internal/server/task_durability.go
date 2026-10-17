@@ -146,6 +146,11 @@ type taskStatusToolCallView struct {
 	Class    string `json:"class"`
 	Status   string `json:"status"`
 	ArgsHash string `json:"args_hash"`
+	// Run is the worker run that made the attempt; ReplayedRun the latest
+	// run that replayed its receipt, 0 = never (FIX-FINAL
+	// receipt-replay-per-run).
+	Run         int64 `json:"run"`
+	ReplayedRun int64 `json:"replayed_run,omitempty"`
 }
 
 // taskStatusResponse is GET /v1/task/status's response body.
@@ -154,6 +159,7 @@ type taskStatusResponse struct {
 	Status    string                   `json:"status"`
 	SessionID string                   `json:"session_id,omitempty"`
 	Attempts  int64                    `json:"attempts"`
+	WorkerRun int64                    `json:"worker_run"`
 	PID       int                      `json:"pid,omitempty"`
 	ToolCalls []taskStatusToolCallView `json:"tool_calls"`
 }
@@ -187,7 +193,7 @@ func (s *Server) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := taskStatusResponse{ID: t.ID, Status: t.Status, Attempts: t.Attempts}
+	resp := taskStatusResponse{ID: t.ID, Status: t.Status, Attempts: t.Attempts, WorkerRun: t.WorkerRun}
 	if t.SessionID.Valid {
 		resp.SessionID = t.SessionID.String
 	}
@@ -200,6 +206,7 @@ func (s *Server) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	for _, c := range calls {
 		resp.ToolCalls = append(resp.ToolCalls, taskStatusToolCallView{
 			Seq: c.Seq, Tool: c.ToolName, Class: c.Class, Status: c.Status, ArgsHash: c.ArgsHash,
+			Run: c.Run, ReplayedRun: c.ReplayedRun,
 		})
 	}
 

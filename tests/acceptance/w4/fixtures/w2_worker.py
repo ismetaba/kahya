@@ -27,9 +27,11 @@ standing in for the worker" pattern):
     devstub.go's own doc comment for why that is safe and correct), this
     fixture simply never gets to see the response.
   - always emits a normal-looking worker JSONL result protocol so the SSE
-    task itself completes cleanly (on the RESUMED invocation, where the
-    call this time hits Receipts.Execute's idempotent-replay path and
-    returns near-instantly).
+    task itself completes cleanly (on the RESUMED invocation - the task's
+    next worker run - where the call this time hits Receipts.Execute's
+    idempotent-replay path and returns near-instantly; a receipt is only
+    ever replayed for a LATER run than the one that wrote it, FIX-FINAL
+    receipt-replay-per-run).
 """
 import json
 import os

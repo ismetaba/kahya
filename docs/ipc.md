@@ -96,7 +96,7 @@ Field rules (`kahyad/internal/spawn.Envelope` + `Envelope.Validate`):
 | `created_at` | Plain RFC3339 (`time.RFC3339`, e.g. `2026-07-10T12:00:00Z`, no fractional seconds), UTC. |
 | `lane` | **W3-08.** `"secret"` \| `"normal"` \| `""` (omitted from JSON when empty via `omitempty` — `Envelope.Validate` treats empty identically to `"normal"`, so every pre-W3-08 envelope/test still validates unchanged). Set by `kahyad/internal/secretlane.ClassifyDeterministic` against the raw `prompt` **before** this envelope is even constructed — an IBAN/TCKN/card-number/CVV/finans-sağlık-kimlik-keyword hit is FINAL: no model consulted, no fallback to "normal". The worker never chooses or overrides this field; it only exists in the wire schema at all so a future worker-side integration can read it (see the "Worker-side wiring status" note below — today the worker is never even spawned for a `"secret"` task, see §4 below). |
 | `category` | **W3-08.** `"finans"` \| `"saglik"` \| `"kimlik"` \| `""` (omitted via `omitempty`). Set alongside `lane` when a deterministic hit fires; informational only (CLI badge, Telegram redaction, logs) — never itself a security boundary. |
-| `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). FIX-I-4: on resume the worker sends `RESUME_CONTINUATION_PROMPT` (worker/kahya_worker/__main__.py; logs JSONL `session_resumed`), never `prompt` again — the resumed transcript already holds the original prompt, and `client.query` always appends a new user turn. The `UserPromptSubmit` memory hook still searches with the envelope's original `prompt` on resume, never the continuation text, so the injected and ledgered `<hafiza>` block matches the task (FIX-FINAL resume-memory-search-uses-continuation-text). The binding double-execution guard is kahyad's receipt replay (see the W4-02 note in §8), not this text. |
+| `resume` | **W4-02.** `true` \| `false` (omitted via `omitempty` when `false` — every pre-W4-02 envelope/test still validates unchanged). Set only by `kahyad/internal/outbox.Dispatcher` when re-spawning a worker for an already-`session_id`-bearing task (`Envelope.Validate` requires a non-blank `session_id` whenever this is `true`). The worker (`kahya_worker.__main__._build_options`) reads this to construct `ClaudeAgentOptions(resume=session_id, ...)` instead of starting a fresh conversation — streaming input mode stays in force either way (hooks/`can_use_tool` still need it). FIX-I-4: on resume the worker sends `RESUME_CONTINUATION_PROMPT` (worker/kahya_worker/__main__.py; logs JSONL `session_resumed`), never `prompt` again — the resumed transcript already holds the original prompt, and `client.query` always appends a new user turn. The `UserPromptSubmit` memory hook still searches with the envelope's original `prompt` on resume, never the continuation text, so the injected and ledgered `<hafiza>` block matches the task (FIX-FINAL resume-memory-search-uses-continuation-text). The binding double-execution guard is kahyad's receipt replay (see the W4-02 note in §8; since FIX-FINAL receipt-replay-per-run it answers only calls an EARLIER worker run of the task completed, once per receipt per run), not this text. |
 | `intent` | **W4-08.** The §4 routing-table intent bucket (`kahyad/internal/router`'s `Intent*` constants: `plan`, `code_multi_file`, `hard_exec`, `subagent_exec`, `fanout`, `extract`, `writeback`, `route`, `classify`, `reader`, `chat`) — omitted via `omitempty` when empty, so every pre-W4-08 envelope/test still validates unchanged. Informational only (logs/CLI/ledger `intent_classified`/`routing_decision` events) — no enum validation in `Envelope.Validate` (the routing DECISION already happened before this envelope was built; the worker never reads this to choose anything, §4: "karar Go kodunda, istemde değil"). An ordinary `/v1/task` chat prompt with no CLI-declared kind is always `"chat"`, decided deterministically (no model call) — see the W4-08 note below for why. |
 | `deep_think` | **W4-08.** `true` \| `false` (omitted via `omitempty` when `false`). The "derin düşün" opt-in: set by `kahya ask --derin`, or detected server-side (POST /v1/task) from the byte-exact Turkish prompt prefix `"derin düşün:"` (stripped from `prompt` before this envelope is built — never model-detected). `kahyad/internal/router.SelectModel` pins `model` to `router.ModelFable` (`claude-fable-5-1`) whenever this is `true`, UNLESS `lane=="secret"` (which outranks it unconditionally). This field carries no enforcement of its own — it is only the audit trail of why `model` ended up being Fable. |
 | `mode` | **W4-03/W6-02.** `""` (ordinary Actor/chat, every pre-W4-03 envelope) \| `"reader"` (toolless cloud-Haiku Reader, `spawn.ModeReader` — requires `schema` non-blank) \| `"stt"` (toolless, CLOUD-LESS local transcription, `spawn.ModeSTT` — requires `input_audio_path` non-blank). See the "W6-02 note" below for the `"stt"` case. |
@@ -2239,9 +2239,10 @@ first boot). `{}` disables it.
   (`memory_write`/`memory_forget`, the dev-only `w2_slow_stub`) in
   `policyGateMiddleware`. Order inside a tool: its mechanical refusals
   (deny glob, scan, argv validator, workdir scope) -> `Receipts.Replay`
-  (a durable receipt for the same task, tool and canonical args hash is
-  returned with `replayed:true` — no policy decision, no approval asked for
-  again, no token minted or consumed, nothing executes; ledger
+  (a durable receipt an EARLIER worker run of the same task wrote for the
+  same tool and canonical args hash is returned with `replayed:true` — no
+  policy decision, no approval asked for again, no token minted or
+  consumed, nothing executes; ledger
   `tool.replayed` plus the tool's own `fs_write_replayed` /
   `fs_delete_replayed` / `shell_docker_replayed` / `hostexec_replayed` /
   `osascript_replayed` / `shortcuts_replayed`, JSONL `mcp_tool_replayed` on
@@ -2259,10 +2260,38 @@ first boot). `{}` disables it.
   `mcp/shell.ShellDockerToolInput`, and its approval card shows the
   workdir mounted rw at /work, the network, env and timeout request), or the
   canonically re-encoded JSON arguments (generic path: sorted keys, no
-  whitespace, numbers verbatim). Consequence: an identical call repeated
-  within ONE task is always answered from its receipt (the
-  `idx_tool_calls_live_unique` index never allowed a second live row for
-  the same key anyway); vary the arguments to run it again. A tool error
+  whitespace, numbers verbatim). FIX-FINAL receipt-replay-per-run (owner
+  decision 2026-10-16): receipts replay only on RESUME. Every `tool_calls`
+  row records the worker run (incarnation) that made it (`tool_calls.run`,
+  migration 0026): a task's first worker spawn (`POST /v1/task`) is run 1,
+  and every later spawn of the same task - an outbox redispatch: crash
+  resume, orphan-sweep resume, cloud-retry redispatch, `kahya task resolve
+  --retry` - increments `tasks.worker_run` BEFORE the worker starts (no
+  run, no worker: `task_worker_run_failed` / `outbox.worker_run_failed`).
+  The run is kahyad-side state, never a worker value, resolved once per
+  `tools/call` (`policyGateMiddleware` pins it with `task.WithRunPin`, so a
+  call parked on an approval while its task is redispatched is still
+  recorded under the run that issued it). A replay answers only a receipt
+  an EARLIER run wrote that the current run has not consumed yet
+  (`tool_calls.replayed_run`), oldest first, each at most once per run:
+  after a crash following X, Y, X the resumed run's X, Y, X are replayed
+  and a 4th X executes. Inside one live run an identical call executes
+  normally - a new row, a normal `Check` and approval - so fs_write X, Y, X
+  leaves X on disk, re-running the same `shell_docker` test script runs a
+  fresh container, and a second `git status` sees the changes;
+  `idx_tool_calls_live_unique` now covers only the in-flight statuses
+  (`intent`, `executing`), so two executions of one key never overlap. A
+  replayed real-tool result carries `replayed:true` plus `replay_note` (the
+  model-facing `mcp/fs.MsgReplayedFromEarlierRun`: "Bu sonuç bu çağrıda
+  yürütülmedi: görevin kesintiye uğrayan önceki bir çalışmasında
+  tamamlanmış aynı çağrının makbuzundan döndü."); a generic-path replay
+  keeps the stored content and appends that text as a last text content.
+  `tool.replayed` names `run` and `receipt_run`; `GET /v1/task/status`
+  shows `worker_run` and each row's `run` / `replayed_run`. The W1
+  auto-retry cap (`CountToolCallAttempts`) counts only the attempts of a key
+  that did not complete after its latest receipt, so completed live
+  repeats never block a W1 call, while every interrupted resume still adds
+  one. A tool error
   (an effect error, a generic-path `isError` result) writes no receipt (the
   row is `failed`; the next identical call may run, with a fresh decision).
   If the effect ran but its receipt cannot be written,

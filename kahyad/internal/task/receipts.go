@@ -69,6 +69,24 @@
 // session re-issuing a completed call gets the stored result, no second
 // execution, no second approval. The tool_calls intent/executing row is the
 // pre-op journal, the receipt the post-op record.
+//
+// FIX-FINAL receipt-replay-per-run (owner decision 2026-10-16): receipts
+// replay only on RESUME. Every tool_calls row records the worker run
+// (incarnation) that made it (tool_calls.run, migrations/0026): a task's
+// first worker spawn is run 1 and every later spawn of the same task (an
+// outbox redispatch - crash resume, cloud-retry redispatch, `kahya task
+// resolve --retry`) the next one; the counter is tasks.worker_run, bumped
+// kahyad-side before the worker starts and resolved here once per tool call
+// (currentRun, WithRunPin) - never taken from the worker. A replay answers
+// only a receipt an EARLIER run wrote that the current run has not consumed
+// yet (oldest first; tool_calls.replayed_run records the consuming run), so
+// each earlier receipt is replayed at most once per run: after a crash
+// following X, Y, X the resumed run's X, Y, X replay those three and a 4th X
+// executes. Inside one live run an identical call executes normally - a new
+// row, a normal policy decision - and many receipts of one key are legal;
+// idx_tool_calls_live_unique still allows only ONE in-flight
+// (intent/executing) attempt per key, so two executions of the identical
+// call never overlap.
 package task
 
 import (
@@ -133,6 +151,17 @@ var ErrReadOnlyClass = errors.New("task: Execute must not be called for class R 
 // for this exact key for the entire retry window.
 var ErrToolCallClaimTimeout = errors.New("task: tool call intent claim timed out waiting on a concurrent in-flight attempt")
 
+// ErrReplayConsumeContended is returned when a replay found an earlier
+// run's receipt but kept losing the compare-and-set that consumes it for the
+// current run (MarkToolCallReplayed) - something else consumed every
+// candidate it saw replayConsumeMaxAttempts times in a row. The keyed mutex
+// rules this out inside one process; the caller refuses the call
+// (fail-closed: it neither replays nor executes).
+var ErrReplayConsumeContended = errors.New("task: replay could not consume an earlier run's receipt (contended)")
+
+// replayConsumeMaxAttempts bounds checkReplay's lookup/consume loop.
+const replayConsumeMaxAttempts = 8
+
 // claimIntentMaxAttempts/claimIntentInitialBackoff/claimIntentMaxBackoff
 // bound claimIntent's retry loop (BLOCKER 1 fix) - see its own doc
 // comment. Worst case total wait is a few seconds, never unbounded.
@@ -151,7 +180,13 @@ type ToolCallStore interface {
 	MarkToolCallExecuting(ctx context.Context, arg sqlcgen.MarkToolCallExecutingParams) error
 	MarkToolCallReceipt(ctx context.Context, arg sqlcgen.MarkToolCallReceiptParams) error
 	MarkToolCallFailed(ctx context.Context, arg sqlcgen.MarkToolCallFailedParams) error
-	GetReceiptToolCall(ctx context.Context, arg sqlcgen.GetReceiptToolCallParams) (sqlcgen.ToolCall, error)
+	// GetReplayableReceiptToolCall / MarkToolCallReplayed are the per-run
+	// replay lookup and its consume step (FIX-FINAL receipt-replay-per-run).
+	GetReplayableReceiptToolCall(ctx context.Context, arg sqlcgen.GetReplayableReceiptToolCallParams) (sqlcgen.ToolCall, error)
+	MarkToolCallReplayed(ctx context.Context, arg sqlcgen.MarkToolCallReplayedParams) (int64, error)
+	// GetTaskWorkerRun reads tasks.worker_run, the task's current worker
+	// run (currentRun).
+	GetTaskWorkerRun(ctx context.Context, id string) (int64, error)
 	ListReceiptlessToolCalls(ctx context.Context, taskID string) ([]sqlcgen.ToolCall, error)
 	CountToolCallAttempts(ctx context.Context, arg sqlcgen.CountToolCallAttemptsParams) (int64, error)
 	ListToolCallsByTask(ctx context.Context, taskID string) ([]sqlcgen.ToolCall, error)
@@ -194,7 +229,8 @@ func hashApprovalToken(token string) sql.NullString {
 
 // toolCallKey is the in-process keyed-mutex key (BLOCKER 1 fix) for one
 // (task_id, tool_name, args_hash) triple - the same triple
-// idx_tool_calls_live_unique and GetReceiptToolCall are both scoped to.
+// idx_tool_calls_live_unique and GetReplayableReceiptToolCall are both
+// scoped to.
 // The NUL separator cannot appear in any of the three fields' normal
 // values (task ids/tool names are ASCII identifiers, args_hash is hex),
 // so this cannot collide two DIFFERENT triples onto the same key.
@@ -280,6 +316,30 @@ const (
 	ClassW2 = policy.ClassW2
 	ClassW3 = policy.ClassW3
 )
+
+// runPinKey is the context key of a tool call's run pin (WithRunPin).
+type runPinKey struct{}
+
+// runPin holds the worker run each task id resolved to for ONE tool call.
+type runPin struct {
+	mu   sync.Mutex
+	runs map[string]int64
+}
+
+// WithRunPin returns ctx carrying a run pin for ONE tool call (FIX-FINAL
+// receipt-replay-per-run): the first Receipts step under it (normally Replay,
+// before the policy check) resolves the task's worker run from
+// tasks.worker_run, and every later step of the same call (Execute after the
+// policy check and any approval wait) reuses that value. So a call is always
+// recorded under the run that issued it, even if the task is redispatched -
+// and tasks.worker_run bumped - while the call waits on an approval: a later
+// run then replays it instead of executing it a second time.
+// kahyad/internal/server installs one per /v1/mcp tools/call
+// (policyGateMiddleware); without a pin every step reads tasks.worker_run
+// itself.
+func WithRunPin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, runPinKey{}, &runPin{runs: make(map[string]int64)})
+}
 
 // keyedMutexes lets Receipts.Execute serialize concurrent calls for the
 // exact same (task_id, tool_name, args_hash) key WITHIN THIS PROCESS
@@ -419,6 +479,35 @@ func (r *Receipts) SetClock(now func() time.Time) { r.now = now }
 
 func (r *Receipts) nowRFC3339() string { return r.now().UTC().Format(time.RFC3339Nano) }
 
+// currentRun resolves taskID's worker run for this tool call (FIX-FINAL
+// receipt-replay-per-run): the value pinned on ctx (WithRunPin) if a step of
+// the same call already resolved it, else tasks.worker_run - kahyad-side
+// state, never a worker-supplied value. A task id with no tasks row is run
+// 0: tool_calls.task_id references tasks(id), so such a task has no row to
+// replay (every lookup is a miss) and an Execute fails closed on the FK. Any
+// other read error is returned and the call is refused (fail-closed).
+func (r *Receipts) currentRun(ctx context.Context, taskID string) (int64, error) {
+	pin, _ := ctx.Value(runPinKey{}).(*runPin)
+	if pin != nil {
+		pin.mu.Lock()
+		defer pin.mu.Unlock()
+		if run, ok := pin.runs[taskID]; ok {
+			return run, nil
+		}
+	}
+	run, err := r.q.GetTaskWorkerRun(ctx, taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		run, err = 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("task: worker run lookup (task=%s): %w", taskID, err)
+	}
+	if pin != nil {
+		pin.runs[taskID] = run
+	}
+	return run, nil
+}
+
 // Execute is the whole W4-02 receipt lifecycle for one side-effectful
 // tool call whose effect lives OUTSIDE brain.db: idempotent-replay check
 // (step 4) -> insert tool_calls status=intent (step 3) -> mark executing
@@ -426,11 +515,14 @@ func (r *Receipts) nowRFC3339() string { return r.now().UTC().Format(time.RFC333
 // write the receipt (commitReceipt); on failure, mark failed and return
 // the effect's error.
 //
-// replayed reports whether result came from an EARLIER completed attempt
-// (effect was NOT invoked this call) - this is the double-execution-safety
-// mechanism the whole W4-02 durability story rests on. A replay hit
-// ledgers EventReplayed and returns immediately; effect is never called at
-// all in that case.
+// replayed reports whether result came from a completed attempt of an
+// EARLIER worker run of the task that this run had not consumed yet (effect
+// was NOT invoked this call) - this is the double-execution-safety mechanism
+// the whole W4-02 durability story rests on. A replay hit ledgers
+// EventReplayed and returns immediately; effect is never called at all in
+// that case. An identical call whose only receipts belong to the current run
+// (or were already consumed by it) executes (FIX-FINAL
+// receipt-replay-per-run).
 //
 // BLOCKER 1 fix: every call for the exact same (task_id, tool_name,
 // args_hash) key is serialized, in this process, by locks before the
@@ -471,22 +563,31 @@ func (r *Receipts) ExecuteDetached(ctx context.Context, in ExecuteInput, effect 
 	}, true)
 }
 
-// Replay answers "does a durable receipt already exist for this exact
-// (task_id, tool_name, args_hash) triple?" WITHOUT claiming an intent row
-// (FIX-I-4). A side-effectful tool calls it BEFORE its policy check on every
-// call, so a resumed session re-issuing an already-completed call neither
-// re-executes it nor asks for (and burns) a second approval: a hit returns
-// the stored result and ledgers EventReplayed. A miss writes nothing. Runs
-// under the same keyed mutex as Execute*, so it never observes a
-// half-written attempt of its own process.
+// Replay answers "did an EARLIER worker run of this task complete this exact
+// (task_id, tool_name, args_hash) call, with a receipt the current run has
+// not consumed yet?" WITHOUT claiming an intent row (FIX-I-4, narrowed to
+// resume by FIX-FINAL receipt-replay-per-run). A side-effectful tool calls
+// it BEFORE its policy check on every call, so a resumed session re-issuing
+// an already-completed call neither re-executes it nor asks for (and burns)
+// a second approval: a hit consumes that receipt for the current run,
+// returns the stored result and ledgers EventReplayed. A miss writes nothing
+// - and an identical call inside the live run that wrote the receipt is
+// always a miss. The run is resolved (and pinned on ctx, WithRunPin) BEFORE
+// the keyed lock, so waiting on an in-flight identical call never moves
+// this call into a later run. Runs under the same keyed mutex as Execute*,
+// so it never observes a half-written attempt of its own process.
 func (r *Receipts) Replay(ctx context.Context, in ExecuteInput) (result json.RawMessage, hit bool, err error) {
+	run, err := r.currentRun(ctx, in.TaskID)
+	if err != nil {
+		return nil, false, err
+	}
 	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
 	defer unlock()
-	res, seq, ok, err := r.checkReplay(ctx, in)
+	res, row, ok, err := r.checkReplay(ctx, in, run)
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	r.ledgerReplayed(ctx, in, seq)
+	r.ledgerReplayed(ctx, in, row, run)
 	return res, true, nil
 }
 
@@ -497,6 +598,10 @@ func (r *Receipts) executeExternal(ctx context.Context, in ExecuteInput, effect 
 	if in.Class == ClassR {
 		return nil, false, ErrReadOnlyClass
 	}
+	run, err := r.currentRun(ctx, in.TaskID)
+	if err != nil {
+		return nil, false, err
+	}
 
 	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
 	defer unlock()
@@ -506,7 +611,7 @@ func (r *Receipts) executeExternal(ctx context.Context, in ExecuteInput, effect 
 	r.beginEffect(in.TaskID)
 	defer r.endEffect(in.TaskID)
 
-	row, replayResult, wasReplayed, err := r.prepare(ctx, in)
+	row, replayResult, wasReplayed, err := r.prepare(ctx, in, run)
 	if err != nil {
 		return nil, false, err
 	}
@@ -571,6 +676,10 @@ func (r *Receipts) ExecuteInTx(ctx context.Context, in ExecuteInput, effect Effe
 	if in.Class == ClassR {
 		return nil, false, ErrReadOnlyClass
 	}
+	run, err := r.currentRun(ctx, in.TaskID)
+	if err != nil {
+		return nil, false, err
+	}
 
 	unlock := r.locks.Lock(toolCallKey(in.TaskID, in.ToolName, in.ArgsHash))
 	defer unlock()
@@ -580,7 +689,7 @@ func (r *Receipts) ExecuteInTx(ctx context.Context, in ExecuteInput, effect Effe
 	r.beginEffect(in.TaskID)
 	defer r.endEffect(in.TaskID)
 
-	row, replayResult, wasReplayed, err := r.prepare(ctx, in)
+	row, replayResult, wasReplayed, err := r.prepare(ctx, in, run)
 	if err != nil {
 		return nil, false, err
 	}
@@ -609,24 +718,27 @@ func (r *Receipts) ExecuteInTx(ctx context.Context, in ExecuteInput, effect Effe
 // unique-constraint race) -> mark executing (an autocommit statement, as
 // before). replayed=true means replayResult is a stored receipt's result
 // and EventReplayed has been ledgered; the caller must not run the effect.
-func (r *Receipts) prepare(ctx context.Context, in ExecuteInput) (row sqlcgen.ToolCall, replayResult json.RawMessage, replayed bool, err error) {
-	// Step 4: idempotent replay - a status='receipt' row for this exact
-	// (task_id, tool_name, args_hash) triple already exists, from ANY
-	// earlier attempt (any seq).
-	if hitResult, seq, hit, cerr := r.checkReplay(ctx, in); cerr != nil {
+// run is the call's worker run (currentRun): the intent row records it.
+func (r *Receipts) prepare(ctx context.Context, in ExecuteInput, run int64) (row sqlcgen.ToolCall, replayResult json.RawMessage, replayed bool, err error) {
+	// Step 4: idempotent replay - an earlier run completed this exact
+	// (task_id, tool_name, args_hash) call and the current run has not
+	// consumed that receipt yet (an identical call of an earlier run that
+	// completed while this one waited on its policy decision is caught here
+	// too).
+	if hitResult, hitRow, hit, cerr := r.checkReplay(ctx, in, run); cerr != nil {
 		return sqlcgen.ToolCall{}, nil, false, cerr
 	} else if hit {
-		r.ledgerReplayed(ctx, in, seq)
+		r.ledgerReplayed(ctx, in, hitRow, run)
 		return sqlcgen.ToolCall{}, hitResult, true, nil
 	}
 
 	// Step 3: intent.
-	row, claimedReplay, replaySeq, wasReplayed, err := r.claimIntent(ctx, in)
+	row, claimedReplay, replayRow, wasReplayed, err := r.claimIntent(ctx, in, run)
 	if err != nil {
 		return sqlcgen.ToolCall{}, nil, false, err
 	}
 	if wasReplayed {
-		r.ledgerReplayed(ctx, in, replaySeq)
+		r.ledgerReplayed(ctx, in, replayRow, run)
 		return sqlcgen.ToolCall{}, claimedReplay, true, nil
 	}
 
@@ -691,90 +803,106 @@ func (r *Receipts) commitReceipt(ctx context.Context, id int64, in ExecuteInput,
 	return effectResult, false, nil
 }
 
-// checkReplay looks up an existing 'receipt' row for in's exact
-// (task_id, tool_name, args_hash) triple (task spec step 4). hit=false,
-// err=nil means no receipt exists (yet) - callers that need to
-// distinguish "genuinely fresh" from "a rival attempt is currently live"
-// do so themselves (claimIntent); this method only ever answers the
-// narrower "is there a receipt to replay" question.
-func (r *Receipts) checkReplay(ctx context.Context, in ExecuteInput) (result json.RawMessage, seq int64, hit bool, err error) {
-	existing, err := r.q.GetReceiptToolCall(ctx, sqlcgen.GetReceiptToolCallParams{
-		TaskID: in.TaskID, ToolName: in.ToolName, ArgsHash: in.ArgsHash,
-	})
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, 0, false, nil
+// checkReplay looks up the oldest receipt of in's exact (task_id,
+// tool_name, args_hash) triple that an EARLIER worker run wrote and run has
+// not consumed yet (task spec step 4, FIX-FINAL receipt-replay-per-run),
+// and consumes it for run (MarkToolCallReplayed, a compare-and-set:
+// another replay of run that consumed it first sends the loop to the next
+// candidate). hit=false, err=nil means there is nothing to replay - callers
+// that need to distinguish "genuinely fresh" from "a rival attempt is
+// currently live" do so themselves (claimIntent). A stored receipt that
+// cannot be decoded is an error and is NOT consumed.
+func (r *Receipts) checkReplay(ctx context.Context, in ExecuteInput, run int64) (result json.RawMessage, row sqlcgen.ToolCall, hit bool, err error) {
+	for attempt := 0; attempt < replayConsumeMaxAttempts; attempt++ {
+		existing, err := r.q.GetReplayableReceiptToolCall(ctx, sqlcgen.GetReplayableReceiptToolCallParams{
+			TaskID: in.TaskID, ToolName: in.ToolName, ArgsHash: in.ArgsHash, CurrentRun: run,
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, sqlcgen.ToolCall{}, false, nil
+			}
+			return nil, sqlcgen.ToolCall{}, false, fmt.Errorf("task: replay lookup (task=%s tool=%s): %w", in.TaskID, in.ToolName, err)
 		}
-		return nil, 0, false, fmt.Errorf("task: replay lookup (task=%s tool=%s): %w", in.TaskID, in.ToolName, err)
+		var env receiptEnvelope
+		if uerr := json.Unmarshal([]byte(existing.ReceiptJson.String), &env); uerr != nil {
+			return nil, sqlcgen.ToolCall{}, false, fmt.Errorf("task: decode stored receipt (task=%s tool=%s): %w", in.TaskID, in.ToolName, uerr)
+		}
+		n, err := r.q.MarkToolCallReplayed(ctx, sqlcgen.MarkToolCallReplayedParams{CurrentRun: run, ID: existing.ID})
+		if err != nil {
+			return nil, sqlcgen.ToolCall{}, false, fmt.Errorf("task: consume replayed receipt (id=%d run=%d): %w", existing.ID, run, err)
+		}
+		if n == 1 {
+			return env.Result, existing, true, nil
+		}
 	}
-	var env receiptEnvelope
-	if uerr := json.Unmarshal([]byte(existing.ReceiptJson.String), &env); uerr != nil {
-		return nil, 0, false, fmt.Errorf("task: decode stored receipt (task=%s tool=%s): %w", in.TaskID, in.ToolName, uerr)
-	}
-	return env.Result, existing.Seq, true, nil
+	return nil, sqlcgen.ToolCall{}, false, fmt.Errorf("%w (task=%s tool=%s run=%d)", ErrReplayConsumeContended, in.TaskID, in.ToolName, run)
 }
 
-func (r *Receipts) ledgerReplayed(ctx context.Context, in ExecuteInput, seq int64) {
+// ledgerReplayed records a replay: seq/tool_call_id/receipt_run name the
+// earlier run's receipt that answered, run the run it was replayed for.
+func (r *Receipts) ledgerReplayed(ctx context.Context, in ExecuteInput, receipt sqlcgen.ToolCall, run int64) {
 	r.ledgerRaw(ctx, in.TraceID, EventReplayed, map[string]any{
-		"event": EventReplayed, "task_id": in.TaskID, "tool": in.ToolName, "args_hash": in.ArgsHash, "seq": seq,
+		"event": EventReplayed, "task_id": in.TaskID, "tool": in.ToolName, "args_hash": in.ArgsHash,
+		"seq": receipt.Seq, "tool_call_id": receipt.ID, "receipt_run": receipt.Run, "run": run,
 	})
 }
 
 // claimIntent inserts a fresh tool_calls 'intent' row for in's
-// (task_id, tool_name, args_hash) triple, at the next seq for that key
-// (task spec step 3).
+// (task_id, tool_name, args_hash) triple, at the next seq for that key and
+// under the call's worker run (task spec step 3).
 //
-// BLOCKER 1 fix: idx_tool_calls_live_unique (migrations/0008) makes a
-// second live (intent/executing/receipt) row for the exact same key
-// impossible at the DB level. Execute's in-process keyed mutex already
+// BLOCKER 1 fix: idx_tool_calls_live_unique (migrations/0008, narrowed to
+// the in-flight statuses by 0026) makes a second IN-FLIGHT
+// (intent/executing) row for the exact same key impossible at the DB level. Execute's in-process keyed mutex already
 // rules out a SAME-process rival ever reaching this method concurrently,
 // so a unique-constraint hit here can only mean a DIFFERENT process (or
 // connection) currently holds the live row for this key. This retries
 // with a short bounded backoff instead of failing outright: each
 // iteration either (a) wins the insert outright, (b) discovers the rival
-// has since committed a receipt - returned directly (wasReplayed=true)
-// for Execute to replay, exactly as if checkReplay had run one instant
-// later - or (c) discovers the rival has since failed, which frees the
-// unique slot so the next iteration's insert succeeds. Returns
-// ErrToolCallClaimTimeout if none of those resolve within
-// claimIntentMaxAttempts.
-func (r *Receipts) claimIntent(ctx context.Context, in ExecuteInput) (row sqlcgen.ToolCall, replayResult json.RawMessage, replaySeq int64, wasReplayed bool, err error) {
+// was an EARLIER run's attempt that has since committed a receipt -
+// returned directly (wasReplayed=true) for Execute to replay, exactly as if
+// checkReplay had run one instant later - or (c) discovers the rival has
+// since resolved (failed, or a receipt of the current run: an identical
+// call executes again inside a live run), which frees the unique slot so
+// the next iteration's insert succeeds. Returns ErrToolCallClaimTimeout if
+// none of those resolve within claimIntentMaxAttempts.
+func (r *Receipts) claimIntent(ctx context.Context, in ExecuteInput, run int64) (row sqlcgen.ToolCall, replayResult json.RawMessage, replayRow sqlcgen.ToolCall, wasReplayed bool, err error) {
 	backoff := claimIntentInitialBackoff
 	for attempt := 0; attempt < claimIntentMaxAttempts; attempt++ {
 		seq, serr := r.q.NextToolCallSeq(ctx, sqlcgen.NextToolCallSeqParams{
 			TaskID: in.TaskID, ToolName: in.ToolName, ArgsHash: in.ArgsHash,
 		})
 		if serr != nil {
-			return sqlcgen.ToolCall{}, nil, 0, false, fmt.Errorf("task: next seq (task=%s tool=%s): %w", in.TaskID, in.ToolName, serr)
+			return sqlcgen.ToolCall{}, nil, sqlcgen.ToolCall{}, false, fmt.Errorf("task: next seq (task=%s tool=%s): %w", in.TaskID, in.ToolName, serr)
 		}
 		inserted, ierr := r.q.InsertToolCallIntent(ctx, sqlcgen.InsertToolCallIntentParams{
 			TaskID: in.TaskID, Seq: seq, ToolName: in.ToolName, Class: string(in.Class),
 			ArgsHash: in.ArgsHash, ApprovalTokenID: hashApprovalToken(in.ApprovalToken),
-			CreatedAt: r.nowRFC3339(),
+			CreatedAt: r.nowRFC3339(), Run: run,
 		})
 		if ierr == nil {
-			return inserted, nil, 0, false, nil
+			return inserted, nil, sqlcgen.ToolCall{}, false, nil
 		}
 		if !isUniqueConstraintViolation(ierr) {
-			return sqlcgen.ToolCall{}, nil, 0, false, fmt.Errorf("task: insert tool_calls intent (task=%s tool=%s): %w", in.TaskID, in.ToolName, ierr)
+			return sqlcgen.ToolCall{}, nil, sqlcgen.ToolCall{}, false, fmt.Errorf("task: insert tool_calls intent (task=%s tool=%s): %w", in.TaskID, in.ToolName, ierr)
 		}
 
-		if hitResult, hitSeq, hit, rerr := r.checkReplay(ctx, in); rerr != nil {
-			return sqlcgen.ToolCall{}, nil, 0, false, rerr
+		if hitResult, hitRow, hit, rerr := r.checkReplay(ctx, in, run); rerr != nil {
+			return sqlcgen.ToolCall{}, nil, sqlcgen.ToolCall{}, false, rerr
 		} else if hit {
-			return sqlcgen.ToolCall{}, hitResult, hitSeq, true, nil
+			return sqlcgen.ToolCall{}, hitResult, hitRow, true, nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return sqlcgen.ToolCall{}, nil, 0, false, ctx.Err()
+			return sqlcgen.ToolCall{}, nil, sqlcgen.ToolCall{}, false, ctx.Err()
 		case <-time.After(backoff):
 		}
 		if backoff < claimIntentMaxBackoff {
 			backoff *= 2
 		}
 	}
-	return sqlcgen.ToolCall{}, nil, 0, false, fmt.Errorf("%w (task=%s tool=%s)", ErrToolCallClaimTimeout, in.TaskID, in.ToolName)
+	return sqlcgen.ToolCall{}, nil, sqlcgen.ToolCall{}, false, fmt.Errorf("%w (task=%s tool=%s)", ErrToolCallClaimTimeout, in.TaskID, in.ToolName)
 }
 
 // failAndReturn marks the tool_calls row id 'failed' then returns cause -

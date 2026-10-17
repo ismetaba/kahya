@@ -10,6 +10,7 @@ import (
 
 	"kahya/kahyad/internal/policy"
 	"kahya/kahyad/internal/store"
+	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/task"
 	mcpfs "kahya/mcp/fs"
 )
@@ -51,6 +52,36 @@ func toolCallRows(t *testing.T, st *store.Store, taskID string) (receipt, failed
 	return receipt, failed, other
 }
 
+// beginWorkerRun counts one more worker spawn of taskID (tasks.worker_run)
+// exactly as handleTask and the outbox dispatcher do before a worker starts
+// (FIX-FINAL receipt-replay-per-run) - the test's stand-in for "the task's
+// worker was respawned (resumed)". Returns the new run.
+func beginWorkerRun(t *testing.T, st *store.Store, taskID string) int64 {
+	t.Helper()
+	run, err := st.Queries.IncrementTaskWorkerRun(context.Background(), sqlcgen.IncrementTaskWorkerRunParams{UpdatedAt: rfc3339Now(), ID: taskID})
+	if err != nil {
+		t.Fatalf("IncrementTaskWorkerRun(%s): %v", taskID, err)
+	}
+	return run
+}
+
+// assertReplayNote checks a generic-path replay carries the stored content
+// unchanged first and the model-facing replay note last.
+func assertReplayNote(t *testing.T, replayed, first jsonrpcToolCallResult) {
+	t.Helper()
+	if len(replayed.Result.Content) != len(first.Result.Content)+1 {
+		t.Fatalf("replayed content = %+v, want the stored %+v plus the replay note", replayed.Result.Content, first.Result.Content)
+	}
+	for i := range first.Result.Content {
+		if replayed.Result.Content[i].Text != first.Result.Content[i].Text {
+			t.Fatalf("replayed content[%d] = %q, want the stored %q", i, replayed.Result.Content[i].Text, first.Result.Content[i].Text)
+		}
+	}
+	if got := replayed.Result.Content[len(first.Result.Content)].Text; got != mcpfs.MsgReplayedFromEarlierRun {
+		t.Fatalf("replay note = %q, want %q", got, mcpfs.MsgReplayedFromEarlierRun)
+	}
+}
+
 func newReceiptsMCPFixture(t *testing.T, extra func(srv *Server, st *store.Store)) mcpTestFixture {
 	t.Helper()
 	return newMCPTestFixtureWith(t, testPolicyDoc(), func(srv *Server, st *store.Store) {
@@ -74,25 +105,30 @@ func postToolCall(t *testing.T, f mcpTestFixture, body, taskID string) (raw []by
 
 // TestPolicyGateMiddlewareWritesReceiptForSideEffectfulTool: a W1 tool on
 // the generic /v1/mcp path (memory_write) gets intent -> executing ->
-// receipt; the same call again - even serialized with another key order and
-// spacing, as a resumed model may - is answered from the receipt: the
-// handler does not run a second time and tool.replayed is ledgered.
+// receipt; the same call re-issued by the task's NEXT worker run (a resume)
+// - even serialized with another key order and spacing, as a resumed model
+// may - is answered from the receipt: the handler does not run a second
+// time, tool.replayed is ledgered and the result carries the replay note
+// (FIX-FINAL receipt-replay-per-run).
 func TestPolicyGateMiddlewareWritesReceiptForSideEffectfulTool(t *testing.T) {
 	f := newReceiptsMCPFixture(t, nil)
 	insertDurabilityTestTask(t, f.store, "rt-1")
+	beginWorkerRun(t, f.store, "rt-1")
 	seedAutonomyState(t, f.store, "memory_write", string(policy.ClassW1), "global", 2)
 
 	_, first := postToolCall(t, f, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_write","arguments":{"content":"makbuz testi","file":"inbox/receipt.md"}}}`, "rt-1")
 	if first.Result.IsError {
 		t.Fatalf("first memory_write failed: %+v", first)
 	}
+	beginWorkerRun(t, f.store, "rt-1")
 	_, second := postToolCall(t, f, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_write","arguments":{ "file" : "inbox/receipt.md", "content" : "makbuz testi" }}}`, "rt-1")
 	if second.Result.IsError {
 		t.Fatalf("replayed memory_write failed: %+v", second)
 	}
-	if len(second.Result.Content) == 0 || len(first.Result.Content) == 0 || second.Result.Content[0].Text != first.Result.Content[0].Text {
-		t.Fatalf("replayed result %+v != first %+v", second.Result, first.Result)
+	if len(first.Result.Content) == 0 {
+		t.Fatalf("first result has no content: %+v", first.Result)
 	}
+	assertReplayNote(t, second, first)
 	if n := countEventsOfKind(t, f.store, "memory_write"); n != 1 {
 		t.Fatalf("memory_write handler ran %d times, want 1", n)
 	}
@@ -153,7 +189,8 @@ func TestPolicyGateMiddlewareToolErrorWritesNoReceipt(t *testing.T) {
 
 // TestDevStubThroughGenericPathRunsEffectExactlyOnce is W4-07 scenario A's
 // unit-level twin after FIX-I-4: w2_slow_stub's receipt is the GENERIC
-// path's, and the second identical call never appends to the counter.
+// path's, and the identical call the resumed run (the next worker run)
+// re-issues never appends to the counter.
 func TestDevStubThroughGenericPathRunsEffectExactlyOnce(t *testing.T) {
 	doc := testPolicyDoc()
 	rule := policy.ToolRule{Name: devStubToolName, Class: policy.ClassW2, ScopeKey: "global"}
@@ -168,14 +205,14 @@ func TestDevStubThroughGenericPathRunsEffectExactlyOnce(t *testing.T) {
 	args, _ := json.Marshal(DevStubArgs{DurationMs: 5, CounterFile: counter})
 	body := `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"w2_slow_stub","arguments":` + string(args) + `}}`
 
+	beginWorkerRun(t, f.store, "dev-t1")
 	_, first := postToolCall(t, f, body, "dev-t1")
+	beginWorkerRun(t, f.store, "dev-t1") // SIGKILL mid-call + resume
 	_, second := postToolCall(t, f, body, "dev-t1")
 	if first.Result.IsError || second.Result.IsError {
 		t.Fatalf("dev stub calls = %+v / %+v", first, second)
 	}
-	if second.Result.Content[0].Text != first.Result.Content[0].Text {
-		t.Fatalf("replayed result %q != first %q", second.Result.Content[0].Text, first.Result.Content[0].Text)
-	}
+	assertReplayNote(t, second, first)
 	if b, _ := os.ReadFile(counter); string(b) != "1\n" {
 		t.Fatalf("counter = %q, want exactly one line (side effect ran twice)", b)
 	}
@@ -189,7 +226,8 @@ func TestDevStubThroughGenericPathRunsEffectExactlyOnce(t *testing.T) {
 
 // TestFSWriteThroughMCPWritesReceiptAndReplays: the real fs tool, wired
 // through the server's receipt adapter exactly as main.go wires it, writes a
-// tool_calls receipt keyed on its canonical input and replays it.
+// tool_calls receipt keyed on its canonical input and replays it for the
+// task's next worker run (a resume).
 func TestFSWriteThroughMCPWritesReceiptAndReplays(t *testing.T) {
 	home := t.TempDir()
 	f := newReceiptsMCPFixture(t, func(srv *Server, st *store.Store) {
@@ -204,6 +242,7 @@ func TestFSWriteThroughMCPWritesReceiptAndReplays(t *testing.T) {
 	b64 := "bWVyaGFiYQo="
 	body := `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fs_write","arguments":{"path":"` + target + `","content_base64":"` + b64 + `"}}}`
 
+	beginWorkerRun(t, f.store, "rt-fs")
 	_, first := postToolCall(t, f, body, "rt-fs")
 	if first.Result.IsError {
 		t.Fatalf("first fs_write: %+v", first)
@@ -211,9 +250,14 @@ func TestFSWriteThroughMCPWritesReceiptAndReplays(t *testing.T) {
 	if err := os.WriteFile(target, []byte("sonradan degisti\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	beginWorkerRun(t, f.store, "rt-fs")
 	_, second := postToolCall(t, f, body, "rt-fs")
 	if second.Result.IsError {
 		t.Fatalf("replayed fs_write: %+v", second)
+	}
+	var replayedOut mcpfs.FsWriteOutput
+	if err := json.Unmarshal([]byte(second.Result.Content[0].Text), &replayedOut); err != nil || !replayedOut.Replayed || replayedOut.ReplayNote != mcpfs.MsgReplayedFromEarlierRun {
+		t.Fatalf("replayed fs_write output = %s (%v), want replayed:true with the replay note", second.Result.Content[0].Text, err)
 	}
 	if b, _ := os.ReadFile(target); string(b) != "sonradan degisti\n" {
 		t.Fatalf("file = %q after the replay: fs_write ran twice (wanted %q to stay overwritten only once)", b, content)
@@ -245,17 +289,22 @@ func TestReceiptExecutorDenyAllServesNoReplay(t *testing.T) {
 	r := task.NewReceipts(st.DB(), st.Queries, st)
 	in := mcpfs.ReceiptInput{TaskID: "rt-da", TraceID: "trace-rt-da", Tool: "fs_write", Class: "W1", ArgsHash: "h"}
 	live := NewReceiptExecutor(r, func() bool { return false })
+	beginWorkerRun(t, st, "rt-da")
 	if _, _, err := live.Execute(context.Background(), in, func(context.Context) (json.RawMessage, error) {
 		return json.RawMessage(`{"ok":true}`), nil
 	}); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if _, hit, err := live.Replay(context.Background(), in); err != nil || !hit {
-		t.Fatalf("Replay with deny-all off = (hit=%v, %v), want a hit", hit, err)
-	}
+	beginWorkerRun(t, st, "rt-da") // resumed: run 1's receipt is replayable
+	// Deny-all first: it must miss although an unconsumed receipt exists...
 	denied := NewReceiptExecutor(r, func() bool { return true })
 	if _, hit, err := denied.Replay(context.Background(), in); err != nil || hit {
 		t.Fatalf("Replay in deny-all mode = (hit=%v, %v), want a miss", hit, err)
+	}
+	// ...and it consumed nothing: the same receipt still replays with
+	// deny-all off.
+	if _, hit, err := live.Replay(context.Background(), in); err != nil || !hit {
+		t.Fatalf("Replay with deny-all off = (hit=%v, %v), want a hit", hit, err)
 	}
 	if srvWithout := New(testConfig(filepath.Join(shortSocketDir(t), "k.sock")), testLogger(t), "v", healthyDB); srvWithout.ReceiptExecutor() != nil {
 		t.Fatal("ReceiptExecutor() without SetReceipts must be a nil interface (tools then take the direct path)")

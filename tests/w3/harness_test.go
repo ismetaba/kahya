@@ -817,6 +817,27 @@ func (d *daemon) seedResolvableSession(t *testing.T, taskID, traceID string) {
 	}
 }
 
+// beginWorkerRun counts one more worker spawn of taskID in tasks.worker_run,
+// exactly as kahyad's own spawn sites do before a worker starts (FIX-FINAL
+// receipt-replay-per-run): this package drives /v1/mcp with no real worker,
+// so a test that needs "the task was resumed in a new worker run" bumps the
+// counter itself, like seedResolvableSession seeds the row.
+func (d *daemon) beginWorkerRun(t *testing.T, taskID string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", d.dbPath+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("beginWorkerRun: open %s: %v", d.dbPath, err)
+	}
+	defer db.Close()
+	res, err := db.Exec(`UPDATE tasks SET worker_run = worker_run + 1 WHERE id = ?`, taskID)
+	if err != nil {
+		t.Fatalf("beginWorkerRun(%s): %v", taskID, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("beginWorkerRun(%s): %d rows, want 1", taskID, n)
+	}
+}
+
 func (d *daemon) mcpCall(t *testing.T, traceID, taskID, name string, args map[string]any) mcpResult {
 	t.Helper()
 	d.seedResolvableSession(t, taskID, traceID)

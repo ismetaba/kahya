@@ -95,8 +95,11 @@ func waitForSentMessages(t *testing.T, fake *faketelegram.Server, want int, time
 // identical fs_write retry reaches the real mcp/fs.Server.HandleWrite,
 // whose binding Engine.Check redeems the single-use approval grant into a
 // fresh token it consumes, and the write happens exactly once. A third
-// identical call needs approval again (the grant is single-use). This
-// suite runs with approval_wait_seconds: 0 (the first call answers at
+// identical call of the same live worker run needs approval again (the
+// grant is single-use, and a repeat inside one run is never answered from a
+// receipt - FIX-FINAL receipt-replay-per-run); once the task is resumed in
+// its next worker run, the identical call is answered from the receipt.
+// This suite runs with approval_wait_seconds: 0 (the first call answers at
 // once); TestGate1c proves the parked-call variant of the same loop.
 func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 	fake := faketelegram.New()
@@ -213,19 +216,35 @@ func TestGate1_W2RequiresByteExactTelegramDiffApproval(t *testing.T) {
 		t.Fatalf("unconsumed approval_tokens for pending %s = %d, want 0 (the grant is single-use)", id, unconsumedGrants)
 	}
 
-	// FIX-I-4: a THIRD identical call of the SAME task (a resumed session
-	// re-issuing the completed call) is answered from its durable receipt -
-	// nothing executes, no new approval is asked for, no token is consumed.
+	// FIX-FINAL receipt-replay-per-run: a THIRD identical call inside the
+	// SAME live worker run is a legitimate repeat - never answered from the
+	// receipt - so it needs a fresh approval (the grant was single-use).
 	beforeThird := d.existingApprovalIDs(t, "fs_write")
 	res3 := d.mcpCall(t, traceID, taskID, "fs_write", args)
-	if res3.IsError || !strings.Contains(res3.Text, `"replayed":true`) {
-		t.Fatalf("third identical fs_write = %+v, want the stored result replayed", res3)
+	if !res3.IsError || strings.Contains(res3.Text, `"replayed":true`) {
+		t.Fatalf("third identical fs_write of the live run = %+v, want needs_approval (no replay inside one run)", res3)
 	}
-	if after := d.existingApprovalIDs(t, "fs_write"); len(after) != len(beforeThird) {
-		t.Fatalf("pending fs_write approvals %d -> %d: a replay must never ask for approval", len(beforeThird), len(after))
+	if fresh := d.newPendingID(t, "fs_write", beforeThird); fresh == id {
+		t.Fatalf("the live repeat reused the consumed pending id %s", id)
+	}
+	if n := countEventsMatching(t, db, traceID, "fs_write_replayed"); n != 0 {
+		t.Fatalf("fs_write_replayed after a live repeat = %d, want 0", n)
+	}
+
+	// FIX-I-4: once the task is resumed in its NEXT worker run, the same call
+	// re-issued by the resumed session is answered from its durable receipt -
+	// nothing executes, no new approval is asked for, no token is consumed.
+	d.beginWorkerRun(t, taskID)
+	beforeFourth := d.existingApprovalIDs(t, "fs_write")
+	res4r := d.mcpCall(t, traceID, taskID, "fs_write", args)
+	if res4r.IsError || !strings.Contains(res4r.Text, `"replayed":true`) {
+		t.Fatalf("resumed run's identical fs_write = %+v, want the stored result replayed", res4r)
+	}
+	if after := d.existingApprovalIDs(t, "fs_write"); len(after) != len(beforeFourth) {
+		t.Fatalf("pending fs_write approvals %d -> %d: a replay must never ask for approval", len(beforeFourth), len(after))
 	}
 	if n := countEventsMatching(t, db, traceID, "fs_write"); n != 1 {
-		t.Fatalf("fs_write ledger events after the third call = %d, want still exactly 1", n)
+		t.Fatalf("fs_write ledger events after the replay = %d, want still exactly 1", n)
 	}
 	if n := countEventsMatching(t, db, traceID, "fs_write_replayed"); n != 1 {
 		t.Fatalf("fs_write_replayed ledger events = %d, want 1", n)

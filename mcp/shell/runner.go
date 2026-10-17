@@ -25,9 +25,10 @@
 //  4. the actual execution (docker run / the fixed-argv host command).
 //  5. the ledger event (shell_exec / hostexec_exec or hostexec_denied).
 //
-// FIX-I-4: between steps 1 and 2 a completed identical call of the same
-// task is answered from its durable receipt (no policy decision, nothing
-// executes), and steps 4-5 run as one effect inside kahyad's tool_calls
+// FIX-I-4: between steps 1 and 2 an identical call an EARLIER worker run of
+// the same task completed (a resume; FIX-FINAL receipt-replay-per-run) is
+// answered from its durable receipt (no policy decision, nothing executes),
+// and steps 4-5 run as one effect inside kahyad's tool_calls
 // receipt lifecycle (mcp/fs/receipts.go; Runner.Receipts/HostExec.Receipts).
 //
 // PolicyClient, Ledger, and Logger are literal type ALIASES of mcp/fs's
@@ -213,10 +214,15 @@ type RunOutput struct {
 	Workdir       string `json:"workdir"`
 	ContainerName string `json:"container_name"`
 	TimedOut      bool   `json:"timed_out"`
-	// Replayed is true when this is the stored result of an EARLIER,
-	// identical, completed shell_docker call of the same task (FIX-I-4
-	// receipt replay): no container ran this call.
+	// Replayed is true when this is the stored result of an identical
+	// shell_docker call that an EARLIER worker run of the same task
+	// completed (FIX-I-4 receipt replay, per run since FIX-FINAL
+	// receipt-replay-per-run): no container ran this call. Re-running the
+	// same script inside one live run (tests after an edit, a retry of a
+	// timed-out run) runs a fresh container.
 	Replayed bool `json:"replayed,omitempty"`
+	// ReplayNote is mcpfs.MsgReplayedFromEarlierRun on a replayed result.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // Result is one Executor.Run's outcome.
@@ -426,8 +432,9 @@ type Runner struct {
 	// SetEgressTokenRegistrar.
 	EgressTokenRegistrar EgressTokenRegistrar
 
-	// Receipts is the FIX-I-4 receipt seam (mcp/fs/receipts.go): a completed
-	// identical call of the same task is replayed before any docker/egress
+	// Receipts is the FIX-I-4 receipt seam (mcp/fs/receipts.go): an identical
+	// call an earlier worker run of the task completed is replayed before
+	// any docker/egress
 	// work or policy decision, and the container run itself executes inside
 	// kahyad's tool_calls lifecycle. nil = direct path (tests); kahyad
 	// always wires it.
@@ -566,8 +573,9 @@ func (r *Runner) Run(ctx context.Context, traceID, taskID string, in RunInput) (
 	}
 
 	// FIX-I-4: after every mechanical refusal, before any docker/egress work
-	// or policy decision - a completed identical call of the same task
-	// answers from its receipt (needs no daemon, no approval, no token).
+	// or policy decision - an identical call an earlier worker run of the
+	// task completed answers from its receipt (needs no daemon, no
+	// approval, no token).
 	rin := ReceiptInput{TaskID: taskID, TraceID: traceID, Tool: "shell_docker", ArgsHash: shellDockerReceiptHash(in, cp.Match, timeoutS)}
 	var stored RunOutput
 	if hit, err := mcpfs.ReplayReceipt(ctx, r.Receipts, rin, &stored); err != nil {
@@ -831,6 +839,7 @@ func (r *Runner) replayedRun(ctx context.Context, traceID, taskID string, out Ru
 		"workdir": out.Workdir, "container_name": out.ContainerName,
 	})
 	out.Replayed = true
+	out.ReplayNote = mcpfs.MsgReplayedFromEarlierRun
 	return out
 }
 

@@ -287,11 +287,11 @@ func (r *Resume) Scan(ctx context.Context) (int, error) {
 //     Turkish W2/W3 string naming the newest such row's tool. No
 //     auto-retry at all (HANDOFF §6 W4: "yalniz W1 oto-tekrar, W2/W3
 //     asla").
-//   - Otherwise (all W1) -> count every attempt ever made for each
-//     distinct (task_id, tool_name, args_hash) triple; any past
-//     task.retry.w1_max_auto -> blocked_user + the exact Turkish W1-cap
-//     string for the newest such row; all within the cap -> requeue for
-//     resume (auto-retry).
+//   - Otherwise (all W1) -> count the interrupted/failed attempts of each
+//     distinct (task_id, tool_name, args_hash) triple since its latest
+//     receipt (CountToolCallAttempts); any past task.retry.w1_max_auto ->
+//     blocked_user + the exact Turkish W1-cap string for the newest such
+//     row; all within the cap -> requeue for resume (auto-retry).
 //   - A block is made durable FIRST (the blocked_user transition), then
 //     every row is marked failed, then the notice is sent; a requeue
 //     marks every row first and enqueues only when all marks landed
@@ -336,8 +336,12 @@ func (r *Resume) ProcessTask(ctx context.Context, t sqlcgen.Task) error {
 		}
 	}
 
-	// All W1: CountToolCallAttempts counts every row of the triple whatever
-	// its status, so it is the same before and after the marks.
+	// All W1: CountToolCallAttempts counts the triple's attempts that did
+	// not complete (intent/executing/failed) after its latest receipt
+	// (FIX-FINAL receipt-replay-per-run: completed live repeats of an
+	// identical call never count against the cap) - marking a receipt-less
+	// row failed keeps it counted, so the count is the same before and after
+	// the marks.
 	type triple struct{ tool, argsHash string }
 	counted := make(map[triple]bool, len(rows))
 	for _, row := range rows {

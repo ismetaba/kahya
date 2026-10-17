@@ -10,9 +10,15 @@
 //     Receipts.ExecuteDetached;
 //   - every other tool mounted on /v1/mcp (memory_write/memory_forget, the
 //     dev-only w2_slow_stub) goes through policyGateMiddleware's generic
-//     path, which replays a completed identical call BEFORE the policy
-//     check and runs a non-R call's handler inside ExecuteDetached
-//     (mcpReplayStoredResult / mcpExecuteWithReceipt).
+//     path, which replays an identical call an EARLIER worker run completed
+//     BEFORE the policy check and runs a non-R call's handler inside
+//     ExecuteDetached (mcpReplayStoredResult / mcpExecuteWithReceipt).
+//
+// FIX-FINAL receipt-replay-per-run: a receipt is replayed only for a later
+// (resumed) run of the task - at most once per run - and never inside the
+// live run that wrote it, where an identical call executes again. The run
+// is kahyad-side state (tasks.worker_run, pinned per tools/call by
+// policyGateMiddleware's task.WithRunPin), never a worker value.
 //
 // kahyad stays brain.db's only writer: the mcp/* packages never touch the
 // DB, they call back into this process through the adapter.
@@ -118,7 +124,16 @@ func (s *Server) mcpReplayStoredResult(ctx context.Context, in task.ExecuteInput
 		return nil, false, err
 	}
 	s.log.With(in.TraceID).Info("mcp_tool_replayed", "tool", in.ToolName, "task_id", in.TaskID)
-	return &out, true, nil
+	return withReplayNote(&out), true, nil
+}
+
+// withReplayNote appends the model-facing mcp/fs.MsgReplayedFromEarlierRun
+// to a generic-path result answered from an earlier run's receipt
+// (FIX-FINAL receipt-replay-per-run) - the stored content stays first and
+// unchanged; the note tells the resumed model the call did not run again.
+func withReplayNote(out *mcp.CallToolResult) *mcp.CallToolResult {
+	out.Content = append(out.Content, &mcp.TextContent{Text: mcpfs.MsgReplayedFromEarlierRun})
+	return out
 }
 
 // errToolResultIsError marks a handler that returned an MCP tool error
@@ -132,8 +147,8 @@ var errToolResultIsError = errors.New("server: tool returned an error result")
 // request's cancellation (the W4-07 posture: a worker killed mid-call must
 // not abandon a half-done effect). The handler's successful CallToolResult
 // is the receipt; a tool error result is returned as is with no receipt; a
-// replay hit (an identical call completed meanwhile) returns the stored
-// result.
+// replay hit (an identical call of an earlier run completed meanwhile)
+// returns the stored result.
 func (s *Server) mcpExecuteWithReceipt(ctx context.Context, in task.ExecuteInput, run func(context.Context) (mcp.Result, error)) (mcp.Result, error) {
 	var toolErrResult, fresh mcp.Result
 	raw, replayed, err := s.receipts.ExecuteDetached(context.WithoutCancel(ctx), in, func(ectx context.Context) (json.RawMessage, error) {
@@ -163,5 +178,5 @@ func (s *Server) mcpExecuteWithReceipt(ctx context.Context, in task.ExecuteInput
 		return nil, uerr
 	}
 	s.log.With(in.TraceID).Info("mcp_tool_replayed", "tool", in.ToolName, "task_id", in.TaskID)
-	return &out, nil
+	return withReplayNote(&out), nil
 }
