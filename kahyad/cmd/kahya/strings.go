@@ -720,8 +720,17 @@ const (
 	MsgFactDeniedMany           = "%d olgu reddedildi."
 	// MsgFactConfirmAllUpto follows the dry run's prompt (FIX-FINAL TUX-2):
 	// the exact command that confirms only the listed facts (%s = the
-	// --since bound, %d = the largest listed fact id).
-	MsgFactConfirmAllUpto = "Yalnız bu listeyi onaylamak için: kahya fact confirm --all-quarantined --since %s --upto %d --yes"
+	// --since bound, %d = the largest listed fact id). Worded as THE command
+	// the prompt's "komutu --yes ile tekrarla" means (FIX-FINAL
+	// tux-fact-confirm-dry-run-contradictory-instruction): the old "Yalnız
+	// bu listeyi onaylamak için" read as an alternative to a bare --yes,
+	// which TUX-2 refuses. The handbook's prompt itself stays byte-exact.
+	MsgFactConfirmAllUpto = "Tekrarlanacak komut (yalnız bu liste onaylanır): kahya fact confirm --all-quarantined --since %s --upto %d --yes"
+	// MsgFactConfirmAllTooMany refuses a dry run whose window holds more
+	// than one bulk call may confirm (%d = the cap) and says how to go on
+	// (FIX-FINAL tux-fact-confirm-dry-run-contradictory-instruction). The
+	// daemon's own 400 text (factengine.ErrFactBatchTooLarge) is unchanged.
+	MsgFactConfirmAllTooMany = "Olgu onayı başarısız: en fazla %d olgu (--since değerini daha yeni bir zamana çekip tekrarlayın; onaylananlar listeden çıkar)."
 	// MsgFactConfirmAllNeedsUpto refuses --yes without --upto: otherwise a
 	// fact written after the review would be confirmed unseen.
 	MsgFactConfirmAllNeedsUpto = "--yes için --upto <id> zorunlu (listeyi gördükten sonra eklenen olgular onaylanmasın)."

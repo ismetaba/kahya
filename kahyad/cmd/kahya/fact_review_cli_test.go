@@ -134,7 +134,7 @@ func TestFactConfirmAllQuarantinedListsThenNeedsYes(t *testing.T) {
 	}, confirmAnswer: map[string]any{"ok": true, "confirmed": []int64{12, 9}, "failed": map[string]string{}}}
 	code, out, _ := runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2026-10-01T00:00:00Z")
 	wantTail := "2 olgu onaylanacak; devam için komutu --yes ile tekrarla.\n" +
-		"Yalnız bu listeyi onaylamak için: kahya fact confirm --all-quarantined --since 2026-10-01T00:00:00Z --upto 12 --yes\n"
+		"Tekrarlanacak komut (yalnız bu liste onaylanır): kahya fact confirm --all-quarantined --since 2026-10-01T00:00:00Z --upto 12 --yes\n"
 	if code != 0 || !strings.HasSuffix(out, wantTail) || !strings.HasPrefix(out, "Olgular (2):\n#12  Emre") {
 		t.Fatalf("dry run = %d %q", code, out)
 	}
@@ -155,7 +155,7 @@ func TestFactConfirmAllQuarantinedListsThenNeedsYes(t *testing.T) {
 	}
 	fake.truncated = true
 	fake.confirmBody = nil
-	if code, _, errOut := runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2000-01-01T00:00:00Z"); code != 2 || errOut != "Olgu onayı başarısız: en fazla 500 olgu\n" || fake.confirmBody != nil {
+	if code, _, errOut := runFactCLI(t, fake, "fact", "confirm", "--all-quarantined", "--since", "2000-01-01T00:00:00Z"); code != 2 || errOut != "Olgu onayı başarısız: en fazla 500 olgu (--since değerini daha yeni bir zamana çekip tekrarlayın; onaylananlar listeden çıkar).\n" || fake.confirmBody != nil {
 		t.Fatalf("over the cap = %d %q", code, errOut)
 	}
 }
@@ -172,5 +172,26 @@ func TestFactDenyPrintsTurkish(t *testing.T) {
 		if code, _, errOut := runFactCLI(t, fake, args...); code != 2 || !strings.Contains(errOut, MsgFactUsage) {
 			t.Errorf("%v = %d %q, want usage", args, code, errOut)
 		}
+	}
+}
+
+// TestFactConfirmDryRunTextsDoNotContradict (FIX-FINAL
+// tux-fact-confirm-dry-run-contradictory-instruction): after TUX-2 the dry
+// run printed "devam için komutu --yes ile tekrarla." and then an
+// "only this list" alternative, while a bare --yes is refused. The
+// handbook's prompt stays byte-exact; the line after it now reads as THE
+// command to repeat, and the over-cap refusal says how to proceed.
+func TestFactConfirmDryRunTextsDoNotContradict(t *testing.T) {
+	if MsgFactConfirmAllPrompt != "%d olgu onaylanacak; devam için komutu --yes ile tekrarla." {
+		t.Errorf("MsgFactConfirmAllPrompt drifted from the handbook text: %q", MsgFactConfirmAllPrompt)
+	}
+	if MsgFactConfirmAllUpto != "Tekrarlanacak komut (yalnız bu liste onaylanır): kahya fact confirm --all-quarantined --since %s --upto %d --yes" {
+		t.Errorf("MsgFactConfirmAllUpto = %q", MsgFactConfirmAllUpto)
+	}
+	if MsgFactConfirmAllTooMany != "Olgu onayı başarısız: en fazla %d olgu (--since değerini daha yeni bir zamana çekip tekrarlayın; onaylananlar listeden çıkar)." {
+		t.Errorf("MsgFactConfirmAllTooMany = %q", MsgFactConfirmAllTooMany)
+	}
+	if strings.HasPrefix(MsgFactConfirmAllUpto, "Yalnız") {
+		t.Error("the --upto line must not read as an alternative to the prompt's --yes")
 	}
 }

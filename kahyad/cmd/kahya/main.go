@@ -760,7 +760,7 @@ func runFactConfirm(client *Client, args []string, stdout, stderr io.Writer) int
 			}
 			printFactList(stdout, rows)
 			if truncated {
-				fmt.Fprintf(stderr, MsgFactConfirmFailed+"\n", fmt.Sprintf("en fazla %d olgu", maxFactBatch))
+				fmt.Fprintf(stderr, MsgFactConfirmAllTooMany+"\n", maxFactBatch)
 				return 2
 			}
 			if len(rows) > 0 {

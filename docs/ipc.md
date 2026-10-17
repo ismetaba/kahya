@@ -976,9 +976,15 @@ a cloud model, without changing anything in §2-§6 above:
   --yes]` (one id keeps `"Olgu onaylandı: %d"`, otherwise `"%d olgu
   onaylandı."`; `--all-quarantined` without `--since` is a usage error,
   without `--yes` it only lists and prints `"%d olgu onaylanacak; devam
-  için komutu --yes ile tekrarla."` followed by `"Yalnız bu listeyi
-  onaylamak için: kahya fact confirm --all-quarantined --since %s --upto %d
-  --yes"` (%d = the largest listed fact id); `--yes` needs `--upto` (usage
+  için komutu --yes ile tekrarla."` followed by `"Tekrarlanacak komut
+  (yalnız bu liste onaylanır): kahya fact confirm --all-quarantined --since
+  %s --upto %d --yes"` (%d = the largest listed fact id; FIX-FINAL
+  tux-fact-confirm-dry-run-contradictory-instruction - it is THE command
+  the prompt asks to repeat, no longer an "only this list" alternative to
+  a refused bare `--yes`), and a window over 500 facts is refused (exit 2)
+  with `"Olgu onayı başarısız: en fazla %d olgu (--since değerini daha yeni
+  bir zamana çekip tekrarlayın; onaylananlar listeden çıkar)."`; `--yes`
+  needs `--upto` (usage
   error 2 `"--yes için --upto <id> zorunlu (listeyi gördükten sonra
   eklenen olgular onaylanmasın)."`), sends `all_quarantined_max_id` and
   prints `"Onaylananlar: #12, #9"` - fact ids only grow, so `--yes`
