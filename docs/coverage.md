@@ -216,6 +216,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Memory #5 | eval gate refuses on stale result (gate before consolidation) | `kahyad/internal/eval/TestGateRefusesStale` | W78-01 | ci-hermetic |
 | Memory #5 | eval gate fails closed on reader error | `kahyad/internal/eval/TestGateRefusesOnReaderErrorFailClosed` | W78-01 | ci-hermetic |
 | Memory #5 | re-embed gate refuses without a green candidate | `kahyad/internal/eval/TestReEmbedGateRefusesWithoutGreenCandidate` | W78-01 | ci-hermetic |
+| Memory #5 | hot-window facts cite their source episode, so the weekly truth ritual (label source) can select them; secret-lane ones stay excluded | `kahyad/internal/consolidation/TestHotWindowFactsReachTheTruthRitual` | W5-04 | ci-hermetic |
 | Product A | W3 never auto-allows, even with a forged L4 autonomy row | `kahyad/internal/policy/TestW3NeverAllowsEvenWithForgedL4Row` | W3-02 | ci-hermetic |
 | Product A | W3 card is notice-only, no approve keyboard on Telegram | `kahyad/internal/telegram/TestW3NoticeOnlyNoKeyboard` | W3-07 | ci-hermetic |
 | Product B | unknown tool denied fail-closed (static metadata, executor-side) | `kahyad/internal/policy/TestUnknownToolDeniesFailClosed` | W3-01 | ci-hermetic |

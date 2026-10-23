@@ -243,6 +243,14 @@ type CandidateFact struct {
 	Evidence      string
 	ExtractorVer  string
 	TraceID       string
+
+	// EpisodeID is the episode the atom was promoted from. StoreFactWriter.
+	// InsertFact passes it to factengine as the evidence row's episode
+	// citation: the W5-03 ritual sampler (kahyad/internal/ritual/select.go
+	// classify) selects only facts whose evidence cites a resolvable,
+	// non-secret-lane episode, so a fact without it can never be asked
+	// about in the truth ritual.
+	EpisodeID int64
 }
 
 // FactStore is the narrow brain.db seam PromoteHotWindow needs -
@@ -307,6 +315,7 @@ func PromoteHotWindow(ctx context.Context, store FactStore, traceID string, now 
 					Evidence:      formatEvidence(refs),
 					ExtractorVer:  HotWindowExtractorVersion,
 					TraceID:       traceID,
+					EpisodeID:     ep.ID,
 				}
 				if _, err := store.InsertFact(ctx, fact); err != nil {
 					return promoted, fmt.Errorf("consolidation: insert candidate fact for episode %d: %w", ep.ID, err)
@@ -397,6 +406,7 @@ func (w StoreFactWriter) InsertFact(ctx context.Context, f CandidateFact) (int64
 		Importance:    f.Importance,
 		Evidence:      f.Evidence,
 		ExtractorVer:  f.ExtractorVer,
+		EpisodeID:     f.EpisodeID,
 	})
 }
 

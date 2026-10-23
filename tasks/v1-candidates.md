@@ -36,6 +36,8 @@ What is worth taking is ideas, re-implemented in Go/Python under Kâhya's invari
 
 ### D1 — hot-window facts can never reach the truth ritual
 
+**Status: fixed.** `CandidateFact.EpisodeID` now flows from `PromoteHotWindow` through `InsertFact` into the evidence row. Pinned by `kahyad/internal/consolidation/TestHotWindowFactsReachTheTruthRitual` (cited in `docs/coverage.md`, Memory #5). Facts promoted before the fix keep a NULL citation: no backfill was added.
+
 - `StoreFactWriter.InsertFact` does not pass `EpisodeID` (`kahyad/internal/consolidation/hotwindow.go:389-400`), and `CandidateFact` (`:235`) has no such field.
 - As a result `addEvidence` stores `evidence.episode_id = NULL` (`kahyad/internal/factengine/engine.go:532`; `nullInt64(0)` is invalid, `:314`).
 - The ritual sampler's `classify` excludes, fail-closed, every fact without a resolvable episode citation (`kahyad/internal/ritual/select.go:179`).
