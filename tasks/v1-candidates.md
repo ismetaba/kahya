@@ -4,10 +4,11 @@
 >
 > Exception: the two **pre-dogfood defects** (D1, D2) are MVP bugs, not v1 work.
 
-This file has two sources:
+This file has three sources:
 
 - **The 2026-10-14 review of [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)** at v2.0.3-beta.1 (commit `badbd21`, 2026-10-13). It produced the verdict, D1–D2 and Candidates 1–3. TencentDB paths below are relative to that repo at that commit.
 - **The 2026-10-23 comparison with OpenAI dots.** It produced the "Toward dots-like behavior" section and Candidates 4–7.
+- **The user's 2026-10-23 opportunity-radar request.** It produced Candidate 8.
 
 ## Verdict on the library itself: do not adopt
 
@@ -198,6 +199,60 @@ Gaps:
 - dots ships 4,000+ app plugins. Kâhya adds MCP servers one at a time, each with its `policy.yaml` classes, undo recipe and egress allowlist entries.
 - In exchange, Kâhya drives the user's real Mac apps. dots only touches the user's own computer when the user connects it.
 
+## Candidate 8 — opportunity radar
+
+Kâhya should proactively research opportunities that fit what it knows about the user and suggest them, for example:
+
+- **business:** "you know X; X's company does Y; your product could be turned into Z for them";
+- **immigration and visas:** a country opening a special work-visa route for Turkish citizens, or a green-card lottery window opening;
+- **also:** career, grants and programs, education, events, investment.
+
+It only suggests. It never applies, pays, registers or contacts anyone.
+
+- **Gap (today):**
+  - No web access: the egress allowlist holds only `api.anthropic.com`, `api.telegram.org`, `api.github.com` and `github.com` (`policy.yaml`), and there is no fetch or search tool.
+  - The briefing reads only local sources.
+  - `entities` is never populated, so "people you know" does not exist yet (Candidate 3).
+  - Already in place: the Reader parses web pages into a validated struct (`kahyad/internal/reader/schemas.go:51`, `WebpageExtractV1`). The egress proxy, taint model and secret-lane router are the right safety rails for this feature.
+- **Core rule — generic fetch, private match.** What leaves the machine is never the profile:
+  1. **Topic list (outbound):**
+     - kahyad derives coarse topics and source feeds from non-secret facts (e.g. "Canada immigration announcements", "US DV program", "custody/tokenization industry news");
+     - the user approves the list byte-exact, and any change needs re-approval;
+     - queries never carry personal facts, secret-lane data, or the names of private individuals the user knows.
+  2. **Sources:**
+     - primary and official first: government portals, official gazettes, company press pages, curated RSS;
+     - each host goes into the egress allowlist with a byte budget;
+     - optional discovery via model-side web search, restricted to the approved topics; anything found that way is confirmed on a primary source before it is shown.
+  3. **Ingest (untrusted, §5 safety #2):**
+     - fetched pages go through the Reader into a new `OpportunityV1` schema with: kind enum, title, issuer, region, deadline, short eligibility criteria, cost, `source_url`, `published_at`, and status (announced / open / closing / closed / unconfirmed);
+     - the `source_url` host must match the fetched host;
+     - the struct is validated in Go and stored by kahyad in an `opportunities` table at `external_doc` trust, with fetch timestamps.
+  4. **Match (private, local-first):**
+     - Deterministic eligibility filters run first against facts (nationality, degree, years of experience, …).
+     - Then come relevance and a "why you" explanation. A match that touches secret-lane facts (kimlik for visas, finans for investments, sağlık) runs on the local Qwen only. Other matches may use the cloud model after local classification (ordering invariant).
+     - Network/business ideas combine entities (who works where), the user's product and skill facts, and fresh news. They are labelled as hypotheses with evidence refs (fact ids + source URLs), and are never written back as facts.
+  5. **Deliver:**
+     - A weekly "Fırsat bülteni" goes out as one notification with a `trace_id`. Saved items also get deadline alerts (e.g. T-7, T-1).
+     - Every item shows: what, why you (which facts), deadline, next step, official link, confidence, last-verified date.
+     - Telegram gets titles only. Items that touch secret-lane facts get a redacted "yerelde görüntüle" notice instead.
+     - Feedback buttons (ilgilenmiyorum / kaydet / hedef yap → Candidate 4 / yanlış) feed ranking and preference facts.
+- **Hard rules:**
+  - The radar session is tainted by design: R-tools + notify only. Applying, paying, registering or messaging is W3 and needs written local approval; drafts for it are prepared only in a clean Actor session.
+  - Scam defense: immigration and investment items from non-primary sources are never shown as actionable. Flag paid intermediaries and "guaranteed visa" patterns.
+  - Re-verify deadline and eligibility at presentation time and always link the official source. The output is information, not legal or financial advice.
+  - The radar has its own daily cost and egress budget, and quiet hours.
+- **Depends on:**
+  - Candidate 3: facts + entities;
+  - Candidate 5: scheduled tainted scan sessions (the radar is a specialization of them);
+  - Candidate 2: the profile used for matching;
+  - Candidate 4: the target of "hedef yap".
+- **Smallest useful slice:** an official-source watch list for 2–3 categories (immigration, grants, industry news), deterministic matching on a few `user_asserted` profile facts, and the weekly bulletin. Business-idea synthesis comes later.
+- **Done when:**
+  - every bulletin item carries an official source and why-you evidence;
+  - an egress-log test shows no personal fact in any outbound query;
+  - a radar session's direct W-tool call is rejected;
+  - precision is tracked via feedback (the share of "ilgilenmiyorum").
+
 ## Smaller ideas
 
 - **Materiality gate before re-consolidation:** label each delta as conflict / new_rule / reinforcement / none, and rebuild only on the first two. On failure, defer without advancing the cursor. TencentDB's version calls an external API (`MemoryCore/src/core/persona/jev-gate.ts`); ours would run on the local Qwen.
@@ -206,7 +261,8 @@ Gaps:
 ## Suggested order
 
 1. Before dogfood: fix D1, and decide D2.
-2. After the dogfood gate, two tracks:
+2. After the dogfood gate, three tracks:
    - **Memory:** Candidate 3, then Candidate 2.
    - **dots-like:** Candidate 6 (once W3-07 is live), then Candidate 5, then Candidate 4. Decide Candidate 7 before Candidate 4.
+   - **Opportunity radar:** Candidate 8 after Candidates 3 and 5. Its smallest slice can start as soon as Candidate 5's scan sessions exist.
 3. Candidate 1 is independent; schedule it when long-task cost shows up in `kahya metrics`.
