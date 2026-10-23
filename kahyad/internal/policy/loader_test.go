@@ -192,11 +192,26 @@ func TestLoadRejectsMissingMandatoryDenyGlob(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsMissingKahyaRepoDenyGlob: a policy.yaml without the
+// "~/Kahya/**" memory-repo glob is rejected (tasks/v1-candidates.md D2) -
+// otherwise an fs/shell write there is committed as author=user at 03:00
+// and indexed as source_tier=user_edit.
+func TestLoadRejectsMissingKahyaRepoDenyGlob(t *testing.T) {
+	_, err := Load(testdataPath(t, "invalid_missing_kahya_deny_glob.yaml"))
+	if err == nil {
+		t.Fatal("Load(invalid_missing_kahya_deny_glob.yaml) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `"~/Kahya/**"`) {
+		t.Errorf("error = %q, want it to name the missing ~/Kahya/** glob", err.Error())
+	}
+}
+
 // TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies is the "checked
 // by a test, not by eyeball" acceptance criterion: the real, committed
 // repo-root policy.yaml must load cleanly AND its fs_write_deny_globs must
-// contain every one of the four mandatory families (shell rc/profile
-// files, LaunchAgents, Hammerspoon, App Support/Kahya).
+// contain every one of the five mandatory families (shell rc/profile
+// files, LaunchAgents, Hammerspoon, App Support/Kahya, the ~/Kahya memory
+// repo).
 func TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies(t *testing.T) {
 	path := filepath.Join(repoRoot(t), "policy.yaml")
 	pol, err := Load(path)
@@ -227,6 +242,7 @@ func TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies(t *testing.T) {
 		"App Support/Kahya": {
 			filepath.Join(home, "Library", "Application Support", "Kahya", "**"),
 		},
+		"Kahya memory repo": {filepath.Join(home, "Kahya", "**")},
 	}
 
 	for family, wantGlobs := range families {
@@ -234,6 +250,37 @@ func TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies(t *testing.T) {
 			if !present[want] {
 				t.Errorf("family %q: expanded glob %q not present in committed policy.yaml's fs_write_deny_globs (%v)", family, want, pol.FSWriteDenyGlobs)
 			}
+		}
+	}
+}
+
+// TestCommittedDevPolicyYAMLDeniesBothMemoryRepos: the committed
+// policy.dev.yaml (KAHYA_ENV=dev, dev/launchd/com.kahya.dev.plist) must
+// load cleanly and deny fs writes to both the prod memory repo
+// (loader-mandatory) and the dev profile's own ~/Kahya-dev, which the dev
+// daemon's 03:00 consolidation also commits as author=user
+// (tasks/v1-candidates.md D2).
+func TestCommittedDevPolicyYAMLDeniesBothMemoryRepos(t *testing.T) {
+	path := filepath.Join(repoRoot(t), "policy.dev.yaml")
+	pol, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(%s) = %v, want nil", path, err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve home dir: %v", err)
+	}
+	present := make(map[string]bool, len(pol.FSWriteDenyGlobs))
+	for _, g := range pol.FSWriteDenyGlobs {
+		present[g] = true
+	}
+	for _, want := range []string{
+		filepath.Join(home, "Kahya", "**"),
+		filepath.Join(home, "Kahya-dev", "**"),
+	} {
+		if !present[want] {
+			t.Errorf("expanded glob %q not present in committed policy.dev.yaml's fs_write_deny_globs (%v)", want, pol.FSWriteDenyGlobs)
 		}
 	}
 }

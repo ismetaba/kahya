@@ -18,6 +18,7 @@ fs_write_deny_globs:
   - "~/Library/LaunchAgents/**"
   - "~/.hammerspoon/**"
   - "~/Library/Application Support/Kahya/**"
+  - "~/Kahya/**"
 
 egress:
   allowlist:

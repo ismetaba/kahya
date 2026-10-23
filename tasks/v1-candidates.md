@@ -51,6 +51,13 @@ What is worth taking is ideas, re-implemented in Go/Python under Kâhya's invari
 
 ### D2 — agent writes into `~/Kahya/memory` can be laundered to `user_edit`
 
+**Status: fixed.** The fix covers the whole repo (`~/Kahya/**`), not just `memory/`, for two reasons: the 03:00 commit stages the entire dirty tree, and `~/Kahya/eval` holds the retrieval-QA ground truth.
+
+- `~/Kahya/**` is now in `MandatoryFSWriteDenyGlobs` (`kahyad/internal/policy/schema.go`). The loader rejects a policy without it, and the fs and Docker-shell tools refuse those paths before any approval is consulted.
+- `policy.dev.yaml` also denies the dev profile's own `~/Kahya-dev/**`.
+- Pinned by `TestHandleWriteDeniedInsideKahyaRepo`, `TestLoadRejectsMissingKahyaRepoDenyGlob` and `TestCommittedDevPolicyYAMLDeniesBothMemoryRepos`, all cited in `docs/coverage.md`.
+- Known limit, shared with the existing App Support entry: the loader mandates only the prod paths. Other non-prod profiles (`redteam`, `restore`, …) must list their own `~/Kahya-<env>/**` in the policy file they load. A Go-side guard derived from `cfg.KahyaDir` would close this for every profile.
+
 - `fs_write_deny_globs` does not cover `~/Kahya/memory/**` (`policy.yaml:97-106`). An approved or ladder-auto-approved `fs_write` can therefore change the memory corpus directly, bypassing `memory_write`, which stamps `agent_derived` and commits as kahyad.
 - At 03:00, consolidation commits any dirty `~/Kahya` tree as `user <user@kahya.local>` (`kahyad/internal/consolidation/consolidation.go:252`).
 - The indexer upgrades a clean file whose last commit author is that string to `user_edit` (`kahyad/internal/indexer/gitauthor.go`, `resolveUserEditTier`).
@@ -262,7 +269,7 @@ It only suggests. It never applies, pays, registers or contacts anyone.
 
 ## Suggested order
 
-1. Before dogfood: fix D1, and decide D2.
+1. Before dogfood: D1 and D2, both fixed.
 2. After the dogfood gate, three tracks:
    - **Memory:** Candidate 3, then Candidate 2.
    - **dots-like:** Candidate 6 (once W3-07 is live), then Candidate 5, then Candidate 4. Decide Candidate 7 before Candidate 4.

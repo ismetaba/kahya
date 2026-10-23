@@ -20,6 +20,7 @@ fs_write_deny_globs:
   - "~/.profile"
   - "~/Library/LaunchAgents/**"
   - "~/.hammerspoon/**"
+  - "~/Kahya/**"
 
 egress:
   allowlist:

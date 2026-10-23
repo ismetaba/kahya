@@ -328,6 +328,44 @@ func TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck(t *testing.T) {
 	}
 }
 
+// TestHandleWriteDeniedInsideKahyaRepo pins tasks/v1-candidates.md D2: with
+// the mandatory ~/Kahya/** deny glob, fs_write anywhere in the memory repo
+// is refused before any policy decision, so no approval can unlock it -
+// memory/ (an agent write there would be committed as author=user at 03:00
+// and indexed as source_tier=user_edit) and eval/ (the retrieval-QA ground
+// truth) alike.
+func TestHandleWriteDeniedInsideKahyaRepo(t *testing.T) {
+	home := testHome(t)
+	targets := []string{
+		filepath.Join("Kahya", "memory", "notlar.md"),
+		filepath.Join("Kahya", "eval", "retrieval", "dataset.jsonl"),
+	}
+	for _, rel := range targets {
+		mustMkdirAll(t, filepath.Dir(filepath.Join(home, rel)))
+		mustWriteFile(t, filepath.Join(home, rel), "original")
+	}
+	pc := &fakePolicyClient{decision: allowDecision("shouldneverbeused")}
+	led := &fakeLedger{}
+	s := newTestServer(t, home, []string{filepath.Join(home, "Kahya", "**")}, nil, pc, led)
+
+	for _, rel := range targets {
+		args := FsWriteArgs{Path: "~/" + filepath.ToSlash(rel), ContentBase64: b64("ajan yazdı")}
+		if _, err := s.HandleWrite(context.Background(), "trace-kahya-repo", "task-1", args); err == nil {
+			t.Fatalf("HandleWrite(%s) = nil error, want a deny-glob refusal", args.Path)
+		}
+		content, rerr := os.ReadFile(filepath.Join(home, rel))
+		if rerr != nil || string(content) != "original" {
+			t.Errorf("%s content = %q (err=%v), want unchanged %q", args.Path, content, rerr, "original")
+		}
+	}
+	if pc.checkCalls != 0 {
+		t.Errorf("Policy.Check was called %d times, want 0 — deny-glob must short-circuit BEFORE any policy decision", pc.checkCalls)
+	}
+	if got := len(led.find("fs_deny_glob_hit")); got != len(targets) {
+		t.Fatalf("fs_deny_glob_hit ledger events = %d, want %d", got, len(targets))
+	}
+}
+
 func TestHandleDeleteDenyGlobHitAppliesSameGateChain(t *testing.T) {
 	home := testHome(t)
 	mustMkdirAll(t, filepath.Join(home, "Library", "LaunchAgents"))

@@ -115,8 +115,9 @@ type Document struct {
 // MandatoryFSWriteDenyGlobs is the Day-1 invariant set (HANDOFF §5 safety
 // #6 [flag]: shell rc/profile files, LaunchAgents, Hammerspoon config, and
 // kahyad's own App Support directory - "defter/DB'nin kendi kendini
-// kurcalamasina karsi"). loader.go's Load hard-rejects any policy.yaml
-// whose fs_write_deny_globs is missing any one of these, verbatim.
+// kurcalamasina karsi"), plus the ~/Kahya memory repo (below). loader.go's
+// Load hard-rejects any policy.yaml whose fs_write_deny_globs is missing
+// any one of these, verbatim.
 var MandatoryFSWriteDenyGlobs = []string{
 	"~/.zshrc",
 	"~/.zprofile",
@@ -127,6 +128,15 @@ var MandatoryFSWriteDenyGlobs = []string{
 	"~/Library/LaunchAgents/**",
 	"~/.hammerspoon/**",
 	"~/Library/Application Support/Kahya/**",
+	// The memory repo (tasks/v1-candidates.md D2). The 03:00 consolidation
+	// commits a dirty ~/Kahya tree as author=user, and the indexer reads a
+	// clean file whose last author is the user as source_tier=user_edit -
+	// so an fs/shell write here would launder agent bytes into the top
+	// trust tier past the HANDOFF §5 safety #3 human gate. ~/Kahya/eval
+	// also holds the retrieval-QA ground truth (§5 memory #5). Memory
+	// changes go through memory_write only (CLAUDE.md hard rule). Kept
+	// last so the first-missing error for an older fixture is unchanged.
+	"~/Kahya/**",
 }
 
 // Policy is the fully validated, normalized policy.yaml document -

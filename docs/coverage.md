@@ -51,7 +51,7 @@
 | Safety #2: data-level taint + dual-LLM Reader/Actor; Actor never sees raw untrusted text | W4-03 | covered |
 | Safety #2 · untrusted tier = R-tools + notify only; W-actions from CLEAN seeded session; briefing tainted by design | W4-03, W5-01 | covered |
 | Safety #2 · taint persisted in SQLite by session_id, reloaded on resume, only rises, missing⇒untrusted | W4-03, W78-02 (restart scenario) | covered |
-| Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow); profile-card builder itself not in MVP | covered |
+| Safety #3: source_tier + human gate — untrusted-ingested memory never in profile card / reflex injection | W12-05 (injection-eligibility quarantine), W5-04 (tier clamping, confirm flow), W3-01/W3-03 (`~/Kahya/**` deny glob: no laundering of agent fs/shell writes into `user_edit` via the 03:00 author=user commit — tasks/v1-candidates.md D2); profile-card builder itself not in MVP | covered |
 | Safety #4: external-anchored ledger; every injected `<hafiza>` block recorded | W4-05 (anchor+verify+separate Keychain item), W12-05/W12-10 (`hafiza_injected` + sha256) | covered |
 | Safety #5: WYSIWYE (NFC, bidi/zero-width/homoglyph, canonical path/host, hash; executed≠approved ⇒ reject) | W3-06 (+W78-02 homoglyph scenario) | covered |
 | Safety #5 · W3 "onayla" local-surface only (CLI W3–5, Hammerspoon W6+); Telegram notify-only for W3 | W3-06, W3-07, W6-01 (server-stamped surface) | covered |
@@ -59,7 +59,7 @@
 | Safety #5 · Telegram auth: fixed chat_id/user_id Go-side, silent drop + ledger, long-polling, `remote` label | W3-07 | covered |
 | Safety #6: model shell in Docker by default (workdir-only rw, no net); binary allowlist not a boundary; narrow arg-validated host set | W3-04 | covered |
 | Safety #6 · osascript/JXA/Shortcuts ≥W2, WYSIWYE-diffed, `do shell script` rejected/rerouted | W3-09 (↔ slidable; must land before W7–8) | covered |
-| Safety #6 · fs write-deny globs (shell rc, LaunchAgents, .hammerspoon, App Support/Kahya) | W3-01 (globs), W3-03 (enforcement + canonicalization) | covered |
+| Safety #6 · fs write-deny globs (shell rc, LaunchAgents, .hammerspoon, App Support/Kahya, `~/Kahya` memory repo) | W3-01 (globs), W3-03 (enforcement + canonicalization) | covered |
 | Memory #1: source-trust lattice; agent_derived quarantined until user confirms | W5-04, W12-05, W12-04/W0-01 (seed = user_asserted) | covered |
 | Memory #2: evidence-gated entity merge; split op; merge_ledger; provisional namesakes | W5-04 | covered |
 | Memory #3: negative evidence + log-odds; same-session dedupe; <0.3 out of injection; retraction | W5-04, W5-03 (ritual answers) | covered |
@@ -183,6 +183,7 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #3 | agent_derived / untrusted-sourced memory quarantined from injection | `kahyad/internal/factengine/TestAgentDerivedFactQuarantinedUntilConfirmed` | W12-05 | ci-hermetic |
 | Safety #3 | memory search for-injection excludes agent_derived facts | `kahyad/internal/server/TestMemorySearchForInjectionExcludesAgentDerived` | W12-05 | ci-hermetic |
 | Safety #3 | red-team planted-mail-poisons-profile scenario blocked | `kahyad/internal/eval/TestRedteamAllScenariosBlocked` | W78-02 | ci-hermetic |
+| Safety #3 | agent fs_write into the `~/Kahya` memory repo (memory/, eval/) refused before any policy decision — no laundering into `user_edit` via the 03:00 author=user commit | `mcp/fs/TestHandleWriteDeniedInsideKahyaRepo` | W3-03 | ci-hermetic |
 | Safety #4 | local ledger tamper detected vs external anchor | `kahyad/internal/anchor/TestVerifyDetectsLocalTamperAfterTwoAnchors` | W4-05 | ci-hermetic |
 | Safety #4 | remote-anchor mismatch detected | `kahyad/internal/anchor/TestVerifyDetectsRemoteMismatch` | W4-05 | ci-hermetic |
 | Safety #4 | anchor ledger is append-only (first line unchanged on 2nd anchor) | `kahyad/internal/anchor/TestPusherRunSecondAnchorAppendsAndFirstLineUnchanged` | W4-05 | ci-hermetic |
@@ -199,6 +200,8 @@ Docker / MLX / Keychain / real spawned bins, existence-checked in CI, executed l
 | Safety #5 | W3 approval local-only over real bins (not via Telegram / CLI onayla) | `tests/w3/TestGate2_W3NeverApprovedViaTelegramOnlyLocalOnayla` | W3-10 | local-integration |
 | Safety #6 | fs write-deny glob (`~/.zshrc`) denies before any policy check | `mcp/fs/TestHandleWriteDenyGlobHitDeniesBeforeAnyPolicyCheck` | W3-03 | ci-hermetic |
 | Safety #6 | all mandatory fs deny-glob families present in committed policy | `kahyad/internal/policy/TestCommittedPolicyYAMLHasAllMandatoryDenyGlobFamilies` | W3-01 | ci-hermetic |
+| Safety #6 | a policy.yaml missing the mandatory `~/Kahya/**` memory-repo glob is rejected | `kahyad/internal/policy/TestLoadRejectsMissingKahyaRepoDenyGlob` | W3-01 | ci-hermetic |
+| Safety #6 | committed policy.dev.yaml denies both `~/Kahya` and the dev profile's own `~/Kahya-dev` | `kahyad/internal/policy/TestCommittedDevPolicyYAMLDeniesBothMemoryRepos` | W3-01 | ci-hermetic |
 | Safety #6 | osascript/JXA tool below W2 floor rejected at policy load | `kahyad/internal/policy/TestLoadRejectsOsascriptToolBelowW2Floor` | W3-09 | ci-hermetic |
 | Safety #6 | `do shell script` in osascript rejected (not a reroute) | `mcp/osascript/TestScanRejectsDoShellScript` | W3-09 | ci-hermetic |
 | Safety #6 | model shell defaults to Docker `--network none` (real Docker) | `mcp/shell/TestLive_DefaultNetworkNoneBlocksEgress` | W3-04 | local-integration |

@@ -92,8 +92,10 @@ secret_lane_globs:
 # Day-1 invariants (HANDOFF §5 safety #6 [flag]). The loader hard-rejects
 # any policy.yaml whose fs_write_deny_globs is missing ANY one of these,
 # verbatim — they exist so a compromised/over-eager agent can never
-# rewrite your shell startup files, LaunchAgents, Hammerspoon config, or
-# kahyad's own ledger/DB directory.
+# rewrite your shell startup files, LaunchAgents, Hammerspoon config,
+# kahyad's own ledger/DB directory, or the ~/Kahya memory repo (the 03:00
+# consolidation commits a dirty ~/Kahya as you, which would launder agent
+# bytes into source_tier=user_edit; memory changes go through memory_write).
 fs_write_deny_globs:
   - "~/.zshrc"
   - "~/.zprofile"
@@ -104,6 +106,11 @@ fs_write_deny_globs:
   - "~/Library/LaunchAgents/**"
   - "~/.hammerspoon/**"
   - "~/Library/Application Support/Kahya/**"
+  - "~/Kahya/**"
+  # The dev profile's own memory repo (KAHYA_ENV=dev -> ~/Kahya-dev): not
+  # loader-mandatory, but its 03:00 consolidation commits it as author=user
+  # exactly like prod's.
+  - "~/Kahya-dev/**"
 
 # egress.allowlist entries below all omit `ports:`, which now defaults to
 # 443 (HTTPS) ONLY (egress-security review, MINOR G fix —
