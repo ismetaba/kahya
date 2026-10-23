@@ -4,7 +4,10 @@
 >
 > Exception: the two **pre-dogfood defects** (D1, D2) are MVP bugs, not v1 work.
 
-Origin: 2026-10-14 review of [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) at v2.0.3-beta.1 (commit `badbd21`, 2026-10-13). TencentDB paths below are relative to that repo at that commit.
+This file has two sources:
+
+- **The 2026-10-14 review of [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)** at v2.0.3-beta.1 (commit `badbd21`, 2026-10-13). It produced the verdict, D1–D2 and Candidates 1–3. TencentDB paths below are relative to that repo at that commit.
+- **The 2026-10-23 comparison with OpenAI dots.** It produced the "Toward dots-like behavior" section and Candidates 4–7.
 
 ## Verdict on the library itself: do not adopt
 
@@ -110,6 +113,91 @@ What is worth taking is ideas, re-implemented in Go/Python under Kâhya's invari
   - the precision of confirmed facts is tracked via ritual labels;
   - the retrieval eval does not regress.
 
+## Toward dots-like behavior
+
+OpenAI announced "dots" at DevDay on 2026-09-29 ([The Next Web](https://thenextweb.com/news/openai-dots-always-on-ai-agents-cloud-computers-devday)). Each dot:
+
+- runs on its own cloud computer and works toward goals around the clock, on several projects at once;
+- does read-only "proactive research" when the user is away;
+- learns preferences from feedback;
+- is reachable from ChatGPT (message or call), Slack and Teams;
+- follows allow / block / require-approval rules, always leaves sensitive actions such as password changes to the user, and can be paused by a monitor.
+
+Kâhya already matches most of that safety skeleton:
+
+| dots | Kâhya today |
+|---|---|
+| Background, long-running work | W4 background tasks + resume (outbox, `session_id`) |
+| Read-only proactive research when the user is away | The morning briefing session is tainted by design: R-tools + notify only (W5-01) |
+| Drafts what it noticed; the user approves | The briefing notifies; the action runs in a clean Actor session after approval (§5 safety #2) |
+| Allow / block / require-approval rules | `policy.yaml` classes + L0–L4 ladder |
+| Sensitive actions always stay with the user | W3 always needs written local approval |
+| A monitor can pause or stop it | `⌥⎋` halt; the cost governor pauses at caps |
+
+Gaps:
+
+- not always-on: Candidate 7;
+- no persistent goals: Candidate 4;
+- no proactivity beyond the briefing: Candidate 5;
+- no remote command intake: Candidate 6;
+- weak preference learning: Candidates 2–3 plus the note below.
+
+### Candidate 4 — persistent goals
+
+- **Gap:** work is task-shaped (command → task → receipt) plus fixed routines (briefing, consolidation, ritual). There is no `goals` table, so nothing holds an objective across days.
+- **Kâhya shape:**
+  - A new kahyad-owned `goals` table holds the description, status (active / paused / done / abandoned), cadence, progress notes and a per-goal token/$ budget.
+  - A scheduler tick wakes one clean worker session per active goal, with its own `trace_id`. The session is seeded with the goal record and its last progress note, not the previous transcript. That way goal state survives restarts and taint does not accumulate across ticks.
+  - Every W-action still goes through the ladder and approvals. A goal never raises autonomy.
+  - CLI: create / list / pause / close goals, with Turkish strings. Progress is reported through the existing notification path.
+  - Per-goal ceilings live inside the daily/monthly cost governor. A goal that hits its ceiling pauses and notifies.
+- **Done when:** a multi-day goal survives a daemon restart and a Mac sleep, reports progress, and never executes a W-action without the approval its class requires.
+
+### Candidate 5 — idle-time proactive scan + watchers
+
+- **Gap:** proactivity is only the fixed-time briefing. The HANDOFF §1 watchers ("CI kırmızı", "pasaportun doluyor") were never built; no watcher code exists in kahyad.
+- **Kâhya shape:**
+  - Generalize the briefing into periodic tainted, R-tools-only sessions over configured sources (gh, calendar, files, later mail). Their output is notifications and approval-ready drafts.
+  - Drafts run only in a clean Actor session seeded with Go-validated structs (§5 safety #2). The taint model already enforces "read-only when away" in Go.
+  - Watchers start as cheap deterministic checks, such as CI status or document expiry dates from facts. They escalate to an LLM session only when something fires.
+  - Rate-limit notifications (quiet hours, dedupe) so proactivity does not turn into noise.
+- **Done when:**
+  - at least one watcher fires end-to-end with a single notification + `trace_id`;
+  - a scan session's direct W-tool call is rejected (reuse the W5-05 gate test).
+
+### Candidate 6 — remote command intake over Telegram
+
+- **Gap:**
+  - The bot ignores inbound text (`kahyad/internal/telegram/bot.go:272`, `OnText → noop`). It only sends notifications and takes approval callbacks, so remote use is limited to approvals.
+  - The bot is also not live yet (W3-07 is blocked on the token).
+- **Kâhya shape:**
+  - Accept text, and voice notes transcribed by the local Whisper, from the allowlisted `chat_id`/`user_id` only. Each becomes a new task labelled `remote` in the ledger.
+  - Forwarded messages are not user-authored. Ingest them as untrusted content through the Reader path, never as commands.
+  - W3 approval stays local-only. Secret-lane results never go to Telegram; at most a redacted title (§5 safety #5, unchanged).
+  - Residual risk: takeover of the Telegram account. The W3-local rule and the ladder bound the damage. Consider a per-message confirmation for anything above R when the origin is `remote`.
+- **Done when:**
+  - a Telegram text and a voice note each create a task with one `trace_id`;
+  - a forwarded message is tainted;
+  - a W3 action requested remotely still waits for local approval.
+
+### Candidate 7 — always-on host (ops, not architecture)
+
+- dots runs 24/7 in OpenAI's cloud. Kâhya is local-first by locked decision and stops while the Mac sleeps; launchd runs missed calendar jobs once on wake.
+- 24/7 without the cloud: run kahyad on an always-awake Mac (e.g. a home Mac mini), or disable sleep on the current one.
+- No code change is needed. On a new host, redo the TCC grants and Keychain items (`docs/tcc-w6-checklist.md`, HANDOFF §7) and keep the backup/anchor setup.
+- Decide this before Candidate 4: goals that should progress overnight need it.
+
+### Preference learning
+
+- Covered by Candidates 3 and 2, with one more input: approval/denial events in the ledger become evidence for preference facts (e.g. "prefers formal tone in mail drafts").
+- These go through the same extractor path as `agent_derived` facts and are confirmed via the ritual.
+- Preferences inform *how* work is proposed, never *whether* it is allowed (§5 product principles).
+
+### Integrations
+
+- dots ships 4,000+ app plugins. Kâhya adds MCP servers one at a time, each with its `policy.yaml` classes, undo recipe and egress allowlist entries.
+- In exchange, Kâhya drives the user's real Mac apps. dots only touches the user's own computer when the user connects it.
+
 ## Smaller ideas
 
 - **Materiality gate before re-consolidation:** label each delta as conflict / new_rule / reinforcement / none, and rebuild only on the first two. On failure, defer without advancing the cursor. TencentDB's version calls an external API (`MemoryCore/src/core/persona/jev-gate.ts`); ours would run on the local Qwen.
@@ -118,5 +206,7 @@ What is worth taking is ideas, re-implemented in Go/Python under Kâhya's invari
 ## Suggested order
 
 1. Before dogfood: fix D1, and decide D2.
-2. After the dogfood gate: Candidate 3, then Candidate 2.
+2. After the dogfood gate, two tracks:
+   - **Memory:** Candidate 3, then Candidate 2.
+   - **dots-like:** Candidate 6 (once W3-07 is live), then Candidate 5, then Candidate 4. Decide Candidate 7 before Candidate 4.
 3. Candidate 1 is independent; schedule it when long-task cost shows up in `kahya metrics`.
