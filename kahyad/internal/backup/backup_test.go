@@ -446,3 +446,38 @@ func TestRunSweepsStaleStagingFromEarlierDays(t *testing.T) {
 		t.Errorf("staging files left: %v", left)
 	}
 }
+
+// TestRunDatesTheSnapshotInTheConfiguredZone (FIX-FINAL ops-config-r2-
+// timezone-not-single-zone): with SetLocation brain-YYYYMMDD.db carries the
+// configured zone's date - 22:30 UTC on the 12th is the 13th in Kiritimati
+// (UTC+14) - and without it the clock's own (the 12th, as every other test
+// here pins with a UTC clock).
+func TestRunDatesTheSnapshotInTheConfiguredZone(t *testing.T) {
+	kiritimati, err := time.LoadLocation("Pacific/Kiritimati")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		loc  *time.Location
+		want string
+	}{
+		{"unset", nil, "brain-20260712.db"},
+		{"Pacific/Kiritimati", kiritimati, "brain-20260713.db"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			backupDir := filepath.Join(t.TempDir(), "backups")
+			snap := NewSnapshotter(st, &fakeNotifier{}, backupDir)
+			snap.SetClock(func() time.Time { return time.Date(2026, 7, 12, 22, 30, 0, 0, time.UTC) })
+			snap.SetLocation(tc.loc)
+			if err := snap.Run(context.Background(), "trace-zone"); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			names := listBrainFiles(t, backupDir)
+			if len(names) != 1 || names[0] != tc.want {
+				t.Fatalf("backup files = %v, want [%s]", names, tc.want)
+			}
+		})
+	}
+}

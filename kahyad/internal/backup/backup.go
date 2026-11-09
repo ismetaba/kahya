@@ -88,6 +88,9 @@ type Snapshotter struct {
 	// call) purely so backup_test.go's same-day-rerun test can pin it
 	// deterministically instead of racing a real local-midnight rollover.
 	now func() time.Time
+	// loc is the calendar zone of that date (SetLocation); nil = the
+	// clock's own zone (time.Now's is time.Local).
+	loc *time.Location
 }
 
 // NewSnapshotter constructs a Snapshotter. store/notifier must not be nil
@@ -112,6 +115,22 @@ func (s *Snapshotter) SetVerifier(v Verifier) { s.verifier = v }
 // for the same-day-rerun test.
 func (s *Snapshotter) SetClock(now func() time.Time) { s.now = now }
 
+// SetLocation sets the calendar zone brain-YYYYMMDD.db is dated in
+// (FIX-FINAL ops-config-r2-timezone-not-single-zone): main.go passes
+// cfg.Location(), kahyad's one calendar zone (G00 C-22). Unset (or nil),
+// the date is the clock's own - time.Local for time.Now.
+func (s *Snapshotter) SetLocation(loc *time.Location) { s.loc = loc }
+
+// dateStamp is today's YYYYMMDD in the snapshotter's zone (SetLocation).
+func (s *Snapshotter) dateStamp() string {
+	now := s.now()
+	loc := s.loc
+	if loc == nil {
+		loc = now.Location()
+	}
+	return now.In(loc).Format("20060102")
+}
+
 // Run executes one backup-nightly cycle (task spec step 1): VACUUM INTO a
 // STAGING file, verify it, and only once it is proven good atomically
 // rename it over brain-YYYYMMDD.db, then ledger `backup.completed` +
@@ -134,7 +153,7 @@ func (s *Snapshotter) Run(ctx context.Context, traceID string) error {
 		return fmt.Errorf("backup: create backup dir %s: %w", s.backupDir, err)
 	}
 
-	date := s.now().Format("20060102")
+	date := s.dateStamp()
 	target := filepath.Join(s.backupDir, fmt.Sprintf("brain-%s.db", date))
 	staging := target + ".staging"
 

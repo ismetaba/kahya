@@ -36,3 +36,21 @@ func TestGovernorLocationWiring(t *testing.T) {
 		t.Error("no anthproxy_governor_booted log line in main.go")
 	}
 }
+
+// TestDayKeyZoneWiring (FIX-FINAL ops-config-r2-timezone-not-single-zone):
+// the three day keys that still followed the process zone - the egress
+// gate's daily byte budget, the nightly backup's file date, consolidation's
+// "today" (user-touched midnight, branch date) - get cfg.Location() too.
+func TestDayKeyZoneWiring(t *testing.T) {
+	gate := onlyCallSite(t, "egress", "NewGate", "")
+	setGate := onlyCallSite(t, "egressGate", "SetLocation", "cfg.Location()")
+	use := onlyCallSite(t, "srv", "SetEgressGate", "egressGate")
+	if setGate.offset < gate.offset || setGate.offset > use.offset {
+		t.Error("egressGate.SetLocation must run after egress.NewGate and before the gate is handed to the server")
+	}
+	onlyCallSite(t, "snapshotter", "SetLocation", "cfg.Location()")
+	cons := onlyCompositeLit(t, "consolidation", "Config")
+	if cons["Location"] != "cfg.Location()" {
+		t.Errorf("consolidation.Config.Location = %q, want cfg.Location()", cons["Location"])
+	}
+}

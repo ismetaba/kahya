@@ -168,6 +168,9 @@ type Gate struct {
 	log      *logx.Logger
 
 	now func() time.Time
+	// loc is the calendar zone of the daily-budget day key (SetLocation);
+	// nil = the clock's own zone (time.Now's is time.Local).
+	loc *time.Location
 
 	// mu serializes Check: a budget check-then-add is a single logical
 	// decision that must never race a concurrent Check for the same host
@@ -241,6 +244,25 @@ func NewGate(cfg policy.EgressConfig, sessions *SensitiveTracker, budget Budget,
 // at a controlled local-day boundary without a real wait).
 func (g *Gate) SetClock(now func() time.Time) { g.now = now }
 
+// SetLocation sets the calendar zone the per-host DAILY byte budget rolls
+// over in (FIX-FINAL ops-config-r2-timezone-not-single-zone): main.go
+// passes cfg.Location(), kahyad's one calendar zone (G00 C-22), so the
+// egress budget resets on the same midnight as the cost governor's daily
+// USD bucket. Unset (or nil), the day is the clock's own - time.Local for
+// time.Now. Call before the gate serves its first Check.
+func (g *Gate) SetLocation(loc *time.Location) { g.loc = loc }
+
+// dayKey is today's egress_budget.day: the calendar day of now in the
+// gate's zone (SetLocation).
+func (g *Gate) dayKey() string {
+	now := g.now()
+	loc := g.loc
+	if loc == nil {
+		loc = now.Location()
+	}
+	return now.In(loc).Format("2006-01-02")
+}
+
 // matchAllowlist reports whether canonicalHost:port is present in the
 // allowlist — an EXACT string match against canonicalHost (never a
 // prefix/suffix/substring match), so a hostname, an IP literal, and a
@@ -300,7 +322,7 @@ func (g *Gate) Check(ctx context.Context, target Target, nbytes int64, session S
 		return g.deny(ctx, canonical, EventBlockedAllowlist, reason, session), nil
 	}
 
-	day := g.now().Format("2006-01-02")
+	day := g.dayKey()
 	limit := g.defaultDailyByteBudget
 	if override, ok := g.perHostDailyByteBudget[canonical]; ok {
 		limit = override
@@ -357,7 +379,7 @@ func (g *Gate) MeterUsage(ctx context.Context, host string, nbytes int64, sessio
 	if err != nil || g.budget == nil {
 		return
 	}
-	day := g.now().Format("2006-01-02")
+	day := g.dayKey()
 	if _, err := g.budget.Add(ctx, canonical, day, nbytes); err != nil {
 		if g.log != nil {
 			g.log.With(session.TraceID).Warn("egress_meter_failed", "host", canonical, "err", err.Error())

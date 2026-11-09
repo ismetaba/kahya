@@ -793,3 +793,64 @@ func TestSensitiveTracker_MarkCtxIsIdempotentAcrossRestart(t *testing.T) {
 		t.Errorf("sensitive_reads.trace_id = %q, want the first mark's %q", row.TraceID, "trace-1")
 	}
 }
+
+// TestCheck_BudgetDayFollowsTheConfiguredZone (FIX-FINAL ops-config-r2-
+// timezone-not-single-zone): with SetLocation the daily byte budget is
+// keyed - and rolls over - on the configured zone's day, not the clock's.
+// 09:00 and 11:00 UTC on Jan 1 are one UTC day but two Kiritimati (UTC+14)
+// days (23:00 Jan 1, 01:00 Jan 2), so the counter restarts between them.
+func TestCheck_BudgetDayFollowsTheConfiguredZone(t *testing.T) {
+	kiritimati, err := time.LoadLocation("Pacific/Kiritimati")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := policy.EgressConfig{
+		Allowlist:              []policy.EgressAllowEntry{{Host: "budget-test.example.com"}},
+		DefaultDailyByteBudget: 1024,
+	}
+	budget := newFakeBudget()
+	g := NewGate(cfg, NewSensitiveTracker(), budget, &fakeLedger{}, nil, nil)
+	g.SetLocation(kiritimati)
+	target := Target{Host: "budget-test.example.com", Port: 443}
+
+	before := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	g.SetClock(func() time.Time { return before })
+	if d, err := g.Check(context.Background(), target, 900, SessionInfo{TraceID: "t1"}); err != nil || !d.Allow {
+		t.Fatalf("first Check: allow=%v err=%v, want allow", d.Allow, err)
+	}
+	if d, err := g.Check(context.Background(), target, 900, SessionInfo{TraceID: "t2"}); err != nil || d.Allow {
+		t.Fatalf("second Check the same zone day: allow=%v err=%v, want blocked (900+900 > 1024)", d.Allow, err)
+	}
+
+	after := before.Add(2 * time.Hour) // same UTC day, next Kiritimati day
+	g.SetClock(func() time.Time { return after })
+	if d, err := g.Check(context.Background(), target, 900, SessionInfo{TraceID: "t3"}); err != nil || !d.Allow {
+		t.Fatalf("Check after the zone's midnight: allow=%v err=%v, want allow (budget rolled over)", d.Allow, err)
+	}
+	g.MeterUsage(context.Background(), "budget-test.example.com", 10, SessionInfo{TraceID: "t3"})
+
+	for day, want := range map[string]int64{"2026-01-01": 900, "2026-01-02": 910} {
+		if got, _ := budget.Bytes(context.Background(), "budget-test.example.com", day); got != want {
+			t.Errorf("budget[%s] = %d, want %d (keys: %v)", day, got, want, budget.m)
+		}
+	}
+}
+
+// TestCheck_BudgetDayUnsetLocationKeepsTheClocksOwnZone: with no
+// SetLocation the day is the clock value's own (time.Local for time.Now) -
+// the behaviour every earlier test in this file pins with a UTC clock.
+func TestCheck_BudgetDayUnsetLocationKeepsTheClocksOwnZone(t *testing.T) {
+	g := NewGate(policy.EgressConfig{}, NewSensitiveTracker(), newFakeBudget(), &fakeLedger{}, nil, nil)
+	g.SetClock(func() time.Time { return time.Date(2026, 1, 1, 23, 30, 0, 0, time.UTC) })
+	if got := g.dayKey(); got != "2026-01-01" {
+		t.Fatalf("dayKey() = %q, want 2026-01-01", got)
+	}
+	g.SetLocation(time.FixedZone("plus3", 3*3600))
+	if got := g.dayKey(); got != "2026-01-02" {
+		t.Fatalf("dayKey() in UTC+3 = %q, want 2026-01-02", got)
+	}
+	g.SetLocation(nil)
+	if got := g.dayKey(); got != "2026-01-01" {
+		t.Fatalf("dayKey() after SetLocation(nil) = %q, want 2026-01-01", got)
+	}
+}

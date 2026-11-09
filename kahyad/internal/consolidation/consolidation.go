@@ -157,6 +157,12 @@ type Config struct {
 	// (branch name, hot-window cutoff, user-touched-lines midnight) to a
 	// fixed instant.
 	Now func() time.Time
+	// Location is the calendar zone of the run's "today" (FIX-FINAL
+	// ops-config-r2-timezone-not-single-zone): the midnight the
+	// user-touched-lines window starts at and the consolidation branch's
+	// date. main.go passes cfg.Location(), kahyad's one calendar zone
+	// (G00 C-22); nil = the clock's own zone (time.Now's is time.Local).
+	Location *time.Location
 
 	// FIX-B-5 batching (cfg.consolidation_*): each lane is consolidated in
 	// batches whose estimateFilesTokens stays under its budget, never as
@@ -258,6 +264,23 @@ func (c *Consolidator) now() time.Time {
 	return time.Now()
 }
 
+// runDay resolves a run's calendar "today" (FIX-FINAL ops-config-r2-
+// timezone-not-single-zone): now moved into loc (Config.Location; nil =
+// now's own zone), that zone's midnight - where the user-touched-lines
+// window starts - and the consolidation branch named after that zone's
+// date. With `timezone` set to a zone other than the system's, the old
+// process-local midnight let a run rewrite lines the user had edited
+// earlier in the configured day.
+func runDay(now time.Time, loc *time.Location) (local, midnight time.Time, branch string) {
+	if loc == nil {
+		loc = now.Location()
+	}
+	local = now.In(loc)
+	midnight = time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	branch = ConsolidationBranchPrefix + now.In(loc).Format("20060102")
+	return local, midnight, branch
+}
+
 func (c *Consolidator) matcher() GlobMatcher {
 	if c.Matcher != nil {
 		return c.Matcher
@@ -312,7 +335,9 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 		return err
 	}
 
-	now := c.now()
+	// now is the run's instant in its calendar zone (Config.Location);
+	// midnight and branch are that zone's "today" (runDay).
+	now, midnight, branch := runDay(c.now(), c.Cfg.Location)
 
 	// memRelToRepo is MemoryDir's own path RELATIVE TO KahyaDir (normally
 	// "memory") - the worktree mirrors the WHOLE ~/Kahya repo, not just
@@ -352,7 +377,6 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	// Step 2: the user-touched line set for the day (task spec step 3) -
 	// computed AFTER the pre-run commit above, so today's dirty-tree edits
 	// are included.
-	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	userTouched, err := ComputeUserTouchedLines(ctx, c.Git, c.Cfg.KahyaDir, midnight)
 	if err != nil {
 		return err
@@ -417,8 +441,6 @@ func (c *Consolidator) Run(ctx context.Context, traceID string) error {
 	if err != nil {
 		return err
 	}
-	branch := ConsolidationBranchPrefix + now.Format("20060102")
-
 	worktreeDir, err := os.MkdirTemp(c.worktreeParentDir(), "kahya-consolidation-*")
 	if err != nil {
 		return fmt.Errorf("consolidation: create worktree parent: %w", err)

@@ -575,6 +575,9 @@ func run() int {
 	}
 	egressBudget := egress.NewSQLBudget(st.Queries)
 	egressGate := egress.NewGate(pol.Egress, sessions, egressBudget, st, notifier, log)
+	// FIX-FINAL ops-config-r2-timezone-not-single-zone: the daily byte
+	// budget rolls over on the configured zone's midnight (G00 C-22).
+	egressGate.SetLocation(cfg.Location())
 	srv.SetEgressGate(egressGate)
 
 	// W3-07: the Telegram approval bot. New NEVER errors - an unconfigured
@@ -1279,6 +1282,9 @@ func run() int {
 		log.Info("backup_gitignore_ensured", "entry", entry)
 	}
 	snapshotter := backup.NewSnapshotter(st, governorNotifier, cfg.BackupDir)
+	// FIX-FINAL ops-config-r2-timezone-not-single-zone: brain-YYYYMMDD.db
+	// is dated in the configured zone.
+	snapshotter.SetLocation(cfg.Location())
 	pusher := backup.NewPusher(backup.NewExecGitRunner(), governorNotifier, cfg.KahyaDir)
 	sched.RegisterHandler("backup-nightly", func(ctx context.Context) error {
 		if err := snapshotter.Run(ctx, scheduler.TraceIDFromContext(ctx)); err != nil {
@@ -1370,6 +1376,10 @@ func run() int {
 		Cfg: consolidation.Config{
 			KahyaDir:  cfg.KahyaDir,
 			MemoryDir: cfg.MemoryDir,
+			// FIX-FINAL ops-config-r2-timezone-not-single-zone: the
+			// user-touched midnight and the branch date follow the
+			// configured zone.
+			Location: cfg.Location(),
 			// FIX-P-1: Run re-ensures the backup dir is git-ignored and
 			// refuses to commit while a path under it is staged.
 			BackupDir:       cfg.BackupDir,

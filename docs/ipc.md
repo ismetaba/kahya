@@ -448,6 +448,18 @@ the daemon's local zone) — never UTC; ledger `created_at` stays UTC, and
 user's daily budget reset at 03:00 local. `anthproxy_governor_booted`
 carries `timezone`.
 
+**FIX-FINAL ops-config-r2-timezone-not-single-zone** — the last three day
+keys that followed the process zone take `cfg.Location()` too: the egress
+gate's per-host daily byte budget (`egress.Gate.SetLocation`, the
+`egress_budget.day` key), the nightly backup's `brain-YYYYMMDD.db` date
+(`backup.Snapshotter.SetLocation`) and consolidation's "today"
+(`consolidation.Config.Location`: the midnight the user-touched-lines
+window starts at, and the `kahya/consolidation-YYYYMMDD` branch date). With
+`timezone` unset nothing changes (the daemon's local zone). With it set to
+another zone, the egress budget now resets on the same midnight as the cost
+governor, and a consolidation run no longer treats lines edited earlier in
+the configured day as untouched.
+
 ### W3-08 note — secret-lane branch (HANDOFF §4 ⚑ ordering invariant)
 
 `kahyad/internal/secretlane` + `kahyad/internal/mlx` add the Go routing

@@ -529,7 +529,10 @@ type Config struct {
 	// Timezone is cfg.timezone (FIX-P-14): the IANA zone name every "which
 	// calendar day is it" decision in kahyad uses (the briefing's
 	// once-per-day gate, metrics/readiness day buckets, metrics absolute
-	// --since dates, the cost governor's daily/monthly USD buckets). Empty
+	// --since dates, the cost governor's daily/monthly USD buckets, the
+	// egress gate's daily byte budget, the nightly backup's file date and
+	// consolidation's "today" - FIX-FINAL ops-config-r2-timezone-not-
+	// single-zone added the last three). Empty
 	// (default) = the daemon process's time.Local, i.e. the macOS system
 	// zone - the user's own zone on a single-user Mac. Ledger timestamps
 	// stay UTC regardless (store.InsertEventWithDigest). An unknown name

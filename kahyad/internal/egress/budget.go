@@ -4,9 +4,10 @@
 // 0004_egress_budget.sql) so a kahyad restart never resets a host's
 // counter mid-day.
 //
-// "day" is ALWAYS the Mac's LOCAL wall-clock day —
-// time.Now().Format("2006-01-02") (Gate.now, overridable via SetClock) —
-// deliberately NOT UTC: an operator reasons about "today's egress
+// "day" is ALWAYS a wall-clock calendar day - Gate.dayKey: the clock's
+// (Gate.now, overridable via SetClock) day in kahyad's one configured
+// zone (Gate.SetLocation, cfg.Location(); the Mac's local zone when no
+// `timezone` is configured) - deliberately NOT UTC: an operator reasons about "today's egress
 // budget" in their own local day, and a bare UTC boundary would roll a
 // budget over at an arbitrary, confusing local wall-clock moment (e.g.
 // 03:00 in Istanbul, DST-dependent). This mirrors the same
