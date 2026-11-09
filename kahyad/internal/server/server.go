@@ -558,6 +558,9 @@ func (s *Server) Prepare() error {
 	secret, err := mintControlSecret(secretPath)
 	if err != nil {
 		ln.Close()
+		// The listener no longer unlinks its path on Close (prepareListener):
+		// remove it by name while the flock is still held.
+		_ = os.Remove(s.cfg.Socket)
 		if lock != nil {
 			lock.Close()
 		}
@@ -716,6 +719,16 @@ func (s *Server) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(ctx)
+	// FIX-FINAL flake-r2-control-secret-late-serve-unlinks-socket:
+	// http.Shutdown closes only listeners Serve has registered. When
+	// Shutdown wins the race against the Serve goroutine (a context
+	// cancelled right after Prepare, a test that shuts down at once) the
+	// listener was never registered and stayed open: close it here. On the
+	// usual path it is already closed and this returns an error nobody
+	// needs.
+	if s.ln != nil {
+		_ = s.ln.Close()
+	}
 
 	// W3-04 spec step 7: "on kahyad shutdown, kill all containers labeled
 	// kahya.task_id" - only the ones THIS daemon owns (kahya.owner, FIX-FINAL
@@ -731,18 +744,22 @@ func (s *Server) Shutdown() error {
 		}
 	}
 
-	// Safe: we have held the startup flock since Prepare, so no other
-	// daemon can have bound this path in the meantime.
-	_ = os.Remove(s.cfg.Socket)
-	// G03 / B-3 (G00 C-5): the per-boot control secret goes LAST, after
-	// the listener is closed and the socket unlinked - but still while the
-	// startup flock is held, so a successor kahyad (which must take that
-	// flock before it can mint) can never have its fresh secret deleted
-	// here. Any step G10 adds to Shutdown goes above this line.
-	if s.controlSecret != "" {
-		_ = os.Remove(config.ControlSecretPath(s.cfg.Socket))
-	}
+	// The socket and the secret are unlinked only while this server still
+	// holds the startup flock it has held since Prepare - then no other
+	// daemon can have bound the path in the meantime. A repeated Shutdown
+	// (test fixtures call it again from t.Cleanup) has already released the
+	// flock: by then the path may belong to a successor, so it unlinks
+	// nothing (FIX-FINAL flake-r2-control-secret-late-serve-unlinks-socket).
 	if s.lock != nil {
+		_ = os.Remove(s.cfg.Socket)
+		// G03 / B-3 (G00 C-5): the per-boot control secret goes LAST, after
+		// the listener is closed and the socket unlinked - but still while
+		// the startup flock is held, so a successor kahyad (which must take
+		// that flock before it can mint) can never have its fresh secret
+		// deleted here. Any step G10 adds to Shutdown goes above this line.
+		if s.controlSecret != "" {
+			_ = os.Remove(config.ControlSecretPath(s.cfg.Socket))
+		}
 		_ = s.lock.Close() // releases the flock; the .lock file stays (never unlink a lock file)
 		s.lock = nil
 	}
@@ -844,8 +861,20 @@ func prepareListener(socketPath string, lock *os.File) (net.Listener, *os.File, 
 		lock.Close()
 		return nil, nil, fmt.Errorf("server: listen on %s: %w", socketPath, err)
 	}
+	// FIX-FINAL flake-r2-control-secret-late-serve-unlinks-socket: the
+	// socket path is unlinked BY NAME, under the startup flock, and nowhere
+	// else (the stale-socket takeover above, the two failure paths that
+	// follow a successful bind, Server.Shutdown) - never as a side effect of
+	// closing the listener. net.UnixListener unlinks its path on Close by
+	// default, and a Close that runs late - a Serve goroutine that only
+	// starts after Shutdown returned still closes the listener it was
+	// handed - then deleted a successor daemon's live socket.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		ln.Close()
+		_ = os.Remove(socketPath) // still under the flock
 		lock.Close()
 		return nil, nil, fmt.Errorf("server: chmod socket %s: %w", socketPath, err)
 	}

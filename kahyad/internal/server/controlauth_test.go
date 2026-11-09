@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"kahya/kahyad/internal/config"
 	"kahya/kahyad/internal/memlane"
@@ -121,6 +122,10 @@ func TestControlSecretMintedNextToSocket(t *testing.T) {
 		t.Fatalf("temp file %s.tmp left behind (err=%v)", secretPath, err)
 	}
 
+	// Wait until the Serve goroutine is really serving, so this test is the
+	// "served, then shut down" order every time (the other order - Shutdown
+	// before Serve ran - is TestLateServeNeverUnlinksASuccessorsSocket).
+	waitServing(t, sock)
 	if err := srv.Shutdown(); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
@@ -709,5 +714,97 @@ func TestWorkerRawMemorySearchRefused(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || len(out.Results) != 1 || out.Results[0].ChunkID != 4 {
 		t.Fatalf("for_injection:true = %d %+v, want 200 with only the clean chunk 4", resp.StatusCode, out.Results)
+	}
+}
+
+// waitServing blocks until a daemon answers /health on sock.
+func waitServing(t *testing.T, sock string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !probeHealth(sock) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no daemon answered /health on %s within 5s", sock)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestLateServeNeverUnlinksASuccessorsSocket (FIX-FINAL flake-r2-control-
+// secret-late-serve-unlinks-socket): the order that made
+// TestControlSecretMintedNextToSocket flaky, forced. Shutdown runs before
+// the first server's Serve ever does; a successor then binds the same
+// path; only now does the first server's Serve run. http.Server.Serve
+// closes the listener it is handed, and net.UnixListener used to unlink its
+// path on Close - deleting the successor's live socket ("second Prepare:
+// chmod socket ...: no such file or directory", or a successor left
+// serving a socket nobody can dial).
+func TestLateServeNeverUnlinksASuccessorsSocket(t *testing.T) {
+	sock := filepath.Join(shortSocketDir(t), "k.sock")
+
+	srv := New(testConfig(sock), testLogger(t), "v-late", healthyDB)
+	if err := srv.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	firstListener := srv.ln
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("Shutdown before Serve: %v", err)
+	}
+	// Shutdown closed the listener Serve never registered: Accept on it
+	// fails at once. (On a listener left open it would block, so it runs
+	// beside a timer.)
+	accepted := make(chan error, 1)
+	go func() {
+		c, err := firstListener.Accept()
+		if err == nil {
+			c.Close()
+		}
+		accepted <- err
+	}()
+	select {
+	case err := <-accepted:
+		if err == nil {
+			t.Fatal("the first server's listener still accepts after Shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first server's listener is still open after Shutdown (Accept blocks)")
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("socket still present after Shutdown (err=%v)", err)
+	}
+
+	srv2 := New(testConfig(sock), testLogger(t), "v-late", healthyDB)
+	if err := srv2.Prepare(); err != nil {
+		t.Fatalf("successor Prepare: %v", err)
+	}
+	go srv2.Serve() //nolint:errcheck
+	t.Cleanup(func() { srv2.Shutdown() })
+	waitServing(t, sock)
+	successorSecret := readSecretFile(t, sock)
+
+	// The first server's Serve goroutine finally runs.
+	if err := srv.Serve(); err != nil {
+		t.Fatalf("late Serve = %v, want nil (server already shut down)", err)
+	}
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("the late Serve unlinked the successor's socket: %v", err)
+	}
+	if !probeHealth(sock) {
+		t.Fatal("the successor no longer answers /health after the first server's late Serve")
+	}
+
+	// A repeated Shutdown of the first server (t.Cleanup in other tests)
+	// no longer holds the flock: it must not unlink the successor's socket
+	// or secret either.
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("repeated Shutdown: %v", err)
+	}
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("a repeated Shutdown unlinked the successor's socket: %v", err)
+	}
+	if got := readSecretFile(t, sock); got != successorSecret {
+		t.Fatalf("a repeated Shutdown changed the successor's secret: %q != %q", got, successorSecret)
+	}
+	if !probeHealth(sock) {
+		t.Fatal("the successor no longer answers /health after the first server's repeated Shutdown")
 	}
 }
