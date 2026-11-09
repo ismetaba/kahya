@@ -645,12 +645,6 @@ func (e *Engine) WriteFact(ctx context.Context, traceID string, c Candidate) (in
 	return fact.ID, nil
 }
 
-// addEvidence inserts one evidence row, deduped per (fact_id, session_id,
-// polarity) - HANDOFF S5 memory #3: "ayni-oturum tekrari tek kanit
-// sayilir". A candidate with no session_id (sessionID == "") is never
-// deduped (SQL's own NULL != NULL semantics already make the dedupe
-// SELECT below match nothing for a NULL session_id, which is the safe
-// default: fewer things to conflate, not fewer evidence rows).
 // isUniqueViolation reports whether err is a SQLite UNIQUE/PK constraint
 // violation (the shape mattn/go-sqlite3 surfaces) - mirrors
 // kahyad/internal/task.isUniqueConstraintViolation one package over.
@@ -662,6 +656,12 @@ func isUniqueViolation(err error) bool {
 	return false
 }
 
+// addEvidence inserts one evidence row, deduped per (fact_id, session_id,
+// polarity) - HANDOFF S5 memory #3: "ayni-oturum tekrari tek kanit
+// sayilir". A candidate with no session_id (sessionID == "") is never
+// deduped (SQL's own NULL != NULL semantics already make the dedupe
+// SELECT below match nothing for a NULL session_id, which is the safe
+// default: fewer things to conflate, not fewer evidence rows).
 func (e *Engine) addEvidence(ctx context.Context, factID, episodeID int64, sessionID string, polarity int64, weight float64) error {
 	sessCol := nullString(sessionID)
 	if sessionID != "" {

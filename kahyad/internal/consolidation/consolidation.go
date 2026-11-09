@@ -178,15 +178,6 @@ type Config struct {
 	ChangedFilesFirst bool
 }
 
-// Consolidator is the W5-02 nightly consolidation orchestrator. Every
-// dependency below is a narrow interface (or, for git, the SAME
-// kahyad/internal/backup.GitRunner every other git-touching package in
-// this codebase already reuses) - nothing here holds a *sql.DB directly
-// except HotWindow, which is a SEPARATE, optional collaborator
-// (consolidation_test.go's write-boundary test constructs a Consolidator
-// with HotWindow left nil and proves Run still fully completes the
-// markdown/git pipeline with ZERO brain.db access anywhere else in this
-// struct).
 // RepoLocker serializes consolidation's own memory-repo git mutations with
 // kahyad's memory tools (mcp/memory.Server's mutex, through
 // kahyad/internal/server.Server.LockMemoryRepo): LockMemoryRepo blocks
@@ -207,6 +198,15 @@ type PendingWriteRecoverer interface {
 	RecoverPendingMemoryWritesLocked(ctx context.Context, traceID string) error
 }
 
+// Consolidator is the W5-02 nightly consolidation orchestrator. Every
+// dependency below is a narrow interface (or, for git, the SAME
+// kahyad/internal/backup.GitRunner every other git-touching package in
+// this codebase already reuses) - nothing here holds a *sql.DB directly
+// except HotWindow, which is a SEPARATE, optional collaborator
+// (consolidation_test.go's write-boundary test constructs a Consolidator
+// with HotWindow left nil and proves Run still fully completes the
+// markdown/git pipeline with ZERO brain.db access anywhere else in this
+// struct).
 type Consolidator struct {
 	Cfg Config
 

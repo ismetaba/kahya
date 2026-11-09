@@ -234,14 +234,14 @@ func (x *Executor) SetClock(now func() time.Time) { x.now = now }
 
 func (x *Executor) nowRFC3339() string { return x.now().UTC().Format(time.RFC3339Nano) }
 
-// isTerminalStatus reports whether status is one of the task state
-// machine's three terminal, zero-outbound-edge statuses
-// (kahyad/internal/task.allowedTransitions has no entry at all for any of
-// these three, by construction).
 // haltTransitionAttempts bounds HaltTask's user_halted compare-and-set
 // retries against concurrent non-terminal transitions.
 const haltTransitionAttempts = 8
 
+// isTerminalStatus reports whether status is one of the task state
+// machine's three terminal, zero-outbound-edge statuses
+// (kahyad/internal/task.allowedTransitions has no entry at all for any of
+// these three, by construction).
 func isTerminalStatus(status string) bool {
 	switch status {
 	case task.StatusDone, task.StatusFailed, task.StatusUserHalted:

@@ -276,6 +276,14 @@ func classifyToken(tok string) (FlagKind, bool) {
 	return "", false
 }
 
+// scriptsOfInterest is the curated script subset scriptOf checks, in
+// lookup order (scriptOf's doc comment says why these).
+var scriptsOfInterest = []string{
+	"Latin", "Cyrillic", "Greek", "Armenian", "Hebrew", "Arabic",
+	"Han", "Hiragana", "Katakana", "Hangul", "Devanagari", "Thai",
+	"Georgian", "Cherokee",
+}
+
 // scriptOf resolves r's Unicode Script property value among the common
 // scripts this package cares about for spoof-detection, returning "" for
 // Common/Inherited (script-neutral: digits, combining marks with no
@@ -285,12 +293,6 @@ func classifyToken(tok string) (FlagKind, bool) {
 // #39's own "Restricted"/"Highly Restrictive" script list) keeps this
 // cheap and avoids ever needing to special-case Common/Inherited
 // separately — they are simply absent from the set below.
-var scriptsOfInterest = []string{
-	"Latin", "Cyrillic", "Greek", "Armenian", "Hebrew", "Arabic",
-	"Han", "Hiragana", "Katakana", "Hangul", "Devanagari", "Thai",
-	"Georgian", "Cherokee",
-}
-
 func scriptOf(r rune) string {
 	for _, name := range scriptsOfInterest {
 		if table, ok := unicode.Scripts[name]; ok && unicode.Is(table, r) {

@@ -518,14 +518,6 @@ func (c *Client) PolicyFeedback(ctx context.Context, traceID, kind, pendingAppro
 	return fr.Token, nil
 }
 
-// ApprovalDecision calls POST /approvals/{id}/decision {approve, typed}
-// (W6-01) - the non-interactive counterpart to PolicyFeedback used by
-// `kahya approvals decide` and (indirectly, via that subcommand)
-// hammerspoon/kahya.lua's approval cards. No surface field is ever sent -
-// kahyad itself stamps surface="local" from the UDS channel (see
-// kahyad/internal/server's handleApprovalsDecision doc comment); there is
-// no wire field on this route for a caller to forge one through. Like
-// PolicyFeedback, the returned legacy token string is always "" since B-1.
 // approvalCodeW3TypedOnaylaRequired mirrors kahyad/internal/server's stable
 // decision refusal code for a W3 approve whose typed word was not exactly
 // "onayla" (FIX-FINAL TUX-4).
@@ -535,6 +527,14 @@ const approvalCodeW3TypedOnaylaRequired = "w3_typed_onayla_required"
 // pending approval was NOT consumed and still waits.
 var errW3TypedMismatch = errors.New("approvals/decision: W3 typed confirmation word mismatch")
 
+// ApprovalDecision calls POST /approvals/{id}/decision {approve, typed}
+// (W6-01) - the non-interactive counterpart to PolicyFeedback used by
+// `kahya approvals decide` and (indirectly, via that subcommand)
+// hammerspoon/kahya.lua's approval cards. No surface field is ever sent -
+// kahyad itself stamps surface="local" from the UDS channel (see
+// kahyad/internal/server's handleApprovalsDecision doc comment); there is
+// no wire field on this route for a caller to forge one through. Like
+// PolicyFeedback, the returned legacy token string is always "" since B-1.
 func (c *Client) ApprovalDecision(ctx context.Context, traceID, id string, approve bool, typed string) (string, error) {
 	body, err := json.Marshal(map[string]any{"approve": approve, "typed": typed})
 	if err != nil {
@@ -1577,10 +1577,6 @@ func (c *Client) EvalExportRitual(ctx context.Context, traceID string) (evalExpo
 	return rr, nil
 }
 
-// Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
-// "lines" array (kahyad/internal/server.logLineResponse). traceID is the
-// X-Kahya-Trace-Id this request itself carries (a freshly minted one - it
-// need not match queryTraceID, the trace being looked up).
 // metricsDayCount / metricsDaySpend / metricsResult mirror
 // kahyad/internal/metrics.{DayCount,DaySpend,Metrics} (W78-04) exactly, so the
 // CLI stays a THIN client: it decodes the daemon's aggregate JSON and renders
@@ -1689,6 +1685,10 @@ func (c *Client) Readiness(ctx context.Context, traceID, since string) (readines
 	return rep, nil
 }
 
+// Log calls GET /v1/log?trace_id=queryTraceID and returns the decoded
+// "lines" array (kahyad/internal/server.logLineResponse). traceID is the
+// X-Kahya-Trace-Id this request itself carries (a freshly minted one - it
+// need not match queryTraceID, the trace being looked up).
 func (c *Client) Log(ctx context.Context, traceID, queryTraceID string) ([]map[string]any, error) {
 	q := url.Values{"trace_id": {queryTraceID}}
 	req, err := c.newRequest(ctx, http.MethodGet, "/v1/log?"+q.Encode(), traceID, nil)
