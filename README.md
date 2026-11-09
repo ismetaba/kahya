@@ -42,6 +42,13 @@ Related directories **outside** this repo (per HANDOFF §7/§9 — code and memo
 `make build` · `make test` · `make lint` · `make invariants` — Go for kahyad, the CLI and the memory MCP;
 Python (`worker/.venv`, built by `make venv` from `worker/requirements.lock`) for the worker only.
 
+**Upgrading an installed Mac.** After pulling, run `make install` (the `~/bin` copies of `kahyad` and
+`kahya`) and `make install-agent`. `~/.hammerspoon/kahya.lua` is a rendered copy that only
+`make hammerspoon-install` writes, so both targets end with `make hammerspoon-check`: when the installed
+copy differs from this checkout's `hammerspoon/kahya.lua` it prints a `WARNING: ... is STALE` block. Run
+`make hammerspoon-install` and reload Hammerspoon's config then; until you do, the palette, the approval
+cards and the ⌥⎋ halt key keep running the old Lua. The check never writes the file itself.
+
 **Platform note.** `make test` is macOS-only: `make venv` installs `worker/requirements.lock`, which pins
 Apple-silicon-only wheels (`mlx`, `mlx-metal`, `mlx-whisper` for in-worker STT). On Linux run the Go suite
 directly (`go test -tags sqlite_fts5 ./...`; `tests/e2e` and the spawn tests skip without a worker venv)

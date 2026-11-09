@@ -28,7 +28,7 @@ REPO_ROOT := $(abspath .)
 # `sandbox-image` pins below matches what's actually built.
 SANDBOX_IMAGE_TAG := kahya-sandbox:0.1.0
 
-.PHONY: build test lint venv venv-locked mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install invariants restore-drill readiness readiness-complete
+.PHONY: build test lint venv venv-locked mlx-venv test-mlx generate codesign install run-daemon install-agent uninstall-agent accept-w12 accept-w4 eval-retrieval eval-redteam metrics sandbox-image docker-up hammerspoon-install hammerspoon-check invariants restore-drill readiness readiness-complete
 # sqlite_fts5 is required on EVERY Go build/test/lint/vet invocation:
 # mattn/go-sqlite3's default build does not compile in FTS5, and
 # kahyad/migrations/0002 (W12-03) creates an FTS5 virtual table that would
@@ -268,6 +268,7 @@ install: codesign
 	mkdir -p $(HOME)/bin
 	install -m 0755 bin/kahyad $(HOME)/bin/kahyad
 	install -m 0755 bin/kahya  $(HOME)/bin/kahya
+	@$(MAKE) --no-print-directory hammerspoon-check
 run-daemon: build
 	./bin/kahyad
 install-agent: build
@@ -276,6 +277,7 @@ install-agent: build
 	sed -e 's#__KAHYA_REPO_ROOT__#$(REPO_ROOT)#g' -e 's#__KAHYA_LOG_DIR__#$(KAHYA_LOG_DIR)#g' \
 		kahyad/launchd/$(PLIST_NAME) > "$(LAUNCH_AGENTS_DIR)/$(PLIST_NAME)"
 	launchctl bootstrap gui/$$(id -u) "$(LAUNCH_AGENTS_DIR)/$(PLIST_NAME)"
+	@$(MAKE) --no-print-directory hammerspoon-check
 uninstall-agent:
 	-launchctl bootout gui/$$(id -u)/com.kahya.kahyad
 	rm -f "$(LAUNCH_AGENTS_DIR)/$(PLIST_NAME)"
@@ -287,15 +289,49 @@ uninstall-agent:
 # to ~/.hammerspoon/init.lua if not already present (creating init.lua
 # first if it doesn't exist yet). Depends on `build` so bin/kahya actually
 # exists before its path is baked into the installed Lua file.
+#
+# HS_DIR is where Hammerspoon reads its config: a variable only so a test
+# can point hammerspoon-check at a scratch directory - never override it
+# for a real install. HS_RENDER writes the installable kahya.lua to stdout;
+# it is the ONE rendering both hammerspoon-install and hammerspoon-check
+# use, so "what is installed" and "what the check compares against" cannot
+# drift apart. (Its sed delimiter is '|': a '#' would start a make comment
+# inside a variable definition.)
+HS_DIR ?= $(HOME)/.hammerspoon
+HS_LUA = $(HS_DIR)/kahya.lua
+HS_RENDER = sed -e 's|@KAHYA_BIN@|$(abspath bin/kahya)|g' hammerspoon/kahya.lua
 hammerspoon-install: build
-	mkdir -p "$(HOME)/.hammerspoon"
-	sed -e 's#@KAHYA_BIN@#$(abspath bin/kahya)#g' \
-		hammerspoon/kahya.lua > "$(HOME)/.hammerspoon/kahya.lua"
-	touch "$(HOME)/.hammerspoon/init.lua"
-	grep -qxF 'require("kahya")' "$(HOME)/.hammerspoon/init.lua" || \
-		echo 'require("kahya")' >> "$(HOME)/.hammerspoon/init.lua"
-	@echo "installed: $(HOME)/.hammerspoon/kahya.lua (kahya bin: $(abspath bin/kahya))"
+	mkdir -p "$(HS_DIR)"
+	$(HS_RENDER) > "$(HS_LUA)"
+	touch "$(HS_DIR)/init.lua"
+	grep -qxF 'require("kahya")' "$(HS_DIR)/init.lua" || \
+		echo 'require("kahya")' >> "$(HS_DIR)/init.lua"
+	@echo "installed: $(HS_LUA) (kahya bin: $(abspath bin/kahya))"
 	@echo "reload Hammerspoon's config (menu bar icon -> Reload Config) to pick it up"
+# hammerspoon-check (FIX-FINAL ops-config-r2-installed-kahya-lua-never-
+# refreshed): the installed kahya.lua is a rendered COPY that only
+# hammerspoon-install writes, so an upgrade (`git pull && make install`)
+# left the old Lua running - the palette, the approval cards and the halt
+# key kept their pre-upgrade behaviour (an old halt handler shows its
+# "all tasks stopped" banner even when kahyad was unreachable) and nothing
+# said so. `make install` and `make install-agent` end with this check: it
+# compares the installed copy with what hammerspoon-install would write
+# now and prints a warning naming that command when they differ. It never
+# writes into HS_DIR (an installed copy may point at another checkout's
+# bin/kahya on purpose) and never fails the install.
+hammerspoon-check:
+	@if [ ! -f "$(HS_LUA)" ]; then \
+		echo "hammerspoon: $(HS_LUA) is not installed (optional: make hammerspoon-install)"; \
+	elif $(HS_RENDER) | cmp -s - "$(HS_LUA)"; then \
+		echo "hammerspoon: $(HS_LUA) is up to date"; \
+	else \
+		echo ""; \
+		echo "WARNING: $(HS_LUA) is STALE: it differs from this checkout's hammerspoon/kahya.lua."; \
+		echo "         The palette, the approval cards and the halt key keep running the old Lua until you run"; \
+		echo "             make hammerspoon-install"; \
+		echo "         and reload Hammerspoon's config (menu bar icon -> Reload Config)."; \
+		echo ""; \
+	fi
 # accept-w12: the W1-2 LIVE acceptance gate (W12-10). Unlike `test`'s
 # hermetic e2e gate (mock Anthropic server, throwaway fixture corpus), this
 # runs against a REAL already-running kahyad (launchd `make install-agent`

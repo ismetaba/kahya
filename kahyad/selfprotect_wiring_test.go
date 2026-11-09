@@ -398,7 +398,14 @@ func TestMakeInstallTargetsTheProtectedBinDir(t *testing.T) {
 		"install -m 0755 bin/kahyad " + dest + "/kahyad",
 		"install -m 0755 bin/kahya  " + dest + "/kahya",
 	}
-	if !slices.Equal(recipe, want) {
-		t.Fatalf("Makefile install recipe = %q, want %q (update config.InstallBinDirName / SelfProtectDenyGlobs with it)", recipe, want)
+	// The recipe may go on after the copies (it ends with the Hammerspoon
+	// staleness check); what it writes, and where, is its first three lines.
+	if len(recipe) < len(want) || !slices.Equal(recipe[:len(want)], want) {
+		t.Fatalf("Makefile install recipe = %q, want it to start with %q (update config.InstallBinDirName / SelfProtectDenyGlobs with it)", recipe, want)
+	}
+	for _, l := range recipe[len(want):] {
+		if strings.Contains(l, "install ") || strings.Contains(l, "cp ") {
+			t.Fatalf("Makefile install recipe copies something else (%q): protect its destination too", l)
+		}
 	}
 }
