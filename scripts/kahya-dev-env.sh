@@ -40,6 +40,15 @@ DEV_SOCK="${DEV_DATA_DIR}/kahyad-dev.sock"
 # default 3128, is shared and held by a running prod daemon). Override with
 # KAHYA_DEV_EGRESS_PORT; rendered into the dev plist too.
 DEV_EGRESS_PORT="${KAHYA_DEV_EGRESS_PORT:-3129}"
+# kahyad's config.Load refuses a KAHYA_EGRESS_PORT that is not an integer
+# (FIX-FINAL ops-config-r2-env-overrides-silently-ignore-bad-values): stop
+# here, before a bad value is rendered into the dev plist.
+case "${DEV_EGRESS_PORT}" in
+'' | *[!0-9]*)
+	echo "ERROR: KAHYA_DEV_EGRESS_PORT='${DEV_EGRESS_PORT}' is not a port number" >&2
+	exit 1
+	;;
+esac
 DEV_MEM_DIR="${HOME}/Kahya-dev/memory"
 DEV_BACKUP_DIR="${HOME}/Kahya-dev/backups"
 DEV_POLICY="${REPO_ROOT}/policy.dev.yaml"

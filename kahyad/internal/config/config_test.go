@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 // state from the invoking shell or bleed between subtests.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS", "KAHYA_TIMEZONE", "KAHYA_TELEGRAM_TOKEN_OVERRIDE", "KAHYA_ANCHOR_KEY_OVERRIDE", "KAHYA_ANCHOR_REMOTE", "KAHYA_ANCHOR_LOCAL_FALLBACK_PATH"} {
+	for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_ENV", "KAHYA_LOG_LEVEL", "KAHYA_SHELL_WORKDIR_ROOTS", "KAHYA_TELEGRAM_CHAT_ID", "KAHYA_TELEGRAM_USER_ID", "KAHYA_QWEN_CLASSIFY_BUDGET_MS", "KAHYA_BRIEFING_MAX_FILE_ITEMS", "KAHYA_TIMEZONE", "KAHYA_TELEGRAM_TOKEN_OVERRIDE", "KAHYA_ANCHOR_KEY_OVERRIDE", "KAHYA_ANCHOR_REMOTE", "KAHYA_ANCHOR_LOCAL_FALLBACK_PATH", "KAHYA_EGRESS_PORT", "KAHYA_QWEN_PORT", "KAHYA_QWEN_IDLE_TTL_SECONDS", "KAHYA_ANCHOR_INTERVAL_HOURS"} {
 		t.Setenv(k, "")
 	}
 }
@@ -659,7 +660,7 @@ func TestLoadFileOverridesDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	yamlContent := "embed_port: 9999\n" +
-		"default_model: \"custom-model\"\n" +
+		"default_model: \"claude-opus-5-5\"\n" +
 		"data_dir: \"" + customDataDir + "\"\n"
 	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(yamlContent), 0o600); err != nil {
 		t.Fatal(err)
@@ -673,8 +674,8 @@ func TestLoadFileOverridesDefaults(t *testing.T) {
 	if cfg.EmbedPort != 9999 {
 		t.Errorf("EmbedPort = %d, want 9999 (file should override default)", cfg.EmbedPort)
 	}
-	if cfg.DefaultModel != "custom-model" {
-		t.Errorf("DefaultModel = %q, want custom-model", cfg.DefaultModel)
+	if cfg.DefaultModel != "claude-opus-5-5" {
+		t.Errorf("DefaultModel = %q, want claude-opus-5-5", cfg.DefaultModel)
 	}
 	if cfg.DataDir != customDataDir {
 		t.Errorf("DataDir = %q, want %q", cfg.DataDir, customDataDir)
@@ -2348,5 +2349,166 @@ func TestResolveSocketIgnoresUnrelatedValidators(t *testing.T) {
 	writeConfigYAML(t, home, "socket: [unterminated\n")
 	if _, err := ResolveSocket(); err == nil {
 		t.Error("an unparseable config.yaml resolved a socket")
+	}
+}
+
+// numericEnvOverrides is every KAHYA_* override applyEnv parses as an
+// integer, with a value Load accepts for it.
+var numericEnvOverrides = map[string]string{
+	"KAHYA_EGRESS_PORT":             "4001",
+	"KAHYA_QWEN_PORT":               "4002",
+	"KAHYA_QWEN_IDLE_TTL_SECONDS":   "600",
+	"KAHYA_QWEN_CLASSIFY_BUDGET_MS": "2000",
+	"KAHYA_BRIEFING_MAX_FILE_ITEMS": "5",
+	"KAHYA_ANCHOR_INTERVAL_HOURS":   "12",
+	"KAHYA_TELEGRAM_CHAT_ID":        "555",
+	"KAHYA_TELEGRAM_USER_ID":        "777",
+}
+
+// TestLoadFailsClosedOnUnparseableNumericEnvOverride (FIX-FINAL ops-config-
+// r2-env-overrides-silently-ignore-bad-values): every numeric KAHYA_*
+// override fails Load, naming the variable and its value, when the value is
+// not an integer. Before the fix the value was dropped and the config.yaml
+// or default value used instead - KAHYA_EGRESS_PORT=31a9 from the dev plist
+// left the dev daemon binding prod's egress port.
+func TestLoadFailsClosedOnUnparseableNumericEnvOverride(t *testing.T) {
+	for name := range numericEnvOverrides {
+		for _, bad := range []string{"31a9", "abc", "12.5", " 3128", "3128 ", "0x10", "1e3"} {
+			t.Run(name+"="+bad, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv(name, bad)
+				_, err := Load()
+				if err == nil {
+					t.Fatalf("Load() with %s=%q succeeded, want an error", name, bad)
+				}
+				want := fmt.Sprintf("config: %s=%q is not an integer", name, bad)
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("Load() error = %q, want it to contain %q", err, want)
+				}
+			})
+		}
+	}
+}
+
+// TestLoadNamesEveryUnparseableNumericEnvOverride: two bad overrides are
+// both reported by the one Load error (no fix-one-find-the-next loop).
+func TestLoadNamesEveryUnparseableNumericEnvOverride(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KAHYA_EGRESS_PORT", "31a9")
+	t.Setenv("KAHYA_QWEN_PORT", "x")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() succeeded, want an error")
+	}
+	for _, want := range []string{`KAHYA_EGRESS_PORT="31a9"`, `KAHYA_QWEN_PORT="x"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Load() error = %q, want it to name %s", err, want)
+		}
+	}
+}
+
+// TestLoadAppliesParseableNumericEnvOverrides: the same overrides still
+// apply when they parse, and an empty variable is unset.
+func TestLoadAppliesParseableNumericEnvOverrides(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	for name, v := range numericEnvOverrides {
+		t.Setenv(name, v)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	got := map[string]int64{
+		"KAHYA_EGRESS_PORT":             int64(cfg.EgressPort),
+		"KAHYA_QWEN_PORT":               int64(cfg.QwenPort),
+		"KAHYA_QWEN_IDLE_TTL_SECONDS":   int64(cfg.QwenIdleTTLSeconds),
+		"KAHYA_QWEN_CLASSIFY_BUDGET_MS": int64(cfg.QwenClassifyBudgetMS),
+		"KAHYA_BRIEFING_MAX_FILE_ITEMS": int64(cfg.BriefingMaxFileItems),
+		"KAHYA_ANCHOR_INTERVAL_HOURS":   int64(cfg.AnchorIntervalHours),
+		"KAHYA_TELEGRAM_CHAT_ID":        cfg.TelegramChatID,
+		"KAHYA_TELEGRAM_USER_ID":        cfg.TelegramUserID,
+	}
+	for name, v := range numericEnvOverrides {
+		if fmt.Sprint(got[name]) != v {
+			t.Errorf("%s=%s applied as %d", name, v, got[name])
+		}
+	}
+
+	clearEnv(t)
+	t.Setenv("KAHYA_EGRESS_PORT", "")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() with an empty KAHYA_EGRESS_PORT error = %v, want none (empty is unset)", err)
+	}
+}
+
+// TestResolveSocketIgnoresUnparseableNumericEnvOverride: a bad numeric
+// override in a client's environment must not keep `kahya halt` from
+// dialing the live daemon (FIX-FINAL ops-config-load-gates-halt-and-jobs) -
+// none of those overrides can move the socket.
+func TestResolveSocketIgnoresUnparseableNumericEnvOverride(t *testing.T) {
+	clearEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want, err := ResolveSocket()
+	if err != nil {
+		t.Fatalf("ResolveSocket() error = %v", err)
+	}
+	t.Setenv("KAHYA_EGRESS_PORT", "31a9")
+	got, err := ResolveSocket()
+	if err != nil || got != want {
+		t.Fatalf("ResolveSocket() with a bad KAHYA_EGRESS_PORT = %q, %v; want %q, nil", got, err, want)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() with the same environment succeeded, want it to fail closed")
+	}
+}
+
+// TestLoadValidatesDefaultModel (FIX-FINAL ops-config-r2-env-overrides-
+// silently-ignore-bad-values): default_model must be a model id the proxy
+// allowlist accepts - a typo fails Load instead of refusing every chat task
+// at runtime. Current and legacy ids load; IsLegacyModelID tells them apart.
+func TestLoadValidatesDefaultModel(t *testing.T) {
+	for _, tc := range []struct {
+		yaml    string
+		wantErr bool
+		legacy  bool
+	}{
+		{"", false, false},
+		{"default_model: claude-opus-5-5\n", false, false},
+		{"default_model: claude-fable-5-1\n", false, false},
+		{"default_model: claude-sonnet-5\n", false, true},
+		{"default_model: claude-opus-4-8\n", false, true},
+		{"default_model: claude-sonet-5-5\n", true, false},
+		{"default_model: custom-model\n", true, false},
+		{"default_model: \"\"\n", true, false},
+		{"default_model: \" claude-sonnet-5-5\"\n", true, false},
+	} {
+		t.Run(tc.yaml, func(t *testing.T) {
+			clearEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tc.yaml != "" {
+				writeConfigYAML(t, home, tc.yaml)
+			}
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "default_model") || !strings.Contains(err.Error(), "claude-sonnet-5-5") {
+					t.Fatalf("Load() error = %v, want a default_model error listing the known ids", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if got := IsLegacyModelID(cfg.DefaultModel); got != tc.legacy {
+				t.Errorf("IsLegacyModelID(%q) = %v, want %v", cfg.DefaultModel, got, tc.legacy)
+			}
+		})
+	}
+	if !slices.Contains(CurrentModelIDs(), DefaultModelID) {
+		t.Fatalf("DefaultModelID %q is not a current model id", DefaultModelID)
 	}
 }

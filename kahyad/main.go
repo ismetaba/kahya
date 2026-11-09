@@ -315,6 +315,15 @@ func run() int {
 			"hint", "this is an isolated profile; the production daemon must NOT set KAHYA_ENV",
 		)
 	}
+	// FIX-FINAL ops-config-r2-env-overrides-silently-ignore-bad-values:
+	// Load already refused an unknown default_model; a previous-generation
+	// id still loads (resumable tasks carry them), so say it once at boot.
+	if config.IsLegacyModelID(cfg.DefaultModel) {
+		log.Warn("default_model_legacy",
+			"default_model", cfg.DefaultModel,
+			"hint", "previous-generation model id: still accepted, but routing no longer selects it; set default_model to a current id",
+		)
+	}
 
 	// W6-02: <data_dir>/tmp (e.g. ~/Library/Application Support/Kahya/tmp),
 	// 0700 - hammerspoon/kahya.lua's ffmpeg push-to-talk capture writes

@@ -383,7 +383,18 @@ selected (G12-7). Proxy consequences:
   `claude-sonnet-5-5` (legacy mapping kept); `router.SelectModel` applies
   the rung to a legacy Opus/Sonnet `cfg.default_model` too. The built-in
   `default_model` is `config.DefaultModelID` (`claude-sonnet-5-5`); an
-  operator `config.yaml` naming a legacy id keeps working.
+  operator `config.yaml` naming a legacy id keeps working (kahyad logs
+  `default_model_legacy` once at boot). Any other value fails
+  `config.Load`: the id must be one of `router.CurrentModels()` /
+  `LegacyModels()` (FIX-FINAL ops-config-r2-env-overrides-silently-ignore-
+  bad-values; before, a typo only showed as every chat task being refused
+  by the proxy allowlist). The same fix makes every numeric `KAHYA_*`
+  override (`KAHYA_EGRESS_PORT`, `KAHYA_QWEN_PORT`,
+  `KAHYA_QWEN_IDLE_TTL_SECONDS`, `KAHYA_QWEN_CLASSIFY_BUDGET_MS`,
+  `KAHYA_BRIEFING_MAX_FILE_ITEMS`, `KAHYA_ANCHOR_INTERVAL_HOURS`,
+  `KAHYA_TELEGRAM_CHAT_ID`, `KAHYA_TELEGRAM_USER_ID`) fail `Load` when its
+  value is not an integer, instead of falling back to the file or default
+  value; `config.ResolveSocket` (the clients' path) does not check them.
 - **Live checks pending** (owner-run, through the passthrough proxy): one
   real call per new id with `usd > 0` in `kahya log` — Sonnet 5.5
   (`kahya ask`), Fable 5.1 (`kahya ask --derin`, plus

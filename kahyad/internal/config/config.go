@@ -1129,12 +1129,51 @@ type fileConfig struct {
 // claude-sonnet-5-5).
 const DefaultModelID = "claude-sonnet-5-5"
 
+// currentModelIDs / legacyModelIDs mirror kahyad/internal/router's
+// CurrentModels() / LegacyModels() (this package imports nothing of
+// kahyad's, so it cannot name them; router's
+// TestConfigModelIDsMirrorTheRoutingTable keeps the two in step).
+var (
+	currentModelIDs = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"}
+	legacyModelIDs  = []string{"claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5"}
+)
+
+// CurrentModelIDs returns the current-generation model ids default_model
+// may name (a fresh slice).
+func CurrentModelIDs() []string { return append([]string(nil), currentModelIDs...) }
+
+// LegacyModelIDs returns the previous-generation ids default_model still
+// accepts (a fresh slice); see IsLegacyModelID.
+func LegacyModelIDs() []string { return append([]string(nil), legacyModelIDs...) }
+
+// IsLegacyModelID reports whether id is a previous-generation model id:
+// accepted, priced and resumable, but no longer what routing selects.
+// kahyad warns at boot when default_model is one.
+func IsLegacyModelID(id string) bool { return slices.Contains(legacyModelIDs, id) }
+
+// validateDefaultModel fails Load closed on a default_model the proxy's
+// model allowlist would refuse (FIX-FINAL ops-config-r2-env-overrides-
+// silently-ignore-bad-values): a typo used to surface only at runtime, as
+// every chat task being refused.
+func validateDefaultModel(id string) error {
+	if slices.Contains(currentModelIDs, id) || slices.Contains(legacyModelIDs, id) {
+		return nil
+	}
+	return fmt.Errorf("config: default_model %q is not a known model id (current: %s; legacy, still accepted: %s)",
+		id, strings.Join(currentModelIDs, ", "), strings.Join(legacyModelIDs, ", "))
+}
+
 // layered is resolveLayers' result: the defaults + config.yaml + env
 // layers applied, before any derivation or validation.
 type layered struct {
 	cfg                                                                  Config
 	home                                                                 string
 	explicitSocket, explicitLogDir, explicitDBPath, explicitApprovalWait bool
+	// envErr is applyEnv's verdict on the numeric KAHYA_* overrides: nil,
+	// or one error naming every override whose value does not parse. Load
+	// fails closed on it; ResolveSocket does not look at it (none of those
+	// overrides can move the socket).
+	envErr error
 }
 
 // resolveLayers is Load's layering prefix, shared with ResolveSocket so the
@@ -1194,10 +1233,10 @@ func resolveLayers() (layered, error) {
 		explicitApprovalWait = fc.ApprovalWaitSeconds != nil
 	}
 
-	applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
+	envErr := applyEnv(&cfg, home, &explicitSocket, &explicitLogDir, &explicitDBPath)
 
 	return layered{cfg: cfg, home: home, explicitSocket: explicitSocket, explicitLogDir: explicitLogDir,
-		explicitDBPath: explicitDBPath, explicitApprovalWait: explicitApprovalWait}, nil
+		explicitDBPath: explicitDBPath, explicitApprovalWait: explicitApprovalWait, envErr: envErr}, nil
 }
 
 // ResolveSocket returns the control socket a client (kahya, kahya-trigger,
@@ -1210,8 +1249,9 @@ func resolveLayers() (layered, error) {
 // which keeps running on its own already-validated config. Only what the
 // socket path itself depends on is still checked: KAHYA_ENV (it names the
 // socket file), an ASCII path, and a readable, parseable config.yaml (else
-// the socket really is unknown). The daemon still refuses to boot on an
-// invalid config (Load).
+// the socket really is unknown). An unparseable numeric KAHYA_* override
+// (layered.envErr) is one of the things it does not check, for the same
+// reason. The daemon still refuses to boot on an invalid config (Load).
 func ResolveSocket() (string, error) {
 	l, err := resolveLayers()
 	if err != nil {
@@ -1240,6 +1280,13 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// FIX-FINAL ops-config-r2-env-overrides-silently-ignore-bad-values: a
+	// numeric override that does not parse fails Load, exactly as the same
+	// mistake in config.yaml does - it used to fall back to the file or
+	// default value without a word.
+	if l.envErr != nil {
+		return Config{}, l.envErr
+	}
 	cfg, home := l.cfg, l.home
 	explicitSocket, explicitLogDir, explicitDBPath, explicitApprovalWait := l.explicitSocket, l.explicitLogDir, l.explicitDBPath, l.explicitApprovalWait
 
@@ -1261,6 +1308,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateCredentialMode(cfg.CredentialMode); err != nil {
+		return Config{}, err
+	}
+	if err := validateDefaultModel(cfg.DefaultModel); err != nil {
 		return Config{}, err
 	}
 	if err := validateJobs(cfg.Jobs); err != nil {
@@ -2570,7 +2620,36 @@ func applyFile(cfg *Config, fc fileConfig, home string, explicitSocket, explicit
 	}
 }
 
-func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) {
+// applyEnv layers the KAHYA_* environment overrides onto cfg. A numeric
+// override whose value does not parse as an integer is NOT applied and is
+// reported: the returned error names every such variable (nil when all
+// parse). An empty variable is unset, as everywhere else.
+func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicitDBPath *bool) error {
+	var bad []error
+	envInt := func(name string, dst *int) {
+		v := os.Getenv(name)
+		if v == "" {
+			return
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			bad = append(bad, fmt.Errorf("config: %s=%q is not an integer", name, v))
+			return
+		}
+		*dst = n
+	}
+	envInt64 := func(name string, dst *int64) {
+		v := os.Getenv(name)
+		if v == "" {
+			return
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			bad = append(bad, fmt.Errorf("config: %s=%q is not an integer", name, v))
+			return
+		}
+		*dst = n
+	}
 	if v := os.Getenv("KAHYA_DATA_DIR"); v != "" {
 		cfg.DataDir = expandHome(v, home)
 	}
@@ -2604,11 +2683,7 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_EVAL_RETRIEVAL_DATASET_PATH"); v != "" {
 		cfg.EvalRetrievalDatasetPath = expandHome(v, home)
 	}
-	if v := os.Getenv("KAHYA_EGRESS_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			cfg.EgressPort = p
-		}
-	}
+	envInt("KAHYA_EGRESS_PORT", &cfg.EgressPort)
 	if v := os.Getenv("KAHYA_DOCKER_IMAGE_TAG"); v != "" {
 		cfg.DockerImageTag = v
 	}
@@ -2621,59 +2696,32 @@ func applyEnv(cfg *Config, home string, explicitSocket, explicitLogDir, explicit
 	if v := os.Getenv("KAHYA_SHELL_WORKDIR_ROOTS"); v != "" {
 		cfg.ShellWorkdirRoots = expandHomeEach(strings.Split(v, ","), home)
 	}
-	if v := os.Getenv("KAHYA_TELEGRAM_CHAT_ID"); v != "" {
-		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
-			cfg.TelegramChatID = id
-		}
-	}
-	if v := os.Getenv("KAHYA_TELEGRAM_USER_ID"); v != "" {
-		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
-			cfg.TelegramUserID = id
-		}
-	}
+	envInt64("KAHYA_TELEGRAM_CHAT_ID", &cfg.TelegramChatID)
+	envInt64("KAHYA_TELEGRAM_USER_ID", &cfg.TelegramUserID)
 	if v := os.Getenv("KAHYA_TELEGRAM_API_URL"); v != "" {
 		cfg.TelegramAPIURL = v
 	}
-	if v := os.Getenv("KAHYA_QWEN_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			cfg.QwenPort = p
-		}
-	}
+	envInt("KAHYA_QWEN_PORT", &cfg.QwenPort)
 	if v := os.Getenv("KAHYA_QWEN_MODEL_PATH"); v != "" {
 		cfg.QwenModelPath = expandHome(v, home)
 	}
-	if v := os.Getenv("KAHYA_QWEN_IDLE_TTL_SECONDS"); v != "" {
-		if s, err := strconv.Atoi(v); err == nil {
-			cfg.QwenIdleTTLSeconds = s
-		}
-	}
-	if v := os.Getenv("KAHYA_QWEN_CLASSIFY_BUDGET_MS"); v != "" {
-		if ms, err := strconv.Atoi(v); err == nil {
-			cfg.QwenClassifyBudgetMS = ms
-		}
-	}
-	if v := os.Getenv("KAHYA_BRIEFING_MAX_FILE_ITEMS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.BriefingMaxFileItems = n
-		}
-	}
+	envInt("KAHYA_QWEN_IDLE_TTL_SECONDS", &cfg.QwenIdleTTLSeconds)
+	envInt("KAHYA_QWEN_CLASSIFY_BUDGET_MS", &cfg.QwenClassifyBudgetMS)
+	envInt("KAHYA_BRIEFING_MAX_FILE_ITEMS", &cfg.BriefingMaxFileItems)
 	if v := os.Getenv("KAHYA_TIMEZONE"); v != "" {
 		cfg.Timezone = v
 	}
 	if v := os.Getenv("KAHYA_ANCHOR_REMOTE"); v != "" {
 		cfg.AnchorRemote = v
 	}
-	if v := os.Getenv("KAHYA_ANCHOR_INTERVAL_HOURS"); v != "" {
-		if h, err := strconv.Atoi(v); err == nil {
-			cfg.AnchorIntervalHours = h
-		}
-	}
+	envInt("KAHYA_ANCHOR_INTERVAL_HOURS", &cfg.AnchorIntervalHours)
 	if v := os.Getenv("KAHYA_ANCHOR_LOCAL_FALLBACK_PATH"); v != "" {
 		cfg.AnchorLocalFallbackPath = expandHome(v, home)
 	}
 	if v := os.Getenv("KAHYA_UI_HS_CLI"); v != "" {
 		cfg.HsCliPath = expandHome(v, home)
 	}
+	return errors.Join(bad...)
 }
 
 // envNamePattern is the constraint a non-prod KAHYA_ENV profile name must
