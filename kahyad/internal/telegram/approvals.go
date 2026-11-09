@@ -518,17 +518,22 @@ func (b *Bot) handleCallback(c tele.Context) error {
 // markResolved marks id's card resolved (at b.clock(), FIX-P-19) and edits
 // it; a no-op for an id with no tracked card - never sent, or already
 // evicted by sweepCards (the engine has decided the tap either way).
+// FIX-FINAL flake-r2-telegram-tap-double-edit: a check-and-set under b.mu -
+// a card the decided hook (which a tap's own Approve/Deny fires, in its own
+// goroutine in production), the halt or the post-store reconciliation
+// already resolved is not edited again: no duplicate editMessageText (a
+// Telegram 400 "message is not modified", a second egress check and byte
+// charge), and a failed tap never stamps "Süresi doldu" over a decision.
 func (b *Bot) markResolved(id, suffix string) {
 	b.mu.Lock()
 	card, ok := b.cards[id]
-	if ok {
-		card.resolved = true
-		card.resolvedAt = b.clock()
-	}
-	b.mu.Unlock()
-	if !ok {
+	if !ok || card.resolved {
+		b.mu.Unlock()
 		return
 	}
+	card.resolved = true
+	card.resolvedAt = b.clock()
+	b.mu.Unlock()
 	b.editCard(card, suffix)
 }
 

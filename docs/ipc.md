@@ -2140,7 +2140,10 @@ Every in-process binding gate — `/v1/mcp`'s `policyGateMiddleware`
    after it is stored (the decision suffix, or the halt text), and a tap
    that fails because another surface decided first answers `"Zaten
    işlendi."` with the recorded decision stamped, never `"⏰ Süresi
-   doldu"` (FIX-FINAL flake-r2-tux3-card-send-race).
+   doldu"` (FIX-FINAL flake-r2-tux3-card-send-race). Whichever path
+   resolves a card first (the tap's own handler, the decided hook its
+   Approve/Deny fires, the halt) is the only one that edits it: one tap is
+   one `editMessageText` (FIX-FINAL flake-r2-telegram-tap-double-edit).
 4. The same call re-checks **bound to its own pending id**
    (`RedeemPendingApprovalID` + `NoMintPending`: never a second pending
    row). `Engine.Check` **redeems** that id's grant and no other — never a
