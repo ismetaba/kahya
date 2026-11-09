@@ -20,7 +20,8 @@
 //     excluded on that basis alone - "no classification => treat as
 //     secret-lane => exclude" (task spec, verbatim).
 //   - CONTENT (FIX-P-17): the exact text Run would send to Telegram
-//     (factText) is classified locally - always by the deterministic
+//     (questionText, FIX-FINAL TUX-1: the Turkish rendering) and the stored
+//     triple are classified locally - always by the deterministic
 //     pre-pass (secretlane.ClassifyDeterministic: IBAN/TCKN/card/CVV and
 //     the finans/saglik/kimlik lexicon), plus an optional FactClassifier
 //     on top (fail-closed: any error excludes). Facts are path-independent
@@ -84,7 +85,7 @@ func (PolicyGlobMatcher) Match(pattern, path string) (bool, error) {
 
 // FactClassifier is the FIX-P-17 content seam on top of the deterministic
 // pre-pass: it decides whether the text that WOULD be sent to Telegram
-// (factText) is finans/saglik/kimlik content. Optional - nil means
+// (questionText) is finans/saglik/kimlik content. Optional - nil means
 // "deterministic pre-pass only", never "skip classification". kahyad wires
 // none (owner decision G02-4: deterministic-only, so memory pressure on
 // the local model can never empty a ritual); a wired one must be local-only
@@ -242,11 +243,12 @@ func (s *Sampler) lastAskedByFact(ctx context.Context) (map[int64]string, error)
 // this file's own package doc comment through memlane.Classifier.Classify:
 // f is eligible iff it has at least one evidence row citing an episode with
 // a resolvable, non-secret source_path, NONE of its cited episodes' paths
-// match a secret-lane glob, AND its text (factText - exactly what Run
-// sends; memlane.FactText is the same string) is not secret-lane content.
-// Every exclusion is ledgered (ledgerExcluded).
+// match a secret-lane glob, AND neither its stored triple
+// (memlane.FactText) nor its question text (questionText - exactly the
+// string Run sends, FIX-FINAL TUX-1) is secret-lane content. Every
+// exclusion is ledgered (ledgerExcluded).
 func (s *Sampler) classify(ctx context.Context, traceID string, f sqlcgen.Fact) (eligible bool, err error) {
-	v, err := s.lane.Classify(ctx, f)
+	v, err := s.lane.ClassifyTexts(ctx, f, memlane.FactText(f), questionText(f))
 	if err != nil {
 		return false, fmt.Errorf("ritual: classify fact %d: %w", f.ID, err)
 	}

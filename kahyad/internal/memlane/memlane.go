@@ -220,6 +220,18 @@ func FoldForSecretGlob(s string) string { return pathfold.Fold(textnorm.Fold(s))
 // the content half on FactText(f). An error means the store could not be
 // read; the caller must then treat the fact as excluded.
 func (c Classifier) Classify(ctx context.Context, f sqlcgen.Fact) (Verdict, error) {
+	return c.ClassifyTexts(ctx, f, FactText(f))
+}
+
+// ClassifyTexts is Classify for a caller that sends fact f in a rendering
+// of its own (FIX-FINAL TUX-1: the ritual's Turkish question body). The
+// path half is Classify's; the content half runs on EVERY text given, and
+// f is eligible only when all of them pass - so the bytes that leave the
+// machine are always among the bytes that were classified. The
+// deterministic pre-pass runs on every text before the optional Content
+// classifier sees any; a repeated text is classified once. With no text at
+// all it classifies FactText(f): the content half is never skipped.
+func (c Classifier) ClassifyTexts(ctx context.Context, f sqlcgen.Fact, texts ...string) (Verdict, error) {
 	if c.Store == nil {
 		return Verdict{}, errors.New("memlane: no store wired")
 	}
@@ -241,17 +253,36 @@ func (c Classifier) Classify(ctx context.Context, f sqlcgen.Fact) (Verdict, erro
 		return Verdict{Reason: ReasonNoClassification}, nil
 	}
 
-	text := FactText(f)
-	if secretlane.ClassifyDeterministic(text).SecretLane {
-		return Verdict{Reason: ReasonContentDeterministic}, nil
+	distinct := make([]string, 0, len(texts))
+	for _, text := range texts {
+		seen := false
+		for _, d := range distinct {
+			if d == text {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			distinct = append(distinct, text)
+		}
+	}
+	if len(distinct) == 0 {
+		distinct = append(distinct, FactText(f))
+	}
+	for _, text := range distinct {
+		if secretlane.ClassifyDeterministic(text).SecretLane {
+			return Verdict{Reason: ReasonContentDeterministic}, nil
+		}
 	}
 	if c.Content != nil {
-		secret, err := c.Content.ClassifySecretLane(ctx, text)
-		if err != nil {
-			return Verdict{Reason: ReasonClassifyFailed}, nil
-		}
-		if secret {
-			return Verdict{Reason: ReasonContentClassifier}, nil
+		for _, text := range distinct {
+			secret, err := c.Content.ClassifySecretLane(ctx, text)
+			if err != nil {
+				return Verdict{Reason: ReasonClassifyFailed}, nil
+			}
+			if secret {
+				return Verdict{Reason: ReasonContentClassifier}, nil
+			}
 		}
 	}
 	return Verdict{Eligible: true}, nil

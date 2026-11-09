@@ -452,3 +452,90 @@ func TestChunkCloudEligible(t *testing.T) {
 		}
 	}
 }
+
+// recordingContent is a ContentClassifier that records every text it was
+// asked about and calls the ones in secret secret-lane.
+type recordingContent struct {
+	seen   []string
+	secret map[string]bool
+	err    error
+}
+
+func (r *recordingContent) ClassifySecretLane(_ context.Context, text string) (bool, error) {
+	r.seen = append(r.seen, text)
+	if r.err != nil {
+		return false, r.err
+	}
+	return r.secret[text], nil
+}
+
+// TestClassifyTextsExcludesWhenAnyTextIsSecret (FIX-FINAL TUX-1): a caller
+// that sends a fact in its own rendering classifies every text it names;
+// one secret-lane text excludes the fact whichever position it is in, and
+// the deterministic pre-pass sees every text before the content classifier
+// sees any.
+func TestClassifyTextsExcludesWhenAnyTextIsSecret(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStore{paths: map[int64][]sql.NullString{1: paths("notes/ev.md")}}
+	c := newClassifier(st)
+	f := fact(1, "Emre", "sever", "kahve")
+	const iban = "hesap TR33 0006 1005 1978 6457 8413 26"
+
+	if v, err := c.ClassifyTexts(ctx, f, "Emre sever kahve", "Emre — sevdiği şey: kahve"); err != nil || !v.Eligible {
+		t.Fatalf("two ordinary texts = %+v, %v; want eligible", v, err)
+	}
+	for _, texts := range [][]string{{iban, "Emre sever kahve"}, {"Emre sever kahve", iban}} {
+		content := &recordingContent{}
+		c.Content = content
+		v, err := c.ClassifyTexts(ctx, f, texts...)
+		if err != nil || v.Eligible || v.Reason != ReasonContentDeterministic {
+			t.Fatalf("texts %q = %+v, %v; want excluded (%s)", texts, v, err, ReasonContentDeterministic)
+		}
+		if len(content.seen) != 0 {
+			t.Fatalf("texts %q: the content classifier saw %q before the pre-pass finished", texts, content.seen)
+		}
+	}
+
+	content := &recordingContent{secret: map[string]bool{"ikinci metin": true}}
+	c.Content = content
+	if v, err := c.ClassifyTexts(ctx, f, "birinci metin", "ikinci metin"); err != nil || v.Eligible || v.Reason != ReasonContentClassifier {
+		t.Fatalf("second text secret by the classifier = %+v, %v; want excluded (%s)", v, err, ReasonContentClassifier)
+	}
+	c.Content = &recordingContent{err: errors.New("model down")}
+	if v, err := c.ClassifyTexts(ctx, f, "birinci metin", "ikinci metin"); err != nil || v.Eligible || v.Reason != ReasonClassifyFailed {
+		t.Fatalf("classifier error = %+v, %v; want excluded (%s)", v, err, ReasonClassifyFailed)
+	}
+}
+
+// TestClassifyTextsClassifiesEachDistinctTextOnce (FIX-FINAL TUX-1): a
+// rendering equal to the stored triple costs no second classifier call,
+// and no text at all still classifies the triple (the content half is
+// never skipped).
+func TestClassifyTextsClassifiesEachDistinctTextOnce(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStore{paths: map[int64][]sql.NullString{1: paths("notes/ev.md")}}
+	c := newClassifier(st)
+	f := fact(1, "Emre", "sever", "kahve")
+
+	content := &recordingContent{}
+	c.Content = content
+	if v, err := c.ClassifyTexts(ctx, f, "Emre sever kahve", "Emre sever kahve", "başka metin"); err != nil || !v.Eligible {
+		t.Fatalf("ClassifyTexts = %+v, %v; want eligible", v, err)
+	}
+	if len(content.seen) != 2 || content.seen[0] != "Emre sever kahve" || content.seen[1] != "başka metin" {
+		t.Fatalf("classifier saw %q, want each distinct text once, in order", content.seen)
+	}
+
+	content = &recordingContent{}
+	c.Content = content
+	if v, err := c.ClassifyTexts(ctx, f); err != nil || !v.Eligible {
+		t.Fatalf("ClassifyTexts with no text = %+v, %v; want eligible", v, err)
+	}
+	if len(content.seen) != 1 || content.seen[0] != FactText(f) {
+		t.Fatalf("with no text the classifier saw %q, want the triple %q", content.seen, FactText(f))
+	}
+	secretTriple := fact(1, "hesap", "numarasi", "TR33 0006 1005 1978 6457 8413 26")
+	if v, err := c.ClassifyTexts(ctx, secretTriple); err != nil || v.Eligible || v.Reason != ReasonContentDeterministic {
+		t.Fatalf("no text, secret triple = %+v, %v; want excluded (%s)", v, err, ReasonContentDeterministic)
+	}
+}

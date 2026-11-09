@@ -232,6 +232,26 @@ type FactExtractV1 struct {
 // relation, or "other:<snake_case>" for one outside the prompt's list.
 var predicateRe = regexp.MustCompile(`^(other:)?[a-z][a-z_]{1,39}$`)
 
+// factPredicates is the relation list the two extraction prompts
+// (factExtractSystemPrompt, docIngestSystemPrompt) name, in prompt order.
+// TestExtractionPromptsNameExactlyFactPredicates pins the prompts to it.
+var factPredicates = []string{
+	"works_at", "role_at", "lives_in", "located_in", "member_of", "owns",
+	"founded", "parent_of", "child_of", "spouse_of", "friend_of",
+	"colleague_of", "manages", "reports_to", "prefers", "dislikes",
+	"decided", "promised", "met_with", "contacted", "attended", "owes",
+	"paid", "received", "scheduled", "phone_of", "email_of", "birthday_of",
+	"relates_to",
+}
+
+// FactPredicates returns a copy of the extractor's named predicate
+// vocabulary. The predicates are stored identifiers (English); a surface
+// that shows a fact to the user renders them through its own Turkish
+// labels (kahyad/internal/ritual's predicateLabels, FIX-FINAL TUX-1).
+func FactPredicates() []string {
+	return append([]string(nil), factPredicates...)
+}
+
 // ValidateFactExtractV1 sanitizes and validates every field of v and
 // returns a NEW, fully validated FactExtractV1 - or the first failure, with
 // no partial output (the same contract as the mail/webpage validators).

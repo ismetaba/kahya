@@ -47,7 +47,6 @@ import (
 	"time"
 
 	"kahya/kahyad/internal/factengine"
-	"kahya/kahyad/internal/memlane"
 	"kahya/kahyad/internal/store/sqlcgen"
 	"kahya/kahyad/internal/taint"
 )
@@ -194,17 +193,6 @@ func (e *Engine) SetClock(now func() time.Time) { e.now = now }
 
 func (e *Engine) nowRFC3339() string { return e.now().UTC().Format(time.RFC3339Nano) }
 
-// factText renders a fact's (subject, predicate, object) triple as the
-// plain-Turkish question body ("Bu dogru mu?\n\n<fact text>"'s own <fact
-// text> half) - a straightforward whitespace join, since every field is
-// already free Turkish text an extractor (or a direct user assertion)
-// produced, not a template needing further grammar. It IS memlane.FactText,
-// the text the sampler's secret-lane classification checks (FIX-P-17), so
-// the classified text and the sent text can never drift apart.
-func factText(f sqlcgen.Fact) string {
-	return memlane.FactText(f)
-}
-
 // Run selects up to MaxQuestionsPerRun eligible facts (select.go) and
 // sends one Telegram question per fact under traceID - every eval_labels
 // row this run mints, and every ritual.asked ledger event, shares that
@@ -239,7 +227,7 @@ func (e *Engine) Run(ctx context.Context, traceID string) (asked int, err error)
 
 	askedAt := e.nowRFC3339()
 	for _, f := range facts {
-		qText := factText(f)
+		qText := questionText(f)
 		row, insertErr := e.store.InsertEvalLabel(ctx, sqlcgen.InsertEvalLabelParams{
 			FactID:       f.ID,
 			QuestionText: qText,
