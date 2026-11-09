@@ -754,7 +754,10 @@ func (c Config) TmpDir() string {
 //     dylibs those native images link; when the interpreter or such a
 //     dylib lives in a Homebrew keg, the whole Homebrew prefix (its kegs
 //     and the etc/ config their libraries load code from). These trees are
-//     outside the repo, so G04-2 does not apply to them.
+//     outside the repo, so G04-2 does not apply to them;
+//   - the `make install` destination, <home>/bin (InstallBinDir): the
+//     second copy of kahyad and the kahya CLI, in a directory on the
+//     user's PATH.
 func (c Config) SelfProtectDenyGlobs() []string {
 	var globs []string
 	seen := make(map[string]bool)
@@ -828,7 +831,35 @@ func (c Config) SelfProtectDenyGlobs() []string {
 	for _, bin := range []string{c.MCPBridgePath, c.TriggerBinPath, c.HsCliPath, c.TTSSayBin} {
 		add(bin, false)
 	}
+	// FIX-FINAL ops-config-r2-make-install-bin-not-self-protected: the
+	// `make install` destination. launchd runs <repo>/bin/kahyad, so the
+	// executable-derived bin/ entry above never covered the SECOND copy
+	// `make install` puts in <home>/bin - the kahya a user runs from a
+	// terminal, `kahya halt` included. An fs_write over it left a 0600,
+	// non-executable file (no emergency stop from the terminal); a
+	// shell_docker job with that directory as its workdir could plant an
+	// executable there that later runs unsandboxed on the host. The whole
+	// directory is protected, not just the two names: it is on the user's
+	// PATH, where any planted file shadows a command.
+	if dir := InstallBinDir(); dir != "" {
+		add(dir, true)
+	}
 	return globs
+}
+
+// InstallBinDirName is the directory under the user's home that `make
+// install` copies kahyad and the kahya CLI into (Makefile: $(HOME)/bin;
+// kahyad's TestMakeInstallTargetsTheProtectedBinDir keeps the two in step).
+const InstallBinDirName = "bin"
+
+// InstallBinDir returns the absolute `make install` destination,
+// <home>/bin, or "" when the home directory cannot be resolved.
+func InstallBinDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, InstallBinDirName)
 }
 
 // PythonServiceDir returns the working directory — and so the FIRST import

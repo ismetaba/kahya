@@ -306,3 +306,99 @@ func TestWiredFSSecretLaneGlobsCoverUndoAndTrash(t *testing.T) {
 		}
 	}
 }
+
+// TestWiredDenyGlobsProtectTheInstalledBinDir (FIX-FINAL ops-config-r2-
+// make-install-bin-not-self-protected): `make install` puts a second
+// kahyad and kahya in $HOME/bin, which neither policy.yaml nor the
+// executable-derived self-protect entry (<repo>/bin - launchd runs the
+// repo copy) covered: fs_write / fs_delete could replace or remove the
+// terminal `kahya` (so `kahya halt`), and the directory was a legal
+// shell_docker workdir. The wired deny list now covers the directory and
+// everything in it, in every profile and on a deny-all boot.
+func TestWiredDenyGlobsProtectTheInstalledBinDir(t *testing.T) {
+	pol, err := policy.Load(filepath.Join("..", "policy.yaml"))
+	if err != nil {
+		t.Fatalf("policy.Load: %v", err)
+	}
+	for _, env := range []string{"", "dev"} {
+		t.Run("env="+env, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("KAHYA_ENV", env)
+			for _, k := range []string{"KAHYA_DATA_DIR", "KAHYA_SOCKET", "KAHYA_MEMORY_DIR", "KAHYA_DB_PATH", "KAHYA_POLICY_PATH"} {
+				t.Setenv(k, "")
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("config.Load: %v", err)
+			}
+			binDir := filepath.Join(home, "bin")
+			if got := config.InstallBinDir(); got != binDir {
+				t.Fatalf("config.InstallBinDir() = %q, want %q", got, binDir)
+			}
+			paths := []string{binDir, filepath.Join(binDir, "kahya"), filepath.Join(binDir, "kahyad"), filepath.Join(binDir, "git"), filepath.Join(binDir, "sub", "tool")}
+			// Red baseline: policy.yaml alone leaves all of them writable.
+			for _, p := range paths {
+				if hit, _ := mcpfs.MatchesAnyGlobCI(p, pol.FSWriteDenyGlobs); hit {
+					t.Fatalf("fixture: %s is already covered by policy.yaml alone", p)
+				}
+			}
+			for name, wired := range map[string][]string{
+				"policy+selfprotect": wiredFSDenyGlobs(pol.FSWriteDenyGlobs, cfg),
+				"deny-all boot":      wiredFSDenyGlobs(nil, cfg),
+			} {
+				for _, p := range paths {
+					cp, err := mcpfs.Canonicalize(home, p)
+					if err != nil {
+						t.Fatalf("Canonicalize(%s): %v", p, err)
+					}
+					if hit, err := mcpfs.MatchesAnyGlobCI(cp.Match, wired); err != nil || !hit {
+						t.Errorf("%s: %s (canonical %s) must be write-protected (hit=%v err=%v)", name, p, cp.Match, hit, err)
+					}
+				}
+				// A sibling of the install dir stays writable: the entry is
+				// the directory, not a prefix.
+				for _, p := range []string{filepath.Join(home, "binary-notes.md"), filepath.Join(home, "code", "x", "bin", "tool")} {
+					cp, err := mcpfs.Canonicalize(home, p)
+					if err != nil {
+						t.Fatalf("Canonicalize(%s): %v", p, err)
+					}
+					if hit, _ := mcpfs.MatchesAnyGlobCI(cp.Match, wired); hit {
+						t.Errorf("%s: %s must NOT be covered by the install-dir entry", name, p)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestMakeInstallTargetsTheProtectedBinDir: the Makefile's install recipe
+// writes exactly into $(HOME)/<config.InstallBinDirName> - the directory
+// SelfProtectDenyGlobs protects. Moving the install destination without
+// moving the protection fails here.
+func TestMakeInstallTargetsTheProtectedBinDir(t *testing.T) {
+	mk, err := os.ReadFile(filepath.Join("..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(mk), "\ninstall: codesign\n")
+	if start < 0 {
+		t.Fatal("Makefile has no `install: codesign` target")
+	}
+	var recipe []string
+	for _, l := range strings.Split(string(mk)[start+1:], "\n")[1:] {
+		if !strings.HasPrefix(l, "\t") {
+			break
+		}
+		recipe = append(recipe, strings.TrimSpace(l))
+	}
+	dest := "$(HOME)/" + config.InstallBinDirName
+	want := []string{
+		"mkdir -p " + dest,
+		"install -m 0755 bin/kahyad " + dest + "/kahyad",
+		"install -m 0755 bin/kahya  " + dest + "/kahya",
+	}
+	if !slices.Equal(recipe, want) {
+		t.Fatalf("Makefile install recipe = %q, want %q (update config.InstallBinDirName / SelfProtectDenyGlobs with it)", recipe, want)
+	}
+}
